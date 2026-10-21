@@ -468,7 +468,19 @@ pub fn claim_spare(
     let derived = crate::agent::provider_sandbox_name(cfg, worktree, env_name);
     let repo = repo_root.to_string_lossy().into_owned();
     let db = thegn_core::db::Db::open().ok()?;
-    let (name, checkpoint) = db.claim_pool_spare(&repo, env_name, worktree).ok()??;
+    let (name, checkpoint) = db.begin_pool_spare_claim(&repo, env_name).ok()??;
+    let _spare_lease = match crate::pool_lease::spare_lease(&name) {
+        Ok(lease) => lease,
+        Err(error) => {
+            quarantine_claim_failure(
+                &db,
+                &name,
+                worktree,
+                &format!("could not acquire spare lease: {error}"),
+            );
+            return None;
+        }
+    };
     // The claimed spare's provisioned-base checkpoint rides its pool row; the
     // recycle paths (stale reconcile / worktree delete) restore from it.
     tracing::debug!(
@@ -542,23 +554,69 @@ pub fn claim_spare(
         .iter()
         .map(|s| s.replace("{id}", &name))
         .collect();
-    if !prefix.is_empty() {
+    let location_result = if !prefix.is_empty() {
         let loc = thegn_core::remote::GitLoc::provider_db_string(&prefix, &workdir);
-        // best-effort: a missed rebind heals on the worktree's next open.
-        let _ = db.set_worktree_location(worktree, &loc);
-    }
-    // Placement-engine accounting: if this spare holds a tenancy row (spares
-    // minted onto engine-managed hosts), rebind it to the claiming worktree —
-    // same sandbox, same host, amounts unchanged. No-op otherwise.
-    {
+        db.set_worktree_location(worktree, &loc)
+    } else {
+        Ok(())
+    };
+    let tenancy_result = {
         use thegn_core::store::PlacementStore;
-        let _ = db.tenancy_rebind(&name, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        db.tenancy_rebind(&name, worktree)
+    };
+    match claim_publish_decision(&location_result, &tenancy_result) {
+        ClaimPublish::Publish => {
+            if let Err(error) = db.publish_pool_spare_claim(&name, worktree) {
+                quarantine_claim_failure(
+                    &db,
+                    &name,
+                    worktree,
+                    &format!("claim publication failed: {error:#}"),
+                );
+                return None;
+            }
+        }
+        ClaimPublish::Quarantine(reason) => {
+            quarantine_claim_failure(&db, &name, worktree, &reason);
+            return None;
+        }
     }
     thegn_core::msg::info(&format!("claimed warm spare {name} for {worktree}"));
     // The claim consumed this spare — refill the pool now rather than waiting for
     // the next ~8s maintainer tick to notice the gap (off-loop, its own thread).
     crate::lifecycle::refill_pool_after_claim(cfg, worktree);
     Some(name)
+}
+
+enum ClaimPublish {
+    Publish,
+    Quarantine(String),
+}
+
+fn claim_publish_decision(
+    location: &anyhow::Result<()>,
+    tenancy: &anyhow::Result<()>,
+) -> ClaimPublish {
+    if let Err(error) = location {
+        ClaimPublish::Quarantine(format!("control-location rebind failed: {error:#}"))
+    } else if let Err(error) = tenancy {
+        ClaimPublish::Quarantine(format!("tenancy rebind failed: {error:#}"))
+    } else {
+        ClaimPublish::Publish
+    }
+}
+
+fn quarantine_claim_failure(db: &thegn_core::db::Db, name: &str, worktree: &str, reason: &str) {
+    let quarantine_status = match db.quarantine_pool_spare(name, "claiming") {
+        Ok(()) => "the spare is quarantined".to_string(),
+        Err(error) => {
+            tracing::warn!(target: "thegn::lifecycle", %name, error = %error, "failed to quarantine warm-pool claim");
+            format!("quarantine failed ({error:#})")
+        }
+    };
+    thegn_core::msg::warn(&format!(
+        "warm pool: claim of spare {name} for {worktree} failed ({reason}); {quarantine_status} and a fresh sandbox will be provisioned"
+    ));
 }
 
 /// On-open location rebind: build the `GitLoc` for the freshly RESOLVED
@@ -663,6 +721,26 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn claim_publish_decision_quarantines_any_failed_rebind() {
+        assert!(matches!(
+            claim_publish_decision(&Ok(()), &Ok(())),
+            ClaimPublish::Publish
+        ));
+
+        let location_error = anyhow::anyhow!("location denied");
+        match claim_publish_decision(&Err(location_error), &Ok(())) {
+            ClaimPublish::Quarantine(reason) => assert!(reason.contains("location denied")),
+            ClaimPublish::Publish => panic!("failed location rebind must quarantine"),
+        }
+
+        let tenancy_error = anyhow::anyhow!("tenancy denied");
+        assert!(matches!(
+            claim_publish_decision(&Ok(()), &Err(tenancy_error)),
+            ClaimPublish::Quarantine(_)
+        ));
+    }
 
     #[test]
     fn rebind_resolved_location_persists_only_remote_diffs() {

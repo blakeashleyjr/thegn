@@ -138,14 +138,24 @@ impl PoolStore for Db {
             }
         };
         if let Some((ref name, _)) = picked {
-            let changed = tx.execute(
-                "UPDATE pool_spares SET state='claimed', updated_at=?2
+            let begun = tx.execute(
+                "UPDATE pool_spares SET state='claiming', updated_at=?2
                  WHERE sandbox_name=?1 AND state='ready'",
                 params![name, util::now()],
             )?;
-            if changed != 1 {
+            if begun != 1 {
                 return Err(anyhow::anyhow!(
-                    "warm pool: spare {name} was not exactly one ready ledger row to claim"
+                    "warm pool: spare {name} was not exactly one ready ledger row to begin claiming"
+                ));
+            }
+            let published = tx.execute(
+                "UPDATE pool_spares SET state='claimed', updated_at=?2
+                 WHERE sandbox_name=?1 AND state='claiming'",
+                params![name, util::now()],
+            )?;
+            if published != 1 {
+                return Err(anyhow::anyhow!(
+                    "warm pool: spare {name} was not exactly one claiming ledger row to publish"
                 ));
             }
             tx.execute(
@@ -155,6 +165,77 @@ impl PoolStore for Db {
         }
         tx.commit()?;
         Ok(picked)
+    }
+
+    fn begin_pool_spare_claim(
+        &self,
+        repo: &str,
+        env: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let tx = self.conn().unchecked_transaction()?;
+        let res = tx.query_row(
+            "SELECT sandbox_name, checkpoint_id FROM pool_spares
+             WHERE repo_path=?1 AND env_name=?2 AND state='ready'
+             ORDER BY created_at ASC LIMIT 1",
+            params![repo, env],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        );
+        let picked = match res {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => {
+                tracing::warn!(target: "thegn::db", error = %error, "pick_spare read failed; treating as a miss");
+                None
+            }
+        };
+        if let Some((name, _)) = &picked {
+            let changed = tx.execute(
+                "UPDATE pool_spares SET state='claiming', updated_at=?2
+                 WHERE sandbox_name=?1 AND state='ready'",
+                params![name, util::now()],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!(
+                    "warm pool: spare {name} was not exactly one ready ledger row to begin claiming"
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(picked)
+    }
+
+    fn publish_pool_spare_claim(&self, name: &str, worktree: &str) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE pool_spares SET state='claimed', updated_at=?2
+             WHERE sandbox_name=?1 AND state='claiming'",
+            params![name, util::now()],
+        )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!(
+                "warm pool: spare {name} was not exactly one claiming ledger row to publish"
+            ));
+        }
+        tx.execute(
+            "UPDATE worktrees SET provider_sandbox_id=?2 WHERE worktree=?1",
+            params![worktree, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn quarantine_pool_spare(&self, name: &str, expected_state: &str) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE pool_spares SET state='quarantined', updated_at=?3
+             WHERE sandbox_name=?1 AND state=?2",
+            params![name, expected_state, util::now()],
+        )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!(
+                "warm pool: spare {name} was not exactly one {expected_state} ledger row to quarantine"
+            ));
+        }
+        Ok(())
     }
 
     fn pool_spare_by_name(&self, name: &str) -> Result<Option<PoolSpare>> {
@@ -235,7 +316,7 @@ impl PoolStore for Db {
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
-    use crate::store::PoolStore;
+    use crate::store::{PoolStore, WorkspaceStore};
 
     #[test]
     fn pool_spare_by_name_round_trips_states() {
@@ -335,6 +416,78 @@ mod tests {
         assert_eq!(
             db.pool_spare_by_name("held").unwrap().unwrap().state,
             "ready"
+        );
+    }
+
+    #[test]
+    fn begin_claim_moves_ready_to_claiming_without_binding() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("claiming", "/repo", "sprites")
+            .unwrap();
+        db.set_pool_spare_ready("claiming", Some("cp"), "lock")
+            .unwrap();
+        db.put_worktree("tab", "/repo", "/wt/x", "tg/x", None, None)
+            .unwrap();
+
+        let picked = db
+            .begin_pool_spare_claim("/repo", "sprites")
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked, ("claiming".to_string(), Some("cp".to_string())));
+        assert_eq!(
+            db.pool_spare_by_name("claiming").unwrap().unwrap().state,
+            "claiming"
+        );
+        assert_eq!(db.worktree_provider_sandbox("/wt/x").unwrap(), None);
+
+        db.publish_pool_spare_claim(&picked.0, "/wt/x").unwrap();
+        assert_eq!(
+            db.worktree_provider_sandbox("/wt/x").unwrap().as_deref(),
+            Some("claiming")
+        );
+    }
+
+    #[test]
+    fn publish_requires_a_claiming_row_and_binds_once() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("claiming", "/repo", "sprites")
+            .unwrap();
+        db.set_pool_spare_ready("claiming", Some("cp"), "lock")
+            .unwrap();
+        assert!(db.publish_pool_spare_claim("claiming", "/wt/x").is_err());
+
+        db.begin_pool_spare_claim("/repo", "sprites").unwrap();
+        db.publish_pool_spare_claim("claiming", "/wt/x").unwrap();
+        assert_eq!(
+            db.pool_spare_by_name("claiming").unwrap().unwrap().state,
+            "claimed"
+        );
+        assert!(db.publish_pool_spare_claim("claiming", "/wt/x").is_err());
+    }
+
+    #[test]
+    fn quarantine_requires_the_expected_state() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("claiming", "/repo", "sprites")
+            .unwrap();
+        db.set_pool_spare_ready("claiming", Some("cp"), "lock")
+            .unwrap();
+        db.begin_pool_spare_claim("/repo", "sprites").unwrap();
+
+        assert!(db.quarantine_pool_spare("claiming", "ready").is_err());
+        assert_eq!(
+            db.pool_spare_by_name("claiming").unwrap().unwrap().state,
+            "claiming"
+        );
+        db.quarantine_pool_spare("claiming", "claiming").unwrap();
+        assert_eq!(
+            db.pool_spare_by_name("claiming").unwrap().unwrap().state,
+            "quarantined"
+        );
+        assert!(
+            db.begin_pool_spare_claim("/repo", "sprites")
+                .unwrap()
+                .is_none()
         );
     }
 
