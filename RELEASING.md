@@ -55,9 +55,15 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    admitted tag, then publishes the archives and checksums to a **draft**
    GitHub Release. The broker also adds `thegn-<tag>-release.json`, recording
    the tag, tag object, commit, workflow SHA, run id, and sorted asset digests.
-   Each archive receives keyless GitHub build-provenance attestation. Before
-   validation or packaging, the package job verifies every downloaded archive
-   against the `release.yml` signer workflow and the signing run's `github.sha`,
+   Each archive receives keyless GitHub build-provenance attestation. The upload
+   broker publishes the SHA-256 digests of every archive, checksum, and release
+   record as a job output; the package job likewise publishes digests of the deb,
+   rpm, and four rendered metadata assets it builds. These outputs bind consumers
+   to bytes held by each producing job, independently of the mutable draft
+   release. Before provenance verification or validation, the package job compares
+   every downloaded archive and checksum against the upload broker's digests and
+   refuses any mismatch. It then verifies every downloaded archive against the
+   `release.yml` signer workflow and the signing run's `github.sha`,
    then requires each attestation's run invocation URL to identify that same
    workflow run. The upload job has already checked the tag against the admitted
    commit before creating the attestations. Downloaders can verify an archive
@@ -80,8 +86,9 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    windows-msvc is still out: that CI job has never executed. Add a target only
    once its CI job is green. Check the package job's
    summary for its exact outputs and target/checksum mapping. The
-   `verify-manifest` job is the completeness proof: it checks the exact asset
-   set, archive attestations, checksums, and upload record, then attaches the
+   `verify-manifest` job is the completeness proof: it requires every release
+   asset to match the digest output of its producer, then checks the exact asset
+   set, archive attestations, checksums, and upload record, and attaches the
    deterministic `thegn-<tag>-manifest.json`. Write the release notes (crib
    from the changelog) and publish the draft only after `verify-manifest` is
    green and that manifest is attached.
