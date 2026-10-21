@@ -12320,7 +12320,8 @@ async fn event_loop<T: Terminal>(
             // rebase-merge/" saw no banner, cleared the flow, destroyed the
             // edited TODO list, and printed "rebase finished" before the
             // rebase started.
-            if panel_ui.git.pending.is_none() {
+            // A failed merge probe also cannot establish that a flow ended.
+            if gitui::mirror_external_flows(&panel_ui.git, model.panel.merge_unknown) {
                 let banner = model
                     .panel
                     .merge

@@ -721,6 +721,9 @@ pub struct PanelData {
     pub ahead_behind: Option<(usize, usize)>,
     /// A merge/rebase/cherry-pick in progress (header zone).
     pub merge: Option<MergeBanner>,
+    /// The merge/rebase probe failed during this hydration, so `merge` is last-known (or absent)
+    /// and must not drive flow sync (THE-375).
+    pub merge_unknown: bool,
     /// Porcelain status joined with the diffstat (changes section).
     pub changes: Vec<ChangeRow>,
     /// Git status could not be read during this hydration.
