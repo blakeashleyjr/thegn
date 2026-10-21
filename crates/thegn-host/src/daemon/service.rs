@@ -1924,18 +1924,33 @@ impl ControlApi for DaemonService {
             let path_string = path.to_string_lossy().into_owned();
             self.confine_worktree(&path_string).await?;
             let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
+            let branch_path = path.clone();
+            let branch = tokio::task::spawn_blocking(move || {
+                let loc = thegn_core::remote::GitLoc::for_worktree(&branch_path);
+                loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                    .filter(|branch| !branch.is_empty())
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?;
             let cached = self
                 .with_db({
                     let key = key.clone();
                     move |db| {
                         use thegn_core::store::CacheStore;
-                        db.get_ci_cache(&key)
+                        db.get_ci_cache_entry(&key)
                     }
                 })
                 .await
                 .ok()
                 .flatten();
-            if let Some((json, fetched_at)) = cached
+            if let Some((json, cached_branch, fetched_at)) = cached
+                && crate::ci_refresh::daemon_ci_cache_usable(
+                    &cached_branch,
+                    branch.as_deref(),
+                    fetched_at,
+                    thegn_core::util::now(),
+                    self.config.ci.ttl_secs,
+                )
                 && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
             {
                 let before = cache.runs.len();
@@ -1955,15 +1970,13 @@ impl ControlApi for DaemonService {
 
             let cfg = self.config.ci.clone();
             let provider_path = path.clone();
+            let provider_branch = branch.clone();
             let fetched = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
                 let client = thegn_svc::ci::provider_for(&loc, &cfg)
                     .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
-                let branch = loc
-                    .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-                    .filter(|branch| !branch.is_empty());
                 client
-                    .runs(&loc, branch.as_deref(), requested)
+                    .runs(&loc, provider_branch.as_deref(), requested)
                     .map_err(|error| anyhow::anyhow!("CI provider: {error}"))
             })
             .await
@@ -1975,10 +1988,18 @@ impl ControlApi for DaemonService {
                 discarded_rows: fetched.discarded_rows,
             }) {
                 let key_for_write = key.clone();
+                let branch_for_write = branch.clone();
                 let _ = self
                     .with_db(move |db| {
                         use thegn_core::store::CacheStore;
-                        db.put_ci_cache(&key_for_write, "", &json)
+                        db.put_ci_cache(
+                            &key_for_write,
+                            branch_for_write
+                                .as_deref()
+                                .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+                                .unwrap_or(""),
+                            &json,
+                        )
                     })
                     .await;
             }

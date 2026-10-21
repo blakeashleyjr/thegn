@@ -25,6 +25,8 @@ pub trait CacheStore {
 
     /// CI run-history cache for a worktree: `(json, fetched_at)`.
     fn get_ci_cache(&self, worktree: &str) -> Result<Option<(String, i64)>>;
+    /// CI run-history cache with its branch identity: `(json, branch, fetched_at)`.
+    fn get_ci_cache_entry(&self, worktree: &str) -> Result<Option<(String, String, i64)>>;
     /// Replace the CI run-history cache for a worktree.
     fn put_ci_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()>;
 
