@@ -8,6 +8,7 @@
 //! resolution (`integrate::main_checkout`), which is host-side.
 
 use anyhow::{Context, Result};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::{Db, MergeQueueRow};
@@ -450,15 +451,70 @@ pub fn dequeue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Drop every queue row for `root`'s repo, un-filing each from its lifecycle
-/// folder. Returns the number removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClearKeptClaimed {
+    pub removed: usize,
+    pub kept: Vec<String>,
+}
+
+impl fmt::Display for ClearKeptClaimed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shown = self
+            .kept
+            .iter()
+            .take(3)
+            .map(|worktree| crate::merge_sweep::safe_display(worktree))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = self.kept.len().saturating_sub(3);
+        write!(
+            f,
+            "cleared {} queued branch(es); kept {} claimed by an active drain (clear again after it finishes): {}",
+            self.removed,
+            self.kept.len(),
+            shown
+        )?;
+        if more > 0 {
+            write!(f, " (+{more} more)")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ClearKeptClaimed {}
+
+fn clear_rows(
+    rows: &[MergeQueueRow],
+    mut dequeue: impl FnMut(&MergeQueueRow) -> Result<()>,
+) -> Result<usize> {
+    let mut removed = 0;
+    let mut kept = Vec::new();
+    for row in rows {
+        match dequeue(row) {
+            Ok(()) => removed += 1,
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.to_string() == thegn_core::store::MERGE_CLAIM_ACTIVE) =>
+            {
+                kept.push(row.worktree.clone());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !kept.is_empty() {
+        return Err(anyhow::Error::new(ClearKeptClaimed { removed, kept }));
+    }
+    Ok(removed)
+}
+
+/// Drop every unclaimed queue row for `root`'s repo and un-file it from its
+/// lifecycle folder. Claimed rows remain queued and are named in a typed error.
 pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
     let rows = rows_for_repo(db, root)?;
-    let n = rows.len();
-    for r in &rows {
-        dequeue_worktree(cfg, db, Path::new(&r.worktree))?;
-    }
-    Ok(n)
+    clear_rows(&rows, |row| {
+        dequeue_worktree(cfg, db, Path::new(&row.worktree))
+    })
 }
 
 #[cfg(test)]
@@ -1019,6 +1075,63 @@ mod tests {
             registered_remote_worktree(&db, "/local/alias").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn clear_rows_removes_unclaimed_and_reports_claimed() {
+        let rows = [
+            MergeQueueRow {
+                worktree: "/repo/first".into(),
+                ..land_row("queued", None, "local", "first")
+            },
+            MergeQueueRow {
+                worktree: "/repo/claimed".into(),
+                ..land_row("folding", None, "local", "claimed")
+            },
+            MergeQueueRow {
+                worktree: "/repo/third".into(),
+                ..land_row("ready", Some("oid"), "local", "third")
+            },
+        ];
+        let mut attempted = Vec::new();
+        let result = clear_rows(&rows, |row| {
+            attempted.push(row.worktree.clone());
+            if row.worktree == "/repo/claimed" {
+                anyhow::bail!(thegn_core::store::MERGE_CLAIM_ACTIVE);
+            }
+            Ok(())
+        });
+        assert_eq!(attempted, ["/repo/first", "/repo/claimed", "/repo/third"]);
+        let error = result.unwrap_err();
+        let kept = error.downcast_ref::<ClearKeptClaimed>().unwrap();
+        assert_eq!(kept.removed, 2);
+        assert_eq!(kept.kept, ["/repo/claimed"]);
+        assert!(error.to_string().contains("cleared 2 queued branch(es)"));
+        assert!(error.to_string().contains("/repo/claimed"));
+    }
+
+    #[test]
+    fn clear_rows_stops_on_a_database_error() {
+        let rows = [
+            land_row("queued", None, "local", "first"),
+            land_row("queued", None, "local", "second"),
+        ];
+        let mut attempted = Vec::new();
+        let result = clear_rows(&rows, |row| {
+            attempted.push(row.branch.clone());
+            anyhow::bail!("database failure")
+        });
+        assert_eq!(attempted, ["first"]);
+        assert_eq!(result.unwrap_err().to_string(), "database failure");
+    }
+
+    #[test]
+    fn clear_rows_reports_the_plain_count_when_nothing_is_claimed() {
+        let rows = [
+            land_row("queued", None, "local", "first"),
+            land_row("ready", Some("oid"), "local", "second"),
+        ];
+        assert_eq!(clear_rows(&rows, |_| Ok(())).unwrap(), 2);
     }
 }
 
