@@ -978,12 +978,12 @@ fn nix_copy_argv_builds_push_command() {
 }
 
 #[test]
-fn nix_copy_p2p_argv_targets_ssh_ng_without_sig_check() {
+fn nix_copy_p2p_argv_keeps_signature_checks() {
     let argv = nix_copy_p2p_argv("sprite", &["/nix/store/a-zsh".into()]);
     assert_eq!(&argv[0], "copy");
     assert_eq!(&argv[1], "--to");
     assert_eq!(&argv[2], "ssh-ng://sprite@sprite");
-    assert!(argv.contains(&"--no-check-sigs".to_string()));
+    assert!(!argv.contains(&"--no-check-sigs".to_string()));
     assert!(argv.contains(&"--substitute-on-destination".to_string()));
     assert!(argv.contains(&"/nix/store/a-zsh".to_string()));
 }

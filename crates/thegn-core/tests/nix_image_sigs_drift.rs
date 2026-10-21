@@ -35,3 +35,25 @@ fn shipped_nix_images_keep_signature_checks_enabled() {
         }
     }
 }
+
+#[test]
+fn host_home_closure_push_never_skips_signature_checks() {
+    let source = repository_file("../thegn-host/src/agent.rs");
+    for (line_number, line) in source.lines().enumerate() {
+        let normalized: String = line
+            .trim()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(
+            !normalized.contains("require-sigs=false"),
+            "../thegn-host/src/agent.rs:{} disables Nix signature checks",
+            line_number + 1
+        );
+        assert!(
+            !line.contains("--no-check-sigs"),
+            "../thegn-host/src/agent.rs:{} bypasses Nix signature checks",
+            line_number + 1
+        );
+    }
+}
