@@ -458,9 +458,10 @@ when those files exist; missing optional layers are quiet. The generated
 config reference contains every documented key with its example value; those
 values are illustrative and are not promised to equal code defaults.
 
-The home-manager module (`programs.thegn.*`) renders a `config.toml` with
-the same keys; its options are checked against the schema in CI, so it
-cannot offer a value the binary rejects.
+The home-manager module (`programs.thegn.*`) renders only options you set; unset
+options fall through to the binary's defaults. Its option names and value types
+are checked against the schema in CI, so it cannot offer a value the binary
+rejects.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
