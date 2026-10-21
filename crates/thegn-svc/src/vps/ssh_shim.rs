@@ -6,9 +6,10 @@
 //! - **Secrets stay off every command line** (host and remote `ps`): the remote
 //!   command is a bare `/bin/sh -s` and the actual script — env exports
 //!   included — streams over **stdin**.
-//! - **One connection for the whole pipeline**: `ControlMaster=auto` +
-//!   `ControlPersist` so the pipeline's dozens of small execs share a single
-//!   TCP/auth handshake.
+//! - **One connection for the whole pipeline when custody is valid**:
+//!   `ControlMaster=auto` + `ControlPersist` let the pipeline's dozens of small
+//!   execs share a single TCP/auth handshake. A refused socket directory or an
+//!   overlong socket path disables multiplexing for that connection.
 //! - **Timeout-cancellable**: `tokio::process` with `kill_on_drop`, so the
 //!   caller's `tokio::time::timeout` around `run_exec` actually kills a hung
 //!   ssh instead of leaking it (the provision watchdog contract).
@@ -20,6 +21,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use super::registry;
@@ -84,15 +86,19 @@ pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -
 }
 
 impl SshShim {
-    /// The shared ssh option set (control plane): batch, multiplexed, pinned
-    /// per-instance host key, quiet. Pure over `self` (unit-tested).
+    /// The shared ssh option set (control plane): batch, safe multiplexing,
+    /// pinned per-instance host key, quiet. Pure over `self` (unit-tested).
     pub fn base_argv(&self) -> Vec<String> {
+        let control = control_socket_path_for(&self.key_path);
+        self.base_argv_with(control.as_deref())
+    }
+
+    fn base_argv_with(&self, control: Option<&std::path::Path>) -> Vec<String> {
         let kh = registry::known_hosts_path(&self.name);
         // The identity is part of the multiplexing namespace. This is
         // load-bearing for managed-key rotation: a connection made with the
         // old key must never satisfy the replacement-key connectivity proof by
         // reusing the old key's already-authenticated ControlMaster.
-        let control = control_socket_path_for(&self.key_path);
         let mut v: Vec<String> = vec![
             "ssh".into(),
             // Hermetic: a thegn-managed remote pins its own identity, known_hosts,
@@ -115,13 +121,24 @@ impl SshShim {
                 ..Default::default()
             },
         ));
+        if let Some(control) = control {
+            v.extend([
+                "-o".into(),
+                "ControlMaster=auto".into(),
+                "-o".into(),
+                format!("ControlPath={}", control.display()),
+                "-o".into(),
+                "ControlPersist=90".into(),
+            ]);
+        } else {
+            v.extend([
+                "-o".into(),
+                "ControlMaster=no".into(),
+                "-o".into(),
+                "ControlPath=none".into(),
+            ]);
+        }
         v.extend([
-            "-o".into(),
-            "ControlMaster=auto".into(),
-            "-o".into(),
-            format!("ControlPath={}", control.display()),
-            "-o".into(),
-            "ControlPersist=90".into(),
             "-o".into(),
             "ConnectTimeout=10".into(),
             "-o".into(),
@@ -259,9 +276,9 @@ impl SshShim {
 /// dir) blows the limit and every ssh fails with "path too long for Unix domain
 /// socket". Prefer the short, private `$XDG_RUNTIME_DIR` (`/run/user/<uid>`),
 /// falling back to a per-user temp dir; the socket is ephemeral (ControlPersist),
-/// so location is irrelevant beyond length + privacy. The `tg-ssh` dir is created
-/// 0700 best-effort.
-pub fn control_socket_path() -> PathBuf {
+/// so location is irrelevant beyond length + privacy. The directory is checked
+/// for ownership, type and private permissions before OpenSSH can use it.
+pub fn control_socket_path() -> Option<PathBuf> {
     control_socket_path_for(PathBuf::from("managed").as_path())
 }
 
@@ -269,21 +286,65 @@ pub fn control_socket_path() -> PathBuf {
 /// from local-host/remote-host/port/user, but deliberately does not include the
 /// identity file; without this suffix, key rotation could appear verified by
 /// riding an old key's existing master connection.
-pub fn control_socket_path_for(key_path: &std::path::Path) -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(std::env::temp_dir)
-        .join("tg-ssh");
-    // best-effort: if the mkdir fails, ssh reports the bind error as before.
-    let _ = std::fs::create_dir_all(&base); // best-effort: if the mkdir fails, ssh reports the bind error as before (see above)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)); // best-effort: 0700 on the socket dir; failure leaves the pre-existing perms
+pub fn control_socket_path_for(key_path: &std::path::Path) -> Option<PathBuf> {
+    let dir = control_dir_candidate(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::temp_dir(),
+        std::env::var_os("HOME"),
+    );
+    control_socket_path_in(&dir, key_path)
+}
+
+fn control_identity(key_path: &std::path::Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"thegn/ssh-control-identity/v1\0");
+    hasher.update(key_path.as_os_str().as_encoded_bytes());
+    hasher.finalize()[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn control_dir_candidate(
+    runtime_dir: Option<std::ffi::OsString>,
+    temp_dir: PathBuf,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(runtime_dir) = runtime_dir {
+        let runtime_dir = PathBuf::from(runtime_dir);
+        if runtime_dir.is_absolute() {
+            return runtime_dir.join("tg-ssh");
+        }
     }
-    let identity = thegn_core::util::short_hash(&key_path.to_string_lossy(), 12);
-    base.join(format!("cm-{identity}-%C"))
+    let home_digest = home.filter(|home| !home.is_empty()).map(|home| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"thegn/ssh-control-home/v1\0");
+        hasher.update(home.as_encoded_bytes());
+        hasher.finalize()[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    match home_digest {
+        Some(digest) => temp_dir.join(format!("tg-ssh-{digest}")),
+        None => temp_dir.join("tg-ssh-nohome"),
+    }
+}
+
+pub fn control_socket_path_in(
+    dir: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Option<PathBuf> {
+    if let Err(error) = thegn_core::fsperm::ensure_private_dir(dir) {
+        tracing::warn!(target: "thegn::ssh", dir = %dir.display(), error = %error, "ControlMaster directory refused; connecting without multiplexing");
+        return None;
+    }
+    let template = dir.join(format!("cm-{}-%C", control_identity(key_path)));
+    if template.as_os_str().len() - 2 + 40 > 100 {
+        tracing::warn!(target: "thegn::ssh", dir = %dir.display(), "ControlMaster socket path too long; connecting without multiplexing");
+        return None;
+    }
+    Some(template)
 }
 
 /// Parse `find -printf '%y\t%s\t%f\n'` output into entries. Pure (unit-tested).
@@ -450,7 +511,9 @@ mod tests {
             user: "root".into(),
             key_path: "/state/ssh/sprite_ed25519".into(),
         };
-        let argv = shim.base_argv();
+        let temp = tempfile::tempdir().unwrap();
+        let control = control_socket_path_in(&temp.path().join("sock"), &shim.key_path).unwrap();
+        let argv = shim.base_argv_with(Some(&control));
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         assert!(argv.contains(&"ControlMaster=auto".to_string()));
@@ -479,14 +542,108 @@ mod tests {
 
     #[test]
     fn control_master_namespace_includes_the_identity_path() {
-        let old = control_socket_path_for(std::path::Path::new("/state/ssh/key"));
-        let replacement = control_socket_path_for(std::path::Path::new("/state/ssh/key.next-123"));
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("sock");
+        let old = control_socket_path_in(&dir, std::path::Path::new("/state/ssh/key")).unwrap();
+        let replacement =
+            control_socket_path_in(&dir, std::path::Path::new("/state/ssh/key.next-123")).unwrap();
         assert_ne!(old, replacement);
         assert_eq!(
             old,
-            control_socket_path_for(std::path::Path::new("/state/ssh/key"))
+            control_socket_path_in(&dir, std::path::Path::new("/state/ssh/key")).unwrap()
         );
         assert!(old.to_string_lossy().ends_with("-%C"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_identity_distinguishes_non_utf8_aliases() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let first = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/k/\xff"));
+        let second = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/k/\xfe"));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(control_identity(first), control_identity(second));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_dir_disables_multiplexing() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let shim = SshShim {
+            name: "tg-dev-x1".into(),
+            ip: "203.0.113.7".into(),
+            user: "root".into(),
+            key_path: "/state/ssh/key".into(),
+        };
+
+        assert!(
+            control_socket_path_in(&link, &shim.key_path).is_none(),
+            "a symlinked control directory must be refused"
+        );
+        let argv = shim.base_argv_with(None);
+        assert!(argv.contains(&"ControlMaster=no".to_string()));
+        assert!(argv.contains(&"ControlPath=none".to_string()));
+        assert!(!argv.contains(&"ControlMaster=auto".to_string()));
+        assert!(!argv.contains(&"ControlPersist=90".to_string()));
+        assert_eq!(argv.last().unwrap(), "root@203.0.113.7");
+    }
+
+    #[test]
+    fn control_dir_is_private_and_template_is_stable() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("sock");
+        let key = std::path::Path::new("/state/ssh/key");
+        let first = control_socket_path_in(&dir, key).unwrap();
+        let second = control_socket_path_in(&dir, key).unwrap();
+        let other = control_socket_path_in(&dir, std::path::Path::new("/state/ssh/other")).unwrap();
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert!(first.to_string_lossy().ends_with("-%C"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn overlong_socket_template_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("d".repeat(90));
+        assert!(control_socket_path_in(&dir, std::path::Path::new("/key")).is_none());
+    }
+
+    #[test]
+    fn control_dir_candidate_prefers_an_absolute_runtime_dir() {
+        let temp = PathBuf::from("/tmp/test-temp");
+        assert_eq!(
+            control_dir_candidate(Some("/run/user/1000".into()), temp.clone(), None),
+            PathBuf::from("/run/user/1000/tg-ssh")
+        );
+        let relative = control_dir_candidate(
+            Some("relative".into()),
+            temp.clone(),
+            Some("/home/a".into()),
+        );
+        let second_home = control_dir_candidate(None, temp.clone(), Some("/home/b".into()));
+        assert!(relative.starts_with(&temp));
+        assert_ne!(relative, second_home);
+        assert_eq!(
+            control_dir_candidate(None, temp.clone(), None),
+            temp.join("tg-ssh-nohome")
+        );
+        assert_eq!(
+            control_dir_candidate(None, temp.clone(), Some("".into())),
+            temp.join("tg-ssh-nohome")
+        );
     }
 
     #[test]
