@@ -94,7 +94,7 @@ fn recording_router(
             .push_backend(
                 (*account).into(),
                 Box::new(RecordingBackend {
-                    account: *account,
+                    account,
                     calls: calls.clone(),
                 }),
             )
