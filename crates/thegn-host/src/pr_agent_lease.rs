@@ -151,6 +151,18 @@ pub(crate) fn observe_own_head(
     thegn_core::pr_queue::own_agent_head(admitted, Some(&local), remote_head().as_deref(), descends)
 }
 
+pub(crate) fn own_head_record_warning(number: u64, result: anyhow::Result<bool>) -> Option<String> {
+    match result {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "PR #{number}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push"
+        )),
+        Err(error) => Some(format!(
+            "PR #{number}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push ({error})"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,25 +302,27 @@ mod tests {
             observe_own_head(&loc, &admitted, || Some("f".repeat(40))),
             None
         );
+        let remote = thegn_core::remote::GitLoc::from_db(
+            dir.path().to_str().unwrap(),
+            Some(r#"{"host":"example.invalid","port":22,"path":"/repo"}"#),
+        );
+        assert!(matches!(&remote, thegn_core::remote::GitLoc::Remote { .. }));
+        let called = Cell::new(false);
+        assert_eq!(
+            observe_own_head(&remote, &admitted, || {
+                called.set(true);
+                None
+            }),
+            None
+        );
+        assert!(!called.get());
+
         run(&["reset", "--hard", &admitted]);
         let called = Cell::new(false);
         assert_eq!(
             observe_own_head(&loc, &admitted, || {
                 called.set(true);
                 Some(pushed)
-            }),
-            None
-        );
-        assert!(!called.get());
-        let remote = thegn_core::remote::GitLoc::from_db(
-            dir.path().to_str().unwrap(),
-            Some(r#"{"host":"example.invalid","port":22,"path":"/repo"}"#),
-        );
-        let called = Cell::new(false);
-        assert_eq!(
-            observe_own_head(&remote, &admitted, || {
-                called.set(true);
-                None
             }),
             None
         );
@@ -340,7 +354,7 @@ mod tests {
     #[test]
     fn record_own_head_is_fenced_to_the_live_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_at(dir.path().join("lease.db")).unwrap();
+        let db = Db::open_at(&dir.path().join("lease.db")).unwrap();
         db.enqueue_bound_pr(
             "/repo",
             1,
@@ -373,5 +387,13 @@ mod tests {
             .clone();
         assert!(guard.finish(&db, None).unwrap());
         assert!(!db.record_pr_agent_head(&lease, "head-b", "head-c").unwrap());
+    }
+
+    #[test]
+    fn own_head_database_error_becomes_a_driver_warning() {
+        let warning =
+            own_head_record_warning(7, Err(anyhow::anyhow!("injected database failure"))).unwrap();
+        assert!(warning.contains("could not be recorded under its lease"));
+        assert!(warning.contains("injected database failure"));
     }
 }
