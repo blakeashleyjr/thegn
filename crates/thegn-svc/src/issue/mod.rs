@@ -3139,37 +3139,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fanout_matrix_dropping_the_router_future_cancels_in_flight_accounts() {
+    #[tokio::test(start_paused = true)]
+    async fn fanout_matrix_dropping_the_router_future_cancels_in_flight_accounts() {
         let modes = ["a", "b", "c", "d", "e", "f"]
             .into_iter()
             .map(|account| (account, MatrixMode::Hang))
             .collect();
         let (router, started, in_flight, _) = matrix_router(modes);
-        let runtime = matrix_runtime();
-        let result = runtime.block_on(tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(1),
             router.list_issues(&IssueFilter::default()),
-        ));
+        )
+        .await;
         assert!(result.is_err(), "outer timeout should cancel the fan-out");
         assert_eq!(started.load(Ordering::SeqCst), MAX_CONCURRENT_ACCOUNTS);
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn fanout_matrix_mixed_accounts_keep_healthy_rows_with_limit_zero() {
-        let runtime = matrix_runtime();
+    #[tokio::test(start_paused = true)]
+    async fn fanout_matrix_mixed_accounts_keep_healthy_rows_with_limit_zero() {
         let router = mixed_matrix_router();
-        let listed = runtime
-            .block_on(tokio::time::timeout(
-                Duration::from_secs(60),
-                router.list_issues(&IssueFilter {
-                    limit: 0,
-                    ..IssueFilter::default()
-                }),
-            ))
-            .unwrap()
-            .unwrap();
+        let listed = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.list_issues(&IssueFilter {
+                limit: 0,
+                ..IssueFilter::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(listed.len(), 301);
         assert_eq!(
             issue_numbers(&listed[..4]),
@@ -3198,11 +3197,8 @@ mod tests {
                 .all(|issue| issue.account.as_deref() != Some("hang"))
         );
 
-        let searched = runtime
-            .block_on(tokio::time::timeout(
-                Duration::from_secs(60),
-                router.search("q", 0),
-            ))
+        let searched = tokio::time::timeout(Duration::from_secs(60), router.search("q", 0))
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(searched.len(), 301);
@@ -3234,9 +3230,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fanout_matrix_exact_limit_across_mixed_accounts() {
-        let runtime = matrix_runtime();
+    #[tokio::test(start_paused = true)]
+    async fn fanout_matrix_exact_limit_across_mixed_accounts() {
         let router = mixed_matrix_router();
         let expected = [
             "big-0".to_string(),
@@ -3244,22 +3239,19 @@ mod tests {
             "small-1".to_string(),
             "big-2".to_string(),
         ];
-        let listed = runtime
-            .block_on(tokio::time::timeout(
-                Duration::from_secs(60),
-                router.list_issues(&IssueFilter {
-                    limit: 4,
-                    ..IssueFilter::default()
-                }),
-            ))
-            .unwrap()
-            .unwrap();
+        let listed = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.list_issues(&IssueFilter {
+                limit: 4,
+                ..IssueFilter::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(issue_numbers(&listed), expected);
-        let searched = runtime
-            .block_on(tokio::time::timeout(
-                Duration::from_secs(60),
-                router.search("q", 4),
-            ))
+        let searched = tokio::time::timeout(Duration::from_secs(60), router.search("q", 4))
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(issue_numbers(&searched), expected);
