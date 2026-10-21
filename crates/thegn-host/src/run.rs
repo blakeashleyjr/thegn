@@ -13529,9 +13529,11 @@ async fn event_loop<T: Terminal>(
         // Docked Media section feeds: up-next queue + decoded cover art.
         if let Some(delivery) = media_queue_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            panel_ui
-                .media
-                .set_queue(delivery.request, model.panel.media.as_ref(), delivery.queue);
+            panel_ui.media.set_queue_page(
+                delivery.request,
+                model.panel.media.as_ref(),
+                delivery.queue,
+            );
             dirty = true;
         }
         if let Some(delivery) = media_sources_slot.take() {

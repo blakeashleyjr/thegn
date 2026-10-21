@@ -17,7 +17,7 @@ pub const MAX_FIELD_BYTES: usize = 4096;
 /// Maximum UTF-8 bytes accepted for an opaque provider identifier.
 /// Identifiers are rejected above this limit and are never truncated.
 pub const MAX_ID_BYTES: usize = 1024;
-/// Maximum queue rows retained by the host media panel.
+/// Maximum queue rows retained at backend ingress and by the host media panel.
 pub const MAX_QUEUE_ITEMS: usize = 500;
 /// Maximum source rows retained by the host media panel.
 pub const MAX_SOURCES: usize = 64;
@@ -448,6 +448,27 @@ impl QueueItem {
     }
 }
 
+/// A bounded queue read with the total number of rows reported by the backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueuePage {
+    pub items: Vec<QueueItem>,
+    pub total: usize,
+}
+
+impl QueuePage {
+    /// Retain at most [`MAX_QUEUE_ITEMS`] rows while recording the input count.
+    pub fn from_rows(mut rows: Vec<QueueItem>) -> QueuePage {
+        let total = rows.len();
+        rows.truncate(MAX_QUEUE_ITEMS);
+        QueuePage { items: rows, total }
+    }
+
+    /// Number of backend rows omitted from this page.
+    pub fn hidden(&self) -> usize {
+        self.total.saturating_sub(self.items.len())
+    }
+}
+
 /// Format a duration as `m:ss` (or `h:mm:ss` past an hour).
 pub(crate) fn fmt_mmss(d: Duration) -> String {
     let secs = d.as_secs();
@@ -462,6 +483,28 @@ pub(crate) fn fmt_mmss(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_page_from_rows_caps_and_counts() {
+        let page = QueuePage::from_rows(vec![QueueItem::default(); MAX_QUEUE_ITEMS]);
+        assert_eq!(page.items.len(), MAX_QUEUE_ITEMS);
+        assert_eq!(page.total, MAX_QUEUE_ITEMS);
+        assert_eq!(page.hidden(), 0);
+
+        let page = QueuePage::from_rows(vec![QueueItem::default(); MAX_QUEUE_ITEMS + 1]);
+        assert_eq!(page.items.len(), MAX_QUEUE_ITEMS);
+        assert_eq!(page.total, MAX_QUEUE_ITEMS + 1);
+        assert_eq!(page.hidden(), 1);
+
+        let page = QueuePage::from_rows(vec![QueueItem::default(); MAX_QUEUE_ITEMS + 3]);
+        assert_eq!(page.items.len(), MAX_QUEUE_ITEMS);
+        assert_eq!(page.total, MAX_QUEUE_ITEMS + 3);
+        assert_eq!(page.hidden(), 3);
+
+        let page = QueuePage::from_rows(vec![QueueItem::default(); 2]);
+        assert_eq!(page.total, 2);
+        assert_eq!(page.hidden(), 0);
+    }
 
     #[test]
     fn playback_state_from_mpris() {
