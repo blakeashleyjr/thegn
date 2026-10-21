@@ -259,6 +259,43 @@ class ReleaseRendererTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "binary thegn is not executable"):
             release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
 
+    def test_rejects_high_compression_ratio_archive(self) -> None:
+        entries = [
+            (
+                name,
+                b"\0" * (1024 * 1024) if name == "README.md" else f"fixture:{name}\n".encode(),
+                0o755 if name == "thegn" else 0o644,
+            )
+            for name in self.manifest["archive"]["root_files"]
+        ]
+        self.write_tar_asset(entries)
+        with self.assertRaisesRegex(release.ReleaseError, "exceeds compression ratio"):
+            release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
+    def test_rejects_unsafe_member_modes(self) -> None:
+        for unsafe_name, unsafe_mode in (("thegn", 0o4755), ("README.md", 0o666)):
+            with self.subTest(member=unsafe_name, mode=oct(unsafe_mode)):
+                entries = [
+                    (
+                        name,
+                        f"fixture:{name}\n".encode(),
+                        unsafe_mode
+                        if name == unsafe_name
+                        else (0o755 if name == "thegn" else 0o644),
+                    )
+                    for name in self.manifest["archive"]["root_files"]
+                ]
+                self.write_tar_asset(entries)
+                with self.assertRaisesRegex(release.ReleaseError, "unsafe mode"):
+                    release.validate_assets(
+                        self.manifest, self.tag, self.assets, ["homebrew"]
+                    )
+
+    def test_accepts_ordinary_member_modes(self) -> None:
+        # Positive control: this fixture also validates on the base branch.
+        self.make_asset("aarch64-apple-darwin")
+        release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
     def test_inactive_windows_managers_fail_clearly(self) -> None:
         for manager in ("scoop", "winget"):
             with self.subTest(manager=manager), self.assertRaisesRegex(

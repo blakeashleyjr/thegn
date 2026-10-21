@@ -55,8 +55,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    admitted tag, then publishes the archives and checksums to a **draft**
    GitHub Release. The broker also adds `thegn-<tag>-release.json`, recording
    the tag, tag object, commit, workflow SHA, run id, and sorted asset digests.
-   Each archive receives keyless GitHub build-provenance attestation; verify a
-   downloaded archive with:
+   Each archive receives keyless GitHub build-provenance attestation. Before
+   validation or packaging, the package job verifies every downloaded archive
+   against the `release.yml` signer workflow and the signing run's `github.sha`,
+   then requires each attestation's run invocation URL to identify that same
+   workflow run. The upload job has already checked the tag against the admitted
+   commit before creating the attestations. Downloaders can verify an archive
+   with:
 
    ```sh
    gh attestation verify thegn-v<version>-<target>.tar.gz \
