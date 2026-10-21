@@ -24,12 +24,14 @@ use std::io::{self, Read};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thegn_core::remote::GitLoc;
 use thegn_svc::git::{CliGit, PlumbingOps};
 
 const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const BUNDLE_STDERR_TAIL: usize = 64 * 1024;
+const BUNDLE_READER_GRACE: Duration = Duration::from_millis(100);
 
 struct BundleLimits {
     max_bytes: u64,
@@ -309,6 +311,10 @@ fn needs_ingest(target: &GitLoc, branch: &GitLoc) -> bool {
     host_id(target) != host_id(branch)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "off-loop: merge-queue drain (spawn_blocking) / CLI; the killed producer must be reaped"
+)]
 fn stream_bundle(
     mut producer: Command,
     tmp: &mut BundleTemp,
@@ -350,6 +356,7 @@ fn stream_bundle(
         }
     };
     let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+    let (stdout_done_tx, stdout_done_rx) = mpsc::sync_channel(1);
     let stdout_thread = thegn_core::thread_name::spawn_named("thegn-bndl-out", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let mut reader = stdout;
@@ -359,35 +366,46 @@ fn stream_bundle(
                 Ok(0) => break,
                 Ok(count) => {
                     chunk.truncate(count);
-                    if tx.send(Ok(chunk)).is_err() {
+                    if let Err(unsent) = tx.send(Ok(chunk)) {
+                        tracing::debug!(target: "thegn::merge", "bundle stdout receiver closed: {unsent:?}");
                         break;
                     }
                 }
                 Err(error) => {
-                    if tx.send(Err(error)).is_err() {
-                        break;
+                    if let Err(unsent) = tx.send(Err(error)) {
+                        tracing::debug!(target: "thegn::merge", "bundle stdout receiver closed after read error: {unsent:?}");
                     }
                     break;
                 }
             }
         }
+        if let Err(error) = stdout_done_tx.send(()) {
+            tracing::debug!(target: "thegn::merge", "bundle stdout completion receiver closed: {error}");
+        }
     });
     let stderr_limit = limits.stderr_tail;
+    let stderr_tail = Arc::new(Mutex::new((
+        Vec::with_capacity(stderr_limit.min(64 * 1024)),
+        false,
+    )));
+    let stderr_tail_reader = Arc::clone(&stderr_tail);
+    let (stderr_done_tx, stderr_done_rx) = mpsc::sync_channel(1);
     let stderr_thread = thegn_core::thread_name::spawn_named("thegn-bndl-err", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let mut reader = stderr;
-        let mut tail = Vec::with_capacity(stderr_limit.min(64 * 1024));
-        let mut truncated = false;
         let mut chunk = [0_u8; 8192];
-        loop {
+        let read_result = loop {
             match reader.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) => break Ok(()),
                 Ok(count) => {
                     let incoming = &chunk[..count];
+                    let (tail, truncated) = &mut *stderr_tail_reader
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if stderr_limit == 0 {
-                        truncated |= !incoming.is_empty();
+                        *truncated |= !incoming.is_empty();
                     } else if incoming.len() >= stderr_limit {
-                        truncated |= !tail.is_empty() || incoming.len() > stderr_limit;
+                        *truncated |= !tail.is_empty() || incoming.len() > stderr_limit;
                         tail.clear();
                         tail.extend_from_slice(&incoming[incoming.len() - stderr_limit..]);
                     } else {
@@ -397,156 +415,195 @@ fn stream_bundle(
                             .saturating_sub(stderr_limit);
                         if excess > 0 {
                             tail.drain(..excess);
-                            truncated = true;
+                            *truncated = true;
                         }
                         tail.extend_from_slice(incoming);
                     }
                 }
-                Err(error) => {
-                    tracing::debug!(target: "thegn::merge", %error, "failed reading bundle producer stderr");
-                    break;
-                }
+                Err(error) => break Err(error),
             }
+        };
+        if let Err(error) = stderr_done_tx.send(read_result) {
+            tracing::debug!(target: "thegn::merge", "bundle stderr completion receiver closed: {error}");
         }
-        let mut text = String::new();
-        if truncated {
-            text.push_str("[... stderr truncated ...]");
-        }
-        text.push_str(&String::from_utf8_lossy(&tail));
-        let max_text_bytes = stderr_limit.saturating_add(64);
-        if text.len() > max_text_bytes {
-            let mut end = max_text_bytes;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-        }
-        text
     });
 
     let mut bytes = 0_u64;
-    let mut kill_error = None;
+    let mut terminal_error = None;
+    let mut status = None;
     loop {
         let remaining = limits.deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            kill_bundle_producer(&mut child);
-            kill_error = Some(IngestError::Timeout {
+            terminal_error = Some(IngestError::Timeout {
                 after: limits.deadline,
             });
+            kill_bundle_producer(&mut child);
             break;
         }
-        match rx.recv_timeout(remaining) {
+        let poll_wait = remaining.min(Duration::from_millis(10));
+        match rx.recv_timeout(poll_wait) {
             Ok(Ok(chunk)) => {
                 bytes = bytes.saturating_add(chunk.len() as u64);
                 if bytes > limits.max_bytes {
-                    kill_bundle_producer(&mut child);
-                    kill_error = Some(IngestError::SizeLimit {
+                    terminal_error = Some(IngestError::SizeLimit {
                         cap: limits.max_bytes,
                     });
+                    kill_bundle_producer(&mut child);
                     break;
                 }
                 if let Err(error) = tmp.write(&chunk) {
+                    terminal_error = Some(IngestError::LocalStorage(error));
                     kill_bundle_producer(&mut child);
-                    kill_error = Some(IngestError::LocalStorage(error));
                     break;
                 }
             }
             Ok(Err(error)) => {
-                kill_bundle_producer(&mut child);
-                kill_error = Some(IngestError::Remote {
+                terminal_error = Some(IngestError::Remote {
                     code: None,
                     stderr_tail: error.to_string(),
                 });
+                kill_bundle_producer(&mut child);
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
-                kill_bundle_producer(&mut child);
-                kill_error = Some(IngestError::Timeout {
-                    after: limits.deadline,
-                });
-                break;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    if let Some(error) = kill_error {
-        drop(rx);
-        if let Err(wait_error) = child.wait() {
-            tracing::debug!(target: "thegn::merge", %wait_error, "failed waiting for killed bundle producer");
-        }
-        if let Err(error) = stdout_thread.join() {
-            tracing::debug!(target: "thegn::merge", "bundle stdout reader panicked: {error:?}");
-        }
-        let stderr_tail = match stderr_thread.join() {
-            Ok(tail) => tail,
-            Err(error) => {
-                tracing::debug!(target: "thegn::merge", "bundle stderr reader panicked: {error:?}");
-                String::new()
-            }
-        };
-        return Err(match error {
-            IngestError::Remote { code: None, .. } if !stderr_tail.is_empty() => {
-                IngestError::Remote {
-                    code: None,
-                    stderr_tail,
+                match crate::platform::gate_child_exited(&mut child) {
+                    Ok(true) => {
+                        kill_bundle_producer(&mut child);
+                        match child.wait() {
+                            Ok(exited) => status = Some(exited),
+                            Err(error) => {
+                                terminal_error = Some(IngestError::Remote {
+                                    code: None,
+                                    stderr_tail: error.to_string(),
+                                });
+                            }
+                        }
+                        break;
+                    }
+                    Ok(false) => continue,
+                    Err(error) => {
+                        terminal_error = Some(IngestError::Remote {
+                            code: None,
+                            stderr_tail: error.to_string(),
+                        });
+                        kill_bundle_producer(&mut child);
+                        break;
+                    }
                 }
             }
+            Err(RecvTimeoutError::Disconnected) => {
+                match crate::platform::gate_child_exited(&mut child) {
+                    Ok(true) => {
+                        kill_bundle_producer(&mut child);
+                        match child.wait() {
+                            Ok(exited) => status = Some(exited),
+                            Err(error) => {
+                                terminal_error = Some(IngestError::Remote {
+                                    code: None,
+                                    stderr_tail: error.to_string(),
+                                });
+                            }
+                        }
+                        break;
+                    }
+                    Ok(false) => std::thread::sleep(thegn_proc::next_backoff(
+                        Duration::from_millis(10),
+                        remaining,
+                    )),
+                    Err(error) => {
+                        terminal_error = Some(IngestError::Remote {
+                            code: None,
+                            stderr_tail: error.to_string(),
+                        });
+                        kill_bundle_producer(&mut child);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    drop(rx);
+    if status.is_none()
+        && let Err(error) = child.wait()
+    {
+        tracing::debug!(target: "thegn::merge", %error, "failed waiting for bundle producer after termination");
+    }
+    let reader_wait = limits
+        .deadline
+        .saturating_sub(started.elapsed())
+        .min(BUNDLE_READER_GRACE);
+    let stdout_finished = stdout_done_rx.recv_timeout(reader_wait).is_ok();
+    let stderr_wait = limits
+        .deadline
+        .saturating_sub(started.elapsed())
+        .min(BUNDLE_READER_GRACE);
+    let stderr_result = stderr_done_rx.recv_timeout(stderr_wait).ok();
+    drop(stdout_thread);
+    drop(stderr_thread);
+
+    let (tail, truncated) = stderr_tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut stderr_text = String::new();
+    if truncated {
+        stderr_text.push_str("[... stderr truncated ...]");
+    }
+    stderr_text.push_str(&String::from_utf8_lossy(&tail));
+    if !stdout_finished {
+        tracing::debug!(target: "thegn::merge", "bundle stdout reader did not finish during grace period");
+    }
+    let stderr_reader_missing = stderr_result.is_none();
+    match stderr_result {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            if !stderr_text.is_empty() {
+                stderr_text.push_str("; ");
+            }
+            stderr_text.push_str(&format!("stderr read failed: {error}"));
+        }
+        None => {
+            if !stderr_text.is_empty() {
+                stderr_text.push_str("; ");
+            }
+            stderr_text.push_str("[... stderr reader did not finish ...]");
+        }
+    }
+    let max_text_bytes = limits.stderr_tail.saturating_add(96);
+    if stderr_text.len() > max_text_bytes {
+        let mut end = max_text_bytes;
+        while !stderr_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        stderr_text.truncate(end);
+    }
+
+    if let Some(error) = terminal_error {
+        return Err(match error {
+            IngestError::Remote {
+                code: None,
+                stderr_tail: read_error,
+            } if !stderr_text.is_empty() => IngestError::Remote {
+                code: None,
+                stderr_tail: format!("{read_error}; stderr: {stderr_text}"),
+            },
+            IngestError::Remote {
+                code: None,
+                stderr_tail: read_error,
+            } if stderr_reader_missing => IngestError::Remote {
+                code: None,
+                stderr_tail: format!("{read_error}; [... stderr reader did not finish ...]"),
+            },
             other => other,
         });
     }
-    let status = loop {
-        let remaining = limits.deadline.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            kill_bundle_producer(&mut child);
-            if let Err(error) = child.wait() {
-                tracing::debug!(target: "thegn::merge", %error, "failed waiting for timed out bundle producer");
-            }
-            let _stdout = stdout_thread.join();
-            let _stderr = stderr_thread.join();
-            return Err(IngestError::Timeout {
-                after: limits.deadline,
-            });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(thegn_proc::next_backoff(
-                Duration::from_millis(10),
-                remaining,
-            )),
-            Err(error) => {
-                kill_bundle_producer(&mut child);
-                if let Err(wait_error) = child.wait() {
-                    tracing::debug!(target: "thegn::merge", %wait_error, "failed waiting for bundle producer after status error");
-                }
-                let _stdout = stdout_thread.join();
-                let _stderr = stderr_thread.join();
-                return Err(IngestError::Remote {
-                    code: None,
-                    stderr_tail: error.to_string(),
-                });
-            }
-        }
-    };
-    let stdout_result = stdout_thread.join();
-    let stderr_tail = match stderr_thread.join() {
-        Ok(tail) => tail,
-        Err(error) => {
-            return Err(IngestError::Remote {
-                code: None,
-                stderr_tail: format!("stderr reader panicked: {error:?}"),
-            });
-        }
-    };
-    if let Err(error) = stdout_result {
-        return Err(IngestError::Remote {
-            code: None,
-            stderr_tail: format!("stdout reader panicked: {error:?}"),
-        });
-    }
+    let status =
+        status.unwrap_or_else(|| unreachable!("producer status or terminal error is required"));
     if !status.success() {
         return Err(IngestError::Remote {
             code: status.code(),
-            stderr_tail,
+            stderr_tail: stderr_text,
         });
     }
     if bytes == 0 {
@@ -557,6 +614,11 @@ fn stream_bundle(
     Ok(bytes)
 }
 
+/// Materialize the bundle on the target host and fetch its branch ref into the
+/// supplied generation-scoped ref. Under the co-location model the drain runs on the
+/// target host, so `target` is `Local`; a remote target means the caller should
+/// have dispatched to that host's drain daemon (see Milestone B), so we fail
+/// loudly rather than trying to push a bundle the wrong way.
 fn fetch_from_custody(
     target: &GitLoc,
     branch: &str,
@@ -816,7 +878,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(IngestError::SizeLimit { cap: 1 << 20 })
+            Err(IngestError::SizeLimit { cap }) if cap == 1 << 20
         ));
         assert!(started.elapsed() < Duration::from_secs(10));
         tmp.finish().unwrap();
@@ -838,6 +900,25 @@ mod tests {
         );
         assert!(matches!(result, Err(IngestError::Timeout { .. })));
         assert!(started.elapsed() < Duration::from_secs(10));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_quiesces_background_pipe_inheritor() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let started = Instant::now();
+        let result = stream_bundle(
+            shell("sleep 30 >&2 & printf x"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(5), 4096),
+        );
+        assert!(matches!(result, Ok(1)));
+        assert!(started.elapsed() < Duration::from_secs(3));
         tmp.finish().unwrap();
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }

@@ -18,10 +18,6 @@ use std::path::{Path, PathBuf};
 
 /// Start the bundle producer in a process group that can be terminated as one
 /// unit when streaming exceeds its budget.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the producer is supervised and reaped by stream_bundle"
-)]
 pub(crate) fn spawn_bundle_producer(
     cmd: &mut std::process::Command,
 ) -> io::Result<std::process::Child> {
