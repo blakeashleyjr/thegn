@@ -141,6 +141,23 @@ pub(crate) fn provider_for_named(
     provider_for_named_with_key(pc, name, None)
 }
 
+pub(crate) fn provider_for_named_owned(
+    pc: &thegn_core::config::EnvProviderConfig,
+    name: &str,
+    owner: Option<&str>,
+) -> Option<Provider> {
+    let provider = provider_for_named(pc, name)?;
+    Some(match (provider, owner) {
+        (Provider::Vps(provider), Some(owner)) => {
+            Provider::Vps(provider.with_owner(owner.to_owned()))
+        }
+        (Provider::Fly(provider), Some(owner)) => {
+            Provider::Fly(provider.with_owner(owner.to_owned()))
+        }
+        (provider, _) => provider,
+    })
+}
+
 /// Build a provider using an explicit managed keypair. Rotation uses this only
 /// after authorizing the replacement public key, to prove an actual connection
 /// with the replacement private key before retiring the old one.
@@ -410,6 +427,41 @@ pub(crate) fn provider_sandbox_name(
     }
 }
 
+pub(crate) fn provider_sandbox_owner(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+    env_name: &str,
+) -> Option<String> {
+    use std::path::{Path, PathBuf};
+    use thegn_core::store::{PoolStore, WorkspaceStore};
+    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    let thegn_core::placement::Placement::Provider(_) = env.placement else {
+        return None;
+    };
+    let bound = thegn_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
+    derived_owner(&env.provider.id, bound.is_some(), worktree)
+}
+
+fn derived_owner(configured_id: &str, claimed: bool, worktree: &str) -> Option<String> {
+    if claimed || (!configured_id.trim().is_empty() && !configured_id.contains('{')) {
+        None
+    } else {
+        Some(thegn_svc::vps::registry::worktree_owner(
+            worktree.as_bytes(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +487,13 @@ mod tests {
             ..Default::default()
         };
         assert!(provider_for_named(&pc, "x").is_none());
+    }
+
+    #[test]
+    fn derived_owner_exempts_literals_and_claimed_spares() {
+        assert!(derived_owner("", false, "/w/a").is_some());
+        assert!(derived_owner("{repo}-{worktree}", false, "/w/a").is_some());
+        assert!(derived_owner("shared-box", false, "/w/a").is_none());
+        assert!(derived_owner("", true, "/w/a").is_none());
     }
 }
