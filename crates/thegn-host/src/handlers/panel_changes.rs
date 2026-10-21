@@ -265,38 +265,81 @@ pub(crate) fn toggle_change_selection(
         return;
     }
     panel_ui.chg_sel = Some(i);
-    if let Some(row) = model
-        .panel
-        .changes
-        .get(i)
-        .filter(|row| row.submodule.is_some())
-    {
-        spawn_submodule_preview(
-            row,
-            session,
-            submodule_inflight,
-            submodule_tx,
-            waker,
-            generation,
-        );
-        return;
+    start_selected_preview(
+        panel_ui,
+        model,
+        session,
+        hunk_inflight,
+        hunk_tx,
+        submodule_inflight,
+        submodule_tx,
+        waker,
+        generation,
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PreviewTarget {
+    Hunk(String),
+    Submodule(usize),
+}
+
+fn selected_preview_target(
+    panel_ui: &crate::panel::PanelUi,
+    model: &FrameModel,
+) -> Option<PreviewTarget> {
+    let index = panel_ui.chg_sel?;
+    let row = model.panel.changes.get(index)?;
+    if let Some(submodule) = row.submodule.as_ref() {
+        return submodule
+            .summary
+            .is_none()
+            .then_some(PreviewTarget::Submodule(index));
     }
-    // Untracked rows have no diff: the preview renders a static note.
-    if let Some(row) = model
-        .panel
-        .changes
-        .get(i)
-        .filter(|c| c.stage != crate::panel::Stage::Untracked)
-    {
-        crate::run::spawn_hunk_fetch(
-            &row.path,
+    if row.stage == crate::panel::Stage::Untracked || panel_ui.hunks_banked(&row.path) {
+        return None;
+    }
+    Some(PreviewTarget::Hunk(row.path.clone()))
+}
+
+/// Start a preview for the current selection if it is eligible and has a free
+/// per-kind slot. Completions call this again so only the latest selection is
+/// retried after capacity becomes available.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_selected_preview(
+    panel_ui: &crate::panel::PanelUi,
+    model: &FrameModel,
+    session: &Session,
+    hunk_inflight: &mut PreviewOwners,
+    hunk_tx: &tokio::sync::mpsc::UnboundedSender<crate::run::HunkMsg>,
+    submodule_inflight: &mut PreviewOwners,
+    submodule_tx: &tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
+    waker: &termwiz::terminal::TerminalWaker,
+    generation: u64,
+) {
+    match selected_preview_target(panel_ui, model) {
+        Some(PreviewTarget::Hunk(path)) => crate::run::spawn_hunk_fetch(
+            &path,
             session,
             panel_ui,
             hunk_inflight,
             hunk_tx,
             waker,
             generation,
-        );
+        ),
+        Some(PreviewTarget::Submodule(index)) => {
+            if let Some(row) = model.panel.changes.get(index) {
+                spawn_submodule_preview(
+                    row,
+                    session,
+                    submodule_inflight,
+                    submodule_tx,
+                    waker,
+                    generation,
+                );
+            }
+        }
+        None => {}
     }
 }
 
@@ -306,22 +349,28 @@ pub(crate) fn toggle_change_selection(
 pub(crate) struct PreviewOwners {
     next: u64,
     owners: std::collections::HashMap<String, u64>,
+    running: usize,
 }
+
+/// Maximum blocking Git preview jobs allowed per kind at once.
+pub(crate) const MAX_ACTIVE_PREVIEW_JOBS: usize = 4;
 
 impl PreviewOwners {
     pub(crate) fn begin(&mut self, key: &str) -> Option<u64> {
         if self.owners.contains_key(key) {
             return None;
         }
-        self.next = self
-            .next
-            .checked_add(1)
-            .expect("preview owner token exhausted");
+        if self.running >= MAX_ACTIVE_PREVIEW_JOBS {
+            return None;
+        }
+        self.next = self.next.checked_add(1)?;
         self.owners.insert(key.to_owned(), self.next);
+        self.running = self.running.saturating_add(1);
         Some(self.next)
     }
 
     pub(crate) fn finish(&mut self, key: &str, token: u64) -> bool {
+        self.running = self.running.saturating_sub(1);
         if self.owners.get(key) != Some(&token) {
             return false;
         }
@@ -409,7 +458,90 @@ fn submodule_loc(
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameModel, PreviewOwners, follow_change_cursor_target};
+    use super::{
+        FrameModel, MAX_ACTIVE_PREVIEW_JOBS, PreviewOwners, PreviewTarget,
+        follow_change_cursor_target, selected_preview_target,
+    };
+
+    #[test]
+    fn begin_refuses_past_the_active_job_cap() {
+        let mut owners = PreviewOwners::default();
+        let tokens: Vec<_> = (0..MAX_ACTIVE_PREVIEW_JOBS)
+            .map(|index| owners.begin(&format!("path-{index}")).unwrap())
+            .collect();
+
+        assert_eq!(owners.begin("fifth-path"), None);
+        assert!(owners.finish("path-0", tokens[0]));
+        assert!(owners.begin("fifth-path").is_some());
+    }
+
+    #[test]
+    fn cleared_jobs_hold_their_slot_until_they_report() {
+        let mut owners = PreviewOwners::default();
+        let tokens: Vec<_> = (0..MAX_ACTIVE_PREVIEW_JOBS)
+            .map(|index| owners.begin(&format!("path-{index}")).unwrap())
+            .collect();
+
+        owners.clear();
+        assert_eq!(owners.begin("new-path"), None);
+        assert!(!owners.finish("path-0", tokens[0]));
+        assert!(owners.begin("new-path").is_some());
+    }
+
+    #[test]
+    fn selected_preview_target_picks_the_selected_unbanked_row() {
+        let mut model = FrameModel::default();
+        let mut ui = crate::panel::PanelUi::default();
+        assert_eq!(selected_preview_target(&ui, &model), None);
+        ui.chg_sel = Some(0);
+        assert_eq!(selected_preview_target(&ui, &model), None);
+
+        model.panel.changes.push(crate::panel::ChangeRow {
+            path: "a.rs".into(),
+            ..Default::default()
+        });
+        ui.chg_sel = Some(0);
+        assert_eq!(
+            selected_preview_target(&ui, &model),
+            Some(PreviewTarget::Hunk("a.rs".into()))
+        );
+        ui.bank_hunks("a.rs".into(), Ok(Vec::new()));
+        assert_eq!(selected_preview_target(&ui, &model), None);
+
+        model.panel.changes[0].stage = crate::panel::Stage::Untracked;
+        ui.clear_hunks();
+        assert_eq!(selected_preview_target(&ui, &model), None);
+
+        model.panel.changes[0] = crate::panel::ChangeRow {
+            path: "submodule".into(),
+            submodule: Some(crate::panel::SubmoduleChange {
+                diff: thegn_core::submodule::SubmoduleDiff {
+                    path: "submodule".into(),
+                    old_sha: "old".into(),
+                    new_sha: "new".into(),
+                    kind: thegn_core::submodule::SubmoduleDiffKind::Changed,
+                },
+                state: None,
+                summary: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            selected_preview_target(&ui, &model),
+            Some(PreviewTarget::Submodule(0))
+        );
+        model.panel.changes[0]
+            .submodule
+            .as_mut()
+            .expect("submodule fixture")
+            .summary = Some(thegn_core::submodule::SubmoduleSummary::bounded(
+            thegn_core::submodule::SubmoduleDirection::Unknown,
+            Vec::new(),
+            8,
+            true,
+        ));
+        assert_eq!(selected_preview_target(&ui, &model), None);
+    }
 
     #[test]
     fn duplicate_path_owner_is_refused_until_completed() {
