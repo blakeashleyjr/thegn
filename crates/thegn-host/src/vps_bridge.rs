@@ -64,6 +64,8 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
         user: thegn_svc::vps::VPS_USER.into(),
         key_path: key,
     };
+    shim.prepare_known_hosts()
+        .context("vps-ssh: prepare the per-instance known_hosts pin")?;
     let mut argv = shim.base_argv();
     // Interactive pane (we own a PTY) ⇒ force allocation; captured control
     // reads stay non-tty.
