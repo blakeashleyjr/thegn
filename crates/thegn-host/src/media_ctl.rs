@@ -784,7 +784,7 @@ pub(crate) fn spawn_media_queue(
     let handle = tokio::spawn(async move {
         let queue = within_media_budget(async {
             match crate::media_secret::client_for(&cfg).await {
-                Ok(client) => match client.queue().await {
+                Ok(client) => match client.queue_page().await {
                     Ok(queue) => Ok(queue),
                     Err(e) => {
                         tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");

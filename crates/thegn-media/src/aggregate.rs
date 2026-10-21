@@ -104,6 +104,9 @@ impl MediaBackend for Aggregate {
     fn queue(&self) -> BoxFuture<'_, Result<Vec<crate::model::QueueItem>, MediaError>> {
         Box::pin(async move { self.active_child()?.queue().await })
     }
+    fn queue_page(&self) -> BoxFuture<'_, Result<crate::model::QueuePage, MediaError>> {
+        Box::pin(async move { self.active_child()?.queue_page().await })
+    }
     fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move { self.active_child()?.play_queue_item(id).await })
     }
@@ -717,10 +720,38 @@ mod tests {
         assert_eq!(snapshot.caps, advertised);
     }
 
+    #[tokio::test]
+    async fn queue_page_is_forwarded_to_the_active_child() {
+        let page = crate::model::QueuePage {
+            items: vec![crate::model::QueueItem {
+                id: "row".into(),
+                ..Default::default()
+            }],
+            total: 900,
+        };
+        let aggregate = Aggregate::new(
+            vec![snapshot_backend_with_queue_page(
+                Ok(Some(MediaState {
+                    player: "active".into(),
+                    state: PLAYING,
+                    ..Default::default()
+                })),
+                NO_CAPS,
+                page.clone(),
+            )],
+            Vec::new(),
+        );
+
+        aggregate.snapshot().await.unwrap();
+        assert_eq!(aggregate.queue_page().await.unwrap().total, 900);
+        assert_eq!(aggregate.queue_page().await.unwrap().items, page.items);
+    }
+
     struct SnapshotBackend {
         result: Result<Option<MediaState>, MediaError>,
         caps: MediaCaps,
         snapshot_caps: Option<MediaCaps>,
+        queue_page: Option<crate::model::QueuePage>,
     }
 
     fn snapshot_backend(
@@ -732,6 +763,20 @@ mod tests {
             result,
             caps,
             snapshot_caps,
+            queue_page: None,
+        })
+    }
+
+    fn snapshot_backend_with_queue_page(
+        result: Result<Option<MediaState>, MediaError>,
+        caps: MediaCaps,
+        queue_page: crate::model::QueuePage,
+    ) -> MediaClient {
+        Box::new(SnapshotBackend {
+            result,
+            caps,
+            snapshot_caps: None,
+            queue_page: Some(queue_page),
         })
     }
 
@@ -780,6 +825,15 @@ mod tests {
         }
         fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn queue_page(&self) -> BoxFuture<'_, Result<crate::model::QueuePage, MediaError>> {
+            Box::pin(async move {
+                match self.queue_page.clone() {
+                    Some(page) => Ok(page),
+                    None => Ok(crate::model::QueuePage::default()),
+                }
+            })
         }
     }
 

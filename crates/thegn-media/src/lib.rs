@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
-use model::{LoopMode, MediaState, Playlist, QueueItem};
+use model::{LoopMode, MediaState, Playlist, QueueItem, QueuePage};
 
 pub use mpv::MpvIpc;
 #[cfg(target_os = "linux")]
@@ -215,6 +215,11 @@ pub trait MediaBackend: Send + Sync {
     /// [`MediaCaps::queue`].
     fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+    /// A bounded queue page. Backends that can avoid decoding hidden rows
+    /// should override this method; `total` counts every row they report.
+    fn queue_page(&self) -> BoxFuture<'_, Result<QueuePage, MediaError>> {
+        Box::pin(async move { self.queue().await.map(QueuePage::from_rows) })
     }
     /// Jump to a queue entry by its opaque [`QueueItem::id`]. Default: unsupported.
     fn play_queue_item<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
