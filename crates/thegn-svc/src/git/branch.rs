@@ -2,9 +2,11 @@
 //! plus the nuke-working-tree reset.
 
 use super::{GitBackend, run_w, run_w_locked, run_w_network};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use std::sync::atomic::AtomicBool;
 use thegn_core::git_operand as op;
-use thegn_core::remote::GitLoc;
+use thegn_core::git_run::{GitOutcome, GitPolicy};
+use thegn_core::remote::{GITLOC_READ_DEADLINE, GitLoc};
 
 /// Push force level. Plain `--force` only after `--force-with-lease` was
 /// rejected and the user confirmed a second time.
@@ -139,9 +141,13 @@ fn nuke_working_tree_within(loc: &GitLoc, wait: std::time::Duration) -> Result<(
     run_w(loc, &[], &["clean", "-fdx"])?;
     // Dirty submodules survive a top-level reset/clean; recurse when any
     // are configured (.gitmodules at the worktree root).
-    let has_submodules = loc
-        .git_out(&["ls-files", "--error-unmatch", ".gitmodules"])
-        .is_some();
+    let outcome = loc.git_run(
+        &["ls-files", "--error-unmatch", ".gitmodules"],
+        &GitPolicy::read(GITLOC_READ_DEADLINE),
+        &AtomicBool::new(false),
+    );
+    let has_submodules = gitmodules_tracked(outcome)
+        .map_err(|error| anyhow!("working tree reset, but submodules were not reset: {error}"))?;
     if has_submodules {
         run_w(
             loc,
@@ -155,6 +161,14 @@ fn nuke_working_tree_within(loc: &GitLoc, wait: std::time::Duration) -> Result<(
         )?;
     }
     Ok(())
+}
+
+fn gitmodules_tracked(outcome: GitOutcome) -> Result<bool> {
+    match outcome {
+        GitOutcome::Ok(_) => Ok(true),
+        GitOutcome::EmptyOk | GitOutcome::Exit { code: Some(1), .. } => Ok(false),
+        outcome => Err(anyhow!("could not check for submodules: {outcome}")),
+    }
 }
 
 fn after_ref_mutation(loc: &GitLoc) {
@@ -217,6 +231,42 @@ mod tests {
     use super::{BranchOps, ForceMode};
     use std::path::{Path, PathBuf};
     use thegn_core::remote::GitLoc;
+
+    #[test]
+    fn gitmodules_probe_classifies_tracked_absent_and_failed() {
+        use thegn_core::git_run::GitOutcome;
+
+        assert!(matches!(
+            super::gitmodules_tracked(GitOutcome::Ok(b".gitmodules\n".to_vec())),
+            Ok(true)
+        ));
+        assert!(matches!(
+            super::gitmodules_tracked(GitOutcome::Exit {
+                code: Some(1),
+                stderr_tail: "error: pathspec".into(),
+            }),
+            Ok(false)
+        ));
+        assert!(matches!(
+            super::gitmodules_tracked(GitOutcome::EmptyOk),
+            Ok(false)
+        ));
+        assert!(matches!(
+            super::gitmodules_tracked(GitOutcome::Exit {
+                code: Some(128),
+                stderr_tail: "fatal: not a git repository".into(),
+            }),
+            Err(_)
+        ));
+        assert!(matches!(
+            super::gitmodules_tracked(GitOutcome::Timeout),
+            Err(_)
+        ));
+        assert!(matches!(
+            super::gitmodules_tracked(GitOutcome::Spawn(std::io::Error::other("x"))),
+            Err(_)
+        ));
+    }
 
     struct GlyphBaseSentinel {
         key: super::super::RepoExecutionIdentity,
@@ -619,6 +669,18 @@ mod tests {
             "clean -fdx removes ignored"
         );
         assert!(CliGit.status(&loc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nuke_without_gitmodules_still_succeeds() {
+        let repo = TestRepo::new("br-nuke-no-gitmodules");
+        ident(&repo.dir);
+        repo.commit_file("tracked.txt", "clean\n", "c0");
+        std::fs::write(repo.dir.join("tracked.txt"), "dirty\n").unwrap();
+
+        CliGit.nuke_working_tree(&repo.loc()).unwrap();
+
+        assert_eq!(read_file(&repo.dir.join("tracked.txt")), "clean\n");
     }
 
     #[test]
