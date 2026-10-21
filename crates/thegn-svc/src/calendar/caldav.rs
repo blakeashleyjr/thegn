@@ -875,7 +875,7 @@ END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:
     }
 
     #[test]
-    fn cancel_only_empty_calendar_without_tombstones_stays_a_snapshot() {
+    fn empty_resource_in_a_snapshot_stays_a_snapshot() {
         let xml = format!(
             "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
             resource(

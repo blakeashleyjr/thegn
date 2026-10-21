@@ -17,7 +17,6 @@ use thegn_core::secretref::BareAs;
 
 use super::{
     AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageDiagnostics,
-    PageMode,
 };
 use crate::http::{
     CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
@@ -289,6 +288,7 @@ mod cursor_tests {
 
 #[cfg(test)]
 mod tombstone_tests {
+    use super::super::PageMode;
     use super::*;
     use axum::Router;
     use axum::body::Body;
