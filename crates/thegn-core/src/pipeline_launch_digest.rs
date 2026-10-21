@@ -14,7 +14,7 @@ use crate::config::Config;
 /// Private request marker carrying the stage configuration digest to the daemon.
 pub const STAGE_CONFIG_DIGEST_ENV: &str = "THEGN_STAGE_CONFIG_DIGEST";
 
-const DOMAIN: &[u8] = b"thegn-stage-launch-digest-v1\0";
+const DOMAIN: &[u8] = b"thegn-stage-launch-digest-v2\0";
 
 /// A typed refusal when the claimed stage configuration no longer matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,14 @@ pub fn stage_launch_digest(cfg: &Config, agent: &str, stage: &str) -> Result<Str
     add(&effective.name);
     add(&effective.command);
     add(&effective.harness);
+    let provider = cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .find(|entry| entry.name == effective.name)
+        .and_then(|entry| entry.provider.as_deref())
+        .unwrap_or("");
+    add(provider);
     add(effective.model.as_deref().unwrap_or(""));
     add(if effective.route_via_proxy { "1" } else { "0" });
     add(&effective.env.len().to_string());
@@ -110,6 +118,24 @@ pub fn check_stage_launch(
         agent: agent.trim().to_string(),
         detail,
     })
+}
+
+/// Require the digest for a launch-id-bound pipeline dispatch, while keeping
+/// [`check_stage_launch`] available for legacy layered stage opens.
+pub fn check_stage_launch_required(
+    cfg: &Config,
+    agent: &str,
+    stage: &str,
+    presented: Option<&str>,
+) -> Result<(), StageConfigDrift> {
+    let Some(presented) = presented else {
+        return Err(StageConfigDrift {
+            stage: stage.trim().to_string(),
+            agent: agent.trim().to_string(),
+            detail: Some("no stage configuration digest was presented".into()),
+        });
+    };
+    check_stage_launch(cfg, agent, stage, Some(presented))
 }
 
 #[cfg(test)]
@@ -290,5 +316,28 @@ mod tests {
     #[test]
     fn check_accepts_an_absent_digest() {
         assert!(check_stage_launch(&Config::default(), "worker", "missing", None).is_ok());
+    }
+
+    #[test]
+    fn check_stage_launch_required_refuses_a_missing_digest() {
+        let cfg = config("review", "worker");
+        let error = check_stage_launch_required(&cfg, "worker", "review", None)
+            .expect_err("missing digest refuses");
+        assert!(error.to_string().contains("no stage configuration digest"));
+        let digest = stage_launch_digest(&cfg, "worker", "review").expect("digest");
+        assert!(check_stage_launch_required(&cfg, "worker", "review", Some(&digest)).is_ok());
+    }
+
+    #[test]
+    fn stage_launch_digest_binds_the_agent_provider() {
+        let mut first = config("review", "worker");
+        first.agents[0].harness = Some("claude".into());
+        first.agents[0].provider = Some("account-one".into());
+        let mut second = first.clone();
+        second.agents[0].provider = Some("account-two".into());
+        assert_ne!(
+            stage_launch_digest(&first, "worker", "review").expect("first digest"),
+            stage_launch_digest(&second, "worker", "review").expect("second digest")
+        );
     }
 }
