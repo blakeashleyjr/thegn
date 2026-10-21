@@ -2050,7 +2050,16 @@ mod tests {
             prompt_file_dir(worktree.path().to_str().unwrap(), Some(&remote)),
             Err(reason) if reason.contains("local sandbox")
         ));
-        assert!(prompt_file_dir(worktree.path().to_str().unwrap(), Some(&sandbox_spec())).is_ok());
+
+        let valid_worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(valid_worktree.path().join(".git")).unwrap();
+        assert!(
+            prompt_file_dir(
+                valid_worktree.path().to_str().unwrap(),
+                Some(&sandbox_spec())
+            )
+            .is_ok()
+        );
     }
 
     #[test]
