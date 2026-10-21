@@ -1861,6 +1861,34 @@ fn oci_create_opts_carry_this_profiles_owner_label() {
 }
 
 #[test]
+fn oci_create_opts_stamp_worktree_and_role_labels() {
+    let podman_spec = spec(Backend::Podman);
+    let podman = oci_create_opts(&podman_spec).unwrap();
+    assert!(
+        podman
+            .windows(2)
+            .any(|pair| { pair[0] == "--label" && pair[1] == "thegn.role=main" })
+    );
+    assert!(podman.windows(2).any(|pair| {
+        pair[0] == "--label"
+            && pair[1]
+                == format!(
+                    "thegn.worktree={}",
+                    crate::sandbox_manage::worktree_label_value(
+                        podman_spec.worktree.as_os_str().as_encoded_bytes()
+                    )
+                )
+    }));
+
+    let apple = oci_create_opts(&spec(Backend::Apple)).unwrap();
+    assert!(
+        !apple
+            .iter()
+            .any(|arg| { arg.starts_with("thegn.role=") || arg.starts_with("thegn.worktree=") })
+    );
+}
+
+#[test]
 fn test_run_gc_noop_when_no_backend_available() {
     let state = tempfile::tempdir().unwrap();
     let state_home = state.path().to_string_lossy().into_owned();
