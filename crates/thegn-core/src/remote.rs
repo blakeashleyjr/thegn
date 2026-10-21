@@ -20,6 +20,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Deadline for typed GitLoc reads, matching the thegn-svc default git read timeout.
+pub const GITLOC_READ_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Sequencer files and BISECT_LOG are tiny; cap remote/provider capture so a
 /// hostile or corrupted gitdir cannot stream unbounded data into host memory.
 const GIT_PATH_READ_LIMIT: usize = 8 * 1024 * 1024;
@@ -1048,6 +1051,42 @@ impl GitLoc {
         }
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (!s.is_empty()).then_some(s)
+    }
+
+    /// Run a GitLoc command with bounded execution and typed outcomes, preserving
+    /// successful empty output separately from exit, spawn, timeout and limit failures.
+    pub fn git_run_env(
+        &self,
+        envs: &[(&str, &str)],
+        args: &[&str],
+        policy: &crate::git_run::GitPolicy,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> crate::git_run::GitOutcome {
+        crate::util::note_core_git_spawn();
+        crate::git_run::run_command(&mut self.git_command_env(envs, args), policy, cancel)
+    }
+
+    /// Run a GitLoc command with bounded execution and typed outcomes.
+    pub fn git_run(
+        &self,
+        args: &[&str],
+        policy: &crate::git_run::GitPolicy,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> crate::git_run::GitOutcome {
+        self.git_run_env(&[], args, policy, cancel)
+    }
+
+    /// Read trimmed UTF-8 output with the named 60-second read deadline; empty
+    /// success is `Ok("")`, while command and decoding failures remain typed.
+    pub fn git_text(&self, args: &[&str]) -> Result<String, crate::git_run::GitTextError> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        self.git_run(
+            args,
+            &crate::git_run::GitPolicy::read(GITLOC_READ_DEADLINE),
+            &cancel,
+        )
+        .into_text()
+        .map(|text| text.trim().to_string())
     }
 
     /// `git remote get-url origin`, trimmed; `None` when unset or unreadable.
@@ -2160,5 +2199,80 @@ mod tests {
             ));
         }
         assert!(!locations.by_path.contains_key(""));
+    }
+
+    #[test]
+    fn git_run_tells_empty_success_from_exit_and_unreachable_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut init = crate::util::git_cmd(dir.path());
+        init.args(["init", "-q"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        assert!(matches!(
+            crate::git_run::run_command(
+                &mut init,
+                &crate::git_run::GitPolicy::read(Duration::from_secs(10)),
+                &std::sync::atomic::AtomicBool::new(false),
+            ),
+            crate::git_run::GitOutcome::EmptyOk
+        ));
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let envs = [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ];
+        let policy = crate::git_run::GitPolicy::read(Duration::from_secs(10));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(matches!(
+            loc.git_run_env(&envs, &["for-each-ref"], &policy, &cancel),
+            crate::git_run::GitOutcome::EmptyOk
+        ));
+        assert!(matches!(
+            loc.git_run_env(
+                &envs,
+                &["config", "--get", "thegn.no-such-key"],
+                &policy,
+                &cancel,
+            ),
+            crate::git_run::GitOutcome::Exit { code: Some(1), .. }
+        ));
+        assert!(matches!(
+            loc.git_run_env(&envs, &["rev-parse", "--git-dir"], &policy, &cancel),
+            crate::git_run::GitOutcome::Ok(_)
+        ));
+        let provider = GitLoc::Provider {
+            control_prefix: vec!["thegn-no-such-provider-368c".into()],
+            path: "/workspace".into(),
+        };
+        assert!(matches!(
+            provider.git_run(&["status"], &policy, &cancel),
+            crate::git_run::GitOutcome::Spawn(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn git_text_keeps_empty_success_and_refuses_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut init = crate::util::git_cmd(dir.path());
+        init.args(["init", "-q"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        assert!(matches!(
+            crate::git_run::run_command(
+                &mut init,
+                &crate::git_run::GitPolicy::read(Duration::from_secs(10)),
+                &std::sync::atomic::AtomicBool::new(false),
+            ),
+            crate::git_run::GitOutcome::EmptyOk
+        ));
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        assert_eq!(loc.git_text(&["for-each-ref"]).unwrap(), "");
+        let missing = GitLoc::Local(dir.path().join("missing"));
+        assert!(matches!(
+            missing.git_text(&["remote"]),
+            Err(crate::git_run::GitTextError::Failed(_))
+        ));
     }
 }
