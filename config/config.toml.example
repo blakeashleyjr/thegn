@@ -1482,6 +1482,10 @@ command = "git diff"
 # sandbox_mounts = ["~/datasets:ro", "/opt/toolchain"]
 # Default env bundle for this workspace (see [bundle.*] below):
 # env_bundle = "work"
+# Bind this block to ONE checkout when two repos share a directory name (each
+# gets its own block; a bound block never applies to another checkout, and two
+# blocks may not bind the same path):
+# repo_path = "~/work/my-work-repo"
 
 # ── Environment bundles (AU) ────────────────────────────────────────────────
 # Soft "work vs personal" identities WITHIN one running process — the middle
