@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -39,6 +40,7 @@ pub enum ReserveScope {
 #[derive(Debug)]
 pub enum ReserveError {
     AtCap { occupied: usize, cap: usize },
+    OwnedByOther { name: String },
     Store(anyhow::Error),
 }
 
@@ -86,6 +88,10 @@ impl std::fmt::Display for ReserveError {
                     "registry capacity reached ({occupied} occupied; cap {cap})"
                 )
             }
+            Self::OwnedByOther { name } => write!(
+                formatter,
+                "vps registry: sandbox name {name} is bound to a different worktree; refusing to reuse it"
+            ),
             Self::Store(error) => write!(formatter, "registry reservation failed: {error}"),
         }
     }
@@ -95,6 +101,7 @@ impl std::error::Error for ReserveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::AtCap { .. } => None,
+            Self::OwnedByOther { .. } => None,
             Self::Store(error) => Some(error.as_ref()),
         }
     }
@@ -119,6 +126,8 @@ pub struct VpsRecord {
     pub ip: String,
     /// Unix seconds at intent time (the reaper's stale-`creating` clock).
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
 }
 
 /// Whether `name` is a bake source name: the fixed prefix and exactly sixteen
@@ -185,6 +194,21 @@ fn ensure_owned_root(d: &Path) -> Result<()> {
 pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
     checked_name(&rec.name)?;
     ensure_owned_root(d)?;
+    let mut record = rec.clone();
+    if record.owner.is_empty() {
+        match read_at(d, &record.name) {
+            Some(existing) if !existing.owner.is_empty() => record.owner = existing.owner,
+            Some(_) => {}
+            None => match std::fs::symlink_metadata(record_path(d, &record.name)) {
+                Ok(_) => anyhow::bail!(
+                    "vps registry: cannot preserve owner for unreadable existing record {}",
+                    record.name
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
+        }
+    }
     let path = record_path(d, &rec.name);
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = d.join(format!(
@@ -199,7 +223,7 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
         .open(&tmp)
         .with_context(|| format!("write {}", tmp.display()))?;
     let publish = (|| -> Result<()> {
-        serde_json::to_writer_pretty(&mut file, rec)?;
+        serde_json::to_writer_pretty(&mut file, &record)?;
         file.sync_all()
             .with_context(|| format!("sync {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
@@ -301,11 +325,82 @@ pub fn reserve_at(
     lock.lock()
         .map_err(anyhow::Error::from)
         .map_err(ReserveError::Store)?;
+    if !rec.owner.is_empty() {
+        match read_at(d, &rec.name) {
+            Some(existing) if !existing.owner.is_empty() && existing.owner != rec.owner => {
+                return Err(ReserveError::OwnedByOther {
+                    name: rec.name.clone(),
+                });
+            }
+            Some(_) => {}
+            None => match std::fs::symlink_metadata(record_path(d, &rec.name)) {
+                Ok(_) => {
+                    return Err(ReserveError::Store(anyhow::anyhow!(
+                        "vps registry: cannot verify owner for existing record {}",
+                        rec.name
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ReserveError::Store(error.into())),
+            },
+        }
+    }
     let occupied = occupied_at(d, scope).map_err(ReserveError::Store)?;
     if occupied >= cap {
         return Err(ReserveError::AtCap { occupied, cap });
     }
     write_at(d, rec).map_err(ReserveError::Store)
+}
+
+/// A stable, versioned digest of the exact worktree path bytes.
+pub fn worktree_owner(worktree: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"thegn.provider-owner.v1\0");
+    digest.update(worktree);
+    let bytes = digest.finalize();
+    let digest_hex = bytes[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("wt1-{digest_hex}")
+}
+
+pub fn check_owner_at(d: &Path, name: &str, owner: &str) -> Result<()> {
+    checked_name(name)?;
+    let record = read_at(d, name);
+    if let Some(record) = record.as_ref()
+        && !record.owner.is_empty()
+        && record.owner != owner
+    {
+        anyhow::bail!(ReserveError::OwnedByOther {
+            name: name.to_owned()
+        });
+    }
+    if record.is_some() {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(d) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || !thegn_core::fsperm::owned_by_current_user(&metadata) =>
+        {
+            anyhow::bail!("vps registry: registry root is not an owned real directory")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    match std::fs::symlink_metadata(record_path(d, name)) {
+        Ok(_) => anyhow::bail!("vps registry: cannot verify owner for existing record {name}"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub fn check_owner(name: &str, owner: &str) -> Result<()> {
+    check_owner_at(&dir(), name, owner)
 }
 
 pub fn reserve(
@@ -446,6 +541,7 @@ mod tests {
             instance_id: String::new(),
             ip: String::new(),
             created_at: 1_700_000_000,
+            owner: String::new(),
         }
     }
 
@@ -771,6 +867,9 @@ mod tests {
             match worker.join().unwrap() {
                 Ok(()) => reserved += 1,
                 Err(ReserveError::AtCap { .. }) => refused += 1,
+                Err(ReserveError::OwnedByOther { .. }) => {
+                    panic!("owner refusal is not expected for distinct names")
+                }
                 Err(ReserveError::Store(error)) => panic!("reservation store error: {error}"),
             }
         }
@@ -935,5 +1034,81 @@ mod tests {
         assert!(!is_bake_name("tg-bake-0001020304050607.x"));
         assert!(!is_bake_name("tg-auto-cx32-ab"));
         assert!(!is_bake_name(""));
+    }
+
+    #[test]
+    fn owner_mismatch_refuses_reservation_before_counting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut existing = rec("tg-a-x1", "ready");
+        existing.owner = worktree_owner(b"/worktree/owner-a");
+        write_at(dir, &existing).unwrap();
+        let candidate = VpsRecord {
+            owner: worktree_owner(b"/worktree/owner-b"),
+            ..rec("tg-a-x1", "creating")
+        };
+
+        assert!(matches!(
+            reserve_at(dir, &candidate, 0, ReserveScope::All),
+            Err(ReserveError::OwnedByOther { name }) if name == "tg-a-x1"
+        ));
+        assert_eq!(read_at(dir, "tg-a-x1").unwrap().owner, existing.owner);
+    }
+
+    #[test]
+    fn legacy_record_is_claimed_on_first_owned_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_at(dir, &rec("tg-a-x1", "ready")).unwrap();
+        let candidate = VpsRecord {
+            owner: worktree_owner(b"/worktree/owner-b"),
+            ..rec("tg-a-x1", "creating")
+        };
+
+        reserve_at(dir, &candidate, 5, ReserveScope::All).unwrap();
+
+        assert_eq!(read_at(dir, "tg-a-x1").unwrap().owner, candidate.owner);
+    }
+
+    #[test]
+    fn owner_less_rewrite_keeps_the_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut existing = rec("tg-a-x1", "creating");
+        existing.owner = worktree_owner(b"/worktree/owner-a");
+        write_at(dir, &existing).unwrap();
+        write_at(dir, &rec("tg-a-x1", "ready")).unwrap();
+
+        assert_eq!(read_at(dir, "tg-a-x1").unwrap().owner, existing.owner);
+    }
+
+    #[test]
+    fn ownerless_rewrite_refuses_unreadable_existing_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let path = dir.join("tg-a-x1.json");
+        let malformed = b"not json";
+        std::fs::write(&path, malformed).unwrap();
+
+        assert!(write_at(dir, &rec("tg-a-x1", "ready")).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn worktree_owner_is_versioned_and_path_exact() {
+        let owner = worktree_owner(b"/w/a");
+        assert_eq!(owner, worktree_owner(b"/w/a"));
+        assert_ne!(owner, worktree_owner(b"/w/a/"));
+        assert!(owner.starts_with("wt1-"));
+        assert_eq!(owner.len(), 36);
+    }
+
+    #[test]
+    fn old_json_without_owner_parses() {
+        let json = r#"{"name":"tg-a-x1","provider":"hetzner","state":"ready","instance_id":"i-1","ip":"192.0.2.1","created_at":7}"#;
+        let record: VpsRecord = serde_json::from_str(json).unwrap();
+        assert!(record.owner.is_empty());
+        let encoded = serde_json::to_value(record).unwrap();
+        assert!(encoded.get("owner").is_none());
     }
 }

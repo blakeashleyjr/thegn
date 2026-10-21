@@ -558,6 +558,7 @@ mod tests {
             instance_id: String::new(),
             ip: String::new(),
             created_at,
+            owner: String::new(),
         }
     }
 
