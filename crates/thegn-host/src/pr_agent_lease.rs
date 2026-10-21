@@ -120,7 +120,6 @@ impl Drop for PrAgentGuard {
 mod tests {
     use super::*;
     use thegn_core::pr_queue::PrAgentAdmission;
-    use thegn_core::store::WorktreeAuxStore;
 
     #[test]
     fn finish_releases_and_a_lost_lease_reports_false() {
@@ -138,6 +137,38 @@ mod tests {
         )
         .unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
+        db.enqueue_bound_pr(
+            "/repo",
+            2,
+            Some("/repo/wt"),
+            "feature-2",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/2",
+        )
+        .unwrap();
+        let successful_row = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|queued| queued.number == 2)
+            .unwrap();
+        let successful_request = PrAgentAdmit {
+            key: &successful_row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: successful_row.checkout_gen,
+            max_attempts: 3,
+            head: "head-success",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let successful_guard = PrAgentGuard::admit(&db, &successful_request)
+            .unwrap()
+            .unwrap();
+        assert!(successful_guard.finish(&db, None).unwrap());
         let request = PrAgentAdmit {
             key: &row.key,
             expected_attempts: 0,

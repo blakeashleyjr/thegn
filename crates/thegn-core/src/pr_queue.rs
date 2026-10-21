@@ -784,7 +784,12 @@ mod tests {
             "closed",
             "unknown",
         ] {
-            for (owner, expiry) in [(false, None), (true, Some(100)), (true, Some(99))] {
+            for (owner, expiry) in [
+                (false, None),
+                (true, None),
+                (true, Some(100)),
+                (true, Some(99)),
+            ] {
                 for (attempts, checkout, budget) in [(0, 0, 1), (1, 0, 1), (0, 1, 1), (0, 0, 0)] {
                     let row = PrAgentRowSnapshot {
                         status: status.into(),
@@ -803,9 +808,11 @@ mod tests {
                         None => Some(PrAgentRefusal::Settled {
                             status: status.into(),
                         }),
-                        Some(status) if status.is_settled() => Some(PrAgentRefusal::Settled {
-                            status: status.as_str().into(),
-                        }),
+                        Some(parsed_status) if parsed_status.is_settled() => {
+                            Some(PrAgentRefusal::Settled {
+                                status: parsed_status.as_str().into(),
+                            })
+                        }
                         Some(_) if owner && expiry.is_some_and(|until| until >= 100) => {
                             Some(PrAgentRefusal::Held {
                                 generation: 4,
@@ -833,7 +840,7 @@ mod tests {
         }
     }
 
-    fn request_for_test(request: &PrAgentAdmit<'_>) -> PrAgentAdmit<'_> {
+    fn request_for_test<'a>(request: &PrAgentAdmit<'a>) -> PrAgentAdmit<'a> {
         PrAgentAdmit {
             key: request.key,
             expected_attempts: request.expected_attempts,
