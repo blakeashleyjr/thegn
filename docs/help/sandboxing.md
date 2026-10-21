@@ -389,9 +389,10 @@ tier). A repo-root `.thegn.toml` may only **raise** the floor, never lower it.
 With `agent_sandbox` on, a queue agent is held to at least the `[sandbox]`
 isolation floor in force (default: shared-kernel, refusing on a miss). The
 queue floor (`agent_isolation_floor`) can raise that requirement, but
-`degrade` cannot weaken it. A fail-closed miss holds the entry as an
-infrastructure failure and never marks the branch failed. Opt out with
-`[sandbox] isolation_floor = "off"` or `agent_sandbox = false`.
+`degrade` cannot weaken it. With `agent_sandbox = false`, a fail-closed floor
+still holds the entry as an infrastructure failure and never marks the branch
+failed. Set `[sandbox] isolation_floor = "off"` or disable the sandbox to run
+queue agents uncontained.
 
 ## Choosing per worktree
 

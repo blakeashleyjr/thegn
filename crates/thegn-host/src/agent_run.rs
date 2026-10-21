@@ -207,11 +207,14 @@ fn compose_unverified_warning(
 }
 
 /// Resolve a queue agent task's sandbox + floor into a dispatch decision. With
-/// the opt-in off this is always `Run(None)` (host + slice, unchanged). With it
-/// on, the worktree's sandbox is resolved and its honest class compared against
-/// at least the `[sandbox]` floor in force (default: shared-kernel, refusing on
-/// a miss), via the pure [`thegn_core::sandbox_floor::queue_agent_gate`]. The
-/// queue floor can raise that boundary but cannot weaken it.
+/// the opt-in off, the `[sandbox]` floor still applies: a fail-closed floor
+/// holds the queue entry, explicit degrade labels `RunDegraded(None, ..)`, and
+/// an off floor permits `Run(None)` (host + slice).
+/// With the opt-in on, the worktree's sandbox is resolved and its honest class
+/// compared against at least the `[sandbox]` floor in force (default:
+/// shared-kernel, refusing on a miss), via the pure
+/// [`thegn_core::sandbox_floor::queue_agent_gate`]. The queue floor can raise
+/// that boundary but cannot weaken it.
 /// Before returning a runnable dispatch, this gate ensures the sandbox and
 /// proves it can execute a noninteractive preflight command.
 pub(crate) fn agent_floor_gate(
@@ -222,10 +225,35 @@ pub(crate) fn agent_floor_gate(
     on_miss: thegn_core::config::OnFloorMiss,
 ) -> AgentDispatch {
     if !sandbox_on {
-        return AgentDispatch::Run(None);
+        return uncontained_agent_gate(&full.sandbox);
     }
     let effective = effective_agent_sandbox(full, worktree);
     agent_floor_gate_with_effective(full, worktree, floor, on_miss, effective)
+}
+
+fn uncontained_agent_gate(sb: &thegn_core::config::SandboxConfig) -> AgentDispatch {
+    use thegn_core::config::OnFloorMiss;
+
+    let floor = thegn_core::sandbox_floor::floor_in_force(sb, false);
+    if floor.required_rank().is_none() {
+        return AgentDispatch::Run(None);
+    }
+    match thegn_core::sandbox_floor::miss_policy_in_force(sb) {
+        OnFloorMiss::Fail => AgentDispatch::InfraHold(format!(
+            "queue agent held: agent_sandbox = false would run it on the host, but the [sandbox] \
+             isolation floor in force is `{}` and refuses a miss — set the queue's \
+             agent_sandbox = true to run it contained, or [sandbox] isolation_floor = \"off\" \
+             to allow uncontained queue agents",
+            floor.as_str()
+        )),
+        OnFloorMiss::Degrade => AgentDispatch::RunDegraded(
+            None,
+            format!(
+                "queue agent running uncontained on the host under the explicit [sandbox] isolation floor `{}` (on_floor_miss = \"degrade\")",
+                floor.as_str()
+            ),
+        ),
+    }
 }
 
 fn effective_agent_sandbox(
@@ -1275,6 +1303,109 @@ mod tests {
                 AgentGate::RunDegraded("effective".into())
             ),
             AgentGate::RunDegraded(reason) if reason == "global"
+        ));
+    }
+
+    #[test]
+    fn uncontained_queue_agent_is_held_under_the_default_floor() {
+        assert!(matches!(
+            uncontained_agent_gate(&thegn_core::config::SandboxConfig::default()),
+            AgentDispatch::InfraHold(reason)
+                if reason.contains("shared-kernel")
+                    && reason.contains("isolation_floor = \"off\"")
+        ));
+        assert!(matches!(
+            agent_floor_gate(
+                &thegn_core::config::Config::default(),
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::Off,
+                thegn_core::config::OnFloorMiss::Degrade,
+            ),
+            AgentDispatch::InfraHold(_)
+        ));
+    }
+
+    #[test]
+    fn uncontained_queue_agent_degrades_under_an_explicit_degrade_floor() {
+        let sandbox = thegn_core::config::SandboxConfig {
+            isolation_floor: Some(thegn_core::config::IsolationFloor::SharedKernel),
+            on_floor_miss: thegn_core::config::OnFloorMiss::Degrade,
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&sandbox),
+            AgentDispatch::RunDegraded(None, warning) if warning.contains("uncontained")
+        ));
+        let full = thegn_core::config::Config {
+            sandbox,
+            ..thegn_core::config::Config::default()
+        };
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::Off,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::RunDegraded(None, warning) if warning.contains("uncontained")
+        ));
+    }
+
+    #[test]
+    fn uncontained_queue_agent_runs_when_the_floor_is_off() {
+        let explicit_off = thegn_core::config::SandboxConfig {
+            isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&explicit_off),
+            AgentDispatch::Run(None)
+        ));
+        let full = thegn_core::config::Config {
+            sandbox: explicit_off,
+            ..thegn_core::config::Config::default()
+        };
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::SharedKernel,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::Run(None)
+        ));
+        let disabled = thegn_core::config::SandboxConfig {
+            enabled: false,
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&disabled),
+            AgentDispatch::Run(None)
+        ));
+        let full = thegn_core::config::Config {
+            sandbox: disabled,
+            ..thegn_core::config::Config::default()
+        };
+        assert!(matches!(
+            agent_floor_gate(
+                &full,
+                "/w/fix",
+                false,
+                thegn_core::config::IsolationFloor::SharedKernel,
+                thegn_core::config::OnFloorMiss::Fail,
+            ),
+            AgentDispatch::Run(None)
+        ));
+        let host_backend = thegn_core::config::SandboxConfig {
+            backend: thegn_core::config::SandboxBackend::None,
+            ..thegn_core::config::SandboxConfig::default()
+        };
+        assert!(matches!(
+            uncontained_agent_gate(&host_backend),
+            AgentDispatch::Run(None)
         ));
     }
 

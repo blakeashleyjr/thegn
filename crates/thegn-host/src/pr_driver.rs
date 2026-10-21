@@ -1275,6 +1275,16 @@ mod tests {
     use super::*;
     use thegn_core::forge::model::PrStatus;
 
+    fn uncontained_config() -> Config {
+        Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
+                ..thegn_core::config::SandboxConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
     fn cfg() -> PrQueueConfig {
         PrQueueConfig {
             enabled: true,
@@ -2256,7 +2266,7 @@ mod tests {
             .unwrap();
             let out = drive_queue(
                 &cfg,
-                &Config::default(),
+                &uncontained_config(),
                 &forge,
                 Path::new("/repo"),
                 &db,
@@ -2284,7 +2294,7 @@ mod tests {
             let row = db.list_pr_queue().unwrap().remove(0);
             let out = drive_queue(
                 &cfg,
-                &Config::default(),
+                &uncontained_config(),
                 &forge,
                 Path::new("/repo"),
                 &db,
@@ -2316,7 +2326,7 @@ mod tests {
         assert_eq!(row.ci_rerun_head.as_deref(), Some("abc"));
         let out = drive_queue(
             &cfg,
-            &Config::default(),
+            &uncontained_config(),
             &forge,
             Path::new("/repo"),
             &db,

@@ -91,13 +91,16 @@ pub struct PrQueueConfig {
     /// Watchdog (seconds) for one agent invocation. 0 means the 6-hour ceiling, not unbounded; values over 30 days clamp to 30 days. After the agent process exits, its leftover group members get 15 s before being terminated.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: u64,
-    /// Opt in to running the fixing agent INSIDE the resolved sandbox (default:
-    /// host + the shared resource slice). See [`Self::agent_isolation_floor`].
+    /// Opt in to running the fixing agent INSIDE the resolved sandbox. When
+    /// false, the `[sandbox]` floor still applies: fail-closed floors hold,
+    /// explicit degrade floors label host runs, and an off floor permits them.
+    /// See [`Self::agent_isolation_floor`].
     pub agent_sandbox: bool,
     /// Minimum honest isolation class the sandboxed agent task must enter. The
     /// queue floor can raise, but never weaken, the `[sandbox]` floor in force
-    /// (default: shared-kernel, refusing on a miss). Set
-    /// `[sandbox].isolation_floor = "off"` or disable `agent_sandbox` to run the
+    /// (default: shared-kernel, refusing on a miss). With `agent_sandbox =
+    /// false`, a fail-closed floor holds the entry. Set
+    /// `[sandbox].isolation_floor = "off"` or disable the sandbox to run the
     /// agent uncontained. A fail-closed miss is an INFRASTRUCTURE failure — the
     /// entry is held, never the PR/branch blamed.
     pub agent_isolation_floor: crate::config::IsolationFloor,

@@ -1385,6 +1385,16 @@ fn tail_line(log: &str) -> String {
 mod tests {
     use super::*;
 
+    fn uncontained_config() -> Config {
+        Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
+                ..thegn_core::config::SandboxConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn candidate_drift_table() {
         let candidate = MergeCandidate {
@@ -2103,7 +2113,7 @@ mod tests {
             let queued = bound_item(&db, &feat_wt);
             let outcome = drive_queue(
                 &cfg(FIXER, 2),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
@@ -2213,7 +2223,7 @@ mod tests {
             let mut statuses = Vec::new();
             let outcome = drive_queue(
                 &cfg(&fixer, 2),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
