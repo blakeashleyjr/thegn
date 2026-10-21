@@ -206,6 +206,29 @@ impl RowClaim {
         Ok(result)
     }
 
+    pub(super) fn refund_attempt(&self, db: &Db) -> anyhow::Result<bool> {
+        let claim = self
+            .claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = match db.refund_merge_agent_attempt(&claim) {
+            Ok(result) => result,
+            Err(error) => {
+                if error
+                    .to_string()
+                    .contains(thegn_core::store::MERGE_CLAIM_LOST)
+                {
+                    self.lost.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
+        if !result {
+            self.lost.store(true, Ordering::Release);
+        }
+        Ok(result)
+    }
+
     pub(super) fn lost(&self) -> bool {
         self.lost.load(Ordering::Acquire)
     }

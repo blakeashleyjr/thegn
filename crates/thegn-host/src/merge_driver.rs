@@ -527,7 +527,14 @@ fn drive_queue_with(
     mut actions: DriveActions<
         impl FnMut(&str, &thegn_core::remote::GitLoc, bool) -> anyhow::Result<AttemptOutcome>,
         impl FnMut(&str) -> crate::agent_run::AgentDispatch,
-        impl FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
+        impl FnMut(
+            &str,
+            &str,
+            &str,
+            &str,
+            &Failure,
+            Option<thegn_core::sandbox::SandboxSpec>,
+        ) -> crate::agent_run::AgentRunVerdict,
     >,
 ) -> DriveOutcome {
     let mut out = DriveOutcome::default();
@@ -1138,7 +1145,7 @@ fn drive_queue_with(
                         detail: &note,
                     });
                     // Run to completion; the re-attempt (top of loop) is the real
-                    // arbiter of whether the fix worked, so ignore the exit code.
+                    // arbiter of whether the fix worked for agents that ran.
                     if let Some(template) = agent_cmd.as_deref() {
                         if claim.borrow().as_ref().is_some_and(claim::RowClaim::lost) {
                             out.warnings.push(format!(
@@ -1147,8 +1154,7 @@ fn drive_queue_with(
                             ));
                             break 'attempt;
                         }
-                        let _ = (actions.runner)(
-                            // best-effort: the re-attempt at the top of the loop is the real arbiter (comment above)
+                        let verdict = (actions.runner)(
                             template,
                             &item.worktree,
                             &item.branch,
@@ -1156,6 +1162,61 @@ fn drive_queue_with(
                             &failure,
                             sandbox,
                         );
+                        if let Some(reason) = verdict.not_started() {
+                            if let Some(row_claim) = claim.borrow().as_ref() {
+                                match row_claim.refund_attempt(db) {
+                                    Ok(true) => agent_runs = agent_runs.saturating_sub(1),
+                                    Ok(false) => {
+                                        out.warnings.push(format!(
+                                            "{}: merge claim lost; another drain recovered the row",
+                                            item.branch
+                                        ));
+                                        break 'attempt;
+                                    }
+                                    Err(error)
+                                        if error
+                                            .to_string()
+                                            .contains(thegn_core::store::MERGE_CLAIM_LOST) =>
+                                    {
+                                        out.warnings.push(format!(
+                                            "{}: merge claim lost; another drain recovered the row",
+                                            item.branch
+                                        ));
+                                        break 'attempt;
+                                    }
+                                    Err(error) => out.persistence_errors.push(format!(
+                                        "{}: could not refund agent attempt: {error}",
+                                        item.worktree
+                                    )),
+                                }
+                            } else {
+                                let refunded_runs = agent_runs.saturating_sub(1);
+                                if let Err(error) =
+                                    db.set_merge_agent_attempts(&item.worktree, refunded_runs)
+                                {
+                                    out.persistence_errors.push(format!(
+                                        "{}: could not refund agent attempt: {error}",
+                                        item.worktree
+                                    ));
+                                } else {
+                                    agent_runs = refunded_runs;
+                                }
+                            }
+                            let detail =
+                                format!("agent did not start: {reason}; held, no attempt spent");
+                            thegn_core::msg::warn(&detail);
+                            let fields = set(db, MqStatus::AgentBlocked, None, Some(&detail));
+                            stop_on_write_error!('attempt);
+                            progress(&DriveStep {
+                                fields: &fields,
+                                worktree: &item.worktree,
+                                branch: &item.branch,
+                                status: MqStatus::AgentBlocked.as_str(),
+                                detail: &detail,
+                            });
+                            out.agent_blocked.push(item.branch.clone());
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -1296,11 +1357,13 @@ fn run_agent(
     target: &str,
     failure: &Failure,
     sandbox: Option<thegn_core::sandbox::SandboxSpec>,
-) -> bool {
+) -> crate::agent_run::AgentRunVerdict {
     let Some((kind, vars, prompt)) = compose(cfg, worktree, branch, target, failure) else {
-        return false;
+        return crate::agent_run::AgentRunVerdict::NotStarted(
+            "could not compose the fixer prompt".into(),
+        );
     };
-    crate::agent_run::run(&crate::agent_run::AgentTaskRun {
+    crate::agent_run::run_outcome(&crate::agent_run::AgentTaskRun {
         kind,
         worktree,
         prompt: &prompt,
@@ -1982,6 +2045,28 @@ mod tests {
         }
 
         #[test]
+        fn missing_fixer_command_holds_without_spending_an_attempt() {
+            let (_fixture, root, feat_wt) = conflicting_repo("missing-fixer");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            let outcome = drive_queue(
+                &cfg("thegn-no-such-agent-b62", 2),
+                &uncontained_config(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(outcome.needs_human.is_empty());
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.agent_attempts, 0);
+            assert_eq!(row.status, MqStatus::AgentBlocked.as_str());
+            assert!(row.error_detail.unwrap().contains("did not start"));
+        }
+
+        #[test]
         fn agent_that_cannot_fix_marks_needs_human() {
             let (_fixture, root, feat_wt) = conflicting_repo("giveup");
             let before = out(&root, &["rev-parse", "main"]);
@@ -2589,7 +2674,9 @@ mod tests {
                          _: &str,
                          _: &str,
                          _: &Failure,
-                         _: Option<thegn_core::sandbox::SandboxSpec>| false,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| {
+                            crate::agent_run::AgentRunVerdict::Exited(Some(1))
+                        },
                 },
             );
 
@@ -2628,7 +2715,9 @@ mod tests {
                          _: &str,
                          _: &str,
                          _: &Failure,
-                         _: Option<thegn_core::sandbox::SandboxSpec>| false,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| {
+                            crate::agent_run::AgentRunVerdict::Exited(Some(1))
+                        },
                 },
             );
 
