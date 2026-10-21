@@ -198,7 +198,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{GitOutcome, GitPolicy, GitTextError, git_run, run_command};
+    use super::{GitOutcome, GitPolicy, GitTextError, git_run, outcome_from_run, run_command};
     use crate::util;
     use thegn_proc::{Capture, Containment, End, GroupState, Leader, Run, Which};
 
@@ -374,7 +374,12 @@ mod tests {
         let before = util::core_git_spawn_count();
         let outcome = git_run(
             dir.path(),
-            &["status", "--porcelain"],
+            &[
+                "-c",
+                "status.showUntrackedFiles=no",
+                "status",
+                "--porcelain",
+            ],
             &policy(),
             &AtomicBool::new(false),
         );
