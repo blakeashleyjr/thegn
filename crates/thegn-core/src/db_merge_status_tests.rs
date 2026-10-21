@@ -422,3 +422,58 @@ fn re_enqueue_keeps_budget_of_an_active_row_and_resets_finished_rows() {
         assert_fresh_row(&row(&db));
     }
 }
+
+#[test]
+fn unknown_status_writes_are_refused_without_mutation() {
+    let db = seeded();
+    let before = row(&db);
+    let error = db
+        .update_merge_status(WORKTREE, "bogus", None, None, None)
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown merge-queue status"));
+    assert_eq!(row(&db), before);
+
+    let error = db
+        .replace_merge_status(WORKTREE, "bogus", &MergeStatusFields::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown merge-queue status"));
+    assert_eq!(row(&db), before);
+
+    let claimed_db = Db::open_memory().unwrap();
+    claimed_db
+        .put_worktree("feature", "/private/repo", WORKTREE, "feature", None, None)
+        .unwrap();
+    claimed_db
+        .enqueue_merge(WORKTREE, "feature", "main")
+        .unwrap();
+    let claim = claimed_db
+        .admit_merge_claim(&MergeClaimRequest {
+            worktree: WORKTREE.into(),
+            branch: "feature".into(),
+            repo_root: "/private/repo".into(),
+            target_branch: "main".into(),
+            location: String::new(),
+            expected_status: "queued".into(),
+            lease_until_ms: crate::util::now_ms() + 60_000,
+            owner_hint: Some("unknown-status-test".into()),
+        })
+        .unwrap()
+        .unwrap();
+    let claim = claimed_db.settle_merge_claim_no_child(&claim).unwrap();
+    let before = row(&claimed_db);
+    let error = claimed_db
+        .replace_merge_status_claimed(&claim, "bogus", &MergeStatusFields::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown merge-queue status"));
+    assert_eq!(row(&claimed_db), before);
+}
+
+#[test]
+fn every_canonical_status_is_writable() {
+    for status in crate::attention::MqStatus::ALL {
+        let db = seeded();
+        db.update_merge_status(WORKTREE, status.as_str(), Some("oid"), None, None)
+            .unwrap();
+        assert_eq!(row(&db).status, status.as_str(), "{status:?}");
+    }
+}
