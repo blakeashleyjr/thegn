@@ -101,8 +101,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    published release and runs `makepkg --printsrcinfo`, then passes `PKGBUILD`
    and `.SRCINFO` to the AUR publisher as an artifact. The Homebrew publisher
    pushes `Formula/thegn.rb` to the configured tap. The AUR publisher checks
-   the artifact's `PKGBUILD` against the release asset and pushes both files to
-   the AUR `thegn-bin` repository without interpreting the PKGBUILD.
+   the artifact's `PKGBUILD` against the release asset before pushing both
+   files to the AUR `thegn-bin` repository without interpreting the PKGBUILD.
+   Each publisher records its cloned branch tip and uses a force-with-lease
+   push against that observed tip, then verifies the remote branch with
+   `git ls-remote`. The per-target job summary reports the committed old and
+   new OIDs, an unchanged tip, or a failure and the observed remote state, so a
+   Homebrew success and AUR failure are visible separately.
    Re-dispatching the same tag makes no commit when the repositories already
    contain identical output.
 
