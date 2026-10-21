@@ -140,6 +140,11 @@ pub enum Action {
     Disk(DiskArgs),
     /// Reclaim a worktree's `target/` build artifacts (keeps the checkout).
     Clean(CleanArgs),
+    /// Re-register a worktree you closed: clears its close record and adds it back to the sidebar without starting a pane.
+    Reopen {
+        /// Worktree path (a linked worktree of a registered repo).
+        path: String,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -174,6 +179,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         }
         Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
+        Action::Reopen { path } => reopen(&path),
     }
 }
 
@@ -637,6 +643,36 @@ pub(crate) fn clear_folder_if_registered(db: &Db, worktree_path: &str) -> Result
     }
     db.set_worktree_folder(worktree_path, None)?;
     Ok(true)
+}
+
+fn reopen(path: &str) -> Result<()> {
+    let path = std::fs::canonicalize(path)?;
+    let root = thegn_core::repo::main_worktree(&path)
+        .ok_or_else(|| anyhow::anyhow!("not a git worktree: {}", path.display()))?;
+    anyhow::ensure!(root != path, "the main checkout is never closed");
+    let db = Db::open()?;
+    anyhow::ensure!(
+        db.is_known_repo(&root.to_string_lossy())?,
+        "repo is not registered; open {} first",
+        root.display()
+    );
+    let identity = worktree::inspect_registered(&root, &path)?;
+    let branch = identity
+        .branch()
+        .ok_or_else(|| anyhow::anyhow!("cannot reopen a detached worktree"))?;
+    let branch = std::str::from_utf8(branch.raw())?;
+    let keys = thegn_core::worktree_suppress::keys_for(&path)?;
+    let root = root.to_string_lossy().into_owned();
+    let path = path.to_string_lossy().into_owned();
+    let slug = thegn_core::repo::repo_slug_with_checked(&db, std::path::Path::new(&root))?;
+    let tab = thegn_core::repo::branch_tab(&slug, branch);
+    let was_suppressed =
+        thegn_core::worktree_suppress::reopen(&db, &keys, &tab, &root, &path, branch)?;
+    outln!("{path}");
+    if !was_suppressed {
+        msg::info("worktree had no close record; it was registered anyway");
+    }
+    Ok(())
 }
 
 /// A path resolved (through git) to its actual worktree: everything the filing
@@ -1871,5 +1907,10 @@ mod folder_tests {
             db.worktree_record("/repo/wt").unwrap().unwrap().folder_id,
             None
         );
+    }
+
+    #[test]
+    fn reopen_parses_the_path_argument() {
+        assert!(parse(&["thegn", "wt", "reopen", "/x"]).is_ok());
     }
 }

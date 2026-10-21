@@ -402,6 +402,7 @@ pub const CATALOG: &[Slot] = &[
     // "Worktree path or branch name" — the source offers both.
     slot("wt folder", "worktree", SourceKind::Worktree),
     slot("wt rm", "target", SourceKind::Worktree),
+    slot("wt reopen", "path", SourceKind::Structural),
     // --- repo -------------------------------------------------------------
     slot("autopilot status", "repo", SourceKind::Repo),
     slot("config explain", "repo", SourceKind::Repo),
