@@ -916,6 +916,32 @@ fn config_devcontainer_id(dc: &DevContainer) -> Option<String> {
     })
 }
 
+/// Return the Dockerfile or Compose files selected by this devcontainer config.
+/// Build context directory contents are not part of this referenced-file set.
+pub fn referenced_files(
+    dc: &crate::devcontainer::DevContainer,
+    config_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let references = match &dc.source {
+        crate::devcontainer::ImageSource::Image(_) => Vec::new(),
+        crate::devcontainer::ImageSource::Build(build) => vec![build.dockerfile.as_str()],
+        crate::devcontainer::ImageSource::Compose(compose) => {
+            compose.files.iter().map(String::as_str).collect()
+        }
+    };
+    let mut paths = references
+        .into_iter()
+        .map(|reference| {
+            resolve_under(config_dir, reference)
+                .map(PathBuf::from)
+                .map_err(|reason| format!("devcontainer reference `{reference}` {reason}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,5 +1565,47 @@ mod tests {
         let steps = gated_feature_steps(&dc, "root", &approvals_for(&dc));
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, "devcontainer.feature.node");
+    }
+
+    #[test]
+    fn referenced_files_resolves_build_and_compose_inside_the_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(config_dir.join("docker")).unwrap();
+        let build = parse(r#"{ "build": { "dockerfile": "docker/Dockerfile" } }"#).unwrap();
+        assert_eq!(
+            referenced_files(&build, &config_dir).unwrap(),
+            vec![config_dir.join("docker/Dockerfile")]
+        );
+        let compose = parse(
+            r#"{ "dockerComposeFile": ["compose.yml", "override.yml", "compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            referenced_files(&compose, &config_dir).unwrap(),
+            vec![
+                config_dir.join("compose.yml"),
+                config_dir.join("override.yml")
+            ]
+        );
+        let image = parse(r#"{ "image": "repo" }"#).unwrap();
+        assert!(referenced_files(&image, &config_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn referenced_files_refuses_absolute_and_escaping_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let absolute = parse(r#"{ "build": { "dockerfile": "/tmp/Dockerfile" } }"#).unwrap();
+        let error = referenced_files(&absolute, &config_dir).unwrap_err();
+        assert!(error.contains("/tmp/Dockerfile"), "{error}");
+        assert!(error.contains("is absolute"), "{error}");
+        let escaping =
+            parse(r#"{ "build": { "dockerfile": "../../outside/Dockerfile" } }"#).unwrap();
+        let error = referenced_files(&escaping, &config_dir).unwrap_err();
+        assert!(error.contains("../../outside/Dockerfile"), "{error}");
+        assert!(error.contains("escapes the repository"), "{error}");
     }
 }
