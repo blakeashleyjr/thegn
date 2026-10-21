@@ -1476,6 +1476,19 @@ fn host_execution_header_prefixes_a_failed_gate_log() {
 }
 
 #[test]
+fn host_execution_keeps_silent_failed_gate_log_empty() {
+    let mut f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    f.config.gate_command = "exit 3".into();
+    match gate_tip(&f.repo, &f.first, &f.config).unwrap() {
+        GateVerdict::Failed { log } => assert!(log.is_empty()),
+        other => panic!("expected failed gate verdict: {other:?}"),
+    }
+}
+
+#[test]
 fn host_execution_entries_are_in_doctor_json() {
     let report = crate::cmd::doctor::doctor_json(&thegn_core::config::Config::default());
     let entries = report["host_execution"]

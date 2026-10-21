@@ -51,7 +51,7 @@ pub const HOST_EXECUTION_ROUTES: &[HostExecutionRoute] = &[
     HostExecutionRoute {
         id: "merge_drivers",
         runs: "custom git merge drivers and rerere during a fold",
-        selected_by: "custom git merge drivers and rerere during a fold",
+        selected_by: "the repo's .gitattributes merge= drivers and rerere.enabled",
     },
     HostExecutionRoute {
         id: "tests_panel",
@@ -91,7 +91,7 @@ pub fn host_execution_json() -> serde_json::Value {
 /// Human-readable doctor lines for every host-executed candidate-code route.
 pub fn host_execution_lines() -> Vec<String> {
     let mut lines = Vec::with_capacity(HOST_EXECUTION_ROUTES.len() + 2);
-    lines.push("Host execution (no isolation)".into());
+    lines.push(HOST_EXECUTION_LABEL.replacen("host", "Host", 1));
     lines.extend(
         HOST_EXECUTION_ROUTES
             .iter()
