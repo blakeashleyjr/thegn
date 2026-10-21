@@ -296,13 +296,18 @@ impl Default for IsolatedState {
 /// Environment variable that makes security-test prerequisites mandatory.
 pub const REQUIRE_SECURITY_TESTS_ENV: &str = "THEGN_REQUIRE_SECURITY_TESTS";
 
+/// Outcome of checking whether a security-test prerequisite is available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipVerdict {
+    /// The prerequisite is available and the test should run.
     Run,
+    /// The prerequisite is unavailable, but the test may be skipped.
     Unsupported,
+    /// The prerequisite is unavailable despite security tests being required.
     MissingRequired,
 }
 
+/// Determines the security-test outcome from the required and available flags.
 pub fn skip_verdict(required: bool, available: bool) -> SkipVerdict {
     match (required, available) {
         (_, true) => SkipVerdict::Run,
@@ -311,6 +316,9 @@ pub fn skip_verdict(required: bool, available: bool) -> SkipVerdict {
     }
 }
 
+/// Runs or skips a security test, writing an unsupported diagnostic to `out`.
+///
+/// Panics when the prerequisite is unavailable and security tests are required.
 pub fn require_or_skip_in(
     required: bool,
     prereq: &str,
@@ -335,6 +343,8 @@ pub fn require_or_skip_in(
     }
 }
 
+/// Runs a security test when its prerequisite is available, or reports a skip.
+///
 /// Use as `if !require_or_skip("<prerequisite>", <probe>) { return; }` in a
 /// security-sensitive test. `just security-e2e` sets the required-test variable.
 pub fn require_or_skip(prereq: &str, available: bool) -> bool {

@@ -1166,12 +1166,10 @@ mod tests {
                 let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
                 permissions.set_readonly(false);
                 std::fs::set_permissions(dir.path(), permissions).unwrap();
-                if !thegn_core::testenv::require_or_skip(
+                assert!(!thegn_core::testenv::require_or_skip(
                     "a read-only directory that refuses unlink (non-root)",
                     false,
-                ) {
-                    return;
-                }
+                ));
                 return;
             }
             Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
