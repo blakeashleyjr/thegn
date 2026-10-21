@@ -113,11 +113,11 @@ struct IngestRef {
 impl Drop for IngestRef {
     fn drop(&mut self) {
         // best-effort: the attempt must still return its actual disposition.
-        if !self
-            .target
-            .git_ok(&["update-ref", "-d", &self.ref_name, &self.oid])
-        {
-            tracing::warn!(ref_name = %self.ref_name, "failed to remove merge-queue ingest ref");
+        if let Err(error) = ref_update(
+            &self.target,
+            &["update-ref", "-d", &self.ref_name, &self.oid],
+        ) {
+            tracing::warn!(ref_name = %self.ref_name, error = %error, "failed to remove merge-queue ingest ref");
         }
     }
 }
@@ -229,19 +229,60 @@ fn prune_refs(target: &GitLoc, branch_loc: &GitLoc, branch: &str) -> Result<()> 
         );
     }
     for ref_name in refs {
-        if !target.git_ok(&["update-ref", "-d", &ref_name]) {
-            tracing::warn!(ref_name = %ref_name, "failed to prune stale merge-queue ingest ref");
+        if let Err(error) = ref_update(target, &["update-ref", "-d", &ref_name]) {
+            tracing::warn!(ref_name = %ref_name, error = %error, "failed to prune stale merge-queue ingest ref");
         }
     }
     let legacy = format!("refs/thegn/mq/{branch}");
-    if target
-        .git_out(&["rev-parse", "--verify", &legacy])
-        .is_some()
-        && !target.git_ok(&["update-ref", "-d", &legacy])
-    {
-        tracing::warn!(ref_name = %legacy, "failed to prune legacy merge-queue ingest ref");
+    match ref_oid(target, &legacy) {
+        Ok(Some(_)) => {
+            if let Err(error) = ref_update(target, &["update-ref", "-d", &legacy]) {
+                tracing::warn!(ref_name = %legacy, error = %error, "failed to prune legacy merge-queue ingest ref");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(ref_name = %legacy, error = %error, "failed to read legacy merge-queue ingest ref before pruning");
+        }
     }
     Ok(())
+}
+
+fn ref_update(target: &GitLoc, args: &[&str]) -> std::result::Result<(), String> {
+    let outcome = target.git_run(
+        args,
+        &thegn_core::git_run::GitPolicy::read(crate::integrate::DRIVER_SUBPROCESS_TIMEOUT),
+        &AtomicBool::new(false),
+    );
+    if outcome.is_success() {
+        Ok(())
+    } else {
+        Err(outcome.to_string())
+    }
+}
+
+fn ref_oid(target: &GitLoc, name: &str) -> std::result::Result<Option<String>, String> {
+    // Both callers reject remote targets before this local-only -q argv is used.
+    let outcome = target.git_run(
+        &["rev-parse", "-q", "--verify", name],
+        &thegn_core::git_run::GitPolicy::read(crate::integrate::DRIVER_SUBPROCESS_TIMEOUT),
+        &AtomicBool::new(false),
+    );
+    if outcome.is_success() {
+        let oid = outcome.into_text().map_err(|error| error.to_string())?;
+        let oid = oid.trim();
+        if oid.is_empty() {
+            return Err("git rev-parse returned an empty ref OID".to_string());
+        }
+        return Ok(Some(oid.to_string()));
+    }
+    if matches!(
+        &outcome,
+        thegn_core::git_run::GitOutcome::Exit { code: Some(1), .. }
+    ) {
+        return Ok(None);
+    }
+    Err(outcome.to_string())
 }
 
 fn parse_ref_listing(stdout: &[u8]) -> Result<Vec<String>> {
@@ -251,19 +292,17 @@ fn parse_ref_listing(stdout: &[u8]) -> Result<Vec<String>> {
         .collect())
 }
 
-#[expect(clippy::disallowed_methods)] // off-loop: merge-queue drain (spawn_blocking / CLI)
 fn enumerate_stale_refs(target: &GitLoc, prefix: &str) -> Result<Vec<String>> {
-    let output = target
-        .git_command(&["for-each-ref", "--count=64", "--format=%(refname)", prefix])
-        .output()
-        .context("spawn git for-each-ref")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git for-each-ref failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let outcome = target.git_run(
+        &["for-each-ref", "--count=64", "--format=%(refname)", prefix],
+        &thegn_core::git_run::GitPolicy::read(crate::integrate::DRIVER_SUBPROCESS_TIMEOUT),
+        &AtomicBool::new(false),
+    );
+    match outcome {
+        thegn_core::git_run::GitOutcome::Ok(stdout) => parse_ref_listing(&stdout),
+        thegn_core::git_run::GitOutcome::EmptyOk => Ok(Vec::new()),
+        other => anyhow::bail!("git for-each-ref failed: {other}"),
     }
-    parse_ref_listing(&output.stdout)
 }
 
 /// Result of comparing the live source host branch to the ingested OID.
@@ -655,10 +694,8 @@ fn fetch_from_custody(
     );
     if !outcome.is_success() {
         let outcome_text = outcome.to_string();
-        if let Some(actual) = target.git_out(&["rev-parse", &staging_ref])
-            && !target.git_ok(&["update-ref", "-d", &staging_ref, &actual])
-        {
-            tracing::warn!(ref_name = %staging_ref, "failed to remove staging ref after bundle fetch failure");
+        if let Err(error) = remove_staging_ref(target, &staging_ref) {
+            tracing::warn!(ref_name = %staging_ref, error = %error, "failed to remove staging ref after bundle fetch failure");
         }
         let error = match outcome {
             thegn_core::git_run::GitOutcome::Timeout => IngestError::Timeout {
@@ -680,10 +717,8 @@ fn fetch_from_custody(
     let fetch_head = match CliGit.rev_parse(target, &staging_ref) {
         Ok(oid) => oid,
         Err(error) => {
-            if let Some(actual) = target.git_out(&["rev-parse", &staging_ref])
-                && !target.git_ok(&["update-ref", "-d", &staging_ref, &actual])
-            {
-                tracing::warn!(ref_name = %staging_ref, "failed to remove unreadable bundle staging ref");
+            if let Err(cleanup_error) = remove_staging_ref(target, &staging_ref) {
+                tracing::warn!(ref_name = %staging_ref, error = %cleanup_error, "failed to remove unreadable bundle staging ref");
             }
             let cleanup = tmp.finish();
             return match cleanup {
@@ -695,31 +730,44 @@ fn fetch_from_custody(
         }
     };
     if fetch_head != expected {
-        if !target.git_ok(&["update-ref", "-d", &staging_ref, &fetch_head]) {
-            tracing::warn!(ref_name = %staging_ref, "failed to remove mismatched bundle staging ref");
+        if let Err(error) = ref_update(target, &["update-ref", "-d", &staging_ref, &fetch_head]) {
+            tracing::warn!(ref_name = %staging_ref, error = %error, "failed to remove mismatched bundle staging ref");
         }
         tmp.finish().context("cleanup mismatched fetched bundle")?;
         anyhow::bail!("bundled tip differs from the branch-host tip; retry");
     }
     let zero_oid = "0".repeat(expected.len());
-    if !target.git_ok(&["update-ref", target_ref, expected, &zero_oid]) {
-        if !target.git_ok(&["update-ref", "-d", &staging_ref, expected]) {
-            tracing::warn!(ref_name = %staging_ref, "failed to remove staging ref after create-only publication failure");
+    if let Err(publication_error) =
+        ref_update(target, &["update-ref", target_ref, expected, &zero_oid])
+    {
+        if let Err(error) = ref_update(target, &["update-ref", "-d", &staging_ref, expected]) {
+            tracing::warn!(ref_name = %staging_ref, error = %error, "failed to remove staging ref after create-only publication failure");
         }
-        tmp.finish()
-            .context("cleanup after create-only ref publication failure")?;
-        anyhow::bail!("create-only merge-queue ingest ref publication failed");
+        if let Err(cleanup) = tmp.finish() {
+            anyhow::bail!(
+                "create-only merge-queue ingest ref publication failed: {publication_error}; bundle custody cleanup failed: {cleanup}"
+            );
+        }
+        anyhow::bail!("create-only merge-queue ingest ref publication failed: {publication_error}");
     }
-    if !target.git_ok(&["update-ref", "-d", &staging_ref, expected]) {
-        tracing::warn!(ref_name = %staging_ref, "failed to remove merge-queue bundle staging ref");
+    if let Err(error) = ref_update(target, &["update-ref", "-d", &staging_ref, expected]) {
+        tracing::warn!(ref_name = %staging_ref, error = %error, "failed to remove merge-queue bundle staging ref");
     }
     if let Err(error) = tmp.finish() {
-        if !target.git_ok(&["update-ref", "-d", target_ref, expected]) {
-            tracing::warn!(ref_name = %target_ref, "failed to remove ingest ref after bundle cleanup failure");
+        if let Err(cleanup_error) = ref_update(target, &["update-ref", "-d", target_ref, expected])
+        {
+            tracing::warn!(ref_name = %target_ref, error = %cleanup_error, "failed to remove ingest ref after bundle cleanup failure");
         }
         return Err(error).context("cleanup fetched bundle");
     }
     Ok(())
+}
+
+fn remove_staging_ref(target: &GitLoc, staging_ref: &str) -> std::result::Result<(), String> {
+    match ref_oid(target, staging_ref)? {
+        Some(actual) => ref_update(target, &["update-ref", "-d", staging_ref, &actual]),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -749,6 +797,37 @@ mod tests {
     #[test]
     fn empty_stale_ref_listing_is_successful_and_empty() {
         assert_eq!(parse_ref_listing(b"").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ref_oid_tells_absent_from_a_failed_read() {
+        let fixture = stores("source");
+        let target = GitLoc::Local(fixture.target.clone());
+        assert_eq!(ref_oid(&target, "refs/thegn/mq/none"), Ok(None));
+        assert!(matches!(
+            ref_oid(&target, "HEAD"),
+            Ok(Some(oid)) if (oid.len() == 40 || oid.len() == 64)
+                && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ));
+        let missing = GitLoc::Local(fixture._root.path().join("missing"));
+        assert!(ref_oid(&missing, "HEAD").is_err());
+    }
+
+    #[test]
+    fn ref_update_reports_git_refusal() {
+        let fixture = stores("source");
+        let target = GitLoc::Local(fixture.target.clone());
+        let result = ref_update(
+            &target,
+            &[
+                "update-ref",
+                "-d",
+                "refs/heads/main",
+                "0123456789012345678901234567890123456789",
+            ],
+        );
+        assert!(matches!(result, Err(reason) if reason.contains("Git exited")));
+        assert!(ref_oid(&target, "refs/heads/main").unwrap().is_some());
     }
 
     #[test]
@@ -1009,6 +1088,32 @@ mod tests {
         );
         drop(ingested);
         assert!(list_refs(&fixture.target).is_empty());
+    }
+
+    #[test]
+    fn create_only_publication_failure_names_git_reason() {
+        use thegn_core::util;
+
+        let fixture = stores("source");
+        let temp_root = tempfile::tempdir().unwrap();
+        let generated = generation_ref(&GitLoc::Local(fixture.source.clone()), "feat").unwrap();
+        let target_head = util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+        git(&fixture.target, &["update-ref", &generated, &target_head]);
+        let mut custody = BundleTemp::new_in(temp_root.path()).unwrap();
+        let source = GitLoc::Local(fixture.source.clone());
+        let bundle_command = source.git_command(&["bundle", "create", "-", "refs/heads/feat"]);
+        stream_bundle(bundle_command, &mut custody, &BundleLimits::production()).unwrap();
+
+        let result = fetch_from_custody(
+            &GitLoc::Local(fixture.target.clone()),
+            "feat",
+            custody,
+            &generated,
+            &fixture.oid,
+        );
+        assert!(matches!(result, Err(error) if format!("{error:#}").contains("Git exited")));
+        assert_eq!(list_refs(&fixture.target), vec![generated]);
+        assert_eq!(std::fs::read_dir(temp_root.path()).unwrap().count(), 0);
     }
 
     #[test]

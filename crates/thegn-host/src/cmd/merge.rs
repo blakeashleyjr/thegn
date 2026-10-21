@@ -35,6 +35,12 @@ pub enum Action {
         /// Enqueue every eligible worktree branch in this repo.
         #[arg(long)]
         all: bool,
+        /// Record an override for an unsatisfied pipeline gate.
+        #[arg(long, requires = "why", conflicts_with = "all")]
+        admin: bool,
+        /// Reason recorded on the pipeline row for the override.
+        #[arg(long, value_name = "REASON", requires = "admin")]
+        why: Option<String>,
     },
     /// Remove a worktree from the queue.
     Rm {
@@ -138,7 +144,15 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     }
     match action {
         Action::List { json } => list(json),
-        Action::Add { worktrees, all } => add(cfg, worktrees, all),
+        Action::Add {
+            worktrees,
+            all,
+            admin,
+            why,
+        } => {
+            let admin_why = if admin { why.as_deref() } else { None };
+            add_with(cfg, worktrees, all, false, admin_why)
+        }
         Action::Rm { target } => rm(cfg, target.get()),
         Action::Clear => clear(cfg),
         Action::Sweep { force } => sweep(cfg, force),
@@ -510,13 +524,19 @@ fn effective_remote_mode(
     )
 }
 
-fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
-    add_quiet(cfg, worktrees, all, false)
-}
-
 /// `add`, with its human output suppressible so `drain --all --json` can enqueue
 /// without printing prose ahead of the single JSON document.
 fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Result<()> {
+    add_with(cfg, worktrees, all, quiet, None)
+}
+
+fn add_with(
+    cfg: &Config,
+    worktrees: Vec<String>,
+    all: bool,
+    quiet: bool,
+    admin_why: Option<&str>,
+) -> Result<()> {
     // route_to_host: a provisioned sprite (host control endpoint + token in its
     // env) sends the enqueue to the host's daemon so the host's queue owns the
     // row. `--all` enumerates local branches, so it stays on the local path.
@@ -555,12 +575,43 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
                 );
             }
         }
+        let mut refused = 0usize;
+        let mut refusal_details = Vec::new();
         for (branch, wt) in &cands.worktrees {
-            crate::merge_ops::enqueue_bound_local(&db, wt, branch, &target)?;
-            crate::merge_lifecycle::apply(mq, &db, &root, wt, branch, LifecycleEvent::Enqueued);
-            if !quiet {
-                outln!("  + queued {branch}");
+            match crate::merge_ops::enqueue_bound_local_with(&db, wt, branch, &target, admin_why) {
+                Ok(()) => {
+                    crate::merge_lifecycle::apply(
+                        mq,
+                        &db,
+                        &root,
+                        wt,
+                        branch,
+                        LifecycleEvent::Enqueued,
+                    );
+                    if !quiet {
+                        outln!("  + queued {branch}");
+                    }
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>(
+                        )
+                        .is_some() =>
+                {
+                    refused += 1;
+                    refusal_details.push(format!("{branch}: {error}"));
+                    if !quiet {
+                        outln!("  ! refused {branch}: {error}");
+                    }
+                }
+                Err(error) => return Err(error),
             }
+        }
+        if refused > 0 {
+            return Err(crate::merge_ops::PipelineWorktreeRefusals {
+                details: refusal_details,
+            }
+            .into());
         }
         return Ok(());
     }
@@ -570,16 +621,38 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
     } else {
         worktrees.iter().map(PathBuf::from).collect()
     };
+    let mut refusal_details = Vec::new();
     for wt in paths {
-        let msg = crate::merge_ops::enqueue_worktree(cfg, &db, &wt)?;
-        let mark = if msg.starts_with("skipped") {
-            "•"
-        } else {
-            "+"
-        };
-        if !quiet {
-            outln!("  {mark} {msg}");
+        match crate::merge_ops::enqueue_worktree_with(cfg, &db, &wt, admin_why) {
+            Ok(msg) => {
+                let mark = if msg.starts_with("skipped") {
+                    "•"
+                } else {
+                    "+"
+                };
+                if !quiet {
+                    outln!("  {mark} {msg}");
+                }
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
+                    .is_some() =>
+            {
+                let wt_name = wt.to_string_lossy();
+                refusal_details.push(format!("{wt_name}: {error}"));
+                if !quiet {
+                    outln!("  ! refused {wt_name}: {error}");
+                }
+            }
+            Err(error) => return Err(error),
         }
+    }
+    if !refusal_details.is_empty() {
+        return Err(crate::merge_ops::PipelineWorktreeRefusals {
+            details: refusal_details,
+        }
+        .into());
     }
     Ok(())
 }
@@ -733,9 +806,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // chatter from `--all`, the banner, per-branch progress, and the push
     // footer. Previously all of those printed regardless, so `--json` emitted a
     // stream of prose with one JSON object somewhere in the middle.
+    let mut add_refusal_warning = None;
     if all {
-        add_quiet(cfg, Vec::new(), true, json)?;
+        add_refusal_warning =
+            crate::merge_ops::drain_add_result(add_quiet(cfg, Vec::new(), true, json))?;
     }
+    let had_add_refusals = add_refusal_warning.is_some();
     let target = integrate::resolve_target(mq, &root);
     let rows = match rows_for_repo(&root) {
         Ok(rows) => rows,
@@ -760,6 +836,17 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     if items.is_empty() {
         // The empty path is the one a cron/CI loop hits most often, so it must
         // honour `--json` like every other path rather than printing prose.
+        if let Some(warning) = add_refusal_warning {
+            if json {
+                let mut out = merge_driver::DriveOutcome::default();
+                out.warnings.push(warning);
+                super::emit_json(&drain_json(&target, &out))?;
+            } else {
+                outln!("Warning: {warning}");
+                outln!("Nothing to drain.");
+            }
+            anyhow::bail!("merge drain completed with pipeline worktree refusals");
+        }
         if json {
             return super::emit_json(&drain_json(&target, &merge_driver::DriveOutcome::default()));
         }
@@ -847,6 +934,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
             .into_iter()
             .map(|branch| format!("{branch}: claimed by another drain; target update skipped")),
     );
+    if let Some(warning) = add_refusal_warning {
+        out.warnings.push(warning);
+    }
     crate::merge_notify::record_cli_drain(cfg, &db, &steps, &out);
 
     // push mode: converge by pushing the advanced target to origin. Done before
@@ -927,6 +1017,9 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     }
     if !out.persistence_errors.is_empty() || !out.bookkeeping_failed.is_empty() {
         anyhow::bail!("merge drain partially completed; see the structured outcome above");
+    }
+    if had_add_refusals {
+        anyhow::bail!("merge drain completed with pipeline worktree refusals");
     }
     Ok(())
 }

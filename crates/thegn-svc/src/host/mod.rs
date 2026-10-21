@@ -539,16 +539,15 @@ impl OciRunner {
         cmd: &str,
         timeout: Duration,
     ) -> Result<(bool, String, String), String> {
+        if !valid_container_ref(container) {
+            return Err(format!(
+                "container exec: refusing invalid container reference {container:?}"
+            ));
+        }
         let bin = self.runtime_bin()?;
-        self.exec(
-            &format!(
-                "{bin} exec {container} /bin/sh -lc {}",
-                thegn_core::util::sh_quote(cmd)
-            ),
-            timeout,
-        )
-        .map(ExecOut::tuple)
-        .map_err(|f| f.msg("container exec"))
+        self.exec(&container_shell_cmd(bin, container, false, cmd), timeout)
+            .map(ExecOut::tuple)
+            .map_err(|f| f.msg("container exec"))
     }
 
     /// Pipe a locally-produced stream into a command on the host: spawn
@@ -623,6 +622,11 @@ impl OciRunner {
         dest: &str,
         timeout: Duration,
     ) -> Result<(), String> {
+        if !valid_container_ref(container) {
+            return Err(format!(
+                "container exec: refusing invalid container reference {container:?}"
+            ));
+        }
         let bin = self.runtime_bin()?;
         let local = vec![
             "tar".to_string(),
@@ -632,10 +636,7 @@ impl OciRunner {
             "-".to_string(),
             ".".to_string(),
         ];
-        let host_cmd = format!(
-            "{bin} exec -i {container} /bin/sh -lc {}",
-            thegn_core::util::sh_quote(&format!("mkdir -p {dest} && tar -xf - -C {dest}"))
-        );
+        let host_cmd = container_shell_cmd(bin, container, true, &untar_into_script(dest));
         self.pipe_local_to_host(&local, &host_cmd, timeout)
     }
 
@@ -760,6 +761,26 @@ impl OciRunner {
         }
         Err(format!("manifest inspect {target}: {last_err}"))
     }
+}
+
+fn valid_container_ref(container: &str) -> bool {
+    !container.is_empty() && !container.starts_with('-') && !container.chars().any(char::is_control)
+}
+
+fn container_shell_cmd(bin: &str, container: &str, stdin: bool, script: &str) -> String {
+    format!(
+        "{bin} exec{} {} /bin/sh -lc {}",
+        if stdin { " -i" } else { "" },
+        thegn_core::util::sh_quote(container),
+        thegn_core::util::sh_quote(script)
+    )
+}
+
+fn untar_into_script(dest: &str) -> String {
+    format!(
+        "mkdir -p -- {d} && tar -xf - -C {d}",
+        d = thegn_core::util::sh_quote(dest)
+    )
 }
 
 /// sha256 of a local FILE via `sha256sum` (streaming; archives are GBs).
@@ -1224,6 +1245,58 @@ mod tests {
         assert!(
             err.contains("pipe: host cmd") && err.contains("exit 3"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn container_shell_cmd_quotes_the_container_and_the_script() {
+        assert_eq!(
+            container_shell_cmd("podman", "thegn-w1", true, "true"),
+            "podman exec -i thegn-w1 /bin/sh -lc true"
+        );
+        assert!(
+            container_shell_cmd("docker", "a b;rm -rf x", false, "true").contains("'a b;rm -rf x'")
+        );
+    }
+
+    #[test]
+    fn untar_script_quotes_a_hostile_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("hello.txt"), b"payload").unwrap();
+        let root_text = root.path().to_string_lossy();
+        let dest = format!("{root_text}/home dir; touch {root_text}/CANARY");
+        let local = vec![
+            "tar".to_string(),
+            "-C".to_string(),
+            src.to_string_lossy().into_owned(),
+            "-cf".to_string(),
+            "-".to_string(),
+            ".".to_string(),
+        ];
+        OciRunner::new(Placement::Local)
+            .pipe_local_to_host(&local, &untar_into_script(&dest), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&dest).join("hello.txt")).unwrap(),
+            b"payload"
+        );
+        assert!(!root.path().join("CANARY").exists());
+    }
+
+    #[test]
+    fn invalid_container_refs_are_refused_before_exec() {
+        for invalid in ["", "-rm", "--privileged", "a\nb"] {
+            assert!(!valid_container_ref(invalid), "accepted {invalid:?}");
+        }
+        assert!(valid_container_ref("thegn-w1"));
+        let runner = runner_with_runtime("ARCH=x86_64\nOS=linux\nPODMAN=4.9.3\n");
+        assert!(
+            runner
+                .exec_in_container("-x", "true", Duration::from_secs(1))
+                .unwrap_err()
+                .contains("invalid container reference")
         );
     }
 

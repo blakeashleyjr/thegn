@@ -1496,6 +1496,12 @@ pub fn sync_rebase_flow(git: &mut GitUi, banner: Option<(&str, usize)>) -> Optio
     }
 }
 
+/// Whether hydration may mirror an external rebase/merge into the flow: never while one of OUR
+/// ops is pending (its result is authoritative), never from an unknown merge probe (THE-375).
+pub fn mirror_external_flows(git: &GitUi, merge_unknown: bool) -> bool {
+    git.pending.is_none() && !merge_unknown
+}
+
 /// Mirror an externally-driven merge / cherry-pick / revert into `git.flow`,
 /// tracking the initial conflict count for the progress bar. Clears stale
 /// flows when the banner disappears — AND when the banner's KIND changes
@@ -2715,6 +2721,22 @@ mod tests {
         git.flow = GitFlow::None;
         sync_rebase_flow(&mut git, Some(("MERGING", 1)));
         assert_eq!(git.flow, GitFlow::None);
+    }
+
+    #[test]
+    fn external_flow_mirror_skips_unknown_merge_state() {
+        let mut git = GitUi::default();
+        assert!(mirror_external_flows(&git, false));
+        assert!(!mirror_external_flows(&git, true));
+
+        git.flow = GitFlow::Rebase(RebaseUi {
+            running: true,
+            ..RebaseUi::default()
+        });
+        if mirror_external_flows(&git, true) {
+            sync_rebase_flow(&mut git, None);
+        }
+        assert!(matches!(&git.flow, GitFlow::Rebase(r) if r.running));
     }
 
     #[test]

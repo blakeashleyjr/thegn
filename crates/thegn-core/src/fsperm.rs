@@ -593,6 +593,44 @@ impl PrivateDir {
         &self.path
     }
 
+    /// Create an owner-only temporary file relative to this pinned directory.
+    /// The returned name can be passed to [`Self::remove_file`] for cleanup.
+    #[cfg(unix)]
+    pub fn create_owner_only_temp(&self, bytes: &[u8]) -> std::io::Result<(String, PathBuf)> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        for _ in 0..8 {
+            let name = format!("prompt-{}", temp_token());
+            let fd = match openat(
+                &self.fd,
+                name.as_str(),
+                OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_WRONLY
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::EEXIST) => continue,
+                Err(error) => return Err(nix_io_error(error)),
+            };
+            let mut file = std::fs::File::from(fd);
+            if let Err(error) = file.write_all(bytes) {
+                if let Err(cleanup_error) = self.remove_file(&name) {
+                    tracing::debug!(%cleanup_error, "unable to remove incomplete private temporary file");
+                }
+                return Err(error);
+            }
+            return Ok((name.clone(), self.path.join(name)));
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique private temporary file",
+        ))
+    }
+
     /// Open one regular file without following a leaf symlink, relative to
     /// this held directory handle.
     pub fn open_regular_nofollow(&self, name: &str) -> std::io::Result<std::fs::File> {
@@ -666,6 +704,67 @@ impl PrivateDir {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(error) => Err(error),
             }
+        }
+    }
+
+    /// Create or open a lock file beneath this held private directory without
+    /// following a leaf symlink. The file is never truncated.
+    pub fn open_or_create_regular_nofollow(&self, name: &str) -> std::io::Result<std::fs::File> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::{SFlag, fstat};
+            let fd = openat(
+                &self.fd,
+                name_path,
+                OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::from_bits_truncate(0o600),
+            )
+            .map_err(|error| {
+                if error == nix::errno::Errno::EISDIR {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "private directory entry is not a regular file",
+                    )
+                } else {
+                    nix_io_error(error)
+                }
+            })?;
+            let stat = fstat(&fd).map_err(nix_io_error)?;
+            if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "private directory entry is not a regular file",
+                ));
+            }
+            if stat.st_uid != nix::unistd::geteuid().as_raw() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "private directory entry is owned by another user",
+                ));
+            }
+            Ok(std::fs::File::from(fd))
+        }
+        #[cfg(not(unix))]
+        {
+            match std::fs::symlink_metadata(self.path.join(name_path)) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "private directory entry is not a regular file",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(self.path.join(name_path))
         }
     }
 
@@ -2253,5 +2352,56 @@ mod tests {
 
         let error = pinned.open_regular_nofollow("child").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn open_or_create_regular_nofollow_creates_an_owner_only_file_once() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        let pinned = open_private_dir(&private).unwrap();
+
+        let mut first = pinned.open_or_create_regular_nofollow("lock").unwrap();
+        first.write_all(b"x").unwrap();
+        let _second = pinned.open_or_create_regular_nofollow("lock").unwrap();
+
+        assert_eq!(std::fs::metadata(private.join("lock")).unwrap().len(), 1);
+        assert!(
+            mode_bits(&private.join("lock"))
+                .unwrap()
+                .is_none_or(|mode| mode & 0o777 == 0o600)
+        );
+    }
+
+    #[test]
+    fn open_or_create_regular_nofollow_refuses_a_symlink_and_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        ensure_private_dir(&private).unwrap();
+        std::fs::create_dir(private.join("child")).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        let pinned = open_private_dir(&private).unwrap();
+
+        assert_eq!(
+            pinned
+                .open_or_create_regular_nofollow("child")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(pinned.open_or_create_regular_nofollow("../x").is_err());
+        if let Err(error) = create_symlink(&outside, &private.join("link"), false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+
+        assert!(pinned.open_or_create_regular_nofollow("link").is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
     }
 }

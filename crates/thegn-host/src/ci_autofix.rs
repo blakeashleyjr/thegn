@@ -348,10 +348,8 @@ fn consider_candidate_with_forge(
         return;
     }
     let (vars, prompt) = prepared.expect("prepared dispatch admitted only with a prompt");
-    // Claim only after every safety and prompt gate has passed, immediately
-    // before consuming the attempt and spawning. A refresh race therefore
-    // spends at most one dispatch without permanently suppressing a candidate
-    // that was held by infrastructure or rejected by prompt validation.
+    // The candidate claim and attempt spend now share the PR-agent admission
+    // transaction, after every safety and prompt gate has passed.
     if let Err(reason) = crate::pr_authorship::revalidate(
         authorship.as_ref(),
         db,
@@ -379,36 +377,43 @@ fn consider_candidate_with_forge(
         notify(format!("CI autofix for PR #{} held: {detail}", item.number));
         return;
     }
-    if !db.claim_ci_autofix(&candidate).unwrap_or(false) {
-        return;
-    }
     let next_attempt = item.agent_attempts.saturating_add(1);
-    if let Err(error) = db.set_pr_agent_attempts(&item.key, next_attempt) {
-        tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "could not spend CI autofix attempt; agent dispatch refused");
-        notify(format!(
-            "CI autofix for PR #{} held: could not record the dispatch ({error})",
-            item.number
-        ));
-        return;
-    }
     let note = format!(
         "CI autofix dispatched ({next_attempt}/{})",
         pq.agent_max_attempts
     );
-    if let Err(error) = db.update_pr_status(
-        &item.key,
-        PrqStatus::AgentRunning.as_str(),
-        Some("ci"),
-        Some(&note),
-        Some(entry.head_sha.as_str()),
-    ) {
-        tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, attempt = next_attempt, "could not stamp CI autofix row running; agent dispatch refused");
-        notify(format!(
-            "CI autofix for PR #{} held: could not record the dispatch ({error}); attempt {next_attempt} remains spent",
-            item.number
-        ));
-        return;
-    }
+    let owner = crate::pr_agent_lease::owner_hint();
+    let request = thegn_core::pr_queue::PrAgentAdmit {
+        key: &item.key,
+        expected_attempts: item.agent_attempts,
+        expected_checkout_gen: item.checkout_gen,
+        max_attempts: pq.agent_max_attempts,
+        head: &entry.head_sha,
+        blocker: "ci",
+        detail: &note,
+        lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+        owner_hint: Some(&owner),
+        ci_candidate: Some(&candidate),
+    };
+    let guard = match crate::pr_agent_lease::PrAgentGuard::admit(db, &request) {
+        Ok(Ok(guard)) => guard,
+        Ok(Err(thegn_core::pr_queue::PrAgentRefusal::DuplicateCandidate)) => return,
+        Ok(Err(refusal)) => {
+            notify(format!(
+                "CI autofix for PR #{} held: {refusal}",
+                item.number
+            ));
+            return;
+        }
+        Err(error) => {
+            notify(format!(
+                "CI autofix for PR #{} held: could not record the dispatch ({error})",
+                item.number
+            ));
+            return;
+        }
+    };
+    tracing::debug!(target: "thegn::ci_autofix", pr = item.number, attempt = guard.attempt(), "CI autofix agent admitted under PR lease");
     let exited_zero = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
         kind: thegn_core::agent_task::TaskKind::PrCiFailure,
         worktree,
@@ -424,7 +429,16 @@ fn consider_candidate_with_forge(
     } else {
         "exit failed"
     };
-    restamp_after_agent(db, &item.key, outcome);
+    let finished = format!("CI autofix finished ({outcome}); awaiting the next PR refresh");
+    match guard.finish(db, Some((PrqStatus::BlockedCi.as_str(), &finished))) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(target: "thegn::ci_autofix", pr = item.number, "CI autofix PR-agent lease was lost before release")
+        }
+        Err(error) => {
+            tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "could not release CI autofix PR-agent lease")
+        }
+    }
 }
 
 fn hold_identity_mismatch(
@@ -446,33 +460,6 @@ fn hold_identity_mismatch(
     notify(format!("CI autofix for PR #{number} held: {detail}"));
 }
 
-fn restamp_after_agent(db: &thegn_core::db::Db, key: &str, outcome: &str) {
-    let rows = match db.list_pr_queue() {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(target: "thegn::ci_autofix", %error, "could not re-read PR queue row after CI autofix");
-            return;
-        }
-    };
-    let Some(row) = rows.into_iter().find(|row| row.key == key) else {
-        return;
-    };
-    if row.status != PrqStatus::AgentRunning.as_str() {
-        return;
-    }
-    if let Err(error) = db.update_pr_status(
-        key,
-        PrqStatus::BlockedCi.as_str(),
-        Some("ci"),
-        Some(&format!(
-            "CI autofix finished ({outcome}); awaiting the next PR refresh"
-        )),
-        None,
-    ) {
-        tracing::warn!(target: "thegn::ci_autofix", %error, "could not record completed CI autofix status");
-    }
-}
-
 fn head_is_current(
     forge: &dyn Forge,
     loc: &thegn_core::remote::GitLoc,
@@ -486,7 +473,7 @@ fn head_is_current(
 }
 
 #[cfg(test)]
-mod authorship_tests {
+mod tests {
     use super::*;
     use crate::pr_authorship::tests::Fixture;
     use std::sync::atomic::Ordering;
@@ -757,10 +744,16 @@ mod authorship_tests {
                         .message
                         .contains("could not record the dispatch"))
         );
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
+        );
     }
 
     #[test]
-    fn failed_running_stamp_prevents_ci_agent_spawn_and_reports_spent_attempt() {
+    fn failed_running_stamp_spends_nothing_and_leaves_candidate_unclaimed() {
         let fixture = Fixture::new();
         let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
         let conn = rusqlite::Connection::open(&handoff.db_path).unwrap();
@@ -773,7 +766,7 @@ mod authorship_tests {
 
         let row = handoff.db.list_pr_queue().unwrap().remove(0);
         assert!(!handoff.sentinel.exists());
-        assert_eq!(row.agent_attempts, 1);
+        assert_eq!(row.agent_attempts, 0);
         assert_ne!(row.status, PrqStatus::AgentRunning.as_str());
         assert!(
             handoff
@@ -782,7 +775,15 @@ mod authorship_tests {
                 .unwrap()
                 .iter()
                 .any(|notification| notification.message.contains("held")
-                    && notification.message.contains("attempt 1 remains spent"))
+                    && notification
+                        .message
+                        .contains("could not record the dispatch"))
+        );
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
         );
     }
 
@@ -794,6 +795,21 @@ mod authorship_tests {
         db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
             .unwrap();
         let row = db.list_pr_queue().unwrap().remove(0);
+        let request = thegn_core::pr_queue::PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "initial-head",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = crate::pr_agent_lease::PrAgentGuard::admit(&db, &request)
+            .unwrap()
+            .unwrap();
         db.update_pr_status(
             &row.key,
             PrqStatus::Merged.as_str(),
@@ -803,7 +819,11 @@ mod authorship_tests {
         )
         .unwrap();
 
-        restamp_after_agent(&db, &row.key, "exit ok");
+        assert!(
+            guard
+                .finish(&db, Some((PrqStatus::BlockedCi.as_str(), "finished")))
+                .unwrap()
+        );
 
         let current = db.list_pr_queue().unwrap().remove(0);
         assert_eq!(current.status, PrqStatus::Merged.as_str());
@@ -811,13 +831,40 @@ mod authorship_tests {
 
         db.update_pr_status(
             &row.key,
-            PrqStatus::AgentRunning.as_str(),
+            PrqStatus::BlockedCi.as_str(),
             Some("ci"),
             None,
             None,
         )
         .unwrap();
-        restamp_after_agent(&db, &row.key, "exit failed");
+        let request = thegn_core::pr_queue::PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: current.agent_attempts,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "admitted-head",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = crate::pr_agent_lease::PrAgentGuard::admit(&db, &request)
+            .unwrap()
+            .unwrap();
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::AgentRunning.as_str(),
+            Some("ci"),
+            None,
+            Some("newer-head"),
+        )
+        .unwrap();
+        assert!(
+            guard
+                .finish(&db, Some((PrqStatus::BlockedCi.as_str(), "finished")))
+                .unwrap()
+        );
 
         let current = db.list_pr_queue().unwrap().remove(0);
         assert_eq!(current.status, PrqStatus::BlockedCi.as_str());
@@ -1197,6 +1244,56 @@ mod authorship_tests {
                     notification
                         .message
                         .contains("was not dispatched: prompt is invalid")
+                })
+        );
+    }
+
+    #[test]
+    fn ci_autofix_is_refused_while_another_pr_agent_lease_is_held() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        let request = thegn_core::pr_queue::PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: &handoff.entry.head_sha,
+            blocker: "ci",
+            detail: "PR driver",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("PR driver"),
+            ci_candidate: None,
+        };
+        assert!(matches!(
+            handoff.db.admit_pr_agent(&request).unwrap(),
+            thegn_core::pr_queue::PrAgentAdmission::Admitted(_)
+        ));
+        handoff
+            .db
+            .update_pr_status(&row.key, PrqStatus::BlockedCi.as_str(), None, None, None)
+            .unwrap();
+
+        consider(&handoff, false);
+
+        let current = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(current.agent_attempts, 1);
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| {
+                    notification.message.contains("held:")
+                        && notification.message.contains("another PR agent holds")
                 })
         );
     }

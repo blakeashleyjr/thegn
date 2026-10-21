@@ -15,6 +15,8 @@ ever checking `main` out. Enable it with `[merge_queue] enabled = true`.
 
 ## Queueing
 
+A worktree with pipeline rows is admitted only when its newest row that is not failed or abandoned is finished and has a trusted gate attestation for the enqueued commit. `thegn merge add <worktree> --admin --why <reason>` records an override on that pipeline row.
+
 Add the current worktree's branch from the [[panel]]'s _merge_ section,
 the sidebar row menu, or `thegn merge add` in the pane. The queue is
 persisted; entries survive restarts. The section shows the active
@@ -67,6 +69,8 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   worktree off that branch, the row is held `agent_blocked` with an
   `identity drift:` reason and no attempt spent. `thegn merge add` re-enqueues
   it against the current tip.
+- If a fixing agent does not start, the row is held `agent_blocked` with no
+  attempt spent; `thegn merge retry` re-arms it.
 - `thegn merge clear` removes unclaimed rows. Rows held by an active drain
   stay queued, are named in the error, and require another clear after the
   drain finishes.
@@ -204,6 +208,10 @@ drain time the branch's tip is bundle-fetched into the target store
 before it folds. A branch whose host is unreachable is **deferred** (with
 the reason), never silently dropped, and retried on the next drain.
 
+A tip from another host is streamed into private local storage in a bundle
+capped at 4 GiB and bounded by the drain's subprocess deadline. A size,
+timeout, producer, storage, or validation failure defers the row with the reason.
+
 Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
 it on — the fold, gate, and ref-advance must be co-located with `main`.
@@ -278,6 +286,11 @@ so a drain says so out loud when `agent` names nothing that exists.
 `-p {prompt}` is right and `-p "{prompt}"` hands the agent a prompt
 wrapped in literal quote characters. `thegn config validate` catches it.
 
+`{prompt_file}` (for example, `my-agent --prompt-file {prompt_file}`) passes
+the agent an owner-only file under the worktree's git directory instead of
+putting the prompt on the command line or in `$THEGN_TASK_PROMPT`. thegn deletes
+the file when the run ends; a remote sandbox placement refuses the run.
+
 What the agent is _told_ is yours to change. Leave a prompt empty for
 thegn's built-in instructions, or override one per blocker kind:
 
@@ -306,6 +319,12 @@ point (it tests the union, which exists nowhere else), but it means
 `gate_command` cannot rely on a project-local toolchain: no
 `node_modules`, no virtualenv, no `.direnv`. Rust works out of the box
 only because `cargo` is global.
+
+Gate setup, gate and regenerate commands, custom merge drivers and rerere,
+Tests panel runs, and command-based test discovery execute candidate code on
+the host without isolation, with access to its environment, files, and network.
+`thegn doctor` lists these under “Host execution (no isolation)”; a non-empty
+failed or errored gate log starts with a line identifying host execution.
 
 Provision it with `gate_setup_command`, which runs first and is **not**
 part of the verdict:

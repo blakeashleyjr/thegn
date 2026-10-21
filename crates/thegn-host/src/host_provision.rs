@@ -29,6 +29,29 @@ const MARKER: &str = ".thegn-host-provisioned";
 const MARKER_VERSION: &str = "2";
 const TOOLCHAIN_PROVIDER_STEP: &str = "toolchain_provider";
 
+fn container_home(probe: Result<(bool, String, String), String>) -> Result<String, String> {
+    let (ok, out, stderr) =
+        probe.map_err(|error| format!("container HOME probe failed: {error}"))?;
+    if !ok {
+        let last_stderr = stderr.lines().last().unwrap_or("(empty stderr)");
+        return Err(format!("container HOME probe failed: {last_stderr}"));
+    }
+    let home = out.strip_suffix('\n').unwrap_or(&out).to_string();
+    let normalized = home == "/"
+        || (home.starts_with('/')
+            && !home.chars().any(char::is_control)
+            && home
+                .split('/')
+                .skip(1)
+                .all(|segment| !segment.is_empty() && segment != "." && segment != ".."));
+    if !normalized || home.chars().any(char::is_control) {
+        return Err(format!(
+            "container HOME is not a normalized absolute path: {home:?}"
+        ));
+    }
+    Ok(home)
+}
+
 /// Run the host-backed per-worktree pipeline. Returns the pane-entry init
 /// line when the repo landed on the synthesized-devshell tier (`None` when
 /// the repo brings its own entry — flake/direnv/devenv — or nothing applies).
@@ -91,19 +114,21 @@ pub(crate) fn provision_worktree_on_host(
 
     // 3. Remote facts: container HOME + repo detection (the worktree may only
     //    exist on the host — detect over exec, parse with the pure core fn).
-    let home = match runner.exec_in_container(&container, "printf %s \"$HOME\"", secs(30)) {
-        Ok((true, out, _)) if !out.trim().is_empty() => out.trim().to_string(),
-        _ => "/home/thegn".to_string(),
-    };
-    let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
+    let home =
+        container_home(runner.exec_in_container(&container, "printf %s \"$HOME\"", secs(30)));
     let marker_version = thegn_core::util::sh_quote(MARKER_VERSION);
-    let marker_probe = format!(
-        "test -f {marker_path} && grep -Fxq {marker_version} {marker_path} && echo HAVE || echo NEED"
-    );
-    let already = matches!(
-        runner.exec_in_container(&container, &marker_probe, secs(30)),
-        Ok((true, ref out, _)) if out.contains("HAVE")
-    );
+    let already = if let Ok(home) = &home {
+        let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
+        let marker_probe = format!(
+            "test -f {marker_path} && grep -Fxq {marker_version} {marker_path} && echo HAVE || echo NEED"
+        );
+        matches!(
+            runner.exec_in_container(&container, &marker_probe, secs(30)),
+            Ok((true, ref out, _)) if out.contains("HAVE")
+        )
+    } else {
+        false
+    };
     let (req, detect_error) =
         match crate::mise_provider::detect_on_target(runner, &container, worktree) {
             Ok(req) => (req, None),
@@ -182,6 +207,7 @@ pub(crate) fn provision_worktree_on_host(
         .collect();
     progress(&views);
     let mut all_succeeded = true;
+    let mut home_error_reported = false;
     for (i, step) in plan.steps.iter().enumerate() {
         views[i].state = ProvisionState::Active;
         progress(&views);
@@ -206,8 +232,8 @@ pub(crate) fn provision_worktree_on_host(
                         Err(e) => Err(e),
                     }
                 }
-                StepKind::Dotfiles(names) => {
-                    stage_and_push(runner, &container, &home, false, |staging| {
+                StepKind::Dotfiles(names) => match home.as_deref() {
+                    Ok(home) => stage_and_push(runner, &container, home, false, |staging| {
                         for name in names {
                             let rel = safe_relative_path(name)?;
                             let source = host_home.join(&rel);
@@ -216,18 +242,30 @@ pub(crate) fn provision_worktree_on_host(
                             stage_file(staging, &resolved, &staging.join(rel), false)?;
                         }
                         Ok(())
-                    })
-                }
-                StepKind::AgentConfigs(_) => {
-                    stage_and_push(runner, &container, &home, true, |staging| {
+                    }),
+                    Err(reason) => {
+                        home_error_reported = true;
+                        Err(format!("container HOME unusable: {reason}"))
+                    }
+                },
+                StepKind::AgentConfigs(_) => match home.as_deref() {
+                    Ok(home) => stage_and_push(runner, &container, home, true, |staging| {
                         fill_agent_config_staging(staging)
-                    })
-                }
-                StepKind::AtuinSync => {
-                    stage_and_push(runner, &container, &home, false, |staging| {
+                    }),
+                    Err(reason) => {
+                        home_error_reported = true;
+                        Err(format!("container HOME unusable: {reason}"))
+                    }
+                },
+                StepKind::AtuinSync => match home.as_deref() {
+                    Ok(home) => stage_and_push(runner, &container, home, false, |staging| {
                         fill_atuin_staging(staging, &host_home)
-                    })
-                }
+                    }),
+                    Err(reason) => {
+                        home_error_reported = true;
+                        Err(format!("container HOME unusable: {reason}"))
+                    }
+                },
                 // Provider-only machinery: no meaning on a plain OCI host.
                 StepKind::Checkpoint
                 | StepKind::HomeClosurePush(_)
@@ -253,9 +291,16 @@ pub(crate) fn provision_worktree_on_host(
         }
         progress(&views);
     }
-    if all_succeeded {
+    if all_succeeded && let Ok(home) = &home {
+        let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
         let marker_write = format!("printf '%s\\n' {marker_version} > {marker_path}");
         let _ = runner.exec_in_container(&container, &marker_write, secs(30)); // best-effort: marker write: a failed write just re-runs init on the next claim
+    } else if let Err(reason) = &home
+        && !home_error_reported
+    {
+        thegn_core::msg::warn(&format!(
+            "host worktree pipeline: container HOME unusable: {reason}; provisioning marker not recorded"
+        ));
     }
     init
 }
@@ -816,5 +861,50 @@ mod tests {
             safe_relative_path(".config/app/file").unwrap(),
             std::path::PathBuf::from(".config/app/file")
         );
+    }
+
+    #[test]
+    fn container_home_accepts_only_absolute_normalized_paths() {
+        for (raw, expected) in [
+            ("/home/thegn", "/home/thegn"),
+            ("/root", "/root"),
+            ("/", "/"),
+            ("/home/a b", "/home/a b"),
+            ("/home/x;$(y)", "/home/x;$(y)"),
+            ("/home/thegn\n", "/home/thegn"),
+        ] {
+            assert_eq!(
+                container_home(Ok((true, raw.to_string(), String::new()))).unwrap(),
+                expected
+            );
+        }
+        for raw in [
+            "",
+            "relative",
+            "/home//x",
+            "/home/x/",
+            "/home/./x",
+            "/home/../etc",
+            "/home/x\ty",
+            "/home/x\n/y",
+        ] {
+            assert!(
+                container_home(Ok((true, raw.to_string(), String::new()))).is_err(),
+                "accepted {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_home_probe_failure_is_an_error_not_a_fallback() {
+        for probe in [
+            Err("ssh down".into()),
+            Ok((false, String::new(), "boom".into())),
+            Ok((true, String::new(), String::new())),
+        ] {
+            let result = container_home(probe);
+            assert!(result.is_err());
+            assert_ne!(result.as_deref().unwrap_or_default(), "/home/thegn");
+        }
     }
 }

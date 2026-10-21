@@ -25,12 +25,15 @@ not a replay.
 (registered current and pre-upgrade daemons, the configured socket, and a live
 legacy socket), skips sockets that belong to another state directory, waits
 for each to stop answering, and exits non-zero naming any that are still
-running. With none running it prints "no thegn pane daemon is running" and
-succeeds.
+running. A listener or the registry it cannot check before the stop deadline
+is reported as unknown and makes the command exit non-zero naming it. It prints
+"no thegn pane daemon is running" only when every listener was checked and none
+is running.
 
-When the UI exits, in-flight custom git commands and CI refreshes are cancelled.
-Thegn waits up to two seconds for them before exiting; work still running after
-that is logged.
+When the UI exits, in-flight custom git commands, CI refreshes, and CI rerun or
+cancel actions are cancelled. Thegn waits up to two seconds for them before
+exiting; work still running after that is logged. A CI action requested while
+thegn is quitting is not started.
 
 The status bar's daemon chip shows whether the focused pane is
 daemon-backed; select it for the full session rollup. See [[bars]].
@@ -108,11 +111,13 @@ human, or PR open) arrive as `abandoned` with a `migrated while <status>: not
 resumed` note. Every row's artifact and chunk paths are dropped, so work is
 neither resumed nor re-dispatched under the target profile. Current layout groups/tabs are moved;
 named global layouts, caches, active transports, and whole-session focus are
-not. Opaque pane commands, scrollback, and dispatch reports remain unchanged
-in the target; notes remain unchanged apart from the migration prefix on parked
-rows. These values are omitted from human and JSON audit output.
-Credentials, tokens, identities, config overlays, accounts, pairings, and
-secrets never cross the profile boundary.
+not. By default, pane relaunch commands, scrollback, dispatch reports,
+free-form notes, and note rows are not moved; parked rows keep only the
+migration prefix. `--include-history` carries them unchanged into the target
+as plain text that may contain anything a tool printed. These values are
+omitted from human and JSON audit output. Thegn never reads or copies
+credentials, tokens, identities, accounts, pairings, or profile configuration;
+content history crosses only with `--include-history`.
 
 The move is target-first: the target rows are committed and read back under a
 sanitized fingerprint before exact source rows are deleted. Dispatch IDs are

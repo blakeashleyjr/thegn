@@ -183,13 +183,15 @@ collapse/pin state, and dispatch ledger (including notes). Active dispatch
 rows (queued, spawning, running, waiting for a human, or PR open) arrive as
 `abandoned` with a `migrated while <status>: not resumed` note; every row's
 artifact and chunk paths are dropped, so work is neither resumed nor
-re-dispatched under the target profile. Pane commands, scrollback, and reports
-are opaque text and are carried unchanged; notes are carried unchanged apart
-from the migration prefix on parked rows. These values are never printed by
-the audit. Named global layouts,
+re-dispatched under the target profile. By default, pane relaunch commands,
+scrollback, dispatch reports, free-form notes, and note rows are not moved;
+parked rows keep only the migration prefix. `--include-history` carries them
+unchanged into the target as plain text that may contain anything a tool
+printed. These values are never printed by the audit. Named global layouts,
 global caches, transports, git files/objects, branches, and worktree disk
-locations are not moved. Neither profile configuration nor credentials,
-tokens, identities, accounts, pairings, or secrets are read or copied.
+locations are not moved. Thegn never reads or copies credentials, tokens,
+identities, accounts, pairings, or profile configuration; content history
+crosses only with `--include-history`.
 
 The target transaction commits first and is read back using a sanitized
 fingerprint. Only after confirmation are the selected source rows deleted;
@@ -314,6 +316,9 @@ a satisfied attestation for the row's current HEAD; `dispatch verify` shows its
 state. The worker's own `gate:` line is a claim, not evidence. `--force --why`
 remains the recorded override.
 
+Merge-queue admission consumes the same trusted gate attestation for the enqueued
+commit.
+
 `dispatch set-status` follows a transition table: `merged` is reachable only
 from `done` or `pr_open`; `done` only from `running`, `spawning`,
 `waiting_human` or `failed`; and `queued` is never a target. Terminal rows move
@@ -322,7 +327,7 @@ With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 ...}` with an error kind of `illegal_transition`, `stale`, `missing_evidence` or
 `missing_row` before the command fails.
 
-`dispatch claim`, `session open --stage --issue` and `dispatch set-status` take `--lease <name> --owner <id>`. A claim binds the row to that lease; further claims for that issue and status changes on bound rows require the same live lease. `--admin --why '<reason>'` on claim or set-status is the manual override and is recorded on the row. Rows claimed without a lease behave as before.
+`dispatch claim`, `dispatch put`, `session open --stage --issue`, `session open --resume-work` and `dispatch set-status` take `--lease <name> --owner <id>` where applicable. A claim, put or resume binds its row to that lease; further mutations for that issue require the same live lease. `--admin --why '<reason>'` on claim, put or set-status is the manual override and is recorded on the row. Rows created without a lease behave as before.
 
 The `[pipeline.transport_retry]` budget is stored on each dispatch row and
 counted once per run. It survives daemon restarts without exceeding the
@@ -333,6 +338,12 @@ The daemon also trusts the dispatch row when deciding whether an unbound launch
 is a pipeline stage: it stops and refuses a stage row or a vanished row even if
 the client did not mark the launch as a stage. `dispatch set-status --force` on
 a missing row reports `missing_row`, including with `--json`.
+
+`session open --resume-work` and the daemon's transport retry carry the same
+stage configuration digest as a fresh stage dispatch. If the stage or agent was
+edited after the prompt was rendered, the launch is refused as changed between
+claim and launch. A launch-id-bound pipeline stage launch without a digest is
+refused. Restart the daemon after upgrading; the digest format changed.
 
 Finished rows (not review tasks) older than 90 days are pruned during
 background maintenance unless their worktree is still registered, an active

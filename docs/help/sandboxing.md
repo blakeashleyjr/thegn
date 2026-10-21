@@ -579,6 +579,13 @@ A thegn-derived VPS or Fly sandbox name is bound to the worktree that created
 it. Another worktree resolving to the same name is refused before a provider
 call.
 
+VPS and machine0 sandboxes pin their SSH host key on first contact with
+`accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or
+`$THEGN_DIR/vps/known_hosts.d/`). Thegn creates that directory with owner-only
+permissions before managed SSH connections, refuses a symlinked or
+non-private directory, requires the same key on later connections, and
+removes the pin when it destroys a VPS sandbox.
+
 If local parity fails during provider provisioning, autonomous launches on
 that worktree are refused until a later provision applies parity cleanly;
 interactive panes can still open. Host-parity closure pushes use a
@@ -593,6 +600,12 @@ the remote worktree sync plan before uploading anything. A provider sandbox's
 network policy is applied and read back before its first command; a mismatch
 stops provisioning. If an existing sandbox's policy cannot be verified, thegn
 refuses to provision it and leaves it in place.
+For provider sandboxes, network allow and block entries are trimmed,
+lowercased, stripped of a trailing dot, and deduplicated before the provider
+policy request; non-ASCII entries (use `xn--` punycode), IP literals, and
+malformed domain patterns are refused with the entry named in the error. Any
+allow entry keeps the final deny-everything-else rule, even when blocks shadow
+all allow entries.
 A provider launch using `sealed-tunnel` with a VPN configured is refused before
 provisioning; if a refused launch created its provider sandbox, thegn destroys
 that sandbox.

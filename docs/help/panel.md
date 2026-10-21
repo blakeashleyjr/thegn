@@ -240,7 +240,9 @@ on this branch".
 OPEN PRS rows are selectable. Enter on one jumps to its worktree when
 available, or opens a read-only view of that PR; write actions are refused
 there. `w` creates or jumps to a worktree on that PR's head branch. `M`
-asks for a merge method (squash by default) and lists blockers. `c`
+asks for a merge method (squash by default), lists blockers, and pins the
+merge to the PR head shown in the panel. If the PR moved, nothing is merged
+and the status says so; a forge that cannot pin the head refuses. `c`
 comments when a PR exists and asks before creating one otherwise; `r` needs
 a PR. Enter on the branch PR opens its view. At Full width it shows a
 two-column page: header and checks beside threads and OPEN PRS.

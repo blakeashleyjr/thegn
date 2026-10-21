@@ -43,6 +43,10 @@ pub enum SessionAction {
         /// Emit one redacted audit JSON document instead of human text.
         #[arg(long)]
         json: bool,
+        /// Also carry content history (scrollback, pane relaunch commands,
+        /// dispatch reports and notes) unchanged. Off by default.
+        #[arg(long)]
+        include_history: bool,
     },
     /// List the daemon's sessions — including recently exited ones (the
     /// daemon's tombstones), each marked with a liveness token.
@@ -127,7 +131,7 @@ pub enum SessionAction {
         #[arg(long, requires = "stage", conflicts_with = "resume_work")]
         chunk: Option<String>,
         /// The Lead lease this stage dispatch is made under.
-        #[arg(long, value_name = "NAME", requires_all = ["stage", "issue", "owner"], conflicts_with = "resume_work")]
+        #[arg(long, value_name = "NAME", requires = "owner")]
         lease: Option<String>,
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
@@ -469,13 +473,22 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             json,
         } => {
             use thegn_svc::control::{AgentLaunch, OpenSpec};
+            if lease.is_some() && resume_row.is_none() && (stage.is_none() || issue.is_none()) {
+                anyhow::bail!(
+                    "--lease applies to a stage dispatch (--stage --issue) or --resume-work"
+                );
+            }
+            let resume_proof = match (lease.as_deref(), owner.as_deref()) {
+                (Some(name), Some(owner)) => LeadProof::Lease { name, owner },
+                _ => LeadProof::Unbound,
+            };
             if let Some(row_id) = resume_row {
                 // The resume-of-a-failed-row composition (THE-86): the
                 // offline row checks already ran pre-`connect`; this renders
                 // the finisher prompt and opens the fresh dispatch.
                 // `--bind`/`--adopt`/`--json` shape the new session exactly
                 // as they shape a fresh one.
-                resume_work(cfg, &client, row_id, bind, adopt, json).await?;
+                resume_work(cfg, &client, row_id, bind, adopt, json, resume_proof).await?;
             } else if let (Some(stage_name), Some(issue_id)) = (stage.as_deref(), issue.as_deref())
             {
                 // The one-call stage dispatch (THE-76): the whole
@@ -951,6 +964,30 @@ fn resolve_branch(wt: &str) -> String {
     crate::worktree_snapshot::current_branch(Path::new(wt)).unwrap_or_default()
 }
 
+fn stage_dispatch_env(
+    cfg: &Config,
+    agent_name: &str,
+    stage_name: &str,
+    row_id: i64,
+) -> Result<Vec<(String, String)>> {
+    let config_digest =
+        thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, agent_name, stage_name)
+            .map_err(anyhow::Error::msg)?;
+    let launch = crate::daemon::stage_launch::mint_launch_id()
+        .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
+    Ok(vec![
+        (
+            thegn_core::issue::DISPATCH_ROW_ENV.into(),
+            row_id.to_string(),
+        ),
+        (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
+        (
+            thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+            config_digest,
+        ),
+    ])
+}
+
 /// The `--stage` dispatch: the Lead's hand-rolled loop, performed in one call
 /// (design §3 item 3). The order of operations is deliberate — the roster row
 /// goes in **before** the session opens (D5: a crash between the two leaves a
@@ -1108,11 +1145,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         // behavior for an unknown override. This is deliberately after claim:
         // resolution failures belong to the named failed roster row.
         crate::daemon::agent_open::ensure_configured_agent(cfg, &agent_name)?;
-        let config_digest =
-            thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, &agent_name, &stage.name)
-                .map_err(anyhow::Error::msg)?;
-        let launch = crate::daemon::stage_launch::mint_launch_id()
-            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
+        let env = stage_dispatch_env(cfg, &agent_name, &stage.name, row_id)?;
         let vars = stage_task_vars(
             &facts,
             &branch,
@@ -1127,17 +1160,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![
-                (
-                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                    row_id.to_string(),
-                ),
-                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
-                (
-                    thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
-                    config_digest,
-                ),
-            ],
+            env,
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1393,8 +1416,9 @@ fn claim_resume_dispatch(
     worktree: &str,
     agent_name: &str,
     json: bool,
+    proof: LeadProof<'_>,
 ) -> Result<i64> {
-    let claim = match db.claim_resume_dispatch(
+    let claim = match db.claim_resume_dispatch_led(
         row.id,
         row.status,
         NewDispatch {
@@ -1408,6 +1432,7 @@ fn claim_resume_dispatch(
             chunk_path: row.chunk_path.as_deref(),
         },
         stage.concurrency,
+        proof,
     ) {
         Ok(claim) => claim,
         Err(error) => {
@@ -1522,6 +1547,7 @@ async fn resume_work(
     bind: bool,
     adopt: bool,
     json: bool,
+    proof: LeadProof<'_>,
 ) -> Result<()> {
     use thegn_svc::control::{AgentLaunch, OpenSpec};
     let db = Db::open()?;
@@ -1558,7 +1584,7 @@ async fn resume_work(
     // the freed slot first, this attempt is safely refused rather than
     // oversubscribing the stage.
     policy_admission(cfg, &agent_name, &stage.name)?;
-    let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name, json)?;
+    let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name, json, proof)?;
     let artifact = match db.get_dispatch(new_row).and_then(|row| {
         row.and_then(|dispatch| dispatch.artifact_path)
             .ok_or_else(|| anyhow::anyhow!("stage artifact path was not stamped"))
@@ -1608,19 +1634,12 @@ async fn resume_work(
     // 7. Open — the same headless, stage-layered launch a fresh dispatch
     //    builds, seeded with the finisher prompt instead of the bare task.
     let opened = async {
-        let launch = crate::daemon::stage_launch::mint_launch_id()
-            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
+        let env = stage_dispatch_env(cfg, &agent_name, &stage.name, new_row)?;
         let spec = OpenSpec {
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![
-                (
-                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                    new_row.to_string(),
-                ),
-                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
-            ],
+            env,
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1941,6 +1960,45 @@ mod open_stage_tests {
             "work THE-76: the query is { issues { nodes { name } } } and {literal} too"
         );
     }
+
+    #[test]
+    fn stage_dispatch_env_carries_row_launch_id_and_digest() {
+        let cfg = cfg_with_stage();
+        let env = super::stage_dispatch_env(&cfg, "claude", "code", 42).expect("dispatch env");
+        assert_eq!(env.len(), 3);
+        assert!(
+            env.iter().any(|(key, value)| {
+                key == thegn_core::issue::DISPATCH_ROW_ENV && value == "42"
+            })
+        );
+        let spec = thegn_svc::control::OpenSpec {
+            env: env.clone(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            crate::daemon::stage_launch::launch_id_of(&spec),
+            Some(Ok(_))
+        ));
+        let digest = env
+            .iter()
+            .find(|(key, _)| key == thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV)
+            .map(|(_, value)| value.as_str());
+        let expected =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(&cfg, "claude", "code")
+                .expect("expected digest");
+        assert_eq!(digest, Some(expected.as_str()));
+    }
+
+    #[test]
+    fn stage_dispatch_env_refuses_an_unknown_stage() {
+        let error = super::stage_dispatch_env(&cfg_with_stage(), "claude", "missing", 42)
+            .expect_err("unknown stage refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown pipeline stage `missing`")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1950,7 +2008,7 @@ mod resume_work_tests {
         resume_claim_is_conflict, resume_conflict_payload, resume_row_checks,
     };
     use thegn_core::config_pipeline::PipelineStage;
-    use thegn_core::db::{Db, ResumeDispatchConflict};
+    use thegn_core::db::{Db, LeadLeaseConflict, LeadProof, ResumeDispatchConflict};
     use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
     use thegn_core::store::NotificationStore;
 
@@ -2131,8 +2189,16 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let finisher = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude", false)
-            .expect("reconciled source frees its slot");
+        let finisher = claim_resume_dispatch(
+            &db,
+            &source_row,
+            &stage,
+            "/wt/121",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .expect("reconciled source frees its slot");
         let source_after = db.get_dispatch(source).unwrap().unwrap();
         let finisher = db.get_dispatch(finisher).unwrap().unwrap();
         assert_eq!(source_after.status, AgentDispatchStatus::Failed);
@@ -2165,8 +2231,16 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let error = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude", false)
-            .unwrap_err();
+        let error = claim_resume_dispatch(
+            &db,
+            &source_row,
+            &stage,
+            "/wt/121",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .unwrap_err();
         assert!(
             error.downcast_ref::<crate::cmd::Retryable>().is_some(),
             "capacity refusal must be retryable: {error:#}"
@@ -2228,8 +2302,16 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let error = claim_resume_dispatch(&db, &stale_source, &stage, "/wt/121", "claude", false)
-            .unwrap_err();
+        let error = claim_resume_dispatch(
+            &db,
+            &stale_source,
+            &stage,
+            "/wt/121",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .unwrap_err();
         assert!(
             error.downcast_ref::<crate::cmd::Retryable>().is_some(),
             "concurrent verdict refusal must be retryable: {error:#}"
@@ -2244,6 +2326,56 @@ mod resume_work_tests {
         assert_eq!(
             db.get_dispatch(source).unwrap().unwrap().status,
             AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn resume_claim_lead_lease_conflict_is_not_retryable() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:X";
+        db.acquire_pipeline_lease(lease, "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        let source = db
+            .claim_dispatch_admitted_led(
+                thegn_core::issue::NewDispatch::new("linear:X", "/wt/a", "claude"),
+                2,
+                None,
+                None,
+                None,
+                LeadProof::Lease {
+                    name: lease,
+                    owner: "lead-a",
+                },
+            )
+            .unwrap()
+            .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let source_row = db.get_dispatch(source).unwrap().unwrap();
+        let stage = PipelineStage {
+            name: "code".into(),
+            concurrency: 2,
+            ..Default::default()
+        };
+
+        let error = claim_resume_dispatch(
+            &db,
+            &source_row,
+            &stage,
+            "/wt/a",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<LeadLeaseConflict>().is_some());
+        assert!(error.downcast_ref::<crate::cmd::Retryable>().is_none());
+        assert!(!resume_claim_is_conflict(&error));
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+        assert_eq!(
+            db.get_dispatch(source).unwrap().unwrap().status,
+            AgentDispatchStatus::Failed
         );
     }
 }

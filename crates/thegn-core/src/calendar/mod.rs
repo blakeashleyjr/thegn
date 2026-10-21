@@ -16,6 +16,7 @@
 //! [`crate::event_bus::Event`] already owns that name.
 
 pub mod admission;
+pub mod conformance;
 pub mod cursor;
 pub mod display;
 pub mod grid;
