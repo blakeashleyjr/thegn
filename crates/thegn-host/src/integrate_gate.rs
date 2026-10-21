@@ -1380,7 +1380,7 @@ fn capture_verdict(
 fn label_host_execution(verdict: GateVerdict) -> GateVerdict {
     match verdict {
         GateVerdict::Failed { log } => GateVerdict::Failed {
-            log: format!("{}{log}", gate::HOST_EXECUTION_LOG_HEADER),
+            log: label_host_execution_log(log),
         },
         GateVerdict::Error {
             reason,
@@ -1389,11 +1389,19 @@ fn label_host_execution(verdict: GateVerdict) -> GateVerdict {
             class,
         } => GateVerdict::Error {
             reason,
-            log: format!("{}{log}", gate::HOST_EXECUTION_LOG_HEADER),
+            log: label_host_execution_log(log),
             phase,
             class,
         },
         GateVerdict::Passed => GateVerdict::Passed,
+    }
+}
+
+fn label_host_execution_log(log: String) -> String {
+    if log.trim().is_empty() {
+        log
+    } else {
+        format!("{}{log}", gate::HOST_EXECUTION_LOG_HEADER)
     }
 }
 
