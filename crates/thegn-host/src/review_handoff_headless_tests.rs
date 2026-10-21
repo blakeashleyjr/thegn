@@ -40,6 +40,22 @@ fn forbid_launch(_: &AgentTaskRun<'_>) -> bool {
 }
 
 #[test]
+fn unsupported_platform_holds_review_before_proof_preparation_or_launch() {
+    let fixture = Fixture::new();
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let _unsupported = crate::agent_run::force_headless_unsupported();
+    let result = execute(
+        &queue(),
+        &request(&fixture),
+        Some((&fixture.db, &forge)),
+        forbid_prepare,
+        forbid_launch,
+    );
+    assert!(matches!(result, Err(error) if error.contains("THE-235")));
+    assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn owned_organization_review_proves_before_preparation_and_launches_once() {
     let fixture = Fixture::new();
     let forge = fixture.forge(vec![fixture.proof.clone()]);

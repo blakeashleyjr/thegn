@@ -1846,6 +1846,10 @@ fn harness_report(cfg: &Config) {
             }
         }
     }
+    match crate::agent_run::headless_unsupported() {
+        Some(reason) => outln!("  headless agent handoff: UNSUPPORTED — {reason}"),
+        None => outln!("  headless agent handoff: supported"),
+    }
 }
 
 fn plugin_trust_rows(cfg: &Config, config_path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -1972,6 +1976,10 @@ fn agents_json(cfg: &Config) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(agents)
+}
+
+fn headless_handoff_json(reason: Option<&str>) -> serde_json::Value {
+    serde_json::json!({ "supported": reason.is_none(), "reason": reason })
 }
 
 fn harness_json() -> serde_json::Value {
@@ -2418,6 +2426,9 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
         "agents": agents_json(cfg),
+        "headless_agent_handoff": headless_handoff_json(
+            crate::agent_run::headless_unsupported().as_deref()
+        ),
         "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
@@ -5908,5 +5919,26 @@ args = ["--verbose"]
     #[test]
     fn iroh_reach_json_key_is_present() {
         assert!(channel_json().get("iroh_reach").is_some());
+    }
+
+    #[test]
+    fn headless_handoff_json_reports_support_and_reason() {
+        assert_eq!(
+            headless_handoff_json(None),
+            serde_json::json!({ "supported": true, "reason": null })
+        );
+        let unsupported = headless_handoff_json(Some("x (THE-235)"));
+        assert!(!unsupported["supported"].as_bool().unwrap());
+        assert_eq!(unsupported["reason"], "x (THE-235)");
+    }
+
+    #[test]
+    fn doctor_json_carries_headless_agent_handoff() {
+        let report = doctor_json(&Config::default());
+        assert!(
+            report["headless_agent_handoff"]["supported"]
+                .as_bool()
+                .is_some()
+        );
     }
 }

@@ -32,6 +32,10 @@ pub(crate) fn pickup(
     if !policy.enabled {
         return;
     }
+    if let Some(reason) = autopilot_pickup_hold() {
+        tracing::warn!(target: "thegn::autopilot", %reason, "autopilot pickup held");
+        return;
+    }
     for issue in issues {
         if !matches_issue(
             issue,
@@ -91,6 +95,11 @@ pub(crate) fn pickup(
             );
         }));
     }
+}
+
+fn autopilot_pickup_hold() -> Option<String> {
+    crate::agent_run::headless_unsupported()
+        .map(|reason| format!("autopilot pickup held: {reason}"))
 }
 
 #[expect(
@@ -968,7 +977,7 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        autopilot_backend_is_isolated, autopilot_issue_router, issue_prompt,
+        autopilot_backend_is_isolated, autopilot_issue_router, autopilot_pickup_hold, issue_prompt,
         needs_human_overwrites, pr_opened_reason, record_pr_open, record_worker_result,
         tracker_config_for_account, tracker_in_progress_note, worker_failure, worker_start_reason,
     };
@@ -979,6 +988,31 @@ mod tests {
     use thegn_core::sandbox::Backend;
     use thegn_core::store::{AutopilotStore, NotificationStore};
     use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
+
+    #[test]
+    fn autopilot_pickup_holds_on_unsupported_platform() {
+        let baseline = autopilot_pickup_hold();
+        {
+            let _unsupported = crate::agent_run::force_headless_unsupported();
+            let reason = autopilot_pickup_hold().expect("forced unsupported handoff");
+            assert!(reason.contains("THE-235"));
+        }
+        assert_eq!(autopilot_pickup_hold(), baseline);
+    }
+
+    #[test]
+    fn autopilot_pickup_hold_runs_before_any_claim() {
+        let source = include_str!("autopilot_driver.rs");
+        let production = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap().0;
+        let pickup_start = production.find("pub(crate) fn pickup(").unwrap();
+        let pickup_end = production[pickup_start..].find("\n}\n").unwrap() + pickup_start;
+        let pickup = &production[pickup_start..pickup_end];
+        let hold = pickup.find(concat!("autopilot_", "pickup_hold()")).unwrap();
+        let permit = pickup.find(concat!("bg_", "permit()")).unwrap();
+        let claim = pickup.find(concat!("claim_autopilot_", "slots(")).unwrap();
+        assert!(hold < permit);
+        assert!(hold < claim);
+    }
 
     fn dispatch(db: &Db) -> i64 {
         db.put_agent_dispatch(NewDispatch::new("linear:THE-956", "/wt/956", "claude"))
