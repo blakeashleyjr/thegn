@@ -55,6 +55,11 @@ an unavailable approval never enables `protocol.file.allow` and never blocks
 the checkout itself. The mode is trusted user/workspace configuration; a repo
 cannot turn it on through its own `.thegn.toml`.
 
+A pasted git URL is cloned into a private staging directory beside the
+destination, then renamed into place only after the clone validates. A failed
+or cancelled clone leaves no destination; a destination with an origin but no
+HEAD is refused as an incomplete clone (`remove it and retry`).
+
 Lifecycle hooks apply to every creation door, including the wizard, `wt new`,
 issue dispatch, and the daemon's `worktrees.create` request. A blocking
 `pre_create` leaves both git and the database unchanged. The wizard schedules
