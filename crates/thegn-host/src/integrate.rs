@@ -30,7 +30,7 @@ use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
 use thegn_svc::git::{CasOutcome, CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 
-const DRIVER_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const DRIVER_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RefusedDrivers {
