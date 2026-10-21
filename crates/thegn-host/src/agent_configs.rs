@@ -600,10 +600,19 @@ fn account_upload_ready(
     !failed && expected == written && within_budget
 }
 
+fn account_shell_quote(path: &str) -> String {
+    let quoted = thegn_core::util::sh_quote(path);
+    if quoted == path {
+        format!("'{quoted}'")
+    } else {
+        quoted
+    }
+}
+
 fn account_publish_script(dest_root: &str, stage_root: &str) -> String {
     let state_dirs = AGENT_STATE_SKIP_DIRS
         .iter()
-        .map(|name| thegn_core::util::sh_quote(name))
+        .map(|name| account_shell_quote(name))
         .collect::<Vec<_>>()
         .join(" ");
     format!(
@@ -620,8 +629,8 @@ fn account_publish_script(dest_root: &str, stage_root: &str) -> String {
          done; \
          if ! mv -- \"$s\" \"$d\"; then restore; exit 43; fi; \
          rm -rf -- \"$o\" 2>&1 || exit 44",
-        thegn_core::util::sh_quote(dest_root),
-        thegn_core::util::sh_quote(stage_root),
+        account_shell_quote(dest_root),
+        account_shell_quote(stage_root),
     )
 }
 
@@ -1285,8 +1294,8 @@ mod tests {
         let dest = "/root/.thegn/accounts/claude/work a";
         let stage = "/root/.thegn/accounts/claude/.work-a.thegn-stage-0123456789abcdef";
         let script = account_publish_script(dest, stage);
-        assert!(script.contains(&format!("d={};", thegn_core::util::sh_quote(dest))));
-        assert!(script.contains(&format!("s={};", thegn_core::util::sh_quote(stage))));
+        assert!(script.contains(&format!("d={};", account_shell_quote(dest))));
+        assert!(script.contains(&format!("s={};", account_shell_quote(stage))));
         let aside = script.find("mv -- \"$d\" \"$o\"").unwrap();
         let promote = script.find("mv -- \"$s\" \"$d\"").unwrap();
         let remove_old = script.find("rm -rf -- \"$o\"").unwrap();
@@ -1402,7 +1411,7 @@ mod tests {
         let failed_stage = failed_stage.to_string_lossy().into_owned();
         let failed_script = account_publish_script(&home, &failed_stage);
         let fail_promotion = format!(
-            "mv() {{ if [ \"$1\" = \"$s\" ]; then return 1; fi; command mv \"$@\"; }}; {failed_script}"
+            "mv() {{ if [ \"$2\" = \"$s\" ]; then return 1; fi; command mv \"$@\"; }}; {failed_script}"
         );
         let failed_status = std::process::Command::new("/bin/sh")
             .args(["-c", &fail_promotion])
