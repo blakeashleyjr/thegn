@@ -554,7 +554,11 @@ impl Mpd {
         };
 
         match observed {
-            Ok((repeat, single)) if repeat == target.0 && single == target.1 => Ok(()),
+            Ok((repeat, single))
+                if stage != "single" && repeat == target.0 && single == target.1 =>
+            {
+                Ok(())
+            }
             Ok((repeat, single)) if repeat == previous.0 && single == previous.1 => {
                 Err(MediaError::Backend(format!(
                     "mpd {stage} update failed; loop mode unchanged: {cause}"
@@ -594,11 +598,13 @@ impl Mpd {
         cause: MediaError,
     ) -> Result<(), MediaError> {
         let restore = match self.conn().await {
-            Ok(mut conn) => {
-                conn.command(&format!("repeat {}", previous.0)).await?;
-                conn.command(&format!("single {}", previous.1)).await?;
-                Ok(())
-            }
+            Ok(mut conn) => match conn.command(&format!("repeat {}", previous.0)).await {
+                Ok(_) => conn
+                    .command(&format!("single {}", previous.1))
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         match restore {
@@ -1638,6 +1644,7 @@ mod tests {
         };
         let error = m.set_loop(LoopMode::Playlist).await.unwrap_err();
         assert!(error.to_string().contains("rolled back"), "{error}");
+        assert!(error.to_string().contains("single} denied"), "{error}");
         assert_eq!(
             seen.lock().unwrap().clone(),
             vec![
@@ -1672,6 +1679,7 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("unavailable"), "{error}");
+        assert!(error.to_string().contains("single} denied"), "{error}");
         assert_eq!(
             seen.lock().unwrap().clone(),
             vec![
@@ -1700,12 +1708,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_loop_single_failure_observing_target_is_ok() {
+    async fn set_loop_single_failure_observing_target_restores_and_reports_cause() {
         let (ep, seen) = scripted_server(vec![
             "repeat: 0\nsingle: 0\nOK\n",
             "OK\n",
             "ACK [4@0] {single} late\n",
             "repeat: 1\nsingle: 1\nOK\n",
+            "OK\n",
+            "OK\n",
         ])
         .await;
         let m = Mpd {
@@ -1713,7 +1723,9 @@ mod tests {
             caps: MediaCaps::default(),
             commands: vec![],
         };
-        m.set_loop(LoopMode::Track).await.unwrap();
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(error.to_string().contains("single} late"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
         assert_eq!(
             seen.lock().unwrap().clone(),
             vec![
@@ -1721,6 +1733,8 @@ mod tests {
                 "repeat 1".to_string(),
                 "single 1".to_string(),
                 "status".to_string(),
+                "repeat 0".to_string(),
+                "single 0".to_string(),
             ]
         );
     }
