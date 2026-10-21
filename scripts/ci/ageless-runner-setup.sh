@@ -1,188 +1,416 @@
 #!/usr/bin/env bash
-# Set up N self-hosted GitHub Actions runners on ageless-studio, each pinned to
-# a CPU budget, sharing warm host-level caches (nix store + sccache + cargo
-# registry) so CI builds are near-instant after the first warm run.
-#
-# Run this ON ageless-studio, as the runner user (default: targe):
-#
-#   NIX_GITHUB_TOKEN=<optional PAT; raises the anonymous rate limit> \
-#   GH_PAT=<PAT with repo admin, to auto-register runners> \
-#     bash scripts/ci/ageless-runner-setup.sh
-#
-# It is IDEMPOTENT — re-run it to add nix, re-register runners, or bump config.
-# Teardown with scripts/ci/ageless-runner-uninstall.sh.
-#
-# Why self-hosted + warm caches (see docs/self-hosted-ci.md):
-#   * /nix/store persists → `nix build .#default` / `nix develop` are cache hits
-#     after the first build (the ~60-min cold nix-build on GitHub is gone).
-#   * a shared sccache dir persists → warm Rust crate compiles across every job
-#     and every runner.
-#   * CARGO_HOME (crate registry) persists → no re-download.
-#   * each runner's _work/ persists → incremental `target/` between jobs.
+# Configure root-owned JIT runner loops. Run this script as an operator; jobs
+# execute as the isolated, non-login thegn-ci account.
 set -euo pipefail
 
-# ── knobs (override via env) ─────────────────────────────────────────────────
 GH_REPO="${GH_REPO:-blakeashleyjr/thegn}"
-RUNNER_USER="${RUNNER_USER:-targe}"
+RUNNER_USER="${RUNNER_USER:-thegn-ci}"
 RUNNER_COUNT="${RUNNER_COUNT:-4}"
 RUNNER_CPUS="${RUNNER_CPUS:-3}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,x64,ageless,nix}"
-RUNNER_BASE="${RUNNER_BASE:-/home/$RUNNER_USER/actions-runners}"
-CACHE_BASE="${CACHE_BASE:-/home/$RUNNER_USER/gha-cache}"
-SCCACHE_SIZE="${SCCACHE_SIZE:-60G}"
-NIX_GITHUB_TOKEN="${NIX_GITHUB_TOKEN:-}" # optional; all flake inputs are public
-GH_PAT="${GH_PAT:-}"                     # PAT (repo admin) used to mint runner registration tokens
+RUNNER_BASE="${RUNNER_BASE:-/var/lib/thegn-ci/runners}"
+RUNNER_TOKEN_FILE="${RUNNER_TOKEN_FILE:-/etc/thegn-ci/registration.token}"
+RUNNER_LOOP_FILE="${RUNNER_LOOP_FILE:-/usr/local/libexec/thegn-ci/runner-loop}"
+RUNNER_UNIT_FILE="${RUNNER_UNIT_FILE:-/etc/systemd/system/thegn-ci-runner@.service}"
+RUNNER_ARCHIVE_FILE="${RUNNER_ARCHIVE_FILE:-$RUNNER_BASE/actions-runner-linux-x64.tar.gz}"
+NIX_GITHUB_TOKEN="${NIX_GITHUB_TOKEN:-}"
+GH_PAT="${GH_PAT:-}"
 
 log() { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
 die() {
   printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2
-  exit 1
+  return 1
 }
 
-# ── preflight ────────────────────────────────────────────────────────────────
-[ "$(whoami)" = "$RUNNER_USER" ] || die "run this as '$RUNNER_USER' (you are '$(whoami)')"
-command -v systemctl >/dev/null || die "systemd required (WSL: set 'systemd=true' in /etc/wsl.conf, then 'wsl --shutdown')"
-command -v sudo >/dev/null || die "sudo required (runner services + CPU limits are system units)"
-for t in curl tar jq; do command -v "$t" >/dev/null || die "missing '$t'"; done
-HAVE_CORES="$(nproc)"
-NEED_CORES=$((RUNNER_COUNT * RUNNER_CPUS))
-[ "$HAVE_CORES" -ge "$NEED_CORES" ] ||
-  log "WARNING: $RUNNER_COUNT×${RUNNER_CPUS}cpu = $NEED_CORES cores requested but box has $HAVE_CORES; CPUQuota is a limit (not a reservation), so this still works but runners will contend."
+unexport_credentials() {
+  # GH_PAT reaches the privileged install only through stdin; neither credential
+  # is inherited by preflight, setup, or runner child processes.
+  export -n NIX_GITHUB_TOKEN GH_PAT
+}
 
-# a registration token minter: prefer authed `gh`, else the REST API with GH_PAT.
-reg_token() {
-  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-    gh api -X POST "repos/$GH_REPO/actions/runners/registration-token" --jq .token
-  elif [ -n "$GH_PAT" ]; then
-    curl -fsSL -X POST \
-      -H "Authorization: Bearer $GH_PAT" \
-      -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/repos/$GH_REPO/actions/runners/registration-token" | jq -r .token
+runner_identity_preflight() {
+  local runner_uid operator
+  operator="$(id -un)"
+  if [ "$RUNNER_USER" = "$operator" ]; then
+    printf 'runner account %s is the invoking operator; choose a dedicated account (fix: set RUNNER_USER=thegn-ci)\n' "$RUNNER_USER" >&2
+    return 1
+  fi
+  if ! runner_uid="$(id -u "$RUNNER_USER" 2>/dev/null)"; then
+    return 0
+  fi
+  if [ "$runner_uid" = 0 ] || [ "$RUNNER_USER" = root ]; then
+    printf 'runner account %s is root (fix: use a dedicated non-root account such as thegn-ci)\n' "$RUNNER_USER" >&2
+    return 1
+  fi
+  return 0
+}
+
+runner_preflight() {
+  local failures=0 groups shell home sudo_output sudo_status account_line path
+  unexport_credentials
+  runner_identity_preflight || failures=1
+  if [ -n "$NIX_GITHUB_TOKEN" ]; then
+    printf 'NIX_GITHUB_TOKEN is set; runner jobs must not receive Nix credentials (fix: unset NIX_GITHUB_TOKEN)\n' >&2
+    failures=1
+  fi
+  if ! account_line="$(getent passwd "$RUNNER_USER")"; then
+    # The first preflight runs before account creation. Identity and token checks
+    # still apply; account-specific checks run immediately after creation.
+    if [ "$failures" -ne 0 ]; then return 1; fi
+    return 0
+  fi
+  IFS=: read -r _ _ _ _ _ home shell <<<"$account_line"
+  if [[ $shell != */nologin && $shell != */false ]]; then
+    printf 'runner account %s has interactive shell %s (fix: set its shell to /usr/sbin/nologin)\n' "$RUNNER_USER" "$shell" >&2
+    failures=1
+  fi
+  if ! groups="$(id -nG "$RUNNER_USER" 2>/dev/null)"; then
+    printf 'cannot inspect groups for runner account %s (fix: repair the account and retry)\n' "$RUNNER_USER" >&2
+    failures=1
   else
-    die "need a runner registration token: either 'gh auth login' as a repo admin, or pass GH_PAT=<admin PAT>"
+    local group
+    for group in sudo wheel admin docker podman libvirt kvm lxd; do
+      if [[ " $groups " == *" $group "* ]]; then
+        printf 'runner account %s belongs to privileged group %s (fix: remove it with usermod -G)\n' "$RUNNER_USER" "$group" >&2
+        failures=1
+      fi
+    done
+  fi
+  sudo_status=0
+  sudo_output="$(LC_ALL=C sudo -n -l -U "$RUNNER_USER" 2>&1)" || sudo_status=$?
+  if [[ $sudo_output == *"is not allowed to run sudo"* ]]; then
+    : # A clean policy may return either status depending on the sudo build.
+  elif [ "$sudo_status" -ne 0 ]; then
+    printf 'cannot verify sudo rights for runner account %s (fix: make sudo -n -l -U succeed, then remove any grants)\n' "$RUNNER_USER" >&2
+    failures=1
+  else
+    printf 'runner account %s has sudo rights (fix: remove its sudoers grant)\n' "$RUNNER_USER" >&2
+    failures=1
+  fi
+  if ! sudo test -x "$home" || ! sudo test -r "$home"; then
+    printf 'cannot inspect runner HOME %s (fix: restore root traversal/read access and retry)\n' "$home" >&2
+    failures=1
+  fi
+  for path in "$home/.config/gh/hosts.yml" "$home/.ssh" "$home/.gnupg" \
+    "$home/.git-credentials" "$home/.config/nix/nix.conf" "$home/.docker/config.json"; do
+    if sudo test -e "$path" || sudo test -L "$path"; then
+      if [[ $path == */nix.conf ]]; then
+        if sudo grep -qi 'access-tokens' "$path"; then
+          :
+        else
+          local grep_status=$?
+          if [ "$grep_status" -ne 1 ]; then
+            printf 'cannot inspect runner HOME: unreadable nix.conf at %s\n' "$path" >&2
+            failures=1
+            continue
+          fi
+          continue
+        fi
+      fi
+      printf 'runner HOME contains credentials or persistent auth state at %s (fix: remove it and keep credentials outside the runner account)\n' "$path" >&2
+      failures=1
+    fi
+  done
+  if [ "$failures" -ne 0 ]; then
+    die 'runner preflight refused an unsafe account; apply each fix above and retry'
+    return 1
+  fi
+  return 0
+}
+
+ensure_runner_account() {
+  if [ -e /etc/NIXOS ]; then
+    cat >&2 <<'NIXOS'
+NixOS manages users and systemd units declaratively; /etc/systemd/system is generated and read-only.
+Add this module to configuration.nix. Provision the rendered loop at the declared ExecStart path
+through the Nix store; this script cannot write /etc/systemd/system on NixOS.
+
+{ pkgs, ... }:
+{
+users.groups.thegn-ci = {};
+users.users.thegn-ci = {
+  isSystemUser = true;
+  group = "thegn-ci";
+  home = "/var/lib/thegn-ci";
+  createHome = true;
+  shell = "${pkgs.shadow}/bin/nologin";
+};
+systemd.services."thegn-ci-runner@" = {
+  description = "Ephemeral thegn CI runner %i";
+  wantedBy = [ "multi-user.target" ];
+  after = [ "network-online.target" ];
+  wants = [ "network-online.target" ];
+  serviceConfig = {
+    Type = "simple";
+    User = "root";
+    Group = "root";
+    Restart = "always";
+    RestartSec = 5;
+    ExecStart = "/usr/local/libexec/thegn-ci/runner-loop %i";
+  };
+};
+}
+
+Setup stopped before installing anything.
+NIXOS
+    return 1
+  fi
+  if getent passwd "$RUNNER_USER" >/dev/null; then return 0; fi
+  sudo useradd --system --user-group --create-home --home-dir /var/lib/thegn-ci --shell /usr/sbin/nologin "$RUNNER_USER"
+}
+
+refuse_legacy_runner_layout() {
+  local operator_home legacy_units legacy_running
+  operator_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  legacy_units="$(sudo systemctl list-unit-files 'actions.runner.*' --no-legend --no-pager 2>/dev/null || true)"
+  legacy_running="$(sudo systemctl list-units 'actions.runner.*' --all --no-legend --no-pager 2>/dev/null || true)"
+  if [ -n "$legacy_units" ] || [ -n "$legacy_running" ]; then
+    printf 'legacy actions.runner.* units are installed or loaded:\n%s\n%s\n' "$legacy_units" "$legacy_running" >&2
+    printf 'remove them with their old svc.sh stop/uninstall and config.sh remove steps before installing the hardened runner\n' >&2
+    return 1
+  fi
+  if [ -e "$operator_home/actions-runners" ]; then
+    printf 'legacy runner directory exists at %s/actions-runners; remove its old svc.sh services and run config.sh remove before installing the hardened runner\n' "$operator_home" >&2
+    return 1
   fi
 }
 
-# ── 1. host nix (persistent /nix/store is the single biggest cache win) ───────
-if ! command -v nix >/dev/null && [ ! -e /nix/var/nix/profiles/default/bin/nix ]; then
-  log "installing nix (Determinate Systems, multi-user)…"
-  curl -fsSL https://install.determinate.systems/nix |
-    sh -s -- install --no-confirm
-else
-  log "nix already installed — leaving it in place"
-fi
-# a good host nix.conf: flakes on, sane parallelism, KEEP build outputs so the
-# dev-shell closure survives GC, and access-tokens so private flake inputs
-# resolve WITHOUT the workflow needing a secret.
-NIX_CONF_DIR="/home/$RUNNER_USER/.config/nix"
-mkdir -p "$NIX_CONF_DIR"
-{
-  echo "experimental-features = nix-command flakes"
-  echo "max-jobs = auto"
-  echo "cores = $RUNNER_CPUS"
-  echo "keep-outputs = true"
-  echo "keep-derivations = true"
-  echo "connect-timeout = 20"
-  echo "download-attempts = 5"
-  [ -n "$NIX_GITHUB_TOKEN" ] && echo "access-tokens = github.com=$NIX_GITHUB_TOKEN"
-} >"$NIX_CONF_DIR/nix.conf"
-chmod 600 "$NIX_CONF_DIR/nix.conf"
-log "wrote $NIX_CONF_DIR/nix.conf"
+secure_runner_home_parent() {
+  local home
+  home="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
+  if sudo test -L "$home"; then
+    die "runner HOME is a symlink: $home"
+    return 1
+  fi
+  sudo chown root:root "$home"
+  sudo chmod 0755 "$home"
+}
 
-# ── 2. warm shared caches (host-level, shared across all runners) ─────────────
-mkdir -p "$CACHE_BASE/cargo" "$CACHE_BASE/sccache"
-# The runner reads a `.env` (job env) and `.path` (job PATH) file from each
-# runner dir — the official customization hook. One shared copy, linked in.
-cat >"$CACHE_BASE/runner.env" <<EOF
-# Warm-cache env injected into every CI job on this host (see ageless-runner-setup.sh).
-CARGO_HOME=$CACHE_BASE/cargo
-RUSTC_WRAPPER=sccache
-SCCACHE_DIR=$CACHE_BASE/sccache
-SCCACHE_CACHE_SIZE=$SCCACHE_SIZE
-CARGO_INCREMENTAL=0
+prepare_registration_token() {
+  local token_dir token_mode token_owner dir_mode dir_owner
+  token_dir="$(dirname "$RUNNER_TOKEN_FILE")"
+  if sudo test -L "$token_dir"; then
+    die "registration token directory is a symlink: $token_dir"
+    return 1
+  fi
+  sudo install -d -m 0700 -o root -g root "$token_dir"
+  dir_owner="$(sudo stat -c '%u:%g' "$token_dir")"
+  dir_mode="$(sudo stat -c '%a' "$token_dir")"
+  if [ "$dir_owner" != '0:0' ] || [ "$dir_mode" != 700 ]; then
+    die "registration token directory must be root:root mode 0700: $token_dir"
+    return 1
+  fi
+  if sudo test -e "$RUNNER_TOKEN_FILE" || sudo test -L "$RUNNER_TOKEN_FILE"; then
+    if sudo test -L "$RUNNER_TOKEN_FILE"; then
+      die "registration token path is a symlink: $RUNNER_TOKEN_FILE"
+      return 1
+    fi
+    token_owner="$(sudo stat -c '%u:%g' "$RUNNER_TOKEN_FILE")"
+    token_mode="$(sudo stat -c '%a' "$RUNNER_TOKEN_FILE")"
+    if [ "$token_owner" != '0:0' ] || [ "$token_mode" != 600 ]; then
+      die "existing registration token must be root:root mode 0600: $RUNNER_TOKEN_FILE"
+      return 1
+    fi
+  elif [ -n "$GH_PAT" ]; then
+    printf '%s' "$GH_PAT" | sudo install -m 0600 -o root -g root /dev/stdin "$RUNNER_TOKEN_FILE"
+  else
+    die "put a repository administration PAT in $RUNNER_TOKEN_FILE (root:root, mode 0600), or provide GH_PAT once"
+    return 1
+  fi
+  unset GH_PAT
+}
+
+render_runner_loop() {
+  local loop
+  loop="$(
+    cat <<'LOOP'
+#!/usr/bin/env bash
+set -euo pipefail
+index="${1:?runner index required}"
+runner_user="__RUNNER_USER__"
+runner_group="__RUNNER_USER__"
+runner_base="__RUNNER_BASE__"
+token_file="__RUNNER_TOKEN_FILE__"
+runner_archive="__RUNNER_ARCHIVE__"
+repo="__GH_REPO__"
+labels="__RUNNER_LABELS__"
+cpus="__RUNNER_CPUS__"
+dir="$runner_base/runner-$index"
+job_home="$dir/home"
+work="$dir/_work"
+minimal_path="/nix/var/nix/profiles/per-user/__RUNNER_USER__/profile/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+while :; do
+  job_unit="thegn-ci-job-$index.service"
+  job_state="$(systemctl show -p LoadState --value "$job_unit")"
+  if [ "$job_state" = loaded ]; then
+    systemctl stop "$job_unit"
+  fi
+  # Recreate the writable runner tree from the root-owned archive every job.
+  rm -rf -- "$dir"
+  install -d -m 0755 "$dir"
+  tar xzf "$runner_archive" -C "$dir"
+  cp "$runner_base/runner.env" "$dir/.env"
+  chown -R "$runner_user:$runner_group" "$dir"
+  rm -rf -- "$work" "$job_home"
+  install -d -m 0700 -o "$runner_user" -g "$runner_group" "$work" "$job_home"
+  epoch="$(date +%s)"
+  runner_name="ageless-$index-$epoch"
+  label_json="$(printf '%s' "$labels" | jq -R 'split(",")')"
+  payload="$(jq -nc --arg name "$runner_name" --argjson labels "$label_json" \
+    '{name:$name,runner_group_id:1,labels:$labels,work_folder:"_work"}')"
+  token="$(cat "$token_file")"
+  if ! jit="$(
+    printf 'header = \"Authorization: Bearer %s\"\n' "$token" |
+      curl --config - -fsS --max-time 30 -X POST \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$repo/actions/runners/generate-jitconfig" \
+        -d "$payload" | jq -er '.encoded_jit_config'
+  )"; then
+    unset token payload label_json
+    sleep 30
+    continue
+  fi
+  unset token payload label_json
+  # --jitconfig is single-use and rides argv only in the thegn-ci-owned process.
+  systemd-run --wait --collect --pipe --unit="thegn-ci-job-$index" --uid="$runner_user" --gid="$runner_group" \
+    -p "CPUQuota=$((cpus * 100))%" -p MemoryHigh=12G \
+    -p PrivateTmp=yes -p ProtectHome=read-only -p NoNewPrivileges=yes \
+    -p "PartOf=thegn-ci-runner@$index.service" \
+    -p "WorkingDirectory=$dir" --setenv="HOME=$job_home" --setenv="PATH=$minimal_path" \
+    -- "$dir/run.sh" --jitconfig "$jit"
+  unset jit
+done
+LOOP
+  )"
+  loop="${loop//__GH_REPO__/$GH_REPO}"
+  loop="${loop//__RUNNER_LABELS__/$RUNNER_LABELS}"
+  loop="${loop//__RUNNER_CPUS__/$RUNNER_CPUS}"
+  loop="${loop//__RUNNER_USER__/$RUNNER_USER}"
+  loop="${loop//__RUNNER_BASE__/$RUNNER_BASE}"
+  loop="${loop//__RUNNER_TOKEN_FILE__/$RUNNER_TOKEN_FILE}"
+  loop="${loop//__RUNNER_ARCHIVE__/$RUNNER_ARCHIVE_FILE}"
+  printf '%s\n' "$loop"
+}
+
+render_runner_unit() {
+  local unit
+  unit="$(
+    cat <<'UNIT'
+[Unit]
+Description=Ephemeral thegn CI runner %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Restart=always
+RestartSec=5
+ExecStart=__RUNNER_LOOP_FILE__ %i
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  )"
+  unit="${unit//__RUNNER_LOOP_FILE__/$RUNNER_LOOP_FILE}"
+  printf '%s\n' "$unit"
+}
+
+render_runner_env() {
+  cat <<'ENV'
 DO_NOT_TRACK=1
 OPENSPEC_TELEMETRY=0
-EOF
-# PATH for jobs: nix profiles first, then NixOS + Debian/WSL system dirs (extra
-# entries that don't exist are harmless), then the shared cargo bin.
-cat >"$CACHE_BASE/runner.path" <<EOF
-/home/$RUNNER_USER/.nix-profile/bin
-/nix/var/nix/profiles/default/bin
-$CACHE_BASE/cargo/bin
-/run/current-system/sw/bin
-/usr/local/sbin
-/usr/local/bin
-/usr/sbin
-/usr/bin
-/sbin
-/bin
-EOF
-log "wrote warm-cache env + path under $CACHE_BASE"
-
-# ── 3. download the actions runner once, fan out to runner-1..N ──────────────
-mkdir -p "$RUNNER_BASE"
-RUNNER_VER="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')"
-TARBALL="actions-runner-linux-x64-${RUNNER_VER}.tar.gz"
-CACHE_TARBALL="$RUNNER_BASE/$TARBALL"
-[ -f "$CACHE_TARBALL" ] || {
-  log "downloading actions-runner v$RUNNER_VER…"
-  curl -fsSL -o "$CACHE_TARBALL" \
-    "https://github.com/actions/runner/releases/download/v${RUNNER_VER}/${TARBALL}"
+ENV
 }
 
-for i in $(seq 1 "$RUNNER_COUNT"); do
-  name="ageless-$i"
-  dir="$RUNNER_BASE/$name"
-  log "── runner $i/$RUNNER_COUNT: $name ──"
-  mkdir -p "$dir"
-  [ -f "$dir/config.sh" ] || tar xzf "$CACHE_TARBALL" -C "$dir"
-
-  # The runner is a .NET app; on a fresh distro it needs libicu/libssl etc.
-  # `installdependencies.sh` installs them system-wide — do it once.
-  if [ ! -f "$RUNNER_BASE/.deps-installed" ]; then
-    log "  installing runner system deps (libicu/.NET)…"
-    (cd "$dir" && sudo ./bin/installdependencies.sh) && touch "$RUNNER_BASE/.deps-installed"
-  fi
-
-  # warm-cache hooks (per-runner copies of the shared env/path)
-  cp "$CACHE_BASE/runner.env" "$dir/.env"
-  cp "$CACHE_BASE/runner.path" "$dir/.path"
-
-  # (re)register. --replace lets us re-run this script to refresh config.
-  if [ -f "$dir/.runner" ]; then
-    log "  already registered — refreshing service only"
-  else
-    log "  registering with $GH_REPO…"
-    (cd "$dir" && ./config.sh \
-      --url "https://github.com/$GH_REPO" \
-      --token "$(reg_token)" \
-      --name "$name" \
-      --labels "$RUNNER_LABELS" \
-      --work _work \
-      --unattended --replace)
-  fi
-
-  # install + start as a systemd service (svc.sh handles the unit + linger)
-  (cd "$dir" && sudo ./svc.sh install "$RUNNER_USER" && sudo ./svc.sh start)
-
-  # CPU cap: a drop-in on the runner's service. CPUQuota=<cpus*100>% limits the
-  # runner (and every job it spawns) to that many cores' worth of CPU time.
-  svc_name="$(cat "$dir/.service" 2>/dev/null || true)"
-  [ -n "$svc_name" ] || die "  could not determine systemd service name for $name"
-  dropin="/etc/systemd/system/${svc_name}.d"
-  sudo mkdir -p "$dropin"
-  sudo tee "$dropin/10-thegn-ci.conf" >/dev/null <<EOF
-[Service]
-# Pin this runner to ${RUNNER_CPUS} cores' worth of CPU (4×${RUNNER_CPUS} across the box).
-CPUQuota=$((RUNNER_CPUS * 100))%
-CPUWeight=100
-# keep a wedged job from OOM-killing the host
-MemoryHigh=12G
-EOF
+install_runner_loop() {
+  local loop unit tmp_loop tmp_unit
+  loop="$(render_runner_loop)"
+  unit="$(render_runner_unit)"
+  tmp_loop="$(mktemp)"
+  tmp_unit="$(mktemp)"
+  printf '%s\n' "$loop" >"$tmp_loop"
+  printf '%s\n' "$unit" >"$tmp_unit"
+  sudo install -D -m 0755 -o root -g root "$tmp_loop" "$RUNNER_LOOP_FILE"
+  sudo install -D -m 0644 -o root -g root "$tmp_unit" "$RUNNER_UNIT_FILE"
+  rm -f "$tmp_loop" "$tmp_unit"
   sudo systemctl daemon-reload
-  sudo systemctl restart "$svc_name"
-  log "  $svc_name up (CPUQuota=$((RUNNER_CPUS * 100))%)"
-done
+  local index
+  for ((index = 1; index <= RUNNER_COUNT; index++)); do
+    sudo systemctl enable --now "thegn-ci-runner@$index.service"
+    sudo systemctl restart "thegn-ci-runner@$index.service"
+  done
+}
 
-log "done. Verify on GitHub: Settings → Actions → Runners (expect $RUNNER_COUNT × 'ageless-*' idle)."
-log "Or: gh api repos/$GH_REPO/actions/runners --jq '.runners[]|{name,status}'"
+install_nix_if_missing() {
+  if ! command -v nix >/dev/null && [ ! -e /nix/var/nix/profiles/default/bin/nix ]; then
+    log 'installing nix (Determinate Systems, multi-user)…'
+    curl -fsSL https://install.determinate.systems/nix | sh -s -- install --no-confirm
+  else
+    log 'nix already installed — leaving it in place'
+  fi
+}
+
+install_runner_payload() {
+  local version tarball cache_tarball tmp_archive tmp_env base_owner base_mode
+  if sudo test -L "$RUNNER_BASE"; then
+    die "runner base is a symlink: $RUNNER_BASE"
+    return 1
+  fi
+  sudo install -d -m 0755 -o root -g root "$RUNNER_BASE"
+  base_owner="$(sudo stat -c '%u:%g' "$RUNNER_BASE")"
+  base_mode="$(sudo stat -c '%a' "$RUNNER_BASE")"
+  if [ "$base_owner" != '0:0' ] || [ "$base_mode" != 755 ]; then
+    die "runner base must be root:root mode 0755: $RUNNER_BASE"
+    return 1
+  fi
+  tmp_env="$(mktemp)"
+  render_runner_env >"$tmp_env"
+  sudo install -m 0644 -o root -g root "$tmp_env" "$RUNNER_BASE/runner.env"
+  rm -f "$tmp_env"
+  version="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')"
+  tarball="actions-runner-linux-x64-${version}.tar.gz"
+  cache_tarball="$RUNNER_BASE/$tarball"
+  RUNNER_ARCHIVE_FILE="$cache_tarball"
+  if ! sudo test -f "$cache_tarball"; then
+    log "downloading actions-runner v$version…"
+    tmp_archive="$(mktemp)"
+    curl -fsSL -o "$tmp_archive" "https://github.com/actions/runner/releases/download/v${version}/${tarball}"
+    sudo install -D -m 0644 -o root -g root "$tmp_archive" "$cache_tarball"
+    rm -f "$tmp_archive"
+  fi
+}
+
+main() {
+  unexport_credentials
+  if [ "$(id -u)" = 0 ]; then
+    die 'run setup as an operator, never as root'
+    return 1
+  fi
+  sudo -v || {
+    die 'sudo authentication is required before setup preflight'
+    return 1
+  }
+  refuse_legacy_runner_layout || return 1
+  runner_preflight
+  command -v systemctl >/dev/null || {
+    die 'systemd is required'
+    return 1
+  }
+  local tool
+  for tool in curl tar jq; do command -v "$tool" >/dev/null || {
+    die "missing '$tool'"
+    return 1
+  }; done
+  ensure_runner_account
+  runner_preflight
+  secure_runner_home_parent
+  prepare_registration_token
+  install_nix_if_missing
+  install_runner_payload
+  install_runner_loop
+  log "done. Verify in GitHub Settings → Actions → Runners (expect $RUNNER_COUNT ephemeral runners)."
+}
+
+if [ "${THEGN_CI_SETUP_SOURCE_ONLY:-0}" != 1 ]; then main "$@"; fi
