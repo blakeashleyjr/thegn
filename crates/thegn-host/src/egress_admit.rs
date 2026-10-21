@@ -12,20 +12,23 @@ pub(crate) fn admit_egress(
     allow: &[String],
     block: &[String],
 ) -> Result<()> {
-    let expected = thegn_svc::provider::rules_from(allow, block);
-    let verification = steps.apply(id, allow, block).and_then(|()| {
-        steps.read_back(id).and_then(|observed| {
-            if observed == expected {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "rule count mismatch: expected {}, observed {}",
-                    expected.len(),
-                    observed.len()
-                ))
-            }
-        })
-    });
+    let verification = thegn_svc::provider::rules_from(allow, block)
+        .map_err(anyhow::Error::from)
+        .and_then(|expected| {
+            steps.apply(id, allow, block).and_then(|()| {
+                steps.read_back(id).and_then(|observed| {
+                    if observed == expected {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "observed policy differs from the requested policy (expected {} rules, observed {})",
+                            expected.len(),
+                            observed.len()
+                        ))
+                    }
+                })
+            })
+        });
     match verification {
         Ok(()) => Ok(()),
         Err(reason) => match steps.destroy(id) {
@@ -45,7 +48,11 @@ pub(crate) fn verify_existing_egress(
     allow: &[String],
     block: &[String],
 ) -> Result<()> {
-    let expected = thegn_svc::provider::rules_from(allow, block);
+    let expected = thegn_svc::provider::rules_from(allow, block).map_err(|reason| {
+        anyhow!(
+            "network policy for existing sandbox {id} is invalid ({reason}); refusing to provision it"
+        )
+    })?;
     let initial_read = steps.read_back(id);
     if let Ok(observed) = &initial_read
         && observed == &expected
@@ -59,7 +66,7 @@ pub(crate) fn verify_existing_egress(
                 Ok(())
             } else {
                 Err(anyhow!(
-                    "rule count mismatch: expected {}, observed {}",
+                    "observed policy differs from the requested policy (expected {} rules, observed {})",
                     expected.len(),
                     observed.len()
                 ))
@@ -170,7 +177,7 @@ mod tests {
     #[test]
     fn existing_matching_policy_is_not_reapplied() {
         let (allow, block) = lists();
-        let steps = ScriptedEgress::new(vec![], vec![Ok(rules_from(&allow, &block))]);
+        let steps = ScriptedEgress::new(vec![], vec![Ok(rules_from(&allow, &block).unwrap())]);
 
         assert!(verify_existing_egress(&steps, "sandbox-1", &allow, &block).is_ok());
         assert_eq!(steps.calls(), ["read:sandbox-1"]);
@@ -181,7 +188,7 @@ mod tests {
         let (allow, block) = lists();
         let steps = ScriptedEgress::new(
             vec![Ok(())],
-            vec![Ok(Vec::new()), Ok(rules_from(&allow, &block))],
+            vec![Ok(Vec::new()), Ok(rules_from(&allow, &block).unwrap())],
         );
 
         assert!(verify_existing_egress(&steps, "sandbox-1", &allow, &block).is_ok());
@@ -198,7 +205,7 @@ mod tests {
             vec![Ok(())],
             vec![
                 Err(anyhow::anyhow!("read failed")),
-                Ok(rules_from(&allow, &block)),
+                Ok(rules_from(&allow, &block).unwrap()),
             ],
         );
 
@@ -238,6 +245,35 @@ mod tests {
             failed_verification.calls(),
             ["read:sandbox-1", "apply:sandbox-1", "read:sandbox-1"]
         );
+    }
+
+    #[test]
+    fn fresh_admission_with_an_invalid_entry_destroys_without_applying() {
+        let allow = vec!["192.0.2.1".to_string()];
+        let steps = ScriptedEgress::new(vec![], vec![]);
+
+        let result = admit_egress(&steps, "sandbox-1", &allow, &[]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| { error.to_string().contains("192.0.2.1") })
+        );
+        assert_eq!(steps.calls(), ["destroy:sandbox-1"]);
+    }
+
+    #[test]
+    fn existing_with_an_invalid_entry_refuses_without_provider_calls() {
+        let allow = vec!["192.0.2.1".to_string()];
+        let steps = ScriptedEgress::new(vec![], vec![]);
+        let result = verify_existing_egress(&steps, "sandbox-1", &allow, &[]);
+
+        assert!(result.is_err());
+        assert!(result.err().is_some_and(|error| {
+            let message = error.to_string();
+            message.contains("refusing to provision") && message.contains("192.0.2.1")
+        }));
+        assert!(steps.calls().is_empty());
     }
 
     #[test]
