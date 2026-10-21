@@ -1783,23 +1783,24 @@ mod tests {
 
     #[test]
     fn ci_mutation_guard_unregisters_on_drop() {
-        let lock = Box::leak(Box::new(Mutex::new(CiRefreshCoordinator::default())));
-        let idle = Box::leak(Box::new(Condvar::new()));
+        let lock: &'static Mutex<CiRefreshCoordinator> =
+            Box::leak(Box::new(Mutex::new(CiRefreshCoordinator::default())));
+        let idle: &'static Condvar = Box::leak(Box::new(Condvar::new()));
         let guard = begin_ci_mutation_in(lock, idle).expect("mutation admitted");
         assert_eq!(
-            lock.get_mut().expect("local coordinator").mutations.len(),
+            lock.lock().expect("local coordinator").mutations.len(),
             1
         );
 
         drop(guard);
 
         assert!(
-            lock.get_mut()
+            lock.lock()
                 .expect("local coordinator")
                 .mutations
                 .is_empty()
         );
-        cancel_coordinator_for_shutdown(lock.get_mut().expect("local coordinator"));
+        cancel_coordinator_for_shutdown(&mut lock.lock().expect("local coordinator"));
         assert!(begin_ci_mutation_in(lock, idle).is_none());
     }
 
