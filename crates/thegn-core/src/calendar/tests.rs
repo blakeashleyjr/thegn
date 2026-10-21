@@ -892,6 +892,84 @@ fn transp_free_round_trips_through_plugin_json() {
     assert_eq!(encoded["busy"], serde_json::json!("free"));
 }
 
+// THE-470 regression lock: expected to pass on main.
+#[test]
+fn transp_override_carries_its_own_transparency() {
+    let input = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:series-free\nDTSTART:20260803T090000Z\nDTEND:20260803T093000Z\nRRULE:FREQ=WEEKLY;COUNT=3\nTRANSP:TRANSPARENT\nEND:VEVENT\nBEGIN:VEVENT\nUID:series-free\nRECURRENCE-ID:20260810T090000Z\nDTSTART:20260810T110000Z\nDTEND:20260810T113000Z\nEND:VEVENT\nEND:VCALENDAR";
+    let events = parse_ics(input, "UTC");
+    let expanded = expand_by_date(&events, d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).unwrap();
+
+    let first = &expanded[&d(2026, 8, 3)];
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].busy, Busy::Free);
+
+    let replacement = &expanded[&d(2026, 8, 10)];
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(
+        replacement[0].start,
+        EventTime::Instant {
+            at: utc(2026, 8, 10, 11, 0)
+        }
+    );
+    assert_eq!(replacement[0].busy, Busy::Busy);
+
+    let last = &expanded[&d(2026, 8, 17)];
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].busy, Busy::Free);
+}
+
+// THE-470 regression lock: expected to pass on main.
+#[test]
+fn transp_free_override_of_a_busy_master_is_free_only_there() {
+    let input = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:series-busy\nDTSTART:20260803T090000Z\nDTEND:20260803T093000Z\nRRULE:FREQ=WEEKLY;COUNT=3\nTRANSP:OPAQUE\nEND:VEVENT\nBEGIN:VEVENT\nUID:series-busy\nRECURRENCE-ID:20260810T090000Z\nDTSTART:20260810T110000Z\nDTEND:20260810T113000Z\nTRANSP:TRANSPARENT\nEND:VEVENT\nEND:VCALENDAR";
+    let events = parse_ics(input, "UTC");
+    let expanded = expand_by_date(&events, d(2026, 8, 1), d(2026, 8, 31), Tz::UTC).unwrap();
+
+    for date in [d(2026, 8, 3), d(2026, 8, 17)] {
+        assert_eq!(expanded[&date].len(), 1);
+        assert_eq!(expanded[&date][0].busy, Busy::Busy);
+    }
+    let replacement = &expanded[&d(2026, 8, 10)];
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(replacement[0].busy, Busy::Free);
+}
+
+// THE-470 regression lock: expected to pass on main.
+#[test]
+fn transp_struct_built_override_keeps_busy_through_expansion() {
+    let mut master = daily_master();
+    master.busy = Busy::Free;
+    let override_event = timed_override(utc(2026, 8, 3, 11, 0), "Replacement");
+    let expanded = expand_calendar(
+        &[master, override_event],
+        d(2026, 8, 1),
+        d(2026, 8, 5),
+        Tz::UTC,
+    )
+    .unwrap();
+
+    for day in [1, 2, 4, 5] {
+        assert_eq!(expanded.by_date[&d(2026, 8, day)].len(), 1);
+        assert_eq!(expanded.by_date[&d(2026, 8, day)][0].busy, Busy::Free);
+    }
+    let replacement = &expanded.by_date[&d(2026, 8, 3)];
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(replacement[0].busy, Busy::Busy);
+}
+
+// THE-470 regression lock: expected to pass on main (positive control).
+#[test]
+fn transp_absent_plugin_busy_defaults_to_busy() {
+    let json = r#"{
+        "uid":"plugin-default-busy",
+        "title":"Meeting",
+        "start":{"kind":"date","date":"2026-08-21"},
+        "end":{"kind":"date","date":"2026-08-22"}
+    }"#;
+    let event: CalEvent = serde_json::from_str(json).unwrap();
+    assert_eq!(event.busy, Busy::Busy);
+}
+
 #[test]
 fn recurrence_id_is_optional_on_the_plugin_wire() {
     let json = r#"{

@@ -2903,6 +2903,45 @@ async fn a_structurally_failed_remote_ics_feed_is_not_a_snapshot() {
     server.abort();
 }
 
+// THE-470 regression lock: expected to pass on main.
+#[tokio::test]
+async fn transp_ics_url_feed_round_trips_free_and_busy() {
+    let body = concat!(
+        "BEGIN:VCALENDAR\r\n",
+        "VERSION:2.0\r\n",
+        "BEGIN:VEVENT\r\n",
+        "UID:free\r\n",
+        "DTSTART:20260821T090000Z\r\n",
+        "DTEND:20260821T093000Z\r\n",
+        "TRANSP:TRANSPARENT\r\n",
+        "END:VEVENT\r\n",
+        "BEGIN:VEVENT\r\n",
+        "UID:busy\r\n",
+        "DTSTART:20260821T090000Z\r\n",
+        "DTEND:20260821T093000Z\r\n",
+        "END:VEVENT\r\n",
+        "END:VCALENDAR\r\n",
+    );
+    let (address, _hits, server) =
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", body).await;
+    let backend = ics_url::IcsUrlBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/feed.ics"),
+            allow_private_network: true,
+            ..account("transp", CalendarProviderKind::IcsUrl)
+        },
+        adm(),
+    );
+    let (from, to) = window();
+    let page = backend.list_events(from, to, "").await.unwrap();
+    let events = page.events();
+    let free = events.iter().find(|event| event.uid == "free").unwrap();
+    assert_eq!(free.busy, thegn_core::calendar::Busy::Free);
+    let busy = events.iter().find(|event| event.uid == "busy").unwrap();
+    assert_eq!(busy.busy, thegn_core::calendar::Busy::Busy);
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_saturated_global_budget_refuses_before_any_request() {
     let (address, hits, server) =
