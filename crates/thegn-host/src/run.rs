@@ -2808,13 +2808,16 @@ impl ScanCoalescer {
 /// complete gitlink scan started, so unchanged hydration applies can skip it.
 static SUBMODULE_SEEN: crate::diff_watch::Seen = crate::diff_watch::Seen::new();
 
+/// Skip only when the same merged worktree still has the print from its last
+/// complete scan and no displayed gitlink needs its own HEAD refreshed.
 fn submodule_scan_due(
     seen: &crate::diff_watch::Seen,
     active: &Path,
     print: Option<crate::diff_watch::WatchPrint>,
     merged_for: Option<&Path>,
+    has_gitlink_rows: bool,
 ) -> bool {
-    !(merged_for == Some(active) && seen.matches(active, print))
+    has_gitlink_rows || !(merged_for == Some(active) && seen.matches(active, print))
 }
 
 /// Enrich hydrated change rows with gitlink data without putting git reads on
@@ -11294,30 +11297,37 @@ async fn event_loop<T: Terminal>(
                     submodule_merged_for = Some(wt.clone());
                 }
             }
-            let active = active_tab_path(&session);
-            if submodule_merged_for.as_deref() != Some(active.as_path()) {
-                submodule_merged_for = None;
-            }
-            let print = crate::diff_watch::current_print(&active);
-            if refresh
-                && active_submodules_enabled(&session, &current_config)
-                && !model.panel.changes.is_empty()
-                && submodule_scan_due(
-                    &SUBMODULE_SEEN,
-                    &active,
-                    print,
-                    submodule_merged_for.as_deref(),
-                )
-                && let Some(next_token) = submodule_scans.request()
-            {
-                spawn_submodule_scan(
-                    hydration_gen,
-                    next_token,
-                    &session,
-                    print,
-                    &submodule_scan_tx,
-                    &waker,
-                );
+            if refresh {
+                let active = active_tab_path(&session);
+                if submodule_merged_for.as_deref() != Some(active.as_path()) {
+                    submodule_merged_for = None;
+                }
+                let print = crate::diff_watch::current_print(&active);
+                let has_gitlink_rows = model
+                    .panel
+                    .changes
+                    .iter()
+                    .any(|row| row.submodule.is_some());
+                if active_submodules_enabled(&session, &current_config)
+                    && !model.panel.changes.is_empty()
+                    && submodule_scan_due(
+                        &SUBMODULE_SEEN,
+                        &active,
+                        print,
+                        submodule_merged_for.as_deref(),
+                        has_gitlink_rows,
+                    )
+                    && let Some(next_token) = submodule_scans.request()
+                {
+                    spawn_submodule_scan(
+                        hydration_gen,
+                        next_token,
+                        &session,
+                        print,
+                        &submodule_scan_tx,
+                        &waker,
+                    );
+                }
             }
         }
         while let Ok((generation, token, path, summary)) = submodule_preview_rx.try_recv() {
@@ -12135,6 +12145,11 @@ async fn event_loop<T: Terminal>(
             if submodule_merged_for.as_deref() != Some(active.as_path()) {
                 submodule_merged_for = None;
             }
+            let has_gitlink_rows = model
+                .panel
+                .changes
+                .iter()
+                .any(|row| row.submodule.is_some());
             if active_submodules_enabled
                 && !model.panel.changes.is_empty()
                 && submodule_scan_due(
@@ -12142,6 +12157,7 @@ async fn event_loop<T: Terminal>(
                     &active,
                     print,
                     submodule_merged_for.as_deref(),
+                    has_gitlink_rows,
                 )
                 && let Some(token) = submodule_scans.request()
             {

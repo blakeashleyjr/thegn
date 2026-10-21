@@ -28,7 +28,8 @@ fn submodule_scan_skipped_while_print_unchanged_for_the_merged_worktree() {
         &seen,
         active,
         Some(print),
-        Some(active)
+        Some(active),
+        false,
     ));
 }
 
@@ -43,6 +44,7 @@ fn submodule_scan_runs_when_the_print_moved() {
         active,
         Some(crate::diff_watch::WatchPrint::for_test(2, 2)),
         Some(active),
+        false,
     ));
 }
 
@@ -52,7 +54,7 @@ fn submodule_scan_runs_without_a_live_print() {
     let active = std::path::Path::new("/wt/active");
     seen.mark(active, Some(crate::diff_watch::WatchPrint::for_test(1, 2)));
 
-    assert!(submodule_scan_due(&seen, active, None, Some(active)));
+    assert!(submodule_scan_due(&seen, active, None, Some(active), false));
 }
 
 #[test]
@@ -63,7 +65,13 @@ fn submodule_scan_runs_after_switching_worktrees() {
     let print = crate::diff_watch::WatchPrint::for_test(1, 2);
     seen.mark(active, Some(print));
 
-    assert!(submodule_scan_due(&seen, active, Some(print), Some(other)));
+    assert!(submodule_scan_due(
+        &seen,
+        active,
+        Some(print),
+        Some(other),
+        false,
+    ));
 }
 
 #[test]
@@ -71,7 +79,23 @@ fn submodule_scan_runs_before_any_complete_scan() {
     let seen = crate::diff_watch::Seen::new();
     let active = std::path::Path::new("/wt/active");
 
-    assert!(submodule_scan_due(&seen, active, None, None));
+    assert!(submodule_scan_due(&seen, active, None, None, false));
+}
+
+#[test]
+fn submodule_scan_runs_while_gitlink_rows_are_shown() {
+    let seen = crate::diff_watch::Seen::new();
+    let active = std::path::Path::new("/wt/active");
+    let print = crate::diff_watch::WatchPrint::for_test(1, 2);
+    seen.mark(active, Some(print));
+
+    assert!(submodule_scan_due(
+        &seen,
+        active,
+        Some(print),
+        Some(active),
+        true,
+    ));
 }
 
 /// Sets `XDG_STATE_HOME` for a test's lifetime and RESTORES the prior value on
