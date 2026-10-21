@@ -132,12 +132,12 @@ fn unmount_sshfs(spec: &ProjectionSpec) -> Result<()> {
         .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
         .collect();
     let plan = sshfs_unmount_plan(spec, &legacy_paths);
-    let primary_result = run(&plan[0]);
+    let primary_result = run_unmount_bounded(&plan[0]);
 
     let mut slug_legacy_succeeded = false;
     let mut v1_legacy_succeeded = false;
     for (legacy_path, legacy_argv) in legacy_paths.iter().zip(plan.iter().skip(1)) {
-        match run(legacy_argv) {
+        match run_unmount_bounded(legacy_argv) {
             Ok(()) => {
                 if slug_legacy_path
                     .as_ref()
@@ -319,28 +319,58 @@ fn run_unmount_bounded(argv: &[String]) -> Result<()> {
 }
 
 fn run_unmount_with_timeout(argv: &[String], timeout: std::time::Duration) -> Result<()> {
+    run_bounded(argv, timeout)
+}
+
+fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
     use std::sync::atomic::AtomicBool;
 
     if argv.is_empty() {
-        bail!("empty projection unmount argv");
+        bail!("empty projection argv");
     }
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     let cancelled = AtomicBool::new(false);
-    let run = thegn_proc::run(
-        &mut command,
-        &thegn_proc::Limits::silent(timeout),
-        &cancelled,
-    );
+    let limits = thegn_proc::Limits {
+        stderr: thegn_proc::Stream::Tail { cap: 4096 },
+        ..thegn_proc::Limits::silent(timeout)
+    };
+    let run = thegn_proc::run(&mut command, &limits, &cancelled);
     if !run.success() {
-        bail!(
-            "{} failed: end={:?}, leader={:?}",
-            argv[0],
-            run.end,
-            run.leader
-        );
+        let reason = match (&run.end, &run.leader) {
+            (thegn_proc::End::TimedOut, _) => {
+                format!("timed out after {}s", timeout.as_secs_f64())
+            }
+            (thegn_proc::End::Spawn(error), _) => format!("could not run: {error}"),
+            (thegn_proc::End::LeaderExited, thegn_proc::Leader::Reaped(status)) => {
+                format!("exited with {status}")
+            }
+            _ => format!("end={:?}, leader={:?}", run.end, run.leader),
+        };
+        let stderr = String::from_utf8_lossy(&run.stderr.bytes);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("{} failed: {reason}", argv[0]);
+        }
+        bail!("{} failed: {reason}: {stderr}", argv[0]);
     }
     Ok(())
+}
+
+/// Large working trees over slow links need room for a real pull; the deadline
+/// bounds a wedged rsync transport without racing ordinary transfers.
+const RSYNC_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Large working trees over slow links need room for a real push; the deadline
+/// bounds a wedged rsync transport without racing ordinary transfers.
+const RSYNC_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn run_rsync_pull(argv: &[String]) -> Result<()> {
+    run_bounded(argv, RSYNC_PULL_TIMEOUT)
+}
+
+fn run_rsync_push(argv: &[String]) -> Result<()> {
+    run_bounded(argv, RSYNC_PUSH_TIMEOUT)
 }
 
 /// `rsync -e` transport flag carrying the placement's ssh knobs.
@@ -385,7 +415,7 @@ fn local_dir(mountpoint: &str) -> String {
 /// (pull on mount, push on refresh/close) — true bidirectional conflict
 /// resolution is out of scope.
 fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
-    mount_sync_with(spec, run)
+    mount_sync_with(spec, run_rsync_pull)
 }
 
 fn mount_sync_with(
@@ -528,10 +558,11 @@ fn push_sync(spec: &ProjectionSpec) -> Result<()> {
     argv.extend(rsync_ssh_opt(s));
     argv.push(local_dir(&spec.mountpoint));
     argv.push(rsync_remote(s, &spec.remote_dir));
-    run(&argv)
+    run_rsync_push(&argv)
 }
 
-/// Run an argv to completion, mapping a spawn error or non-zero exit to `Err`.
+/// Run the sshfs mount argv to completion. Kept direct because its ssh transport
+/// child must outlive the sshfs leader; see THE-251.
 fn run(argv: &[String]) -> Result<()> {
     if argv.is_empty() {
         bail!("empty projection argv");
@@ -1092,5 +1123,45 @@ mod tests {
         assert!(!siblings.iter().any(|name| name.contains(".thegn-stage-")));
         assert!(!siblings.iter().any(|name| name.contains(".thegn-old-")));
         assert!(manifest::verify(&projection).is_ok());
+    }
+
+    #[test]
+    fn bounded_transport_returns_by_deadline_when_a_descendant_holds_the_pipe() {
+        let started = std::time::Instant::now();
+        let result = run_bounded(
+            &["sh".into(), "-c".into(), "sleep 30 & sleep 30".into()],
+            std::time::Duration::from_millis(300),
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_transport_error_keeps_stderr_and_exit_status() {
+        let result = run_bounded(
+            &["sh".into(), "-c".into(), "echo boom >&2; exit 3".into()],
+            std::time::Duration::from_secs(5),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("boom"));
+        assert!(error.contains("exited with"));
+    }
+
+    #[test]
+    fn bounded_transport_reports_a_missing_binary() {
+        let result = run_bounded(
+            &["thegn-no-such-binary-xyz".into()],
+            std::time::Duration::from_secs(2),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("could not run"));
+    }
+
+    #[test]
+    fn bounded_transport_accepts_success() {
+        assert!(run_bounded(&["true".into()], std::time::Duration::from_secs(2)).is_ok());
     }
 }
