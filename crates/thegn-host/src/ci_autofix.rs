@@ -417,7 +417,7 @@ fn consider_candidate_with_forge(
         vars: &vars,
         timeout_secs: pq.agent_timeout_secs,
         sandbox,
-        credential_free: false,
+        credential_free: true,
     });
     let outcome = if exited_zero {
         "exit ok"
