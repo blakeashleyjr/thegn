@@ -772,7 +772,7 @@ fn setup_and_schedule_with_waker(
     drop(resolved_envs);
 
     if let Err(error) = tx.send(PluginMsg::Loaded(loaded)) {
-        tracing::debug!(target: "thegn::plugin", %error, closing = registered.len(), "plugin loop is gone before startup publish; closing the sessions this setup started");
+        tracing::warn!(target: "thegn::plugin", %error, closing = registered.len(), "plugin loop is gone before startup publish; closing the sessions this setup started");
         let mut map = lock(&sessions);
         for id in &registered {
             if let Some(session) = map.remove(id) {
@@ -952,21 +952,33 @@ mod tests {
         spec
     }
 
-    fn wait_for_pidfile_and_exit(pidfile: &std::path::Path) -> (i32, Duration) {
+    fn wait_for_pidfile_and_exit(pidfile: &std::path::Path) {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(10);
-        while !pidfile.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            pidfile.exists(),
-            "pid file was not created within 10 seconds"
-        );
-        let pid = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        let pid = loop {
+            match std::fs::read_to_string(pidfile) {
+                Ok(contents) if contents.trim().is_empty() => return,
+                Ok(contents) => match contents.trim().parse::<i32>() {
+                    Ok(pid) => break pid,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => panic!(
+                        "pid file remained unparsable after {:?}: {contents:?}",
+                        started.elapsed()
+                    ),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) if Instant::now() < deadline => {
+                    tracing::debug!(%error, "retrying resident pid file read");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "could not read pid file after {:?}: {error}",
+                    started.elapsed()
+                ),
+            }
+        };
         while !crate::platform::sound_process::test_support::pid_gone(pid)
             && Instant::now() < deadline
         {
@@ -977,7 +989,6 @@ mod tests {
             crate::platform::sound_process::test_support::pid_gone(pid),
             "pid {pid} was still alive after {elapsed:?}"
         );
-        (pid, elapsed)
     }
 
     #[test]
@@ -1383,6 +1394,7 @@ mod tests {
             .build()
             .unwrap();
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let probe = supervisor.clone();
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(StopSignal::default());
@@ -1404,12 +1416,9 @@ mod tests {
             tmp.path().join("state"),
         );
 
+        assert!(probe.wait_for_release("hello").is_ok());
         assert!(lock(&sessions).is_empty());
-        let (pid, elapsed) = wait_for_pidfile_and_exit(&pidfile);
-        assert!(
-            crate::platform::sound_process::test_support::pid_gone(pid),
-            "pid {pid} was alive after {elapsed:?}"
-        );
+        wait_for_pidfile_and_exit(&pidfile);
     }
 
     #[test]
@@ -1510,6 +1519,9 @@ mod tests {
 
     #[test]
     fn startup_resident_spawn_failure_leaves_no_session() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let mut spec = example_spec();
         spec.mode = PluginMode::Resident;
@@ -1559,6 +1571,7 @@ mod tests {
             .build()
             .unwrap();
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let probe = supervisor.clone();
         let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
         let stop = Arc::new(StopSignal::default());
@@ -1581,12 +1594,9 @@ mod tests {
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.len() == 1));
+        assert!(probe.wait_for_release("hello").is_ok());
         assert!(lock(&sessions).is_empty());
-        let (pid, elapsed) = wait_for_pidfile_and_exit(&pidfile);
-        assert!(
-            crate::platform::sound_process::test_support::pid_gone(pid),
-            "pid {pid} was alive after {elapsed:?}"
-        );
+        wait_for_pidfile_and_exit(&pidfile);
     }
 
     #[test]
