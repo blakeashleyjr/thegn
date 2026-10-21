@@ -188,9 +188,16 @@ self: {
   tomlFormat = pkgs.formats.toml {};
 
   pruneNulls = lib.filterAttrsRecursive (_: v: v != null);
+  pruneEmpty = value:
+    if builtins.isAttrs value
+    then let
+      pruned = lib.mapAttrs (_: pruneEmpty) value;
+    in
+      lib.filterAttrs (_: v: v != {}) pruned
+    else value;
 
   # Rendered to ~/.config/thegn/config.toml; keys match the Rust serde struct.
-  configFile = tomlFormat.generate "thegn-config.toml" (pruneNulls {
+  configFile = tomlFormat.generate "thegn-config.toml" (pruneEmpty (pruneNulls {
     worktrees_dir = cfg.worktreesDir;
     projects_dir =
       if cfg.projectsDir != null
@@ -241,7 +248,7 @@ self: {
         forward_agent = cfg.sandbox.remote.forwardAgent;
       };
     };
-  });
+  }));
 in {
   options.programs.thegn = {
     enable = lib.mkEnableOption "thegn terminal-native worktree IDE";
