@@ -1566,7 +1566,9 @@ mod tests {
                 }
             }
         };
-        assert!(loaded.iter().any(|state| state.writer.is_none()));
+        // A plugin whose resident spawn failed publishes no live writer
+        // (it may be absent from Loaded entirely) and leaves no session.
+        assert!(loaded.iter().all(|state| state.writer.is_none()));
         assert!(lock(&sessions).is_empty());
     }
 
