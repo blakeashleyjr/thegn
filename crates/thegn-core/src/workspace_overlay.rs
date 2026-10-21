@@ -656,7 +656,7 @@ mod tests {
         let result = resolve_for_root(&t, Path::new("/a/foo"), lexical_same_path);
         assert!(matches!(
             &result,
-            WorkspaceOverlay::Refused(OverlayRefusal::RepoPathCollision { ref keys, .. })
+            WorkspaceOverlay::Refused(OverlayRefusal::RepoPathCollision { keys, .. })
                 if keys.iter().map(String::as_str).eq(["bar", "foo"])
         ));
         assert!(result.refusal().unwrap().to_string().contains("/a/foo"));
