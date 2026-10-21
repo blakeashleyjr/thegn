@@ -1200,7 +1200,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                         "session": info.id,
                         "stage": stage.name,
                         "artifact": artifact,
-                        "issue": d.issue,
+                        "issue": issue,
                         "worktree": wt,
                         "branch": branch,
                     })
