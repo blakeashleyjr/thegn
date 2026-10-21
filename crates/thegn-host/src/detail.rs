@@ -2402,31 +2402,37 @@ fn fit_to_screen(ov: &mut DetailOverlay, screen: Rect) {
 fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet) -> DetailRow {
     use crate::handlers::merge_queue::SidebarMq;
     use thegn_core::attention::MqStatus;
-    let (glyph, hue) = MqStatus::parse(&r.status)
+    let status = MqStatus::parse(&r.status);
+    let (glyph, hue) = status
+        .as_ref()
         .map(|s| s.glyph(gl))
         .unwrap_or((gl.dot_hollow, Hue::Blue));
     // Blocked rows show their reason; the rest show the status word.
-    let note = match r.status.as_str() {
-        "agent_blocked" => Some(format!(
+    let note = match status {
+        Some(MqStatus::AgentBlocked) => Some(format!(
             "environment/policy blocked — {}",
             r.error_detail
                 .as_deref()
                 .unwrap_or("agent isolation floor not met")
         )),
-        "deferred" | "gate_failed" | "gate_error" | "needs_human" => r
+        Some(s) if s.is_held() => r
             .error_detail
             .as_deref()
             .or(r.conflict_paths.as_deref())
             .map(|p| p.replace('\n', ", ")),
-        _ => Some(r.status.clone()),
+        Some(s) => Some(s.as_str().to_string()),
+        None => Some(format!(
+            "unrecognised queue status '{}'",
+            crate::merge_sweep::safe_display(&r.status)
+        )),
     };
     let path = r.worktree.clone();
     let mut row = DetailRow::new(Tok::Hue(hue), glyph, r.branch.clone())
         .on_enter(DetailAction::FocusWorktree(path.clone()))
         .action('m', DetailAction::OpenMergeQueueSection);
     // Verb keys mirror the panel section, gated on the row's status.
-    match r.status.as_str() {
-        "ready" => {
+    match status {
+        Some(MqStatus::Ready) => {
             row = row.action(
                 'l',
                 DetailAction::MergeQueueAction {
@@ -2435,7 +2441,7 @@ fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet
                 },
             );
         }
-        "deferred" | "gate_failed" | "gate_error" | "agent_blocked" | "needs_human" => {
+        Some(s) if s.is_held() => {
             row = row.action(
                 'r',
                 DetailAction::MergeQueueAction {

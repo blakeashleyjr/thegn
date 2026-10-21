@@ -94,7 +94,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         // an expiry the reader cannot see is one they cannot act on before it
         // fires. The right column carries the countdown in place of the bare
         // "landed", which the ✓ glyph already conveys.
-        let right = expiry_label(r).unwrap_or_else(|| r.status.clone());
+        let right = right_label(r);
         // Each queue row carries a `Row` hit so the enumerate index lines up
         // with `ui.cursor` and with `model.panel.merge_queue`.
         out.push(
@@ -104,6 +104,10 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     out.push(mq_hint_row());
     out
+}
+
+fn right_label(r: &thegn_core::db::MergeQueueRow) -> String {
+    expiry_label(r).unwrap_or_else(|| crate::merge_sweep::safe_display(&r.status))
 }
 
 fn held_reason(r: &thegn_core::db::MergeQueueRow) -> Option<(String, Hue)> {
@@ -190,7 +194,11 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
     let mut detail: Vec<Vec<Seg>> = vec![
         vec![
             status_glyph(&r.status),
-            seg(t(), format!(" {}", r.status)).bold(),
+            seg(
+                t(),
+                format!(" {}", crate::merge_sweep::safe_display(&r.status)),
+            )
+            .bold(),
         ],
         vec![
             seg(d(), r.branch.clone()),
@@ -290,6 +298,7 @@ fn mq_hint_row() -> PanelRow {
 #[cfg(test)]
 mod expiry_tests {
     use super::*;
+    use thegn_core::store::{MergeRetryOutcome, MergeStatusFields, WorktreeAuxStore};
 
     fn row(status: &str, updated_at: i64) -> thegn_core::db::MergeQueueRow {
         thegn_core::db::MergeQueueRow {
@@ -363,5 +372,74 @@ mod expiry_tests {
         let (reason, tone) = held_reason(&row("future_status", 1)).unwrap();
         assert_eq!(tone, Hue::Red);
         assert!(reason.contains("future_status"));
+    }
+
+    #[test]
+    fn right_column_status_is_sanitized() {
+        let label = right_label(&row("evil\u{1b}[2J\u{202e}", 1));
+        assert!(!label.contains('\u{1b}'));
+        assert!(!label.contains('\u{202e}'));
+        assert!(label.starts_with("evil"));
+    }
+
+    #[test]
+    fn persisted_agent_blocked_row_keeps_its_reason_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let db = thegn_core::db::Db::open_at(&path).unwrap();
+        db.enqueue_merge("/wt/a", "feat", "main").unwrap();
+        db.replace_merge_status(
+            "/wt/a",
+            "agent_blocked",
+            &MergeStatusFields {
+                error_detail: Some("sandbox floor not met".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let db = thegn_core::db::Db::open_at(&path).unwrap();
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            held_reason(&rows[0]),
+            Some((
+                "environment/policy blocked — sandbox floor not met".into(),
+                Hue::Amber
+            ))
+        );
+    }
+
+    #[test]
+    fn agent_blocked_retry_rearms_with_attempts_unspent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let db = thegn_core::db::Db::open_at(&path).unwrap();
+        db.enqueue_merge("/wt/a", "feat", "main").unwrap();
+        db.replace_merge_status(
+            "/wt/a",
+            "agent_blocked",
+            &MergeStatusFields {
+                error_detail: Some("sandbox floor not met".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let db = thegn_core::db::Db::open_at(&path).unwrap();
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "agent_blocked");
+        db.set_merge_agent_attempts("/wt/a", 2).unwrap();
+        assert_eq!(
+            db.retry_held_merge_entry("/wt/a").unwrap(),
+            MergeRetryOutcome::Rearmed
+        );
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "queued");
+        assert_eq!(rows[0].agent_attempts, 0);
     }
 }

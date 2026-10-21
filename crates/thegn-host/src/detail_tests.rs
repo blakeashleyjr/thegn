@@ -2135,3 +2135,60 @@ fn memory_popup_breakdown_has_available_then_optional_free() {
     let keys: Vec<&str> = rows.iter().map(|(key, _, _)| key.as_str()).collect();
     assert_eq!(keys, ["used", "total", "available", "free"]);
 }
+
+fn mq_test_row(status: &str) -> thegn_core::db::MergeQueueRow {
+    thegn_core::db::MergeQueueRow {
+        worktree: "/wt/a".into(),
+        branch: "feat".into(),
+        target_branch: "main".into(),
+        status: status.into(),
+        queued_at: 1,
+        updated_at: 1,
+        result_oid: None,
+        conflict_paths: None,
+        error_detail: None,
+        location: String::new(),
+        agent_attempts: 0,
+    }
+}
+
+#[test]
+fn mq_row_unknown_status_note_is_sanitized_and_has_no_retry() {
+    let row = super::mq_row(
+        &mq_test_row("bogus\u{1b}[31m"),
+        crate::caps::active_glyphs(),
+    );
+    let note = row
+        .note
+        .as_deref()
+        .expect("unknown status has an explanatory note");
+    assert!(note.contains("unrecognised queue status"));
+    assert!(!note.contains('\u{1b}'));
+    assert!(!row.actions.iter().any(|(key, _)| matches!(key, 'r' | 'l')));
+}
+
+#[test]
+fn mq_row_verbs_follow_the_typed_status_table() {
+    use thegn_core::attention::MqStatus;
+
+    for status in MqStatus::ALL {
+        let row = super::mq_row(&mq_test_row(status.as_str()), crate::caps::active_glyphs());
+        assert_eq!(
+            row.actions.iter().any(|(key, _)| *key == 'r'),
+            status.is_held(),
+            "retry action for {}",
+            status.as_str()
+        );
+        assert_eq!(
+            row.actions.iter().any(|(key, _)| *key == 'l'),
+            status == MqStatus::Ready,
+            "land action for {}",
+            status.as_str()
+        );
+        assert!(
+            row.actions.iter().any(|(key, _)| *key == 'x'),
+            "remove action for {}",
+            status.as_str()
+        );
+    }
+}
