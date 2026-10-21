@@ -248,13 +248,13 @@ fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeClaim> {
     })
 }
 
-fn read_claim(tx: &Connection, worktree: &str) -> Result<Option<MergeClaim>> {
+fn read_claim(tx: &Connection, worktree: &str, repo_root: &str) -> Result<Option<MergeClaim>> {
     Ok(tx
         .query_row(
-            "SELECT q.worktree,q.branch,w.repo_path,q.target_branch,q.location,q.claim_generation,\
+            "SELECT q.worktree,q.branch,COALESCE(w.repo_path,?2),q.target_branch,q.location,q.claim_generation,\
                 q.claim_phase,q.claim_lease_until_ms,q.claim_owner_hint,q.claim_owner \
-         FROM merge_queue q JOIN worktrees w ON w.worktree=q.worktree WHERE q.worktree=?1",
-            [worktree],
+         FROM merge_queue q LEFT JOIN worktrees w ON w.worktree=q.worktree WHERE q.worktree=?1",
+            params![worktree, repo_root],
             claim_from_row,
         )
         .optional()?)
@@ -328,7 +328,7 @@ impl Db {
             ],
         )?;
         let claim = if changed == 1 {
-            read_claim(&tx, &request.worktree)?
+            read_claim(&tx, &request.worktree, &request.repo_root)?
         } else {
             None
         };
@@ -1037,8 +1037,8 @@ impl WorktreeAuxStore for Db {
             params![lease_until_ms, claim.worktree, claim.owner_token, claim.generation, now],
         )?;
         anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
-        let mut renewed =
-            read_claim(&tx, &claim.worktree)?.ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
+        let mut renewed = read_claim(&tx, &claim.worktree, &claim.repo_root)?
+            .ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
         tx.commit()?;
         renewed.lease_until_ms = lease_until_ms;
         Ok(renewed)
@@ -1052,8 +1052,8 @@ impl WorktreeAuxStore for Db {
             params![claim.worktree, claim.owner_token, claim.generation],
         )?;
         anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
-        let settled =
-            read_claim(&tx, &claim.worktree)?.ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
+        let settled = read_claim(&tx, &claim.worktree, &claim.repo_root)?
+            .ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
         tx.commit()?;
         Ok(settled)
     }
@@ -1132,8 +1132,8 @@ impl WorktreeAuxStore for Db {
                 claim.worktree, claim.owner_token, claim.generation, now],
         )?;
         anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
-        let updated =
-            read_claim(&tx, &claim.worktree)?.ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
+        let updated = read_claim(&tx, &claim.worktree, &claim.repo_root)?
+            .ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
         tx.commit()?;
         Ok(updated)
     }
