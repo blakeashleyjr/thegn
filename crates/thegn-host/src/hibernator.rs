@@ -98,16 +98,21 @@ pub(crate) fn is_hibernated(worktree: &str) -> bool {
 }
 
 /// The snapshot key for one worktree: repo slug / worktree dir name / env.
-fn snapshot_key(repo_root: &Path, worktree: &str, env: &str) -> SnapshotKey {
+fn snapshot_key(
+    db: &thegn_core::db::Db,
+    repo_root: &Path,
+    worktree: &str,
+    env: &str,
+) -> anyhow::Result<SnapshotKey> {
     let wt_slug = Path::new(worktree)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| worktree.to_string());
-    SnapshotKey {
-        repo_slug: thegn_core::repo::repo_slug(repo_root),
+    Ok(SnapshotKey {
+        repo_slug: thegn_core::repo::repo_slug_with_checked(db, repo_root)?,
         worktree_slug: wt_slug,
         env: env.to_string(),
-    }
+    })
 }
 
 /// Open the configured snapshot store with the host secret chain.
@@ -355,7 +360,7 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
     let db = thegn_core::db::Db::open()?;
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let (repo_root, _repo, _env) = crate::lifecycle::pool_context(&db, cfg, worktree, &loc);
-    let key = snapshot_key(&repo_root, worktree, env_name);
+    let key = snapshot_key(&db, &repo_root, worktree, env_name)?;
     let store = open_store(&cfg.lifecycle.snapshot)?;
 
     // Intent row BEFORE any capture work (the crash-healing anchor).
@@ -466,7 +471,7 @@ fn restore_into_sandbox(
     let row = db
         .hibernation_for(worktree)?
         .ok_or_else(|| anyhow::anyhow!("no hibernation row for {worktree}"))?;
-    let key = snapshot_key(Path::new(&row.repo_path), worktree, &row.env_name);
+    let key = snapshot_key(db, Path::new(&row.repo_path), worktree, &row.env_name)?;
     let store = open_store(&cfg.lifecycle.snapshot)?;
     let legacy_key = key.legacy();
     let (restore_key, manifest) = match store.get_manifest(&key, snapshot_id) {
@@ -736,17 +741,47 @@ fn verify_bundle_shape(data: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::store::WorkspaceStore;
 
     #[test]
     fn snapshot_key_uses_repo_slug_worktree_dirname_env() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
         let k = snapshot_key(
+            &db,
             Path::new("/home/u/code/myrepo"),
             "/home/u/wt/tg-fox",
             "hetzner",
-        );
+        )
+        .unwrap();
+        assert_eq!(k.repo_slug, "myrepo");
         assert_eq!(k.worktree_slug, "tg-fox");
         assert_eq!(k.env, "hetzner");
         assert!(k.prefix().ends_with("/tg-fox/hetzner"));
+    }
+
+    #[test]
+    fn snapshot_key_refuses_unresolved_slug() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("db.sqlite");
+        let db = thegn_core::db::Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.slug_for_repo("/elsewhere/same-name", "same-name")
+                .unwrap(),
+            "same-name"
+        );
+        let ro = thegn_core::db::Db::open_read_only_wal_at(&path)
+            .unwrap()
+            .expect("db file exists");
+
+        assert!(
+            snapshot_key(
+                &ro,
+                Path::new("/home/me/code/same-name"),
+                "/wt/x",
+                "hetzner",
+            )
+            .is_err()
+        );
     }
 
     #[test]
