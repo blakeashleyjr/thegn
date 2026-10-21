@@ -937,6 +937,32 @@ mod tests {
         assert!(crate::pipeline_report::gate_evidence(&report).is_some());
     }
 
+    #[test]
+    fn pipeline_skill_drives_the_lead_lease_and_states_native_concurrency() {
+        let pipeline = EMBEDDED_MANIFEST
+            .iter()
+            .find(|entry| entry.name == "pipeline")
+            .expect("pipeline skill is embedded")
+            .document;
+        let collapsed = pipeline.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for command in [
+            "dispatch lease acquire",
+            "dispatch lease renew",
+            "dispatch lease release",
+        ] {
+            assert!(collapsed.contains(command), "missing {command}");
+        }
+        assert!(collapsed.contains("--name") && collapsed.contains("--owner"));
+        assert!(collapsed.contains("<repo>:<issue-id>"));
+        assert!(collapsed.contains("--ttl 300"));
+        assert!(collapsed.contains("every 100 seconds"));
+        assert!(!collapsed.contains("--name lead"));
+        assert!(!collapsed.contains("Nothing in thegn checks this"));
+        assert!(!collapsed.contains("is yours to enforce"));
+        assert!(!collapsed.contains("enforces `concurrency`"));
+    }
+
     fn source(name: &str) -> SkillSource {
         SkillSource::user(format!("fixture/{name}/SKILL.md"))
     }
