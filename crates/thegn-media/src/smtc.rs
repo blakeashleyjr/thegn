@@ -8,11 +8,14 @@
 //! `PlaybackInfoChanged`/`MediaPropertiesChanged`, and rebinds to the new session
 //! whenever the active app changes — so the badge updates event-driven (the
 //! ~0%-idle contract) instead of polling.
+//! Rebinds are generation-fenced outside the bind lock, and a failed rebind ends
+//! the watch so the host reconnects instead of trusting stale signal capability.
 //!
 //! All WinRT calls run inside `spawn_blocking` and return plain owned data
 //! (`String`/`bool`/`MediaState`), so no COM object crosses an `.await`. The
 //! pure enum/tick decoding lives in [`crate::smtc_decode`] (Linux-testable).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -28,8 +31,9 @@ use crate::MediaWatch;
 
 use crate::model::{LoopMode, MediaKind, MediaState};
 use crate::smtc_decode::{
-    ControlFlags, accepted, loop_from_repeat, loop_to_repeat, manager_unavailable,
-    playback_state_from_status, seek_target, session_caps, snapshot_caps, timeline,
+    BindState, ControlFlags, accepted, lock_unpoisoned, loop_from_repeat, loop_to_repeat,
+    manager_unavailable, playback_state_from_status, register_pair, seek_target, session_caps,
+    snapshot_caps, timeline,
 };
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
@@ -52,7 +56,12 @@ impl Smtc {
     pub async fn watch(&self) -> Result<SmtcWatch, MediaError> {
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
         let sub = run_blocking(move || subscribe(tx)).await?;
-        Ok(SmtcWatch { _sub: sub, rx })
+        let failed = sub.failed.clone();
+        Ok(SmtcWatch {
+            _sub: sub,
+            rx,
+            failed,
+        })
     }
 
     /// The current session's source app id (SMTC's notion of "player").
@@ -257,24 +266,31 @@ impl MediaBackend for Smtc {
 
 /// The per-session event bindings, swapped out whenever the current session
 /// changes. Tokens are removed on drop / rebind.
-#[derive(Default)]
 struct SessionBind {
-    session: Option<Session>,
-    info_token: Option<EventRegistrationToken>,
-    props_token: Option<EventRegistrationToken>,
+    session: Session,
+    info_token: EventRegistrationToken,
+    props_token: EventRegistrationToken,
 }
 
-impl SessionBind {
-    /// Detach the current session's handlers (best-effort).
-    fn clear(&mut self) {
-        if let Some(sess) = self.session.take() {
-            if let Some(t) = self.info_token.take() {
-                let _ = sess.RemovePlaybackInfoChanged(t); // best-effort: session may already be gone
-            }
-            if let Some(t) = self.props_token.take() {
-                let _ = sess.RemoveMediaPropertiesChanged(t); // best-effort: session may already be gone
-            }
-        }
+/// Remove both event handlers. Attempt both removals even if the first fails.
+fn detach(binding: SessionBind) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if let Err(error) = binding
+        .session
+        .RemovePlaybackInfoChanged(binding.info_token)
+    {
+        failures.push(format!("playback-info handler: {error}"));
+    }
+    if let Err(error) = binding
+        .session
+        .RemoveMediaPropertiesChanged(binding.props_token)
+    {
+        failures.push(format!("media-properties handler: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -282,64 +298,117 @@ impl SessionBind {
 struct Subscription {
     manager: Manager,
     session_changed_token: Option<EventRegistrationToken>,
-    bind: Arc<Mutex<SessionBind>>,
+    bind: Arc<Mutex<BindState<SessionBind>>>,
+    failed: Arc<AtomicBool>,
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
         if let Some(t) = self.session_changed_token.take() {
-            let _ = self.manager.RemoveCurrentSessionChanged(t); // best-effort: session may already be gone
+            if let Err(error) = self.manager.RemoveCurrentSessionChanged(t) {
+                tracing::warn!(target: "thegn::media", %error, "smtc manager handler removal failed");
+            }
         }
-        self.bind.lock().unwrap().clear();
+        let old = lock_unpoisoned(&self.bind).close();
+        if let Some(old) = old
+            && let Err(error) = detach(old)
+        {
+            tracing::warn!(target: "thegn::media", error = %error, "smtc handler removal failed");
+        }
     }
 }
 
 /// (Re)bind `PlaybackInfoChanged` + `MediaPropertiesChanged` on the manager's
 /// current session, replacing any prior bindings. Each fires `tx`.
-fn rebind(manager: &Manager, bind: &Arc<Mutex<SessionBind>>, tx: &tokio::sync::mpsc::Sender<()>) {
-    let mut b = bind.lock().unwrap();
-    b.clear();
+fn rebind(
+    manager: &Manager,
+    bind: &Arc<Mutex<BindState<SessionBind>>>,
+    tx: &tokio::sync::mpsc::Sender<()>,
+) -> Result<(), MediaError> {
+    let Some((generation, old)) = lock_unpoisoned(bind).begin() else {
+        return Ok(());
+    };
+    if let Some(old) = old
+        && let Err(error) = detach(old)
+    {
+        tracing::warn!(target: "thegn::media", error = %error, "smtc handler removal failed");
+    }
     let Ok(session) = manager.GetCurrentSession() else {
-        return;
+        return Ok(());
     };
     let tx_info = tx.clone();
-    b.info_token = session
-        .PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_info.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
-            Ok(())
-        }))
-        .ok(); // best-effort: registration failure just means no auto-updates
     let tx_props = tx.clone();
-    b.props_token = session
-        .MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_props.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
-            Ok(())
-        }))
-        .ok(); // best-effort: registration failure just means no auto-updates
-    b.session = Some(session);
+    let (info_token, props_token) = register_pair(
+        || {
+            session
+                .PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
+                    let _ = tx_info.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
+                    Ok(())
+                }))
+                .map_err(|error| error.to_string())
+        },
+        || {
+            session
+                .MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
+                    let _ = tx_props.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
+                    Ok(())
+                }))
+                .map_err(|error| error.to_string())
+        },
+        |token| {
+            session
+                .RemovePlaybackInfoChanged(token)
+                .map_err(|error| error.to_string())
+        },
+    )?;
+    let new = SessionBind {
+        session,
+        info_token,
+        props_token,
+    };
+    let installed = lock_unpoisoned(bind).install(generation, new);
+    if let Err(stale) = installed
+        && let Err(error) = detach(stale)
+    {
+        tracing::warn!(target: "thegn::media", error = %error, "stale smtc handler removal failed");
+    }
+    Ok(())
 }
 
 /// Build the full subscription: bind the current session now, then subscribe to
 /// `CurrentSessionChanged` to rebind + tick on app swaps.
 fn subscribe(tx: tokio::sync::mpsc::Sender<()>) -> Result<Subscription, MediaError> {
     let manager = manager().map_err(win_err)?;
-    let bind = Arc::new(Mutex::new(SessionBind::default()));
-    rebind(&manager, &bind, &tx);
+    let bind = Arc::new(Mutex::new(BindState::<SessionBind>::default()));
+    rebind(&manager, &bind, &tx)?;
+    let failed = Arc::new(AtomicBool::new(false));
 
     let mgr_for_handler = manager.clone();
     let bind_for_handler = bind.clone();
-    let session_changed_token = manager
-        .CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
-            rebind(&mgr_for_handler, &bind_for_handler, &tx);
+    let failed_for_handler = failed.clone();
+    let session_changed_token = match manager.CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
+            if let Err(error) = rebind(&mgr_for_handler, &bind_for_handler, &tx) {
+                tracing::warn!(target: "thegn::media", %error, "smtc session rebind failed; ending watcher");
+                failed_for_handler.store(true, Ordering::Release);
+            }
             let _ = tx.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
             Ok(())
-        }))
-        .map_err(win_err)?;
+        })) {
+        Ok(token) => token,
+        Err(error) => {
+            let old = lock_unpoisoned(&bind).close();
+            if let Some(old) = old && let Err(removal_error) = detach(old) {
+                tracing::warn!(target: "thegn::media", error = %removal_error, "smtc handler removal failed");
+            }
+            return Err(win_err(error));
+        }
+    };
 
     Ok(Subscription {
         manager,
         session_changed_token: Some(session_changed_token),
         bind,
+        failed,
     })
 }
 
@@ -348,13 +417,18 @@ fn subscribe(tx: tokio::sync::mpsc::Sender<()>) -> Result<Subscription, MediaErr
 pub struct SmtcWatch {
     _sub: Subscription,
     rx: tokio::sync::mpsc::Receiver<()>,
+    failed: Arc<AtomicBool>,
 }
 
 impl MediaWatch for SmtcWatch {
     fn changed(
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
-        Box::pin(async move { self.rx.recv().await.is_some() })
+        Box::pin(async move {
+            !self.failed.load(Ordering::Acquire)
+                && self.rx.recv().await.is_some()
+                && !self.failed.load(Ordering::Acquire)
+        })
     }
 }
 
