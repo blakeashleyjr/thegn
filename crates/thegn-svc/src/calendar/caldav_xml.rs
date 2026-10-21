@@ -20,7 +20,7 @@ const MAX_XML_ATTRIBUTES: usize = 64;
 #[derive(Debug)]
 struct Element<'a> {
     ns: String,
-    local: String,
+    local: &'a str,
     inner: &'a str,
     text: String,
     children: Vec<Element<'a>>,
@@ -98,13 +98,14 @@ impl<'a> Reader<'a> {
         &mut self,
         inherited: &BTreeMap<String, String>,
         depth: usize,
+        root_phase: &mut u8,
         visit_response: &mut impl FnMut(&Element<'a>) -> Result<(), CalendarError>,
     ) -> Result<Element<'a>, CalendarError> {
         if depth > MAX_XML_DEPTH || !self.input[self.pos..].starts_with('<') {
             return self.fail();
         }
         self.pos += 1;
-        let qname = self.name()?.to_string();
+        let qname = self.name()?;
         let mut attrs = Vec::new();
         let mut self_closing = false;
         loop {
@@ -126,7 +127,7 @@ impl<'a> Reader<'a> {
             if attrs.len() >= MAX_XML_ATTRIBUTES {
                 return self.fail();
             }
-            let key = self.name()?.to_string();
+            let key = self.name()?;
             if attrs.iter().any(|(existing, _)| existing == &key) {
                 return self.fail();
             }
@@ -156,15 +157,21 @@ impl<'a> Reader<'a> {
             attrs.push((key, value));
             self.pos += quote.len_utf8();
         }
-        let mut scope = inherited.clone();
-        scope.insert("xml".into(), "http://www.w3.org/XML/1998/namespace".into());
+        let has_namespace_decl = attrs
+            .iter()
+            .any(|(key, _)| key == "xmlns" || key.starts_with("xmlns:"));
+        let mut owned_scope = None;
         for (key, value) in &attrs {
-            if key == "xmlns" {
-                scope.insert(String::new(), decode_text(value)?.into_owned());
-            } else if let Some(prefix) = key.strip_prefix("xmlns:") {
-                scope.insert(prefix.to_string(), decode_text(value)?.into_owned());
+            if has_namespace_decl && (key == "xmlns" || key.starts_with("xmlns:")) {
+                let scope = owned_scope.get_or_insert_with(|| inherited.clone());
+                if key == "xmlns" {
+                    scope.insert(String::new(), decode_text(value)?.into_owned());
+                } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+                    scope.insert(prefix.to_string(), decode_text(value)?.into_owned());
+                }
             }
         }
+        let scope = owned_scope.as_ref().unwrap_or(inherited);
         if qname.matches(':').count() > 1 {
             return self.fail();
         }
@@ -182,6 +189,19 @@ impl<'a> Reader<'a> {
             },
             None => scope.get("").cloned().unwrap_or_default(),
         };
+        if depth == 1 && (ns != DAV_NS || local != "multistatus") {
+            return self.fail();
+        }
+        if depth == 2 && ns == DAV_NS {
+            match local {
+                "response" if *root_phase > 0 => return self.fail(),
+                "responsedescription" if *root_phase > 0 => return self.fail(),
+                "responsedescription" => *root_phase = 1,
+                "sync-token" if *root_phase > 1 => return self.fail(),
+                "sync-token" => *root_phase = 2,
+                _ => {}
+            }
+        }
         let collect_text =
             ns == DAV_NS && ["multistatus", "response", "propstat", "prop"].contains(&local);
         let content_start = self.pos;
@@ -204,7 +224,7 @@ impl<'a> Reader<'a> {
                     self.pos += 1;
                     let element = Element {
                         ns,
-                        local: local.to_string(),
+                        local,
                         inner: &self.input[content_start..content_end],
                         text,
                         children,
@@ -237,7 +257,7 @@ impl<'a> Reader<'a> {
                 {
                     self.skip_misc()?;
                 } else if self.input[self.pos..].starts_with('<') {
-                    let child = self.element(&scope, depth + 1, visit_response)?;
+                    let child = self.element(&scope, depth + 1, root_phase, visit_response)?;
                     if !(depth == 1 && is(&child, DAV_NS, "response")) {
                         children.push(child);
                     }
@@ -256,7 +276,7 @@ impl<'a> Reader<'a> {
         }
         let element = Element {
             ns,
-            local: local.to_string(),
+            local,
             inner: &self.input[self.pos..self.pos],
             text,
             children,
@@ -295,13 +315,11 @@ fn status_code(element: &Element<'_>) -> Result<u16, CalendarError> {
     let mut fields = text.split_whitespace();
     let version = fields.next().unwrap_or("");
     let code = fields.next().unwrap_or("");
-    let reason = fields.next();
     if !version
         .strip_prefix("HTTP/")
         .is_some_and(|version| !version.is_empty())
         || code.len() != 3
         || !code.bytes().all(|b| b.is_ascii_digit())
-        || reason.is_none()
     {
         return Err(CalendarError::Parse("invalid CalDAV HTTP status".into()));
     }
@@ -332,12 +350,15 @@ pub(super) fn walk_multistatus<'a>(
             0
         },
     };
+    let mut root_phase = 0;
     reader.skip_misc()?;
-    let root = reader.element(&BTreeMap::new(), 1, &mut |response| {
+    let mut namespaces = BTreeMap::new();
+    namespaces.insert("xml".into(), "http://www.w3.org/XML/1998/namespace".into());
+    let root = reader.element(&namespaces, 1, &mut root_phase, &mut |response| {
         process_response(response, &mut visit)
     })?;
     reader.skip_misc()?;
-    if reader.pos != input.len() || !is(&root, DAV_NS, "multistatus") {
+    if reader.pos != input.len() {
         return Err(parse_error(reader.pos));
     }
     let mut token = String::new();
@@ -595,37 +616,67 @@ fn valid_xml_char(ch: char) -> bool {
     matches!(ch as u32, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
 }
 
+fn scan_entity(raw: &str) -> Result<(char, usize), CalendarError> {
+    let Some(after_ampersand) = raw.strip_prefix('&') else {
+        return Err(CalendarError::Parse("invalid CalDAV entity".into()));
+    };
+    let Some(end) = after_ampersand.find(';') else {
+        return Err(CalendarError::Parse("unterminated CalDAV entity".into()));
+    };
+    let entity = &after_ampersand[..end];
+    let ch = match entity {
+        "lt" => '<',
+        "gt" => '>',
+        "amp" => '&',
+        "quot" => '"',
+        "apos" => '\'',
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            let digits = &entity[2..];
+            if !digits.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) {
+                return Err(CalendarError::Parse(
+                    "invalid CalDAV character reference".into(),
+                ));
+            }
+            let value = u32::from_str_radix(digits, 16)
+                .ok()
+                .and_then(char::from_u32);
+            match value {
+                Some(ch) if valid_xml_char(ch) => ch,
+                _ => {
+                    return Err(CalendarError::Parse(
+                        "invalid CalDAV character reference".into(),
+                    ));
+                }
+            }
+        }
+        _ if entity.starts_with('#') => {
+            let digits = &entity[1..];
+            if !digits.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                return Err(CalendarError::Parse(
+                    "invalid CalDAV character reference".into(),
+                ));
+            }
+            let value = digits.parse::<u32>().ok().and_then(char::from_u32);
+            match value {
+                Some(ch) if valid_xml_char(ch) => ch,
+                _ => {
+                    return Err(CalendarError::Parse(
+                        "invalid CalDAV character reference".into(),
+                    ));
+                }
+            }
+        }
+        _ => return Err(CalendarError::Parse("unknown CalDAV entity".into())),
+    };
+    Ok((ch, end + 2))
+}
+
 fn validate_xml_text(raw: &str) -> Result<(), CalendarError> {
     let mut rest = raw;
     while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix('&') {
-            let Some(end) = after.find(';') else {
-                return Err(CalendarError::Parse("unterminated CalDAV entity".into()));
-            };
-            let entity = &after[..end];
-            match entity {
-                "lt" | "gt" | "amp" | "quot" | "apos" => {}
-                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-                    let value = u32::from_str_radix(&entity[2..], 16)
-                        .ok()
-                        .and_then(char::from_u32);
-                    if !value.is_some_and(valid_xml_char) {
-                        return Err(CalendarError::Parse(
-                            "invalid CalDAV character reference".into(),
-                        ));
-                    }
-                }
-                _ if entity.starts_with('#') => {
-                    let value = entity[1..].parse::<u32>().ok().and_then(char::from_u32);
-                    if !value.is_some_and(valid_xml_char) {
-                        return Err(CalendarError::Parse(
-                            "invalid CalDAV character reference".into(),
-                        ));
-                    }
-                }
-                _ => return Err(CalendarError::Parse("unknown CalDAV entity".into())),
-            }
-            rest = &after[end + 1..];
+        if rest.starts_with('&') {
+            let (_, len) = scan_entity(rest)?;
+            rest = &rest[len..];
         } else {
             let end = rest.find('&').unwrap_or(rest.len());
             if rest[..end]
@@ -678,45 +729,10 @@ pub(super) fn decode_text(raw: &str) -> Result<Cow<'_, str>, CalendarError> {
                 ));
             };
             rest = &pi[end + 2..];
-        } else if let Some(after) = rest.strip_prefix('&') {
-            let Some(end) = after.find(';') else {
-                return Err(CalendarError::Parse("unterminated CalDAV entity".into()));
-            };
-            let entity = &after[..end];
-            let ch = match entity {
-                "lt" => '<',
-                "gt" => '>',
-                "amp" => '&',
-                "quot" => '"',
-                "apos" => '\'',
-                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-                    let value = u32::from_str_radix(&entity[2..], 16)
-                        .ok()
-                        .and_then(char::from_u32);
-                    match value {
-                        Some(ch) if valid_xml_char(ch) => ch,
-                        _ => {
-                            return Err(CalendarError::Parse(
-                                "invalid CalDAV character reference".into(),
-                            ));
-                        }
-                    }
-                }
-                _ if entity.starts_with('#') => {
-                    let value = entity[1..].parse::<u32>().ok().and_then(char::from_u32);
-                    match value {
-                        Some(ch) if valid_xml_char(ch) => ch,
-                        _ => {
-                            return Err(CalendarError::Parse(
-                                "invalid CalDAV character reference".into(),
-                            ));
-                        }
-                    }
-                }
-                _ => return Err(CalendarError::Parse("unknown CalDAV entity".into())),
-            };
+        } else if rest.starts_with('&') {
+            let (ch, len) = scan_entity(rest)?;
             out.push(ch);
-            rest = &after[end + 1..];
+            rest = &rest[len..];
         } else {
             let end = rest.find(['&', '<']).unwrap_or(rest.len());
             if end == 0 {
