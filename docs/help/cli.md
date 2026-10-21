@@ -175,8 +175,11 @@ thegn --profile <source> session move <worktree> --to-profile <target>
 `--profile` (or `THEGN_PROFILE`) selects the source; `<target>` must already
 exist. The exact stored worktree path is selected. The move carries its
 worktree registration, all matching current groups and tabs, sidebar
-collapse/pin state, and dispatch ledger (including notes and artifact/chunk
-paths). Pane commands, scrollback, reports, and notes are opaque text and are
+collapse/pin state, and dispatch ledger (including notes). Active dispatch
+rows (queued, spawning, running, waiting for a human, or PR open) arrive as
+`abandoned` with a `migrated while <status>: not resumed` note; every row's
+artifact and chunk paths are dropped, so work is neither resumed nor
+re-dispatched under the target profile. Pane commands, scrollback, reports, and notes are opaque text and are
 carried unchanged, but never printed by the audit. Named global layouts,
 global caches, transports, git files/objects, branches, and worktree disk
 locations are not moved. Neither profile configuration nor credentials,

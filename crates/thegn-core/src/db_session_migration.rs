@@ -9,8 +9,8 @@ use crate::models::{GroupTabRow, TabGroupRow};
 use crate::session_migration::{
     MigrationBundle, MigrationCleanupResult, MigrationCounts, MigrationDispatch, MigrationGroup,
     MigrationImportResult, MigrationNote, MigrationPlan, MigrationTarget, MigrationUiState,
-    MigrationWorktree, make_bundle, migration_tab, persisted_group, persisted_tab, select_groups,
-    select_sidebar_state,
+    MigrationWorktree, imported_dispatch, make_bundle, migration_tab, persisted_group,
+    persisted_tab, select_groups, select_sidebar_state,
 };
 use crate::store::SessionMigrationStore;
 use anyhow::Result;
@@ -226,6 +226,7 @@ impl SessionMigrationStore for Db {
                 )?;
             }
             for dispatch in &bundle.dispatches {
+                let row = imported_dispatch(dispatch);
                 db.conn().execute(
                     "INSERT INTO agent_dispatches
                        (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,
@@ -236,11 +237,11 @@ impl SessionMigrationStore for Db {
                         dispatch.worktree_path,
                         dispatch.agent_name,
                         dispatch.dispatched_at_ms,
-                        dispatch.status,
-                        dispatch.stage,
-                        dispatch.artifact_path,
-                        dispatch.note,
-                        dispatch.chunk_path,
+                        row.status,
+                        row.stage,
+                        row.artifact_path,
+                        row.note,
+                        row.chunk_path,
                         dispatch.report,
                         dispatch.chunk_scope,
                     ],
@@ -611,6 +612,7 @@ mod tests {
         assert!(target.confirm_migration(&plan).unwrap());
         let rows = dispatches_for_worktree(&target, "/w").unwrap();
         assert!(rows.iter().all(|row| row.session_id.is_none()));
+        assert!(rows.iter().all(|row| row.status == "abandoned"));
         assert_eq!(rows[1].parent_id, Some(rows[0].source_id));
         let note_dispatch: i64 = target
             .conn()
@@ -943,5 +945,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(existing, "/other");
+    }
+
+    #[test]
+    fn db_import_parks_active_dispatches_and_drops_source_paths() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,artifact_path,chunk_path,note,session_id)
+                 VALUES('THE-1144','/park','agent',1,'running','/src/a.md','/src/c.md','n','source-session')",
+                [],
+            )
+            .unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,artifact_path)
+                 VALUES('THE-1145','/park','agent',2,'done','/src/d.md')",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/park")
+            .unwrap();
+        let plan = plan_migration(
+            bundle.clone(),
+            target
+                .migration_target_snapshot("default", "/park")
+                .unwrap(),
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+
+        let rows = dispatches_for_worktree(&target, "/park").unwrap();
+        assert_eq!(rows.len(), 2);
+        let running = rows.iter().find(|row| row.issue_id == "THE-1144").unwrap();
+        assert_eq!(running.status, "abandoned");
+        assert_eq!(
+            running.note.as_deref(),
+            Some("[migrated while running: not resumed] n")
+        );
+        let done = rows.iter().find(|row| row.issue_id == "THE-1145").unwrap();
+        assert_eq!(done.status, "done");
+        assert!(
+            rows.iter()
+                .all(|row| row.artifact_path.is_none() && row.chunk_path.is_none())
+        );
+        assert!(target.confirm_migration(&plan).unwrap());
+        assert_eq!(
+            target.import_migration(&plan).unwrap().counts,
+            MigrationCounts::default()
+        );
+        source.cleanup_migration(&bundle).unwrap();
     }
 }
