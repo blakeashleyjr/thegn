@@ -468,7 +468,18 @@ pub fn prepare_sandbox_env(
         && crate::devcontainer_provider::can_honor_sandbox(&sb)
         && let Some(dc) = &devcontainer
         && dc.provider_eligible
-        && prepare_devcontainer(
+    {
+        // `can_honor_sandbox` only admits this provider for Off or SharedKernel
+        // floors, and devcontainers are SharedKernel. Admit before bring-up so a
+        // secure rejection cannot follow a container spawn.
+        let admission = crate::sandbox_admission::admit(
+            &sb,
+            thegn_core::capabilities::IsolationClass::SharedKernel,
+            worktree,
+            force_host_requested(worktree),
+            &mut warnings,
+        )?;
+        if prepare_devcontainer(
             crate::devcontainer_provider::startup::StartInputs {
                 workspace: Path::new(worktree),
                 config_path: &dc.config_path,
@@ -478,29 +489,20 @@ pub fn prepare_sandbox_env(
             },
             worktree,
             &mut warnings,
-        )?
-    {
-        // `can_honor_sandbox` only admits this provider for Off or SharedKernel
-        // floors, and devcontainers are SharedKernel.
-        let admission = crate::sandbox_admission::admit(
-            &sb,
-            thegn_core::capabilities::IsolationClass::SharedKernel,
-            worktree,
-            force_host_requested(worktree),
-            &mut warnings,
-        )?;
-        return Ok(SandboxOutcome {
-            spec: None,
-            backend_label: "devcontainer".to_string(),
-            warnings,
-            shell: env_shell,
-            is_remote: false,
-            cwd_override: None,
-            location: None,
-            degraded_from_provider: false,
-            route_ssh_target: None,
-            admission,
-        });
+        )? {
+            return Ok(SandboxOutcome {
+                spec: None,
+                backend_label: "devcontainer".to_string(),
+                warnings,
+                shell: env_shell,
+                is_remote: false,
+                cwd_override: None,
+                location: None,
+                degraded_from_provider: false,
+                route_ssh_target: None,
+                admission,
+            });
+        }
     }
     // Selection dropped: the user asked for a non-default env that isn't defined
     // under `[env.<name>]`, so `resolve_env` fell back to Local. The Provider/ssh
@@ -778,7 +780,8 @@ pub fn prepare_sandbox_env(
                 crate::sandbox_admission::CandidateAdmission::Admitted(admission) => admission,
                 crate::sandbox_admission::CandidateAdmission::Miss(miss) => {
                     // Fail-closed. On an explicit pick, refuse now; otherwise
-                    // remember the miss and try a stronger candidate.
+                    // remember the miss and try a stronger candidate. The
+                    // end-of-loop halt fires only if no candidate meets the floor.
                     if explicit_choice {
                         anyhow::bail!("{} for {worktree}", miss.refusal());
                     }
@@ -786,6 +789,8 @@ pub fn prepare_sandbox_env(
                     continue;
                 }
             };
+            // Degrade is fail-safe: admit_candidate flags and warns, then returns
+            // an Admission with MissedDegrade rather than a Miss.
             // THE-215: a sealed launch must hide the host $HOME. Fail closed on a
             // backend/config that would expose it — same doctrine as the floor.
             if let Some(m) = thegn_core::sandbox_floor::home_gate(&spec) {
