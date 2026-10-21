@@ -1965,7 +1965,7 @@ check "dispatch report files the handoff report" \
   "'$SZ' dispatch report '$untracked_row' --text 'verdict: DONE; commits: 1
 gate: just smoke -- exit 0' --json | grep -q '\"bytes\"'"
 set +e
-untrusted_done_out="$("$SZ" dispatch set-status "$untracked_row" done 2>&1)"
+untrusted_done_out="$("$SZ" dispatch set-status "$untracked_row" "done" 2>&1)"
 untrusted_done_rc=$?
 set -e
 untrusted_done_ok=1
@@ -2236,6 +2236,14 @@ if command -v curl >/dev/null 2>&1; then
     "[[ $live_stage_exit_ok -eq 1 ]]"
   check "stage worker's artifact is tracked and its report verifies" \
     "'$SZ' dispatch verify '$live_stage_row' --json | grep -q '\"ok\":true'"
+  set +e
+  live_untrusted_done_out="$("$SZ" dispatch set-status "$live_stage_row" "done" 2>&1)"
+  live_untrusted_done_rc=$?
+  set -e
+  live_untrusted_done_ok=1
+  [[ $live_untrusted_done_rc -ne 0 ]] && grep -q 'dispatch gate' <<<"$live_untrusted_done_out" || live_untrusted_done_ok=0
+  check "stage worker's unforced done is refused without a trusted gate attestation" \
+    "[[ $live_untrusted_done_ok -eq 1 ]]"
   check "verified stage-worker row records an explicit forced completion" \
     "'$SZ' dispatch set-status '$live_stage_row' done --force --why 'smoke: no gate configured' | grep -q forced"
 
