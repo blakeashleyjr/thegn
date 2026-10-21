@@ -643,6 +643,26 @@ pub fn calendar_account_in_file(config_path: &Path, name: &str) -> Result<bool> 
         }))
 }
 
+/// Return the token string for `name`'s `[[calendar.accounts]]` entry in this
+/// config file. Inline arrays, absent entries, and non-string tokens return
+/// `None`.
+pub fn calendar_account_token_in_file(config_path: &Path, name: &str) -> Result<Option<String>> {
+    let (doc, _) = read_doc(config_path)?;
+    Ok(doc
+        .get("calendar")
+        .and_then(Item::as_table)
+        .and_then(|calendar| calendar.get("accounts"))
+        .and_then(Item::as_array_of_tables)
+        .and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|account| account.get("name").and_then(|v| v.as_str()) == Some(name.trim()))
+        })
+        .and_then(|account| account.get("token"))
+        .and_then(Item::as_str)
+        .map(str::to_owned))
+}
+
 /// Rewrite only the token of an existing `[[calendar.accounts]]` entry.
 /// Unlike the issue-account upsert, this never creates a partial account when
 /// the account is defined in another config layer.
