@@ -28,9 +28,10 @@ for each to stop answering, and exits non-zero naming any that are still
 running. With none running it prints "no thegn pane daemon is running" and
 succeeds.
 
-When the UI exits, in-flight custom git commands and CI refreshes are cancelled.
-Thegn waits up to two seconds for them before exiting; work still running after
-that is logged.
+When the UI exits, in-flight custom git commands, CI refreshes, and CI rerun or
+cancel actions are cancelled. Thegn waits up to two seconds for them before
+exiting; work still running after that is logged. A CI action requested while
+thegn is quitting is not started.
 
 The status bar's daemon chip shows whether the focused pane is
 daemon-backed; select it for the full session rollup. See [[bars]].
