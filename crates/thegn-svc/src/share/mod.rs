@@ -493,13 +493,49 @@ impl UrlRule {
     }
 }
 
+/// Secret-bearing share values are zeroized on drop and never formatted (THE-325).
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct SecretString(zeroize::Zeroizing<String>);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self::new(value.to_owned())
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretString(<redacted>)")
+    }
+}
+
 /// A file the provider needs materialized on disk (0600) before spawn and
 /// referenced by `args`/`cwd` — e.g. a generated `frpc.toml`. Mirrors
 /// `crate::vpn::SidecarFile`. `dest` is relative to the per-share state dir.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SharePlanFile {
     pub dest: String,
-    pub contents: String,
+    pub contents: SecretString,
 }
 
 impl fmt::Debug for SharePlanFile {
@@ -521,7 +557,7 @@ pub struct SharePlan {
     /// `{statedir}`, expanded to the per-share state directory at spawn time.
     pub args: Vec<String>,
     /// Environment overrides (secrets already resolved).
-    pub env: Vec<(String, String)>,
+    pub env: Vec<(String, SecretString)>,
     /// Files to materialize 0600 in the per-share state dir before spawn.
     pub files: Vec<SharePlanFile>,
     /// How to recognise/derive the public URL.
@@ -620,7 +656,7 @@ fn plan_bore(spec: &ShareSpec, b: &BoreConfig) -> SharePlan {
     let secret = expand_env_ref(&b.secret);
     let mut env = vec![("RUST_LOG".into(), "info".into())];
     if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
-        env.push(("BORE_SECRET".into(), secret));
+        env.push(("BORE_SECRET".into(), SecretString::new(secret)));
     }
     SharePlan {
         program: "bore".into(),
@@ -777,7 +813,7 @@ fn plan_frp_resolving_token(
         env: Vec::new(),
         files: vec![SharePlanFile {
             dest: "frpc.toml".into(),
-            contents: toml,
+            contents: toml.into(),
         }],
         url_rule: UrlRule::Fixed(url),
     })
@@ -1760,7 +1796,7 @@ fn start_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in &plan.env {
-        cmd.env(k, v);
+        cmd.env(k, v.expose());
     }
     if matches!(grouping, ProcessGrouping::OwnGroup) {
         crate::plugin::proc::set_process_group(&mut cmd);
@@ -2079,7 +2115,7 @@ fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()>
     }
     for f in &plan.files {
         let path = statedir.join(&f.dest);
-        thegn_core::fsperm::write_owner_only_atomic(&path, f.contents.as_bytes())
+        thegn_core::fsperm::write_owner_only_atomic(&path, f.contents.expose().as_bytes())
             .with_context(|| format!("share: write {}", path.display()))?;
     }
     Ok(())
