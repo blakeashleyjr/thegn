@@ -224,6 +224,7 @@ impl FlySpec {
 pub struct FlyProvider {
     spec: FlySpec,
     client: reqwest::Client,
+    owner: Option<String>,
     ips: Mutex<HashMap<String, String>>,
 }
 
@@ -232,12 +233,22 @@ impl FlyProvider {
         FlyProvider {
             spec,
             client: crate::provider::provider_http_client(),
+            owner: None,
             ips: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn spec(&self) -> &FlySpec {
         &self.spec
+    }
+
+    pub fn with_owner(mut self, owner: String) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
     }
 
     async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
@@ -679,6 +690,7 @@ impl RemoteProvider for FlyProvider {
                 instance_id: String::new(),
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
+                owner: self.owner.clone().unwrap_or_default(),
             };
             let cap = self.spec.max_instances();
             let reservation_name = name.clone();
@@ -699,6 +711,9 @@ impl RemoteProvider for FlyProvider {
                         "fly: {occupied} managed machines already exist (max_instances = {cap}); \
                          destroy one or raise `[env.<name>.provider] max_instances`"
                     ));
+                }
+                Err(error @ registry::ReserveError::OwnedByOther { .. }) => {
+                    return Err(anyhow!(error));
                 }
                 Err(registry::ReserveError::Store(error)) => {
                     return Err(
@@ -766,6 +781,7 @@ impl RemoteProvider for FlyProvider {
                 instance_id: machine_id,
                 ip: ip.clone(),
                 created_at: thegn_core::util::now(),
+                owner: self.owner.clone().unwrap_or_default(),
             })?;
             self.ips.lock().unwrap().insert(name.clone(), ip.clone());
             thegn_core::managed_ssh::record_authorized(
@@ -884,6 +900,7 @@ mod tests {
             instance_id: "machine-b".into(),
             ip: "198.51.100.2".into(),
             created_at: 1,
+            owner: String::new(),
         })
         .unwrap();
 
@@ -903,6 +920,7 @@ mod tests {
             instance_id: "foreign-machine".into(),
             ip: "203.0.113.9".into(),
             created_at: 1,
+            owner: String::new(),
         })
         .unwrap();
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1425,5 +1443,37 @@ mod tests {
         assert_eq!(admitted.size.as_str(), "performance-1x");
         assert_eq!(admitted.region, "ams");
         assert_eq!(admitted.org_slug, "acme");
+    }
+
+    #[tokio::test]
+    async fn owner_mismatch_refuses_ensure_exists_before_http() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-fly-owner-check";
+        registry::write(&registry::VpsRecord {
+            name: name.into(),
+            provider: LEDGER_PROVIDER.into(),
+            state: "ready".into(),
+            instance_id: "machine-1".into(),
+            ip: "192.0.2.1".into(),
+            created_at: 1,
+            owner: registry::worktree_owner(b"/worktree/owner-a"),
+        })
+        .unwrap();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _srv) = fake_fly_server(hits.clone()).await;
+        let provider = FlyProvider::new(FlySpec {
+            api_base: base.clone(),
+            graphql_url: format!("{base}/"),
+            name: name.into(),
+            ..spec()
+        })
+        .with_owner(registry::worktree_owner(b"/worktree/owner-b"));
+
+        let error = crate::provider::Provider::Fly(provider)
+            .ensure_exists(name)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("bound to a different worktree"));
+        assert!(hits.lock().unwrap().is_empty(), "no Fly request is allowed");
     }
 }
