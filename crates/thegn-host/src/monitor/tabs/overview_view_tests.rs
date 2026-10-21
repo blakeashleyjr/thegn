@@ -385,3 +385,63 @@ fn overview_power_panel_appears_with_a_battery_reading() {
     );
     assert!(demand.contains(CollectorId::PowerSupply));
 }
+
+#[test]
+fn fresh_overview_does_not_place_or_demand_power_before_discovery() {
+    let model = OverviewModel::default();
+    let (_, placed, demand) = paint(&model, 240, 60);
+
+    assert!(
+        !placed
+            .iter()
+            .any(|panel| panel.id == PanelId("overview.power"))
+    );
+    assert!(!demand.contains(CollectorId::PowerSupply));
+    assert!(demand.contains(CollectorId::CpuStat));
+}
+
+#[test]
+fn overview_power_panel_appears_once_discovery_finds_a_supply() {
+    // Positive control: this already passes on main after a supply is discovered.
+    let mut model = fixture();
+    let mut health =
+        [thegn_metrics::collect::health::Health::Warming; thegn_metrics::collect::COLLECTORS];
+    health[CollectorId::PowerSupply.index()] = thegn_metrics::collect::health::Health::Ok;
+    model.absorb_frame(&MonitorFrame {
+        health,
+        ..Default::default()
+    });
+
+    let (_, placed, demand) = paint(&model, 240, 60);
+    assert!(
+        placed
+            .iter()
+            .any(|panel| panel.id == PanelId("overview.power"))
+    );
+    assert!(demand.contains(CollectorId::PowerSupply));
+}
+
+#[test]
+fn overview_power_panel_stays_placed_while_its_collector_is_failing() {
+    // Positive control: this already passes on main for a failing collector.
+    let mut model = fixture();
+    let mut health =
+        [thegn_metrics::collect::health::Health::Warming; thegn_metrics::collect::COLLECTORS];
+    health[CollectorId::PowerSupply.index()] = thegn_metrics::collect::health::Health::Failing {
+        since_tick: 1,
+        backoff: 1,
+        retry_at: 2,
+    };
+    model.absorb_frame(&MonitorFrame {
+        health,
+        ..Default::default()
+    });
+
+    let (_, placed, demand) = paint(&model, 240, 60);
+    assert!(
+        placed
+            .iter()
+            .any(|panel| panel.id == PanelId("overview.power"))
+    );
+    assert!(demand.contains(CollectorId::PowerSupply));
+}
