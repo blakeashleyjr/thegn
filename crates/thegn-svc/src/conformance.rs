@@ -27,6 +27,7 @@ pub const KNOWN_SEAMS: &[&str] = &[
     "structural",
     "host_discovery",
     "weather",
+    "debug",
 ];
 
 /// Shape invariants for a batch of probe reports (typically
@@ -72,11 +73,24 @@ mod tests {
     use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
     use thegn_core::seam::Kind;
 
+    fn hermetic_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false;
+        cfg.managed_tools.insert(
+            "bugstalker".into(),
+            thegn_core::managed_tool::ToolOverride {
+                path: "/fixture/bs".into(),
+                args: Vec::new(),
+            },
+        );
+        cfg
+    }
+
     #[test]
     fn default_config_reports_hold_the_shape() {
         // Keep the batch hermetic — don't shell out to a real tailscale client
         // (the disabled tailnet path still reports the host_discovery seam).
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.host_discovery.tailnet.enabled = false;
         let reports = probes(&cfg);
         assert_report_invariants(&reports);
@@ -99,7 +113,7 @@ mod tests {
     /// account, and the shape still holds.
     #[test]
     fn fully_configured_registry_reports_every_account() {
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.host_discovery.tailnet.enabled = false; // hermetic: no real tailscale exec
         for (name, provider) in [
             ("lin", IssueProviderKind::Linear),
@@ -199,7 +213,7 @@ mod tests {
     /// explains *why* a seam is unavailable rather than omitting it.
     #[test]
     fn reserved_selections_report_reserved() {
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.host_discovery.tailnet.enabled = false; // hermetic: no real tailscale exec
         cfg.ci.provider = thegn_core::config_ci::CiProviderKind::Drone;
         cfg.media.backend = thegn_core::config::MediaBackendKind::Spotify;
@@ -291,7 +305,7 @@ mod tests {
     /// snapshots (cheap by contract, no network), so doctor output is stable.
     #[test]
     fn probes_are_deterministic() {
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.host_discovery.tailnet.enabled = false;
         let a = probes(&cfg);
         let b = probes(&cfg);
