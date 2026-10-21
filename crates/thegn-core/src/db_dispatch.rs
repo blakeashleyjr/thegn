@@ -2669,6 +2669,151 @@ mod tests {
     }
 
     #[test]
+    fn admission_race_parent_abandoned_under_a_held_write_lock_refuses_the_child() {
+        for claim in [false, true] {
+            let (db, dir) = temp_db();
+            let parent = put_row(&db, "linear:CHILD", "/wt/parent");
+            let child = crate::issue::NewDispatch {
+                parent_id: Some(parent),
+                ..crate::issue::NewDispatch::new("linear:CHILD", "/wt/child", "coder")
+            };
+            let path = dir.path().join("thegn.db");
+            db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET status='abandoned' WHERE id=?1",
+                    [parent],
+                )
+                .unwrap();
+
+            let error = std::thread::scope(|scope| {
+                let child_path = path.clone();
+                let worker = scope.spawn(move || {
+                    let other = Db::open_at(&child_path).unwrap();
+                    if claim {
+                        other
+                            .claim_dispatch_admitted(child, 10, None, None, None)
+                            .unwrap_err()
+                    } else {
+                        other.put_dispatch_with_parent_check(child).unwrap_err()
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                db.conn().execute_batch("COMMIT").unwrap();
+                worker.join().expect("child admission worker must finish")
+            });
+
+            assert_eq!(
+                error
+                    .downcast_ref::<ParentDispatchConflict>()
+                    .map(|conflict| conflict.reason),
+                Some(ParentEdgeReason::Ineligible(AgentDispatchStatus::Abandoned)),
+                "claim={claim}; the committed parent transition must be observed: {error}"
+            );
+            assert_eq!(
+                db.list_dispatches().unwrap().len(),
+                1,
+                "claim={claim}; a refused child must not be inserted"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_race_parent_check_precedes_capacity() {
+        let (db, _dir) = temp_db();
+        db.put_agent_dispatch(pipeline_row(
+            "linear:CAPACITY",
+            "/wt/active",
+            "code",
+            None,
+            None,
+        ))
+        .unwrap();
+        let child = pipeline_row("linear:CAPACITY", "/wt/child", "code", None, Some(77_777));
+        let result = db.claim_dispatch_admitted(child, 1, None, None, None);
+
+        assert!(
+            matches!(result, Err(ref error)
+            if error.downcast_ref::<ParentDispatchConflict>().is_some_and(|conflict| {
+                conflict.reason == ParentEdgeReason::Missing
+            })),
+            "missing parent must be rejected before full-stage capacity; observed {result:?}"
+        );
+        assert_eq!(
+            db.list_dispatches().unwrap().len(),
+            1,
+            "parent refusal must leave the active row as the only row"
+        );
+    }
+
+    #[test]
+    fn admission_race_concurrent_note_writers_never_exceed_the_count_quota() {
+        let (db, dir) = temp_db();
+        let id = put_row(&db, "linear:THE-243-race", "/wt/note-race");
+        let prefill = crate::pipeline_report::NOTE_MAX_PER_ROW - 10;
+        db.conn()
+            .execute(
+                "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < ?2) \
+                 INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) \
+                 SELECT ?1, 1, 'n' FROM seq",
+                rusqlite::params![id, prefill as i64],
+            )
+            .unwrap();
+        assert_eq!(
+            db.dispatch_note_count(id, None).unwrap(),
+            prefill,
+            "the deterministic prefill must leave exactly ten available slots"
+        );
+        let path = dir.path().join("thegn.db");
+
+        let mut results = Vec::new();
+        std::thread::scope(|scope| {
+            let left_path = path.clone();
+            let left = scope.spawn(move || {
+                let writer = Db::open_at(&left_path).unwrap();
+                (0..10)
+                    .map(|_| writer.append_dispatch_note_record(id, "x"))
+                    .collect::<Vec<_>>()
+            });
+            let right_path = path;
+            let right = scope.spawn(move || {
+                let writer = Db::open_at(&right_path).unwrap();
+                (0..10)
+                    .map(|_| writer.append_dispatch_note_record(id, "x"))
+                    .collect::<Vec<_>>()
+            });
+            results.extend(left.join().expect("left note writer must finish"));
+            results.extend(right.join().expect("right note writer must finish"));
+        });
+
+        let successes = results.iter().filter(|result| result.is_ok()).count();
+        let refusals = results
+            .iter()
+            .filter(|result| {
+                matches!(result, Err(error)
+                if error.downcast_ref::<DispatchNoteQuotaExceeded>().is_some_and(|quota| {
+                    quota.dispatch_id == id
+                        && quota.kind == NoteQuotaKind::Count
+                        && quota.notes == crate::pipeline_report::NOTE_MAX_PER_ROW
+                }))
+            })
+            .count();
+        assert_eq!(
+            successes, 10,
+            "two concurrent writers must fill exactly the ten remaining slots; successes={successes}"
+        );
+        assert_eq!(
+            refusals, 10,
+            "all excess concurrent writes must report typed count-quota refusals; refusals={refusals}"
+        );
+        assert_eq!(
+            db.dispatch_note_count(id, None).unwrap(),
+            crate::pipeline_report::NOTE_MAX_PER_ROW,
+            "concurrent writers must never commit beyond the per-row count quota"
+        );
+    }
+
+    #[test]
     fn parent_edge_resume_finisher_keeps_a_failed_source_parent() {
         let (db, _dir) = temp_db();
         let source = put_row(&db, "linear:RESUME", "/wt/source");
