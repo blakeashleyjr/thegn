@@ -271,6 +271,14 @@ permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-l
   `.claude/settings.local.json` that an older thegn seeded into a worktree
   still grants whatever it lists — delete the entries you did not write, or a
   narrowed `permissions` list will not take effect.
+- **Autonomous Claude launches** (headless queue and pipeline agents, and
+  every pipeline-stage launch including resume, continue, and fork) pass
+  `--setting-sources user`. The worktree's `.claude/settings.json` and
+  `settings.local.json` do not load, so their hooks and permission rules do
+  not apply. Your own `~/.claude/settings.json` and the command-scoped
+  `permissions` grant still apply. An explicit `agent_command` runs exactly as
+  written; add the flag yourself if it should skip project settings.
+  Interactive panes you open load project settings as usual.
 
 A stage overrides any of these for its own launches — including `harness`, so
 one generic role can run on claude for reviews and pi for the fan-out — and
