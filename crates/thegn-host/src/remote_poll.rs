@@ -731,7 +731,7 @@ mod tests {
     fn remote_for_reports_an_unreadable_repo_as_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let loc = GitLoc::Local(dir.path().join("missing"));
-        assert!(matches!(remote_for(&loc), Err(_)));
+        assert!(remote_for(&loc).is_err());
     }
 
     #[test]
