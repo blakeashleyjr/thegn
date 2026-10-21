@@ -2548,6 +2548,11 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WorkspaceConfig {
+    /// Bind this trusted block to one checkout (an absolute path; `~` is
+    /// expanded). A bound block is selected by path, never by its key, and is
+    /// refused for every other checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
     /// Trusted per-workspace logical editor provider. `None` inherits
     /// `[editor] provider`; an explicit `auto` selects the custom-program
     /// ladder for this workspace.
@@ -7106,6 +7111,7 @@ impl Config {
 
     /// The trusted `[workspace.<key>]` overlay for a repository ROOT — the
     /// single selector every repo-scoped consumer uses (THE-515). The key is
+    /// selected by an explicit `repo_path` first, then by the legacy key
     /// derived purely from the root path (no Git, safe on the UI loop); pass
     /// the repository's main checkout, never a linked worktree path.
     pub fn workspace_overlay(
@@ -7115,14 +7121,16 @@ impl Config {
         if self.workspace.is_empty() {
             return crate::workspace_overlay::WorkspaceOverlay::Unconfigured;
         }
-        crate::workspace_overlay::resolve(
+        crate::workspace_overlay::resolve_for_root(
             &self.workspace,
-            crate::workspace_overlay::legacy_key_for_root(repo_root).as_deref(),
+            repo_root,
+            crate::workspace_overlay::lexical_same_path,
         )
     }
 
     /// The trusted overlay for an already-derived legacy key (a tab/workspace
-    /// slug). Same refusals as [`Self::workspace_overlay`].
+    /// slug). Bound blocks are never selected by key because this caller cannot
+    /// prove which checkout the key represents.
     pub fn workspace_overlay_for_key(
         &self,
         key: &str,
@@ -7135,10 +7143,11 @@ impl Config {
     /// binding lands).
     ///
     /// The slug itself is never the key: the registry maps it to the
-    /// repository path it was issued for, and the overlay is selected by that
-    /// path's own legacy key — so the `repo` fallback and `-N` collision
-    /// suffixes never select a block that merely shares their spelling, and a
-    /// `-2` tab of a correctly configured repo still gets its own block. The
+    /// repository path it was issued for, and the overlay is selected by an
+    /// explicit path binding first, then that path's own legacy key — so the
+    /// `repo` fallback and `-N` collision suffixes never select a block that
+    /// merely shares their spelling, and a `-2` tab of a correctly configured
+    /// repo still gets its own block. The
     /// registry is a cache (stale rows, several spellings of one checkout), so
     /// it is used only to REFUSE, and only when another row is a separate live
     /// main checkout (filesystem identity, not path) deriving the same key. An
@@ -7165,22 +7174,38 @@ impl Config {
         let Some(path) = crate::workspace_overlay::registered_path(slug, &rows) else {
             return WorkspaceOverlay::Unconfigured;
         };
-        let Some(key) = crate::workspace_overlay::legacy_key_for_root(Path::new(path)) else {
-            return WorkspaceOverlay::Unconfigured;
+        let same = |bound: &Path, root: &Path| {
+            crate::workspace_overlay::lexical_same_path(bound, root)
+                || matches!(
+                    (
+                        bound.to_str().and_then(live_main_checkout),
+                        root.to_str().and_then(live_main_checkout)
+                    ),
+                    (Some(a), Some(b)) if a == b
+                )
         };
-        let base = self.workspace_overlay_for_key(&key);
-        if !matches!(base, WorkspaceOverlay::Selected { .. }) {
+        let base =
+            crate::workspace_overlay::resolve_for_root(&self.workspace, Path::new(path), same);
+        if let WorkspaceOverlay::Selected { overlay, .. } = &base
+            && overlay.repo_path.is_some()
+        {
             return base;
         }
+        let WorkspaceOverlay::Selected { key, .. } = &base else {
+            return base;
+        };
         let duplicates =
-            crate::workspace_overlay::live_duplicates(&key, path, &rows, live_main_checkout);
+            crate::workspace_overlay::live_duplicates(key, path, &rows, live_main_checkout);
         if duplicates.is_empty() {
             return base;
         }
         let mut repositories = duplicates;
         repositories.push(path.to_string());
         repositories.sort();
-        WorkspaceOverlay::Refused(OverlayRefusal::AmbiguousRepositories { key, repositories })
+        WorkspaceOverlay::Refused(OverlayRefusal::AmbiguousRepositories {
+            key: key.to_string(),
+            repositories,
+        })
     }
 
     /// The refusal for a repository's trusted overlay, if selection is
