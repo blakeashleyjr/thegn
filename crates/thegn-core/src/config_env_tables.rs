@@ -703,6 +703,9 @@ pub struct SnapshotStoreConfig {
     pub access_key: String,
     /// Secret ref for the secret access key (same forms as `access_key`).
     pub secret_key: String,
+    /// S3 backend: sign the x-amz-server-side-encryption: AES256 header into every snapshot upload (default). Set false only for an
+    /// S3-compatible store that rejects SSE-S3; it never permits a plaintext endpoint.
+    pub server_side_encryption: bool,
 }
 
 impl Default for SnapshotStoreConfig {
@@ -718,6 +721,7 @@ impl Default for SnapshotStoreConfig {
             prefix: "thegn".into(),
             access_key: "env:AWS_ACCESS_KEY_ID".into(),
             secret_key: "env:AWS_SECRET_ACCESS_KEY".into(),
+            server_side_encryption: true,
         }
     }
 }
@@ -902,6 +906,18 @@ mod tests {
         // keep=0 would prune the only copy of just-captured work; clamp to 1.
         assert_eq!(zero.keep_clamped(), 1);
         assert_eq!(zero.max_artifact_bytes(), None);
+    }
+
+    #[test]
+    fn snapshot_store_sse_defaults_on_and_parses_opt_out() {
+        assert!(SnapshotStoreConfig::default().server_side_encryption);
+
+        let opted_out = toml::from_str::<SnapshotStoreConfig>("server_side_encryption = false")
+            .expect("SSE opt-out parses");
+        assert!(!opted_out.server_side_encryption);
+
+        let empty = toml::from_str::<SnapshotStoreConfig>("").expect("empty config parses");
+        assert!(empty.server_side_encryption);
     }
 
     #[test]
