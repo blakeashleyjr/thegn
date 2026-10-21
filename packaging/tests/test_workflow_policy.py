@@ -280,6 +280,127 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, scripts)
 
+    def test_package_verifies_attestations_before_validation(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["package"]
+        steps = job.get("steps", [])
+        names = [step.get("name") for step in steps]
+        verify_index = names.index("Verify archive provenance")
+        download_index = names.index("Download this tag's source assets")
+        validation_index = names.index("Validate all active inputs and render metadata")
+        self.assertLess(download_index, verify_index)
+        self.assertLess(verify_index, validation_index)
+        script = steps[verify_index].get("run", "")
+        for expected in (
+            "gh attestation verify",
+            "--signer-workflow",
+            "--source-digest",
+            "--deny-self-hosted-runners",
+            "--format json",
+            "runInvocationURI",
+            "$GITHUB_RUN_ID",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, script)
+        self.assertEqual("read", job.get("permissions", {}).get("attestations"))
+
+    def test_package_provenance_rehearsal(self) -> None:
+        if shutil.which("bash") is None:
+            self.skipTest("bash is required for the package provenance rehearsal")
+        job = read_workflow("release.yml")["jobs"]["package"]
+        step = next(
+            candidate
+            for candidate in job.get("steps", [])
+            if candidate.get("name") == "Verify archive provenance"
+        )
+        script = step["run"]
+        admitted_sha = "38ea6674e95abc580c473ed708332cd3d14e97ea"
+        signing_sha = "e45b37fb590f7aac8d3580ab22be6cd2b450c43f"
+        self.assertNotEqual(admitted_sha, signing_sha)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            assets = temporary_path / "assets"
+            assets.mkdir()
+            for name in ("thegn-v1.2.3-a.tar.gz", "thegn-v1.2.3-b.tar.gz"):
+                (assets / name).write_bytes(b"")
+            (assets / "thegn-v1.2.3-a.tar.gz.sha256").write_text(
+                "not an archive\n", encoding="utf-8"
+            )
+            stub_dir = temporary_path / "bin"
+            stub_dir.mkdir()
+            log_path = temporary_path / "gh.log"
+            stub = stub_dir / "gh"
+            stub.write_text(
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$*" >> "$GH_LOG"\n'
+                'if [ -n "$GH_FAIL" ]; then\n'
+                '  case "$*" in *"/$GH_FAIL "*) exit 1;; esac\n'
+                "fi\n"
+                'if [ "$GH_FOREIGN_RUN" = 1 ]; then\n'
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/other/attempts/1"\n'
+                "else\n"
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1"\n'
+                "fi\n"
+                'printf \'[{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"%s"}}}}]\\n\' "$run_uri"\n',
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+
+            def run_case(
+                *, fail: str = "", foreign_run: bool = False, empty: bool = False
+            ) -> subprocess.CompletedProcess[str]:
+                log_path.write_text("", encoding="utf-8")
+                if empty:
+                    for archive in assets.glob("*.tar.gz"):
+                        archive.unlink()
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "PATH": f"{stub_dir}{os.pathsep}{environment.get('PATH', '')}",
+                        "PACKAGE_ROOT": str(temporary_path),
+                        "TAG": "v1.2.3",
+                        "GITHUB_REPOSITORY": "o/r",
+                        "ADMITTED_SHA": admitted_sha,
+                        "GITHUB_SHA": signing_sha,
+                        "GITHUB_SERVER_URL": "https://github.com",
+                        "GITHUB_RUN_ID": "12345",
+                        "GITHUB_TOKEN": "x",
+                        "GH_LOG": str(log_path),
+                        "GH_FAIL": fail,
+                        "GH_FOREIGN_RUN": "1" if foreign_run else "0",
+                    }
+                )
+                return subprocess.run(
+                    ["bash", "-c", script],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            result = run_case(fail="")
+            self.assertEqual(0, result.returncode, result.stderr)
+            calls = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(2, len(calls))
+            for call in calls:
+                self.assertTrue(call.startswith("attestation verify "))
+                self.assertIn(f"--source-digest {signing_sha}", call)
+                self.assertIn("--repo o/r", call)
+                self.assertIn("--format json", call)
+            self.assertTrue(any("thegn-v1.2.3-a.tar.gz" in call for call in calls))
+            self.assertTrue(any("thegn-v1.2.3-b.tar.gz" in call for call in calls))
+            self.assertFalse(any(".sha256" in call for call in calls))
+
+            result = run_case(fail="thegn-v1.2.3-b.tar.gz")
+            self.assertNotEqual(0, result.returncode)
+
+            result = run_case(foreign_run=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not bound to this workflow run", result.stdout)
+
+            result = run_case(fail="", empty=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual("", log_path.read_text(encoding="utf-8"))
+
     def test_no_job_holds_both_deploy_keys(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]
         serialized = {name: yaml.safe_dump(job) for name, job in jobs.items()}
