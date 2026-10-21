@@ -142,6 +142,163 @@ fn sidecar_argv_carries_managed_and_profile_owner_labels() {
 }
 
 #[test]
+fn plan_fingerprint_tracks_credentials_routes_and_image() {
+    let baseline = spec(ts_cfg());
+    let baseline_plan = for_provider(&baseline)
+        .sidecar_plan("vpn-fingerprint")
+        .unwrap();
+    let first = plan_fingerprint(&baseline_plan);
+    let second = plan_fingerprint(
+        &for_provider(&spec(ts_cfg()))
+            .sidecar_plan("another-container-name")
+            .unwrap(),
+    );
+    assert_eq!(first, second, "container identity is not part of the plan");
+    assert_eq!(first.len(), 64);
+    assert!(
+        first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+
+    let mut credentials = ts_cfg();
+    credentials.tailscale.auth_key = "tskey-changed".into();
+    assert_ne!(
+        first,
+        plan_fingerprint(
+            &for_provider(&spec(credentials))
+                .sidecar_plan("vpn-fingerprint")
+                .unwrap()
+        )
+    );
+
+    let mut routes = ts_cfg();
+    routes
+        .tailscale
+        .advertise_routes
+        .push("10.42.0.0/16".into());
+    assert_ne!(
+        first,
+        plan_fingerprint(
+            &for_provider(&spec(routes))
+                .sidecar_plan("vpn-fingerprint")
+                .unwrap()
+        )
+    );
+
+    let mut image = ts_cfg();
+    image.sidecar_image = "example.invalid/tailscale:test".into();
+    assert_ne!(
+        first,
+        plan_fingerprint(
+            &for_provider(&spec(image))
+                .sidecar_plan("vpn-fingerprint")
+                .unwrap()
+        )
+    );
+}
+
+#[test]
+fn sidecar_argv_carries_the_plan_fingerprint_label() {
+    let plan = for_provider(&spec(ts_cfg()))
+        .sidecar_plan("vpn-label")
+        .unwrap();
+    let expected = format!("{VPN_PLAN_LABEL}={}", plan_fingerprint(&plan));
+    let args = sidecar_run_args(&plan, &[], None);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--label", expected.as_str()])
+    );
+}
+
+#[test]
+fn existing_sidecar_classification_table() {
+    for (stdout, expected) in [
+        (
+            "true|abc\n",
+            ExistingSidecar::Running {
+                plan: Some("abc".into()),
+            },
+        ),
+        ("true|<no value>", ExistingSidecar::Running { plan: None }),
+        ("true|", ExistingSidecar::Running { plan: None }),
+        ("true", ExistingSidecar::Running { plan: None }),
+        ("false|abc", ExistingSidecar::NotRunning),
+        ("", ExistingSidecar::NotRunning),
+    ] {
+        assert_eq!(classify_existing(stdout), expected, "stdout: {stdout:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn running_sidecar_with_another_plan_is_refused_without_side_effects() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let script = dir.path().join("fake.sh");
+    let log = dir.path().join("log");
+    std::fs::write(
+        &script,
+        format!(
+            "if [ \"$1\" = inspect ]; then printf '%s\\n' 'true|deadbeef'; else printf '%s\\n' \"$1\" >> '{}'; fi\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    let plan = for_provider(&spec(ts_cfg()))
+        .sidecar_plan("vpn-drift")
+        .unwrap();
+    let rt = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
+
+    let result = run_sidecar(&rt, &plan);
+    assert!(matches!(
+        result,
+        Err(ref error)
+            if matches!(error.downcast_ref::<VpnSidecarDrift>(), Some(VpnSidecarDrift { found: Some(found), .. }) if found == "deadbeef")
+    ));
+    assert!(
+        !log.exists(),
+        "drift refusal must not remove or run the sidecar"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn running_sidecar_with_the_same_plan_is_reused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let script = dir.path().join("fake.sh");
+    let log = dir.path().join("log");
+    let plan = for_provider(&spec(ts_cfg()))
+        .sidecar_plan("vpn-reuse")
+        .unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "if [ \"$1\" = inspect ]; then printf '%s\\n' 'true|{}'; else printf '%s\\n' \"$1\" >> '{}'; fi\n",
+            plan_fingerprint(&plan),
+            log.display()
+        ),
+    )
+    .unwrap();
+    let rt = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
+
+    run_sidecar(&rt, &plan).unwrap();
+    assert!(
+        !log.exists(),
+        "matching plan should be reused without run or rm"
+    );
+}
+
+#[test]
 fn wireguard_plan_mounts_conf_and_adds_tun() {
     let mut c = VpnConfig {
         provider: VpnProviderKind::Wireguard,
