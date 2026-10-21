@@ -4073,9 +4073,27 @@ pub fn launch_spec_full(
     // itself. Only an already-existing cache is read; a cold cache is left to
     // explicit target-side setup. Local worktrees only (remote panes run where
     // the host store isn't mounted). See [`devenv`].
-    let devshell = (cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote)
-        .then(|| devenv::cached(&repo_root))
-        .flatten();
+    let devshell = (!loc.is_remote() && !outcome.is_remote)
+        .then(|| {
+            let approvals = db
+                .as_ref()
+                .map(|db| {
+                    crate::handlers::repo_trust::approvals_for(db, &repo_root.to_string_lossy())
+                })
+                .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
+            crate::handlers::repo_trust::effective_environment_for_worktree(
+                cfg,
+                db.as_ref(),
+                &repo_root,
+                Path::new(worktree),
+                None,
+                &approvals,
+            )
+            .sandbox
+            .inject_devshell
+        })
+        .filter(|enabled| *enabled)
+        .and_then(|_| devenv::cached(&repo_root));
     // Toolchain activation is one shared, cache-first composition for host,
     // sandbox, provider, and daemon launches. The provider call performs no
     // child-process work here: a cold approved environment schedules a bounded

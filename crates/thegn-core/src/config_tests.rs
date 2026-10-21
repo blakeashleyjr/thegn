@@ -1784,7 +1784,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SANDBOX_PROFILE", "sealed"),
         ("THEGN_SANDBOX_COMPILER_CACHE", "auto"),
         ("THEGN_SANDBOX_ON_DORMANT", "cancel"),
-        ("THEGN_SANDBOX_INJECT_DEVSHELL", "no"),
+        ("THEGN_SANDBOX_INJECT_DEVSHELL", "yes"),
         ("THEGN_SANDBOX_NIX_DAEMON", "yes"),
         ("THEGN_SANDBOX_WARM_DIRENV", "allowed-only"),
         ("THEGN_SANDBOX_ISOLATION_FLOOR", "guest-kernel"),
@@ -1879,7 +1879,7 @@ fn env_overlay_covers_every_knob() {
         c.sandbox.on_dormant,
         crate::config_placement::OnDormant::Cancel
     );
-    assert!(!c.sandbox.inject_devshell);
+    assert!(c.sandbox.inject_devshell);
     assert!(c.sandbox.nix_daemon);
     assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
     assert_eq!(
@@ -4061,6 +4061,17 @@ fn config_enum_reserved_marker_emits_kind_and_lenient_default() {
     assert_eq!(cfg.ci.provider, CiProviderKind::Auto);
     // Serialization of an implemented kind is unchanged.
     assert_eq!(CiProviderKind::Gitlab.as_str(), "gitlab");
+}
+
+#[test]
+fn sandbox_inject_devshell_defaults_off() {
+    assert!(!Config::default().sandbox.inject_devshell);
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("empty.toml");
+    std::fs::write(&path, "").unwrap();
+    let empty = Config::load_layered(&MapEnv::default(), &[], Some(path));
+    assert!(!empty.sandbox.inject_devshell);
 }
 
 #[test]

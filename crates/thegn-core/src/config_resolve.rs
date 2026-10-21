@@ -840,10 +840,23 @@ pub fn classify_repo_overlay(
 
     // --- Allow: in-sandbox preferences, inside the trust boundary. --------
     out.devenv = devenv;
-    out.inject_devshell = inject_devshell;
+    if let Some(v) = inject_devshell {
+        let gr = GatedRequest {
+            key: "sandbox.inject_devshell".to_string(),
+            value: json!(v),
+            summary: format!("inject cached devShell (inject_devshell = {v})"),
+        };
+        if approvals.is_approved(&gr) {
+            out.inject_devshell = Some(v);
+        } else if v {
+            pending.push(gr);
+        } else {
+            // Disabling injection is a tightening → allow.
+            out.inject_devshell = Some(false);
+        }
+    }
     // devshell: which flake devShell attr the sandbox enters — a repo names its
-    // own flake output, which runs INSIDE the sandbox (no escape/egress), so it's
-    // a benign in-sandbox preference like devenv/inject_devshell above.
+    // own flake output, which runs INSIDE the sandbox (no escape/egress).
     out.devshell = devshell;
     out.shell = shell;
 
@@ -1293,7 +1306,7 @@ const HINT_FIELDS: &[(&str, HintRule)] = &[
     ("prepare", HintRule::Neutral),
     ("warm_direnv", HintRule::Neutral),
     ("devenv", HintRule::Neutral),
-    ("inject_devshell", HintRule::Neutral),
+    ("inject_devshell", HintRule::Opaque),
     ("devshell", HintRule::Neutral),
     ("nix_daemon", HintRule::Opaque),
     ("shell", HintRule::Neutral),
@@ -1474,6 +1487,7 @@ fn repo_hint_weakens(
                 "compiler_cache" => base.compiler_cache != hinted.compiler_cache,
                 "init_script" => base.init_script != hinted.init_script,
                 "nix_daemon" => base.nix_daemon != hinted.nix_daemon,
+                "inject_devshell" => !base.inject_devshell && hinted.inject_devshell,
                 "failover" => base.failover != hinted.failover,
                 "oci_host" => base.oci_host != hinted.oci_host,
                 "oci_runtime" => base.oci_runtime != hinted.oci_runtime,
@@ -2883,6 +2897,7 @@ mod tests {
             ("compose = 'compose.yml'", "sandbox.compose"),
             ("gpu = 'nvidia'", "sandbox.gpu"),
             ("nix_daemon = true", "sandbox.nix_daemon"),
+            ("inject_devshell = true", "sandbox.inject_devshell"),
             ("vpn.provider = 'tailscale'", "sandbox.vpn"),
             ("home.tools = ['fd']", "sandbox.home"),
             ("remote.host = 'box'", "sandbox.remote"),
@@ -3003,5 +3018,37 @@ mod tests {
                 .as_ref()
                 .is_some_and(|blocks| { blocks.iter().any(|block| block == "*") })
         );
+    }
+
+    #[test]
+    fn repo_inject_devshell_request_is_gated_until_approved() {
+        let request = SandboxOverlay {
+            inject_devshell: Some(true),
+            ..overlay()
+        };
+        let denied = classify_repo_overlay(request.clone(), &base(), &Approvals::deny_all());
+        assert_eq!(denied.sanctioned.inject_devshell, None);
+        assert_eq!(denied.pending.len(), 1);
+        assert_eq!(denied.pending[0].key, "sandbox.inject_devshell");
+
+        let approvals =
+            Approvals::from_canonical(denied.pending.iter().map(GatedRequest::canonical));
+        let approved = classify_repo_overlay(request, &base(), &approvals);
+        assert_eq!(approved.sanctioned.inject_devshell, Some(true));
+        assert!(approved.pending.is_empty());
+    }
+
+    #[test]
+    fn repo_inject_devshell_false_is_allowed_without_approval() {
+        let denied = classify_repo_overlay(
+            SandboxOverlay {
+                inject_devshell: Some(false),
+                ..overlay()
+            },
+            &base(),
+            &Approvals::deny_all(),
+        );
+        assert_eq!(denied.sanctioned.inject_devshell, Some(false));
+        assert!(denied.pending.is_empty());
     }
 }
