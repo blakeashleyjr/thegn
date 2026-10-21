@@ -58,11 +58,22 @@ impl Smtc {
     /// The current session's source app id (SMTC's notion of "player").
     pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
         run_blocking(|| {
-            let session = current_session()?;
+            let mgr = manager().map_err(win_err)?;
+            let session = match session_if_present(mgr.GetCurrentSession()) {
+                Some(session) => session,
+                None => return Ok(Vec::new()),
+            };
             let id = session.SourceAppUserModelId().map_err(win_err)?.to_string();
             Ok(if id.is_empty() { Vec::new() } else { vec![id] })
         })
         .await
+    }
+}
+
+fn session_if_present<T, E>(session: Result<T, E>) -> Option<T> {
+    match session {
+        Ok(session) => Some(session),
+        Err(_) => None,
     }
 }
 
@@ -449,5 +460,15 @@ where
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r,
         Err(e) => Err(MediaError::Backend(format!("smtc task: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_if_present;
+
+    #[test]
+    fn missing_current_session_is_a_healthy_empty_result() {
+        assert!(session_if_present::<(), _>(Err("no current session")).is_none());
     }
 }

@@ -435,7 +435,7 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                 }
             }
             Ok(None) => {
-                if !poll_media(
+                poll_media(
                     &client,
                     generation,
                     &tx,
@@ -444,14 +444,12 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                     &mut state,
                     period,
                 )
-                .await
-                {
-                    return;
-                }
+                .await;
+                return;
             }
             Err(error) => {
                 tracing::warn!(target: "thegn::media", %error, "media push watcher failed to start; polling");
-                if !poll_media(
+                poll_media(
                     &client,
                     generation,
                     &tx,
@@ -460,10 +458,8 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                     &mut state,
                     period,
                 )
-                .await
-                {
-                    return;
-                }
+                .await;
+                return;
             }
         }
     }
@@ -477,7 +473,7 @@ async fn poll_media(
     active: &mut bool,
     state: &mut WatchState,
     period: std::time::Duration,
-) -> bool {
+) {
     let mut ticker = interval(period);
     ticker.tick().await;
     loop {
@@ -487,7 +483,7 @@ async fn poll_media(
                 note_cleared(*active, next_active);
                 *active = next_active;
             }
-            None => return false,
+            None => return,
         }
     }
 }
