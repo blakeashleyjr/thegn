@@ -54,6 +54,8 @@
 - [x] 7.1 Unit: `row_action_for` matrix, `apply_step` patch/materialize,
       `push_mq_badge` severity matrix.
 - [x] 7.2 Full core+host suites green.
-- [ ] 7.3 `just ci` (pre-PR gate, run once at the end).
-- [ ] 7.4 Live TUI verification (enqueue, drain with fake agent, land/retry,
+- [x] 7.3 `just ci` (pre-PR gate, run once at the end).
+      Superseded, not performed as a separate check: the owner issue THE-146 was closed on 2026-10-13 as a duplicate of THE-705 (Done), whose scope is archiving delivered changes without inventing residual work from generic gate boxes; the change is archived in batch 62.
+- [x] 7.4 Live TUI verification (enqueue, drain with fake agent, land/retry,
       badge/chip/inbox).
+      Superseded, not performed as a separate check: the owner issue THE-146 was closed on 2026-10-13 as a duplicate of THE-705 (Done), whose scope is archiving delivered changes without inventing residual work from generic gate boxes; the change is archived in batch 62.
