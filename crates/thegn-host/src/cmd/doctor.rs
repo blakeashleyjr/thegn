@@ -4383,7 +4383,10 @@ fn floor_report(cfg: &Config) {
                 actual
             ),
             FloorDecision::BypassProvider => {
-                outln!("                provider-managed placement — floor out of scope")
+                outln!(
+                    "                {} — thegn does not enforce the floor on a provider placement",
+                    thegn_core::sandbox_floor::PROVIDER_UNVERIFIED
+                )
             }
             FloorDecision::Degrade(m) => {
                 outln!(

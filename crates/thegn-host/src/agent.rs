@@ -529,6 +529,21 @@ pub fn prepare_sandbox_env(
     ) {
         return Err(anyhow::Error::new(refusal));
     }
+    let is_provider = matches!(placement, thegn_core::placement::Placement::Provider(_));
+    if let Some(refusal) = thegn_core::sandbox_floor::provider_refusal(is_provider, &sb, &env_name)
+    {
+        return Err(anyhow::Error::new(refusal));
+    }
+    if is_provider {
+        let floor = thegn_core::sandbox_floor::floor_in_force(&sb, false);
+        if floor != thegn_core::config::IsolationFloor::Off {
+            warnings.push(format!(
+                "{}: the isolation floor `{}` is not enforced by thegn on env `{env_name}`",
+                thegn_core::sandbox_floor::PROVIDER_UNVERIFIED,
+                floor.as_str()
+            ));
+        }
+    }
     let mut provisioned = None;
     // Bring the execution placement up (k8s pod / provider sandbox) BEFORE
     // resolving the backend — a no-op for the default local `in_env` env. Warm-on-
@@ -1858,6 +1873,17 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         return None;
     };
     let pc = &cfg.env.get(&environment.name)?.provider;
+    if let Some(request) =
+        thegn_core::sandbox_floor::provider_explicit_request(&environment.sandbox)
+    {
+        tracing::warn!(
+            target: "thegn::sandbox",
+            env = %environment.name,
+            request = %request.describe(),
+            "provider pane refused: explicit isolation request"
+        );
+        return None;
+    }
     if pc.exec == ProviderExecMode::Cli || !thegn_svc::provider::exec_api_by_name(&pc.provider) {
         return None;
     }
