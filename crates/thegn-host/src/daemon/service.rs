@@ -289,6 +289,7 @@ pub(crate) fn session_identity_env(
             k != "THEGN_SESSION_ID"
                 && k != "THEGN_CONTROL_SOCKET"
                 && k != super::stage_launch::STAGE_LAUNCH_ENV
+                && k != thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV
         })
         .cloned()
         .collect();
@@ -6938,5 +6939,17 @@ mod identity_env_tests {
             out.iter()
                 .all(|(key, _)| key != super::super::stage_launch::STAGE_LAUNCH_ENV)
         );
+    }
+
+    #[test]
+    fn session_identity_env_strips_the_stage_config_digest() {
+        let env = vec![(
+            thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+            "a".repeat(64),
+        )];
+        let out = session_identity_env("session", "/run/x/daemon.sock", &env);
+        assert!(out.iter().all(|(key, _)| {
+            key != thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV
+        }));
     }
 }

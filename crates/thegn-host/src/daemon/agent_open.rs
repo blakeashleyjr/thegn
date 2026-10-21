@@ -66,6 +66,26 @@ pub(crate) fn resolve(
     launch: &AgentLaunch,
     branch: Option<String>,
 ) -> Result<LaunchSpec> {
+    if let Some(stage) = launch
+        .stage
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        ensure_configured_agent(cfg, launch.agent.trim())?;
+        let presented = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV)
+            .map(|(_, value)| value.as_str());
+        thegn_core::pipeline_launch_digest::check_stage_launch(
+            cfg,
+            launch.agent.trim(),
+            stage,
+            presented,
+        )
+        .map_err(anyhow::Error::new)?;
+    }
     resolve_inner(cfg, db, spec, launch, None, branch)
 }
 
@@ -1089,5 +1109,114 @@ mod tests {
                 .is_none_or(|error| !error.contains("local parity")),
             "interactive open was refused for parity: {interactive_error:?}"
         );
+    }
+
+    #[test]
+    fn stage_digest_mismatch_refuses_before_any_launch() {
+        let db = Db::open_memory().expect("in-memory db");
+        let mut claimed = cfg();
+        claimed.agents.push(named("worker", "claude"));
+        claimed
+            .pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                permissions: vec!["Read".into()],
+                ..Default::default()
+            });
+        let digest =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(&claimed, "worker", "review")
+                .expect("claimed digest");
+        let mut current = claimed.clone();
+        current.pipeline.stages[0].permissions.push("Bash".into());
+        let spec = OpenSpec {
+            env: vec![(
+                thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+                digest,
+            )],
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            stage: Some("review".into()),
+            ..launch("worker", "rendered prompt")
+        };
+        let error = resolve(&current, &db, &spec, &launch, None).expect_err("drift refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("changed between claim and launch"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn stage_digest_unknown_agent_keeps_configured_agent_refusal() {
+        let db = Db::open_memory().expect("in-memory db");
+        let mut config = cfg();
+        config
+            .pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                ..Default::default()
+            });
+        let spec = OpenSpec {
+            env: vec![(
+                thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+                "0".repeat(64),
+            )],
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            stage: Some("review".into()),
+            ..launch(
+                "pipeline-smoke-agent-that-is-not-configured",
+                "rendered prompt",
+            )
+        };
+        let error = resolve(&config, &db, &spec, &launch, None).expect_err("unknown agent refuses");
+        assert_eq!(
+            error.to_string(),
+            "unknown configured agent `pipeline-smoke-agent-that-is-not-configured`"
+        );
+    }
+
+    #[test]
+    fn stage_digest_match_resolves() {
+        let db = Db::open_memory().expect("in-memory db");
+        let mut config = cfg();
+        config.agents.push(named("worker", "claude"));
+        config
+            .pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                ..Default::default()
+            });
+        let digest =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(&config, "worker", "review")
+                .expect("digest");
+        let spec = OpenSpec {
+            env: vec![(
+                thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+                digest,
+            )],
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            stage: Some("review".into()),
+            ..launch("worker", "rendered prompt")
+        };
+        if let Err(error) = resolve(&config, &db, &spec, &launch, None) {
+            assert!(
+                !error
+                    .to_string()
+                    .contains("changed between claim and launch"),
+                "matching config was treated as drift: {error}"
+            );
+        }
     }
 }
