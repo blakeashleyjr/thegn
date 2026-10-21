@@ -48,6 +48,21 @@ fn ambient_container_listing_with_no_present_backend_is_empty_without_ps() {
     assert!(calls.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn output_and_stderr_with_timeout_runs_the_command_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("runs");
+    let script = format!(
+        "printf x >> {}; printf out; printf err >&2; exit 7",
+        crate::util::sh_quote(&marker.to_string_lossy())
+    );
+    let argv = vec!["sh".into(), "-c".into(), script];
+    let result = output_and_stderr_with_timeout(&argv, Duration::from_secs(1)).unwrap();
+    assert_eq!(result, (false, "out".into(), "err".into()));
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+}
+
 #[test]
 fn none_backend_skips_cd_for_unretargeted_remote_worktree() {
     // A bare remote shell whose worktree was NOT retargeted (local path) must
@@ -335,6 +350,7 @@ fn spec(backend: Backend) -> SandboxSpec {
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: None,
+        volume_owners: Vec::new(),
     }
 }
 
@@ -673,6 +689,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
         RefusalClass::MountUnresolvable,
+        RefusalClass::VolumeOwner,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
         RefusalClass::StrictUnsupported,
@@ -708,6 +725,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
         RefusalClass::MountUnresolvable,
+        RefusalClass::VolumeOwner,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
         RefusalClass::StrictUnsupported,
