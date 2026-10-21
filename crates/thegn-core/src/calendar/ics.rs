@@ -26,8 +26,32 @@ use super::{Busy, CalEvent, EventStatus, EventTime, Reminder, TzRef};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentLine {
     pub name: String,
-    pub params: BTreeMap<String, String>,
+    pub params: BTreeMap<String, Vec<String>>,
     pub value: String,
+}
+
+impl ContentLine {
+    /// Return a parameter's value only when it has exactly one member.
+    /// Multi-member singleton parameters such as TZID and VALUE are rejected
+    /// while parsing, so readers cannot silently lose a time zone or value type.
+    pub fn param(&self, key: &str) -> Option<&str> {
+        let values = self.param_values(key);
+        if values.is_empty() {
+            return None;
+        }
+        (values.len() == 1).then(|| values[0].as_str())
+    }
+
+    /// Return every decoded parameter member, or an empty slice when absent.
+    pub fn param_values(&self, key: &str) -> &[String] {
+        let key = key.to_ascii_uppercase();
+        self.params.get(&key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Replace a parameter with exactly one value.
+    pub fn set_param(&mut self, key: &str, value: String) {
+        self.params.insert(key.to_ascii_uppercase(), vec![value]);
+    }
 }
 
 /// Value-free parser diagnostics. They deliberately contain no feed text.
@@ -284,21 +308,25 @@ pub fn parse_line(line: &str) -> Option<ContentLine> {
         if key.is_empty() || key.contains([';', ':', '"', ',']) {
             return None;
         }
-        // PARAM-VALUE allows a comma-separated list. Keep it as one string in
-        // ContentLine's compatibility map, but only treat commas outside
-        // quoted-string values as separators. Decode RFC 6868 on each member.
+        // PARAM-VALUE allows a comma-separated list. Only commas outside
+        // quoted-string values separate members; decode RFC 6868 per member.
         let values = split_outside_quotes(v.trim(), ',')?;
         let decoded = values
             .iter()
             .map(|value| decode_param_value(value.trim()))
             .collect::<Option<Vec<_>>>()?;
-        let value = decoded.join(",");
-        if matches!(key.as_str(), "TZID" | "VALUE")
-            && params.get(&key).is_some_and(|previous| previous != &value)
-        {
+        if matches!(key.as_str(), "TZID" | "VALUE") && decoded.len() != 1 {
             return None;
         }
-        params.insert(key, value);
+        if let Some(previous) = params.get_mut(&key) {
+            if param_is_list(&key) {
+                previous.extend(decoded);
+            } else if previous != &decoded {
+                return None;
+            }
+        } else {
+            params.insert(key, decoded);
+        }
     }
     let value = if is_text_property(&name) {
         unescape(value)
@@ -310,6 +338,32 @@ pub fn parse_line(line: &str) -> Option<ContentLine> {
         params,
         value,
     })
+}
+
+/// RFC list parameters (plus unknown extensions) may carry repeated members.
+fn param_is_list(key: &str) -> bool {
+    !matches!(
+        key,
+        "ALTREP"
+            | "CN"
+            | "CUTYPE"
+            | "DIR"
+            | "ENCODING"
+            | "FMTTYPE"
+            | "FBTYPE"
+            | "LANGUAGE"
+            | "PARTSTAT"
+            | "RANGE"
+            | "RELATED"
+            | "RELTYPE"
+            | "ROLE"
+            | "RSVP"
+            | "SENT-BY"
+            | "TZID"
+            | "VALUE"
+            | "EMAIL"
+            | "LABEL"
+    )
 }
 
 /// Split on a delimiter outside quoted-string values. An open quote makes the
@@ -432,7 +486,7 @@ pub fn escape(s: &str) -> String {
 /// time, which we anchor to the caller's `default_zone`.
 pub fn parse_time(line: &ContentLine, default_zone: &str) -> Option<EventTime> {
     let v = line.value.trim();
-    let is_date = line.params.get("VALUE").is_some_and(|s| s == "DATE") || !v.contains('T');
+    let is_date = line.param("VALUE") == Some("DATE") || !v.contains('T');
     if is_date {
         return NaiveDate::parse_from_str(v, "%Y%m%d")
             .ok()
@@ -444,11 +498,7 @@ pub fn parse_time(line: &ContentLine, default_zone: &str) -> Option<EventTime> {
             at: chrono::DateTime::from_naive_utc_and_offset(local, chrono::Utc),
         });
     }
-    let zone = line
-        .params
-        .get("TZID")
-        .map(String::as_str)
-        .unwrap_or(default_zone);
+    let zone = line.param("TZID").unwrap_or(default_zone);
     Some(EventTime::Zoned {
         local,
         zone: TzRef::new(zone),
@@ -736,10 +786,7 @@ pub fn parse_ics_window_reported(
                         .is_some_and(|part| matches!(part, ComponentName::Alarm))
             });
             if in_alarm && line.name == "TRIGGER" {
-                let related = line
-                    .params
-                    .get("RELATED")
-                    .map(|value| value.to_ascii_uppercase());
+                let related = line.param("RELATED").map(str::to_ascii_uppercase);
                 match related.as_deref() {
                     None | Some("START") => {
                         if let Some(mins) = parse_trigger_minutes(&line.value) {
@@ -1139,13 +1186,13 @@ impl Builder {
         let line = if matches!(
             line.name.as_str(),
             "DTSTART" | "DTEND" | "RECURRENCE-ID" | "RDATE" | "EXDATE"
-        ) && let Some(tzid) = line.params.get("TZID")
+        ) && let Some(tzid) = line.param("TZID").map(str::to_string)
             && !tzid.is_empty()
         {
-            match timezone_bindings.get(tzid) {
+            match timezone_bindings.get(&tzid) {
                 Some(TimezoneBinding::Iana(name)) => {
                     normalized = line.clone();
-                    normalized.params.insert("TZID".to_string(), name.clone());
+                    normalized.set_param("TZID", name.clone());
                     &normalized
                 }
                 Some(TimezoneBinding::Rules(rules)) => {
@@ -1169,9 +1216,7 @@ impl Builder {
                     });
                     if let Some(zone) = matched {
                         normalized = line.clone();
-                        normalized
-                            .params
-                            .insert("TZID".to_string(), zone.name().to_string());
+                        normalized.set_param("TZID", zone.name().to_string());
                         &normalized
                     } else {
                         self.quarantined = true;
@@ -1187,9 +1232,7 @@ impl Builder {
                 None => match resolve_tzid(tzid) {
                     Some(zone) => {
                         normalized = line.clone();
-                        normalized
-                            .params
-                            .insert("TZID".to_string(), zone.name().to_string());
+                        normalized.set_param("TZID", zone.name().to_string());
                         &normalized
                     }
                     None => {
@@ -1203,7 +1246,7 @@ impl Builder {
             line
         };
         let text = line.value.len() + ENTRY_OVERHEAD;
-        let tz = line.params.get("TZID").map_or(0, String::len);
+        let tz = line.param("TZID").map_or(0, str::len);
         if let Some(name) = singleton_property(&line.name)
             && !self.seen_singletons.insert(name)
         {
