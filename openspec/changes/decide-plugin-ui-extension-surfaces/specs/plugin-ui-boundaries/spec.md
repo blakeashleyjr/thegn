@@ -46,8 +46,9 @@ sidebar mode.
 #### Scenario: A plugin crashes while its sidebar rows are visible
 
 - **WHEN** the host detects that a contributing plugin has crashed
-- **THEN** the host removes its rows and restores focus safely while preserving
-  the current sidebar mode and all other rows
+- **THEN** the host removes its rows and moves focus to the nearest remaining
+  sidebar row, or to native navigation when none remain, while preserving the
+  current sidebar mode and all other rows
 
 ### Requirement: Adopted Theme contributions are complete data-only palettes
 
