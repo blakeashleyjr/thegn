@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 pub const VOLUME_OWNER_LABEL: &str = "thegn.volume.owner";
 pub const DEVCONTAINER_VOLUME_ROLE: &str = "devcontainer";
 
+/// Success flag and bounded stdout/stderr from one volume command.
+pub type VolumeCommandOutput = (bool, String, String);
+/// Callback used to run a single bounded volume command.
+pub type VolumeCommandRunner = dyn FnMut(&[String]) -> Option<VolumeCommandOutput>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VolumeProbe {
     Absent,
@@ -107,10 +112,8 @@ fn record_path(spec: &SandboxSpec, dir: &Path, name: &str) -> PathBuf {
     hash.update(spec.oci_host.as_deref().unwrap_or("").as_bytes());
     hash.update(b"\0");
     hash.update(name.as_bytes());
-    let digest = hash.finalize();
-    dir.join(format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-        digest[8], digest[9], digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]))
+    let hex = format!("{:x}", hash.finalize());
+    dir.join(&hex[..32])
 }
 
 fn read_claim(path: &Path) -> std::io::Result<Option<String>> {
@@ -202,7 +205,7 @@ fn redacted_tail(value: &str) -> String {
 pub fn claim_volumes(
     spec: &SandboxSpec,
     state_home: &Path,
-    run: &mut dyn FnMut(&[String]) -> Option<(bool, String, String)>,
+    run: &mut VolumeCommandRunner,
 ) -> Result<(), EnterError> {
     if spec.volume_owners.is_empty() {
         return Ok(());
@@ -480,6 +483,6 @@ mod tests {
         claim_volumes(&spec(OWNER), &state, &mut runner).unwrap();
         let dir = state.join("thegn/devcontainer-volumes");
         assert!(dir.is_dir());
-        assert!(crate::fsperm::ensure_private_dir(&dir).is_ok());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 }

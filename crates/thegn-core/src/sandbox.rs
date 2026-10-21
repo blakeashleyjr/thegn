@@ -106,12 +106,15 @@ pub(crate) fn output_and_stderr_with_timeout(
     argv: &[String],
     timeout: Duration,
 ) -> Option<(bool, String, String)> {
-    let (ok, stdout) = output_with_timeout(argv, timeout)?;
-    if ok {
-        return Some((true, stdout, String::new()));
-    }
-    let (_, stderr) = stderr_with_timeout(argv, timeout)?;
-    Some((false, stdout, stderr))
+    proc::run_bounded(
+        argv,
+        timeout,
+        proc::Capture {
+            stdout: Some(256 * 1024),
+            stderr: Some(256 * 1024),
+        },
+    )
+    .into_stdout_and_stderr()
 }
 
 /// Run a control command while delivering a bounded secret payload on stdin.

@@ -998,7 +998,10 @@ mod tests {
         dc.config_path = Some(std::path::PathBuf::from(
             "/repo/.devcontainer/devcontainer.json",
         ));
-        let owner = config_devcontainer_id(&dc).unwrap();
+        let owner = devcontainer::devcontainer_id(
+            Path::new("/repo"),
+            Path::new(".devcontainer/devcontainer.json"),
+        );
         let mut sb = SandboxConfig::default();
         fold_mounts(
             &dc,
