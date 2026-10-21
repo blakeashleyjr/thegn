@@ -5069,9 +5069,11 @@ mod tests {
 
     #[test]
     fn trusted_done_accepts_a_current_head_attestation() {
-        let (_repo_dir, _db_dir, db, row, root) = trusted_done_fixture("trusted-done-current");
-        let log_path = root.join("gate.log");
+        let (_repo_dir, db_dir, db, row, root) = trusted_done_fixture("trusted-done-current");
+        let log_path = db_dir.path().join("gate.log");
         record_current_gate_attestation(&db, &row, &root, &log_path);
+        let status = git_out_allow_empty(&root, &["status", "--porcelain"]).unwrap();
+        assert!(status.is_empty(), "fixture worktree is dirty: {status}");
         done_gate_bound(&db, &row).unwrap();
     }
 

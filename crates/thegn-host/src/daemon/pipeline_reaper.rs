@@ -19,10 +19,10 @@
 //!   valid PASS gate evidence is filed and the latest trusted gate attestation
 //!   satisfies the row's current HEAD — the same gate `dispatch set-status
 //!   done` enforces on the supervisor's behalf. Applying it is arithmetic on
-//!   recorded facts, not a judgement about
-//!   whether the work was any good, so there is nothing here for a human to
-//!   decide differently. Refusing to apply it would not protect anything; it
-//!   would only mean the row keeps lying about being live.
+//!   recorded facts, not a judgement about whether the work was any good, so
+//!   there is nothing here for a human to decide differently. Refusing to
+//!   apply it would not protect anything; it would only mean the row keeps
+//!   lying about being live.
 //! - **`MarkFailed` → `waiting_human` + a note.** Parked, never failed. The
 //!   CLI writes `failed` here because a supervisor is present and owns the
 //!   verdict; the daemon has no such standing, and "the worker vanished leaving
