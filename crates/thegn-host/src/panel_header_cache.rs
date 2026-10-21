@@ -67,7 +67,7 @@ pub(crate) fn merge_lists(
     incoming: Result<std::collections::HashSet<String>, ()>,
 ) -> MergedLists {
     let mut map = list_cache().lock().unwrap_or_else(|e| e.into_inner());
-    let prior = map.get(path).cloned().unwrap_or_else(ListRow::default);
+    let prior = map.get(path).cloned().unwrap_or_default();
     let log_requested = log.is_some();
     let (status, status_unavailable) = match status {
         Ok(value) => (value, false),
