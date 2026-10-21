@@ -85,6 +85,10 @@ pub struct VerifyFacts {
     pub stage: Option<String>,
     /// The row's `artifact_path` column.
     pub artifact: Option<String>,
+    /// Whether the stored artifact belongs to this pipeline row.
+    pub artifact_identity: ArtifactIdentity,
+    /// The artifact is a zero-byte regular file.
+    pub artifact_empty: bool,
     /// The file exists under the worktree.
     pub exists: bool,
     /// The file is committed in `HEAD` and unchanged at this path.
@@ -106,6 +110,18 @@ pub struct VerifyFacts {
     pub report_gate_valid: bool,
     /// Relationship between the filed report's HEAD and the current artifact.
     pub report_commit_binding: ReportCommitBinding,
+}
+
+/// Identity of a stored artifact path relative to its pipeline row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactIdentity {
+    /// Stage-less dispatches retain their plain-dispatch behavior.
+    NotPipeline,
+    /// The path is the canonical handoff for this issue, stage, and row.
+    Canonical,
+    /// The path names a different file than this row's canonical handoff.
+    Mismatch { expected: String },
 }
 
 /// Result of observing `git status --porcelain` for an artifact-bearing row.
@@ -232,6 +248,16 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     };
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
+    if f.stage.is_some()
+        && let ArtifactIdentity::Mismatch { expected } = &f.artifact_identity
+    {
+        reasons.push(format!(
+            "artifact {a:?} is not this row's handoff; a pipeline row's handoff is {expected:?}"
+        ));
+    }
+    if f.stage.is_some() && f.artifact_empty && f.exists {
+        reasons.push(format!("artifact {a:?} is empty"));
+    }
     if f.worktree_state == Some(WorktreeState::Unknown) {
         reasons.push(
             "could not observe worktree status (`git status --porcelain` failed); retry verification"
@@ -596,6 +622,8 @@ mod tests {
         VerifyFacts {
             stage: None,
             artifact: artifact.map(str::to_string),
+            artifact_identity: ArtifactIdentity::NotPipeline,
+            artifact_empty: false,
             exists,
             tracked,
             dirty,
@@ -633,6 +661,54 @@ mod tests {
                 .any(|reason| reason.contains("no artifact path") && reason.contains("publish")),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn artifact_identity_mismatch_refuses_a_pipeline_row() {
+        let mut f = facts_report(Some("wrong.md"), true, true, false, true);
+        f.stage = Some("code".into());
+        f.artifact_identity = ArtifactIdentity::Mismatch {
+            expected: "x".into(),
+        };
+        let report = verify_report(&f);
+        assert!(!report.ok);
+        assert!(report.reasons.iter().any(|reason| {
+            reason.contains("not this row's handoff") && reason.contains("\"x\"")
+        }));
+    }
+
+    #[test]
+    fn artifact_identity_empty_file_refuses() {
+        let mut f = facts_report(Some("empty.md"), true, true, false, true);
+        f.stage = Some("code".into());
+        f.artifact_empty = true;
+        let report = verify_report(&f);
+        assert!(!report.ok);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("is empty"))
+        );
+    }
+
+    #[test]
+    fn artifact_identity_canonical_passes() {
+        let mut f = facts_report(Some("canonical.md"), true, true, false, true);
+        f.stage = Some("code".into());
+        f.artifact_identity = ArtifactIdentity::Canonical;
+        let report = verify_report(&f);
+        assert!(report.ok, "positive control: canonical artifact passes");
+    }
+
+    #[test]
+    fn artifact_identity_is_ignored_for_plain_rows() {
+        let mut f = facts_report(Some("plain.md"), true, true, false, true);
+        f.artifact_identity = ArtifactIdentity::Mismatch {
+            expected: "canonical.md".into(),
+        };
+        let report = verify_report(&f);
+        assert!(report.ok, "positive control: plain dispatch is unchanged");
     }
 
     #[test]
