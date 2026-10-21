@@ -1137,6 +1137,19 @@ impl WorktreeAuxStore for Db {
         Ok(result)
     }
 
+    fn refund_merge_agent_attempt(&self, claim: &MergeClaim) -> Result<bool> {
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let now = util::now_ms();
+        let changed = tx.execute(
+            "UPDATE merge_queue SET agent_attempts=agent_attempts-1,updated_at=?1 WHERE worktree=?2 \
+             AND claim_owner=?3 AND claim_generation=?4 AND claim_phase='claimed_no_child' \
+             AND claim_lease_until_ms>=?5 AND agent_attempts>0",
+            params![util::now(), claim.worktree, claim.owner_token, claim.generation, now],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     fn replace_merge_status_claimed(
         &self,
         claim: &MergeClaim,

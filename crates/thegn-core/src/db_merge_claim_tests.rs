@@ -1,6 +1,6 @@
 use super::*;
 use crate::store::WorkspaceStore;
-use crate::store::{MergeStatusFields, WorktreeAuxStore};
+use crate::store::{MergeAttemptResult, MergeStatusFields, WorktreeAuxStore};
 use std::sync::{Arc, Barrier};
 
 const WT: &str = "/private/repo/feature";
@@ -550,4 +550,33 @@ fn claim_aware_del_worktree_still_removes_an_unclaimed_row() {
     db.del_worktree(WT).unwrap();
 
     assert!(db.list_merge_queue().unwrap().is_empty());
+}
+
+#[test]
+fn refund_returns_a_consumed_attempt_only_to_the_live_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+
+    assert_eq!(
+        db.consume_merge_agent_attempt(&claim, 3).unwrap(),
+        MergeAttemptResult::Consumed
+    );
+    assert!(db.refund_merge_agent_attempt(&claim).unwrap());
+    assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
+    assert!(!db.refund_merge_agent_attempt(&claim).unwrap());
+    assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 0);
+
+    assert_eq!(
+        db.consume_merge_agent_attempt(&claim, 3).unwrap(),
+        MergeAttemptResult::Consumed
+    );
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET claim_lease_until_ms=?1 WHERE worktree=?2",
+            rusqlite::params![util::now_ms() - 1, WT],
+        )
+        .unwrap();
+    assert!(!db.refund_merge_agent_attempt(&claim).unwrap());
+    assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 1);
 }
