@@ -88,3 +88,20 @@ python3 docs/audits/sandbox-security-2026-10-13/runtime/run-probes.py \
 ```
 
 Omit `--corrected-mounts --minimal-oci` to reproduce configured defaults. `--only` accepts comma-separated case labels. The helper uses real core APIs; the Python driver supplies synthetic inputs, PTYs, controlled endpoints, and bounded execution. Read the individual logs' `request`, `mounts`, `argv`, refusal/error, and probe lines together before interpreting a result.
+
+## Regression canaries (2026-10-21, THE-792)
+
+These four canaries are positive controls on the current code: each passes on main and fails if its named fix is reverted. They run through core APIs without starting a host workload or an OCI runtime.
+
+| Reproduction                                                                                                                                         | Canary and pre-existing regression tests                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Repo `env = "hostdev"` cannot weaken a sealed global sandbox; explicit user selection remains available.                                             | `sandbox::tests::evidence::canary_env_selection_repo_hint_cannot_select_a_weaker_named_env`; `config_resolve::tests::repo_env_hint_*` — guards the repo env-hint weakening clamp in `config_resolve.rs`.                                                    |
+| Missing terminal backend cannot silently fall through to a host process under the default floor; explicit degrade and off remain deliberate choices. | `sandbox::tests::evidence::canary_terminal_fallback_default_floor_refuses_host_process`; `panes.rs::terminal_unknown_backend_*` — guards default-floor `Fail` policy. The canary checks the pure floor decision; the pane tests exercise launcher behavior. |
+| A retained NAT container cannot be reused for a `network = none` request.                                                                            | `sandbox::tests::evidence::canary_reuse_narrowing_network_change_forces_recreate`; `sandbox_tests::judge_inspect_rejects_policy_mismatch` — guards policy-fingerprinted reuse in `judge_inspect`.                                                           |
+| A second deny-all DNS policy gets its own filter and blocks a name allowed by the first policy.                                                      | `sandbox::tests::evidence::canary_dns_singleton_second_policy_gets_its_own_filter`; `dns_filter::tests::find_or_plan_reuses_equal_key_starts_new_and_caps` — guards per-policy DNS instance keys.                                                           |
+
+Run the canaries with:
+
+```sh
+cargo nextest run -p thegn-core -E 'test(sandbox::tests::evidence::)'
+```
