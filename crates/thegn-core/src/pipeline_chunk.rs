@@ -20,7 +20,7 @@
 //! names the offending line number, so the host's refusal can point at the
 //! exact line instead of "bad frontmatter".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 /// The scope a chunk file declares: the paths it may touch, the siblings it
@@ -523,6 +523,70 @@ pub fn after_unmet(after: &[String], done: &HashSet<String>) -> Vec<String> {
         }
     }
     unmet
+}
+
+/// One same-stage roster candidate for resolving an `after:` chunk name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AfterCandidate {
+    pub row: i64,
+    pub path: String,
+    pub status: crate::issue::AgentDispatchStatus,
+}
+
+/// Index of same-stage candidates for the `after:` admission gate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AfterIndex {
+    /// Chunk names whose governing attempt is Done or Merged.
+    pub done: HashSet<String>,
+    /// The governing row and status for each unambiguous chunk name.
+    pub governing: HashMap<String, (i64, crate::issue::AgentDispatchStatus)>,
+    /// Names shared by distinct paths, with every row/path pair in row order.
+    pub ambiguous: BTreeMap<String, Vec<(i64, String)>>,
+}
+
+/// Resolve `after:` names against candidates already restricted to one stage.
+/// Newest means highest roster row id. Empty and non-UTF-8 stems are ignored.
+pub fn after_index(candidates: &[AfterCandidate]) -> AfterIndex {
+    let mut by_name: HashMap<String, Vec<&AfterCandidate>> = HashMap::new();
+    for candidate in candidates {
+        let Some(name) = std::path::Path::new(&candidate.path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        by_name.entry(name.to_string()).or_default().push(candidate);
+    }
+
+    let mut index = AfterIndex::default();
+    for (name, attempts) in by_name {
+        let mut paths = HashSet::new();
+        for attempt in &attempts {
+            paths.insert(attempt.path.as_str());
+        }
+        if paths.len() > 1 {
+            let mut rows: Vec<_> = attempts
+                .iter()
+                .map(|attempt| (attempt.row, attempt.path.clone()))
+                .collect();
+            rows.sort_by_key(|(row, _)| *row);
+            index.ambiguous.insert(name, rows);
+            continue;
+        }
+        if let Some(governing) = attempts.iter().max_by_key(|attempt| attempt.row) {
+            index
+                .governing
+                .insert(name.clone(), (governing.row, governing.status));
+            if matches!(
+                governing.status,
+                crate::issue::AgentDispatchStatus::Done | crate::issue::AgentDispatchStatus::Merged
+            ) {
+                index.done.insert(name);
+            }
+        }
+    }
+    index
 }
 
 /// One active sibling's recorded scope, as plain data — the host builds these
@@ -1040,6 +1104,82 @@ mod tests {
         assert!(after_unmet(&s(&["chunk-1"]), &d).is_empty());
         assert!(after_unmet(&[], &d).is_empty());
         assert_eq!(after_unmet(&s(&["chunk-9"]), &d), s(&["chunk-9"]));
+    }
+
+    #[test]
+    fn after_index_newest_attempt_governs() {
+        let candidates = [
+            AfterCandidate {
+                row: 10,
+                path: "code/chunk-1.md".into(),
+                status: crate::issue::AgentDispatchStatus::Done,
+            },
+            AfterCandidate {
+                row: 11,
+                path: "code/chunk-1.md".into(),
+                status: crate::issue::AgentDispatchStatus::Failed,
+            },
+        ];
+        let index = after_index(&candidates);
+        assert!(!index.done.contains("chunk-1"));
+        assert_eq!(
+            index.governing.get("chunk-1"),
+            Some(&(11, crate::issue::AgentDispatchStatus::Failed))
+        );
+        assert!(index.ambiguous.is_empty());
+    }
+
+    #[test]
+    fn after_index_merged_counts_as_done() {
+        let index = after_index(&[AfterCandidate {
+            row: 12,
+            path: "code/chunk-1.md".into(),
+            status: crate::issue::AgentDispatchStatus::Merged,
+        }]);
+        assert!(index.done.contains("chunk-1"));
+        assert_eq!(
+            index.governing.get("chunk-1"),
+            Some(&(12, crate::issue::AgentDispatchStatus::Merged))
+        );
+        assert!(index.ambiguous.is_empty());
+    }
+
+    #[test]
+    fn after_index_distinct_paths_with_one_stem_are_ambiguous() {
+        let candidates = [
+            AfterCandidate {
+                row: 12,
+                path: "code/a/chunk-1.md".into(),
+                status: crate::issue::AgentDispatchStatus::Done,
+            },
+            AfterCandidate {
+                row: 15,
+                path: "code/b/chunk-1.md".into(),
+                status: crate::issue::AgentDispatchStatus::Done,
+            },
+        ];
+        let index = after_index(&candidates);
+        assert!(!index.done.contains("chunk-1"));
+        assert!(!index.governing.contains_key("chunk-1"));
+        assert_eq!(
+            index.ambiguous.get("chunk-1"),
+            Some(&vec![
+                (12, "code/a/chunk-1.md".into()),
+                (15, "code/b/chunk-1.md".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn after_index_skips_empty_stems() {
+        let index = after_index(&[AfterCandidate {
+            row: 1,
+            path: String::new(),
+            status: crate::issue::AgentDispatchStatus::Done,
+        }]);
+        assert!(index.done.is_empty());
+        assert!(index.governing.is_empty());
+        assert!(index.ambiguous.is_empty());
     }
 
     // --- verdict ------------------------------------------------------------
