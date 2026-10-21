@@ -2657,6 +2657,8 @@ pub fn run(
     if json {
         let mut report = doctor_json_with_health_and_overrides(cfg, &health, cli_overrides);
         report["plugins"] = plugins_trust_json(cfg, &config_path);
+        report["batteries"] =
+            super::batteries_doctor::json(&super::batteries_doctor::inspect_env());
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -2809,6 +2811,8 @@ pub fn run(
 
     outln!("");
     macos_report(&env);
+    outln!("");
+    super::batteries_doctor::print(&super::batteries_doctor::inspect_env());
 
     outln!("");
     pane_daemon_report(cfg);
