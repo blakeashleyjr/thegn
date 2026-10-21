@@ -516,6 +516,7 @@ mod authorship_tests {
         .unwrap();
         let sentinel = fixture.dir.path().join("agent-ran");
         let mut config = Config::default();
+        config.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
         config.ci.autofix.mode = mode;
         config.pr_queue.enabled = true;
         config.pr_queue.agent_command = format!("touch {}", sentinel.display());

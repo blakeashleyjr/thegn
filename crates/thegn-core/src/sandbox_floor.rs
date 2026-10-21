@@ -349,8 +349,7 @@ pub fn queue_agent_gate(
         match sandbox_gate {
             AgentGate::InfraHold(reason) => AgentGate::InfraHold(format!(
                 "{reason}; inherited from the [sandbox] isolation floor in force — set \
-                 [sandbox] isolation_floor = \"off\" or the queue's agent_sandbox = false \
-                 to run the agent uncontained"
+                 [sandbox] isolation_floor = \"off\" to run queue agents uncontained"
             )),
             other => other,
         }
