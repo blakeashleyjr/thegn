@@ -1000,8 +1000,10 @@ sandbox-e2e-full: build
     fi
 
 # THE-307 security gate; requires Linux, bwrap, and working user namespaces.
+# The sealed-home bwrap tests are required too.
 security-e2e:
     THEGN_REQUIRE_SECURITY_TESTS=1 cargo nextest run -p thegn-host --test security_e2e
+    THEGN_REQUIRE_SECURITY_TESTS=1 cargo nextest run -p thegn-core --test sandbox_sealed_home -E 'test(real_bwrap_sealed_) | test(user_gnupg_mount_never_reaches_a_sealed_argv)'
 
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:

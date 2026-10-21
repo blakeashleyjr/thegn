@@ -1160,13 +1160,18 @@ mod tests {
         permissions.set_readonly(true);
         std::fs::set_permissions(dir.path(), permissions).unwrap();
         // Root and some unusual filesystems can still unlink from a read-only
-        // directory. Skip there; the check ensures this test really exercises
-        // an undeletable stale socket wherever it runs.
+        // directory. Report that missing non-root prerequisite explicitly.
         match std::fs::remove_file(&sock) {
             Ok(()) => {
                 let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
                 permissions.set_readonly(false);
                 std::fs::set_permissions(dir.path(), permissions).unwrap();
+                if !thegn_core::testenv::require_or_skip(
+                    "a read-only directory that refuses unlink (non-root)",
+                    false,
+                ) {
+                    return;
+                }
                 return;
             }
             Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
