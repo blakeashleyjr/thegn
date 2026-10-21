@@ -5054,7 +5054,8 @@ mod tests {
         let (svc, _rx) = service(0);
         let row_id = svc
             .with_db(|db| {
-                db.acquire_pipeline_lease("repo:linear:A-1", "lead-a", 300)?;
+                db.acquire_pipeline_lease("repo:linear:A-1", "lead-a", 300)?
+                    .map_err(anyhow::Error::msg)?;
                 db.claim_dispatch_admitted_led(
                     NewDispatch::new("linear:A-1", "/wt/a", "coder"),
                     20,
