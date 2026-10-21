@@ -154,4 +154,7 @@ sandbox or placement.
 
 The System → Debug panel entry is a reserved placeholder. This release has no
 DAP integration, no gdb/lldb pane integration, and no thegn-managed
-breakpoints, stepping, variables, or launch configurations.
+breakpoints, stepping, variables, or launch configurations. `thegn doctor` lists
+BugStalker under the `debug` provider seam; the plugin `DebugAdapter` (DAP)
+extension point is reserved vocabulary and `thegn plugin check` rejects it
+until its runtime lands.

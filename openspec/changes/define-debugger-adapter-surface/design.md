@@ -1,5 +1,19 @@
 # Design — debugger adapter and DAP surface
 
+## Decision (owner, 2026-10-20)
+
+Adopt the plugin `DebugAdapter` seam as the long-term DAP provider surface.
+This slice establishes a launch-adapter seam with BugStalker as its implemented
+kind and DAP as reserved vocabulary; plugin negotiation remains unsupported
+until a runtime can bridge the seam. Defer DAP transport and the plugin debugger
+UI to later slices.
+
+`DebugAdapterCaps::breakpoints`, `stepping`, and `variables` are placeholders
+for slice-b operations; this slice defines no corresponding trait operations.
+When those operations are added, each capability bit must track whether its
+optional operation is available. `launch` is a required adapter operation, and
+`attach` is an optional operation.
+
 ## Decisions to separate
 
 1. **Launch adapters:** pure argv planning plus foreground exec can generalize
