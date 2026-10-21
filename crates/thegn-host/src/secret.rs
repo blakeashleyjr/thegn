@@ -1410,14 +1410,32 @@ impl std::fmt::Display for SecretsLockError {
 
 impl std::error::Error for SecretsLockError {}
 
-fn lock_secrets_in(dir: &std::path::Path) -> Result<std::fs::File, SecretsLockError> {
+/// Held for one file-backend operation. Threads of this process queue on the
+/// mutex first, so they never starve each other while polling the bounded
+/// cross-process file lock (fields drop in order: file lock, then mutex).
+struct SecretsLock {
+    _file: std::fs::File,
+    _process: std::sync::MutexGuard<'static, ()>,
+}
+
+static SECRETS_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_secrets_in(dir: &std::path::Path) -> Result<SecretsLock, SecretsLockError> {
+    let process = SECRETS_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     secrets_dir_at(dir).map_err(|error| SecretsLockError::Other(error.to_string()))?;
     let file =
         open_dir_lock_file(dir, SECRETS_LOCK, "file secrets").map_err(SecretsLockError::Other)?;
     let started = std::time::Instant::now();
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => {
+                return Ok(SecretsLock {
+                    _file: file,
+                    _process: process,
+                });
+            }
             Err(std::fs::TryLockError::WouldBlock) => {
                 let elapsed = started.elapsed();
                 if elapsed >= SECRETS_LOCK_WAIT {
