@@ -84,3 +84,46 @@ The host MAY query the outer terminal (Device Attributes + XTVERSION) before the
 
 - **WHEN** `thegn doctor` runs
 - **THEN** it prints the detected environment, the resolved capabilities, and which features are enabled vs degraded
+
+### Requirement: Set-only bounded pane clipboard admission
+
+Pane OSC 52 passthrough SHALL accept only a complete bounded validated clipboard set and SHALL reject reads before writer admission.
+
+#### Scenario: Clipboard read or malformed set
+
+- **WHEN** a pane emits a query, empty/default or multiple selector, empty payload, invalid base64 or oversized sequence
+- **THEN** no such command SHALL reach the outer writer or replace a retained valid set
+
+#### Scenario: Split input and backpressure
+
+- **WHEN** a valid set spans arbitrary PTY reads or writer admission is refused
+- **THEN** the pane SHALL retain bounded state, preserving the latest validated write for wake-driven retry
+
+#### Scenario: Session generation barrier
+
+- **WHEN** reattach, fallback or exit ends a pane generation
+- **THEN** partial and unadmitted pending clipboard state SHALL be cleared without joining queued old bytes to the new generation
+
+#### Scenario: Writer ownership
+
+- **WHEN** a valid set is accepted by the bounded clipboard queue
+- **THEN** it SHALL preserve FIFO ordering with previously accepted output and SHALL NOT be included in frame-completion metrics
+
+### Requirement: Bounded linear corner APC framing
+
+The corner relay SHALL examine newly received bytes in amortized linear time, retain at most 4 MiB for one APC, and emit completed pieces incrementally.
+
+#### Scenario: Bytewise APC delivery
+
+- **WHEN** an APC arrives one byte at a time with ST split between reads
+- **THEN** the relay SHALL detect completion without rescanning or copying its retained prefix
+
+#### Scenario: Oversized APC
+
+- **WHEN** an APC exceeds the complete-sequence byte cap
+- **THEN** the relay SHALL discard through its ST and SHALL NOT expose its suffix as emulator text or a graphics command
+
+#### Scenario: Pane replacement
+
+- **WHEN** the relay is reset for a replacement pane
+- **THEN** partial and discard state SHALL be released
