@@ -42,6 +42,14 @@ guessed: none of it applies, that repo's queues, CI autofix and autopilot are
 held off, `thegn land`/`integrate` refuse, and `config explain` and
 `thegn repo trust` print why.
 
+When two checkouts share a directory name, give each its own block with
+`repo_path = "<absolute path>"` (`~` is allowed). A bound block is chosen by
+path and never applies to another checkout; that checkout's trusted settings
+are refused with the bound path named. Two blocks may not bind the same path.
+Use the same path spelling that thegn shows for the repo.
+Workspace keybinds and the workspace editor setting are not applied from a
+bound block.
+
 The canonical root for repositories is `projects_dir`; the former
 `workspaces_dir` spelling remains accepted for three stable releases. The
 same compatibility window applies to `[workspace.<slug>]`,
