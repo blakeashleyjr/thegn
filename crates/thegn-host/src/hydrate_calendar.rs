@@ -804,15 +804,25 @@ fn apply_page_with_generation(
                 %error,
                 "calendar cache write failed — keeping the previous page and cursor"
             );
-            if let Err(error) = db.set_calendar_error(account, "calendar cache write failed") {
-                tracing::debug!(
-                    target: "thegn::calendar",
-                    %error,
-                    "could not record the calendar cache failure"
-                );
-            }
+            record_calendar_cache_failure(db, account, generation);
             false
         }
+    }
+}
+
+fn record_calendar_cache_failure(
+    db: &Db,
+    account: &str,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
+) {
+    if crate::hydrate_schedule::generation_is_current(generation)
+        && let Err(error) = db.set_calendar_error(account, "calendar cache write failed")
+    {
+        tracing::debug!(
+            target: "thegn::calendar",
+            %error,
+            "could not record the calendar cache failure"
+        );
     }
 }
 
