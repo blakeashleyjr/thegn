@@ -661,7 +661,8 @@
     },
     {
       "change": "confirm-fold-before-land",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-confirm-fold-before-land/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
