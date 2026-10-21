@@ -627,6 +627,47 @@ pub fn set_issue_account_token(config_path: &Path, name: &str, token_ref: &str) 
     })
 }
 
+/// Return whether `name` is an existing `[[calendar.accounts]]` entry in this
+/// config file. Inline arrays and absent entries are not considered writable.
+pub fn calendar_account_in_file(config_path: &Path, name: &str) -> Result<bool> {
+    let (doc, _) = read_doc(config_path)?;
+    Ok(doc
+        .get("calendar")
+        .and_then(Item::as_table)
+        .and_then(|calendar| calendar.get("accounts"))
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|accounts| {
+            accounts
+                .iter()
+                .any(|account| account.get("name").and_then(|v| v.as_str()) == Some(name.trim()))
+        }))
+}
+
+/// Rewrite only the token of an existing `[[calendar.accounts]]` entry.
+/// Unlike the issue-account upsert, this never creates a partial account when
+/// the account is defined in another config layer.
+pub fn set_calendar_account_token(config_path: &Path, name: &str, token_ref: &str) -> Result<()> {
+    let (mut doc, expected) = read_doc(config_path)?;
+    let account = doc
+        .get_mut("calendar")
+        .and_then(Item::as_table_mut)
+        .and_then(|calendar| calendar.get_mut("accounts"))
+        .and_then(Item::as_array_of_tables_mut)
+        .and_then(|accounts| {
+            accounts
+                .iter_mut()
+                .find(|account| account.get("name").and_then(|v| v.as_str()) == Some(name.trim()))
+        });
+    let Some(account) = account else {
+        anyhow::bail!(
+            "calendar account {name:?} is not defined in {}; edit the config layer that defines it",
+            config_path.display()
+        );
+    };
+    put_str_ref(account, "token", token_ref);
+    write_doc(config_path, &doc, expected.as_deref())
+}
+
 /// Create or update a `[[forges]]` entry (keyed by `name`). `token_ref` must be
 /// a SecretRef / `env:` ref; empty `host`/`token` are omitted.
 pub fn upsert_forge(
@@ -1069,6 +1110,46 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn calendar_account_token_rewrites_only_the_named_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("calendar-accts.toml");
+        std::fs::write(
+            &p,
+            "# keep\n[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\nurl = \"https://example.test/work.ics\"\ntoken = \"lit\"\n\n[[calendar.accounts]]\nname = \"home\"\ntoken = \"lit2\"\n",
+        )
+        .unwrap();
+
+        set_calendar_account_token(&p, "work", "file:/x").unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("# keep"));
+        let doc = out.parse::<DocumentMut>().unwrap();
+        let accounts = doc["calendar"]["accounts"].as_array_of_tables().unwrap();
+        assert_eq!(accounts.get(0).unwrap()["token"].as_str(), Some("file:/x"));
+        assert_eq!(
+            accounts.get(0).unwrap()["url"].as_str(),
+            Some("https://example.test/work.ics")
+        );
+        assert_eq!(accounts.get(1).unwrap()["token"].as_str(), Some("lit2"));
+        toml::from_str::<crate::config::Config>(&out).unwrap();
+    }
+
+    #[test]
+    fn calendar_account_token_refuses_an_absent_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("calendar-absent.toml");
+        std::fs::write(
+            &p,
+            "[calendar]\n[[calendar.accounts]]\nname = \"home\"\ntoken = \"lit2\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&p).unwrap();
+
+        assert!(!calendar_account_in_file(&p, "work").unwrap());
+        assert!(set_calendar_account_token(&p, "work", "file:/x").is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 
     #[test]
