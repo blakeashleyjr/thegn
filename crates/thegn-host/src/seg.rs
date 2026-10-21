@@ -171,10 +171,62 @@ pub struct Seg {
     pub caret: bool,
 }
 
+/// Sanitize hostile text at the TUI's final render boundary (THE-507).
+///
+/// C0/C1 controls, DEL, and line separators become one visible replacement
+/// character. Bidi formatting controls and invisible spacing/format controls
+/// are removed. Joiners, variation selectors, tag characters, combining marks,
+/// RTL letters, and ordinary text remain unchanged.
+pub(crate) fn chrome_safe_text(text: &str) -> std::borrow::Cow<'_, str> {
+    fn replacement(ch: char) -> Option<char> {
+        let code = ch as u32;
+        if ch.is_control() || matches!(code, 0x2028 | 0x2029) {
+            Some('\u{FFFD}')
+        } else {
+            None
+        }
+    }
+
+    fn is_removed(ch: char) -> bool {
+        matches!(
+            ch as u32,
+            0x061c
+                | 0x200e
+                | 0x200f
+                | 0x202a..=0x202e
+                | 0x2066..=0x2069
+                | 0x200b
+                | 0x2060..=0x2064
+                | 0xfeff
+        )
+    }
+
+    fn needs_change(ch: char) -> bool {
+        replacement(ch).is_some() || is_removed(ch)
+    }
+
+    let Some((first_index, first_char)) = text.char_indices().find(|(_, ch)| needs_change(*ch))
+    else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+
+    let mut clean = String::with_capacity(text.len());
+    clean.push_str(&text[..first_index]);
+    for ch in std::iter::once(first_char).chain(text[first_index + first_char.len_utf8()..].chars())
+    {
+        if let Some(replacement) = replacement(ch) {
+            clean.push(replacement);
+        } else if !is_removed(ch) {
+            clean.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(clean)
+}
+
 /// The standard constructor: `seg(Tok::Slot(S::Dim), "text")`.
 pub fn seg(fg: Tok, text: impl Into<String>) -> Seg {
     let text = text.into();
-    let text = match thegn_core::neutralize_bidi_controls(&text) {
+    let text = match chrome_safe_text(&text) {
         std::borrow::Cow::Owned(clean) => clean,
         std::borrow::Cow::Borrowed(_) => text,
     };
@@ -1163,6 +1215,92 @@ mod tests {
         );
         assert_eq!(seg_width(&[]), 0);
         assert_eq!(cut(&[seg(Tok::Slot(S::Text), "abc")], 0), Vec::<Seg>::new());
+    }
+
+    #[test]
+    fn chrome_safe_text_replaces_c0_c1_del_and_line_separators() {
+        for code in (0x0000..=0x001f)
+            .chain(std::iter::once(0x007f))
+            .chain(0x0080..=0x009f)
+            .chain([0x2028, 0x2029])
+        {
+            let ch = char::from_u32(code).expect("listed code point is valid");
+            assert_eq!(
+                chrome_safe_text(&format!("a{ch}b")),
+                "a\u{FFFD}b",
+                "unexpected sanitization for U+{code:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn seg_text_carries_no_control_characters() {
+        let segment = seg(
+            Tok::Slot(S::Text),
+            "x\u{1b}]52;c;cGF5bG9hZA==\u{7}y\r\nz\u{9b}",
+        );
+        assert!(!segment.text.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn a_carriage_return_in_a_seg_cannot_repaint_the_line_start() {
+        let mut surface = Surface::new(8, 1);
+        let line = Line::segs(vec![
+            seg(Tok::Slot(S::Text), "AB"),
+            seg(Tok::Slot(S::Text), "\rZZ"),
+        ]);
+
+        draw_line(&mut surface, 0, 0, 8, &line, PAD);
+
+        let rendered = row_text(&mut surface, 0);
+        assert!(rendered.starts_with("AB"), "{rendered:?}");
+        assert!(rendered.contains('\u{FFFD}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn draw_text_replaces_controls_like_seg() {
+        let mut surface = Surface::new(8, 2);
+        crate::chrome::draw_text(
+            &mut surface,
+            0,
+            0,
+            "ab\ncd",
+            ColorAttribute::Default,
+            ColorAttribute::Default,
+            8,
+        );
+
+        assert!(row_text(&mut surface, 0).contains("ab\u{FFFD}cd"));
+        assert_eq!(row_text(&mut surface, 1), "        ");
+    }
+
+    #[test]
+    fn chrome_safe_text_drops_invisible_format_controls() {
+        let segment = seg(Tok::Slot(S::Text), "a\u{200B}b\u{2060}c\u{FEFF}d\u{202E}e");
+        assert_eq!(segment.text, "abcde");
+    }
+
+    #[test]
+    fn chrome_safe_text_keeps_joiners_selectors_and_scripts() {
+        // Positive controls: these Unicode sequences are already preserved on main.
+        for text in [
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{2764}\u{FE0F}",
+            "می\u{200C}روم",
+            "\u{05D9}\u{05DC}\u{05D5}\u{05DD}",
+            "\u{4f60}\u{597d}",
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+        ] {
+            assert_eq!(chrome_safe_text(text), text);
+        }
+    }
+
+    #[test]
+    fn chrome_safe_text_borrows_clean_input() {
+        assert!(matches!(
+            chrome_safe_text("plain ascii"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }
 
