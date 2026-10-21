@@ -1,6 +1,8 @@
 use super::*;
 
-fn collect(xml: &str) -> Result<(Vec<(String, String, bool)>, String), CalendarError> {
+type CollectedRows = Vec<(String, String, bool)>;
+
+fn collect(xml: &str) -> Result<(CollectedRows, String), CalendarError> {
     let mut rows = Vec::new();
     let token = walk_multistatus(xml, |row| {
         rows.push((row.href, row.ics_raw.to_string(), row.deleted));

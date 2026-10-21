@@ -177,18 +177,26 @@ impl<'a> Reader<'a> {
         }
         let (prefix, local) = qname
             .split_once(':')
-            .map_or((None, &*qname), |(p, l)| (Some(p), l));
+            .map_or((None, qname), |(p, l)| (Some(p), l));
         if prefix.is_some_and(str::is_empty) || local.is_empty() || local.len() > MAX_XML_NAME_BYTES
         {
             return self.fail();
         }
-        let ns = match prefix {
+        let mut ns = match prefix {
             Some(prefix) => match scope.get(prefix) {
                 Some(ns) => ns.clone(),
                 None => return self.fail(),
             },
             None => scope.get("").cloned().unwrap_or_default(),
         };
+        if depth == 1
+            && local == "multistatus"
+            && prefix.is_none()
+            && scope.get("").is_none()
+            && scope.values().any(|namespace| namespace == DAV_NS)
+        {
+            ns = DAV_NS.to_string();
+        }
         if depth == 1 && (ns != DAV_NS || local != "multistatus") {
             return self.fail();
         }
@@ -257,7 +265,7 @@ impl<'a> Reader<'a> {
                 {
                     self.skip_misc()?;
                 } else if self.input[self.pos..].starts_with('<') {
-                    let child = self.element(&scope, depth + 1, root_phase, visit_response)?;
+                    let child = self.element(scope, depth + 1, root_phase, visit_response)?;
                     if !(depth == 1 && is(&child, DAV_NS, "response")) {
                         children.push(child);
                     }
@@ -396,7 +404,7 @@ pub(super) fn walk_multistatus<'a>(
             }
             phase = 1;
             saw_description = true;
-        } else if structural(&child.local) {
+        } else if structural(child.local) {
             return Err(parse_error(0));
         } else if child.ns == DAV_NS {
             return Err(CalendarError::Parse(
@@ -422,7 +430,7 @@ fn process_response<'a>(
     if response
         .children
         .iter()
-        .any(|e| structural(&e.local) && e.ns != DAV_NS)
+        .any(|e| structural(e.local) && e.ns != DAV_NS)
     {
         return Err(CalendarError::Parse(
             "wrong namespace for CalDAV response element".into(),
@@ -452,7 +460,7 @@ fn process_response<'a>(
                 "location",
                 "error",
             ]
-            .contains(&&*e.local)
+            .contains(&e.local)
     }) {
         return Err(CalendarError::Parse("unexpected DAV response child".into()));
     }
@@ -539,15 +547,14 @@ fn process_response<'a>(
         if propstat
             .children
             .iter()
-            .any(|e| structural(&e.local) && e.ns != DAV_NS)
+            .any(|e| structural(e.local) && e.ns != DAV_NS)
         {
             return Err(CalendarError::Parse(
                 "wrong namespace for CalDAV propstat element".into(),
             ));
         }
         if propstat.children.iter().any(|e| {
-            e.ns == DAV_NS
-                && !["prop", "status", "responsedescription", "error"].contains(&&*e.local)
+            e.ns == DAV_NS && !["prop", "status", "responsedescription", "error"].contains(&e.local)
         }) {
             return Err(CalendarError::Parse("unexpected DAV propstat child".into()));
         }
