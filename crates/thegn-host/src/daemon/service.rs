@@ -5079,9 +5079,8 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(
-                ControlError::FailedPrecondition(ref message) if message.contains("session_changed") || message.contains("stale_run_gen"),
-            )
+            Err(ControlError::FailedPrecondition(ref message))
+                if message.contains("session_changed") || message.contains("stale_run_gen")
         ));
         let report = svc
             .with_db(move |db| Ok(db.get_dispatch(row)?.unwrap().report))
