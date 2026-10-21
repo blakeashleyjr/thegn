@@ -157,7 +157,7 @@ fn map_terminal_run(run: &thegn_proc::Run) -> Result<std::process::ExitStatus, R
         End::TimedOut => Err(RunError::Timeout),
         End::LeaderExited => {
             let status = match &run.leader {
-                Leader::Reaped(status) => status.clone(),
+                Leader::Reaped(status) => *status,
                 Leader::ReapFailed(error) => return Err(RunError::Io(error.to_string())),
                 Leader::Detached | Leader::NotSpawned => {
                     return Err(RunError::Io("could not reap child".into()));
