@@ -13,6 +13,13 @@ const WORKTREE_MUTATION_LOCK_WAIT: Duration = Duration::from_secs(120);
 
 #[cfg(test)]
 thread_local! {
+    static WORKTREE_GIT_DEADLINE_OVERRIDE: std::cell::Cell<Option<Duration>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+thread_local! {
     static WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> = const {
         std::cell::Cell::new(None)
     };
@@ -24,6 +31,22 @@ fn worktree_mutation_lock_wait() -> Duration {
         return wait;
     }
     WORKTREE_MUTATION_LOCK_WAIT
+}
+
+fn worktree_git_deadline() -> Duration {
+    #[cfg(test)]
+    if let Some(deadline) = WORKTREE_GIT_DEADLINE_OVERRIDE.get() {
+        return deadline;
+    }
+    WORKTREE_MUTATION_LOCK_WAIT
+}
+
+fn destructive_policy() -> crate::git_run::GitPolicy {
+    let deadline = worktree_git_deadline();
+    crate::git_run::GitPolicy {
+        deadline,
+        ..crate::git_run::GitPolicy::read(deadline)
+    }
 }
 
 fn acquire_mutation_lock(root: &Path) -> std::io::Result<util::GitLock> {
@@ -347,6 +370,38 @@ pub fn branch_exists(root: &Path, branch: &str) -> bool {
             &format!("refs/heads/{branch}"),
         ],
     )
+}
+
+/// Check whether an exact local branch exists, preserving probe failures.
+/// Lifecycle code must use this checked form so an unverifiable ref is never
+/// mistaken for an absent branch.
+pub fn branch_exists_checked(root: &Path, branch: &str) -> Result<bool, String> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    match crate::git_run::git_run(
+        root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        &crate::git_run::GitPolicy::read(worktree_git_deadline()),
+        &cancel,
+    ) {
+        outcome if outcome.is_success() => Ok(true),
+        crate::git_run::GitOutcome::Exit { code: Some(1), .. } => Ok(false),
+        outcome => Err(format!("could not check branch {branch}: {outcome}")),
+    }
+}
+
+/// Prune stale worktree registrations using bounded Git execution.
+pub fn prune_registrations(root: &Path) -> Result<(), String> {
+    git_destructive(root, &["worktree", "prune"]).map_err(|error| error.to_string())
+}
+
+/// Delete a local branch using bounded Git execution and lock-race retries.
+pub fn delete_branch(root: &Path, branch: &str) -> Result<(), String> {
+    git_destructive(root, &["branch", "-D", branch]).map_err(|error| error.to_string())
 }
 
 /// Every branch name a new branch must avoid: local heads plus branches
@@ -770,22 +825,41 @@ pub fn is_lock_contention(stderr: &str) -> bool {
 /// cap (about 1.3s worst case). Non-contention failures are never retried.
 const LOCK_RETRY_ATTEMPTS: u32 = 6;
 
+#[derive(Debug)]
+enum DestructiveError {
+    Refused(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for DestructiveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(text) | Self::Failed(text) => formatter.write_str(text),
+        }
+    }
+}
+
 /// Run a destructive git command, keeping stderr so a failure carries its
 /// reason, and retry within a bound only when it lost a lock race.
-fn git_destructive(root: &Path, args: &[&str]) -> Result<(), String> {
+fn git_destructive(root: &Path, args: &[&str]) -> Result<(), DestructiveError> {
     let mut delay = std::time::Duration::from_millis(40);
     let mut attempt = 1;
     loop {
-        let out = util::git_cmd(root)
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run git {}: {e}", args.join(" ")))?;
-        if out.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if attempt >= LOCK_RETRY_ATTEMPTS || !is_lock_contention(&stderr) {
-            return Err(stderr);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let outcome = crate::git_run::git_run(root, args, &destructive_policy(), &cancel);
+        match outcome {
+            outcome if outcome.is_success() => return Ok(()),
+            crate::git_run::GitOutcome::Exit { stderr_tail, .. } => {
+                if attempt >= LOCK_RETRY_ATTEMPTS || !is_lock_contention(&stderr_tail) {
+                    return Err(DestructiveError::Refused(stderr_tail));
+                }
+            }
+            outcome => {
+                return Err(DestructiveError::Failed(format!(
+                    "git {}: {outcome}",
+                    args.join(" ")
+                )));
+            }
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(std::time::Duration::from_millis(320));
@@ -814,16 +888,30 @@ pub fn remove_detailed(
     let mut failure = None;
     let mut removed = true;
     if let Err(first) = git_destructive(root, &["worktree", "remove", &path_s]) {
-        match git_destructive(root, &["worktree", "remove", "--force", &path_s]) {
-            Ok(()) => {}
-            Err(forced) => {
+        match first {
+            DestructiveError::Refused(first) => {
+                match git_destructive(root, &["worktree", "remove", "--force", &path_s]) {
+                    Ok(()) => {}
+                    Err(forced) => {
+                        removed = false;
+                        failure = Some(if forced.to_string().is_empty() {
+                            first
+                        } else {
+                            forced.to_string()
+                        });
+                    }
+                }
+            }
+            DestructiveError::Failed(error) => {
                 removed = false;
-                failure = Some(if forced.is_empty() { first } else { forced });
+                failure = Some(error);
             }
         }
     }
     if !removed {
-        let why = failure.take().unwrap_or_default();
+        let why = failure
+            .take()
+            .unwrap_or_else(|| "Git refused removal".to_string());
         match git_worktree_registration(root, path) {
             Some(false) if !path.exists() && !worktree_paths_equal(root, path) => {
                 removed = true;
@@ -884,14 +972,14 @@ pub fn remove_detailed(
 /// `None` is deliberately fail-closed: a broken/unreadable repository is not
 /// permission to recursively delete a directory.
 fn git_worktree_registration(root: &Path, path: &Path) -> Option<bool> {
-    let output = util::git_cmd(root)
-        .args(util::WORKTREE_LIST_Z)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let porcelain = String::from_utf8_lossy(&output.stdout);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let outcome = crate::git_run::git_run(
+        root,
+        util::WORKTREE_LIST_Z,
+        &crate::git_run::GitPolicy::read(worktree_git_deadline()),
+        &cancel,
+    );
+    let porcelain = outcome.into_text().ok()?;
     let worktrees = util::parse_worktree_branches(&porcelain)?;
     Some(
         worktrees
@@ -1097,6 +1185,56 @@ mod tests {
         );
         assert!(path.exists(), "the worktree must remain untouched");
         assert!(branch_exists(&repo, "locked"), "the branch must remain");
+    }
+
+    #[test]
+    fn remove_detailed_times_out_without_forcing_and_keeps_the_branch() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        temp_repo_in(&repo);
+        let path = repo.join(".wt-deadline");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "deadline",
+                &path.to_string_lossy()
+            ]
+        ));
+
+        WORKTREE_GIT_DEADLINE_OVERRIDE.set(Some(Duration::ZERO));
+        let result = remove_detailed(&repo, &path, "deadline", true);
+        WORKTREE_GIT_DEADLINE_OVERRIDE.set(None);
+
+        let Err(error) = result else {
+            panic!("zero-deadline remove unexpectedly succeeded");
+        };
+        assert!(error.contains("timed out"), "{error}");
+        assert!(path.exists(), "the worktree must remain");
+        assert_eq!(branch_exists_checked(&repo, "deadline"), Ok(true));
+    }
+
+    #[test]
+    fn branch_exists_checked_tells_absent_from_unverifiable() {
+        let repo = temp_repo("checked-branch");
+        assert_eq!(branch_exists_checked(&repo, "main"), Ok(true));
+        assert_eq!(branch_exists_checked(&repo, "missing"), Ok(false));
+        let not_repo = tempfile::tempdir().unwrap();
+        let result = branch_exists_checked(not_repo.path(), "main");
+        assert!(matches!(result, Err(error) if error.contains("not a git repository")));
+    }
+
+    #[test]
+    fn prune_registrations_reports_git_stderr() {
+        let not_repo = tempfile::tempdir().unwrap();
+        let result = prune_registrations(not_repo.path());
+        assert!(matches!(result, Err(error) if error.contains("not a git repository")));
+        let repo = temp_repo("prune-registrations");
+        assert!(prune_registrations(&repo).is_ok());
     }
 
     #[test]
