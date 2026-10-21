@@ -12,6 +12,7 @@
 //! timer**: a worktree that comes due while thegn sits idle is collected at the
 //! next natural wake, which is the whole point of an idle loop that never polls.
 
+use crate::merge_lifecycle::CleanupOutcome;
 use std::path::Path;
 use thegn_core::config::{Config, OnLanded};
 use thegn_core::db::{Db, MergeQueueRow};
@@ -49,9 +50,15 @@ pub struct SweepReport {
     pub discarded_build_state: Vec<String>,
     /// Branches removed after admitting exact Rust-seeded tool state.
     pub discarded_tool_state: Vec<String>,
+    /// Branches whose worktree was removed but whose bookkeeping was partial.
+    pub collected_partial: Vec<(String, Vec<String>)>,
+    /// Branches retained for explicit cleanup after worktree removal.
+    pub held_branches: Vec<String>,
+    /// Rows left untouched because they cannot be attributed to this repository.
+    pub informational: Vec<(String, String)>,
     /// Refused or failed physical cleanup, with an actionable reason.
     pub kept: Vec<(String, String)>,
-    /// Enumeration or post-removal bookkeeping failures, never "collected".
+    /// Enumeration and sweep-level bookkeeping failures, never "collected".
     pub bookkeeping_errors: Vec<String>,
 }
 
@@ -63,8 +70,65 @@ impl SweepReport {
             && self.kept_changed.is_empty()
             && self.discarded_build_state.is_empty()
             && self.discarded_tool_state.is_empty()
+            && self.collected_partial.is_empty()
+            && self.held_branches.is_empty()
+            && self.informational.is_empty()
             && self.kept.is_empty()
             && self.bookkeeping_errors.is_empty()
+    }
+}
+
+impl SweepReport {
+    /// Whether the sweep hit a refusal or an incomplete cleanup.
+    pub fn is_incomplete(&self) -> bool {
+        !self.kept.is_empty()
+            || !self.kept_changed.is_empty()
+            || !self.collected_partial.is_empty()
+            || !self.bookkeeping_errors.is_empty()
+    }
+}
+
+fn record_cleanup(
+    report: &mut SweepReport,
+    entry_branch: &str,
+    entry_worktree: &str,
+    outcome: crate::merge_lifecycle::CleanupOutcome,
+) {
+    match outcome {
+        CleanupOutcome::Removed {
+            discarded_build_state,
+            discarded_tool_state,
+            branch_held,
+            bookkeeping_errors,
+            queue_removed,
+            ..
+        } => {
+            if bookkeeping_errors.is_empty() {
+                report.collected.push(entry_branch.to_string());
+            } else {
+                report
+                    .collected_partial
+                    .push((entry_branch.to_string(), bookkeeping_errors));
+            }
+            if branch_held {
+                report.held_branches.push(entry_branch.to_string());
+            }
+            if discarded_build_state {
+                report.discarded_build_state.push(entry_branch.to_string());
+            }
+            if discarded_tool_state {
+                report.discarded_tool_state.push(entry_branch.to_string());
+            }
+            if queue_removed {
+                report.cleared_rows.push(entry_worktree.to_string());
+            }
+        }
+        CleanupOutcome::KeptDirty => report.kept_dirty.push(entry_branch.to_string()),
+        CleanupOutcome::KeptChanged => report.kept_changed.push(entry_branch.to_string()),
+        CleanupOutcome::Refused { class, reason } => report.kept.push((
+            entry_branch.to_string(),
+            format!("{entry_worktree}: {}: {reason}", class.label()),
+        )),
     }
 }
 
@@ -156,7 +220,6 @@ pub(crate) fn clear_selected_landed(db: &Db, selected: &[MergeQueueRow]) -> anyh
 }
 
 fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepReport {
-    use crate::merge_lifecycle::CleanupOutcome;
     let mut report = SweepReport::default();
     // THE-515: a refused trusted overlay may have said `on_landed = "move"`;
     // never delete worktrees under the global policy in its place (the
@@ -197,7 +260,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         // are expected to be gone, so preserve the hold semantics first.
         if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
             if force {
-                report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into()));
+                report.held_branches.push(row.branch.clone());
             }
             continue;
         }
@@ -206,7 +269,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         // ownership; remote rows cannot be cleaned by this local sweep.
         if !row.location.is_empty() && row.location != "local" {
             if force {
-                report.kept.push((
+                report.informational.push((
                     row.branch.clone(),
                     "remote/unknown worktree location".into(),
                 ));
@@ -223,7 +286,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             Ok(candidate) => candidate,
             Err(error) => {
                 if force {
-                    report.kept.push((
+                    report.informational.push((
                         row.branch.clone(),
                         format!("repository identity unavailable; row left untouched: {error}"),
                     ));
@@ -335,7 +398,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             ));
             continue;
         };
-        match crate::merge_lifecycle::remove_landed_with_config(
+        let outcome = crate::merge_lifecycle::remove_landed_with_config(
             cfg,
             db,
             repo_root,
@@ -345,33 +408,8 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             Some(landed),
             &row,
             /* delete_branch */ true,
-        ) {
-            CleanupOutcome::Removed {
-                discarded_build_state,
-                discarded_tool_state,
-                bookkeeping_errors,
-                queue_removed,
-                ..
-            } => {
-                report.collected.push(entry.branch.clone());
-                if discarded_build_state {
-                    report.discarded_build_state.push(entry.branch.clone());
-                }
-                if discarded_tool_state {
-                    report.discarded_tool_state.push(entry.branch.clone());
-                }
-                if queue_removed {
-                    report.cleared_rows.push(entry.worktree.clone());
-                }
-                report.bookkeeping_errors.extend(bookkeeping_errors);
-            }
-            CleanupOutcome::KeptDirty => report.kept_dirty.push(entry.branch.clone()),
-            CleanupOutcome::KeptChanged => report.kept_changed.push(entry.branch.clone()),
-            CleanupOutcome::Refused { reason } => report.kept.push((
-                entry.branch.clone(),
-                format!("{}: {reason}", entry.worktree),
-            )),
-        }
+        );
+        record_cleanup(&mut report, &entry.branch, &entry.worktree, outcome);
     }
     report
 }
@@ -416,6 +454,30 @@ pub fn spawn(cfg: Config, dir: std::path::PathBuf) {
                     .map(|b| safe_display(b))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ));
+        }
+        for (branch, errors) in &report.collected_partial {
+            thegn_core::msg::warn(&format!(
+                "merge queue: swept {} with incomplete bookkeeping: {}",
+                safe_display(branch),
+                errors
+                    .iter()
+                    .map(|error| safe_display(error))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        for branch in &report.held_branches {
+            thegn_core::msg::info(&format!(
+                "merge queue: worktree previously collected; branch {} and queue evidence retained for explicit cleanup (THE-596)",
+                safe_display(branch)
+            ));
+        }
+        for (branch, reason) in &report.informational {
+            thegn_core::msg::info(&format!(
+                "merge queue: left {} untouched — {}",
+                safe_display(branch),
+                safe_display(reason)
             ));
         }
         for b in &report.kept_dirty {
@@ -572,11 +634,11 @@ mod tests {
             1,
             "foreign is outside the sweep; forged main is refused"
         );
-        assert_eq!(
-            report.bookkeeping_errors.len(),
-            1,
-            "branch cleanup explicitly held"
+        assert!(
+            report.bookkeeping_errors.is_empty(),
+            "the retained branch is policy, not a bookkeeping failure"
         );
+        assert_eq!(report.held_branches, ["feature"]);
         assert!(report.cleared_rows.is_empty());
         assert!(!wt.exists());
         assert!(
@@ -621,13 +683,14 @@ mod tests {
         let report = sweep_with_db(&cfg, &root_one, true, &db);
 
         assert!(report.collected.is_empty());
-        assert_eq!(report.kept.len(), 1);
-        assert_eq!(report.kept[0].0, "feature");
+        assert_eq!(report.informational.len(), 1);
+        assert_eq!(report.informational[0].0, "feature");
         assert!(
-            report.kept[0]
+            report.informational[0]
                 .1
                 .contains("remote/unknown worktree location")
         );
+        assert!(!report.is_incomplete());
         assert!(worktree_one.join("tracked").exists());
         assert!(worktree_two.join("tracked").exists());
         let rows = db.list_merge_queue().unwrap();
@@ -648,8 +711,9 @@ mod tests {
         .unwrap();
         drop(conn);
         let held_report = sweep_with_db(&cfg, &root_one, true, &db);
-        assert_eq!(held_report.kept.len(), 1);
-        assert!(held_report.kept[0].1.contains("previously collected"));
+        assert_eq!(held_report.held_branches, ["feature"]);
+        assert!(held_report.kept.is_empty());
+        assert!(!held_report.is_incomplete());
     }
 
     #[test]
@@ -786,9 +850,10 @@ mod tests {
         assert!(startup.collected.is_empty());
         let report = sweep_with_db(&cfg, &root, true, &db);
         assert!(report.collected.is_empty());
-        assert!(report.kept.iter().any(|(branch, reason)| {
+        assert!(report.informational.iter().any(|(branch, reason)| {
             branch == "feature" && reason.contains("repository identity unavailable")
         }));
+        assert!(!report.is_incomplete());
         assert!(
             db.list_merge_queue().unwrap().iter().any(|row| {
                 row.worktree == missing.to_string_lossy().into_owned() && row.result_oid.is_none()
@@ -1437,8 +1502,9 @@ mod tests {
         assert!(sweep_with_db(&cfg, &root, false, &db).is_empty());
         let forced = sweep_with_db(&cfg, &root, true, &db);
         assert!(forced.collected.is_empty() && forced.cleared_rows.is_empty());
-        assert_eq!(forced.kept.len(), 1);
-        assert!(forced.kept[0].1.contains("previously collected"));
+        assert_eq!(forced.held_branches, ["feature"]);
+        assert!(forced.kept.is_empty());
+        assert!(!forced.is_incomplete());
         assert_eq!(
             refs(),
             before,
@@ -1807,7 +1873,7 @@ mod tests {
                 true,
             );
             assert!(
-                matches!(outcome, crate::merge_lifecycle::CleanupOutcome::Refused { reason } if reason.contains("selected landed"))
+                matches!(outcome, crate::merge_lifecycle::CleanupOutcome::Refused { reason, .. } if reason.contains("selected landed"))
             );
             assert_eq!(db.list_merge_queue().unwrap(), before);
             assert!(wt.join("tracked").exists());
@@ -1890,7 +1956,7 @@ mod tests {
             true,
         );
         assert!(
-            matches!(outcome, crate::merge_lifecycle::CleanupOutcome::Refused { reason }
+            matches!(outcome, crate::merge_lifecycle::CleanupOutcome::Refused { reason, .. }
             if reason.contains("selected landed queue entry changed"))
         );
         assert!(!marker.exists(), "stale selection reached pre_destroy");
@@ -1963,6 +2029,86 @@ mod tests {
             }
             .is_empty()
         );
+        assert!(
+            !SweepReport {
+                collected_partial: vec![("a".into(), vec!["db write failed".into()])],
+                ..Default::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn cleanup_outcome_partial_removal_is_not_collected() {
+        let mut report = SweepReport::default();
+        record_cleanup(
+            &mut report,
+            "feature",
+            "/repo/feature",
+            crate::merge_lifecycle::CleanupOutcome::Removed {
+                branch_deleted: false,
+                queue_removed: false,
+                discarded_build_state: false,
+                discarded_tool_state: false,
+                branch_held: false,
+                bookkeeping_errors: vec!["db write failed".into()],
+            },
+        );
+
+        assert!(report.collected.is_empty());
+        assert_eq!(
+            report.collected_partial,
+            vec![("feature".to_string(), vec!["db write failed".to_string()])]
+        );
+        assert!(report.bookkeeping_errors.is_empty());
+        assert!(report.is_incomplete());
+    }
+
+    #[test]
+    fn cleanup_outcome_branch_hold_alone_is_collected() {
+        let mut sweep_report = SweepReport::default();
+        record_cleanup(
+            &mut sweep_report,
+            "feature",
+            "/repo/feature",
+            crate::merge_lifecycle::CleanupOutcome::Removed {
+                branch_deleted: false,
+                queue_removed: false,
+                discarded_build_state: false,
+                discarded_tool_state: false,
+                branch_held: true,
+                bookkeeping_errors: Vec::new(),
+            },
+        );
+
+        assert_eq!(sweep_report.collected, ["feature"]);
+        assert_eq!(sweep_report.held_branches, ["feature"]);
+        assert!(sweep_report.bookkeeping_errors.is_empty());
+        assert!(!sweep_report.is_incomplete());
+    }
+
+    #[test]
+    fn cleanup_outcome_refusal_is_typed_and_incomplete() {
+        let mut sweep_report = SweepReport::default();
+        record_cleanup(
+            &mut sweep_report,
+            "feature",
+            "/repo/feature",
+            crate::merge_lifecycle::CleanupOutcome::Refused {
+                class: crate::merge_lifecycle::CleanupRefusal::ClaimBusy,
+                reason: "cleanup is already in progress".into(),
+            },
+        );
+
+        assert_eq!(sweep_report.kept.len(), 1);
+        assert_eq!(sweep_report.kept[0].0, "feature");
+        assert!(
+            sweep_report.kept[0]
+                .1
+                .contains("cleanup is already in progress")
+        );
+        assert!(sweep_report.is_incomplete());
+        assert!(!report(&[], &["edited"]).is_incomplete());
     }
 
     /// The sweep is inert in every mode but `expire`, forced or not — under
