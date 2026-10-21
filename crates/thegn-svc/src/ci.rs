@@ -656,19 +656,6 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Result<Vec<u8>, CiError> {
     }
 }
 
-/// Run a command while bounding stdout before it is buffered in memory.
-fn run_cli_capped(cmd: Command, max: usize, cancel: &AtomicBool) -> Result<String, CiError> {
-    run_cli_within(
-        cmd,
-        crate::issue::gh_run::Limits {
-            timeout: CI_CLI_TIMEOUT,
-            max_stdout: max,
-            max_stderr: CI_CLI_MAX_STDERR,
-        },
-        cancel,
-    )
-}
-
 /// Run a log-producing command while retaining only its newest complete lines.
 ///
 /// `Command::output` is unsuitable for CI logs: it buffers the complete child
