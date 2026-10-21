@@ -35,7 +35,7 @@ fn forbid_prepare() -> Result<Option<SandboxSpec>, String> {
     panic!("denied authority reached sandbox preparation")
 }
 
-fn forbid_launch(_: &AgentTaskRun<'_>) -> bool {
+fn forbid_launch(_: &AgentTaskRun<'_>) -> AgentRunVerdict {
     panic!("denied authority reached the actual launch seam")
 }
 
@@ -77,7 +77,7 @@ fn owned_organization_review_proves_before_preparation_and_launches_once() {
             assert_eq!(task.vars.get("pr_number"), Some("7"));
             assert_eq!(task.vars.get("threads"), Some(request.feedback.as_str()));
             launches.set(launches.get() + 1);
-            true
+            AgentRunVerdict::Exited(Some(0))
         },
     )
     .unwrap();
@@ -357,7 +357,7 @@ fn explicit_broader_policy_runs_without_database_or_authorship_prerequisites() {
             assert_eq!(task.vars.get("pr_title"), Some("cached title"));
             assert_eq!(task.vars.get("pr_url"), Some("legacy view URL"));
             launches.set(launches.get() + 1);
-            true
+            AgentRunVerdict::Exited(Some(0))
         },
     )
     .unwrap();
@@ -387,10 +387,48 @@ fn broader_policy_bounds_hostile_review_payload_before_launch() {
             assert!(task.prompt.contains("Rules:"));
             assert!(task.prompt.contains("Do NOT merge, close, or approve"));
             assert!(task.prompt.contains("task data omitted"));
-            true
+            AgentRunVerdict::Exited(Some(0))
         },
     )
     .unwrap();
+}
+
+#[test]
+fn launch_verdicts_map_to_typed_handoff_results() {
+    use crate::agent_run::AgentRunVerdict;
+
+    let fixture = Fixture::new();
+    let queue = PrQueueConfig {
+        own_prs_only: false,
+        ..queue()
+    };
+    let mut request = request(&fixture);
+    request.snapshot = PrReviewSnapshot::default();
+
+    for (verdict, expected) in [
+        (
+            AgentRunVerdict::NotStarted("no agent".into()),
+            Err("agent did not start: no agent"),
+        ),
+        (
+            AgentRunVerdict::Interrupted("timed out".into()),
+            Err("cut short: timed out"),
+        ),
+        (
+            AgentRunVerdict::Exited(Some(2)),
+            Err("PR review agent handoff failed"),
+        ),
+        (AgentRunVerdict::Exited(Some(0)), Ok("")),
+    ] {
+        let result = execute(&queue, &request, None, || Ok(None), |_| verdict.clone());
+        match expected {
+            Ok(_) => assert!(result.is_ok()),
+            Err(fragment) => assert!(matches!(result, Err(error) if error.contains(fragment))),
+        }
+        if matches!(verdict, AgentRunVerdict::Exited(Some(2))) {
+            assert_eq!(result, Err("PR review agent handoff failed".into()));
+        }
+    }
 }
 
 #[test]

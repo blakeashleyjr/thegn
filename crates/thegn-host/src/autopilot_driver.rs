@@ -320,7 +320,7 @@ fn drive_claim(
         );
         return;
     }
-    let ran = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
+    let verdict = crate::agent_run::run_outcome(&crate::agent_run::AgentTaskRun {
         kind: TaskKind::Issue,
         worktree: &wt,
         prompt: &prompt,
@@ -330,13 +330,17 @@ fn drive_claim(
         sandbox: Some(sandbox),
         credential_free: true,
     });
-    if let Err(e) = record_worker_result(db, dispatch_id, ran) {
+    if let Err(e) = record_worker_result(db, dispatch_id, verdict.exited_zero()) {
         mark_worker_failed(
             db,
             run_id,
             dispatch_id,
             &format!("worker result journal update failed: {e}"),
         );
+        return;
+    }
+    if let Some(reason) = worker_run_stop(&verdict) {
+        mark_worker_failed(db, run_id, dispatch_id, &reason);
         return;
     }
 
@@ -875,6 +879,18 @@ fn mark_needs_human(
     }
 }
 
+fn worker_run_stop(verdict: &crate::agent_run::AgentRunVerdict) -> Option<String> {
+    match verdict {
+        crate::agent_run::AgentRunVerdict::NotStarted(reason) => {
+            Some(format!("agent did not start: {reason}"))
+        }
+        crate::agent_run::AgentRunVerdict::Interrupted(reason) => {
+            Some(format!("agent run was cut short: {reason}"))
+        }
+        crate::agent_run::AgentRunVerdict::Exited(_) => None,
+    }
+}
+
 fn worker_failure(current: &str, expected: &str, clean: bool, ahead: u64) -> String {
     format!(
         "worker result rejected: branch={current:?} expected={expected:?}, clean={clean}, commits_ahead={ahead}"
@@ -979,7 +995,8 @@ mod tests {
     use super::{
         autopilot_backend_is_isolated, autopilot_issue_router, autopilot_pickup_hold, issue_prompt,
         needs_human_overwrites, pr_opened_reason, record_pr_open, record_worker_result,
-        tracker_config_for_account, tracker_in_progress_note, worker_failure, worker_start_reason,
+        tracker_config_for_account, tracker_in_progress_note, worker_failure, worker_run_stop,
+        worker_start_reason,
     };
     use std::path::{Path, PathBuf};
 
@@ -1012,6 +1029,35 @@ mod tests {
         let claim = pickup.find(concat!("claim_autopilot_", "slots(")).unwrap();
         assert!(hold < permit);
         assert!(hold < claim);
+    }
+
+    #[test]
+    fn worker_run_stop_names_not_started_and_interrupted_runs() {
+        use crate::agent_run::AgentRunVerdict;
+
+        assert_eq!(
+            worker_run_stop(&AgentRunVerdict::NotStarted("no shell".into())),
+            Some("agent did not start: no shell".into())
+        );
+        assert_eq!(
+            worker_run_stop(&AgentRunVerdict::Interrupted("timed out".into())),
+            Some("agent run was cut short: timed out".into())
+        );
+        assert_eq!(worker_run_stop(&AgentRunVerdict::Exited(Some(0))), None);
+        assert_eq!(worker_run_stop(&AgentRunVerdict::Exited(Some(3))), None);
+        assert_eq!(worker_run_stop(&AgentRunVerdict::Exited(None)), None);
+    }
+
+    #[test]
+    fn autopilot_stops_on_a_typed_verdict_before_inspecting_the_branch() {
+        let source = include_str!("autopilot_driver.rs");
+        let production = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap().0;
+        let stop = production.find("worker_run_stop(&verdict)").unwrap();
+        assert!(production.contains("crate::agent_run::run_outcome("));
+        assert!(!production.contains("crate::agent_run::run(&"));
+        assert!(stop < production.find("current_branch(").unwrap());
+        assert!(stop < production.find("push_set_upstream(").unwrap());
+        assert!(stop < production.find("worker_failure(&current").unwrap());
     }
 
     fn dispatch(db: &Db) -> i64 {
