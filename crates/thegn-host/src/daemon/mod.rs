@@ -57,7 +57,7 @@ const HEARTBEAT_SECS: u64 = 15;
 /// state directory. This is intentionally absent from the TCP control API.
 pub(crate) const SCOPE_PATH: &str = "/daemon/scope";
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
