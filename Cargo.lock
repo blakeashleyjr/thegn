@@ -7805,6 +7805,7 @@ dependencies = [
  "syntect",
  "sysinfo",
  "tempfile",
+ "thegn-core",
  "thegn-media",
  "thegn-proc",
  "toml 0.8.23",

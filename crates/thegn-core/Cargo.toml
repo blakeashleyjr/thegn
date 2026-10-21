@@ -101,6 +101,9 @@ libc.workspace = true
 sysinfo = { workspace = true }
 
 [dev-dependencies]
+# Integration tests (tests/*.rs) use `testenv::require_or_skip`, which is
+# compiled only under `test-utils`; enable it for this crate's own tests.
+thegn-core = { path = ".", features = ["test-utils"] }
 criterion.workspace = true
 tempfile.workspace = true
 
