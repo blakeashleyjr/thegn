@@ -1051,17 +1051,28 @@ fn regenerate_merge(
     if !preserve_scratch {
         remove_scratch_worktree(repo_root, scratch);
     }
-    if tree.is_some() {
-        thegn_core::msg::info(&format!(
-            "merge queue: regenerated {} for a lockfile-only merge",
-            conflict_paths.join(", ")
-        ));
+    if let Some(tree) = tree.as_deref() {
+        let line = regeneration_audit(conflict_paths, regenerate_command, timeout, tree);
+        let conflict_set: Vec<String> = conflict_paths
+            .iter()
+            .map(|path| crate::merge_sweep::safe_display(path))
+            .collect();
+        tracing::info!(
+            target: "thegn::integrate",
+            conflict_set = ?conflict_set,
+            timeout_secs = timeout.as_secs(),
+            tree = %tree,
+            "regenerated lockfile-only merge"
+        );
+        thegn_core::msg::info(&line);
     }
     tree
 }
 
 /// Return whether a tree diff is confined to the explicitly approved paths.
-/// Any invalid tree or failed Git probe rejects the result.
+/// This also binds the driver/rerere caller: a merge that changes an approved
+/// path's mode now defers to a human. Any invalid tree, malformed record, or
+/// failed Git probe rejects the result.
 #[expect(clippy::disallowed_methods)]
 fn tree_changes_confined(dir: &Path, baseline_tree: &str, tree: &str, approved: &[String]) -> bool {
     thegn_core::util::note_core_git_spawn();
@@ -1069,7 +1080,7 @@ fn tree_changes_confined(dir: &Path, baseline_tree: &str, tree: &str, approved: 
         .args([
             "diff-tree",
             "--no-commit-id",
-            "--name-only",
+            "--raw",
             "--no-renames",
             "-r",
             "-z",
@@ -1083,12 +1094,96 @@ fn tree_changes_confined(dir: &Path, baseline_tree: &str, tree: &str, approved: 
     if !diff.status.success() {
         return false;
     }
+    let Some(changes) = parse_raw_tree_changes(&diff.stdout) else {
+        return false;
+    };
     let approved: HashSet<&[u8]> = approved.iter().map(|path| path.as_bytes()).collect();
-    !diff
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .any(|path| !approved.contains(path))
+    changes.into_iter().all(|change| {
+        approved.contains(change.path.as_slice())
+            && (change.status == b'D'
+                || (change.old_mode == *b"000000"
+                    && (change.new_mode == *b"100644" || change.new_mode == *b"100755"))
+                || (change.old_mode != *b"000000" && change.old_mode == change.new_mode))
+    })
+}
+
+struct RawTreeChange {
+    old_mode: [u8; 6],
+    new_mode: [u8; 6],
+    status: u8,
+    path: Vec<u8>,
+}
+
+fn parse_raw_tree_changes(stdout: &[u8]) -> Option<Vec<RawTreeChange>> {
+    if stdout.is_empty() {
+        return Some(Vec::new());
+    }
+    if stdout.last() != Some(&0) {
+        return None;
+    }
+    let fields: Vec<&[u8]> = stdout.split(|byte| *byte == 0).collect();
+    if fields.len().is_multiple_of(2) || fields.last() != Some(&&[][..]) {
+        return None;
+    }
+    let mut changes = Vec::with_capacity(fields.len() / 2);
+    for record in fields[..fields.len() - 1].chunks_exact(2) {
+        let metadata = record[0];
+        let path = record[1];
+        if path.is_empty() || metadata.first() != Some(&b':') {
+            return None;
+        }
+        let parts: Vec<&[u8]> = metadata[1..].split(|byte| *byte == b' ').collect();
+        if parts.len() != 5
+            || parts.iter().any(|part| part.is_empty())
+            || parts[0].len() != 6
+            || parts[1].len() != 6
+            || !parts[0].iter().all(|byte| (b'0'..=b'7').contains(byte))
+            || !parts[1].iter().all(|byte| (b'0'..=b'7').contains(byte))
+            || !parts[2].iter().all(u8::is_ascii_hexdigit)
+            || !parts[3].iter().all(u8::is_ascii_hexdigit)
+            || !matches!(parts[2].len(), 40 | 64)
+            || !matches!(parts[3].len(), 40 | 64)
+            || parts[4].len() != 1
+            || !matches!(parts[4][0], b'A' | b'D' | b'M' | b'T')
+        {
+            return None;
+        }
+        let old_mode: [u8; 6] = parts[0].try_into().ok()?;
+        let new_mode: [u8; 6] = parts[1].try_into().ok()?;
+        let status = parts[4][0];
+        if (status == b'A' && old_mode != *b"000000")
+            || (status == b'D' && new_mode != *b"000000")
+            || (matches!(status, b'M' | b'T') && (old_mode == *b"000000" || new_mode == *b"000000"))
+        {
+            return None;
+        }
+        changes.push(RawTreeChange {
+            old_mode,
+            new_mode,
+            status,
+            path: path.to_vec(),
+        });
+    }
+    Some(changes)
+}
+
+fn regeneration_audit(
+    conflict_paths: &[String],
+    command: &str,
+    timeout: Duration,
+    tree: &str,
+) -> String {
+    let paths = conflict_paths
+        .iter()
+        .map(|path| crate::merge_sweep::safe_display(path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "merge queue: regenerated {paths} (approved outputs: exactly the conflict set) with command `{}` (timeout {}s) -> tree {}",
+        crate::merge_sweep::safe_display(command),
+        timeout.as_secs(),
+        crate::merge_sweep::safe_display(tree)
+    )
 }
 
 /// What the test-gate decided about the folded tip.
@@ -3962,6 +4057,117 @@ mod tests {
             "not-a-tree-oid",
             &["approved.txt".into()]
         ));
+    }
+
+    #[test]
+    fn tree_change_confinement_rejects_mode_change_of_an_approved_path() {
+        let repo = Repo::new("tree-mode");
+        repo.commit("approved.txt", "approved\n", "approved file");
+        let baseline = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        git(&repo.dir, &["update-index", "--chmod=+x", "approved.txt"]);
+        let tree = repo.out(&["write-tree"]);
+        assert!(!tree_changes_confined(
+            &repo.dir,
+            &baseline,
+            &tree,
+            &["approved.txt".into()]
+        ));
+    }
+
+    #[test]
+    fn tree_change_confinement_rejects_symlink_replacement() {
+        let repo = Repo::new("tree-symlink");
+        repo.commit("approved.txt", "approved\n", "approved file");
+        let baseline = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        git(&repo.dir, &["read-tree", &baseline]);
+        let blob = repo.out(&["rev-parse", "HEAD:approved.txt"]);
+        let cacheinfo = format!("120000,{blob},approved.txt");
+        git(&repo.dir, &["update-index", "--cacheinfo", &cacheinfo]);
+        let tree = repo.out(&["write-tree"]);
+        assert!(!tree_changes_confined(
+            &repo.dir,
+            &baseline,
+            &tree,
+            &["approved.txt".into()]
+        ));
+    }
+
+    #[test]
+    fn tree_change_confinement_rejects_gitlink_replacement() {
+        let repo = Repo::new("tree-gitlink");
+        repo.commit("approved.txt", "approved\n", "approved file");
+        let baseline = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        git(&repo.dir, &["read-tree", &baseline]);
+        let commit = repo.out(&["rev-parse", "HEAD"]);
+        let cacheinfo = format!("160000,{commit},approved.txt");
+        git(&repo.dir, &["update-index", "--cacheinfo", &cacheinfo]);
+        let tree = repo.out(&["write-tree"]);
+        assert!(!tree_changes_confined(
+            &repo.dir,
+            &baseline,
+            &tree,
+            &["approved.txt".into()]
+        ));
+    }
+
+    #[test]
+    fn tree_change_confinement_accepts_content_only_change_and_deletion() {
+        let repo = Repo::new("tree-content-delete");
+        repo.commit("approved.txt", "before\n", "approved file");
+        let baseline = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        repo.commit("approved.txt", "after\n", "content edit");
+        let content_tree = repo.out(&["rev-parse", "HEAD^{tree}"]);
+        let approved = &["approved.txt".into()];
+        assert!(tree_changes_confined(
+            &repo.dir,
+            &baseline,
+            &content_tree,
+            approved
+        ));
+        git(&repo.dir, &["rm", "--cached", "approved.txt"]);
+        let deletion_tree = repo.out(&["write-tree"]);
+        assert!(tree_changes_confined(
+            &repo.dir,
+            &content_tree,
+            &deletion_tree,
+            approved
+        ));
+    }
+
+    #[test]
+    fn regeneration_audit_names_conflict_set_command_and_tree() {
+        let tree = "a".repeat(40);
+        let audit = regeneration_audit(
+            &["Cargo.lock".into()],
+            "cargo generate-lockfile\u{1b}[2J",
+            Duration::from_secs(120),
+            &tree,
+        );
+        assert!(audit.contains("Cargo.lock"));
+        assert!(audit.contains("cargo generate-lockfile"));
+        assert!(audit.contains("120s"));
+        assert!(audit.contains(&tree));
+        assert!(!audit.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn parse_raw_tree_changes_rejects_malformed_records() {
+        assert!(parse_raw_tree_changes(b"").is_some_and(|changes| changes.is_empty()));
+        let oid = "a".repeat(40);
+        let valid = format!(":100644 100644 {oid} {oid} M\0approved.txt\0");
+        let parsed = parse_raw_tree_changes(valid.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].status, b'M');
+        assert_eq!(parsed[0].path, b"approved.txt");
+
+        for malformed in [
+            format!("100644 100644 {oid} {oid} M\0approved.txt\0"),
+            format!(":10064x 100644 {oid} {oid} M\0approved.txt\0"),
+            format!(":100644 100644 {oid} {oid} R100\0approved.txt\0"),
+            format!(":100644 100644 {oid} {oid} M\0\0"),
+        ] {
+            assert!(parse_raw_tree_changes(malformed.as_bytes()).is_none());
+        }
     }
 
     #[test]
