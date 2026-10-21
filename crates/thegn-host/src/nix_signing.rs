@@ -296,6 +296,10 @@ fn key_name(line: &str) -> Option<&str> {
     key_name_suffix(name).map(|_| name)
 }
 
+pub(crate) fn install_key_name(key: &InstallKey) -> Option<String> {
+    key_name(&key.public).map(str::to_owned)
+}
+
 fn key_name_suffix(name: &str) -> Option<&str> {
     name.strip_prefix("thegn-")?.strip_suffix("-1")
 }
@@ -303,12 +307,25 @@ fn key_name_suffix(name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_or_create_in, parse_public_key, sign_argv, trust_script, trusted_key_conf_line,
+        InstallKey, install_key_name, load_or_create_in, parse_public_key, sign_argv, trust_script,
+        trusted_key_conf_line,
     };
     use std::path::Path;
 
     const SECRET: &str = "thegn-0123456789abcdef-1:c2VjcmV0";
     const PUBLIC: &str = "thegn-0123456789abcdef-1:cHVibGlj";
+
+    #[test]
+    fn install_key_name_is_the_public_key_prefix() {
+        let key = InstallKey {
+            secret: Path::new("/private/secret-key").to_path_buf(),
+            public: PUBLIC.to_string(),
+        };
+        assert_eq!(
+            install_key_name(&key).as_deref(),
+            Some("thegn-0123456789abcdef-1")
+        );
+    }
 
     fn private_dir(path: &Path) {
         thegn_core::fsperm::ensure_private_dir(path).unwrap();

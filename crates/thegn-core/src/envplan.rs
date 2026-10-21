@@ -497,10 +497,10 @@ pub struct PlanOpts {
     /// Sandbox-side URL of the host's embedded nix binary cache (the loopback the
     /// reverse tunnel binds, e.g. `http://127.0.0.1:8484`), or `None`. When set,
     /// it's baked into the sandbox nix.conf as an `extra-substituters` entry.
-    /// The embedded host cache is unsigned, so Nix ignores its paths while
-    /// signature verification is enforced; it can accelerate substitutions once
-    /// the cache has an authenticated signer. See `[env.<name>.provider] host_cache`.
     pub host_cache_url: Option<String>,
+    /// Installation public key used to verify the embedded host cache's `Sig:`
+    /// lines. Used only with `host_cache_url`; signature verification stays on.
+    pub host_cache_key: Option<String>,
     /// `[toolchain]` — how the [`Tier::SynthNix`] tier resolves language
     /// manifests into a synthesized Nix devShell (mode + per-language package
     /// overrides). The default (`mode = "auto"`) keeps SynthNix; `mise`/`off`
@@ -545,6 +545,7 @@ impl Default for PlanOpts {
             skip_devshell_warm: false,
             local_parity: None,
             snapshot_restore: None,
+            host_cache_key: None,
             host_cache_url: None,
             toolchain: crate::toolchain::ToolchainConfig::default(),
         }
@@ -714,6 +715,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                         opts.nix_parallel,
                         opts.binary_cache.as_ref(),
                         opts.host_cache_url.as_deref(),
+                        opts.host_cache_key.as_deref(),
                     )),
                 });
                 if req.direnv {
@@ -766,6 +768,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                     opts.nix_parallel,
                     opts.binary_cache.as_ref(),
                     opts.host_cache_url.as_deref(),
+                    opts.host_cache_key.as_deref(),
                 )),
             });
             let packages = crate::toolchain::packages_for(&req.languages, &opts.toolchain);
@@ -867,6 +870,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                     opts.nix_parallel,
                     opts.binary_cache.as_ref(),
                     opts.host_cache_url.as_deref(),
+                    opts.host_cache_key.as_deref(),
                 )),
             });
         }
@@ -943,6 +947,7 @@ fn nix_install_script(
     parallel: Option<u32>,
     cache: Option<&BinaryCache>,
     host_cache_url: Option<&str>,
+    host_cache_key: Option<&str>,
 ) -> String {
     use crate::config::NixInstaller;
     // Persisted nix.conf lines (static, safe to bake — NOT secrets; the token auth
@@ -967,15 +972,20 @@ fn nix_install_script(
             ));
         }
     }
-    // The embedded host cache is currently UNSIGNED. Keep Nix's signature boundary
-    // enforced: unsigned narinfo cannot authenticate its own NarHash, and an
-    // unsigned cache must remain inert until it has an authenticated signer. `nix`
-    // accumulates `extra-substituters` lines, so this coexists with `cache` above.
+    // `nix` accumulates `extra-substituters` lines, so the host cache coexists
+    // with `cache` above. Trust only its installation key and keep signature
+    // verification enforced even when the key is absent.
     if let Some(url) = host_cache_url.map(str::trim).filter(|u| !u.is_empty()) {
         conf.push_str(&format!(
             "extra-substituters = {}\\n",
             printf_fmt_escape(url)
         ));
+        if let Some(key) = host_cache_key.map(str::trim).filter(|key| !key.is_empty()) {
+            conf.push_str(&format!(
+                "extra-trusted-public-keys = {}\\n",
+                printf_fmt_escape(key)
+            ));
+        }
         conf.push_str("require-sigs = true\\n");
         // Graceful degradation for a cache reachable ONLY over the per-sprite reverse
         // tunnel. Two failure modes made `host_cache` unusable: (1) the in-sprite
@@ -1140,7 +1150,10 @@ pub fn bake_scripts(
     parallel: Option<u32>,
 ) -> Vec<(&'static str, String)> {
     vec![
-        ("nix", nix_install_script(installer, parallel, None, None)),
+        (
+            "nix",
+            nix_install_script(installer, parallel, None, None, None),
+        ),
         ("direnv", direnv_install_script()),
     ]
 }
@@ -2656,12 +2669,12 @@ mod tests {
     #[test]
     fn nix_installer_official_default_and_determinate_fallback() {
         use crate::config::NixInstaller;
-        let off = nix_install_script(NixInstaller::Official, None, None, None);
+        let off = nix_install_script(NixInstaller::Official, None, None, None, None);
         assert!(off.contains("nixos.org/nix/install"), "official installer");
         assert!(off.contains("--no-daemon"), "single-user");
         assert!(!off.contains("determinate.systems"));
         // Determinate carries the official installer as a fallback (|| (...)).
-        let det = nix_install_script(NixInstaller::Determinate, None, None, None);
+        let det = nix_install_script(NixInstaller::Determinate, None, None, None, None);
         assert!(
             det.contains("install.determinate.systems"),
             "uses Determinate"
@@ -2679,7 +2692,7 @@ mod tests {
         // Hardening against the sprite `exit 127` (official installer can't unpack
         // its .xz tarball on a minimal microVM): the script installs the missing
         // decompression/download tools and retries a flaky install.
-        let s = nix_install_script(NixInstaller::Determinate, None, None, None);
+        let s = nix_install_script(NixInstaller::Determinate, None, None, None, None);
         assert!(s.contains("ensure_tools"), "installs prerequisites");
         assert!(
             s.contains("xz"),
@@ -2696,9 +2709,9 @@ mod tests {
     #[test]
     fn nix_parallel_downloads_written_to_conf() {
         use crate::config::NixInstaller;
-        let none = nix_install_script(NixInstaller::Official, None, None, None);
+        let none = nix_install_script(NixInstaller::Official, None, None, None, None);
         assert!(!none.contains("http-connections"), "off by default");
-        let s = nix_install_script(NixInstaller::Official, Some(100), None, None);
+        let s = nix_install_script(NixInstaller::Official, Some(100), None, None, None);
         assert!(s.contains("http-connections = 100"));
         assert!(s.contains("max-substitution-jobs = 100"));
         // still enables flakes.
@@ -2713,7 +2726,7 @@ mod tests {
             key: "cache.example.org-1:abc".into(),
             push: true,
         };
-        let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None);
+        let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None, None);
         assert!(s.contains("extra-substituters = https://cache.example.org"));
         assert!(s.contains("extra-trusted-public-keys = cache.example.org-1:abc"));
         // host_cache_url adds the loopback substituter while keeping signature
@@ -2723,6 +2736,7 @@ mod tests {
             None,
             Some(&cache),
             Some("http://127.0.0.1:8484"),
+            None,
         );
         assert!(hc.contains("extra-substituters = http://127.0.0.1:8484"));
         assert!(!hc.contains("require-sigs = false"));
@@ -2806,6 +2820,38 @@ mod tests {
     }
 
     #[test]
+    fn host_cache_trusts_the_installation_key() {
+        use crate::config::NixInstaller;
+        let script = nix_install_script(
+            NixInstaller::Official,
+            None,
+            None,
+            Some("http://127.0.0.1:8484"),
+            Some("thegn-0123456789abcdef-1:cHVibGlj"),
+        );
+        assert!(script.contains("extra-trusted-public-keys = thegn-0123456789abcdef-1:cHVibGlj"));
+        assert!(script.contains("require-sigs = true"));
+
+        let no_url = nix_install_script(
+            NixInstaller::Official,
+            None,
+            None,
+            None,
+            Some("thegn-0123456789abcdef-1:cHVibGlj"),
+        );
+        assert!(!no_url.contains("extra-trusted-public-keys"));
+
+        let escaped = nix_install_script(
+            NixInstaller::Official,
+            None,
+            None,
+            Some("http://127.0.0.1:8484"),
+            Some("thegn-key%25'quoted"),
+        );
+        assert!(escaped.contains("thegn-key%%25'\\''quoted"));
+    }
+
+    #[test]
     fn cache_url_special_chars_are_escaped_for_printf() {
         use crate::config::NixInstaller;
         // A presigned S3 URL (with `%`) and a `'` in the key must NOT corrupt the
@@ -2816,7 +2862,7 @@ mod tests {
             key: "it's-a-key".into(),
             push: false,
         };
-        let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None);
+        let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None, None);
         // `%` doubled so printf emits a literal `%`.
         assert!(
             s.contains("X-Amz-Signature=ab%%2Fcd"),
@@ -2832,7 +2878,13 @@ mod tests {
             "key quote must be escaped: {s}"
         );
         // host_cache_url takes the same escaping.
-        let hc = nix_install_script(NixInstaller::Official, None, None, Some("http://h/%41"));
+        let hc = nix_install_script(
+            NixInstaller::Official,
+            None,
+            None,
+            Some("http://h/%41"),
+            None,
+        );
         assert!(hc.contains("http://h/%%41"));
     }
 
