@@ -116,7 +116,11 @@ fn rebuild_outcome(remote_ref: &str, exec: &CappedExec) -> Result<()> {
             "machine0: a previous provisioning run ({PROVISION_UNIT}.service) is still active on the VM; not starting another (it was not interrupted){truncated}"
         )),
         REBUILD_TOOL_MISSING_EXIT => Err(anyhow!(
-            "machine0: provisioning needs systemd-run and nixos-rebuild on the VM:\n{}{truncated}",
+            "machine0: systemd-run / nixos-rebuild not found (or the rebuild exited 127):\n{}{truncated}",
+            exec.output
+        )),
+        255 => Err(anyhow!(
+            "machine0: ssh transport failed during nixos-rebuild; remote state unknown:\n{}{truncated}",
             exec.output
         )),
         code => Err(anyhow!(
@@ -710,7 +714,9 @@ impl Machine0Provider {
         .await
         {
             Ok(Ok(exec)) => rebuild_outcome(&plan.remote_ref, &exec),
-            Ok(Err(error)) => Err(error).context("machine0: nixos-rebuild over ssh"),
+            Ok(Err(error)) => {
+                Err(error).context("machine0: nixos-rebuild over ssh failed; remote state unknown")
+            }
             Err(_) => {
                 let stop_argv = vec!["/bin/sh".into(), "-lc".into(), stop_script()];
                 match tokio::time::timeout(
@@ -2119,6 +2125,13 @@ mod tests {
             ),
             (1, "boom", 0, "exit 1", "boom"),
             (1, "boom", 5, "truncated: 5 bytes", "boom"),
+            (
+                255,
+                "connection reset",
+                0,
+                "remote state unknown",
+                "connection reset",
+            ),
         ];
         for (code, output, dropped, expected_message, expected_output) in cases {
             let error = rebuild_outcome(
