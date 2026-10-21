@@ -298,6 +298,169 @@ fn duplicate_shape_singletons_quarantine_the_event() {
 }
 
 #[test]
+fn cancel_only_override_hides_one_occurrence() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\n\
+UID:s\n\
+DTSTART:20261012T090000Z\n\
+DTEND:20261012T100000Z\n\
+RRULE:FREQ=DAILY;COUNT=5\n\
+END:VEVENT\n\
+BEGIN:VEVENT\n\
+UID:s\n\
+RECURRENCE-ID:20261013T090000Z\n\
+STATUS:CANCELLED\n\
+SEQUENCE:1\n\
+END:VEVENT\n\
+END:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert_eq!(events.len(), 2);
+    let override_event = &events[1];
+    assert_eq!(override_event.status, EventStatus::Cancelled);
+    assert_eq!(
+        override_event.recurrence_id.as_ref(),
+        Some(&override_event.start)
+    );
+    assert!(
+        !report
+            .diagnostics()
+            .contains(&IcsDiagnostic::EventWithoutStart)
+    );
+    let expanded = crate::calendar::expand_calendar(
+        &events,
+        NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+        chrono_tz::UTC,
+    )
+    .unwrap();
+    assert_eq!(expanded.occurrences.len(), 4);
+    assert!(
+        !expanded
+            .by_date
+            .contains_key(&NaiveDate::from_ymd_opt(2026, 10, 13).unwrap())
+    );
+}
+
+#[test]
+fn cancel_only_master_removes_the_series() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\n\
+UID:s\nSEQUENCE:0\nDTSTART:20261012T090000Z\nEND:VEVENT\n\
+BEGIN:VEVENT\n\
+UID:s\nRECURRENCE-ID:20261013T090000Z\nDTSTART:20261013T110000Z\nEND:VEVENT\n\
+BEGIN:VEVENT\n\
+UID:s\nSTATUS:CANCELLED\nSEQUENCE:1\nEND:VEVENT\n\
+END:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert!(events.is_empty());
+    assert_eq!(report.cancelled_uids(), &[String::from("s")]);
+}
+
+#[test]
+fn cancel_tombstone_without_sequence_removes_a_sequence_less_series() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\nUID:s\nDTSTART:20261012T090000Z\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:s\nSTATUS:CANCELLED\nEND:VEVENT\n\
+END:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert!(events.is_empty());
+    assert_eq!(report.cancelled_uids(), &[String::from("s")]);
+}
+
+#[test]
+fn cancel_stale_tombstone_is_ignored() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\nUID:s\nSEQUENCE:3\nDTSTART:20261012T090000Z\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:s\nSTATUS:CANCELLED\nSEQUENCE:2\nEND:VEVENT\n\
+END:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert_eq!(events.len(), 1);
+    assert!(report.cancelled_uids().is_empty());
+}
+
+#[test]
+fn cancel_stale_override_cancellation_is_ignored() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\nUID:s\nRECURRENCE-ID:20261013T090000Z\nDTSTART:20261013T110000Z\nSEQUENCE:2\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:s\nRECURRENCE-ID:20261013T090000Z\nSTATUS:CANCELLED\nSEQUENCE:1\nEND:VEVENT\n\
+END:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].status, EventStatus::Confirmed);
+    assert!(
+        !report
+            .diagnostics()
+            .contains(&IcsDiagnostic::EventWithoutStart)
+    );
+}
+
+#[test]
+fn cancel_newer_override_cancellation_wins() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\nUID:s\nRECURRENCE-ID:20261013T090000Z\nDTSTART:20261013T110000Z\nSEQUENCE:1\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:s\nRECURRENCE-ID:20261013T090000Z\nSTATUS:CANCELLED\nSEQUENCE:2\nEND:VEVENT\n\
+END:VCALENDAR";
+    let (events, _) = parse_report(input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].status, EventStatus::Cancelled);
+}
+
+#[test]
+fn cancel_tombstone_only_touches_its_uid() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\nUID:a\nSTATUS:CANCELLED\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:b\nDTSTART:20261012T090000Z\nEND:VEVENT\n\
+END:VCALENDAR";
+    let (events, report) = parse_report(input);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].uid, "b");
+    assert_eq!(report.cancelled_uids(), &[String::from("a")]);
+}
+
+#[test]
+fn cancel_invalid_sequence_is_reported() {
+    let input = one_event("UID:s\nDTSTART:20261012T090000Z\nSEQUENCE:x");
+    let (events, report) = parse_report(&input);
+    assert_eq!(events.len(), 1);
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+}
+
+#[test]
+fn cancel_duplicate_sequence_is_reported_without_quarantining() {
+    let input = one_event("UID:s\nDTSTART:20261012T090000Z\nSEQUENCE:1\nSEQUENCE:2");
+    let (events, report) = parse_report(&input);
+    assert_eq!(events.len(), 1);
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::DuplicateProperty("SEQUENCE"))
+    );
+}
+
+// Positive control: a cancellation without UID remains an invalid start-less event.
+#[test]
+fn cancel_without_uid_still_reports_missing_start() {
+    let (events, report) = parse_report(&one_event("STATUS:CANCELLED"));
+    assert!(events.is_empty());
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::EventWithoutStart)
+    );
+}
+
+// Positive control: equal, absent sequences keep both same-key components.
+#[test]
+fn cancel_equal_sequence_duplicates_are_unchanged() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\nUID:s\nDTSTART:20261012T090000Z\nSUMMARY:first\nEND:VEVENT\n\
+BEGIN:VEVENT\nUID:s\nDTSTART:20261012T090000Z\nSUMMARY:second\nEND:VEVENT\n\
+END:VCALENDAR";
+    let (events, _) = parse_report(input);
+    assert_eq!(events.len(), 2);
+}
+
+#[test]
 fn invalid_dtend_quarantines_instead_of_defaulting() {
     let input = one_event("UID:x\nDTSTART:20261012T090000Z\nDTEND:garbage");
     let (events, report) = parse_report(&input);
