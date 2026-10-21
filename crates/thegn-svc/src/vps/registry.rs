@@ -14,13 +14,10 @@
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const RESERVE_LOCK: &str = ".reserve.lock";
 pub const BAKE_NAME_PREFIX: &str = "tg-bake-";
@@ -178,22 +175,53 @@ fn record_path(d: &Path, name: &str) -> PathBuf {
     d.join(format!("{name}.json"))
 }
 
-fn ensure_owned_root(d: &Path) -> Result<()> {
-    std::fs::create_dir_all(d)?;
-    let metadata = std::fs::symlink_metadata(d)?;
+fn open_root(d: &Path, create: bool) -> Result<Option<thegn_core::fsperm::PrivateDir>> {
+    if create {
+        thegn_core::fsperm::ensure_private_dir(d)
+            .context("vps registry: registry root is not an owned private directory")?;
+        return thegn_core::fsperm::open_private_dir(d)
+            .map(Some)
+            .context("vps registry: registry root is not an owned private directory");
+    }
+
+    let metadata = match std::fs::symlink_metadata(d) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     anyhow::ensure!(
         !metadata.file_type().is_symlink()
             && metadata.is_dir()
             && thegn_core::fsperm::owned_by_current_user(&metadata),
         "vps registry: registry root is not an owned real directory"
     );
-    Ok(())
+    // A concurrent root swap could make this path-based chmod follow a new
+    // symlink before open_private_dir's O_NOFOLLOW check; mutation requires
+    // write access to the owner-only registry directory.
+    thegn_core::fsperm::restrict_dir_to_owner(d)
+        .context("vps registry: registry root is not an owned private directory")?;
+    thegn_core::fsperm::open_private_dir(d)
+        .map(Some)
+        .context("vps registry: registry root is not an owned private directory")
+}
+
+pub fn ensure_known_hosts_dir_at(d: &Path) -> Result<PathBuf> {
+    let _root = open_root(d, true)?;
+    thegn_core::fsperm::ensure_private_dir_beneath(d, Path::new("known_hosts.d"))
+        .map(|directory| directory.path().to_path_buf())
+        .context("vps registry: known_hosts.d is not an owned private directory")
+}
+
+pub fn ensure_known_hosts_dir() -> Result<PathBuf> {
+    ensure_known_hosts_dir_at(&dir())
 }
 
 /// Write (atomically: tmp + rename) a record into `d`.
 pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
     checked_name(&rec.name)?;
-    ensure_owned_root(d)?;
+    let root = open_root(d, true)?.ok_or_else(|| {
+        anyhow::anyhow!("vps registry: registry root was not opened after creation")
+    })?;
     let mut record = rec.clone();
     if record.owner.is_empty() {
         match read_at(d, &record.name) {
@@ -209,44 +237,9 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
             },
         }
     }
-    let path = record_path(d, &rec.name);
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = d.join(format!(
-        "{}.json.{}.{}.tmp",
-        rec.name,
-        std::process::id(),
-        counter
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    let publish = (|| -> Result<()> {
-        serde_json::to_writer_pretty(&mut file, &record)?;
-        file.sync_all()
-            .with_context(|| format!("sync {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
-        if let Ok(dir) = std::fs::File::open(d)
-            && let Err(error) = dir.sync_all()
-        {
-            tracing::warn!(
-                %error,
-                path = %d.display(),
-                "VPS registry record was published but its directory could not be synced"
-            );
-        }
-        Ok(())
-    })();
-    if let Err(error) = publish {
-        match std::fs::remove_file(&tmp) {
-            Ok(()) => return Err(error),
-            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => return Err(error),
-            Err(cleanup) => {
-                return Err(error.context(format!("also failed to remove staging file: {cleanup}")));
-            }
-        }
-    }
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    root.write_owner_only_atomic(&format!("{}.json", rec.name), &bytes)
+        .with_context(|| format!("publish VPS registry record {}", rec.name))?;
     Ok(())
 }
 
@@ -299,7 +292,13 @@ pub fn reserve_at(
     scope: ReserveScope,
 ) -> std::result::Result<(), ReserveError> {
     checked_name(&rec.name).map_err(ReserveError::Store)?;
-    ensure_owned_root(d).map_err(ReserveError::Store)?;
+    open_root(d, true)
+        .map_err(ReserveError::Store)?
+        .ok_or_else(|| {
+            ReserveError::Store(anyhow::anyhow!(
+                "vps registry: registry root was not opened after creation"
+            ))
+        })?;
     let lock_path = d.join(RESERVE_LOCK);
     match std::fs::symlink_metadata(&lock_path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
@@ -433,20 +432,33 @@ pub fn remove_at(d: &Path, name: &str) {
     if checked_name(name).is_err() {
         return;
     }
-    let Ok(root) = std::fs::symlink_metadata(d) else {
-        return;
+    let root = match open_root(d, false) {
+        Ok(Some(root)) => root,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(target: "thegn::vps", %error, path = %d.display(), "unable to open VPS registry for removal");
+            return;
+        }
     };
-    if root.file_type().is_symlink() || !root.is_dir() {
-        return;
+    if let Err(error) = root.remove_file(&format!("{name}.json")) {
+        tracing::debug!(target: "thegn::vps", %error, name, "unable to remove VPS registry record");
     }
-    let known_hosts = d.join("known_hosts.d");
-    if let Ok(metadata) = std::fs::symlink_metadata(&known_hosts)
-        && (metadata.file_type().is_symlink() || !metadata.is_dir())
-    {
-        return;
+    match root.entry_exists_nofollow("known_hosts.d") {
+        Ok(true) => match thegn_core::fsperm::open_private_dir(&d.join("known_hosts.d")) {
+            Ok(known_hosts) => {
+                if let Err(error) = known_hosts.remove_file(name) {
+                    tracing::debug!(target: "thegn::vps", %error, name, "unable to remove VPS known_hosts pin");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::vps", %error, name, "unable to open VPS known_hosts directory for removal")
+            }
+        },
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(target: "thegn::vps", %error, name, "unable to inspect VPS known_hosts directory")
+        }
     }
-    let _ = std::fs::remove_file(record_path(d, name)); // best-effort: idempotent removal; absence is fine
-    let _ = std::fs::remove_file(d.join("known_hosts.d").join(name)); // best-effort: idempotent removal; absence is fine
 }
 
 pub fn remove(name: &str) {
@@ -670,11 +682,12 @@ mod tests {
         std::fs::write(d.join("blocked.json/child"), b"keep directory nonempty").unwrap();
         assert!(write_at(d, &rec("blocked", "ready")).is_err());
         assert!(std::fs::read_dir(d).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|x| x == "tmp")
+            let path = entry.unwrap().path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            !name.starts_with(".secret.tmp-") && !name.ends_with(".tmp")
         }));
     }
 
@@ -699,11 +712,12 @@ mod tests {
         assert_eq!(record.name, "shared");
         assert_eq!(record.state, "ready");
         assert!(std::fs::read_dir(d).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|x| x == "tmp")
+            let path = entry.unwrap().path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            !name.starts_with(".secret.tmp-") && !name.ends_with(".tmp")
         }));
     }
 
@@ -1110,5 +1124,82 @@ mod tests {
         assert!(record.owner.is_empty());
         let encoded = serde_json::to_value(record).unwrap();
         assert!(encoded.get("owner").is_none());
+    }
+
+    #[test]
+    fn known_hosts_dir_is_created_private_beneath_the_registry_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+
+        let path = ensure_known_hosts_dir_at(&d).unwrap();
+
+        assert_eq!(path, d.join("known_hosts.d"));
+        assert!(path.is_dir());
+        for directory in [&d, &path] {
+            assert!(
+                thegn_core::fsperm::mode_bits(directory)
+                    .unwrap()
+                    .is_none_or(|mode| mode & 0o777 == 0o700)
+            );
+        }
+    }
+
+    #[test]
+    fn known_hosts_dir_refuses_a_symlinked_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+        write_at(&d, &rec("a", "ready")).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("keep"), b"unchanged").unwrap();
+        let mode_before = thegn_core::fsperm::mode_bits(&victim).unwrap();
+        let link = d.join("known_hosts.d");
+        if let Err(error) = thegn_core::fsperm::create_symlink(&victim, &link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+
+        assert!(ensure_known_hosts_dir_at(&d).is_err());
+        assert_eq!(std::fs::read(victim.join("keep")).unwrap(), b"unchanged");
+        assert_eq!(thegn_core::fsperm::mode_bits(&victim).unwrap(), mode_before);
+    }
+
+    #[test]
+    fn write_tightens_an_existing_registry_root_to_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+        std::fs::create_dir(&d).unwrap();
+
+        write_at(&d, &rec("a", "ready")).unwrap();
+
+        assert!(
+            thegn_core::fsperm::mode_bits(&d)
+                .unwrap()
+                .is_none_or(|mode| mode & 0o777 == 0o700)
+        );
+        assert!(
+            thegn_core::fsperm::mode_bits(&d.join("a.json"))
+                .unwrap()
+                .is_none_or(|mode| mode & 0o777 == 0o600)
+        );
+    }
+
+    #[test]
+    fn remove_removes_the_known_hosts_pin_through_the_private_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("vps");
+        write_at(&d, &rec("a", "ready")).unwrap();
+        let known_hosts = ensure_known_hosts_dir_at(&d).unwrap();
+        std::fs::write(known_hosts.join("a"), b"pinned key").unwrap();
+
+        remove_at(&d, "a");
+
+        assert!(!d.join("a.json").exists());
+        assert!(!known_hosts.join("a").exists());
     }
 }

@@ -370,7 +370,6 @@ crates/thegn-svc/src/share/tests.rs
 crates/thegn-svc/src/usage.rs
 crates/thegn-svc/src/vpn/mod.rs
 crates/thegn-svc/src/vps/mod.rs
-crates/thegn-svc/src/vps/registry.rs
 crates/thegn-svc/src/vps/ssh_shim.rs
 crates/thegn-svc/tests/fly_mock.rs
 crates/thegn-svc/tests/machine0_live.rs
