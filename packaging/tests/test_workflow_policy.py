@@ -372,12 +372,23 @@ class WorkflowPolicyTests(unittest.TestCase):
             steps = jobs[job_name]["steps"]
             step = next(item for item in steps if item.get("name") == step_name)
             script = step.get("run", "")
+            summary_name = (
+                "Summarize Homebrew publication"
+                if job_name == "publish-homebrew"
+                else "Summarize AUR publication"
+            )
+            summary = next(item for item in steps if item.get("name") == summary_name)
+            summary_script = summary.get("run", "")
             with self.subTest(job=job_name):
                 self.assertEqual("publish", step.get("id"))
                 self.assertIn("--force-with-lease=", script)
                 self.assertIn("ls-remote", script)
                 self.assertIn("GITHUB_OUTPUT", script)
                 self.assertNotRegex(script, r"(?m)^\s*git .*push origin HEAD\s*$")
+                self.assertIn('[ -z "$BRANCH" ]', summary_script)
+                self.assertIn(
+                    "before the target was cloned; remote state unknown", summary_script
+                )
 
     def test_publish_cas_rehearsal(self) -> None:
         if shutil.which("git") is None or shutil.which("bash") is None:
@@ -392,12 +403,18 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
 
         def git(*args: str, env: dict[str, str] | None = None) -> str:
+            git_environment = os.environ.copy()
+            git_environment.update(
+                {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+            )
+            if env is not None:
+                git_environment.update(env)
             completed = subprocess.run(
                 ["git", "-c", "commit.gpgsign=false", *args],
                 check=True,
                 capture_output=True,
                 text=True,
-                env=env,
+                env=git_environment,
             )
             return completed.stdout.strip()
 
@@ -420,7 +437,6 @@ class WorkflowPolicyTests(unittest.TestCase):
         def run_publisher(
             parent: Path,
             script: str,
-            job_name: str,
             url: str,
             bare: Path,
             *,
@@ -497,7 +513,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     parent = Path(temporary)
                     bare, initial = make_remote(parent, branch)
                     changed, changed_values = run_publisher(
-                        parent, step["run"], job_name, url, bare, content="changed\n"
+                        parent, step["run"], url, bare, content="changed\n"
                     )
                     self.assertEqual(0, changed.returncode, changed.stderr)
                     self.assertEqual("committed", changed_values.get("outcome"))
@@ -508,7 +524,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     )
 
                     unchanged, unchanged_values = run_publisher(
-                        parent, step["run"], job_name, url, bare, content="changed\n"
+                        parent, step["run"], url, bare, content="changed\n"
                     )
                     self.assertEqual(0, unchanged.returncode, unchanged.stderr)
                     self.assertEqual("unchanged", unchanged_values.get("outcome"))
@@ -525,7 +541,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                         "import os, pathlib, subprocess, sys\n"
                         "real = os.environ['REAL_GIT']\n"
                         "args = sys.argv[1:]\n"
-                        "if 'push' in args and os.environ.pop('CAS_INJECTED', '') != 'yes':\n"
+                        "if 'push' in args:\n"
                         "    clone = pathlib.Path(os.environ['CONCURRENT_CLONE'])\n"
                         "    subprocess.run([real, '-c', 'commit.gpgsign=false', 'clone', os.environ['BARE_REPO'], str(clone)], check=True)\n"
                         "    subprocess.run([real, '-c', 'commit.gpgsign=false', '-C', str(clone), 'config', 'user.name', 'Maintainer'], check=True)\n"
@@ -541,7 +557,6 @@ class WorkflowPolicyTests(unittest.TestCase):
                     concurrent, concurrent_values = run_publisher(
                         parent,
                         step["run"],
-                        job_name,
                         url,
                         bare,
                         content="candidate after race\n",
@@ -554,6 +569,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertEqual(changed_values.get("new"), concurrent_values.get("old"))
                     self.assertEqual(concurrent_values.get("observed"), remote_tip)
                     self.assertNotEqual(concurrent_values.get("old"), remote_tip)
+                    self.assertNotEqual(concurrent_values.get("new"), remote_tip)
 
     def test_sandbox_publication_is_serialized(self) -> None:
         workflow = read_workflow("sandbox-image.yml")
