@@ -426,6 +426,8 @@ pub trait IssueBackend: Send + Sync {
         id: &'a str,
         patch: &'a IssuePatch,
     ) -> BoxFuture<'a, Result<Issue, IssueError>>;
+    /// `limit == 0` means one bounded default page per provider; a bounded search
+    /// that stops early returns `IssueError::PartialList` with the rows so far.
     fn search<'a>(
         &'a self,
         query: &'a str,
@@ -1066,6 +1068,31 @@ impl IssueRouter {
                         tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
                     }
                 },
+                Err(IssueError::PartialList { issues, reason }) => {
+                    let valid = issues
+                        .into_iter()
+                        .filter_map(|issue| match validate_issue_identity(&issue) {
+                            Ok(()) => Some(stamp_issue(issue, &b.account)),
+                            Err(error) => {
+                                tracing::warn!(
+                                    account = %b.account,
+                                    provider = b.inner.provider_id(),
+                                    error = %error,
+                                    "partial issue identity rejected"
+                                );
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    tracing::warn!(
+                        account = %b.account,
+                        provider = b.inner.provider_id(),
+                        partial_count = valid.len(),
+                        reason,
+                        "issue search is partial; retaining rows"
+                    );
+                    per_account.push(valid);
+                }
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue search failed")
                 }
@@ -1746,6 +1773,21 @@ mod tests {
 
     struct PartialListBackend;
 
+    impl PartialListBackend {
+        fn partial_issue() -> Issue {
+            Issue {
+                id: "linear:ABC-1".into(),
+                number: "1".into(),
+                provider: "linear".into(),
+                title: "partial row".into(),
+                status: thegn_core::issue::IssueStatus::Todo,
+                priority: thegn_core::issue::IssuePriority::Low,
+                url: "https://linear.app/acme/issue/ABC-1".into(),
+                ..Default::default()
+            }
+        }
+    }
+
     impl IssueBackend for PartialListBackend {
         fn provider_id(&self) -> &str {
             "linear"
@@ -1759,17 +1801,7 @@ mod tests {
             &'a self,
             _filter: &'a IssueFilter,
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
-            let issue = Issue {
-                id: "linear:ABC-1".into(),
-                number: "1".into(),
-                provider: "linear".into(),
-                title: "partial row".into(),
-                status: thegn_core::issue::IssueStatus::Todo,
-                priority: thegn_core::issue::IssuePriority::Low,
-                url: "https://linear.app/acme/issue/ABC-1".into(),
-                ..Default::default()
-            };
-            let issue = serde_json::from_value(serde_json::to_value(issue).unwrap()).unwrap();
+            let issue = Self::partial_issue();
             Box::pin(async move {
                 Err(IssueError::PartialList {
                     issues: vec![issue],
@@ -1802,7 +1834,13 @@ mod tests {
             _query: &'a str,
             _limit: usize,
         ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
-            Box::pin(async { Err(IssueError::Api("not used".into())) })
+            let issue = Self::partial_issue();
+            Box::pin(async move {
+                Err(IssueError::PartialList {
+                    issues: vec![issue],
+                    reason: "test partial page",
+                })
+            })
         }
     }
 
@@ -2252,6 +2290,22 @@ mod tests {
             Err(IssueError::PartialList { issues, .. })
                 if issues.len() == 1 && issues[0].account.as_deref() == Some("partial")
         ));
+    }
+
+    #[test]
+    fn best_effort_search_retains_partial_rows() {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router
+            .push_backend("partial".into(), Box::new(PartialListBackend))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime.block_on(router.search("partial", 10)).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, "partial row");
+        assert_eq!(issues[0].account.as_deref(), Some("partial"));
     }
 
     struct PluginMarker {
