@@ -2147,6 +2147,16 @@
       "path": "/v1/dispatches/{id}/status"
     },
     {
+      "cap": "dispatches.report",
+      "method": "POST",
+      "path": "/v1/dispatches/{id}/report"
+    },
+    {
+      "cap": "dispatches.note",
+      "method": "POST",
+      "path": "/v1/dispatches/{id}/note"
+    },
+    {
       "cap": "preview.fetch",
       "method": "POST",
       "path": "/v1/preview/fetch"
