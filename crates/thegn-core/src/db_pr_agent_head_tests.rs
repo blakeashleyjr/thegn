@@ -100,17 +100,25 @@ fn recorded_own_head_is_neither_foreign_nor_a_budget_reset() {
     let lease = admitted(&db, &key, "head-a");
     assert!(db.record_pr_agent_head(&lease, "head-a", "head-b").unwrap());
     assert!(db.release_pr_agent(&lease, None).unwrap());
+    let row = db.list_pr_queue().unwrap().remove(0);
+    assert_eq!(row.last_head_oid.as_deref(), Some("head-b"));
     let cfg = crate::config::PrQueueConfig {
         reset_attempts_on_push: true,
         ..Default::default()
     };
-    assert!(!crate::pr_queue::foreign_push(Some("head-b"), "head-b"));
+    assert!(!crate::pr_queue::foreign_push(
+        row.last_head_oid.as_deref(),
+        "head-b"
+    ));
     assert!(!crate::pr_queue::attempts_reset(
-        Some("head-b"),
+        row.last_head_oid.as_deref(),
         "head-b",
         &cfg
     ));
-    assert!(crate::pr_queue::foreign_push(Some("head-b"), "head-d"));
+    assert!(crate::pr_queue::foreign_push(
+        row.last_head_oid.as_deref(),
+        "head-d"
+    ));
 }
 
 #[test]
@@ -120,4 +128,21 @@ fn invalid_head_record_is_an_error() {
     let lease = admitted(&db, &key, "head-a");
     assert!(db.record_pr_agent_head(&lease, "", "head-b").is_err());
     assert!(db.record_pr_agent_head(&lease, "head-a", "head-a").is_err());
+}
+
+#[test]
+fn record_head_database_error_leaves_row_unchanged() {
+    let db = Db::open_memory().unwrap();
+    let key = enqueue(&db, 6);
+    let lease = admitted(&db, &key, "head-a");
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_agent_head BEFORE UPDATE OF last_head_oid ON pr_queue
+             BEGIN SELECT RAISE(ABORT, 'injected database failure'); END;",
+        )
+        .unwrap();
+
+    assert!(db.record_pr_agent_head(&lease, "head-a", "head-b").is_err());
+    let row = db.list_pr_queue().unwrap().remove(0);
+    assert_eq!(row.last_head_oid.as_deref(), Some("head-a"));
 }

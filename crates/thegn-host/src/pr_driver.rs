@@ -859,16 +859,11 @@ pub(crate) fn drive_queue(
                         .map(|pr| pr.head_ref_oid)
                 });
                 if let Some(own) = own {
-                    match guard.record_own_head(db, &head, &own) {
-                        Ok(true) => {}
-                        Ok(false) => out.warnings.push(format!(
-                            "PR #{}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push",
-                            item.number
-                        )),
-                        Err(error) => out.warnings.push(format!(
-                            "PR #{}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push ({error})",
-                            item.number
-                        )),
+                    if let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
+                        item.number,
+                        guard.record_own_head(db, &head, &own),
+                    ) {
+                        out.warnings.push(warning);
                     }
                 }
 
