@@ -335,9 +335,9 @@ one of them is about your branch:
   their gate-error messages.
 
 Before each candidate, a reused gate worktree is cleaned of untracked files;
-ignored files such as build output remain as a warm cache. Thegn hashes its
-tracked files after setup and checks them again after the gate. A changed
-tracked file makes the gate an error, not a pass.
+ignored files such as build output remain as a warm cache. Its tracked files are
+hashed after setup and checked again after the gate. A changed tracked file
+makes the gate an error, not a pass.
 
 ## Driving it from an agent pane
 
