@@ -41,14 +41,11 @@ impl AppleScript {
         crate::applescript_parse::pick_active(reads)
     }
 
-    pub async fn list_players(&self) -> Vec<String> {
+    pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
         match self.active_app().await {
-            Ok(Some((app, _))) => vec![app.to_string()],
-            Ok(None) => Vec::new(),
-            Err(error) => {
-                tracing::debug!(target: "thegn::media", %error, "AppleScript player read failed");
-                Vec::new()
-            }
+            Ok(Some((app, _))) => Ok(vec![app.to_string()]),
+            Ok(None) => Ok(Vec::new()),
+            Err(error) => Err(error),
         }
     }
 
@@ -173,7 +170,7 @@ impl MediaBackend for AppleScript {
     }
 
     /// The running scriptable apps; no push watcher (the host polls).
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
         Box::pin(async move { self.list_players().await })
     }
 

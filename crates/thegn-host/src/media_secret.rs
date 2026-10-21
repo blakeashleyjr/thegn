@@ -43,15 +43,33 @@ pub(crate) fn resolve_opts(
     Ok(opts)
 }
 
-pub(crate) async fn client_for(cfg: &MediaConfig) -> Option<thegn_media::MediaClient> {
+pub(crate) enum MediaClientError {
+    Credential(String),
+    Unavailable(thegn_media::Unavailable),
+}
+
+impl std::fmt::Display for MediaClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Credential(outcome) => write!(f, "media credential refused: {outcome}"),
+            Self::Unavailable(reason) => std::fmt::Display::fmt(reason, f),
+        }
+    }
+}
+
+pub(crate) async fn client_for(
+    cfg: &MediaConfig,
+) -> Result<thegn_media::MediaClient, MediaClientError> {
     let opts = match resolve_opts(cfg) {
         Ok(opts) => opts,
         Err(outcome) => {
             tracing::warn!(target: "thegn::media", component = CONSUMER, %outcome, "MPD credential resolution refused");
-            return None;
+            return Err(MediaClientError::Credential(outcome.to_string()));
         }
     };
-    thegn_media::client_for(opts).await
+    thegn_media::client_for(opts)
+        .await
+        .map_err(MediaClientError::Unavailable)
 }
 
 fn effective_socket(configured: &str) -> (String, Option<SecretRef>) {
@@ -169,5 +187,19 @@ mod tests {
         let opts = resolve_opts(&cfg).unwrap();
         assert!(opts.mpd_socket.is_empty());
         assert!(opts.mpd_password.is_none());
+    }
+
+    #[test]
+    fn typed_client_error_display_names_the_reason() {
+        assert!(
+            MediaClientError::Unavailable(thegn_media::Unavailable::Disabled)
+                .to_string()
+                .contains("disabled")
+        );
+        assert!(
+            MediaClientError::Credential("x".into())
+                .to_string()
+                .contains("credential")
+        );
     }
 }

@@ -118,18 +118,25 @@ impl MediaBackend for Aggregate {
     }
 
     /// Union of every child's controllable players (for the picker).
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
         Box::pin(async move {
             let players = join_all(self.children.iter().enumerate().map(|(i, c)| async move {
                 (i, tokio::time::timeout(SNAPSHOT_BUDGET, c.players()).await)
             }))
             .await;
             let mut out = Vec::new();
+            let mut failures = Vec::new();
             for (i, result) in players {
                 let source_players = match result {
-                    Ok(source_players) => source_players,
+                    Ok(Ok(source_players)) => source_players,
+                    Ok(Err(error)) => {
+                        tracing::debug!(target: "thegn::media", child = i, %error, "media player listing failed");
+                        failures.push(error);
+                        continue;
+                    }
                     Err(error) => {
                         tracing::debug!(target: "thegn::media", child = i, %error, "media players timed out");
+                        failures.push(MediaError::Unavailable("player listing timed out".into()));
                         continue;
                     }
                 };
@@ -139,13 +146,18 @@ impl MediaBackend for Aggregate {
                     }
                 }
             }
-            out
+            if out.is_empty() && !self.children.is_empty() && failures.len() == self.children.len()
+            {
+                Err(failures.remove(0))
+            } else {
+                Ok(out)
+            }
         })
     }
 
     /// Fan every child that offers a push watcher into one stream. `None` when no
     /// child pushes (the host then falls back to its poll ticker).
-    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+    fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
         Box::pin(async move {
             let watches = join_all(
                 self.children
@@ -154,9 +166,28 @@ impl MediaBackend for Aggregate {
                     .map(|(i, c)| bounded_watch(i, c.watch(), SNAPSHOT_BUDGET)),
             )
             .await;
-            let children = watches.into_iter().flatten().collect::<Vec<_>>();
-            (!children.is_empty())
-                .then(|| Box::new(AggregateWatch { children }) as Box<dyn MediaWatch + Send>)
+            let mut children = Vec::new();
+            let mut failures = Vec::new();
+            let mut non_failures = 0;
+            for result in watches {
+                match result {
+                    Ok(Some(watch)) => {
+                        non_failures += 1;
+                        children.push(watch);
+                    }
+                    Ok(None) => non_failures += 1,
+                    Err(error) => failures.push(error),
+                }
+            }
+            if !children.is_empty() {
+                Ok(Some(
+                    Box::new(AggregateWatch { children }) as Box<dyn MediaWatch + Send>
+                ))
+            } else if !self.children.is_empty() && non_failures == 0 {
+                Err(failures.remove(0))
+            } else {
+                Ok(None)
+            }
         })
     }
 
@@ -222,15 +253,15 @@ impl Aggregate {
 
 fn bounded_watch<'a>(
     child: usize,
-    watch: BoxFuture<'a, Option<Box<dyn MediaWatch + Send>>>,
+    watch: BoxFuture<'a, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>>,
     budget: std::time::Duration,
-) -> BoxFuture<'a, Option<Box<dyn MediaWatch + Send>>> {
+) -> BoxFuture<'a, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
     Box::pin(async move {
         match tokio::time::timeout(budget, watch).await {
             Ok(watch) => watch,
             Err(error) => {
                 tracing::debug!(target: "thegn::media", child, %error, "media watcher setup timed out");
-                None
+                Err(MediaError::Unavailable("watcher setup timed out".into()))
             }
         }
     })
@@ -391,7 +422,7 @@ mod tests {
             vec![fake_backend(Box::new(DropWatch(dropped.clone())))],
             Vec::new(),
         );
-        let watch = aggregate.watch().await.unwrap();
+        let watch = aggregate.watch().await.unwrap().unwrap();
         drop(watch);
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -403,7 +434,7 @@ mod tests {
             vec![fake_backend(Box::new(DropWatch(dropped.clone())))],
             Vec::new(),
         );
-        let watch = aggregate.watch().await.unwrap();
+        let watch = aggregate.watch().await.unwrap().unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let mut watch = watch;
@@ -427,7 +458,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let mut watch = aggregate.watch().await.unwrap();
+        let mut watch = aggregate.watch().await.unwrap().unwrap();
         assert!(watch.changed().await);
         assert!(!stalled_dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -438,7 +469,7 @@ mod tests {
             vec![fake_backend(Box::new(ReadyWatch(Some(false))))],
             Vec::new(),
         );
-        let mut watch = aggregate.watch().await.unwrap();
+        let mut watch = aggregate.watch().await.unwrap().unwrap();
         assert!(!watch.changed().await);
     }
 
@@ -452,7 +483,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let mut watch = aggregate.watch().await.unwrap();
+        let mut watch = aggregate.watch().await.unwrap().unwrap();
 
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed()).await,
@@ -471,7 +502,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let mut watch = aggregate.watch().await.unwrap();
+        let mut watch = aggregate.watch().await.unwrap().unwrap();
         // Each child produces a wake, then remains alive and pending.
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed()).await,
@@ -485,7 +516,9 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_child_watch_does_not_hold_up_healthy_watchers() {
-        let healthy = Box::pin(async { Some(Box::new(TestWatch) as Box<dyn MediaWatch + Send>) });
+        let healthy = Box::pin(async {
+            Ok::<_, MediaError>(Some(Box::new(TestWatch) as Box<dyn MediaWatch + Send>))
+        });
         let stalled = Box::pin(std::future::pending());
         let watches = join_all([
             bounded_watch(0, stalled, std::time::Duration::from_millis(10)),
@@ -493,8 +526,121 @@ mod tests {
         ])
         .await;
 
-        assert!(watches[0].is_none(), "a stalled watcher should time out");
-        assert!(watches[1].is_some(), "a healthy watcher should be retained");
+        assert!(
+            watches[0].is_err(),
+            "a stalled watcher should report timeout"
+        );
+        assert!(
+            watches[1].as_ref().is_ok_and(Option::is_some),
+            "a healthy watcher should be retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_players_union_skips_a_failed_child() {
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Ok(vec!["a".into()]), Ok(None)),
+                players_backend(Err(MediaError::Unavailable("bus".into())), Ok(None)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(aggregate.players().await, Ok(vec!["a".into()]));
+    }
+
+    #[tokio::test]
+    async fn typed_players_error_when_every_child_fails() {
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Err(MediaError::Unavailable("first".into())), Ok(None)),
+                players_backend(Err(MediaError::Unavailable("second".into())), Ok(None)),
+            ],
+            Vec::new(),
+        );
+        assert!(aggregate.players().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn typed_watch_error_when_every_child_fails() {
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Ok(Vec::new()), Err(MediaError::Unavailable("one".into()))),
+                players_backend(Ok(Vec::new()), Err(MediaError::Unavailable("two".into()))),
+            ],
+            Vec::new(),
+        );
+        assert!(aggregate.watch().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn typed_watch_ok_none_when_no_child_pushes() {
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Ok(Vec::new()), Ok(None)),
+                players_backend(Ok(Vec::new()), Ok(None)),
+            ],
+            Vec::new(),
+        );
+        assert!(aggregate.watch().await.unwrap().is_none());
+    }
+
+    fn players_backend(
+        players: Result<Vec<String>, MediaError>,
+        watch: Result<Option<Box<dyn MediaWatch + Send>>, MediaError>,
+    ) -> MediaClient {
+        Box::new(PlayersBackend {
+            players,
+            watch: Mutex::new(Some(watch)),
+        })
+    }
+
+    type PendingWatch = Option<Result<Option<Box<dyn MediaWatch + Send>>, MediaError>>;
+
+    struct PlayersBackend {
+        players: Result<Vec<String>, MediaError>,
+        watch: Mutex<PendingWatch>,
+    }
+
+    impl MediaBackend for PlayersBackend {
+        fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+            no_player()
+        }
+        fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn set_shuffle(&self, _on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn set_loop(&self, _mode: crate::model::LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+            no_player()
+        }
+        fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+            no_player()
+        }
+        fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+            no_player()
+        }
+
+        fn caps(&self) -> MediaCaps {
+            NO_CAPS
+        }
+
+        fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+            Box::pin(async move { self.players.clone() })
+        }
+
+        fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
+            Box::pin(async move { self.watch.lock().unwrap().take().unwrap_or(Ok(None)) })
+        }
     }
 
     #[tokio::test]
@@ -632,8 +778,8 @@ mod tests {
         fn caps(&self) -> MediaCaps {
             self.caps
         }
-        fn players(&self) -> BoxFuture<'_, Vec<String>> {
-            Box::pin(async { Vec::new() })
+        fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -743,12 +889,12 @@ mod tests {
             NO_CAPS
         }
 
-        fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
-            Box::pin(async move { self.watch.lock().unwrap().take() })
+        fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
+            Box::pin(async move { Ok(self.watch.lock().unwrap().take()) })
         }
 
-        fn players(&self) -> BoxFuture<'_, Vec<String>> {
-            Box::pin(async { Vec::new() })
+        fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
     }
 }

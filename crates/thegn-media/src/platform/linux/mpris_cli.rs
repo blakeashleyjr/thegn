@@ -172,8 +172,8 @@ impl MediaBackend for MprisCli {
     }
 
     /// `playerctl --list-all`; no push watcher (the host polls).
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
-        Box::pin(async move { self.list_players().await.unwrap_or_default() })
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+        Box::pin(async move { self.list_players().await })
     }
 
     fn caps(&self) -> MediaCaps {
