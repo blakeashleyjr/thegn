@@ -17,6 +17,7 @@
 //!   per-instance known_hosts file ([`super::registry::known_hosts_path`]),
 //!   deleted with the instance.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -50,7 +51,7 @@ async fn read_tail_capped<R: AsyncRead + Unpin>(
 ) -> io::Result<(Vec<u8>, u64)> {
     const CHUNK_BYTES: usize = 8192;
     let mut chunk = [0_u8; CHUNK_BYTES];
-    let mut tail = Vec::with_capacity(cap);
+    let mut tail = VecDeque::with_capacity(cap);
     let mut dropped = 0_u64;
     loop {
         let read = reader.read(&mut chunk).await?;
@@ -63,15 +64,15 @@ async fn read_tail_capped<R: AsyncRead + Unpin>(
             dropped = dropped.saturating_add(tail.len() as u64);
             dropped = dropped.saturating_add((read - cap) as u64);
             tail.clear();
-            tail.extend_from_slice(&chunk[read - cap..read]);
+            tail.extend(&chunk[read - cap..read]);
         } else {
             let excess = tail.len().saturating_add(read).saturating_sub(cap);
             tail.drain(..excess);
             dropped = dropped.saturating_add(excess as u64);
-            tail.extend_from_slice(&chunk[..read]);
+            tail.extend(&chunk[..read]);
         }
     }
-    Ok((tail, dropped))
+    Ok((tail.make_contiguous().to_vec(), dropped))
 }
 
 /// Normalize a provider-exec argv into one shell script. The provisioning
@@ -522,6 +523,11 @@ mod tests {
         let (tail, dropped) = read_tail_capped(&b"0123456789"[..], 0).await.unwrap();
         assert!(tail.is_empty());
         assert_eq!(dropped, 10);
+
+        let reader = (&b"012"[..]).chain(&b"345"[..]).chain(&b"6789"[..]);
+        let (tail, dropped) = read_tail_capped(reader, 4).await.unwrap();
+        assert_eq!(tail, b"6789");
+        assert_eq!(dropped, 6);
     }
 
     #[test]
