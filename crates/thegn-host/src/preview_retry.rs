@@ -112,6 +112,17 @@ impl PendingCornerOob {
     }
 }
 
+/// Shared visibility rule for both corner graphics paths; the corner card
+/// itself is never an occluder.
+pub(crate) fn corner_occluded(
+    popup_covers: bool,
+    app_tile: bool,
+    mouse_selection: bool,
+    replay: bool,
+) -> bool {
+    popup_covers || app_tile || mouse_selection || replay
+}
+
 /// Retains the newest admissible host clipboard copy. An oversized copy is
 /// warned about and dropped without displacing an already retained copy.
 #[derive(Debug, Default)]
@@ -509,5 +520,89 @@ mod tests {
         }
         assert_eq!(*submitted.borrow(), vec![MUSE_READY_MARKER.to_vec()]);
         assert!(!marker.is_pending());
+    }
+
+    #[test]
+    fn corner_occluded_is_any_cover_except_the_corner_card() {
+        for flags in 0_u8..16 {
+            let popup_covers = flags & 1 != 0;
+            let app_tile = flags & 2 != 0;
+            let mouse_selection = flags & 4 != 0;
+            let replay = flags & 8 != 0;
+            assert_eq!(
+                corner_occluded(popup_covers, app_tile, mouse_selection, replay),
+                flags != 0,
+                "flags={flags:04b} popup={popup_covers} app_tile={app_tile} mouse_selection={mouse_selection} replay={replay}"
+            );
+        }
+    }
+
+    #[test]
+    fn corner_occluded_trace_keeps_the_corner_visible_until_a_popup_opens() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        let mut popup_covers = false;
+        let mut was_occluded = false;
+
+        for draw in [vec![1], vec![2]] {
+            let occluded = corner_occluded(popup_covers, false, false, false);
+            if occluded && !was_occluded {
+                slot.require_delete();
+            }
+            slot.offer_draw(draw, !occluded, |bytes| {
+                submitted.borrow_mut().push(bytes);
+                Ok(())
+            });
+            was_occluded = occluded;
+        }
+        assert_eq!(*submitted.borrow(), vec![vec![1], vec![2]]);
+
+        popup_covers = true;
+        let occluded = corner_occluded(popup_covers, false, false, false);
+        if occluded && !was_occluded {
+            slot.require_delete();
+        }
+        slot.retry(!occluded, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            submitted.borrow().last(),
+            Some(&kitty_relay::delete_all().to_vec())
+        );
+        slot.offer_draw(vec![3], !occluded, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.offer_draw(vec![4], !occluded, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        was_occluded = occluded;
+        let hidden_count = submitted.borrow().len();
+        assert_eq!(hidden_count, 3);
+
+        popup_covers = false;
+        let occluded = corner_occluded(popup_covers, false, false, false);
+        if occluded && !was_occluded {
+            slot.require_delete();
+        }
+        slot.retry(!occluded, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.retry(!occluded, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![
+                vec![1],
+                vec![2],
+                kitty_relay::delete_all().to_vec(),
+                vec![4]
+            ]
+        );
     }
 }
