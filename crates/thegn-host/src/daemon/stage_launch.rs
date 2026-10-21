@@ -52,12 +52,20 @@ struct LaunchEntry {
     state: LaunchState,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the launch registry holds a handful of short-lived entries; boxing SessionInfo buys nothing"
+)]
 enum LaunchState {
     Opening,
     Opened(SessionInfo),
     Refused(String),
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the launch registry holds a handful of short-lived entries; boxing SessionInfo buys nothing"
+)]
 pub(crate) enum LaunchAdmit {
     Fresh,
     Replay(SessionInfo),
