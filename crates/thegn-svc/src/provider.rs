@@ -948,15 +948,17 @@ pub fn rules_from(
     let mut any_allow = false;
     let mut allowed = std::collections::HashSet::new();
     for d in allow {
-        if let Some(domain) = canonical_domain(d)?
-            && !denied.contains(&domain)
-            && allowed.insert(domain.clone())
-        {
+        let Some(domain) = canonical_domain(d)? else {
+            continue;
+        };
+        // Any allow entry selects allow-list mode, even when every entry is
+        // shadowed by a block: dropping the catch-all deny would fail open.
+        any_allow = true;
+        if !denied.contains(&domain) && allowed.insert(domain.clone()) {
             rules.push(PolicyRule {
                 domain,
                 action: "allow".into(),
             });
-            any_allow = true;
         }
     }
     if any_allow {
