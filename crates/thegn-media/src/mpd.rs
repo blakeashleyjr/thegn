@@ -748,18 +748,18 @@ impl MediaBackend for Mpd {
     }
 
     /// One daemon per endpoint.
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
-        Box::pin(async { vec!["mpd".to_string()] })
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+        Box::pin(async { Ok(vec!["mpd".to_string()]) })
     }
 
     /// The `idle` push watcher.
-    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+    fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
         Box::pin(async move {
             match Mpd::watch(self).await {
-                Ok(w) => Some(Box::new(w) as Box<dyn MediaWatch + Send>),
+                Ok(w) => Ok(Some(Box::new(w) as Box<dyn MediaWatch + Send>)),
                 Err(e) => {
                     tracing::debug!(target: "thegn::media", error = %e, "MPD watcher unavailable");
-                    None
+                    Err(e)
                 }
             }
         })

@@ -109,17 +109,16 @@ impl MediaBackend for Admitted {
     fn caps(&self) -> MediaCaps {
         self.0.caps()
     }
-    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+    fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
         self.0.watch()
     }
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
         Box::pin(async move {
-            self.0
-                .players()
-                .await
+            let names = self.0.players().await?;
+            Ok(names
                 .into_iter()
                 .filter(|name| model::is_valid_opaque_id(name))
-                .collect()
+                .collect())
         })
     }
 }
@@ -134,6 +133,7 @@ mod tests {
         calls: std::sync::Arc<Mutex<Vec<String>>>,
         items: Mutex<Vec<QueueItem>>,
         caps: MediaCaps,
+        players: Result<Vec<String>, MediaError>,
     }
 
     impl MediaBackend for Fake {
@@ -174,8 +174,8 @@ mod tests {
         fn caps(&self) -> MediaCaps {
             self.caps
         }
-        fn players(&self) -> BoxFuture<'_, Vec<String>> {
-            Box::pin(async { Vec::new() })
+        fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+            Box::pin(async move { self.players.clone() })
         }
         fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
             let items = self.items.lock().unwrap().clone();
@@ -188,6 +188,12 @@ mod tests {
     }
 
     fn fake() -> (Admitted, std::sync::Arc<Mutex<Vec<String>>>) {
+        fake_with_players(Ok(Vec::new()))
+    }
+
+    fn fake_with_players(
+        players: Result<Vec<String>, MediaError>,
+    ) -> (Admitted, std::sync::Arc<Mutex<Vec<String>>>) {
         let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
         let client: MediaClient = Box::new(Fake {
             calls: calls.clone(),
@@ -210,6 +216,7 @@ mod tests {
                 signals: true,
                 ..Default::default()
             },
+            players,
         });
         (Admitted(client), calls)
     }
@@ -242,5 +249,12 @@ mod tests {
         assert_eq!(snapshot.caps, admitted.caps());
         assert_eq!(snapshot.state.title.len(), model::MAX_FIELD_BYTES);
         assert!(snapshot.state.track_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_players_error_is_not_filtered_to_empty() {
+        let error = MediaError::Unavailable("bus disconnected".into());
+        let (admitted, _) = fake_with_players(Err(error.clone()));
+        assert_eq!(admitted.players().await, Err(error));
     }
 }

@@ -69,8 +69,8 @@ pub use platform::linux::mpris::{MprisWatch, MprisZbus};
 #[cfg(target_os = "linux")]
 pub use platform::linux::mpris_cli::MprisCli;
 
-/// What went wrong talking to a player. Callers treat every variant as "show
-/// nothing / no-op" — a missing player or absent tool is never a hard error.
+/// What went wrong talking to a player. Callers can distinguish a healthy empty
+/// listing from a transport or provider failure and surface this display text.
 /// Hand-rolled `Display` (no `thiserror` dep), mirroring `thegn_core::ci::CiError`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaError {
@@ -232,15 +232,17 @@ pub trait MediaBackend: Send + Sync {
     fn caps(&self) -> MediaCaps;
 
     /// A push-signal watcher when the backend supports one (native MPRIS, MPD
-    /// `idle`, SMTC, the MediaRemote adapter). `None` ⇒ the host falls back to
-    /// the `[media] poll_interval_secs` ticker (the mpv / playerctl /
-    /// AppleScript backends all poll for now).
-    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
-        Box::pin(async { None })
+    /// `idle`, SMTC, the MediaRemote adapter). `Ok(None)` means the host falls
+    /// back to the `[media] poll_interval_secs` ticker; `Err` means push setup
+    /// failed. The mpv / playerctl / AppleScript backends poll for now.
+    fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
+        Box::pin(async { Ok(None) })
     }
 
-    /// List the controllable players (bus-name tails) for the picker.
-    fn players(&self) -> BoxFuture<'_, Vec<String>>;
+    /// List the controllable players (bus-name tails) for the picker. An empty
+    /// successful list means no player is present; transport and probe failures
+    /// are errors.
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>>;
 }
 
 /// A push-change stream for backends that have one (native MPRIS D-Bus signals,
@@ -262,7 +264,7 @@ pub trait MediaWatch: Send {
 pub enum BackendKind {
     /// Pick the right backend for the current OS.
     Auto,
-    /// Disabled — `client_for` returns `None`.
+    /// Disabled — `client_for` returns [`Unavailable::Disabled`].
     None,
     /// Linux MPRIS (native zbus, `playerctl` fallback).
     Mpris,
@@ -316,29 +318,91 @@ impl MpdPassword {
 /// or the multi-source [`aggregate::Aggregate`]).
 pub type MediaClient = Box<dyn MediaBackend>;
 
-/// Resolve the media backend from lowered config. `None` when disabled, the
-/// backend is `none`/unimplemented, the chosen backend isn't available on this
-/// OS, or its transport can't be reached (the caller then shows nothing — the
-/// feature is silently inert).
-pub async fn client_for(mut opts: ResolveOpts) -> Option<MediaClient> {
+/// Why a requested media backend could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unavailable {
+    /// Media was explicitly disabled in configuration.
+    Disabled,
+    /// The selected provider is reserved but has no implementation.
+    Reserved(BackendKind),
+    /// The selected provider does not run on this operating system.
+    NotOnThisPlatform(BackendKind),
+    /// The selected provider is supported here but no source is reachable.
+    NoSource(BackendKind),
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("media is disabled ([media] backend = \"none\")"),
+            Self::Reserved(kind) => write!(
+                f,
+                "the {} media backend is reserved and not implemented",
+                kind_name(*kind)
+            ),
+            Self::NotOnThisPlatform(kind) => write!(
+                f,
+                "the {} media backend is not available on this OS",
+                kind_name(*kind)
+            ),
+            Self::NoSource(kind) => write!(f, "no reachable {} media source", kind_name(*kind)),
+        }
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+fn kind_name(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Auto => "auto",
+        BackendKind::None => "none",
+        BackendKind::Mpris => "mpris",
+        BackendKind::Mpv => "mpv",
+        BackendKind::Mpd => "mpd",
+        BackendKind::Smtc => "smtc",
+        BackendKind::AppleScript => "applescript",
+        BackendKind::Spotify => "spotify",
+        BackendKind::Jellyfin => "jellyfin",
+    }
+}
+
+/// Resolve the media backend from lowered config, preserving why resolution failed.
+pub async fn client_for(mut opts: ResolveOpts) -> Result<MediaClient, Unavailable> {
+    let kind = opts.backend;
+    if kind == BackendKind::None {
+        return Err(Unavailable::Disabled);
+    }
+    if matches!(kind, BackendKind::Spotify | BackendKind::Jellyfin) {
+        match kind {
+            BackendKind::Spotify => {
+                tracing::debug!(target: "thegn::media", "spotify backend reserved; use MPRIS/SMTC/AppleScript for desktop control")
+            }
+            BackendKind::Jellyfin => {
+                tracing::debug!(target: "thegn::media", "jellyfin backend not implemented yet")
+            }
+            _ => {}
+        }
+        return Err(Unavailable::Reserved(kind));
+    }
+    if (kind == BackendKind::Mpris && !cfg!(target_os = "linux"))
+        || (kind == BackendKind::Smtc && !cfg!(windows))
+        || (kind == BackendKind::AppleScript && !cfg!(target_os = "macos"))
+    {
+        return Err(Unavailable::NotOnThisPlatform(kind));
+    }
     let client: Option<MediaClient> = match opts.backend {
-        BackendKind::None => None,
+        BackendKind::None => unreachable!("disabled handled above"),
         BackendKind::Auto => auto_client(&mut opts).await,
         BackendKind::Mpris => mpris_client(&opts).await,
         BackendKind::Mpv => mpv_client(&opts),
         BackendKind::Mpd => mpd_client(&mut opts).await,
         BackendKind::Smtc => smtc_client(&opts).await,
         BackendKind::AppleScript => applescript_client(&opts),
-        BackendKind::Spotify => {
-            tracing::debug!(target: "thegn::media", "spotify backend reserved; use MPRIS/SMTC/AppleScript for desktop control");
-            None
-        }
-        BackendKind::Jellyfin => {
-            tracing::debug!(target: "thegn::media", "jellyfin backend not implemented yet");
-            None
-        }
+        BackendKind::Spotify | BackendKind::Jellyfin => unreachable!("reserved handled above"),
     };
-    client.map(|client| Box::new(admit::Admitted(client)) as MediaClient)
+    client
+        .map(|client| Box::new(admit::Admitted(client)) as MediaClient)
+        .ok_or(Unavailable::NoSource(kind))
 }
 
 /// Pick the native backend for the current OS. On Linux this composes *every*
@@ -513,3 +577,56 @@ mod platform_ratchet_tests;
 mod ratchet;
 #[cfg(test)]
 mod spawn_ratchet_tests;
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::{BackendKind, ResolveOpts, Unavailable, client_for};
+
+    fn opts(backend: BackendKind) -> ResolveOpts {
+        ResolveOpts {
+            backend,
+            players_priority: Vec::new(),
+            mpv_socket: String::new(),
+            mpd_socket: String::new(),
+            mpd_password: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_client_for_none_is_disabled() {
+        assert!(matches!(
+            client_for(opts(BackendKind::None)).await,
+            Err(Unavailable::Disabled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_client_for_reserved_kinds() {
+        for kind in [BackendKind::Spotify, BackendKind::Jellyfin] {
+            assert!(
+                matches!(client_for(opts(kind)).await, Err(Unavailable::Reserved(found)) if found == kind)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_client_for_wrong_os_kind() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        assert!(matches!(
+            client_for(opts(BackendKind::Smtc)).await,
+            Err(Unavailable::NotOnThisPlatform(BackendKind::Smtc))
+        ));
+    }
+
+    #[test]
+    fn typed_unavailable_display_names_the_reason() {
+        assert!(Unavailable::Disabled.to_string().contains("disabled"));
+        assert!(
+            Unavailable::NoSource(BackendKind::Mpd)
+                .to_string()
+                .contains("mpd")
+        );
+    }
+}
