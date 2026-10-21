@@ -197,8 +197,11 @@ fn add(
     image: Option<&str>,
     replace: bool,
 ) -> Result<()> {
-    use thegn_core::host_config::{InstallConsent, parse_host_target};
+    use thegn_core::host_config::{InstallConsent, parse_host_target, validate_host_alias};
     let (derived, mut hc) = parse_host_target(target, user).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(name) = name {
+        validate_host_alias(name).map_err(anyhow::Error::msg)?;
+    }
     let db = Db::open()?;
     let db_defs = db.host_defs()?;
     let name = resolve_add_name(name, &derived, &hc, replace, &db_defs, &|candidate| {
@@ -666,7 +669,7 @@ fn promote_candidate(
     name_override: Option<&str>,
     install: &str,
 ) -> Result<()> {
-    use thegn_core::host_config::InstallConsent;
+    use thegn_core::host_config::{InstallConsent, validate_host_alias};
     let cand = candidates.iter().find(|c| c.matches(sel)).ok_or_else(|| {
         anyhow::anyhow!(
             "no discovered candidate matching {sel:?} \
@@ -676,6 +679,9 @@ fn promote_candidate(
     let (derived, mut hc) = cand.to_host_config();
     hc.install_runtime =
         InstallConsent::from_str_validated(install).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(name) = name_override {
+        validate_host_alias(name).map_err(anyhow::Error::msg)?;
+    }
     let db = Db::open()?;
     let db_defs = db.host_defs()?;
     let name = resolve_add_name(
