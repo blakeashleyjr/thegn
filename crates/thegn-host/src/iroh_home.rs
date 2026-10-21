@@ -22,6 +22,7 @@ const SECRET_ACCOUNT: &str = "iroh-home-node";
 
 static HOME: OnceLock<Arc<IrohHome>> = OnceLock::new();
 static STARTING: AtomicBool = AtomicBool::new(false);
+static WARNED_NOT_BUILT: AtomicBool = AtomicBool::new(false);
 
 /// Whether the iroh call-home reach is enabled. Opt-in (`THEGN_IROH=1`) until
 /// a config field replaces the env toggle.
@@ -134,8 +135,7 @@ pub(crate) fn injection_for(sandbox: &str) -> Option<thegn_svc::fly::IrohInject>
         return None;
     }
     if !thegn_svc::iroh_reach::BUILT {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::SeqCst) {
+        if !WARNED_NOT_BUILT.swap(true, Ordering::SeqCst) {
             thegn_core::msg::warn(
                 "THEGN_IROH is set but this thegn was built without the `iroh` feature; using the ssh path",
             );
@@ -173,5 +173,6 @@ mod tests {
         }
         let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_IROH", "1")]);
         assert!(injection_for("wt").is_none());
+        assert!(WARNED_NOT_BUILT.load(Ordering::SeqCst));
     }
 }

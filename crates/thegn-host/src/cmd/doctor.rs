@@ -5756,14 +5756,12 @@ args = ["--verbose"]
     #[test]
     fn iroh_reach_json_reports_the_build() {
         let report = channel_json();
-        assert_eq!(
-            report["iroh_reach"],
-            if thegn_svc::iroh_reach::BUILT {
-                "built"
-            } else {
-                "not built"
-            }
-        );
+        let expected = if thegn_svc::iroh_reach::BUILT {
+            "built"
+        } else {
+            "not built"
+        };
+        assert_eq!(report["iroh_reach"], expected);
     }
 
     #[test]
