@@ -580,12 +580,13 @@ impl MediaBackend for MprisZbus {
             })?;
             let cur = Result::ok(bool::try_from(read));
             let next = toggled_fullscreen(cur)?;
+            let proxy = &proxy;
             write_fullscreen_if_same_owner(
                 &owner,
                 self.owner_of(&bus).await,
                 iface,
                 next,
-                |iface, value| async {
+                |iface, value| async move {
                     proxy
                         .set(iface, "Fullscreen", Value::Bool(value))
                         .await
