@@ -1552,8 +1552,21 @@ mod tests {
             tmp.path().join("state"),
         );
 
-        assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded)
-            if loaded.iter().any(|state| state.writer.is_none())));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let loaded = loop {
+            assert!(
+                Instant::now() < deadline,
+                "startup did not publish Loaded before timeout"
+            );
+            match rx.try_recv() {
+                Ok(PluginMsg::Loaded(loaded)) => break loaded,
+                Ok(_) => {}
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        assert!(loaded.iter().any(|state| state.writer.is_none()));
         assert!(lock(&sessions).is_empty());
     }
 
