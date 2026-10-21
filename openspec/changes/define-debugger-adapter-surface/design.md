@@ -8,6 +8,12 @@ kind and DAP as reserved vocabulary; plugin negotiation remains unsupported
 until a runtime can bridge the seam. Defer DAP transport and the plugin debugger
 UI to later slices.
 
+`DebugAdapterCaps::breakpoints`, `stepping`, and `variables` are placeholders
+for slice-b operations; this slice defines no corresponding trait operations.
+When those operations are added, each capability bit must track whether its
+optional operation is available. `launch` is a required adapter operation, and
+`attach` is an optional operation.
+
 ## Decisions to separate
 
 1. **Launch adapters:** pure argv planning plus foreground exec can generalize
