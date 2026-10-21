@@ -6273,7 +6273,7 @@ fn compose_corner(
     let outer = prospective_corner_rect(pin, cols, rows);
     // The corner card sits over the center band, so a focused center pane whose
     // caret lands under it would otherwise blink through the card.
-    crate::caret::cover(outer);
+    crate::caret::cover_corner(outer);
     crate::compositor::compose_pane(scratch, p.emulator(), crate::pins::inset1(outer));
     let border = if focused {
         crate::chrome::col(crate::chrome::S::Focus)
@@ -9194,10 +9194,12 @@ async fn event_loop<T: Terminal>(
         let corner_visible = corner.is_some()
             && corner_kitty
             && !corner_occluded
-            && crate::caret::no_covers()
-            && app_host.active_tile_mut().is_none()
-            && mouse_sel.is_none()
-            && replay.is_none();
+            && !crate::preview_retry::corner_occluded(
+                !crate::caret::no_popup_covers(),
+                app_host.active_tile_mut().is_some(),
+                mouse_sel.is_some(),
+                replay.is_some(),
+            );
         pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
         pending_clipboard_oob.retry(|bytes| writer.try_submit_oob(bytes));
         pending_bell.retry(|bytes| writer.try_submit_oob(bytes));
@@ -16294,7 +16296,12 @@ async fn event_loop<T: Terminal>(
             // blank the video on occlusion, retaining only the latest complete
             // child update for replay after the overlay clears.
             if corner.is_some() && corner_kitty {
-                let occluded_now = overlays.any();
+                let occluded_now = crate::preview_retry::corner_occluded(
+                    !crate::caret::no_popup_covers(),
+                    app_tile_active,
+                    mouse_sel.is_some(),
+                    replay.is_some(),
+                );
                 if occluded_now && !corner_occluded {
                     pending_corner_oob.require_delete();
                 }
