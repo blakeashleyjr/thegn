@@ -338,43 +338,46 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
     let mut active = false;
 
     loop {
-        let Some(client) = crate::media_secret::client_for(&cfg).await else {
-            // No backend yet (bus down, playerctl absent). Retry with backoff so
-            // media appears once the transport comes up, rather than never.
-            tracing::debug!(target: "thegn::media", "media backend unavailable; retrying");
-            if let Some(snapshot) = state
-                .freshness
-                .on_failure(tokio::time::Instant::now(), state.grace)
-            {
-                active = shows_badge(&snapshot);
-                let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
-                if should_deliver(&state.last_sent, state.last_epoch, epoch, &snapshot) {
-                    let accepted = match offer(
-                        &tx,
-                        MediaSnapshotDelivery {
-                            generation,
-                            snapshot: snapshot.clone(),
-                        },
-                    ) {
-                        Ok(accepted) => accepted,
-                        Err(()) => return,
-                    };
-                    if accepted {
-                        if let Err(error) = waker.wake() {
-                            tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
+        let client = match crate::media_secret::client_for(&cfg).await {
+            Ok(client) => client,
+            Err(error) => {
+                // No backend yet (bus down, playerctl absent). Retry with backoff so
+                // media appears once the transport comes up, rather than never.
+                tracing::debug!(target: "thegn::media", %error, "media backend unavailable; retrying");
+                if let Some(snapshot) = state
+                    .freshness
+                    .on_failure(tokio::time::Instant::now(), state.grace)
+                {
+                    active = shows_badge(&snapshot);
+                    let epoch = crate::media_ctl::MEDIA_DELIVERY_EPOCH.load(Ordering::Acquire);
+                    if should_deliver(&state.last_sent, state.last_epoch, epoch, &snapshot) {
+                        let accepted = match offer(
+                            &tx,
+                            MediaSnapshotDelivery {
+                                generation,
+                                snapshot: snapshot.clone(),
+                            },
+                        ) {
+                            Ok(accepted) => accepted,
+                            Err(()) => return,
+                        };
+                        if accepted {
+                            if let Err(error) = waker.wake() {
+                                tracing::debug!(target: "thegn::media", %error, "media watcher wake failed");
+                            }
+                            state.last_sent = snapshot;
+                            state.last_epoch = epoch;
                         }
-                        state.last_sent = snapshot;
-                        state.last_epoch = epoch;
                     }
                 }
+                let retry_after = state
+                    .freshness
+                    .until_expiry(tokio::time::Instant::now(), state.grace)
+                    .map_or(backoff, |remaining| backoff.min(remaining));
+                tokio::time::sleep(retry_after).await;
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
             }
-            let retry_after = state
-                .freshness
-                .until_expiry(tokio::time::Instant::now(), state.grace)
-                .map_or(backoff, |remaining| backoff.min(remaining));
-            tokio::time::sleep(retry_after).await;
-            backoff = (backoff * 2).min(max_backoff);
-            continue;
         };
         // Refresh after resolution; retain `active` across failed resolutions
         // so a prior generation's badge follows the same stale-grace policy.
@@ -383,65 +386,104 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
             None => return, // receiver gone
         };
 
-        if let Some(mut watch) = client.watch().await {
-            let connected_at = tokio::time::Instant::now();
-            // Native push path. Re-snapshot on each D-Bus signal; additionally,
-            // *while no track is displayed*, run a slow safety poll so a failed
-            // initial read self-heals. Once a badge shows, drop back to
-            // signal-only (no idle polling during playback).
-            let mut safety = interval(period);
-            safety.tick().await; // consume the immediate first tick
-            let stream_ended = loop {
-                let changed = if active {
-                    if let Some(delay) = state
-                        .freshness
-                        .until_expiry(tokio::time::Instant::now(), state.grace)
-                    {
-                        tokio::select! {
-                            changed = watch.changed() => changed,
-                            _ = tokio::time::sleep(delay) => true,
+        match client.watch().await {
+            Ok(Some(mut watch)) => {
+                let connected_at = tokio::time::Instant::now();
+                // Native push path. Re-snapshot on each D-Bus signal; additionally,
+                // *while no track is displayed*, run a slow safety poll so a failed
+                // initial read self-heals. Once a badge shows, drop back to
+                // signal-only (no idle polling during playback).
+                let mut safety = interval(period);
+                safety.tick().await; // consume the immediate first tick
+                let stream_ended = loop {
+                    let changed = if active {
+                        if let Some(delay) = state
+                            .freshness
+                            .until_expiry(tokio::time::Instant::now(), state.grace)
+                        {
+                            tokio::select! {
+                                changed = watch.changed() => changed,
+                                _ = tokio::time::sleep(delay) => true,
+                            }
+                        } else {
+                            watch.changed().await
                         }
                     } else {
-                        watch.changed().await
+                        tokio::select! {
+                            c = watch.changed() => c,
+                            _ = safety.tick() => true,
+                        }
+                    };
+                    if !changed {
+                        break true; // signal stream ended → reconnect
                     }
-                } else {
-                    tokio::select! {
-                        c = watch.changed() => c,
-                        _ = safety.tick() => true,
+                    match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await
+                    {
+                        Some(a) => {
+                            note_cleared(active, a);
+                            active = a;
+                        }
+                        None => return, // receiver gone
                     }
                 };
-                if !changed {
-                    break true; // signal stream ended → reconnect
-                }
-                match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await {
-                    Some(a) => {
-                        note_cleared(active, a);
-                        active = a;
-                    }
-                    None => return, // receiver gone
-                }
-            };
-            if stream_ended {
-                tracing::debug!(target: "thegn::media", "MPRIS signal stream ended; reconnecting");
-                backoff = backoff_after_stream(backoff, connected_at.elapsed());
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
-                continue;
-            }
-        } else {
-            // Poll path: backends without a signal stream (mpv / playerctl).
-            let mut ticker = interval(period);
-            ticker.tick().await; // consume the immediate first tick
-            loop {
-                ticker.tick().await;
-                match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await {
-                    Some(a) => {
-                        note_cleared(active, a);
-                        active = a;
-                    }
-                    None => return, // receiver gone
+                if stream_ended {
+                    tracing::debug!(target: "thegn::media", "MPRIS signal stream ended; reconnecting");
+                    backoff = backoff_after_stream(backoff, connected_at.elapsed());
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                    continue;
                 }
             }
+            Ok(None) => {
+                poll_media(
+                    &client,
+                    generation,
+                    &tx,
+                    &waker,
+                    &mut active,
+                    &mut state,
+                    period,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::media", %error, "media push watcher failed to start; polling");
+                poll_media(
+                    &client,
+                    generation,
+                    &tx,
+                    &waker,
+                    &mut active,
+                    &mut state,
+                    period,
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn poll_media(
+    client: &thegn_media::MediaClient,
+    generation: u64,
+    tx: &SnapshotSender,
+    waker: &TerminalWaker,
+    active: &mut bool,
+    state: &mut WatchState,
+    period: std::time::Duration,
+) {
+    let mut ticker = interval(period);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match push_snapshot(client, generation, tx, waker, *active, state).await {
+            Some(next_active) => {
+                note_cleared(*active, next_active);
+                *active = next_active;
+            }
+            None => return,
         }
     }
 }

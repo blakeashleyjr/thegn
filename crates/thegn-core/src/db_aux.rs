@@ -34,6 +34,14 @@ mod merge_status_tests;
 #[path = "db_merge_candidate_tests.rs"]
 mod merge_candidate_tests;
 
+fn ensure_known_merge_status(status: &str) -> Result<()> {
+    anyhow::ensure!(
+        MqStatus::parse(status).is_some(),
+        "unknown merge-queue status {status:?}: not in the canonical MqStatus vocabulary"
+    );
+    Ok(())
+}
+
 fn merge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueRow> {
     Ok(MergeQueueRow {
         worktree: row.get(0)?,
@@ -691,6 +699,7 @@ impl WorktreeAuxStore for Db {
         status: &str,
         fields: &MergeStatusFields,
     ) -> Result<()> {
+        ensure_known_merge_status(status)?;
         anyhow::ensure!(
             status != "landed"
                 || fields
@@ -734,6 +743,7 @@ impl WorktreeAuxStore for Db {
         conflict_paths: Option<&str>,
         error_detail: Option<&str>,
     ) -> Result<()> {
+        ensure_known_merge_status(status)?;
         let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
         if status == "landed" {
             anyhow::ensure!(
@@ -1073,6 +1083,7 @@ impl WorktreeAuxStore for Db {
         status: &str,
         fields: &MergeStatusFields,
     ) -> Result<MergeClaim> {
+        ensure_known_merge_status(status)?;
         anyhow::ensure!(
             status != "landed"
                 || fields

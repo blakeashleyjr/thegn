@@ -1195,6 +1195,36 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    pub async fn dispatch_report(
+        &self,
+        id: i64,
+        req: &super::DispatchWorkerWriteReq,
+    ) -> Result<super::DispatchReportReply> {
+        let value = self
+            .request(
+                "POST",
+                &format!("/v1/dispatches/{id}/report"),
+                Some(serde_json::to_value(req)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn dispatch_note(
+        &self,
+        id: i64,
+        req: &super::DispatchWorkerWriteReq,
+    ) -> Result<super::DispatchNoteReply> {
+        let value = self
+            .request(
+                "POST",
+                &format!("/v1/dispatches/{id}/note"),
+                Some(serde_json::to_value(req)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     pub async fn pair(&self, code: &str, label: &str) -> Result<Value> {
         self.request(
             "POST",

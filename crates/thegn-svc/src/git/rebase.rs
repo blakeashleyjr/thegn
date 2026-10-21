@@ -379,8 +379,8 @@ fn todo_for(loc: &GitLoc, base: &str) -> Result<Vec<TodoEntry>> {
     } else {
         format!("{base}..HEAD")
     };
-    let out = run_read(loc, &["log", "--reverse", "--format=%x1f%H%x1f%s", &range])?;
-    let todo = todo_from_log(&out);
+    let out = run_read(loc, &todo_log_args(&range, !loc.is_remote()))?;
+    let todo = todo_from_log(&out)?;
     if todo.is_empty() {
         bail!("no commits to rebase");
     }
@@ -391,6 +391,15 @@ fn todo_for(loc: &GitLoc, base: &str) -> Result<Vec<TodoEntry>> {
         bail!("range contains merge commits — rebase them manually");
     }
     Ok(todo)
+}
+
+fn todo_log_args(range: &str, local: bool) -> Vec<&str> {
+    let mut args = vec!["log", "--reverse"];
+    if local {
+        args.extend(["--no-show-signature", "--color=never"]);
+    }
+    args.extend(["--format=%x1f%H%x1f%s", range]);
+    args
 }
 
 pub trait RebaseOps: GitBackend {
@@ -842,6 +851,25 @@ mod tests {
 
     fn opts() -> RebaseOpts {
         RebaseOpts::default()
+    }
+
+    #[test]
+    fn rebase_todo_log_argv_disables_signature_and_color_output() {
+        assert_eq!(
+            todo_log_args("base..HEAD", true),
+            vec![
+                "log",
+                "--reverse",
+                "--no-show-signature",
+                "--color=never",
+                "--format=%x1f%H%x1f%s",
+                "base..HEAD",
+            ]
+        );
+        assert_eq!(
+            todo_log_args("base..HEAD", false),
+            vec!["log", "--reverse", "--format=%x1f%H%x1f%s", "base..HEAD",]
+        );
     }
 
     #[test]

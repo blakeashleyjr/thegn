@@ -476,8 +476,8 @@ impl MediaBackend for MpvIpc {
     }
 
     /// One mpv instance per socket; no push watcher (the host polls).
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
-        Box::pin(async { vec!["mpv".to_string()] })
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+        Box::pin(async { Ok(vec!["mpv".to_string()]) })
     }
 
     fn caps(&self) -> MediaCaps {

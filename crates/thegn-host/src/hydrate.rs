@@ -3130,18 +3130,18 @@ pub(crate) fn build_panel(
         });
         let h_status = s.spawn(|| {
             if let Some(c) = &cached_reads {
-                return c.status.clone();
+                return Ok(c.status.clone());
             }
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             let status = crate::git_handle::get().status(&loc);
             if status.is_err() {
                 reads_ok.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            let mut status = status.unwrap_or_default();
+            let mut status = status.map_err(|_| ())?;
             if matches!(loc, GitLoc::Local(_)) {
                 status.retain(|entry| !crate::git_watch::is_panel_excluded_rel(&entry.path));
             }
-            status
+            Ok(status)
         });
         let h_ahead = s.spawn(|| {
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
@@ -3158,20 +3158,19 @@ pub(crate) fn build_panel(
         let h_merge = s.spawn(|| {
             let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             let merge = crate::git_handle::get().merge_state(&loc);
-            let incoming = merge
-                .as_ref()
-                .ok()
-                .cloned()
-                .flatten()
-                .map(|mi| {
-                    crate::git_handle::get()
-                        .diff_files(&loc, &format!("HEAD...{}", mi.kind.head_ref()))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|d| d.path)
-                        .collect::<std::collections::HashSet<String>>()
-                })
-                .unwrap_or_default();
+            let incoming = match &merge {
+                Ok(Some(mi)) => crate::git_handle::get()
+                    .diff_files(&loc, &format!("HEAD...{}", mi.kind.head_ref()))
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| entry.path)
+                            .collect::<std::collections::HashSet<String>>()
+                    })
+                    .map_err(|_| ()),
+                Ok(None) => Ok(std::collections::HashSet::new()),
+                Err(_) => Err(()),
+            };
             (merge.map_err(|_| ()), incoming)
         });
         let h_stash_count = s.spawn(|| {
@@ -3189,7 +3188,7 @@ pub(crate) fn build_panel(
                 let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
                 crate::git_handle::get()
                     .log_graph(&loc, log_n)
-                    .unwrap_or_default()
+                    .map_err(|_| ())
             })
         });
         // Only re-run the subprocess on a repo-cache miss/stale; a warm entry
@@ -3247,7 +3246,7 @@ pub(crate) fn build_panel(
             h_ahead.join().unwrap(),
             merge_res,
             h_stash_count.join().unwrap(),
-            h_log.map(|h| h.join().unwrap()).unwrap_or_default(),
+            h_log.map(|h| h.join().unwrap()),
             h_branches.map(|h| h.join().unwrap()),
             h_stashes
                 .map(|h| h.join().unwrap())
@@ -3273,7 +3272,10 @@ pub(crate) fn build_panel(
         crate::panel_git_cache::GitReads {
             diff_entries: diff_entries.clone(),
             entities: entities.clone(),
-            status: status.clone(),
+            status: match &status {
+                Ok(rows) => rows.clone(),
+                Err(()) => Vec::new(),
+            },
             stash_count: None,
         },
         stash_count,
@@ -3305,6 +3307,7 @@ pub(crate) fn build_panel(
     // would fall back to A's branch + ahead/behind).
     let (branch, ahead_behind, merge_info) =
         crate::panel_header_cache::merge_header(&cache_key, branch, ahead_behind, merge_info);
+    let lists = crate::panel_header_cache::merge_lists(&cache_key, status, log, incoming);
     let mut panel = crate::panel::PanelData {
         branch,
         ..Default::default()
@@ -3445,14 +3448,14 @@ pub(crate) fn build_panel(
         Some(db),
     ));
 
-    panel.files = panel_diff_files(&diff_entries, &status);
+    panel.files = panel_diff_files(&diff_entries, &lists.status);
 
     // Changes section: porcelain status joined with the diffstat, with
     // merge-incoming files tagged for the "incoming from <onto>" grouping.
     panel.changes = change_rows(
-        &status,
+        &lists.status,
         diff_ok.then_some(diff_entries.as_slice()),
-        &incoming,
+        &lists.incoming,
     );
     panel.dir_changes = crate::panel::dir_change_counts(&panel.changes);
     // Semantic git layer (items 311/313/317): entity-level view of the changes.
@@ -3465,7 +3468,7 @@ pub(crate) fn build_panel(
 
     // Header zone: upstream divergence + merge-in-progress banner.
     panel.ahead_behind = ahead_behind;
-    let unresolved = thegn_svc::git::conflict_count(&status);
+    let unresolved = thegn_svc::git::conflict_count(&lists.status);
     // Host-path key (never `loc.path()` — see `worktree_cache_key`): two
     // provider worktrees sharing `/workspace` cross-contaminated each other's
     // "N/M resolved" merge banner through this row.
@@ -3477,7 +3480,10 @@ pub(crate) fn build_panel(
         total,
     });
     panel.stash_count = stash_count;
-    panel.log = log;
+    panel.status_unavailable = lists.status_unavailable;
+    panel.log = lists.log;
+    panel.log_unavailable = lists.log_unavailable;
+    panel.incoming_unavailable = lists.incoming_unavailable;
 
     let commits_open = hints.wants_commits();
     if commits_open || hints.warm_git_summaries {

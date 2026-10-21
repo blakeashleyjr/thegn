@@ -89,6 +89,8 @@ pub(crate) struct DaemonService {
     /// Empty after a crash, so the reaper can distinguish active slow opens
     /// from reservations abandoned by the previous process.
     pub spawning_relaunches: Arc<Mutex<std::collections::HashSet<i64>>>,
+    /// Stage launch ids are replayable only for this daemon's lifetime (THE-272).
+    pub launches: Mutex<super::stage_launch::LaunchRegistry>,
     pub events: broadcast::Sender<Arc<EventFrame>>,
     pub db: SharedDb,
     /// `[daemon] lease_grace_secs`, in ms.
@@ -283,7 +285,11 @@ pub(crate) fn session_identity_env(
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = env
         .iter()
-        .filter(|(k, _)| k != "THEGN_SESSION_ID" && k != "THEGN_CONTROL_SOCKET")
+        .filter(|(k, _)| {
+            k != "THEGN_SESSION_ID"
+                && k != "THEGN_CONTROL_SOCKET"
+                && k != super::stage_launch::STAGE_LAUNCH_ENV
+        })
         .cloned()
         .collect();
     out.push(("THEGN_SESSION_ID".into(), id.to_string()));
@@ -951,6 +957,47 @@ impl ControlApi for DaemonService {
             )
             .map_err(|error| ControlError::Conflict(error.to_string()))?;
 
+            let launch_guard = match super::stage_launch::launch_id_of(&spec) {
+                Some(Err(reason)) => {
+                    return Err(ControlError::InvalidArgument(format!(
+                        "invalid stage launch id: {reason}"
+                    )));
+                }
+                Some(Ok(id)) => {
+                    let admit = self
+                        .launches
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .begin(
+                            &id,
+                            dispatch_row_of(&spec).and_then(Result::ok),
+                            spec.worktree.as_deref(),
+                            thegn_core::util::now_ms(),
+                        );
+                    match admit {
+                        super::stage_launch::LaunchAdmit::Fresh => {
+                            Some(super::stage_launch::LaunchGuard::new(&self.launches, &id))
+                        }
+                        super::stage_launch::LaunchAdmit::Replay(info) => return Ok(info),
+                        super::stage_launch::LaunchAdmit::Refused(message) => {
+                            return Err(ControlError::Conflict(message));
+                        }
+                        super::stage_launch::LaunchAdmit::StillOpening => {
+                            return Err(ControlError::Conflict(format!(
+                                "stage launch {id} is still opening"
+                            )));
+                        }
+                        super::stage_launch::LaunchAdmit::Mismatch => {
+                            return Err(ControlError::Conflict(
+                                "stage launch id reused for a different dispatch row or worktree"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            };
+
             // An agent launch resolves through the same pipeline the wizard
             // uses — sandbox, credentials, cap and all — so what runs here is
             // identical to what a TUI-launched agent runs. Blocking work
@@ -1200,6 +1247,9 @@ impl ControlApi for DaemonService {
                 {
                     tracing::warn!(target: "thegn::daemon", "adopt intent for {id} failed: {e}");
                 }
+            }
+            if let Some(guard) = launch_guard {
+                guard.commit(&info);
             }
             Ok(info)
         })
@@ -2493,6 +2543,119 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn dispatch_report(
+        &self,
+        id: i64,
+        req: thegn_svc::control::DispatchWorkerWriteReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::DispatchReportReply>> {
+        let secret = match thegn_core::parse_capability_token(&req.token) {
+            Ok(secret) => secret,
+            Err(refusal) => {
+                tracing::warn!(target: "thegn::dispatch", dispatch_id = id, refusal = refusal.kind(), "worker dispatch capability refused");
+                return Box::pin(async move {
+                    Err(ControlError::FailedPrecondition(format!(
+                        "dispatch capability refused: {}",
+                        refusal.kind()
+                    )))
+                });
+            }
+        };
+        if let Err(error) = thegn_core::pipeline_report::report_text(&req.text) {
+            return Box::pin(async move { Err(ControlError::InvalidArgument(error.to_string())) });
+        }
+        Box::pin(async move {
+            let outcome = self
+                .with_db(move |db| {
+                    let verified = db.verify_dispatch_capability(
+                        &secret,
+                        id,
+                        thegn_core::CapabilityVerb::Report,
+                        thegn_core::util::now_ms(),
+                    )?;
+                    match verified {
+                        Ok(_grant) => {}
+                        Err(refusal) => return Ok(Err(refusal)),
+                    }
+                    let recorded = crate::cmd::dispatch::record_report(db, id, &req.text)?;
+                    Ok(Ok(thegn_svc::control::DispatchReportReply {
+                        id,
+                        bytes: recorded.validated.len(),
+                        pass_without_gate_evidence: recorded.ungated,
+                    }))
+                })
+                .await?;
+            outcome.map_err(|refusal| {
+                tracing::warn!(target: "thegn::dispatch", dispatch_id = id, refusal = refusal.kind(), "worker dispatch capability refused");
+                if refusal == thegn_core::CapabilityRefusal::RowMissing {
+                    ControlError::NotFound(format!("dispatch {id} does not exist"))
+                } else {
+                    ControlError::FailedPrecondition(format!("dispatch capability refused: {}", refusal.kind()))
+                }
+            })
+        })
+    }
+
+    fn dispatch_note(
+        &self,
+        id: i64,
+        req: thegn_svc::control::DispatchWorkerWriteReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::DispatchNoteReply>> {
+        let secret = match thegn_core::parse_capability_token(&req.token) {
+            Ok(secret) => secret,
+            Err(refusal) => {
+                tracing::warn!(target: "thegn::dispatch", dispatch_id = id, refusal = refusal.kind(), "worker dispatch capability refused");
+                return Box::pin(async move {
+                    Err(ControlError::FailedPrecondition(format!(
+                        "dispatch capability refused: {}",
+                        refusal.kind()
+                    )))
+                });
+            }
+        };
+        if let Err(error) = thegn_core::pipeline_report::note_text(&req.text) {
+            return Box::pin(async move { Err(ControlError::InvalidArgument(error.to_string())) });
+        }
+        Box::pin(async move {
+            let outcome = self
+                .with_db(move |db| {
+                    let verified = db.verify_dispatch_capability(
+                        &secret,
+                        id,
+                        thegn_core::CapabilityVerb::Note,
+                        thegn_core::util::now_ms(),
+                    )?;
+                    match verified {
+                        Err(refusal) => Ok(Err(refusal)),
+                        Ok(_grant) => match db.append_dispatch_note_record(id, &req.text) {
+                            Ok(note) => Ok(Ok(Ok(thegn_svc::control::DispatchNoteReply {
+                                id,
+                                note_id: note.id,
+                                created_at_ms: note.created_at_ms,
+                            }))),
+                            Err(error)
+                                if error
+                                    .downcast_ref::<thegn_core::db::DispatchNoteQuotaExceeded>()
+                                    .is_some() =>
+                            {
+                                Ok(Ok(Err(error.to_string())))
+                            }
+                            Err(error) => Err(error),
+                        },
+                    }
+                })
+                .await?;
+            outcome.map_err(|refusal| {
+                tracing::warn!(target: "thegn::dispatch", dispatch_id = id, refusal = refusal.kind(), "worker dispatch capability refused");
+                if refusal == thegn_core::CapabilityRefusal::RowMissing {
+                    ControlError::NotFound(format!("dispatch {id} does not exist"))
+                } else {
+                    ControlError::FailedPrecondition(format!("dispatch capability refused: {}", refusal.kind()))
+                }
+            })?
+            .map_err(ControlError::ResourceExhausted)
+        })
+    }
+
     fn worktree_create(
         &self,
         req: thegn_svc::control::WorktreeCreateReq,
@@ -3600,6 +3763,7 @@ mod tests {
             ))),
             native_ids: Mutex::new(HashMap::new()),
             spawning_relaunches: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            launches: Mutex::new(crate::daemon::stage_launch::LaunchRegistry::default()),
             events,
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
@@ -3833,6 +3997,119 @@ mod tests {
             .expect("tracker row retains best-effort open behavior");
         assert_eq!(svc.list_sessions().await.expect("list sessions").len(), 1);
         svc.kill(&opened.id).await.expect("stop tracker worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_retry_after_lost_response_returns_the_same_session() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .expect("prepare pipeline row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "a".repeat(32),
+        ));
+
+        let first = svc.open(spec.clone()).await.expect("first launch");
+        let first_id = first.id.clone();
+        drop(first);
+        let retry = svc.open(spec).await.expect("idempotent retry");
+        assert_eq!(retry.id, first_id);
+        let live = wait_for_live_sessions(&svc, |sessions| sessions.len() == 1).await;
+        assert_eq!(live[0].id, first_id);
+        svc.kill(&first_id).await.expect("stop worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_refusal_is_replayed_without_a_second_spawn() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(move |db| {
+                let row = staged_dispatch(db, Some("code"));
+                db.update_dispatch_status(row, thegn_core::issue::AgentDispatchStatus::Failed)?;
+                Ok(row)
+            })
+            .await
+            .expect("prepare failed stage row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "b".repeat(32),
+        ));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                svc.open(spec.clone()).await,
+                Err(ControlError::Conflict(_))
+            ));
+        }
+        let sessions = svc.list_sessions().await.expect("list sessions");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the refusal replay must not spawn a second worker"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_id_reused_for_another_row_is_refused() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let (first_row, second_row) = svc
+            .with_db(|db| {
+                Ok((
+                    staged_dispatch(db, Some("code")),
+                    staged_dispatch(db, Some("code")),
+                ))
+            })
+            .await
+            .expect("prepare pipeline rows");
+        let mut first_spec = dispatch_open_spec(first_row);
+        first_spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "c".repeat(32),
+        ));
+        let first = svc.open(first_spec).await.expect("first launch");
+        let mut second_spec = dispatch_open_spec(second_row);
+        second_spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "c".repeat(32),
+        ));
+        assert!(matches!(
+            svc.open(second_spec).await,
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(
+            svc.list_sessions().await.expect("list sessions").len(),
+            1,
+            "reused launch id must not spawn another worker"
+        );
+        svc.kill(&first.id).await.expect("stop worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_malformed_id_is_refused_before_spawn() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .expect("prepare pipeline row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "not-hex".into(),
+        ));
+
+        assert!(matches!(
+            svc.open(spec).await,
+            Err(ControlError::InvalidArgument(_))
+        ));
+        assert!(svc.list_sessions().await.expect("list sessions").is_empty());
     }
 
     fn folder_req(
@@ -4743,6 +5020,245 @@ mod tests {
             })),
             ControlError::FailedPrecondition(_)
         ));
+    }
+
+    async fn worker_capability_fixture(svc: &DaemonService) -> (i64, String) {
+        svc.with_db(|db| {
+            let row = staged_dispatch(db, Some("code"));
+            assert!(db.bind_dispatch_session(row, "sess-a")?);
+            let secret = [7_u8; 32];
+            let verbs = [
+                thegn_core::CapabilityVerb::Report,
+                thegn_core::CapabilityVerb::Note,
+            ];
+            let grant = db
+                .mint_dispatch_capability(
+                    &secret,
+                    &thegn_core::CapabilityMint {
+                        dispatch_id: row,
+                        verbs: &verbs,
+                        ttl_ms: 60_000,
+                        now_ms: thegn_core::util::now_ms(),
+                    },
+                )?
+                .map_err(anyhow::Error::new)?;
+            assert_eq!(grant.dispatch_id, row);
+            Ok((row, "07".repeat(32)))
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn worker_capability_report_writes_with_a_valid_token() {
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (row, token) = worker_capability_fixture(&svc).await;
+        let reply = svc
+            .dispatch_report(
+                row,
+                thegn_svc::control::DispatchWorkerWriteReq {
+                    text: "findings: none".into(),
+                    token,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.id, row);
+        assert_eq!(reply.bytes, "findings: none".len());
+        let stored = svc
+            .with_db(move |db| Ok(db.get_dispatch(row)?.unwrap().report))
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("findings: none"));
+    }
+
+    #[tokio::test]
+    async fn worker_capability_note_writes_with_a_valid_token() {
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (row, token) = worker_capability_fixture(&svc).await;
+        let reply = svc
+            .dispatch_note(
+                row,
+                thegn_svc::control::DispatchWorkerWriteReq {
+                    text: "progress update".into(),
+                    token,
+                },
+            )
+            .await
+            .unwrap();
+        let notes = svc
+            .with_db(move |db| db.dispatch_notes(row, None, 20))
+            .await
+            .unwrap();
+        assert_eq!(reply.id, row);
+        assert_eq!(reply.note_id, notes[0].id);
+        assert_eq!(notes[0].text, "progress update");
+    }
+
+    #[tokio::test]
+    async fn worker_capability_token_for_another_row_is_refused_and_writes_nothing() {
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (row, token) = worker_capability_fixture(&svc).await;
+        let other = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .unwrap();
+        let result = svc
+            .dispatch_report(
+                other,
+                thegn_svc::control::DispatchWorkerWriteReq {
+                    text: "findings: none".into(),
+                    token,
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ControlError::FailedPrecondition(ref message)) if message.contains("wrong_row"))
+        );
+        let report = svc
+            .with_db(move |db| Ok(db.get_dispatch(row)?.unwrap().report))
+            .await
+            .unwrap();
+        assert!(report.is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_capability_unknown_and_malformed_tokens_are_refused() {
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (row, _) = worker_capability_fixture(&svc).await;
+        for (token, expected) in [
+            ("00".repeat(32), "unknown_token"),
+            ("not-hex".into(), "malformed"),
+        ] {
+            let result = svc
+                .dispatch_note(
+                    row,
+                    thegn_svc::control::DispatchWorkerWriteReq {
+                        text: "progress".into(),
+                        token,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ControlError::FailedPrecondition(ref message)) if message.contains(expected))
+            );
+        }
+        let notes = svc
+            .with_db(move |db| db.dispatch_notes(row, None, 20))
+            .await
+            .unwrap();
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_capability_revoked_and_expired_tokens_are_refused() {
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (revoked_row, revoked_token) = worker_capability_fixture(&svc).await;
+        svc.with_db(move |db| {
+            let count = db.revoke_dispatch_capabilities(revoked_row, thegn_core::util::now_ms())?;
+            assert!(count > 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let revoked = svc
+            .dispatch_note(
+                revoked_row,
+                thegn_svc::control::DispatchWorkerWriteReq {
+                    text: "progress".into(),
+                    token: revoked_token,
+                },
+            )
+            .await;
+        assert!(
+            matches!(revoked, Err(ControlError::FailedPrecondition(ref message)) if message.contains("revoked"))
+        );
+        let revoked_notes = svc
+            .with_db(move |db| db.dispatch_notes(revoked_row, None, 20))
+            .await
+            .unwrap();
+        assert!(revoked_notes.is_empty());
+
+        let (expired_row, expired_token) = svc
+            .with_db(|db| {
+                let row = staged_dispatch(db, Some("code"));
+                assert!(db.bind_dispatch_session(row, "sess-expired")?);
+                let secret = [8_u8; 32];
+                let verbs = [thegn_core::CapabilityVerb::Note];
+                let grant = db
+                    .mint_dispatch_capability(
+                        &secret,
+                        &thegn_core::CapabilityMint {
+                            dispatch_id: row,
+                            verbs: &verbs,
+                            ttl_ms: 1,
+                            now_ms: 0,
+                        },
+                    )?
+                    .map_err(anyhow::Error::new)?;
+                assert_eq!(grant.dispatch_id, row);
+                Ok((row, "08".repeat(32)))
+            })
+            .await
+            .unwrap();
+        let expired = svc
+            .dispatch_note(
+                expired_row,
+                thegn_svc::control::DispatchWorkerWriteReq {
+                    text: "progress".into(),
+                    token: expired_token,
+                },
+            )
+            .await;
+        assert!(
+            matches!(expired, Err(ControlError::FailedPrecondition(ref message)) if message.contains("expired"))
+        );
+        let expired_notes = svc
+            .with_db(move |db| db.dispatch_notes(expired_row, None, 20))
+            .await
+            .unwrap();
+        assert!(expired_notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_capability_stale_run_gen_is_refused() {
+        let _state = isolated_state();
+        let (svc, _rx) = service(0);
+        let (row, token) = worker_capability_fixture(&svc).await;
+        svc.with_db(move |db| {
+            let outcome = db.publish_dispatch_run(row, "sess-b", "a.md")?;
+            assert!(matches!(
+                outcome,
+                thegn_core::issue::DispatchRunPublishOutcome::Published
+            ));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let result = svc
+            .dispatch_report(
+                row,
+                thegn_svc::control::DispatchWorkerWriteReq {
+                    text: "findings: none".into(),
+                    token,
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(ref message))
+                if message.contains("session_changed") || message.contains("stale_run_gen")
+        ));
+        let report = svc
+            .with_db(move |db| Ok(db.get_dispatch(row)?.unwrap().report))
+            .await
+            .unwrap();
+        assert!(report.is_none());
     }
 
     /// With no `[issues]` provider configured, the issue verbs answer
@@ -6248,6 +6764,19 @@ mod identity_env_tests {
         assert_eq!(
             out.iter().filter(|(k, _)| k == "THEGN_SESSION_ID").count(),
             1
+        );
+    }
+
+    #[test]
+    fn session_env_strips_the_stage_launch_id() {
+        let env = vec![(
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "a".repeat(32),
+        )];
+        let out = session_identity_env("session", "/run/x/daemon.sock", &env);
+        assert!(
+            out.iter()
+                .all(|(key, _)| key != super::super::stage_launch::STAGE_LAUNCH_ENV)
         );
     }
 }

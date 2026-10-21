@@ -17,11 +17,12 @@ pub mod command;
 pub mod ics;
 pub mod ics_url;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use thegn_core::calendar::{
     AdmissionBudget, AdmissionError, AdmissionLease, AdmissionMeter, AdmissionPool, CalEvent,
     CalendarWindow,
@@ -646,10 +647,53 @@ impl CalendarBackend for AccountPolicyBackend {
     }
 }
 
+/// Workload class used to bound concurrent calendar fetches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchClass {
+    Network,
+    Command,
+    Local,
+}
+
+// Network providers hold sockets and response bodies while fetching. Four
+// allows useful overlap without multiplying the process-wide admission cap.
+const NETWORK_FETCH_CONCURRENCY: usize = 4;
+// A command provider owns a subprocess; serialize these to bound child count.
+const COMMAND_FETCH_CONCURRENCY: usize = 1;
+// Local ICS reads and parsing can hold file handles and page memory; serialize.
+const LOCAL_FETCH_CONCURRENCY: usize = 1;
+
+impl FetchClass {
+    fn of(kind: CalendarProviderKind) -> Self {
+        match kind {
+            CalendarProviderKind::IcsUrl | CalendarProviderKind::CalDav => Self::Network,
+            CalendarProviderKind::Command => Self::Command,
+            CalendarProviderKind::Ics | CalendarProviderKind::None => Self::Local,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Network => 0,
+            Self::Command => 1,
+            Self::Local => 2,
+        }
+    }
+
+    fn limit(self) -> usize {
+        match self {
+            Self::Network => NETWORK_FETCH_CONCURRENCY,
+            Self::Command => COMMAND_FETCH_CONCURRENCY,
+            Self::Local => LOCAL_FETCH_CONCURRENCY,
+        }
+    }
+}
+
 /// One configured account plus its backend.
 struct AccountBackend {
     name: String,
     hue: Option<thegn_core::theme::Hue>,
+    class: FetchClass,
     inner: Box<dyn CalendarBackend>,
 }
 
@@ -694,11 +738,27 @@ impl CalendarRouter {
                 backend_from_account(&a, admission.clone()).map(|inner| AccountBackend {
                     hue: a.hue(),
                     name: a.name.clone(),
+                    class: FetchClass::of(a.provider),
                     inner,
                 })
             })
             .collect();
         CalendarRouter { accounts }
+    }
+
+    #[cfg(test)]
+    fn from_test_backends(accounts: Vec<(String, FetchClass, Box<dyn CalendarBackend>)>) -> Self {
+        CalendarRouter {
+            accounts: accounts
+                .into_iter()
+                .map(|(name, class, inner)| AccountBackend {
+                    name,
+                    hue: None,
+                    class,
+                    inner,
+                })
+                .collect(),
+        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -777,33 +837,42 @@ impl CalendarRouter {
     /// Fetch every account, handing each result to `sink` as soon as it is
     /// ready.
     ///
-    /// The sink owns the page, so a caller that applies and drops it there
-    /// releases that account's admission lease before the next account is
-    /// fetched — a router never holds more than one account's data, and an
-    /// early account cannot starve a later one of the shared budget.
+    /// Accounts run concurrently under per-class caps, so several pages can be
+    /// alive at once (at most the sum of those caps). The shared admission pool
+    /// still bounds their total. Concurrent network fetches can contend for
+    /// that pool and receive an immediate typed refusal even when a serial
+    /// fetch could have succeeded after its predecessor's page was applied;
+    /// the next pass retries refused work. Results reach the sink in completion
+    /// order. The no-starvation guarantee holds within each class, not across a
+    /// class's concurrent fetches.
     pub async fn list_events_each(
         &self,
         window: CalendarWindow,
         tokens: &BTreeMap<String, String>,
         mut sink: impl FnMut(AccountResult),
     ) {
-        for a in &self.accounts {
-            let token = tokens.get(&a.name).map(String::as_str).unwrap_or("");
-            let mut result = a.inner.list_events_window(&window, token).await;
-            // Stamp identity onto every event so ids are globally unique and the
-            // UI can color by source.
-            if let Ok(page) = result.as_mut() {
-                let source =
-                    thegn_core::calendar::SourceId(format!("{}:{}", a.inner.provider_id(), a.name));
-                if let Err(e) = page.stamp(&source, a.hue) {
-                    result = Err(e);
+        let mut queues: [VecDeque<&AccountBackend>; 3] = std::array::from_fn(|_| VecDeque::new());
+        for account in &self.accounts {
+            queues[account.class.index()].push_back(account);
+        }
+        let mut running = [0_usize; 3];
+        let mut in_flight = FuturesUnordered::new();
+        loop {
+            for class in [FetchClass::Network, FetchClass::Command, FetchClass::Local] {
+                let class_index = class.index();
+                while running[class_index] < class.limit()
+                    && let Some(account) = queues[class_index].pop_front()
+                {
+                    running[class_index] += 1;
+                    let token = tokens.get(&account.name).map(String::as_str).unwrap_or("");
+                    in_flight.push(fetch_account(account, &window, token));
                 }
             }
-            sink(AccountResult {
-                account: a.name.clone(),
-                provider: a.inner.provider_id(),
-                result,
-            });
+            let Some((class, result)) = in_flight.next().await else {
+                break;
+            };
+            running[class.index()] -= 1;
+            sink(result);
         }
     }
 
@@ -826,6 +895,34 @@ impl CalendarRouter {
         self.list_events_each(window, tokens, |r| out.push(r)).await;
         out
     }
+}
+
+async fn fetch_account(
+    account: &AccountBackend,
+    window: &CalendarWindow,
+    token: &str,
+) -> (FetchClass, AccountResult) {
+    let mut result = account.inner.list_events_window(window, token).await;
+    // Stamp identity onto every event so ids are globally unique and the UI
+    // can color by source.
+    if let Ok(page) = result.as_mut() {
+        let source = thegn_core::calendar::SourceId(format!(
+            "{}:{}",
+            account.inner.provider_id(),
+            account.name
+        ));
+        if let Err(error) = page.stamp(&source, account.hue) {
+            result = Err(error);
+        }
+    }
+    (
+        account.class,
+        AccountResult {
+            account: account.name.clone(),
+            provider: account.inner.provider_id(),
+            result,
+        },
+    )
 }
 
 #[cfg(test)]

@@ -1413,6 +1413,36 @@ pub(super) async fn dispatch_set_status(
     }
 }
 
+pub(super) async fn dispatch_report(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: axum::Json<super::DispatchWorkerWriteReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesReport) {
+        return r;
+    }
+    match state.api.dispatch_report(id, body.0).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+pub(super) async fn dispatch_note(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: axum::Json<super::DispatchWorkerWriteReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesNote) {
+        return r;
+    }
+    match state.api.dispatch_note(id, body.0).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct WorktreeQuery {
     worktree: String,

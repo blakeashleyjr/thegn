@@ -875,8 +875,9 @@ pub struct MergeQueueConfig {
     pub require_enqueue: bool,
     /// Auto-commit uncommitted worktree work before folding (else skip dirty ones).
     pub snapshot_dirty: bool,
-    /// Conflicts confined to these paths (exact/basename) are regenerable, not
-    /// handed to a human (e.g. `Cargo.lock`).
+    /// Conflicts confined to these paths are regenerable, not handed to a human:
+    /// an exact repo-relative path, or `**/<path>` for that path in any directory.
+    /// A bare name matches only the repo root.
     ///
     /// Defaults to the common lockfiles across ecosystems, not just Rust's: a
     /// name costs nothing in a repo that doesn't have that file, and lockfile
@@ -1053,20 +1054,20 @@ impl Default for MergeQueueConfig {
             snapshot_dirty: false,
             regenerate_paths: [
                 // Rust
-                "Cargo.lock",
+                "**/Cargo.lock",
                 // JS/TS
-                "pnpm-lock.yaml",
-                "package-lock.json",
-                "yarn.lock",
-                "bun.lockb",
+                "**/pnpm-lock.yaml",
+                "**/package-lock.json",
+                "**/yarn.lock",
+                "**/bun.lockb",
                 // Python
-                "poetry.lock",
-                "uv.lock",
-                "Pipfile.lock",
+                "**/poetry.lock",
+                "**/uv.lock",
+                "**/Pipfile.lock",
                 // Go / Ruby / PHP
-                "go.sum",
-                "Gemfile.lock",
-                "composer.lock",
+                "**/go.sum",
+                "**/Gemfile.lock",
+                "**/composer.lock",
             ]
             .iter()
             .map(|s| (*s).to_string())

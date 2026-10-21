@@ -31,6 +31,22 @@ fn order_memo() -> &'static Mutex<Vec<(String, AttentionTier)>> {
     MEMO.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn mq_facts(row: &thegn_core::db::MergeQueueRow) -> MqFacts {
+    let status = MqStatus::parse(&row.status).unwrap_or_else(|| {
+        tracing::debug!(
+            target: "thegn::attention",
+            worktree = %row.worktree,
+            status = %row.status,
+            "unknown merge-queue status scored as needs-human"
+        );
+        MqStatus::NeedsHuman
+    });
+    MqFacts {
+        status,
+        updated_at: row.updated_at,
+    }
+}
+
 #[derive(Default)]
 struct AttentionEdgeState {
     seeded: bool,
@@ -230,15 +246,7 @@ pub(crate) fn collect_attention(
     // Merge-queue entries (one row per worktree; `landed` scores as no signal).
     let mut mq: BTreeMap<String, MqFacts> = BTreeMap::new();
     for row in db.list_merge_queue().unwrap_or_default() {
-        if let Some(st) = MqStatus::parse(&row.status) {
-            mq.insert(
-                row.worktree,
-                MqFacts {
-                    status: st,
-                    updated_at: row.updated_at,
-                },
-            );
-        }
+        mq.insert(row.worktree.clone(), mq_facts(&row));
     }
     // Re-expose the raw statuses for the sidebar's per-worktree MQ chip (the
     // scorer folds them into tiers; the chip wants the status itself).
@@ -877,6 +885,26 @@ mod tests {
             thegn_core::attention::AttentionTier::Blocked
         );
         assert!(status.attention["/wt/q"].needs_user());
+    }
+
+    #[test]
+    fn mq_unknown_status_row_is_flagged_not_dropped() {
+        let row = thegn_core::db::MergeQueueRow {
+            worktree: "/wt/future".into(),
+            branch: "feat".into(),
+            target_branch: "main".into(),
+            status: "future_status".into(),
+            queued_at: 1,
+            updated_at: 2,
+            result_oid: None,
+            conflict_paths: None,
+            error_detail: None,
+            location: String::new(),
+            agent_attempts: 0,
+        };
+        let facts = mq_facts(&row);
+        assert_eq!(facts.status, MqStatus::NeedsHuman);
+        assert_eq!(facts.updated_at, 2);
     }
 
     #[test]

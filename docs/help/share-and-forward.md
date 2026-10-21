@@ -37,6 +37,8 @@ Stopping a share in thegn while it is still starting cancels the start, so
 the tunnel does not come up after the stop request.
 A share client started by thegn runs in its own process group. Stopping it sends
 TERM to the group, then KILL after a short grace period if processes remain.
+A Tailscale share cannot restart on a port whose previous share is still
+stopping; wait for teardown to finish first.
 
 ## Auto port forwards (`[forward]`)
 

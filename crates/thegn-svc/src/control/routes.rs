@@ -105,6 +105,12 @@ pub static ROUTES: &[Route] = &[
         &["dispatches.set_status"],
         || post(http::dispatch_set_status),
     ),
+    route("/v1/dispatches/{id}/report", &["dispatches.report"], || {
+        post(http::dispatch_report)
+    }),
+    route("/v1/dispatches/{id}/note", &["dispatches.note"], || {
+        post(http::dispatch_note)
+    }),
     route("/v1/preview/fetch", &["preview.fetch"], || {
         post(http::preview_fetch)
     }),
@@ -200,6 +206,8 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
         "POST",
         "/v1/dispatches/{id}/status",
     ),
+    ("dispatches.report", "POST", "/v1/dispatches/{id}/report"),
+    ("dispatches.note", "POST", "/v1/dispatches/{id}/note"),
     ("preview.fetch", "POST", "/v1/preview/fetch"),
     ("git.status", "GET", "/v1/git/status"),
     ("git.stage", "POST", "/v1/git/stage"),

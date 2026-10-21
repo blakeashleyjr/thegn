@@ -398,7 +398,7 @@ fn cleanup_history_refusal(external_graft: bool) {
         &before_rows[0],
         true,
     );
-    let crate::merge_lifecycle::CleanupOutcome::Refused { reason } = outcome else {
+    let crate::merge_lifecycle::CleanupOutcome::Refused { reason, .. } = outcome else {
         panic!("history override must refuse cleanup");
     };
     assert!(reason.contains("canonical history"));

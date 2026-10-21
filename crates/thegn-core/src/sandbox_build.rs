@@ -4,13 +4,17 @@
 //! is created, driven through the same `oci_prefix` as every other runtime call
 //! so it targets the right daemon (rootful podman, an `oci_host` remote, …).
 //!
-//! The argv + tag construction are pure and unit-tested here; only
-//! [`build_image`] touches a subprocess (a `cov_ignore` seam exercised by
-//! `test/smoke.sh`).
+//! The tag binds the build declaration and safely-read Dockerfile bytes; files
+//! under the build context are deliberately outside its digest. The argv + tag
+//! construction are unit-tested here; only [`build_image`] touches a
+//! subprocess (a `cov_ignore` seam exercised by `test/smoke.sh`).
 
 use std::collections::BTreeMap;
+use std::io;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::sandbox::{SandboxSpec, oci_prefix};
 
@@ -29,22 +33,32 @@ pub struct SandboxBuild {
     pub target: Option<String>,
 }
 
-/// A stable, local image tag for a build. Content-addressed over the build
-/// *declaration* (dockerfile/context/args/target) so two worktrees with the same
-/// devcontainer reuse one built image, and a changed declaration gets a fresh
-/// tag. `basename` is a human hint (e.g. the repo name); it is slugified.
-pub fn content_tag(basename: &str, b: &SandboxBuild) -> String {
-    let mut sig = format!("{}\u{1f}{}", b.dockerfile, b.context);
-    for (k, v) in &b.args {
-        sig.push('\u{1f}');
-        sig.push_str(k);
-        sig.push('=');
-        sig.push_str(v);
+/// Hash a Dockerfile without following a symlink or blocking on a FIFO.
+pub fn dockerfile_sha256(path: &Path) -> io::Result<String> {
+    let mut file = crate::fsperm::open_regular_file_nofollow(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// A stable, local image tag for a build. The versioned SHA-256 covers the
+/// build declaration and the Dockerfile bytes when they can be read safely;
+/// it does not cover files in the build context. An absent digest marks a
+/// declaration-only tag. `basename` is a human hint (e.g. the repo name); it
+/// is slugified.
+pub fn content_tag(basename: &str, b: &SandboxBuild, dockerfile_sha256: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"thegn.dc-build-tag.v2\0");
+    hash_field(&mut hasher, b.dockerfile.as_bytes());
+    hash_field(&mut hasher, b.context.as_bytes());
+    hasher.update((b.args.len() as u64).to_be_bytes());
+    for (key, value) in &b.args {
+        hash_field(&mut hasher, key.as_bytes());
+        hash_field(&mut hasher, value.as_bytes());
     }
-    if let Some(t) = &b.target {
-        sig.push('\u{1f}');
-        sig.push_str(t);
-    }
+    hash_optional_field(&mut hasher, b.target.as_deref());
+    hash_optional_field(&mut hasher, dockerfile_sha256);
+    let digest = hasher.finalize();
     let slug: String = basename
         .chars()
         .map(|c| {
@@ -57,7 +71,22 @@ pub fn content_tag(basename: &str, b: &SandboxBuild) -> String {
         .collect();
     let slug = slug.trim_matches('-');
     let slug = if slug.is_empty() { "img" } else { slug };
-    format!("thegn-dc-{slug}:{}", crate::util::short_hash(&sig, 12))
+    format!("thegn-dc-{slug}:{digest:x}")
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hash_field(hasher, value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
 }
 
 /// The `build …` subcommand argv (the runtime binary + any daemon flags come
@@ -180,28 +209,82 @@ mod tests {
 
     #[test]
     fn tag_is_stable_and_declaration_sensitive() {
-        let t1 = content_tag("my-repo", &build());
-        assert_eq!(t1, content_tag("my-repo", &build()));
+        let t1 = content_tag("my-repo", &build(), Some("dockerfile-digest"));
+        assert_eq!(
+            t1,
+            content_tag("my-repo", &build(), Some("dockerfile-digest"))
+        );
         assert!(t1.starts_with("thegn-dc-my-repo:"));
 
         // A changed arg → different tag.
         let mut b2 = build();
         b2.args.insert("VARIANT".into(), "22".into());
-        assert_ne!(t1, content_tag("my-repo", &b2));
+        assert_ne!(t1, content_tag("my-repo", &b2, Some("dockerfile-digest")));
 
         // A changed target → different tag.
         let mut b3 = build();
         b3.target = Some("prod".into());
-        assert_ne!(t1, content_tag("my-repo", &b3));
+        assert_ne!(t1, content_tag("my-repo", &b3, Some("dockerfile-digest")));
+
+        let mut b4 = build();
+        b4.dockerfile.push_str(".changed");
+        assert_ne!(t1, content_tag("my-repo", &b4, Some("dockerfile-digest")));
+        let mut b5 = build();
+        b5.context.push_str("-changed");
+        assert_ne!(t1, content_tag("my-repo", &b5, Some("dockerfile-digest")));
     }
 
     #[test]
     fn tag_slugifies_basename() {
-        let t = content_tag("My Repo/App!", &build());
+        let t = content_tag("My Repo/App!", &build(), Some("dockerfile-digest"));
         // Only the tag prefix is slugified; the ':' + hash follow.
         let prefix = t.split(':').next().unwrap();
         assert_eq!(prefix, "thegn-dc-my-repo-app");
         // Empty/garbage basename falls back to a placeholder.
-        assert!(content_tag("///", &build()).starts_with("thegn-dc-img:"));
+        assert!(
+            content_tag("///", &build(), Some("dockerfile-digest")).starts_with("thegn-dc-img:")
+        );
+    }
+
+    #[test]
+    fn dockerfile_bytes_change_the_tag() {
+        let declaration = build();
+        let first = content_tag("my-repo", &declaration, Some("sha256-one"));
+        let tag_digest = first.split_once(':').unwrap().1;
+        assert_eq!(tag_digest.len(), 64, "tag must contain a full SHA-256");
+        assert!(tag_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(
+            first,
+            content_tag("my-repo", &declaration, Some("sha256-two"))
+        );
+        assert_eq!(
+            first,
+            content_tag("my-repo", &declaration, Some("sha256-one"))
+        );
+        assert_ne!(
+            first,
+            content_tag("my-repo", &declaration, None),
+            "unhashed declaration-only tags must be distinct"
+        );
+    }
+
+    #[test]
+    fn dockerfile_sha256_streams_regular_files_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        let bytes = b"FROM scratch\n";
+        std::fs::write(&dockerfile, bytes).unwrap();
+        assert_eq!(
+            dockerfile_sha256(&dockerfile).unwrap(),
+            format!("{:x}", Sha256::digest(bytes))
+        );
+
+        if !cfg!(unix) {
+            return;
+        }
+        let link = dir.path().join("Dockerfile-link");
+        crate::fsperm::create_symlink(&dockerfile, &link, false).unwrap();
+        let result = dockerfile_sha256(&link);
+        assert!(result.is_err(), "a symlinked Dockerfile must be refused");
     }
 }

@@ -78,6 +78,22 @@ fn a_reminder_fires_on_the_tick_that_straddles_its_trigger() {
     );
 }
 
+// Positive control: transparency changes occupancy, not reminder delivery.
+#[test]
+fn transp_free_event_still_fires_its_reminder() {
+    let mut event = ev("free-travel", 9, 30, &[10]);
+    event.busy = crate::calendar::Busy::Free;
+    let hit = due(
+        &[event],
+        UTC,
+        &[],
+        at(2026, 8, 21, 9, 19),
+        at(2026, 8, 21, 9, 21),
+    );
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].title, "free-travel");
+}
+
 #[test]
 fn an_event_with_several_lead_times_fires_each_once() {
     let events = [ev("review", 15, 0, &[60, 10])];

@@ -498,9 +498,13 @@ pub(crate) fn spawn_media_op(
                 pulse(&outcome_waker);
                 return;
             }
-            let Some(client) = crate::media_secret::client_for(&cfg).await else {
-                publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
-                return;
+            let client = match crate::media_secret::client_for(&cfg).await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::media", %error, "media client unavailable");
+                    publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
+                    return;
+                }
             };
             let cur = snapshot_or_log(&client, "preflight").await.unwrap_or(None);
             let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
@@ -620,31 +624,38 @@ pub(crate) fn spawn_media_playlist(
                 pulse(&outcome_waker);
                 return;
             }
-            if let Some(client) = crate::media_secret::client_for(&cfg).await {
-                if !generation_is_current(captured_generation, &generation_guard, &MEDIA_OP_OUTCOME)
-                {
-                    pulse(&outcome_waker);
-                    return;
+            match crate::media_secret::client_for(&cfg).await {
+                Ok(client) => {
+                    if !generation_is_current(
+                        captured_generation,
+                        &generation_guard,
+                        &MEDIA_OP_OUTCOME,
+                    ) {
+                        pulse(&outcome_waker);
+                        return;
+                    }
+                    if !client.caps().playlists {
+                        tracing::debug!(target: "thegn::media", playlist = %id, "playlist activation is unsupported by the selected player");
+                        publish_outcome(MediaOpOutcome::Unsupported, &outcome_waker);
+                        return;
+                    }
+                    if let Err(e) = client.activate_playlist(&id).await {
+                        tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+                        publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
+                    }
+                    if let Some(delivery) = delivery_from_read(
+                        captured_generation,
+                        snapshot_or_log(&client, "playlist").await,
+                    ) && send_delivery(&tx, delivery)
+                        && let Err(error) = waker.wake()
+                    {
+                        tracing::debug!(target: "thegn::media", %error, "media playlist wake failed");
+                    }
                 }
-                if !client.caps().playlists {
-                    tracing::debug!(target: "thegn::media", playlist = %id, "playlist activation is unsupported by the selected player");
-                    publish_outcome(MediaOpOutcome::Unsupported, &outcome_waker);
-                    return;
-                }
-                if let Err(e) = client.activate_playlist(&id).await {
-                    tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+                Err(error) => {
+                    tracing::debug!(target: "thegn::media", %error, "media client unavailable");
                     publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
                 }
-                if let Some(delivery) = delivery_from_read(
-                    captured_generation,
-                    snapshot_or_log(&client, "playlist").await,
-                ) && send_delivery(&tx, delivery)
-                    && let Err(error) = waker.wake()
-                {
-                    tracing::debug!(target: "thegn::media", %error, "media playlist wake failed");
-                }
-            } else {
-                publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
             }
         },
     );
@@ -664,18 +675,18 @@ pub(crate) fn spawn_media_pick(
     let handle = tokio::spawn(async move {
         let result = within_media_budget(async {
             match crate::media_secret::client_for(&cfg).await {
-                Some(client) if players => MediaPick::Players(Ok(client.players().await)),
-                Some(client) => match client.playlists().await {
+                Ok(client) if players => MediaPick::Players(
+                    client.players().await.map_err(|error| error.to_string()),
+                ),
+                Ok(client) => match client.playlists().await {
                     Ok(playlists) => MediaPick::Playlists(Ok(playlists)),
                     Err(error) => {
                         tracing::debug!(target: "thegn::media", error = %error, "media playlist fetch failed");
                         MediaPick::Playlists(Err(error.to_string()))
                     }
                 },
-                None if players => {
-                    MediaPick::Players(Err("media provider unavailable".into()))
-                }
-                None => MediaPick::Playlists(Err("media provider unavailable".into())),
+                Err(error) if players => MediaPick::Players(Err(error.to_string())),
+                Err(error) => MediaPick::Playlists(Err(error.to_string())),
             }
         })
         .await;
@@ -700,14 +711,14 @@ pub(crate) fn spawn_media_queue(
     let handle = tokio::spawn(async move {
         let queue = within_media_budget(async {
             match crate::media_secret::client_for(&cfg).await {
-                Some(client) => match client.queue().await {
+                Ok(client) => match client.queue().await {
                     Ok(queue) => Ok(queue),
                     Err(e) => {
                         tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");
                         Err(e.to_string())
                     }
                 },
-                None => Err("media provider unavailable".to_string()),
+                Err(error) => Err(error.to_string()),
             }
         })
         .await
@@ -728,11 +739,20 @@ pub(crate) fn spawn_media_sources(
     waker: TerminalWaker,
 ) {
     let handle = tokio::spawn(async move {
-        let Some(client) = crate::media_secret::client_for(&cfg).await else {
-            return;
+        let client = match crate::media_secret::client_for(&cfg).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(target: "thegn::media", %error, "media sources unavailable");
+                return;
+            }
         };
-        let Some(sources) = within_media_budget(client.players()).await else {
-            return;
+        let sources = match within_media_budget(client.players()).await {
+            Some(Ok(sources)) => sources,
+            Some(Err(error)) => {
+                tracing::debug!(target: "thegn::media", %error, "media source listing failed");
+                return;
+            }
+            None => return,
         };
         slot.put(MediaSourcesDelivery { request, sources });
         let _ = waker.wake();

@@ -950,6 +950,22 @@ sweep_due_has() {
     return 1
   fi
 }
+sweep_due_refuses() {
+  local pattern=$1 output="$TMP/sweep-output"
+  shift
+  if sweep_fixture_due "$@" >"$output" 2>&1; then
+    cat "$output" >&2
+    return 1
+  fi
+  if ! grep "$pattern" "$output" >/dev/null; then
+    cat "$output" >&2
+    return 1
+  fi
+}
+sweep_due_expired_refuses() {
+  sleep 2
+  sweep_due_refuses "$@"
+}
 # Untracked, NON-ignored content is real work: never swept, with or without
 # --force. This is the protection that matters, and it was previously untested —
 # the old case asserted it for ignored files instead, which is what THE-686
@@ -1066,7 +1082,7 @@ check "installed Docker with unrelated mounts collects on the clock alone" \
 # A query refusal must also hold without --force, not only with it.
 OCI_BAD_DUE_MP="$(seed_sweep_case oci-garbage-due)"
 check "Docker garbage output is a refusal on the clock alone" \
-  "THEGN_SMOKE_OCI_MODE=garbage THEGN_SMOKE_OCI_TARGET='$OCI_BAD_DUE_MP' sweep_due_expired 'could not be queried' && [[ -d '$OCI_BAD_DUE_MP' ]]"
+  "THEGN_SMOKE_OCI_MODE=garbage THEGN_SMOKE_OCI_TARGET='$OCI_BAD_DUE_MP' sweep_due_expired_refuses 'could not be queried' && [[ -d '$OCI_BAD_DUE_MP' ]]"
 
 # And the no-runtime branch must collect on the clock alone too. `sweep_fixture_due`
 # fixes PATH internally, so hide the shim rather than trying to override it, and
@@ -1080,14 +1096,14 @@ mv "$TMP/docker-shim-hidden" "$TMP/sweep-bin/docker"
 OCI_OWNED_MP="$(seed_sweep_case oci-owned)"
 mkdir -p "$OCI_OWNED_MP/subdir"
 check "Docker mount at the worktree keeps it without --force" \
-  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_expired 'may own the worktree' && [[ -d '$OCI_OWNED_MP' ]]"
+  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_expired_refuses 'may own the worktree' && [[ -d '$OCI_OWNED_MP' ]]"
 check "Docker mount at the worktree keeps it with --force" \
-  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_has 'may own the worktree' --force && [[ -d '$OCI_OWNED_MP' ]]"
+  "THEGN_SMOKE_OCI_MODE=owned THEGN_SMOKE_OCI_TARGET='$OCI_OWNED_MP' sweep_due_refuses 'may own the worktree' --force && [[ -d '$OCI_OWNED_MP' ]]"
 
 for mode in nonzero garbage hang; do
   OCI_BAD_MP="$(seed_sweep_case "oci-$mode")"
   check "Docker $mode is a query refusal, not proof of no ownership" \
-    "THEGN_SMOKE_OCI_MODE='$mode' THEGN_SMOKE_OCI_TARGET='$OCI_BAD_MP' sweep_due_has 'could not be queried' --force && [[ -d '$OCI_BAD_MP' ]]"
+    "THEGN_SMOKE_OCI_MODE='$mode' THEGN_SMOKE_OCI_TARGET='$OCI_BAD_MP' sweep_due_refuses 'could not be queried' --force && [[ -d '$OCI_BAD_MP' ]]"
 done
 
 # `--json` must emit EXACTLY one document on every path. The empty queue is the
