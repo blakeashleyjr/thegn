@@ -89,6 +89,8 @@ pub(crate) struct DaemonService {
     /// Empty after a crash, so the reaper can distinguish active slow opens
     /// from reservations abandoned by the previous process.
     pub spawning_relaunches: Arc<Mutex<std::collections::HashSet<i64>>>,
+    /// Stage launch ids are replayable only for this daemon's lifetime (THE-272).
+    pub launches: Mutex<super::stage_launch::LaunchRegistry>,
     pub events: broadcast::Sender<Arc<EventFrame>>,
     pub db: SharedDb,
     /// `[daemon] lease_grace_secs`, in ms.
@@ -283,7 +285,11 @@ pub(crate) fn session_identity_env(
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = env
         .iter()
-        .filter(|(k, _)| k != "THEGN_SESSION_ID" && k != "THEGN_CONTROL_SOCKET")
+        .filter(|(k, _)| {
+            k != "THEGN_SESSION_ID"
+                && k != "THEGN_CONTROL_SOCKET"
+                && k != super::stage_launch::STAGE_LAUNCH_ENV
+        })
         .cloned()
         .collect();
     out.push(("THEGN_SESSION_ID".into(), id.to_string()));
@@ -951,6 +957,47 @@ impl ControlApi for DaemonService {
             )
             .map_err(|error| ControlError::Conflict(error.to_string()))?;
 
+            let launch_guard = match super::stage_launch::launch_id_of(&spec) {
+                Some(Err(reason)) => {
+                    return Err(ControlError::InvalidArgument(format!(
+                        "invalid stage launch id: {reason}"
+                    )));
+                }
+                Some(Ok(id)) => {
+                    let admit = self
+                        .launches
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .begin(
+                            &id,
+                            dispatch_row_of(&spec).and_then(Result::ok),
+                            spec.worktree.as_deref(),
+                            thegn_core::util::now_ms(),
+                        );
+                    match admit {
+                        super::stage_launch::LaunchAdmit::Fresh => {
+                            Some(super::stage_launch::LaunchGuard::new(&self.launches, &id))
+                        }
+                        super::stage_launch::LaunchAdmit::Replay(info) => return Ok(info),
+                        super::stage_launch::LaunchAdmit::Refused(message) => {
+                            return Err(ControlError::Conflict(message));
+                        }
+                        super::stage_launch::LaunchAdmit::StillOpening => {
+                            return Err(ControlError::Conflict(format!(
+                                "stage launch {id} is still opening"
+                            )));
+                        }
+                        super::stage_launch::LaunchAdmit::Mismatch => {
+                            return Err(ControlError::Conflict(
+                                "stage launch id reused for a different dispatch row or worktree"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            };
+
             // An agent launch resolves through the same pipeline the wizard
             // uses — sandbox, credentials, cap and all — so what runs here is
             // identical to what a TUI-launched agent runs. Blocking work
@@ -1200,6 +1247,9 @@ impl ControlApi for DaemonService {
                 {
                     tracing::warn!(target: "thegn::daemon", "adopt intent for {id} failed: {e}");
                 }
+            }
+            if let Some(guard) = launch_guard {
+                guard.commit(&info);
             }
             Ok(info)
         })
@@ -3600,6 +3650,7 @@ mod tests {
             ))),
             native_ids: Mutex::new(HashMap::new()),
             spawning_relaunches: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            launches: Mutex::new(super::stage_launch::LaunchRegistry::default()),
             events,
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
@@ -3833,6 +3884,119 @@ mod tests {
             .expect("tracker row retains best-effort open behavior");
         assert_eq!(svc.list_sessions().await.expect("list sessions").len(), 1);
         svc.kill(&opened.id).await.expect("stop tracker worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_retry_after_lost_response_returns_the_same_session() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .expect("prepare pipeline row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "a".repeat(32),
+        ));
+
+        let first = svc.open(spec.clone()).await.expect("first launch");
+        let first_id = first.id.clone();
+        drop(first);
+        let retry = svc.open(spec).await.expect("idempotent retry");
+        assert_eq!(retry.id, first_id);
+        let live = wait_for_live_sessions(&svc, |sessions| sessions.len() == 1).await;
+        assert_eq!(live[0].id, first_id);
+        svc.kill(&first_id).await.expect("stop worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_refusal_is_replayed_without_a_second_spawn() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(move |db| {
+                let row = staged_dispatch(db, Some("code"));
+                db.update_dispatch_status(row, thegn_core::issue::AgentDispatchStatus::Failed)?;
+                Ok(row)
+            })
+            .await
+            .expect("prepare failed stage row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "b".repeat(32),
+        ));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                svc.open(spec.clone()).await,
+                Err(ControlError::Conflict(_))
+            ));
+        }
+        let sessions = svc.list_sessions().await.expect("list sessions");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the refusal replay must not spawn a second worker"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_id_reused_for_another_row_is_refused() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let (first_row, second_row) = svc
+            .with_db(|db| {
+                Ok((
+                    staged_dispatch(db, Some("code")),
+                    staged_dispatch(db, Some("code")),
+                ))
+            })
+            .await
+            .expect("prepare pipeline rows");
+        let mut first_spec = dispatch_open_spec(first_row);
+        first_spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "c".repeat(32),
+        ));
+        let first = svc.open(first_spec).await.expect("first launch");
+        let mut second_spec = dispatch_open_spec(second_row);
+        second_spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "c".repeat(32),
+        ));
+        assert!(matches!(
+            svc.open(second_spec).await,
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(
+            svc.list_sessions().await.expect("list sessions").len(),
+            1,
+            "reused launch id must not spawn another worker"
+        );
+        svc.kill(&first.id).await.expect("stop worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_launch_malformed_id_is_refused_before_spawn() {
+        let _state = isolated_state();
+        let (svc, _) = service(0);
+        let row = svc
+            .with_db(|db| Ok(staged_dispatch(db, Some("code"))))
+            .await
+            .expect("prepare pipeline row");
+        let mut spec = dispatch_open_spec(row);
+        spec.env.push((
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "not-hex".into(),
+        ));
+
+        assert!(matches!(
+            svc.open(spec).await,
+            Err(ControlError::InvalidArgument(_))
+        ));
+        assert!(svc.list_sessions().await.expect("list sessions").is_empty());
     }
 
     fn folder_req(
@@ -6248,6 +6412,19 @@ mod identity_env_tests {
         assert_eq!(
             out.iter().filter(|(k, _)| k == "THEGN_SESSION_ID").count(),
             1
+        );
+    }
+
+    #[test]
+    fn session_env_strips_the_stage_launch_id() {
+        let env = vec![(
+            super::super::stage_launch::STAGE_LAUNCH_ENV.into(),
+            "a".repeat(32),
+        )];
+        let out = session_identity_env("session", "/run/x/daemon.sock", &env);
+        assert!(
+            out.iter()
+                .all(|(key, _)| key != super::super::stage_launch::STAGE_LAUNCH_ENV)
         );
     }
 }

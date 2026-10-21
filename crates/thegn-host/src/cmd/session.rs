@@ -1069,6 +1069,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         .or_else(|| parent_row.as_ref().and_then(|r| r.artifact_path.clone()))
         .unwrap_or_default();
     let opened = async {
+        let launch = crate::daemon::stage_launch::mint_launch_id()
+            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
         let vars = stage_task_vars(
             &facts,
             &branch,
@@ -1083,10 +1085,13 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![(
-                thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                row_id.to_string(),
-            )],
+            env: vec![
+                (
+                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
+                    row_id.to_string(),
+                ),
+                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
+            ],
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1110,7 +1115,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             adopt: d.adopt,
             already_capped: false,
         };
-        client.open(&spec).await
+        crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await
     }
     .await;
     match opened {
@@ -1544,14 +1549,19 @@ async fn resume_work(
     // 7. Open — the same headless, stage-layered launch a fresh dispatch
     //    builds, seeded with the finisher prompt instead of the bare task.
     let opened = async {
+        let launch = crate::daemon::stage_launch::mint_launch_id()
+            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
         let spec = OpenSpec {
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![(
-                thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                new_row.to_string(),
-            )],
+            env: vec![
+                (
+                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
+                    new_row.to_string(),
+                ),
+                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
+            ],
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1577,7 +1587,7 @@ async fn resume_work(
             adopt,
             already_capped: false,
         };
-        client.open(&spec).await
+        crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await
     }
     .await;
     match opened {
