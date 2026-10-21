@@ -70,6 +70,10 @@ changes.
 Keyring operations run on one worker. While an earlier keyring call is stuck
 past its timeout, further keyring operations fail at once without starting,
 and nothing is written to a file instead.
+Remote calendar account tokens appear in `thegn secret list` and `audit` as
+`calendar.accounts[<name>].token`. `thegn secret migrate` moves a literal token
+to a 0600 file reference and rewrites only that account's token; an account
+defined in another config layer is skipped with a message to move it by hand.
 
 ### Tailing the event feed
 
@@ -223,6 +227,13 @@ redacted cached job-log tail. It reads the cache first and uses the daemon's
 blocking provider lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
+
+When a GitLab job list reaches its page or row budget, `thegn ci view` and
+`ci logs` warn that the list is incomplete and show the first jobs. Incomplete
+details are not used to ingest job logs, so their logs are not cached and CI
+autofix does not start from them. `thegn ci trigger -i KEY=VALUE` inputs are
+validated before any provider request; malformed or duplicate keys, control
+characters, and oversized keys or values are refused.
 
 `thegn ci runs --json` emits a JSON array on success. If provider fetching fails,
 or the provider returns a partial list containing malformed rows, it emits an
