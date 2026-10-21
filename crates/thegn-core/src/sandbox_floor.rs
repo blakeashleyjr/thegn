@@ -268,9 +268,7 @@ fn home_path_under(dest: &str, home: &std::path::Path) -> bool {
 /// `tunnel_admission`, and provider-native requests are refused before
 /// provisioning by the separate THE-801a admission gate.
 pub fn strict_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
-    if spec.seal_home.is_none() {
-        return None;
-    }
+    spec.seal_home.as_ref()?;
     let mut unsupported = crate::sandbox::unsupported_hardening(spec)
         .into_iter()
         .map(str::to_owned)
@@ -398,9 +396,8 @@ mod tests {
 
     fn strict_spec(backend: Backend, file_access: FileAccess) -> crate::sandbox::SandboxSpec {
         use crate::config::Network;
-        use crate::config::SandboxLimits;
         use crate::placement::Placement;
-        use crate::sandbox::{Mount, SandboxSpec};
+        use crate::sandbox::{Mount, SandboxLimits, SandboxSpec};
         SandboxSpec {
             backend,
             placement: Placement::Local,
