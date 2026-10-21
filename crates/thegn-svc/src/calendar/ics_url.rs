@@ -245,11 +245,13 @@ impl CalendarBackend for IcsUrlBackend {
                     "calendar document is incomplete or structurally malformed".into(),
                 ));
             }
+            let mode =
+                super::ics::snapshot_mode(events.is_empty(), !report.cancelled_uids().is_empty());
             let diagnostics = PageDiagnostics::from_report(&report);
             drop(body);
             EventPage::from_meter(
                 meter,
-                PageMode::Snapshot,
+                mode,
                 events,
                 Vec::new(),
                 stored_cursor(self.zone.name(), &etag),
@@ -282,5 +284,87 @@ mod cursor_tests {
             "Europe/Berlin",
             &stored_cursor("Europe/Berlin", &("x".repeat(MAX_REQUEST_BYTES + 1)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod tombstone_tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
+
+    const TOMBSTONE_ONLY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:gone\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const EMPTY_CALENDAR: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n";
+
+    async fn feed(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(any(move |_request: Request| async move {
+                    let mut response = (StatusCode::OK, Body::from(body)).into_response();
+                    response.headers_mut().insert(
+                        "content-type",
+                        HeaderValue::from_static("text/calendar; charset=utf-8"),
+                    );
+                    response
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://{address}/feed.ics"), task)
+    }
+
+    fn admission() -> AccountAdmission {
+        AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC)
+    }
+
+    fn window() -> (NaiveDate, NaiveDate) {
+        (
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        )
+    }
+
+    async fn fetch(body: &'static str) -> EventPage {
+        let (url, task) = feed(body).await;
+        let account = CalendarAccount {
+            name: "feed".into(),
+            provider: CalendarProviderKind::IcsUrl,
+            url,
+            allow_private_network: true,
+            ..CalendarAccount::default()
+        };
+        let backend = IcsUrlBackend::new(&account, admission());
+        let (from, to) = window();
+        let result = backend.list_events(from, to, "").await;
+        task.abort();
+        result.unwrap()
+    }
+
+    /// Regression: this assertion fails on main because the complete empty feed
+    /// remains Snapshot and the host rejects it as a suspicious empty response.
+    #[tokio::test]
+    async fn tombstone_only_feed_is_a_reset() {
+        let page = fetch(TOMBSTONE_ONLY).await;
+
+        assert_eq!(page.mode(), PageMode::Reset);
+        assert!(page.events().is_empty());
+    }
+
+    /// Positive control: an empty feed without effective tombstones stays guarded.
+    #[tokio::test]
+    async fn empty_feed_stays_a_snapshot() {
+        let page = fetch(EMPTY_CALENDAR).await;
+
+        assert_eq!(page.mode(), PageMode::Snapshot);
+        assert!(page.events().is_empty());
     }
 }
