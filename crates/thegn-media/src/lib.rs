@@ -69,6 +69,12 @@ pub use platform::linux::mpris::{MprisWatch, MprisZbus};
 #[cfg(target_os = "linux")]
 pub use platform::linux::mpris_cli::MprisCli;
 
+/// The host's time budget for one media operation (client resolution,
+/// preflight read, mutation, and post-op read). Backends with multi-stage
+/// mutations size their internal deadlines from it so a stage's reconcile
+/// always finishes before the host gives up.
+pub const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
+
 /// What went wrong talking to a player. Callers can distinguish a healthy empty
 /// listing from a transport or provider failure and surface this display text.
 /// Hand-rolled `Display` (no `thiserror` dep), mirroring `thegn_core::ci::CiError`.
