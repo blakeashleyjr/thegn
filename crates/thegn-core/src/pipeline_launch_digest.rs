@@ -23,15 +23,21 @@ pub struct StageConfigDrift {
     pub stage: String,
     /// The agent requested for that stage.
     pub agent: String,
+    /// Why the launch configuration could not be recomputed, when applicable.
+    pub detail: Option<String>,
 }
 
 impl std::fmt::Display for StageConfigDrift {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "stage launch refused: the configuration for pipeline stage `{}` (agent `{}`) changed between claim and launch; retry the dispatch",
+            "stage launch refused: the configuration for pipeline stage `{}` (agent `{}`) changed between claim and launch",
             self.stage, self.agent
-        )
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        write!(f, "; retry the dispatch")
     }
 }
 
@@ -94,16 +100,16 @@ pub fn check_stage_launch(
     let Some(presented) = presented else {
         return Ok(());
     };
-    let matches =
-        stage_launch_digest(cfg, agent, stage).is_ok_and(|expected| expected == presented);
-    if matches {
-        Ok(())
-    } else {
-        Err(StageConfigDrift {
-            stage: stage.trim().to_string(),
-            agent: agent.trim().to_string(),
-        })
-    }
+    let detail = match stage_launch_digest(cfg, agent, stage) {
+        Ok(expected) if expected == presented => return Ok(()),
+        Ok(_) => None,
+        Err(error) => Some(error),
+    };
+    Err(StageConfigDrift {
+        stage: stage.trim().to_string(),
+        agent: agent.trim().to_string(),
+        detail,
+    })
 }
 
 #[cfg(test)]
@@ -226,6 +232,19 @@ mod tests {
             stage_launch_digest(&first, "worker", "ab").expect("first"),
             stage_launch_digest(&second, "worker", "a").expect("second")
         );
+
+        let mut env_first = config("review", "worker");
+        env_first.pipeline.stages[0]
+            .env
+            .insert("AB".into(), "C".into());
+        let mut env_second = config("review", "worker");
+        env_second.pipeline.stages[0]
+            .env
+            .insert("A".into(), "BC".into());
+        assert_ne!(
+            stage_launch_digest(&env_first, "worker", "review").expect("first env boundary"),
+            stage_launch_digest(&env_second, "worker", "review").expect("second env boundary")
+        );
     }
 
     #[test]
@@ -254,6 +273,18 @@ mod tests {
         let unknown = check_stage_launch(&cfg, "worker", "missing", Some(zeros.as_str()))
             .expect_err("unresolvable config refuses");
         assert!(unknown.to_string().contains("missing"));
+        assert!(
+            unknown
+                .to_string()
+                .contains("unknown pipeline stage `missing`"),
+            "recompute reason was dropped: {unknown}"
+        );
+        let missing_agent = check_stage_launch(&cfg, "missing", "review", Some(zeros.as_str()))
+            .expect_err("removed agent refuses");
+        assert!(
+            missing_agent.to_string().contains("unknown agent"),
+            "recompute reason was dropped: {missing_agent}"
+        );
     }
 
     #[test]
