@@ -18,7 +18,8 @@ use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::store::WorktreeAuxStore;
 
 const GATE: &str = "if [ -f red-gate-marker ]; then printf 'private-red-gate\\n'; exit 1; fi; printf 'private-green-gate\\n'";
-const HOLD: &str = "sandbox could not be established for the queue task (infrastructure failure); the branch is not at fault";
+// The credential-free queue-agent hold (THE-419): no sandbox, and autonomous agents never fall back to the host.
+const HOLD: &str = "no sandbox could be established for the queued agent in ";
 
 fn lexical_tool(name: &str) -> PathBuf {
     let found = PathBuf::from(
@@ -530,7 +531,9 @@ fn exercise(case: Case) {
     assert_eq!(blocked.status, "agent_blocked");
     assert_eq!(blocked.agent_attempts, 1);
     assert!(blocked.result_oid.is_none() && blocked.conflict_paths.is_none());
-    assert_eq!(blocked.error_detail.as_deref(), Some(HOLD));
+    let detail = blocked.error_detail.as_deref().unwrap_or_default();
+    assert!(detail.starts_with(HOLD), "{detail}");
+    assert!(detail.contains("never fall back to the host"), "{detail}");
     assert_eq!(blocked.queued_at, old.queued_at);
     assert_eq!(blocked.worktree, old.worktree);
     assert_eq!(blocked.branch, old.branch);

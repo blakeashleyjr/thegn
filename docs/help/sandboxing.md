@@ -394,6 +394,13 @@ still holds the entry as an infrastructure failure and never marks the branch
 failed. Set `[sandbox] isolation_floor = "off"` or disable the sandbox to run
 queue agents uncontained.
 
+Queue agents (merge and PR fixers, CI autofix, headless review and review
+tasks) run credential-free, like autopilot: their environment and their
+sandbox's `env_passthrough` drop token, key, password, secret, agent-socket and
+GPG-agent variables. With `agent_sandbox` on, a queue agent whose sandbox
+cannot be established is held; it never falls back to the host. Interactive
+panes are unchanged.
+
 ## Choosing per worktree
 
 The `Alt-w` "what to run" picker offers the sandbox choice when
