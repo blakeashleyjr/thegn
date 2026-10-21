@@ -468,7 +468,28 @@ pub fn claim_spare(
     let derived = crate::agent::provider_sandbox_name(cfg, worktree, env_name);
     let repo = repo_root.to_string_lossy().into_owned();
     let db = thegn_core::db::Db::open().ok()?;
-    let (name, checkpoint) = db.claim_pool_spare(&repo, env_name, worktree).ok()??;
+    let (name, checkpoint) = db.begin_pool_spare_claim(&repo, env_name).ok()??;
+    let _spare_lease = {
+        let mut retries = 0;
+        loop {
+            match crate::pool_lease::spare_lease(&name) {
+                Ok(lease) => break lease,
+                Err(crate::pool_lease::LeaseError::Busy) if retries < 3 => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => {
+                    quarantine_claim_failure(
+                        &db,
+                        &name,
+                        worktree,
+                        &format!("could not acquire spare lease: {error}"),
+                    );
+                    return None;
+                }
+            }
+        }
+    };
     // The claimed spare's provisioned-base checkpoint rides its pool row; the
     // recycle paths (stale reconcile / worktree delete) restore from it.
     tracing::debug!(
@@ -542,23 +563,146 @@ pub fn claim_spare(
         .iter()
         .map(|s| s.replace("{id}", &name))
         .collect();
-    if !prefix.is_empty() {
+    let original_location = match db.location_for(worktree) {
+        Ok(location) => location,
+        Err(error) => {
+            quarantine_claim_failure(
+                &db,
+                &name,
+                worktree,
+                &format!("could not read prior control location: {error:#}"),
+            );
+            return None;
+        }
+    };
+    use thegn_core::store::PlacementStore;
+    let original_tenancy = match db.tenancy_for(&name) {
+        Ok(row) => row.map(|row| row.worktree),
+        Err(error) => {
+            quarantine_claim_failure(
+                &db,
+                &name,
+                worktree,
+                &format!("could not read prior tenancy binding: {error:#}"),
+            );
+            return None;
+        }
+    };
+    let location_result = if !prefix.is_empty() {
         let loc = thegn_core::remote::GitLoc::provider_db_string(&prefix, &workdir);
-        // best-effort: a missed rebind heals on the worktree's next open.
-        let _ = db.set_worktree_location(worktree, &loc);
-    }
-    // Placement-engine accounting: if this spare holds a tenancy row (spares
-    // minted onto engine-managed hosts), rebind it to the claiming worktree —
-    // same sandbox, same host, amounts unchanged. No-op otherwise.
-    {
-        use thegn_core::store::PlacementStore;
-        let _ = db.tenancy_rebind(&name, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        db.set_worktree_location(worktree, &loc)
+    } else {
+        Ok(())
+    };
+    let tenancy_result = db.tenancy_rebind(&name, worktree);
+    match finish_claim_rebinds(
+        &db,
+        &name,
+        worktree,
+        &location_result,
+        &tenancy_result,
+        original_location.as_deref(),
+        original_tenancy.as_deref(),
+    ) {
+        ClaimPublish::Publish => {
+            if let Err(error) = db.publish_pool_spare_claim(&name, worktree) {
+                restore_claim_rebinds(
+                    &db,
+                    &name,
+                    worktree,
+                    original_location.as_deref(),
+                    original_tenancy.as_deref(),
+                );
+                quarantine_claim_failure(
+                    &db,
+                    &name,
+                    worktree,
+                    &format!("claim publication failed: {error:#}"),
+                );
+                return None;
+            }
+        }
+        ClaimPublish::Quarantine(reason) => {
+            quarantine_claim_failure(&db, &name, worktree, &reason);
+            return None;
+        }
     }
     thegn_core::msg::info(&format!("claimed warm spare {name} for {worktree}"));
     // The claim consumed this spare — refill the pool now rather than waiting for
     // the next ~8s maintainer tick to notice the gap (off-loop, its own thread).
     crate::lifecycle::refill_pool_after_claim(cfg, worktree);
     Some(name)
+}
+
+fn restore_claim_rebinds(
+    db: &thegn_core::db::Db,
+    name: &str,
+    worktree: &str,
+    location: Option<&str>,
+    tenancy_worktree: Option<&str>,
+) {
+    if let Err(error) = db.restore_worktree_location(worktree, location) {
+        tracing::warn!(target: "thegn::lifecycle", %name, %worktree, %error, "failed to restore worktree location after warm-pool claim failure");
+    }
+    if let Some(previous_worktree) = tenancy_worktree {
+        use thegn_core::store::PlacementStore;
+        if let Err(error) = db.tenancy_rebind(name, previous_worktree) {
+            tracing::warn!(target: "thegn::lifecycle", %name, %previous_worktree, %error, "failed to restore tenancy binding after warm-pool claim failure");
+        }
+    }
+}
+
+fn finish_claim_rebinds(
+    db: &thegn_core::db::Db,
+    name: &str,
+    worktree: &str,
+    location: &anyhow::Result<()>,
+    tenancy: &anyhow::Result<()>,
+    previous_location: Option<&str>,
+    previous_tenancy_worktree: Option<&str>,
+) -> ClaimPublish {
+    let decision = claim_publish_decision(location, tenancy);
+    if matches!(&decision, ClaimPublish::Quarantine(_)) {
+        restore_claim_rebinds(
+            db,
+            name,
+            worktree,
+            previous_location,
+            previous_tenancy_worktree,
+        );
+    }
+    decision
+}
+
+enum ClaimPublish {
+    Publish,
+    Quarantine(String),
+}
+
+fn claim_publish_decision(
+    location: &anyhow::Result<()>,
+    tenancy: &anyhow::Result<()>,
+) -> ClaimPublish {
+    if let Err(error) = location {
+        ClaimPublish::Quarantine(format!("control-location rebind failed: {error:#}"))
+    } else if let Err(error) = tenancy {
+        ClaimPublish::Quarantine(format!("tenancy rebind failed: {error:#}"))
+    } else {
+        ClaimPublish::Publish
+    }
+}
+
+fn quarantine_claim_failure(db: &thegn_core::db::Db, name: &str, worktree: &str, reason: &str) {
+    let quarantine_status = match db.quarantine_pool_spare(name, "claiming") {
+        Ok(()) => "the spare is quarantined".to_string(),
+        Err(error) => {
+            tracing::warn!(target: "thegn::lifecycle", %name, error = %error, "failed to quarantine warm-pool claim");
+            format!("quarantine failed ({error:#})")
+        }
+    };
+    thegn_core::msg::warn(&format!(
+        "warm pool: claim of spare {name} for {worktree} failed ({reason}); {quarantine_status} and a fresh sandbox will be provisioned"
+    ));
 }
 
 /// On-open location rebind: build the `GitLoc` for the freshly RESOLVED
@@ -663,6 +807,93 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn claim_publish_decision_quarantines_any_failed_rebind() {
+        assert!(matches!(
+            claim_publish_decision(&Ok(()), &Ok(())),
+            ClaimPublish::Publish
+        ));
+
+        let location_error = anyhow::anyhow!("location denied");
+        match claim_publish_decision(&Err(location_error), &Ok(())) {
+            ClaimPublish::Quarantine(reason) => assert!(reason.contains("location denied")),
+            ClaimPublish::Publish => panic!("failed location rebind must quarantine"),
+        }
+
+        let tenancy_error = anyhow::anyhow!("tenancy denied");
+        assert!(matches!(
+            claim_publish_decision(&Ok(()), &Err(tenancy_error)),
+            ClaimPublish::Quarantine(_)
+        ));
+    }
+
+    #[test]
+    fn tenancy_rebind_failure_restores_location_and_tenancy() {
+        use thegn_core::capacity::ResourceReq;
+        use thegn_core::host::HostId;
+        use thegn_core::store::{PlacementStore, TenancyMode, TenancyRow, TenancyState};
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let worktree = "/wt/claim-rollback";
+        let previous_location = "old-location";
+        db.put_worktree(
+            "tab",
+            "/repo",
+            worktree,
+            "feat",
+            Some(previous_location),
+            None,
+        )
+        .unwrap();
+        db.set_worktree_location(worktree, "spare-location")
+            .unwrap();
+        db.tenancy_force(
+            &TenancyRow {
+                sandbox: "spare-rollback".into(),
+                host: HostId::named("test"),
+                worktree: "/wt/original".into(),
+                zone: String::new(),
+                mode: TenancyMode::Packed,
+                req: ResourceReq {
+                    cpu_floor_milli: 1,
+                    mem_floor_mb: 1,
+                    cpu_ceiling_milli: None,
+                    mem_ceiling_mb: None,
+                },
+                state: TenancyState::Reserved,
+                reserved_at: 0,
+                activated_at: None,
+                released_at: None,
+            },
+            0,
+        )
+        .unwrap();
+        db.tenancy_rebind("spare-rollback", worktree).unwrap();
+
+        let failure = anyhow::anyhow!("injected tenancy failure");
+        assert!(matches!(
+            finish_claim_rebinds(
+                &db,
+                "spare-rollback",
+                worktree,
+                &Ok(()),
+                &Err(failure),
+                Some(previous_location),
+                Some("/wt/original"),
+            ),
+            ClaimPublish::Quarantine(_)
+        ));
+
+        assert_eq!(
+            db.location_for(worktree).unwrap().as_deref(),
+            Some(previous_location)
+        );
+        assert_eq!(
+            db.tenancy_for("spare-rollback").unwrap().unwrap().worktree,
+            "/wt/original"
+        );
+    }
 
     #[test]
     fn rebind_resolved_location_persists_only_remote_diffs() {

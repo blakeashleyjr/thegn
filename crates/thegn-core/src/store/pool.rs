@@ -56,6 +56,23 @@ pub trait PoolStore {
         worktree: &str,
     ) -> Result<Option<(String, Option<String>)>>;
 
+    /// Move the oldest ready spare for `(repo, env)` to `claiming` without
+    /// binding it to a worktree. Returns the selected `(sandbox_name,
+    /// checkpoint_id)`, or `None` when no ready spare exists.
+    fn begin_pool_spare_claim(
+        &self,
+        repo: &str,
+        env: &str,
+    ) -> Result<Option<(String, Option<String>)>>;
+
+    /// Publish a previously begun claim by moving exactly one `claiming` row
+    /// to `claimed` and binding its sandbox to `worktree` in one transaction.
+    fn publish_pool_spare_claim(&self, name: &str, worktree: &str) -> Result<()>;
+
+    /// Quarantine exactly one spare currently in `expected_state` so it is
+    /// neither claimable nor counted by pool reconciliation.
+    fn quarantine_pool_spare(&self, name: &str, expected_state: &str) -> Result<()>;
+
     /// The pool-spare row for one sandbox name (any state), or `None`.
     fn pool_spare_by_name(&self, name: &str) -> Result<Option<PoolSpare>>;
 

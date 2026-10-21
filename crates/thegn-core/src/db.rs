@@ -1098,13 +1098,15 @@ pub use crate::models::{ForwardRow, ShareRow};
 
 /// One pre-provisioned spare in the warm pool (`pool_spares`). A spare is created
 /// generically (not bound to a worktree), fully provisioned + checkpointed, then
-/// `claimed` by a new worktree which binds it via `worktrees.provider_sandbox_id`.
+/// `claiming` during handoff and `claimed` after publication. Claimed rows bind
+/// via `worktrees.provider_sandbox_id`. Quarantined spares are never claimed or
+/// counted and are left for the operator (no automatic destroy).
 #[derive(Debug, Clone)]
 pub struct PoolSpare {
     pub sandbox_name: String,
     pub repo_path: String,
     pub env_name: String,
-    /// `"provisioning"` | `"ready"` | `"claimed"`.
+    /// `"provisioning"` | `"ready"` | `"claiming"` | `"claimed"` | `"quarantined"`.
     pub state: String,
     pub checkpoint_id: Option<String>,
     pub lock_hash: Option<String>,
