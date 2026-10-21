@@ -69,7 +69,9 @@ pub enum Action {
         /// exit stamps THIS row and not a sibling stage's.
         #[arg(long)]
         session: Option<String>,
-        /// Path to the handoff artifact committed in the worktree.
+        /// Path to the handoff artifact. A pipeline row's handoff is
+        /// `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`; it is assigned
+        /// automatically when omitted, and any other path never verifies.
         #[arg(long)]
         artifact: Option<String>,
         /// The chunk file this row dispatches under (`.thegn/pipeline/<ISSUE>/
@@ -127,9 +129,10 @@ pub enum Action {
         /// configured `concurrency` is the budget enforced here.
         #[arg(long)]
         stage: String,
-        /// Path to the handoff artifact this row will produce. This is what
-        /// distinguishes parallel chunks from a re-dispatch — give each
-        /// concurrent worker its own.
+        /// Path to the handoff artifact this row will produce. A pipeline
+        /// row's handoff is `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`; it is
+        /// assigned automatically when omitted, and any other path never
+        /// verifies.
         #[arg(long)]
         artifact: Option<String>,
         /// The roster row this one was chunked out of.
@@ -1625,6 +1628,8 @@ fn verify_facts_with_report_head(
         return pipeline_run::VerifyFacts {
             stage: row.stage.clone(),
             artifact: None,
+            artifact_identity: pipeline_run::ArtifactIdentity::NotPipeline,
+            artifact_empty: false,
             exists: false,
             tracked: false,
             dirty: false,
@@ -1651,6 +1656,21 @@ fn verify_facts_with_report_head(
         .join(&artifact)
         .symlink_metadata()
         .is_ok_and(|m| m.is_file());
+    let artifact_empty = wt
+        .join(&artifact)
+        .symlink_metadata()
+        .is_ok_and(|m| m.is_file() && m.len() == 0);
+    let artifact_identity = match row.stage.as_deref() {
+        None => pipeline_run::ArtifactIdentity::NotPipeline,
+        Some(stage) => {
+            let expected = pipeline_run::artifact_path(&row.issue_id, stage, row.id);
+            if artifact == expected {
+                pipeline_run::ArtifactIdentity::Canonical
+            } else {
+                pipeline_run::ArtifactIdentity::Mismatch { expected }
+            }
+        }
+    };
     let tracked_in_index = git_ok(
         wt,
         &["ls-files", "--error-unmatch", "--", artifact.as_str()],
@@ -1674,6 +1694,8 @@ fn verify_facts_with_report_head(
     let mut facts = pipeline_run::VerifyFacts {
         stage: row.stage.clone(),
         artifact: Some(artifact),
+        artifact_identity,
+        artifact_empty,
         exists,
         tracked,
         dirty,
@@ -1815,6 +1837,11 @@ fn reap_facts(
         report_verdict: f.report_verdict,
         report_gate_valid: f.report_gate_valid,
         worktree_unknown: f.worktree_state == Some(pipeline_run::WorktreeState::Unknown),
+        artifact_ok: f.stage.is_none()
+            || (matches!(
+                &f.artifact_identity,
+                pipeline_run::ArtifactIdentity::Canonical
+            ) && !f.artifact_empty),
     }
 }
 
@@ -2932,9 +2959,9 @@ mod tests {
         let (_dir, db) = db("wake-missing-artifact");
         let (_worktree_dir, worktree) = git_repo("wake-worktree");
         let id = db
-            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+            .put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                 stage: Some("code"),
-                artifact_path: Some("handoff.md"),
+                artifact_path: None,
                 ..thegn_core::issue::NewDispatch::new(
                     "linear:THE-253",
                     worktree.to_str().unwrap(),
@@ -2954,7 +2981,8 @@ mod tests {
             run_gen: run.run_gen,
         };
         let (outcome, _, artifact) = wake_handoff(Ok(db), &target);
-        assert_eq!(artifact.as_deref(), Some("handoff.md"));
+        let expected = pipeline_run::artifact_path("linear:THE-253", "code", id);
+        assert_eq!(artifact.as_deref(), Some(expected.as_str()));
         assert_eq!(outcome, pipeline_run::HandoffOutcome::Absent);
         assert!(!outcome.handoff_present(), "assigned path is not a handoff");
     }
@@ -3020,13 +3048,10 @@ mod tests {
     fn committed_artifact_and_report_are_verified_for_the_selected_run() {
         let (_dir, db) = db("wake-verified-artifact");
         let (_worktree_dir, worktree) = git_repo("wake-verified-worktree");
-        std::fs::write(worktree.join("handoff.md"), "# finished\n").unwrap();
-        assert!(git_ok(&worktree, &["add", "--", "handoff.md"]));
-        assert!(git_ok(&worktree, &["commit", "-q", "-m", "handoff"]));
         let id = db
-            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+            .put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                 stage: Some("code"),
-                artifact_path: Some("handoff.md"),
+                artifact_path: None,
                 ..thegn_core::issue::NewDispatch::new(
                     "linear:THE-253",
                     worktree.to_str().unwrap(),
@@ -3034,6 +3059,12 @@ mod tests {
                 )
             })
             .unwrap();
+        let artifact = pipeline_run::artifact_path("linear:THE-253", "code", id);
+        let artifact_path = worktree.join(&artifact);
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "# finished\n").unwrap();
+        assert!(git_ok(&worktree, &["add", "--", artifact.as_str()]));
+        assert!(git_ok(&worktree, &["commit", "-q", "-m", "handoff"]));
         db.bind_dispatch_session(id, "session-253").unwrap();
         write_report(
             &db,
@@ -3067,18 +3098,10 @@ mod tests {
     fn a_report_bound_to_a_newer_commit_is_not_a_verified_wake_handoff() {
         let (_dir, db) = db("wake-stale-report-commit");
         let (_worktree_dir, worktree) = git_repo("wake-stale-report-worktree");
-        std::fs::write(worktree.join("handoff.md"), "version one\n").unwrap();
-        assert!(git_ok(&worktree, &["add", "--", "handoff.md"]));
-        assert!(git_ok(&worktree, &["commit", "-q", "-m", "artifact one"]));
-        let first =
-            thegn_core::util::git_out_allow_empty(&worktree, &["rev-parse", "HEAD"]).unwrap();
-        std::fs::write(worktree.join("handoff.md"), "version two\n").unwrap();
-        assert!(git_ok(&worktree, &["add", "--", "handoff.md"]));
-        assert!(git_ok(&worktree, &["commit", "-q", "-m", "artifact two"]));
         let id = db
-            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+            .put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                 stage: Some("code"),
-                artifact_path: Some("handoff.md"),
+                artifact_path: None,
                 ..thegn_core::issue::NewDispatch::new(
                     "linear:THE-253",
                     worktree.to_str().unwrap(),
@@ -3086,6 +3109,17 @@ mod tests {
                 )
             })
             .unwrap();
+        let artifact = pipeline_run::artifact_path("linear:THE-253", "code", id);
+        let artifact_path = worktree.join(&artifact);
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "version one\n").unwrap();
+        assert!(git_ok(&worktree, &["add", "--", artifact.as_str()]));
+        assert!(git_ok(&worktree, &["commit", "-q", "-m", "artifact one"]));
+        let first =
+            thegn_core::util::git_out_allow_empty(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(&artifact_path, "version two\n").unwrap();
+        assert!(git_ok(&worktree, &["add", "--", artifact.as_str()]));
+        assert!(git_ok(&worktree, &["commit", "-q", "-m", "artifact two"]));
         db.bind_dispatch_session(id, "session-stale-report")
             .unwrap();
         write_report(
@@ -3877,7 +3911,7 @@ mod tests {
     fn row_in(root: &std::path::Path, artifact: Option<&str>) -> AgentDispatch {
         AgentDispatch {
             id: 7,
-            issue_id: "linear:A-1".into(),
+            issue_id: "linear:THE-76".into(),
             worktree_path: root.to_string_lossy().into_owned(),
             agent_name: "coder".into(),
             dispatched_at_ms: 0,
@@ -4058,16 +4092,21 @@ mod tests {
     fn committed_artifact_with_fail_report_cannot_be_completed_or_reaped_done() {
         let (_db_dir, db) = db("fail-report-done-gate");
         let (_worktree_dir, root) = git_repo("fail-report-worktree");
-        commit_artifact(&root);
         let id = db
             .put_agent_dispatch(NewDispatch {
                 stage: Some("code"),
-                artifact_path: Some(ARTIFACT),
+                artifact_path: None,
                 ..NewDispatch::new("linear:THE-269", root.to_str().unwrap(), "coder")
             })
             .unwrap();
+        let artifact = pipeline_run::artifact_path("linear:THE-269", "code", id);
+        let path = root.join(&artifact);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "# handoff").unwrap();
+        assert!(git_ok(&root, &["add", "--", artifact.as_str()]));
+        assert!(git_ok(&root, &["commit", "-q", "-m", "artifact"]));
         let run = db
-            .publish_dispatch_run(id, "fail-session", ARTIFACT)
+            .publish_dispatch_run(id, "fail-session", &artifact)
             .unwrap();
         assert_eq!(run, thegn_core::issue::DispatchRunPublishOutcome::Published);
         write_report(&db, id, "FAIL: tests failed", false).unwrap();
@@ -4516,6 +4555,8 @@ mod tests {
         let facts = pipeline_run::VerifyFacts {
             stage: Some("code".into()),
             artifact: Some("artifact.md".into()),
+            artifact_identity: pipeline_run::ArtifactIdentity::Canonical,
+            artifact_empty: false,
             exists: true,
             tracked: true,
             dirty: false,
@@ -4535,6 +4576,8 @@ mod tests {
         let facts = pipeline_run::VerifyFacts {
             stage: Some("code".into()),
             artifact: Some("artifact.md".into()),
+            artifact_identity: pipeline_run::ArtifactIdentity::Canonical,
+            artifact_empty: false,
             exists: true,
             tracked: true,
             dirty: false,
@@ -4727,6 +4770,93 @@ mod tests {
         assert_eq!(
             recorded.ungated,
             pipeline_report::pass_without_gate_evidence(&recorded.validated)
+        );
+    }
+
+    fn commit_test_file(root: &std::path::Path, path: &str, contents: &str) {
+        let full_path = root.join(path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full_path, contents).unwrap();
+        assert!(git_ok(root, &["add", "--", path]));
+        assert!(git_ok(root, &["commit", "-q", "-m", "artifact"]));
+    }
+
+    #[test]
+    fn canonical_artifact_readme_is_not_a_handoff() {
+        let (_dir, root) = git_repo("canonical-readme");
+        commit_test_file(&root, "README.md", "# unrelated\n");
+        let mut row = row_in(&root, Some("README.md"));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(error.contains("not this row's handoff"), "{error}");
+    }
+
+    #[test]
+    fn canonical_artifact_prior_row_handoff_is_refused() {
+        let (_dir, root) = git_repo("canonical-prior-row");
+        let prior = ".thegn/pipeline/THE-76/code/6.md";
+        commit_test_file(&root, prior, "# prior row\n");
+        let mut row = row_in(&root, Some(prior));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(error.contains("not this row's handoff"), "{error}");
+    }
+
+    #[test]
+    fn canonical_artifact_other_stage_is_refused() {
+        let (_dir, root) = git_repo("canonical-other-stage");
+        let other_stage = ".thegn/pipeline/THE-76/review/7.md";
+        commit_test_file(&root, other_stage, "# other stage\n");
+        let mut row = row_in(&root, Some(other_stage));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(error.contains("not this row's handoff"), "{error}");
+    }
+
+    #[test]
+    fn canonical_artifact_other_issue_is_refused() {
+        let (_dir, root) = git_repo("canonical-other-issue");
+        let other_issue = ".thegn/pipeline/THE-77/code/7.md";
+        commit_test_file(&root, other_issue, "# other issue\n");
+        let mut row = row_in(&root, Some(other_issue));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(error.contains("not this row's handoff"), "{error}");
+    }
+
+    #[test]
+    fn canonical_artifact_empty_committed_file_is_refused() {
+        let (_dir, root) = git_repo("canonical-empty");
+        commit_test_file(&root, ARTIFACT, "");
+        let mut row = row_in(&root, Some(ARTIFACT));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(error.contains("is empty"), "{error}");
+    }
+
+    #[test]
+    fn canonical_artifact_committed_handoff_verifies() {
+        let (_dir, root) = git_repo("canonical-handoff");
+        commit_artifact(&root);
+        let mut row = row_in(&root, Some(ARTIFACT));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        done_gate(&row).unwrap();
+    }
+
+    #[test]
+    fn reap_plan_does_not_close_a_committed_readme_as_a_handoff() {
+        let (_dir, root) = git_repo("reap-readme");
+        commit_test_file(&root, "README.md", "# unrelated\n");
+        let mut row = row_in(&root, Some("README.md"));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        row.exit_code = Some(0);
+        let plan = reap_plan_rows(&[row], Some(&[]));
+        assert_eq!(plan.len(), 1);
+        assert!(
+            !matches!(&plan[0].verdict, pipeline_reap::ReapVerdict::CloseDone),
+            "a committed non-canonical artifact must not be reaped done"
         );
     }
 }
