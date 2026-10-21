@@ -53,6 +53,51 @@ pub(crate) fn force_headless_unsupported() -> impl Drop {
     Reset
 }
 
+/// Name configured headless agent settings that cannot run on this platform.
+/// These are advisory because the queues hold the work for a human instead.
+pub(crate) fn headless_settings_warnings(cfg: &thegn_core::config::Config) -> Vec<String> {
+    let Some(reason) = headless_unsupported() else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    for (section, agent, agent_command, enabled) in [
+        (
+            "[merge_queue]",
+            cfg.merge_queue.agent.trim(),
+            cfg.merge_queue.agent_command.trim(),
+            true,
+        ),
+        (
+            "[pr_queue]",
+            cfg.pr_queue.agent.trim(),
+            cfg.pr_queue.agent_command.trim(),
+            true,
+        ),
+        (
+            "[autopilot]",
+            cfg.autopilot.agent.trim(),
+            cfg.autopilot.agent_command.trim(),
+            cfg.autopilot.enabled,
+        ),
+    ] {
+        let mut configured = Vec::new();
+        if enabled && !agent.is_empty() {
+            configured.push("agent");
+        }
+        if enabled && !agent_command.is_empty() {
+            configured.push("agent_command");
+        }
+        if !configured.is_empty() {
+            warnings.push(format!(
+                "{section} agent settings are configured, but {reason}: the queue holds work for a human instead of running the agent (configured keys: {})",
+                configured.join(", ")
+            ));
+        }
+    }
+    warnings
+}
+
 #[cfg(any(unix, test))]
 const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
 
@@ -2401,5 +2446,59 @@ mod tests {
             assert!(production.contains("credential_free: true"));
             assert!(!production.contains("credential_free: false"));
         }
+    }
+
+    #[test]
+    fn headless_settings_warnings_name_each_configured_queue() {
+        let _unsupported = force_headless_unsupported();
+        let cfg = thegn_core::config::Config {
+            merge_queue: thegn_core::config::MergeQueueConfig {
+                agent_command: "claude -p {prompt}".into(),
+                ..Default::default()
+            },
+            pr_queue: thegn_core::config::PrQueueConfig {
+                agent: "claude".into(),
+                ..Default::default()
+            },
+            autopilot: thegn_core::config::AutopilotConfig {
+                enabled: true,
+                agent: "claude".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let warnings = headless_settings_warnings(&cfg);
+
+        assert_eq!(warnings.len(), 3);
+        for (warning, (section, key)) in warnings.iter().zip([
+            ("[merge_queue]", "agent_command"),
+            ("[pr_queue]", "agent"),
+            ("[autopilot]", "agent"),
+        ]) {
+            assert!(warning.starts_with(section));
+            assert!(warning.contains("not supported on this platform"));
+            assert!(warning.contains(key));
+        }
+    }
+
+    #[test]
+    fn headless_settings_warnings_skip_unset_and_disabled() {
+        let _unsupported = force_headless_unsupported();
+        assert!(headless_settings_warnings(&thegn_core::config::Config::default()).is_empty());
+
+        let cfg = thegn_core::config::Config {
+            merge_queue: thegn_core::config::MergeQueueConfig {
+                agent_command: "   ".into(),
+                ..Default::default()
+            },
+            autopilot: thegn_core::config::AutopilotConfig {
+                enabled: false,
+                agent: "claude".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(headless_settings_warnings(&cfg).is_empty());
     }
 }
