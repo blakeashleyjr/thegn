@@ -405,21 +405,8 @@ pub fn remove_at(d: &Path, name: &str) {
     if let Err(error) = root.remove_file(&format!("{name}.json")) {
         tracing::debug!(target: "thegn::vps", %error, name, "unable to remove VPS registry record");
     }
-    match root.entry_exists_nofollow("known_hosts.d") {
-        Ok(true) => match thegn_core::fsperm::open_private_dir(&d.join("known_hosts.d")) {
-            Ok(known_hosts) => {
-                if let Err(error) = remove_pin_from_held_dir(&known_hosts, name) {
-                    tracing::debug!(target: "thegn::vps", %error, name, "unable to remove VPS known_hosts pin");
-                }
-            }
-            Err(error) => {
-                tracing::debug!(target: "thegn::vps", %error, name, "unable to open VPS known_hosts directory for removal")
-            }
-        },
-        Ok(false) => {}
-        Err(error) => {
-            tracing::debug!(target: "thegn::vps", %error, name, "unable to inspect VPS known_hosts directory")
-        }
+    if let Err(error) = remove_pin_in(&root, d, name) {
+        tracing::debug!(target: "thegn::vps", %error, name, "unable to remove VPS known_hosts pin");
     }
 }
 
