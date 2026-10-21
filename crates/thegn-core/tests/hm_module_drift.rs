@@ -163,6 +163,11 @@ fn module_src() -> String {
     .expect("nix/hm-module.nix")
 }
 
+fn declared_default(line: &str) -> Option<&str> {
+    line.strip_prefix("default = ")
+        .map(|value| value.strip_suffix(';').unwrap_or(value).trim())
+}
+
 fn strip_null_or(expr: &str) -> &str {
     let Some(inner) = expr.strip_prefix("lib.types.nullOr ") else {
         return expr;
@@ -235,11 +240,8 @@ fn every_value_option_defaults_to_null() {
                 index += 1;
                 break;
             }
-            if let Some(value) = option_trimmed
-                .strip_prefix("default = ")
-                .and_then(|value| value.strip_suffix(';'))
-            {
-                default = Some(value.trim());
+            if let Some(value) = declared_default(option_trimmed) {
+                default = Some(value);
             }
             offset += option_line.len() + 1;
             index += 1;
@@ -268,15 +270,38 @@ fn every_value_option_defaults_to_null() {
 }
 
 #[test]
+fn multiline_default_opening_line_is_recorded() {
+    assert_eq!(declared_default("default = ["), Some("["));
+    assert_eq!(declared_default("default = null;"), Some("null"));
+}
+
+#[test]
 fn generate_block_prunes_nulls() {
     let src = module_src();
     assert!(
-        src.contains("tomlFormat.generate \"thegn-config.toml\" (pruneNulls {"),
-        "generated config must recursively prune null values"
+        src.contains("tomlFormat.generate \"thegn-config.toml\" (pruneEmpty (pruneNulls {"),
+        "generated config must recursively prune null values and empty tables"
     );
     assert!(
         src.contains("pruneNulls = lib.filterAttrsRecursive (_: v: v != null);"),
         "the recursive prune predicate must remove null values"
+    );
+}
+
+#[test]
+fn generate_block_prunes_empty_tables_for_all_null_defaults() {
+    let src = module_src();
+    assert!(
+        src.contains("pruneEmpty = value:")
+            && src.contains("lib.mapAttrs (_: pruneEmpty) value")
+            && src.contains("lib.filterAttrs (_: v: v != {}) pruned"),
+        "empty attrsets must be recursively pruned after null values"
+    );
+    assert!(
+        src.contains("(pruneEmpty (pruneNulls {")
+            && src.contains("theme.accent = cfg.themeAccent;")
+            && src.contains("remote = {"),
+        "the all-null render must pass its nested config tables through pruneEmpty"
     );
 }
 
@@ -304,10 +329,31 @@ fn rendered_paths(src: &str) -> BTreeSet<String> {
     let block = &src[open + 1..end];
     let mut out = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
-    for raw in block.lines() {
-        let line = raw.trim();
+    let lines: Vec<&str> = block.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let mut line = lines[index].trim().to_string();
+        index += 1;
         if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+        // A Nix assignment may put its `if/then/else` expression on the next
+        // lines. Collect through the terminating semicolon before inspecting
+        // map/inherit expressions. These continuation keywords are never
+        // assignments even if their text contains `=` (e.g. `if x == null`).
+        if line.starts_with("if ") || line.starts_with("then ") || line.starts_with("else ") {
+            continue;
+        }
+        if line.ends_with('=') {
+            while index < lines.len() {
+                let continuation = lines[index].trim();
+                line.push(' ');
+                line.push_str(continuation);
+                index += 1;
+                if continuation.ends_with(';') {
+                    break;
+                }
+            }
         }
         let prefix = |k: &str| {
             let mut p = stack.clone();
@@ -359,6 +405,10 @@ fn rendered_paths(src: &str) -> BTreeSet<String> {
         }
     }
     assert!(out.len() > 20, "generate-block parse broke: {out:?}");
+    assert!(
+        out.contains("agents.name") && out.contains("actions.hint") && out.contains("projects_dir"),
+        "conditional assignments and list item keys must remain visible: {out:?}"
+    );
     out
 }
 
@@ -678,7 +728,6 @@ fn every_numeric_option_matches_its_destination_range() {
     );
 
     for (name, nix_type) in options {
-        let nix_type = strip_null_or(&nix_type);
         let path = expected
             .iter()
             .find_map(|(option, path)| (*option == name).then_some(*path))
