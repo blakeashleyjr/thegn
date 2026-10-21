@@ -404,7 +404,7 @@ floor, available class, and how to satisfy it. The refusal names the opt-outs:
 default floor was not applied. It also prints `containment` and `file access`
 lines, including a line such as
 `requested <scope> — NOT ENFORCED on <backend>: <note>` when file access is not
-enforced. It now prints separate `requested`, `resolved`, and `enforced`
+enforced. It prints separate `requested`, `resolved`, and `enforced`
 isolation lines, and `thegn doctor --json` includes the same layers in an
 `isolation` object. The floor also applies to standalone terminal tabs. If a
 terminal requests a backend with no runtime, it is refused under the default

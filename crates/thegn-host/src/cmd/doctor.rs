@@ -216,7 +216,7 @@ fn isolation_json(report: &thegn_core::sandbox_floor::IsolationReport) -> serde_
                 "default"
             },
             "on_floor_miss": report.requested.on_floor_miss.as_str(),
-            "file_access": report.requested.file_access.as_str(),
+            "file_access": thegn_core::sandbox_floor::file_access_str(report.requested.file_access),
         },
         "resolved": {
             "backend": report.resolved.backend.label(),
@@ -4474,7 +4474,7 @@ fn isolation_lines(report: &thegn_core::sandbox_floor::IsolationReport) -> [Stri
                 "default"
             },
             report.requested.on_floor_miss.as_str(),
-            report.requested.file_access.as_str(),
+            thegn_core::sandbox_floor::file_access_str(report.requested.file_access),
         ),
         format!(
             "  resolved      `{}` at `{}`",

@@ -29,6 +29,18 @@ use crate::sandbox::{Backend, BackendFamily};
 /// deliberate host execution choice.
 pub const DEFAULT_ISOLATION_FLOOR: IsolationFloor = IsolationFloor::SharedKernel;
 
+/// Stable machine-readable spelling for a requested filesystem scope.
+pub fn file_access_str(file_access: FileAccess) -> &'static str {
+    match file_access {
+        FileAccess::Worktree => "worktree",
+        FileAccess::WorktreePlusCaches => "worktree_plus_caches",
+        FileAccess::Custom => "custom",
+        FileAccess::All => "all",
+        FileAccess::Host => "host",
+        FileAccess::None => "none",
+    }
+}
+
 /// Resolve the floor that governs this launch. An explicit configured floor
 /// always wins, including over deliberate host choices.
 pub fn floor_in_force(sb: &SandboxConfig, host_pinned: bool) -> IsolationFloor {
@@ -276,14 +288,15 @@ pub fn isolation_report(
     best: IsolationClass,
 ) -> IsolationReport {
     let floor = floor_in_force(sb, false);
-    let decision = decide(floor, miss_policy_in_force(sb), actual, best);
+    let on_floor_miss = miss_policy_in_force(sb);
+    let decision = decide(floor, on_floor_miss, actual, best);
     IsolationReport {
         requested: IsolationRequest {
             profile: sb.profile,
             network: sb.network,
             floor,
             floor_configured: sb.isolation_floor.is_some(),
-            on_floor_miss: miss_policy_in_force(sb),
+            on_floor_miss,
             file_access: sb.file_access,
         },
         resolved: IsolationResolved {
@@ -1003,8 +1016,6 @@ mod tests {
 
     #[test]
     fn isolation_report_separates_request_resolution_and_enforcement() {
-        use crate::config::SandboxConfig;
-
         let sealed = SandboxConfig {
             profile: SandboxProfile::Sealed,
             ..SandboxConfig::default()
@@ -1057,6 +1068,19 @@ mod tests {
     }
 
     #[test]
+    fn isolation_report_file_access_spellings_cover_every_variant() {
+        assert_eq!(file_access_str(FileAccess::Worktree), "worktree");
+        assert_eq!(
+            file_access_str(FileAccess::WorktreePlusCaches),
+            "worktree_plus_caches"
+        );
+        assert_eq!(file_access_str(FileAccess::Custom), "custom");
+        assert_eq!(file_access_str(FileAccess::All), "all");
+        assert_eq!(file_access_str(FileAccess::Host), "host");
+        assert_eq!(file_access_str(FileAccess::None), "none");
+    }
+
+    #[test]
     fn isolation_report_floor_enforcement_covers_every_decision() {
         let miss = FloorMiss {
             floor: IsolationFloor::GuestKernel,
@@ -1086,6 +1110,14 @@ mod tests {
             floor_enforcement(IsolationFloor::GuestKernel, &FloorDecision::Fail(miss)),
             FloorEnforcement::MissedRefuse
         );
+        assert_eq!(FloorEnforcement::NoFloor.as_str(), "no-floor");
+        assert_eq!(FloorEnforcement::Met.as_str(), "met");
+        assert_eq!(
+            FloorEnforcement::ProviderUnverified.as_str(),
+            "provider-managed (unverified)"
+        );
+        assert_eq!(FloorEnforcement::MissedDegrade.as_str(), "missed-degrade");
+        assert_eq!(FloorEnforcement::MissedRefuse.as_str(), "missed-refuse");
     }
 
     #[test]
