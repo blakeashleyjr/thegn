@@ -8,10 +8,11 @@
 //! only — inherently excludes `target/` etc.), streamed over the placement's ssh
 //! control transport (which carries the configured `ProxyCommand`), `git clone`d
 //! there, then the working state (tracked diff + `.gitignore`-filtered untracked
-//! files) applied on top. Existing remote destinations are retained for explicit
-//! recovery. Completed destinations are refreshed from the current local state
-//! once per process, and a path is returned only after every materialization
-//! step succeeds.
+//! files) applied on top. New destinations are built in a sibling staging
+//! directory and promoted only after every materialization step succeeds.
+//! Existing remote destinations are retained for explicit recovery. Completed
+//! destinations are refreshed from the current local state once per process,
+//! and a path is returned only after every materialization step succeeds.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -145,11 +146,11 @@ fn q(s: &str) -> String {
 
 fn claim_command(slug: &str) -> String {
     format!(
-        "set -e; d=\"$HOME/thegn-worktrees\"/{slug}; marker=\"$d.thegn-incomplete\"; \
+        "set -e; d=\"$HOME/thegn-worktrees\"/{slug}; s=\"$d.thegn-staging\"; marker=\"$d.thegn-incomplete\"; \
          mkdir -p \"$(dirname \"$d\")\"; \
          set -C; \
-         if [ ! -e \"$d\" ] && : > \"$marker\" 2>/dev/null; then \
-              if mkdir \"$d\"; then printf 'NEW:%s' \"$d\"; \
+         if [ ! -e \"$d\" ] && [ ! -L \"$d\" ] && [ ! -e \"$s\" ] && [ ! -L \"$s\" ] && : > \"$marker\" 2>/dev/null; then \
+              if mkdir \"$s\"; then printf 'NEW:%s' \"$d\"; \
               else printf '%s' 'remote destination exists and was retained' >&2; exit 1; fi; \
          elif [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ ! -e \"$marker\" ] && \
               [ -e \"$d/.git\" ] && top=$(git -C \"$d\" rev-parse --show-cdup 2>/dev/null) && [ -z \"$top\" ] && \
@@ -178,7 +179,7 @@ fn should_apply_tracked_diff(worktree: &str) -> Result<bool, String> {
     }
 }
 
-fn restore_command(dir: &str, branch: &str, recursive_submodules: bool) -> String {
+fn restore_command(dir: &str, bundle: &str, branch: &str, recursive_submodules: bool) -> String {
     let restore = if branch.is_empty() || branch == "HEAD" {
         String::new()
     } else {
@@ -192,7 +193,23 @@ fn restore_command(dir: &str, branch: &str, recursive_submodules: bool) -> Strin
     } else {
         String::new()
     };
-    format!("set -e; {restore}{init}rm -f {d}.bundle", d = q(dir))
+    format!("set -e; {restore}{init}rm -f {bundle}", bundle = q(bundle))
+}
+
+fn promote_command(staging: &str, dir: &str) -> String {
+    format!(
+        "set -e; s={s}; d={d}; \
+         if [ -e \"$d\" ] || [ -L \"$d\" ] || [ -L \"$s\" ] || [ ! -d \"$s\" ]; then \
+              printf '%s' 'remote destination appeared during sync; staging retained for reconciliation' >&2; exit 1; \
+         fi; \
+         mv -- \"$s\" \"$d\"",
+        s = q(staging),
+        d = q(dir),
+    )
+}
+
+fn apply_diff_command(dir: &str) -> String {
+    format!("cd {d} && git apply --whitespace=nowarn -", d = q(dir))
 }
 
 fn refresh_command(dir: &str, branch: &str, recursive_submodules: bool) -> String {
@@ -337,7 +354,7 @@ pub(crate) fn apply_remote_sync_with(
         }
         Err(e) => {
             let warning = format!(
-                "remote worktree sync failed: {e}; after saving any work in it, manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.thegn-synced\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
+                "remote worktree sync failed: {e}; after saving any work in it, manual recovery on the remote host: run `rm -rf \"$HOME/thegn-worktrees/{0}\" \"$HOME/thegn-worktrees/{0}.thegn-staging\" \"$HOME/thegn-worktrees/{0}.thegn-incomplete\" \"$HOME/thegn-worktrees/{0}.thegn-synced\" \"$HOME/thegn-worktrees/{0}.bundle\"`, then retry",
                 spec.name
             );
             warnings.push(warning.clone());
@@ -423,6 +440,8 @@ fn sync_worktree_uncached(
     } else {
         return Err("remote destination claim returned an invalid response".to_string());
     };
+    let staging = format!("{dir}.thegn-staging");
+    let materialized_dir = if reused { &dir } else { &staging };
     if reused {
         warnings.push(format!(
             "reusing completed remote worktree at {dir} and syncing current local state"
@@ -445,7 +464,11 @@ fn sync_worktree_uncached(
     )?;
     if !reused {
         let (ok, _o, err) = runner.host_exec(
-            &format!("git clone -q {d}.bundle {d}", d = q(&dir)),
+            &format!(
+                "git clone -q {bundle} {staging}",
+                bundle = q(&format!("{dir}.bundle")),
+                staging = q(&staging),
+            ),
             secs(600),
         )?;
         if !ok {
@@ -462,7 +485,12 @@ fn sync_worktree_uncached(
         &if reused {
             refresh_command(&dir, &branch, recursive_submodules)
         } else {
-            restore_command(&dir, &branch, recursive_submodules)
+            restore_command(
+                &staging,
+                &format!("{dir}.bundle"),
+                &branch,
+                recursive_submodules,
+            )
         },
         secs(600),
     )?;
@@ -484,10 +512,7 @@ fn sync_worktree_uncached(
                 "--binary".into(),
                 "HEAD".into(),
             ],
-            &format!(
-                "cd {d} && git apply --whitespace=nowarn - 2>/dev/null",
-                d = q(&dir)
-            ),
+            &apply_diff_command(materialized_dir),
             secs(180),
         )?;
     }
@@ -502,9 +527,15 @@ fn sync_worktree_uncached(
                 wt = q(worktree),
             ),
         ],
-        &format!("tar -C {d} -xf -", d = q(&dir)),
+        &format!("tar -C {d} -xf -", d = q(materialized_dir)),
         secs(180),
     )?;
+    if !reused {
+        let (ok, _out, err) = runner.host_exec(&promote_command(&staging, &dir), secs(60))?;
+        if !ok {
+            return Err(format!("remote worktree promotion failed: {}", err.trim()));
+        }
+    }
     runner
         .host_exec(&record_command(&dir), secs(30))
         .and_then(|(ok, _out, err)| {
@@ -538,8 +569,9 @@ fn sync_worktree_uncached(
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncCache, apply_remote_sync_with, claim_command, plan_spec_before_ensure, record_command,
-        refresh_command, restore_command, should_apply_tracked_diff, sync_key, sync_once,
+        SyncCache, apply_diff_command, apply_remote_sync_with, claim_command,
+        plan_spec_before_ensure, promote_command, record_command, refresh_command, restore_command,
+        should_apply_tracked_diff, sync_key, sync_once,
     };
     use std::process::Command;
     use std::sync::{
@@ -611,7 +643,7 @@ mod tests {
         let command = claim_command("sandbox");
         let first = run_sh(&home, &command);
         assert!(first.status.success());
-        let marker = home.join("thegn-worktrees/sandbox/user-data");
+        let marker = home.join("thegn-worktrees/sandbox.thegn-staging/user-data");
         std::fs::write(&marker, b"keep").unwrap();
 
         let second = run_sh(&home, &command);
@@ -621,12 +653,116 @@ mod tests {
     }
 
     #[test]
+    fn new_destination_claim_creates_staging_not_destination() {
+        let home = temp_home("claim-staging");
+        let result = run_sh(&home, &claim_command("fresh"));
+        let destination = home.join("thegn-worktrees/fresh");
+        let staging = home.join("thegn-worktrees/fresh.thegn-staging");
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            format!("NEW:{}", destination.display())
+        );
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
+        assert!(home.join("thegn-worktrees/fresh.thegn-incomplete").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn new_destination_claim_refuses_leftover_staging() {
+        let home = temp_home("claim-staging-leftover");
+        let staging = home.join("thegn-worktrees/fresh.thegn-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let result = run_sh(&home, &claim_command("fresh"));
+        assert!(!result.status.success());
+        assert!(staging.is_dir());
+        assert!(!home.join("thegn-worktrees/fresh").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn promote_moves_staging_into_place() {
+        // Positive control for the new promotion helper.
+        let home = temp_home("promote");
+        let staging = home.join("thegn-worktrees/fresh.thegn-staging");
+        let destination = home.join("thegn-worktrees/fresh");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("payload"), b"ready").unwrap();
+        let result = run_sh(
+            &home,
+            &promote_command(staging.to_str().unwrap(), destination.to_str().unwrap()),
+        );
+        assert!(result.status.success());
+        assert_eq!(
+            std::fs::read(destination.join("payload"))
+                .unwrap()
+                .as_slice(),
+            b"ready"
+        );
+        assert!(!staging.exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn promote_refuses_existing_destination_and_keeps_staging() {
+        // Positive control for the new promotion helper's collision refusal.
+        let home = temp_home("promote-collision");
+        let staging = home.join("thegn-worktrees/fresh.thegn-staging");
+        let destination = home.join("thegn-worktrees/fresh");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("payload"), b"staged").unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("existing"), b"keep").unwrap();
+        let result = run_sh(
+            &home,
+            &promote_command(staging.to_str().unwrap(), destination.to_str().unwrap()),
+        );
+        assert!(!result.status.success());
+        assert_eq!(
+            std::fs::read(staging.join("payload")).unwrap().as_slice(),
+            b"staged"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("existing"))
+                .unwrap()
+                .as_slice(),
+            b"keep"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains(
+            "remote destination appeared during sync; staging retained for reconciliation"
+        ));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn apply_diff_command_reports_git_stderr() {
+        let home = temp_home("apply-stderr");
+        let checkout = home.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        run_git(&checkout, &["init", "-q"]);
+        let command = format!(
+            "printf 'not a patch' | ({})",
+            apply_diff_command(checkout.to_str().unwrap())
+        );
+        let result = run_sh(&home, &command);
+        assert!(!result.status.success());
+        assert!(!result.stderr.is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn restore_failures_stop_before_bundle_cleanup() {
         let home = temp_home("restore");
         let checkout_dir = home.join("checkout");
         let checkout_bundle = home.join("checkout.bundle");
         std::fs::write(&checkout_bundle, b"retain").unwrap();
-        let checkout = restore_command(checkout_dir.to_str().unwrap(), "main", true);
+        let checkout = restore_command(
+            checkout_dir.to_str().unwrap(),
+            checkout_bundle.to_str().unwrap(),
+            "main",
+            true,
+        );
         let checkout = format!("git() {{ return 41; }}; {checkout}");
         let checkout_result = run_sh(&home, &checkout);
         assert!(!checkout_result.status.success());
@@ -635,7 +771,12 @@ mod tests {
         let submodule_dir = home.join("submodule");
         let submodule_bundle = home.join("submodule.bundle");
         std::fs::write(&submodule_bundle, b"retain").unwrap();
-        let submodule = restore_command(submodule_dir.to_str().unwrap(), "", true);
+        let submodule = restore_command(
+            submodule_dir.to_str().unwrap(),
+            submodule_bundle.to_str().unwrap(),
+            "",
+            true,
+        );
         let submodule = format!("git() {{ return 41; }}; {submodule}");
         let submodule_result = run_sh(&home, &submodule);
         assert!(!submodule_result.status.success());
@@ -650,6 +791,11 @@ mod tests {
         let first = run_sh(&home, &command);
         assert!(first.status.success());
         let complete = home.join("thegn-worktrees/complete");
+        std::fs::rename(
+            home.join("thegn-worktrees/complete.thegn-staging"),
+            &complete,
+        )
+        .unwrap();
         run_git(&complete, &["init", "-q"]);
         std::fs::remove_file(home.join("thegn-worktrees/complete.thegn-incomplete")).unwrap();
         std::fs::write(home.join("thegn-worktrees/complete.bundle"), b"stale").unwrap();
@@ -1172,6 +1318,9 @@ mod tests {
                 .first()
                 .is_some_and(|warning| warning.starts_with("remote worktree sync failed: boom"))
         );
+        assert!(warnings.first().is_some_and(|warning| {
+            warning.contains("$HOME/thegn-worktrees/sandbox.thegn-staging")
+        }));
     }
 
     #[test]
