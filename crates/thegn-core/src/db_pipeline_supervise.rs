@@ -137,6 +137,20 @@ impl Db {
         Ok(rows)
     }
 
+    /// Roster rows that have at least one recorded validation, newest first.
+    /// Joining the roster intentionally hides orphaned validation records.
+    pub fn dispatch_ids_with_validations(&self) -> Result<Vec<i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT d.id FROM pipeline_validations v \
+             JOIN agent_dispatches d ON d.id = v.dispatch_id \
+             GROUP BY d.id ORDER BY MAX(d.dispatched_at_ms) DESC, d.id DESC",
+        )?;
+        Ok(stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// One validation's stored digest, for the detail view. Kept off
     /// [`ValidationRecord`] so the planner never carries kilobytes of build
     /// output it has no use for.
@@ -580,6 +594,99 @@ mod tests {
             db.latest_approval("linear:THE-407", "code")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn dispatch_ids_with_validations_lists_existing_rows_newest_first() {
+        use crate::issue::NewDispatch;
+        use crate::pipeline_validate::ValidationClass;
+
+        let db = db();
+        let older = db
+            .put_agent_dispatch(NewDispatch {
+                issue_id: "linear:THE-1182",
+                worktree_path: "/wt/older",
+                agent_name: "codex",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        let newer = db
+            .put_agent_dispatch(NewDispatch {
+                issue_id: "linear:THE-1182",
+                worktree_path: "/wt/newer",
+                agent_name: "codex",
+                stage: Some("test"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        for (id, dispatched_at_ms) in [(older, 10_i64), (newer, 20_i64)] {
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
+                    rusqlite::params![dispatched_at_ms, id],
+                )
+                .unwrap();
+        }
+        db.record_validation(
+            &run(
+                older,
+                "build",
+                HEAD,
+                ValidationClass::Green,
+                Some(0),
+                "older",
+            ),
+            NOW,
+        )
+        .unwrap();
+        db.record_validation(
+            &run(
+                newer,
+                "build",
+                HEAD,
+                ValidationClass::Green,
+                Some(0),
+                "newer",
+            ),
+            NOW,
+        )
+        .unwrap();
+        db.record_validation(
+            &run(
+                newer,
+                "test",
+                OLD,
+                ValidationClass::Green,
+                Some(0),
+                "second run",
+            ),
+            NOW + 1,
+        )
+        .unwrap();
+        db.record_validation(
+            &run(
+                999_999,
+                "orphan",
+                HEAD,
+                ValidationClass::Green,
+                Some(0),
+                "orphan",
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.dispatch_ids_with_validations().unwrap(),
+            vec![newer, older]
         );
     }
 }

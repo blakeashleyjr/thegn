@@ -28,7 +28,7 @@ use std::path::Path;
 
 use thegn_core::config::Config;
 use thegn_core::db::Db;
-use thegn_core::issue::AgentDispatch;
+use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
 use thegn_core::outln;
 use thegn_core::pipeline_approval::{ApprovalState, state_for};
 use thegn_core::pipeline_run::{self, RowLiveness};
@@ -114,14 +114,14 @@ struct Lane {
 /// first.
 fn gather(cfg: &Config, db: &Db, issue: Option<&str>, all: bool) -> Result<Vec<Lane>> {
     let now_ms = thegn_core::util::now_ms();
-    let rows = db.list_dispatches()?;
-    // A row's children give it its `child_stages`; built once rather than
-    // re-scanned per row.
-    let mut children: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-    for r in &rows {
-        if let (Some(parent), Some(stage)) = (r.parent_id, r.stage.as_deref()) {
-            children.entry(parent).or_default().push(stage.to_string());
-        }
+    let (rows, children, truncated) =
+        gather_rows(db, all, Db::ROSTER_ACTIVE_LIMIT, Db::ROSTER_HISTORY_LIMIT)?;
+    if truncated {
+        thegn_core::msg::warn(&format!(
+            "supervise roster was truncated at {} active rows and {} newest done rows; use --all for the full roster",
+            Db::ROSTER_ACTIVE_LIMIT,
+            Db::ROSTER_HISTORY_LIMIT,
+        ));
     }
     // Propagated, NOT swallowed. Every other read here fails safe — an
     // unreadable validation set looks unvalidated (=> validate), an unreadable
@@ -207,6 +207,45 @@ fn gather(cfg: &Config, db: &Db, issue: Option<&str>, all: bool) -> Result<Vec<L
         });
     }
     Ok(out)
+}
+
+fn gather_rows(
+    db: &Db,
+    all: bool,
+    active_limit: usize,
+    history_limit: usize,
+) -> Result<(Vec<AgentDispatch>, BTreeMap<i64, Vec<String>>, bool)> {
+    if all {
+        let rows = db.list_dispatches()?;
+        let mut children: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for row in &rows {
+            if let (Some(parent), Some(stage)) = (row.parent_id, row.stage.as_deref()) {
+                children.entry(parent).or_default().push(stage.to_string());
+            }
+        }
+        return Ok((rows, children, false));
+    }
+
+    const ACTIVE: [AgentDispatchStatus; 5] = [
+        AgentDispatchStatus::Queued,
+        AgentDispatchStatus::Spawning,
+        AgentDispatchStatus::Running,
+        AgentDispatchStatus::WaitingHuman,
+        AgentDispatchStatus::PrOpen,
+    ];
+    let (mut active_rows, active_truncated) =
+        db.list_dispatches_with_status(&ACTIVE, active_limit)?;
+    let (mut history_rows, history_truncated) =
+        db.newest_dispatches_with_status(&[AgentDispatchStatus::Done], history_limit)?;
+    active_rows.append(&mut history_rows);
+    active_rows.sort_by(|left, right| {
+        right
+            .dispatched_at_ms
+            .cmp(&left.dispatched_at_ms)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let children = db.dispatch_child_stages()?;
+    Ok((active_rows, children, active_truncated || history_truncated))
 }
 
 /// The two git facts about a worktree, gathered together so they can be cached
@@ -457,16 +496,7 @@ fn validations(row: Option<i64>, want_digest: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
     let rows: Vec<i64> = match row {
         Some(id) => vec![id],
-        None => db
-            .list_dispatches()?
-            .into_iter()
-            .map(|r| r.id)
-            .filter(|id| {
-                db.validations_for_dispatch(*id)
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-            })
-            .collect(),
+        None => db.dispatch_ids_with_validations()?,
     };
 
     let mut vals = Vec::new();
@@ -581,6 +611,71 @@ mod tests {
             facts,
             approval: ApprovalState::Absent,
         }
+    }
+
+    fn insert_row(
+        db: &Db,
+        stage: &str,
+        parent_id: Option<i64>,
+        status: AgentDispatchStatus,
+    ) -> i64 {
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                issue_id: "linear:THE-1182",
+                worktree_path: "/tmp/supervise-bounded-read",
+                agent_name: "codex",
+                stage: Some(stage),
+                parent_id,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(id, status).unwrap();
+        id
+    }
+
+    #[test]
+    fn gather_rows_default_reads_active_rows_and_the_newest_done_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        let running_first = insert_row(&db, "running-first", None, AgentDispatchStatus::Running);
+        let running_second = insert_row(&db, "running-second", None, AgentDispatchStatus::Running);
+        let done_first = insert_row(&db, "done-first", None, AgentDispatchStatus::Done);
+        let done_second = insert_row(&db, "done-second", None, AgentDispatchStatus::Done);
+        let done_third = insert_row(&db, "done-third", None, AgentDispatchStatus::Done);
+        let failed = insert_row(&db, "failed", None, AgentDispatchStatus::Failed);
+
+        let (limited, children, truncated) = gather_rows(&db, false, 10, 2).unwrap();
+        assert!(truncated);
+        assert!(children.is_empty());
+        assert_eq!(
+            limited.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![done_third, done_second, running_second, running_first]
+        );
+
+        let (complete_window, children, truncated) = gather_rows(&db, false, 10, 10).unwrap();
+        assert!(!truncated);
+        assert!(children.is_empty());
+        assert_eq!(complete_window.len(), 5);
+        let got = complete_window.iter().map(|row| row.id).collect::<Vec<_>>();
+        assert!(got.contains(&done_first));
+        assert!(!got.contains(&failed));
+    }
+
+    #[test]
+    fn gather_rows_child_stages_cover_children_outside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        let parent = insert_row(&db, "parent", None, AgentDispatchStatus::Done);
+        insert_row(&db, "child-stage", Some(parent), AgentDispatchStatus::Done);
+        insert_row(&db, "newest", None, AgentDispatchStatus::Done);
+
+        let (rows, children, truncated) = gather_rows(&db, false, 10, 1).unwrap();
+        assert!(truncated);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(children[&parent], vec![String::from("child-stage")]);
+        assert!(!rows.iter().any(|row| row.id == parent));
     }
 
     #[test]
