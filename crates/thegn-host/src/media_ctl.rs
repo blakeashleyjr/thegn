@@ -574,17 +574,6 @@ pub(crate) fn spawn_media_op(
                 pulse(&outcome_waker);
                 return;
             }
-            if let MediaOp::PlayQueueItem(ref lease) = op
-                && let Err(outcome) = queue_lease_check(lease, cur.as_ref())
-            {
-                tracing::debug!(
-                    target: "thegn::media",
-                    outcome = ?outcome,
-                    "media queue item lease refused"
-                );
-                publish_outcome(outcome, &outcome_waker);
-                return;
-            }
             let caps = cur
                 .as_ref()
                 .map(|snapshot| snapshot.caps)
