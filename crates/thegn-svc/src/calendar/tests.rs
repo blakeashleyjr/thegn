@@ -997,7 +997,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
                         let mut response = (
                             StatusCode::MULTI_STATUS,
                             Body::from(
-                                "<multistatus><sync-token>new-token</sync-token></multistatus>",
+                                r#"<multistatus xmlns="DAV:"><sync-token>new-token</sync-token></multistatus>"#,
                             ),
                         )
                             .into_response();
@@ -1067,7 +1067,7 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
                         (
                             StatusCode::MULTI_STATUS,
                             [("content-type", "application/xml")],
-                            "<multistatus><sync-token>new-token</sync-token></multistatus>",
+                            r#"<multistatus xmlns="DAV:"><sync-token>new-token</sync-token></multistatus>"#,
                         )
                             .into_response()
                     }
@@ -1384,7 +1384,7 @@ async fn caldav_body_limits_cover_exact_chunked_and_error_responses() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let exact_prefix = b"<multistatus><sync-token>exact</sync-token><!--";
+    let exact_prefix = b"<multistatus xmlns=\"DAV:\"><sync-token>exact</sync-token><!--";
     let exact_suffix = b"--></multistatus>";
     let mut exact = Vec::with_capacity(crate::http::MAX_BODY_BYTES);
     exact.extend_from_slice(exact_prefix);
@@ -1620,7 +1620,7 @@ async fn media_encoding_and_shared_pool_policies_apply_to_real_backends() {
                         (
                             StatusCode::MULTI_STATUS,
                             Body::from(
-                                "<multistatus><sync-token>dav-new</sync-token></multistatus>",
+                                r#"<multistatus xmlns="DAV:"><sync-token>dav-new</sync-token></multistatus>"#,
                             ),
                         )
                             .into_response()
@@ -2208,7 +2208,7 @@ END:VEVENT</cal:calendar-data>
   </d:response>
   <d:sync-token>http://example.com/ns/sync/42</d:sync-token>
 </d:multistatus>"#;
-    let (responses, token) = caldav::parse_multistatus(xml);
+    let (responses, token) = caldav::parse_multistatus(xml).unwrap();
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].href, "/cal/e1.ics");
     assert!(!responses[0].deleted);
@@ -2226,7 +2226,7 @@ fn a_404_response_is_read_as_a_tombstone() {
   </response>
   <sync-token>tok-2</sync-token>
 </multistatus>"#;
-    let (responses, token) = caldav::parse_multistatus(xml);
+    let (responses, token) = caldav::parse_multistatus(xml).unwrap();
     assert_eq!(responses.len(), 1);
     assert!(responses[0].deleted);
     assert_eq!(token, "tok-2");
@@ -2235,18 +2235,32 @@ fn a_404_response_is_read_as_a_tombstone() {
 
 #[test]
 fn namespace_prefixes_do_not_matter() {
-    // Servers differ: `d:`, `D:`, or no prefix at all. Matching on the local
-    // name is what makes one parser work against all of them.
-    for open in ["<D:href>", "<href>", "<x:href>"] {
-        let close = open.replace('<', "</");
+    // Aliases are accepted by namespace URI, including the default namespace.
+    for (decls, d, data_open, data_close) in [
+        (
+            "xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"",
+            "D:",
+            "C:calendar-data",
+            "C:calendar-data",
+        ),
+        (
+            "xmlns=\"DAV:\"",
+            "",
+            "calendar-data xmlns=\"urn:ietf:params:xml:ns:caldav\"",
+            "calendar-data",
+        ),
+        (
+            "xmlns:x=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"",
+            "x:",
+            "C:calendar-data",
+            "C:calendar-data",
+        ),
+    ] {
         let xml = format!(
-            "<multistatus><response>{open}/cal/a.ics{close}             <calendar-data>BEGIN:VEVENT
-UID:a
-DTSTART:20260821T090000Z
-END:VEVENT             </calendar-data></response></multistatus>"
+            "<multistatus {decls}><{d}response><{d}href>/cal/a.ics</{d}href><{d}propstat><{d}prop><{data_open}>BEGIN:VEVENT\nUID:a\nDTSTART:20260821T090000Z\nEND:VEVENT</{data_close}></{d}prop><{d}status>HTTP/1.1 200 OK</{d}status></{d}propstat></{d}response></multistatus>"
         );
-        let (r, _) = caldav::parse_multistatus(&xml);
-        assert_eq!(r.len(), 1, "failed for {open}");
+        let (r, _) = caldav::parse_multistatus(&xml).unwrap();
+        assert_eq!(r.len(), 1, "failed for {d}");
         assert_eq!(r[0].href, "/cal/a.ics");
     }
 }
@@ -2256,27 +2270,26 @@ fn xml_entities_in_calendar_data_are_unescaped() {
     // An `&` in a summary arrives as `&amp;`; leaving it escaped would show
     // "R&amp;D sync" in the agenda.
     let xml =
-        "<multistatus><response><href>/c/a.ics</href><calendar-data>               BEGIN:VEVENT
+        "<multistatus xmlns=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><response><href>/c/a.ics</href><propstat><prop><C:calendar-data>               BEGIN:VEVENT
 UID:a
 SUMMARY:R&amp;D &lt;sync&gt;
 DTSTART:20260821T090000Z
-               END:VEVENT</calendar-data></response></multistatus>";
-    let (r, _) = caldav::parse_multistatus(xml);
+               END:VEVENT</C:calendar-data></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>";
+    let (r, _) = caldav::parse_multistatus(xml).unwrap();
     assert!(r[0].ics.contains("R&D <sync>"), "got {}", r[0].ics);
 }
 
 #[test]
 fn an_empty_or_malformed_multistatus_is_not_a_panic() {
-    assert_eq!(caldav::parse_multistatus("").0.len(), 0);
-    assert_eq!(caldav::parse_multistatus("not xml at all").0.len(), 0);
+    assert!(caldav::parse_multistatus("").is_err());
+    assert!(caldav::parse_multistatus("not xml at all").is_err());
     // An unterminated element must not hang or index out of bounds.
-    assert_eq!(caldav::parse_multistatus("<response><href>/a").0.len(), 0);
-    // A response with no href is skipped rather than becoming a blank id.
-    assert_eq!(
-        caldav::parse_multistatus("<multistatus><response></response></multistatus>")
-            .0
-            .len(),
-        0
+    assert!(caldav::parse_multistatus("<response><href>/a").is_err());
+    assert!(
+        caldav::parse_multistatus(
+            "<multistatus xmlns=\"DAV:\"><response></response></multistatus>"
+        )
+        .is_err()
     );
 }
 
@@ -2924,10 +2937,11 @@ async fn a_saturated_global_budget_refuses_before_any_request() {
 }
 
 fn multistatus(events: usize, deletions: usize) -> String {
-    let mut s = String::from("<d:multistatus xmlns:d=\"DAV:\">");
+    let mut s =
+        String::from("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">");
     for i in 0..events {
         s.push_str(&format!(
-            "<d:response><d:href>/cal/e{i}.ics</d:href><d:propstat><d:prop><c:calendar-data>{}</c:calendar-data></d:prop></d:propstat></d:response>",
+            "<d:response><d:href>/cal/e{i}.ics</d:href><d:propstat><d:prop><c:calendar-data>{}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
             ics_feed(1).replace("e0", &format!("e{i}"))
         ));
     }
@@ -3021,8 +3035,8 @@ async fn caldav_many_deletions_trigger_snapshot_fallback() {
 
 #[test]
 fn caldav_calendar_data_is_unescaped_exactly_once() {
-    let xml = "<multistatus><response><href>/a.ics</href><calendar-data>SUMMARY:a &amp;lt; b</calendar-data></response></multistatus>";
-    let (r, _) = caldav::parse_multistatus(xml);
+    let xml = "<multistatus xmlns=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><response><href>/a.ics</href><propstat><prop><c:calendar-data>SUMMARY:a &amp;lt; b</c:calendar-data></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>";
+    let (r, _) = caldav::parse_multistatus(xml).unwrap();
     assert_eq!(r[0].ics, "SUMMARY:a &lt; b");
 }
 
@@ -3311,16 +3325,24 @@ async fn a_long_history_feed_only_counts_the_sync_window() {
 
 #[test]
 fn caldav_unescaping_is_single_pass_and_sized_before_it_runs() {
-    let xml = "<multistatus><response><href>/a&amp;b.ics</href><calendar-data>A &amp;amp; &lt;b&gt; &quot;c&quot; &apos;d&apos; &bogus;</calendar-data></response></multistatus>";
-    let (r, _) = caldav::parse_multistatus(xml);
+    let xml = "<multistatus xmlns=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><response><href>/a&amp;b.ics</href><propstat><prop><c:calendar-data>A &amp;amp; &lt;b&gt; &quot;c&quot; &apos;d&apos;</c:calendar-data></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>";
+    let (r, _) = caldav::parse_multistatus(xml).unwrap();
     assert_eq!(r[0].href, "/a&b.ics");
-    assert_eq!(r[0].ics, "A &amp; <b> \"c\" 'd' &bogus;");
+    assert_eq!(r[0].ics, "A &amp; <b> \"c\" 'd'");
+    let unknown = xml.replace("&apos;d&apos;", "&apos;d&apos; &bogus;");
+    assert!(matches!(
+        caldav::parse_multistatus(&unknown),
+        Err(CalendarError::Parse(_))
+    ));
     // An enormous escaped href is refused on its raw size.
     let huge = format!(
-        "<multistatus><response><href>&amp;{}</href></response></multistatus>",
+        "<multistatus xmlns=\"DAV:\"><response><href>&amp;{}</href><status>HTTP/1.1 404 Gone</status></response></multistatus>",
         "x".repeat(crate::http::MAX_REQUEST_BYTES)
     );
-    assert!(caldav::parse_multistatus(&huge).0.is_empty());
+    assert!(matches!(
+        caldav::parse_multistatus(&huge),
+        Err(CalendarError::BodyLimit(_))
+    ));
 }
 
 // --- home zone reaches every backend (THE-464) ------------------------------
