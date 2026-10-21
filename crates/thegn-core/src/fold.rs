@@ -192,8 +192,9 @@ pub fn squash_msg(b: &Branch) -> String {
 }
 
 /// Classify a conflict by its paths: `Regenerable` iff the conflict is non-empty
-/// and *every* conflicted path is a regenerate-path (matched by exact path or by
-/// basename, so `Cargo.lock` matches `crates/x/Cargo.lock`); otherwise `Textual`.
+/// and *every* conflicted path is a regenerate-path. An entry without `*` matches
+/// only its exact repo-relative path; `**/<path>` matches that path at the root or
+/// under any directory. Other wildcard entries match nothing. Otherwise `Textual`.
 pub fn classify(paths: &[String], regenerate_paths: &[String]) -> ConflictKind {
     if !paths.is_empty() && paths.iter().all(|p| is_regenerable(p, regenerate_paths)) {
         ConflictKind::Regenerable
@@ -203,8 +204,18 @@ pub fn classify(paths: &[String], regenerate_paths: &[String]) -> ConflictKind {
 }
 
 fn is_regenerable(path: &str, regenerate_paths: &[String]) -> bool {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    regenerate_paths.iter().any(|r| r == path || r == base)
+    regenerate_paths.iter().any(|entry| {
+        if let Some(rest) = entry.strip_prefix("**/") {
+            !rest.is_empty()
+                && !rest.contains('*')
+                && (path == rest
+                    || path
+                        .strip_suffix(rest)
+                        .is_some_and(|prefix| prefix.ends_with('/')))
+        } else {
+            !entry.contains('*') && entry == path
+        }
+    })
 }
 
 /// Outcome of folding one branch under a strategy.
@@ -751,8 +762,8 @@ mod tests {
 
     #[test]
     fn lockfile_only_conflict_is_classified_regenerable() {
-        let regen = vec!["Cargo.lock".to_string()];
-        // Nested path still matches by basename.
+        let regen = vec!["**/Cargo.lock".to_string()];
+        // Nested path matches through the explicit `**/` pattern.
         let git = Fake::new()
             .branch(
                 "b1",
@@ -797,6 +808,10 @@ mod tests {
         );
         assert_eq!(
             classify(&["a/b/Cargo.lock".into()], &regen),
+            ConflictKind::Textual
+        );
+        assert_eq!(
+            classify(&["a/b/Cargo.lock".into()], &["**/Cargo.lock".into()]),
             ConflictKind::Regenerable
         );
         assert_eq!(
@@ -808,6 +823,64 @@ mod tests {
             classify(&["Cargo.lock".into()], &[]),
             ConflictKind::Textual,
             "no regen list"
+        );
+    }
+
+    #[test]
+    fn regen_bare_name_does_not_match_nested_path() {
+        assert_eq!(
+            classify(&["crates/x/Cargo.lock".into()], &["Cargo.lock".into()]),
+            ConflictKind::Textual
+        );
+    }
+
+    #[test]
+    fn regen_double_star_matches_root_and_nested_only_by_component() {
+        let regen = ["**/Cargo.lock".into()];
+        for path in ["Cargo.lock", "a/b/Cargo.lock"] {
+            assert_eq!(
+                classify(&[path.into()], &regen),
+                ConflictKind::Regenerable,
+                "{path}"
+            );
+        }
+        for path in ["xCargo.lock", "a/xCargo.lock", "Cargo.lock.bak"] {
+            assert_eq!(
+                classify(&[path.into()], &regen),
+                ConflictKind::Textual,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn regen_other_wildcards_match_nothing() {
+        // Positive control: these cases are also Textual with the old matcher.
+        for entry in ["*.lock", "**/*.lock", "**/", "crates/**/Cargo.lock"] {
+            for path in ["Cargo.lock", "crates/x/Cargo.lock"] {
+                assert_eq!(
+                    classify(&[path.into()], &[entry.into()]),
+                    ConflictKind::Textual,
+                    "{entry} against {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn regen_shipped_defaults_keep_nested_lockfiles() {
+        let regen = crate::config::MergeQueueConfig::default().regenerate_paths;
+        assert_eq!(
+            classify(&["crates/x/Cargo.lock".into()], &regen),
+            ConflictKind::Regenerable
+        );
+        assert_eq!(
+            classify(&["web/package-lock.json".into()], &regen),
+            ConflictKind::Regenerable
+        );
+        assert_eq!(
+            classify(&["src/x.rs".into()], &regen),
+            ConflictKind::Textual
         );
     }
 
