@@ -251,21 +251,15 @@ mod tests {
             super::gitmodules_tracked(GitOutcome::EmptyOk),
             Ok(false)
         ));
-        assert!(matches!(
+        assert!(
             super::gitmodules_tracked(GitOutcome::Exit {
                 code: Some(128),
                 stderr_tail: "fatal: not a git repository".into(),
-            }),
-            Err(_)
-        ));
-        assert!(matches!(
-            super::gitmodules_tracked(GitOutcome::Timeout),
-            Err(_)
-        ));
-        assert!(matches!(
-            super::gitmodules_tracked(GitOutcome::Spawn(std::io::Error::other("x"))),
-            Err(_)
-        ));
+            })
+            .is_err()
+        );
+        assert!(super::gitmodules_tracked(GitOutcome::Timeout).is_err());
+        assert!(super::gitmodules_tracked(GitOutcome::Spawn(std::io::Error::other("x"))).is_err());
     }
 
     struct GlyphBaseSentinel {
