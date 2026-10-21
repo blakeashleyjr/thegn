@@ -723,9 +723,15 @@ pub struct PanelData {
     pub merge: Option<MergeBanner>,
     /// Porcelain status joined with the diffstat (changes section).
     pub changes: Vec<ChangeRow>,
+    /// Git status could not be read during this hydration.
+    pub status_unavailable: bool,
     pub stash_count: usize,
     /// Recent `git log --graph` rows (git section LOG block).
     pub log: Vec<thegn_svc::git::LogRow>,
+    /// Git log could not be read during this hydration.
+    pub log_unavailable: bool,
+    /// Incoming paths could not be read during this hydration.
+    pub incoming_unavailable: bool,
     /// PR base ref ("main") and head→base diffstat, when a PR exists.
     pub pr_base: String,
     /// PR head commit SHA — the `commit_id` an inline review comment anchors to.

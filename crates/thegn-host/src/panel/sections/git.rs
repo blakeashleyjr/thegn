@@ -136,10 +136,14 @@ fn log_issues_velocity(ctx: &SectionCtx) -> Vec<PanelRow> {
     let deep = ctx.deep();
     let mut rows = Vec::new();
     // LOG — graph rows.
-    if !data.log.is_empty() {
-        let mut r = vec![seg(d(), "")];
+    if data.log_unavailable || !data.log.is_empty() {
+        let mut r = if data.log_unavailable {
+            vec![seg(hue(Hue::Amber), "log unavailable")]
+        } else {
+            vec![seg(d(), "")]
+        };
         if data.stash_count > 0 {
-            r = vec![seg(g(), format!("stash {}", data.stash_count))];
+            r.push(seg(g(), format!("stash {}", data.stash_count)));
         }
         rows.push(PanelRow::plain(Line::split(
             vec![seg(g2(), "LOG").bold()],
@@ -567,6 +571,19 @@ mod tests {
     use crate::panel::docs::GitDocs;
     use crate::panel::{PanelUi, Section};
 
+    fn flatten(rows: &[PanelRow]) -> String {
+        rows.iter()
+            .map(|row| match &row.line {
+                Line::Blank | Line::Fill { .. } => String::new(),
+                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect(),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn render_velocity(docs: GitDocs) -> String {
         let model = FrameModel::default();
         let mut ui = PanelUi {
@@ -581,17 +598,43 @@ mod tests {
             cols: 75,
             rows: 32,
         };
-        log_issues_velocity(&ctx)
-            .iter()
-            .map(|row| match &row.line {
-                Line::Blank | Line::Fill { .. } => String::new(),
-                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect(),
-                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
-                    l.iter().chain(r).map(|seg| seg.text.as_str()).collect()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        flatten(&log_issues_velocity(&ctx))
+    }
+
+    #[test]
+    fn log_unavailable_renders_marker_over_last_known_rows() {
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                log: vec![thegn_svc::git::LogRow {
+                    graph: "* ".to_string(),
+                    sha: "abc1234".to_string(),
+                    subject: "last known subject".to_string(),
+                    refs: String::new(),
+                }],
+                log_unavailable: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Pr,
+            width: PanelWidth::Half,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 75,
+            rows: 32,
+        };
+        let rendered = flatten(&log_issues_velocity(&ctx));
+
+        assert!(rendered.contains("LOG"), "rendered: {rendered}");
+        assert!(rendered.contains("log unavailable"), "rendered: {rendered}");
+        assert!(
+            rendered.contains("last known subject"),
+            "rendered: {rendered}"
+        );
     }
 
     #[test]
