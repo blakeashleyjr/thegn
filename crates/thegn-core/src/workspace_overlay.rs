@@ -455,7 +455,7 @@ mod tests {
             assert_eq!(cfg.workspace["foo"].repo_path.as_deref(), Some("/a/foo"));
         }
 
-        let serialized = serde_json::to_value(&WorkspaceConfig::default()).unwrap();
+        let serialized = serde_json::to_value(WorkspaceConfig::default()).unwrap();
         assert!(serialized.get("repo_path").is_none());
     }
 
