@@ -1024,7 +1024,7 @@ fn drive_queue_with(
                     out.agent_blocked.push(item.branch.clone());
                     break;
                 }
-                // Opt-in isolation floor for the handoff (default: host + slice).
+                // Enforce the in-force isolation floor before the handoff.
                 // Gate BEFORE consuming an attempt: a fail-closed miss, or an
                 // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
                 // failure — hold the entry and NEVER blame the branch.
@@ -1938,7 +1938,7 @@ mod tests {
             let queued = item(&db, &feat_wt);
             let out_ = drive_queue(
                 &cfg(agent, 2),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
@@ -1962,7 +1962,7 @@ mod tests {
             let queued = item(&db, &feat_wt);
             let out_ = drive_queue(
                 &cfg("true", 1),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
@@ -2413,6 +2413,7 @@ mod tests {
                     drawer_scope: None,
                     drawer_cwd: None,
                 }],
+                sandbox: uncontained_config().sandbox,
                 ..Config::default()
             };
             // `agent_command` empty — resolution must come from `agent`.
@@ -2441,7 +2442,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &mq,
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![item(&db, &feat_wt)],
@@ -2468,7 +2469,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &mq,
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![item(&db, &feat_wt)],

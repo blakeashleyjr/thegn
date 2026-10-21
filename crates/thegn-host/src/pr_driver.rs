@@ -664,7 +664,7 @@ pub(crate) fn drive_queue(
                     }
                 }
 
-                // Opt-in isolation floor for the handoff (default: host + slice).
+                // Enforce the in-force isolation floor before the handoff.
                 // Gate BEFORE consuming an attempt: a fail-closed miss, or an
                 // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
                 // failure — hold the PR and NEVER mark it needs_human.
