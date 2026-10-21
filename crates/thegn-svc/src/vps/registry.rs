@@ -223,13 +223,14 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
         match read_in(&root, &record.name) {
             Some(existing) if !existing.owner.is_empty() => record.owner = existing.owner,
             Some(_) => {}
-            None => match record_exists_in(&root, &record.name)? {
-                true => anyhow::bail!(
-                    "vps registry: cannot preserve owner for unreadable existing record {}",
-                    record.name
-                ),
-                false => {}
-            },
+            None => {
+                if record_exists_in(&root, &record.name)? {
+                    anyhow::bail!(
+                        "vps registry: cannot preserve owner for unreadable existing record {}",
+                        record.name
+                    );
+                }
+            }
         }
     }
     let bytes = serde_json::to_vec_pretty(&record)?;
