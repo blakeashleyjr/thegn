@@ -5550,8 +5550,8 @@ mod tests {
                         put: Arc<Mutex<Option<i64>>>| {
             std::thread::spawn(move || {
                 let lease = "repo:linear:RACE";
-                let acquired = matches!(db.acquire_pipeline_lease(lease, owner, 300), Ok(Ok(())));
                 barrier.wait();
+                let acquired = matches!(db.acquire_pipeline_lease(lease, owner, 300), Ok(Ok(())));
                 let proof = LeadProof::Lease { name: lease, owner };
                 let code_result = db.claim_dispatch_admitted_led(
                     crate::issue::NewDispatch {
