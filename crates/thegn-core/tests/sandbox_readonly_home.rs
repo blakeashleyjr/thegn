@@ -53,6 +53,7 @@ fn mk_spec(
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: None,
+        volume_owners: Vec::new(),
     }
 }
 

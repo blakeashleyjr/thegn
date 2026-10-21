@@ -335,6 +335,7 @@ fn spec(backend: Backend) -> SandboxSpec {
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: None,
+        volume_owners: Vec::new(),
     }
 }
 
@@ -673,6 +674,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
         RefusalClass::MountUnresolvable,
+        RefusalClass::VolumeOwner,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
     ] {
@@ -707,6 +709,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::ComposeServiceMissing,
         RefusalClass::HostnamePolicy,
         RefusalClass::MountUnresolvable,
+        RefusalClass::VolumeOwner,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
     ] {

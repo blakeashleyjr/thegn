@@ -516,7 +516,14 @@ fn fold_mounts(
                         "devcontainer: read-only volume '{name}' mounted read-write (unsupported)"
                     ));
                 }
-                sb.volumes.entry(name).or_insert(dest);
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    sb.volumes.entry(name.clone())
+                {
+                    entry.insert(dest);
+                    if let Some(id) = config_devcontainer_id(dc) {
+                        sb.volume_owners.insert(name, id);
+                    }
+                }
             }
             MountOutcome::Unsupported(why) => warnings.push(why),
         }
@@ -872,7 +879,19 @@ fn ctx_subst(
     local_env_allowed: &dyn Fn(&str) -> bool,
     report: &mut SubstitutionReport,
 ) -> String {
-    let id = dc.config_path.as_ref().map(|path| {
+    let id = config_devcontainer_id(dc);
+    let (value, seen) = match id {
+        Some(id) => {
+            devcontainer::substitute_with_devcontainer_id_report(s, ctx, &id, local_env_allowed)
+        }
+        None => devcontainer::substitute_with_report(s, ctx, local_env_allowed),
+    };
+    report.blocked_local_env.extend(seen.blocked_local_env);
+    value
+}
+
+fn config_devcontainer_id(dc: &DevContainer) -> Option<String> {
+    dc.config_path.as_ref().map(|path| {
         let repo = if path
             .parent()
             .and_then(Path::file_name)
@@ -894,15 +913,7 @@ fn ctx_subst(
         };
         let rel = path.strip_prefix(repo).unwrap_or(path).to_path_buf();
         devcontainer::devcontainer_id(repo, &rel)
-    });
-    let (value, seen) = match id {
-        Some(id) => {
-            devcontainer::substitute_with_devcontainer_id_report(s, ctx, &id, local_env_allowed)
-        }
-        None => devcontainer::substitute_with_report(s, ctx, local_env_allowed),
-    };
-    report.blocked_local_env.extend(seen.blocked_local_env);
-    value
+    })
 }
 
 #[cfg(test)]
@@ -977,6 +988,67 @@ mod tests {
         // env + variable substitution landed in init_script exports.
         assert!(sb.init_script.contains("export TZ=UTC"));
         assert!(sb.init_script.contains("export API=/home/u/proj/x"));
+    }
+
+    #[test]
+    fn devcontainer_volume_records_its_owner_id() {
+        let mut dc =
+            parse(r#"{"mounts":[{"source":"named-vol","target":"/data","type":"volume"}]}"#)
+                .unwrap();
+        dc.config_path = Some(std::path::PathBuf::from(
+            "/repo/.devcontainer/devcontainer.json",
+        ));
+        let owner = config_devcontainer_id(&dc).unwrap();
+        let mut sb = SandboxConfig::default();
+        fold_mounts(
+            &dc,
+            &mut sb,
+            &ctx(),
+            &|_| false,
+            &mut SubstitutionReport::default(),
+        );
+        assert_eq!(sb.volume_owners.get("named-vol"), Some(&owner));
+
+        let no_path =
+            parse(r#"{"mounts":[{"source":"named-vol","target":"/data","type":"volume"}]}"#)
+                .unwrap();
+        let mut unbound = SandboxConfig::default();
+        fold_mounts(
+            &no_path,
+            &mut unbound,
+            &ctx(),
+            &|_| false,
+            &mut SubstitutionReport::default(),
+        );
+        assert!(!unbound.volume_owners.contains_key("named-vol"));
+    }
+
+    #[test]
+    fn user_configured_volume_is_not_owner_bound() {
+        let mut dc =
+            parse(r#"{"mounts":[{"source":"named-vol","target":"/data","type":"volume"}]}"#)
+                .unwrap();
+        dc.config_path = Some(std::path::PathBuf::from(
+            "/repo/.devcontainer/devcontainer.json",
+        ));
+        let mut sb = SandboxConfig {
+            volumes: [("named-vol".into(), "/user-data".into())]
+                .into_iter()
+                .collect(),
+            ..SandboxConfig::default()
+        };
+        fold_mounts(
+            &dc,
+            &mut sb,
+            &ctx(),
+            &|_| false,
+            &mut SubstitutionReport::default(),
+        );
+        assert_eq!(
+            sb.volumes.get("named-vol").map(String::as_str),
+            Some("/user-data")
+        );
+        assert!(!sb.volume_owners.contains_key("named-vol"));
     }
 
     #[test]
