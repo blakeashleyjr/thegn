@@ -145,6 +145,10 @@ pub trait WorkspaceStore {
     /// local/failover resolution (mirrors [`Self::put_worktree`]'s COALESCE).
     fn set_worktree_location(&self, wt: &str, location: &str) -> Result<()>;
 
+    /// Restore the persisted remote-location descriptor, including clearing it
+    /// when the previous value was absent.
+    fn restore_worktree_location(&self, wt: &str, location: Option<&str>) -> Result<()>;
+
     /// The (local) repo root recorded for a worktree — needed for the per-repo
     /// `.thegn` overlay when the worktree itself lives remote.
     fn repo_root_for(&self, wt: &str) -> Result<Option<String>>;
