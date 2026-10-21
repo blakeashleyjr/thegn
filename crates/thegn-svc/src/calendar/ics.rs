@@ -32,10 +32,10 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 const _: () = assert!(MAX_AGGREGATE_SOURCE_BYTES > MAX_SOURCE_DOCUMENT_BYTES);
 const _: () = assert!(MAX_DIRECTORY_ENTRIES > MAX_FILES);
 
-/// A complete document whose only content is effective series cancellations is
-/// authoritative: it is a Reset, so the host replaces the cache instead of
-/// treating the empty page as a suspicious provider glitch. Any other empty
-/// snapshot keeps the Snapshot guard.
+/// A document that yields no in-window events and carries at least one effective
+/// series cancellation is authoritative: it is a Reset, so the host replaces the
+/// cache instead of treating the empty page as a suspicious provider glitch. Any
+/// other empty snapshot keeps the Snapshot guard.
 pub(super) fn snapshot_mode(events_empty: bool, saw_series_tombstone: bool) -> PageMode {
     if events_empty && saw_series_tombstone {
         PageMode::Reset
