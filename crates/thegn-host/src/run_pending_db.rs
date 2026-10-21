@@ -405,12 +405,12 @@ fn host_add_job(
 
 fn run_host_add(
     request: HostAddRequest,
-    result: Result<Vec<(String, thegn_core::host_config::HostConfig)>, String>,
+    result: Result<(String, Vec<(String, thegn_core::host_config::HostConfig)>), String>,
     notify: impl FnOnce(PendingDbResult),
 ) {
     match result {
-        Ok(defs) => notify(PendingDbResult::HostAdded {
-            name: request.name,
+        Ok((alias, defs)) => notify(PendingDbResult::HostAdded {
+            name: alias,
             defs,
             then: request.then,
         }),
@@ -917,7 +917,9 @@ mod tests {
         let (name, hc) =
             thegn_core::host_config::parse_host_target("alice@host.example", None).unwrap();
         let db = thegn_core::db::Db::open_memory().unwrap();
-        let defs = crate::handlers::wizard::store_host_def(&db, &name, &hc, false, 123).unwrap();
+        let (stored_name, defs) =
+            crate::handlers::wizard::store_host_def(&db, &name, &hc, false, 123).unwrap();
+        assert_eq!(stored_name, name);
         assert!(
             defs.iter()
                 .any(|(stored, config)| stored == &name && config.ssh.host == hc.ssh.host)
@@ -925,9 +927,15 @@ mod tests {
 
         let (config_name, config_hc) =
             thegn_core::host_config::parse_host_target("bob@config-only.example", None).unwrap();
-        let duplicate =
-            crate::handlers::wizard::store_host_def(&db, &config_name, &config_hc, true, 124);
-        assert!(matches!(duplicate, Err(error) if error.contains("already exists in config.toml")));
+        let (config_alias, config_defs) =
+            crate::handlers::wizard::store_host_def(&db, &config_name, &config_hc, true, 124)
+                .unwrap();
+        assert!(config_alias.starts_with("config-only-example-"));
+        assert!(
+            config_defs
+                .iter()
+                .any(|(stored, _)| stored == &config_alias)
+        );
         assert!(
             db.host_defs()
                 .unwrap()
@@ -940,8 +948,11 @@ mod tests {
                 .iter()
                 .any(|(stored, _)| stored == &config_name)
         );
+        assert!(!config_defs.iter().any(|(stored, _)| stored == &config_name));
 
-        let readded = crate::handlers::wizard::store_host_def(&db, &name, &hc, true, 125).unwrap();
+        let (readded_name, readded) =
+            crate::handlers::wizard::store_host_def(&db, &name, &hc, true, 125).unwrap();
+        assert_eq!(readded_name, name);
         assert!(
             readded
                 .iter()
@@ -963,15 +974,18 @@ mod tests {
         let mut results = Vec::new();
         run_host_add(
             request(name.clone(), hc.clone()),
-            Ok(vec![(name.clone(), hc.clone())]),
+            Ok((
+                "stored-alias".into(),
+                vec![("stored-alias".into(), hc.clone())],
+            )),
             |result| results.push(result),
         );
         assert!(matches!(
             results.as_slice(),
             [PendingDbResult::HostAdded { name: added, defs, then: HostAddThen::Panel }]
-                if added == &name
+                if added == "stored-alias"
                     && matches!(defs.as_slice(), [(stored, config)]
-                        if stored == &name && config.ssh.host == hc.ssh.host)
+                        if stored == "stored-alias" && config.ssh.host == hc.ssh.host)
         ));
 
         results.clear();

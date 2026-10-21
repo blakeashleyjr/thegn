@@ -1014,23 +1014,26 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
                 } else {
                     clear_landed_in_repo(&db, &root, &repo_landed)
                 };
-                let tail = if swept.collected.is_empty() {
+                let removed = swept.collected.len() + swept.collected_partial.len();
+                let tail = if removed == 0 {
                     String::new()
                 } else {
-                    format!(", removed {} worktree(s)", swept.collected.len())
+                    format!(", removed {removed} worktree(s)")
                 };
                 let kept = if swept.kept_dirty.is_empty()
                     && swept.kept_changed.is_empty()
                     && swept.kept.is_empty()
+                    && swept.collected_partial.is_empty()
                     && swept.bookkeeping_errors.is_empty()
                 {
                     String::new()
                 } else {
                     format!(
-                        "; retained {} edited, {} changed during cleanup, {} refused; {} bookkeeping error(s)",
+                        "; retained {} edited, {} changed during cleanup, {} refused, {} partial; {} bookkeeping error(s)",
                         swept.kept_dirty.len(),
                         swept.kept_changed.len(),
                         swept.kept.len(),
+                        swept.collected_partial.len(),
                         swept.bookkeeping_errors.len()
                     )
                 };

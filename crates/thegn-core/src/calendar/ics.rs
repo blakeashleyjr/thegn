@@ -20,7 +20,7 @@ use super::admission::{
 use super::recur::{RRule, Recurrence, parse_ics_datetime};
 use super::tz::{VtzRules, resolve_tzid, resolve_zone};
 use super::validate::validate_event;
-use super::{CalEvent, EventStatus, EventTime, Reminder, TzRef};
+use super::{Busy, CalEvent, EventStatus, EventTime, Reminder, TzRef};
 
 /// One unfolded content line: `NAME;PARAM=v:VALUE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,6 +485,7 @@ fn is_retained_property(name: &str) -> bool {
             | "CATEGORIES"
             | "ORGANIZER"
             | "STATUS"
+            | "TRANSP"
             | "DTSTART"
             | "RECURRENCE-ID"
             | "DTEND"
@@ -1023,6 +1024,7 @@ struct Builder {
     location: String,
     url: String,
     status: Option<EventStatus>,
+    transp: Option<Busy>,
     start: Option<EventTime>,
     recurrence_id: Option<EventTime>,
     end: Option<EventTime>,
@@ -1056,6 +1058,7 @@ fn singleton_property(name: &str) -> Option<&'static str> {
         "LOCATION" => Some("LOCATION"),
         "URL" => Some("URL"),
         "STATUS" => Some("STATUS"),
+        "TRANSP" => Some("TRANSP"),
         "DTSTART" => Some("DTSTART"),
         "RECURRENCE-ID" => Some("RECURRENCE-ID"),
         "DTEND" => Some("DTEND"),
@@ -1257,6 +1260,16 @@ impl Builder {
                     }
                 }
             }
+            "TRANSP" => {
+                self.transp = match line.value.trim().to_ascii_uppercase().as_str() {
+                    "TRANSPARENT" => Some(Busy::Free),
+                    "OPAQUE" => Some(Busy::Busy),
+                    _ => {
+                        report.record(IcsDiagnostic::InvalidEvent);
+                        None
+                    }
+                }
+            }
             "DTSTART" => {
                 meter.charge_event(tz + ENTRY_OVERHEAD, 0)?;
                 self.start = parse_time(line, "");
@@ -1406,6 +1419,7 @@ impl Builder {
         e.organizer = self.organizer;
         e.category = self.categories;
         e.status = self.status.unwrap_or_default();
+        e.busy = self.transp.unwrap_or_default();
         if let Some(span) = super::nominal_span(&e) {
             let span_minutes = span.num_minutes();
             for before_end in self.end_reminders {

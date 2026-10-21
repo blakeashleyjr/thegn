@@ -25,6 +25,7 @@ mod pty_diagnostics;
 pub(crate) mod record;
 pub(crate) mod service;
 pub(crate) mod session;
+pub(crate) mod stage_launch;
 pub(crate) mod tombstone;
 
 use std::collections::HashMap;
@@ -740,6 +741,7 @@ async fn run(
         )),
         native_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
         spawning_relaunches: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        launches: std::sync::Mutex::new(stage_launch::LaunchRegistry::default()),
         events: events.clone(),
         db: db.clone(),
         grace_ms: thegn_core::time_policy::duration_millis(cfg.daemon.lease_grace_secs),

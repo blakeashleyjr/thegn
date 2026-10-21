@@ -175,25 +175,26 @@ pub(crate) fn add_host_from_input(
 /// to merge into its live config.
 pub(crate) fn store_host_def(
     db: &thegn_core::db::Db,
-    name: &str,
+    derived: &str,
     hc: &thegn_core::host_config::HostConfig,
     cfg_has_name: bool,
     now: i64,
-) -> Result<Vec<(String, thegn_core::host_config::HostConfig)>, String> {
+) -> Result<(String, Vec<(String, thegn_core::host_config::HostConfig)>), String> {
+    use thegn_core::host_config::default_host_alias;
     use thegn_core::store::HostStore;
 
-    if cfg_has_name
-        && !db
-            .host_defs()
-            .map_err(|error| format!("state db: {error}"))?
-            .iter()
-            .any(|(stored, _)| stored == name)
-    {
-        return Err(format!("[host.{name}] already exists in config.toml"));
-    }
-    db.put_host_def(name, hc, now)
+    let defs = db
+        .host_defs()
+        .map_err(|error| format!("state db: {error}"))?;
+    let alias = default_host_alias(derived, hc, &defs, &|name| {
+        name == derived && cfg_has_name && !defs.iter().any(|(stored, _)| stored == name)
+    })?;
+    db.put_host_def(&alias, hc, now)
         .map_err(|error| error.to_string())?;
-    db.host_defs().map_err(|error| format!("state db: {error}"))
+    let updated = db
+        .host_defs()
+        .map_err(|error| format!("state db: {error}"))?;
+    Ok((alias, updated))
 }
 
 #[cfg(test)]

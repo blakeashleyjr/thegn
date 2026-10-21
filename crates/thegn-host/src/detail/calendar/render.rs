@@ -364,6 +364,8 @@ fn agenda_table(st: &CalState) -> super::super::Section {
             let focused = st.pane == CalPane::Agenda && i == st.agenda_sel;
             let title_tone = if focused {
                 Tok::SelAccent
+            } else if e.busy == thegn_core::calendar::Busy::Free {
+                Tok::Slot(S::Dim)
             } else {
                 Tok::Slot(S::Text)
             };

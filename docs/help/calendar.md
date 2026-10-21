@@ -196,9 +196,18 @@ restart. A sync that fails leaves the cache alone — you get yesterday's calend
 rather than an empty one — and a provider that returns an empty calendar when
 thegn has events cached is treated as suspect rather than believed.
 
+Accounts sync independently: up to four network accounts (subscribed links and
+CalDAV) are fetched at once, while command plugins run one at a time. Each
+account's events appear as soon as it finishes, so one slow or unreachable
+server does not hold up the others.
+
 For a recurring event, an override with its `RECURRENCE-ID` replaces the
 generated occurrence, even if it moves to another day; a cancelled override
 hides that occurrence. Events at the same time are listed in a stable order.
+
+An event marked free (`TRANSP:TRANSPARENT` in iCalendar, `"busy": "free"` from
+a command plugin) is shown dimmed in the agenda. It is still listed and its
+reminders still fire; only its busy status differs.
 
 `max_events` (default 2000, allowed 1–10000) is an admission budget per
 account, not a display limit. It counts the events plus deletions that fall in
@@ -302,9 +311,10 @@ An event needs only four fields:
 
 Everything else is optional: `description`, `location`, `url`, `calendar`,
 `color` (a theme hue name like `"teal"`, never an RGB value), `status`,
-`organizer`, `reminders`, and `recurrence` (whose `rules` are plain `RRULE`
-strings). Unknown fields are ignored, so a plugin written against a newer thegn
-still works against an older one.
+`busy` (`"busy"` or `"free"`, default `"busy"`), `organizer`, `reminders`, and
+`recurrence` (whose `rules` are plain `RRULE` strings). Unknown fields are
+ignored, so a plugin written against a newer thegn still works against an older
+one.
 
 Capabilities are `"kind:target"` strings — `"run:khal"`, `"network:example.com"`.
 A plugin that asks for a capability the account didn't grant fails the run.

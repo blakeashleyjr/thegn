@@ -644,6 +644,26 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
         };
         outln!("  ⌫ swept {}{}", safe_display(b), reason);
     }
+    for (branch, errors) in &report.collected_partial {
+        outln!(
+            "  ⌫ swept {} (incomplete: {})",
+            safe_display(branch),
+            safe_display(&errors.join("; "))
+        );
+    }
+    for branch in &report.held_branches {
+        outln!(
+            "  • worktree previously collected; branch {} and queue evidence retained for explicit cleanup (THE-596)",
+            safe_display(branch)
+        );
+    }
+    for (branch, reason) in &report.informational {
+        outln!(
+            "  • left {} untouched — {}",
+            safe_display(branch),
+            safe_display(reason)
+        );
+    }
     for b in &report.kept_dirty {
         outln!("  • kept {} — edited since landing", safe_display(b));
     }
@@ -663,7 +683,19 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
     if report.is_empty() {
         outln!("Nothing to sweep.");
     } else {
-        outln!("Swept {} merged worktree(s).", report.collected.len());
+        outln!(
+            "Swept {} merged worktree(s).",
+            report.collected.len() + report.collected_partial.len()
+        );
+    }
+    if report.is_incomplete() {
+        anyhow::bail!(
+            "merge sweep incomplete: {} refused, {} changed during cleanup, {} partial, {} bookkeeping error(s)",
+            report.kept.len(),
+            report.kept_changed.len(),
+            report.collected_partial.len(),
+            report.bookkeeping_errors.len()
+        );
     }
     Ok(())
 }

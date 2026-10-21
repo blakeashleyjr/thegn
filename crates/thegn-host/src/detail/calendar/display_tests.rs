@@ -4,6 +4,49 @@ use termwiz::surface::Surface;
 use thegn_core::calendar::EventTime;
 
 #[test]
+fn transp_free_event_title_renders_dim_in_agenda() {
+    use crate::chrome::S;
+    use crate::detail::{Cell, Section};
+    use crate::seg::Tok;
+
+    let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
+    let mut free = CalEvent::new(
+        "free",
+        "Free event",
+        EventTime::Date { date },
+        EventTime::Date {
+            date: NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
+        },
+    );
+    free.busy = thegn_core::calendar::Busy::Free;
+    let busy = CalEvent::new(
+        "busy",
+        "Busy event",
+        EventTime::Date { date },
+        EventTime::Date {
+            date: NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
+        },
+    );
+    let st = status_state(
+        BTreeMap::from([(date, vec![Arc::new(free), Arc::new(busy)])]),
+        true,
+        None,
+    );
+    let sections = render::sections_of(&st);
+    let Some(Section::Table(table)) = sections.get(3) else {
+        panic!("agenda table missing")
+    };
+    let tone_for = |title: &str| {
+        table.rows.iter().find_map(|row| match row.get(1) {
+            Some(Cell::Text(label, tone)) if label == title => Some(*tone),
+            _ => None,
+        })
+    };
+    assert_eq!(tone_for("Free event"), Some(Tok::Slot(S::Dim)));
+    assert_eq!(tone_for("Busy event"), Some(Tok::Slot(S::Text)));
+}
+
+#[test]
 fn hostile_calendar_provider_values_stay_inside_popup_and_raw_values_survive() {
     let date = NaiveDate::from_ymd_opt(2026, 9, 13).unwrap();
     let raw = format!(

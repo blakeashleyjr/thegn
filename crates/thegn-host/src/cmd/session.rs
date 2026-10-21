@@ -973,17 +973,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     //    propagates — a prompt with a silently empty issue body is how a
     //    worker ends up implementing nothing.
     let facts = gather_issue_facts(client, stage, d.issue, Some(&wt)).await?;
-    // 5. A parent must exist — the same rule `dispatch put` enforces; restated
-    //    here (rather than imported) so the two verbs stay uncoupled. The row
-    //    is kept: its own `artifact_path` is `{parent_artifact}`'s default.
-    let parent_row = match d.parent {
-        Some(id) => Some(
-            db.get_dispatch(id)?
-                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id} to parent this row on"))?,
-        ),
-        None => None,
-    };
-    // 6. Chunk scope is prepared before the DB lock by shared admission.
+    // 5. Chunk scope is prepared before the DB lock by shared admission.
     // Session open deliberately has no scope override.
     // 6b. Insert the roster row BEFORE opening the session (D5).
     let agent_name = d
@@ -1057,18 +1047,48 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             ))));
         }
     };
-    // 7. The artifact path this stage's worker will write (D6: sanitized,
-    //    per-issue, row-keyed — the row id keeps parallel coders collide-free).
-    let artifact = pipeline_run::artifact_path(d.issue, &stage.name, row_id);
+    // 7. Read the artifact identity admission stamped in the same transaction
+    // as this row. Any missing identity closes the reservation.
+    let handoff = (|| -> Result<(String, String)> {
+        let row = db
+            .get_dispatch(row_id)?
+            .ok_or_else(|| anyhow::anyhow!("dispatch {row_id} disappeared after claim"))?;
+        let artifact = row
+            .artifact_path
+            .ok_or_else(|| anyhow::anyhow!("stage artifact path was not stamped"))?;
+        let parent_artifact = match d.parent {
+            Some(parent_id) => db
+                .get_dispatch(parent_id)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("parent dispatch {parent_id} disappeared after claim")
+                })?
+                .artifact_path
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        Ok((artifact, parent_artifact))
+    })();
+    let (artifact, parent_artifact) = match handoff {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            return match fail_reserved_row(&db, row_id, "stage artifact path was not stamped") {
+                Ok(_) => Err(error),
+                Err(close_error) => Err(error.context(format!(
+                    "dispatch {row_id} failed; row reconciliation failed: {close_error:#}"
+                ))),
+            };
+        }
+    };
     // 8–11. Render, refuse an empty prompt, open. Any failure from here on
     //    must leave the row `failed`: a row stuck `queued` reads as "not yet
     //    driven", and the Lead would re-drive it forever.
     let parent_artifact = d
         .parent_artifact
         .map(str::to_string)
-        .or_else(|| parent_row.as_ref().and_then(|r| r.artifact_path.clone()))
-        .unwrap_or_default();
+        .unwrap_or(parent_artifact);
     let opened = async {
+        let launch = crate::daemon::stage_launch::mint_launch_id()
+            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
         let vars = stage_task_vars(
             &facts,
             &branch,
@@ -1083,10 +1103,13 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![(
-                thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                row_id.to_string(),
-            )],
+            env: vec![
+                (
+                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
+                    row_id.to_string(),
+                ),
+                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
+            ],
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1110,7 +1133,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             adopt: d.adopt,
             already_capped: false,
         };
-        client.open(&spec).await
+        crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await
     }
     .await;
     match opened {
@@ -1508,7 +1531,20 @@ async fn resume_work(
     // oversubscribing the stage.
     policy_admission(cfg, &agent_name, &stage.name)?;
     let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name, json)?;
-    let artifact = pipeline_run::artifact_path(&row.issue_id, &stage.name, new_row);
+    let artifact = match db.get_dispatch(new_row).and_then(|row| {
+        row.and_then(|dispatch| dispatch.artifact_path)
+            .ok_or_else(|| anyhow::anyhow!("stage artifact path was not stamped"))
+    }) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            return match close_unrendered_finisher(&db, new_row) {
+                Ok(()) => Err(error),
+                Err(close_error) => Err(error.context(format!(
+                    "finisher dispatch {new_row} could not be closed: {close_error:#}"
+                ))),
+            };
+        }
+    };
     // 6b. Only now is the finisher's row-derived identity known. Render its
     // stage prompt with the NEW row id/artifact and the source artifact as its
     // parent handoff. If rendering fails, close the reservation rather than
@@ -1544,14 +1580,19 @@ async fn resume_work(
     // 7. Open — the same headless, stage-layered launch a fresh dispatch
     //    builds, seeded with the finisher prompt instead of the bare task.
     let opened = async {
+        let launch = crate::daemon::stage_launch::mint_launch_id()
+            .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
         let spec = OpenSpec {
             automation_origin: None,
             argv: Vec::new(),
             cwd: None,
-            env: vec![(
-                thegn_core::issue::DISPATCH_ROW_ENV.into(),
-                new_row.to_string(),
-            )],
+            env: vec![
+                (
+                    thegn_core::issue::DISPATCH_ROW_ENV.into(),
+                    new_row.to_string(),
+                ),
+                (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
+            ],
             rows: 24,
             cols: 80,
             worktree: Some(wt.clone()),
@@ -1577,7 +1618,7 @@ async fn resume_work(
             adopt,
             already_capped: false,
         };
-        client.open(&spec).await
+        crate::daemon::stage_launch::open_with_reconcile(|| client.open(&spec)).await
     }
     .await;
     match opened {
@@ -2245,11 +2286,10 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // Cross-profile migration is a local, admin-scoped CLI operation rather
     // than a control route, but it is still a catalog-owned CLI surface.
     v.push("sessions.migrate");
-    // Pipeline run-completion verbs (THE-76/THE-88): local `thegn dispatch
-    // verify|wait|report|note|status`
-    // — the first reads the worktree + roster directly, the second composes the
-    // routed `sessions.wait`. Neither is a control route, so they cover the CLI
-    // surface here rather than through `API_CALLS`.
+    // Pipeline run-completion verbs (THE-76/THE-88). `verify` and `status`
+    // remain local, while `wait` composes the routed `sessions.wait`. Report
+    // and note also appear in `API_CALLS`; the final dedup keeps this explicit
+    // CLI list harmless and documents the dedicated subcommands.
     v.extend([
         "dispatches.verify",
         "dispatches.wait",

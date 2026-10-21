@@ -23,7 +23,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use thegn_core::config::Config;
-use thegn_core::db::Db;
+use thegn_core::db::{Db, DispatchNoteQuotaExceeded, NoteQuotaKind};
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_chunk;
@@ -274,7 +274,125 @@ pub enum Action {
     },
 }
 
+pub(crate) const DISPATCH_CAPABILITY_ENV: &str = "THEGN_DISPATCH_CAPABILITY";
+
+#[derive(PartialEq, Eq)]
+enum WorkerRoute {
+    Local,
+    ViaDaemon(String),
+    Refused(&'static str),
+}
+
+impl std::fmt::Debug for WorkerRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => f.write_str("Local"),
+            Self::ViaDaemon(_) => f.write_str("ViaDaemon(<redacted>)"),
+            Self::Refused(verb) => f.debug_tuple("Refused").field(verb).finish(),
+        }
+    }
+}
+
+fn worker_route(action: &Action, token: Option<&str>) -> WorkerRoute {
+    let Some(token) = token else {
+        return WorkerRoute::Local;
+    };
+    match action {
+        Action::Report { .. } | Action::Note { .. } => WorkerRoute::ViaDaemon(token.to_owned()),
+        Action::Claim { .. } => WorkerRoute::Refused("claim"),
+        Action::Put { .. } => WorkerRoute::Refused("put"),
+        Action::SetStatus { .. } => WorkerRoute::Refused("set-status"),
+        Action::Lease { .. } => WorkerRoute::Refused("lease"),
+        Action::Reap { apply: true, .. } => WorkerRoute::Refused("reap --apply"),
+        Action::List { .. }
+        | Action::Reap { apply: false, .. }
+        | Action::Verify { .. }
+        | Action::Wait { .. }
+        | Action::Status { .. } => WorkerRoute::Local,
+    }
+}
+
+#[derive(Debug)]
+struct WorkerCapabilityRefusal {
+    verb: &'static str,
+}
+
+impl std::fmt::Display for WorkerCapabilityRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`thegn dispatch {}` is a supervisor verb and is refused under a worker dispatch capability",
+            self.verb
+        )
+    }
+}
+
+impl std::error::Error for WorkerCapabilityRefusal {}
+
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
+    fn worker_write_via_daemon(cfg: &Config, action: Action, token: String) -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let client = crate::cmd::session::connect(cfg).await?;
+            match action {
+                Action::Report { id, text, json } => {
+                    let validated = pipeline_report::report_text(&text)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let reply = client
+                        .dispatch_report(
+                            id,
+                            &thegn_svc::control::DispatchWorkerWriteReq {
+                                text: validated.clone(),
+                                token,
+                            },
+                        )
+                        .await?;
+                    print_report_outcome(
+                        reply.id,
+                        &validated,
+                        reply.pass_without_gate_evidence,
+                        json,
+                    )?;
+                }
+                Action::Note { id, text, json } => {
+                    let validated = pipeline_report::note_text(&text)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let reply = client
+                        .dispatch_note(
+                            id,
+                            &thegn_svc::control::DispatchWorkerWriteReq {
+                                text: validated.clone(),
+                                token,
+                            },
+                        )
+                        .await?;
+                    if json {
+                        super::emit_json(&serde_json::json!({
+                            "id": id,
+                            "note": validated,
+                            "note_id": reply.note_id,
+                            "created_at_ms": reply.created_at_ms,
+                        }))?;
+                    } else {
+                        outln!(
+                            "note recorded on dispatch {} ({} chars)",
+                            id,
+                            validated.chars().count()
+                        );
+                    }
+                }
+                _ => unreachable!("worker route only sends report or note"),
+            }
+            Ok(())
+        })
+    }
+    let token = std::env::var_os(DISPATCH_CAPABILITY_ENV);
+    let token_text = token.as_ref().map(|value| value.to_str().unwrap_or(""));
+    match worker_route(&action, token_text) {
+        WorkerRoute::Refused(verb) => return Err(WorkerCapabilityRefusal { verb }.into()),
+        WorkerRoute::ViaDaemon(token) => return worker_write_via_daemon(cfg, action, token),
+        WorkerRoute::Local => {}
+    }
     match action {
         Action::List { active, json } => list(active, json),
         Action::Reap { apply, json } => reap(cfg, apply, json),
@@ -2004,23 +2122,11 @@ fn report(id: i64, text: &str, json: bool) -> Result<()> {
 
 /// THE-88 — the DB-bound half of `dispatch report`. Validated text → row.
 pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
-    let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let row = db
-        .get_dispatch(id)?
-        .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
-    let head_oid = git_out_allow_empty(
-        std::path::Path::new(&row.worktree_path),
-        &["rev-parse", "--verify", "HEAD"],
-    )
-    .filter(|oid| !oid.is_empty());
-    if head_oid.is_none() {
-        tracing::warn!(target: "thegn::pipeline", dispatch_id = id, "could not record HEAD for dispatch report");
-    }
-    db.set_dispatch_report_bound(id, &validated, head_oid.as_deref())?;
-    // A PASS is a claim that the queue-boundary suite is green. Surfaced, never
-    // refused: a report that cannot be filed is a silent death, which is the
-    // worse failure — see the handoff contract in `[[pipeline.stages]]`.
-    let ungated = pipeline_report::pass_without_gate_evidence(&validated);
+    let recorded = record_report(db, id, text)?;
+    print_report_outcome(id, &recorded.validated, recorded.ungated, json)
+}
+
+fn print_report_outcome(id: i64, validated: &str, ungated: bool, json: bool) -> Result<()> {
     if json {
         let mut v = serde_json::json!({
             "id": id,
@@ -2049,6 +2155,29 @@ pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<(
     Ok(())
 }
 
+pub(crate) struct RecordedReport {
+    pub validated: String,
+    pub ungated: bool,
+}
+
+pub(crate) fn record_report(db: &Db, id: i64, text: &str) -> Result<RecordedReport> {
+    let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row = db
+        .get_dispatch(id)?
+        .ok_or_else(|| anyhow::anyhow!("roster row {id} does not exist"))?;
+    let head_oid = git_out_allow_empty(
+        std::path::Path::new(&row.worktree_path),
+        &["rev-parse", "--verify", "HEAD"],
+    )
+    .filter(|oid| !oid.is_empty());
+    if head_oid.is_none() {
+        tracing::warn!(target: "thegn::pipeline", dispatch_id = id, "could not record HEAD for dispatch report");
+    }
+    db.set_dispatch_report_bound(id, &validated, head_oid.as_deref())?;
+    let ungated = pipeline_report::pass_without_gate_evidence(&validated);
+    Ok(RecordedReport { validated, ungated })
+}
+
 /// `dispatch note <id> --text <text>` — append a progress note to a row's
 /// queue (THE-88). Validates through `pipeline_report::note_text`
 /// (empty/oversize errors surface verbatim), row must exist, writes via
@@ -2061,7 +2190,15 @@ fn note(id: i64, text: &str, json: bool) -> Result<()> {
 /// THE-88 — the DB-bound half of `dispatch note`.
 pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
     let validated = pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let note = db.append_dispatch_note_record(id, &validated)?;
+    let note = match db.append_dispatch_note_record(id, &validated) {
+        Ok(note) => note,
+        Err(error) => {
+            if json && let Some(quota) = error.downcast_ref::<DispatchNoteQuotaExceeded>() {
+                super::emit_json(&note_quota_error_json(id, quota))?;
+            }
+            return Err(error);
+        }
+    };
     if json {
         super::emit_json(&note_json(id, &note))?;
     } else {
@@ -2072,6 +2209,19 @@ pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn note_quota_error_json(id: i64, quota: &DispatchNoteQuotaExceeded) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "error": "note_quota_exceeded",
+        "kind": match quota.kind {
+            NoteQuotaKind::Count => "count",
+            NoteQuotaKind::Bytes => "bytes",
+        },
+        "notes": quota.notes,
+        "bytes": quota.bytes,
+    })
 }
 
 fn note_json(id: i64, note: &DispatchNote) -> serde_json::Value {
@@ -2164,7 +2314,9 @@ pub(crate) fn read_status(
                 })
             })
             .collect::<Vec<_>>();
+            let notes_shown = notes.len();
             v["notes"] = serde_json::Value::Array(notes);
+            attach_note_quota_status(&mut v, digest.note_count, notes_shown);
             annotate_override(&mut v, overrides.get(&digest.id));
             super::emit_json(&v)?;
         } else {
@@ -2217,6 +2369,16 @@ pub(crate) fn read_status(
         }
     }
     Ok(())
+}
+
+fn attach_note_quota_status(value: &mut serde_json::Value, notes_total: usize, notes_shown: usize) {
+    value["notes_total"] = serde_json::json!(notes_total);
+    value["notes_shown"] = serde_json::json!(notes_shown);
+    value["truncated"] = serde_json::json!(notes_total > notes_shown);
+    value["quota"] = serde_json::json!({
+        "max_notes": pipeline_report::NOTE_MAX_PER_ROW,
+        "max_bytes": pipeline_report::NOTE_MAX_BYTES_PER_ROW,
+    });
 }
 
 fn yes_no(b: bool) -> &'static str {
@@ -3008,6 +3170,57 @@ mod tests {
             note_cell(Some(two_lines)),
             "transport: connection error. (at…"
         );
+    }
+
+    #[test]
+    fn note_quota_status_json_reports_total_shown_truncated_and_quota() {
+        let (_dir, db) = db("note-quota-status");
+        let row = put(
+            &db,
+            NewDispatch::new("linear:THE-243-status", "/wt/note-status", "claude"),
+        )
+        .unwrap();
+        for _ in 0..25 {
+            db.append_dispatch_note_record(row.id, "progress").unwrap();
+        }
+        let total = db.dispatch_note_count(row.id, None).unwrap();
+        let page = db.newest_dispatch_notes(row.id, None, 20).unwrap();
+        let mut value = serde_json::json!({
+            "notes": page.iter().map(|note| note.text.as_str()).collect::<Vec<_>>()
+        });
+        attach_note_quota_status(&mut value, total, page.len());
+        assert_eq!(value["notes_total"], 25);
+        assert_eq!(value["notes_shown"], 20);
+        assert!(value["truncated"].as_bool().unwrap());
+        assert_eq!(
+            value["quota"]["max_notes"],
+            pipeline_report::NOTE_MAX_PER_ROW
+        );
+        assert_eq!(
+            value["quota"]["max_bytes"],
+            pipeline_report::NOTE_MAX_BYTES_PER_ROW
+        );
+    }
+
+    #[test]
+    fn note_quota_write_note_json_error_names_the_kind() {
+        let quota = DispatchNoteQuotaExceeded {
+            dispatch_id: 42,
+            kind: NoteQuotaKind::Count,
+            notes: pipeline_report::NOTE_MAX_PER_ROW,
+            bytes: 2_000,
+        };
+        let value = note_quota_error_json(42, &quota);
+        assert_eq!(value["id"], 42);
+        assert_eq!(value["error"], "note_quota_exceeded");
+        assert_eq!(value["kind"], "count");
+        assert_eq!(value["notes"], 2_000);
+        assert_eq!(value["bytes"], 2_000);
+        let byte_quota = DispatchNoteQuotaExceeded {
+            kind: NoteQuotaKind::Bytes,
+            ..quota
+        };
+        assert_eq!(note_quota_error_json(42, &byte_quota)["kind"], "bytes");
     }
 
     #[test]
@@ -4334,5 +4547,186 @@ mod tests {
         let report = pipeline_run::verify_report(&facts);
         let error = require_done_report(1, report).unwrap_err().to_string();
         assert!(error.contains("worktree status"), "{error}");
+    }
+
+    #[test]
+    fn worker_capability_route_table() {
+        let token = Some("token");
+        let actions = [
+            (
+                Action::Report {
+                    id: 1,
+                    text: "x".into(),
+                    json: false,
+                },
+                WorkerRoute::ViaDaemon("token".into()),
+            ),
+            (
+                Action::Note {
+                    id: 1,
+                    text: "x".into(),
+                    json: false,
+                },
+                WorkerRoute::ViaDaemon("token".into()),
+            ),
+            (
+                Action::Claim {
+                    issue_id: "i".into(),
+                    worktree_path: "/w".into(),
+                    agent_name: "a".into(),
+                    stage: "s".into(),
+                    artifact: None,
+                    parent: None,
+                    chunk: None,
+                    allow_duplicate: None,
+                    allow_scope_overlap: None,
+                    json: false,
+                },
+                WorkerRoute::Refused("claim"),
+            ),
+            (
+                Action::Put {
+                    issue_id: "i".into(),
+                    worktree_path: "/w".into(),
+                    agent_name: "a".into(),
+                    stage: None,
+                    parent: None,
+                    session: None,
+                    artifact: None,
+                    chunk: None,
+                    force: false,
+                    force_reason: None,
+                    json: false,
+                },
+                WorkerRoute::Refused("put"),
+            ),
+            (
+                Action::SetStatus {
+                    id: 1,
+                    status: "done".into(),
+                    force: false,
+                    why: None,
+                    json: false,
+                },
+                WorkerRoute::Refused("set-status"),
+            ),
+            (
+                Action::Lease {
+                    action: "show".into(),
+                    owner: None,
+                    ttl: 300,
+                    name: "lead".into(),
+                    json: false,
+                },
+                WorkerRoute::Refused("lease"),
+            ),
+            (
+                Action::Reap {
+                    apply: true,
+                    json: false,
+                },
+                WorkerRoute::Refused("reap --apply"),
+            ),
+            (
+                Action::Reap {
+                    apply: false,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+            (
+                Action::List {
+                    active: false,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+            (Action::Verify { id: 1, json: false }, WorkerRoute::Local),
+            (
+                Action::Wait {
+                    row: Some(1),
+                    any: false,
+                    timeout: None,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+            (
+                Action::Status {
+                    row: None,
+                    since: None,
+                    all: false,
+                    json: false,
+                },
+                WorkerRoute::Local,
+            ),
+        ];
+        for (action, expected) in actions {
+            assert_eq!(worker_route(&action, token), expected);
+            assert_eq!(worker_route(&action, None), WorkerRoute::Local);
+        }
+        assert_eq!(
+            worker_route(
+                &Action::Report {
+                    id: 1,
+                    text: String::new(),
+                    json: false
+                },
+                Some("")
+            ),
+            WorkerRoute::ViaDaemon(String::new())
+        );
+    }
+
+    #[test]
+    fn worker_capability_refusal_names_the_supervisor_verb() {
+        let message = WorkerCapabilityRefusal { verb: "claim" }.to_string();
+        assert!(message.contains("dispatch claim"));
+        assert!(message.contains("supervisor verb"));
+        let token = "ab".repeat(32);
+        let route = worker_route(
+            &Action::Report {
+                id: 1,
+                text: "x".into(),
+                json: false,
+            },
+            Some(&token),
+        );
+        assert!(!format!("{route:?}").contains(&token));
+        let request = thegn_svc::control::DispatchWorkerWriteReq {
+            text: "x".into(),
+            token: token.clone(),
+        };
+        assert!(!format!("{request:?}").contains(&token));
+    }
+
+    #[test]
+    fn worker_capability_record_report_matches_write_report() {
+        let (_dir, db) = db("worker-report-record");
+        let worktree = tempfile::tempdir().unwrap();
+        let local_id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-1037",
+                worktree.path().to_str().unwrap(),
+                "sh",
+            ))
+            .unwrap();
+        let daemon_id = db
+            .put_agent_dispatch(NewDispatch::new(
+                "linear:THE-1037",
+                worktree.path().to_str().unwrap(),
+                "sh",
+            ))
+            .unwrap();
+        write_report(&db, local_id, "findings: none\nnext: done", false).unwrap();
+        let recorded = record_report(&db, daemon_id, "findings: none\nnext: done").unwrap();
+        let local = db.get_dispatch(local_id).unwrap().unwrap();
+        let daemon = db.get_dispatch(daemon_id).unwrap().unwrap();
+        assert_eq!(local.report, daemon.report);
+        assert_eq!(daemon.report.as_deref(), Some(recorded.validated.as_str()));
+        assert_eq!(
+            recorded.ungated,
+            pipeline_report::pass_without_gate_evidence(&recorded.validated)
+        );
     }
 }

@@ -229,34 +229,67 @@ pub fn is_conflict(f: &FileStatus) -> bool {
     )
 }
 
-/// Parse `git log --graph --format=%x1f%h%x1f%D%x1f%s` output. Lines without
-/// the unit separator are pure graph connectors.
-pub fn parse_log_graph(out: &str) -> Vec<LogRow> {
-    out.lines()
-        .map(|line| match line.split_once('\u{1f}') {
-            Some((graph, rest)) => {
-                let mut it = rest.splitn(3, '\u{1f}');
-                LogRow {
-                    graph: graph.trim_end().to_string(),
-                    sha: it.next().unwrap_or_default().to_string(),
-                    refs: it
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                        .trim_start_matches('(')
-                        .trim_end_matches(')')
-                        .to_string(),
-                    subject: it.next().unwrap_or_default().to_string(),
-                }
+/// Parse `git log --graph --format=%x1f%h%x1f%D%x1f%s` output. Commit rows
+/// have a graph prefix containing `*`, a 4–64 digit lowercase hexadecimal
+/// short sha, decorations, and the remaining subject (which may contain the
+/// unit separator). Connector rows contain only graph characters and spaces.
+/// Any malformed row rejects the entire result.
+pub fn parse_log_graph(out: &str) -> Result<Vec<LogRow>> {
+    let mut rows = Vec::new();
+    for (index, line) in out.lines().enumerate() {
+        let row_number = index + 1;
+        let Some((graph, rest)) = line.split_once('\u{1f}') else {
+            if !line.chars().all(is_graph_char) {
+                anyhow::bail!("log graph row {row_number}: unexpected connector text");
             }
-            None => LogRow {
+            rows.push(LogRow {
                 graph: line.trim_end().to_string(),
                 sha: String::new(),
                 subject: String::new(),
                 refs: String::new(),
-            },
-        })
-        .collect()
+            });
+            continue;
+        };
+        if !graph.contains('*') || !graph.chars().all(is_graph_char) {
+            anyhow::bail!("log graph row {row_number}: invalid graph prefix");
+        }
+        let mut fields = rest.splitn(3, '\u{1f}');
+        let (Some(sha), Some(refs), Some(subject)) = (fields.next(), fields.next(), fields.next())
+        else {
+            anyhow::bail!("log graph row {row_number}: expected sha, decorations and subject");
+        };
+        if !(4..=64).contains(&sha.len())
+            || !sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!("log graph row {row_number}: invalid short sha");
+        }
+        rows.push(LogRow {
+            graph: graph.trim_end().to_string(),
+            sha: sha.to_string(),
+            refs: refs
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .to_string(),
+            subject: subject.to_string(),
+        });
+    }
+    Ok(rows)
+}
+
+fn is_graph_char(ch: char) -> bool {
+    matches!(ch, '*' | '|' | '/' | '\\' | '_' | '-' | '.' | ' ')
+}
+
+fn log_graph_args(n: &str, local: bool) -> Vec<&str> {
+    let mut args = vec!["log", "--graph"];
+    if local {
+        args.extend(["--no-show-signature", "--color=never"]);
+    }
+    args.extend(["--format=%x1f%h%x1f%D%x1f%s", "-n", n]);
+    args
 }
 
 /// Parse unified-diff output (`git diff -U3 -- <path>`) into hunks, capping
@@ -449,11 +482,8 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     /// The last `n` commits as graph rows (glyph prefix + sha/subject/refs).
     fn log_graph(&self, loc: &GitLoc, n: usize) -> Result<Vec<LogRow>> {
         let n = n.to_string();
-        let out = run(
-            loc,
-            &["log", "--graph", "--format=%x1f%h%x1f%D%x1f%s", "-n", &n],
-        )?;
-        Ok(parse_log_graph(&out))
+        let out = run(loc, &log_graph_args(&n, !loc.is_remote()))?;
+        parse_log_graph(&out)
     }
 
     /// Commit timestamps (epoch seconds) for the last `weeks` weeks — the
@@ -4123,7 +4153,7 @@ mod tests {
                    * | \u{1f}f44a09b\u{1f}tag: v0.1\u{1f}tabs: dedup titles\n\
                    |/  \n\
                    * \u{1f}77a1f2c\u{1f}\u{1f}host: panel split math\n";
-        let rows = parse_log_graph(out);
+        let rows = parse_log_graph(out).unwrap();
         assert_eq!(rows.len(), 6);
         assert_eq!(rows[0].graph, "*");
         assert_eq!(rows[0].sha, "a3f81c2");
@@ -4134,11 +4164,48 @@ mod tests {
         assert_eq!(rows[2].graph, "| *");
         assert!(!rows[2].is_head());
         assert_eq!(rows[3].refs, "tag: v0.1");
-        let spoof = parse_log_graph("* \u{1f}abc123\u{1f}\u{1f}x\u{1f}HEAD -> main");
+        let spoof = parse_log_graph("* \u{1f}abc123\u{1f}\u{1f}x\u{1f}HEAD -> main").unwrap();
         assert_eq!(spoof[0].refs, "");
         assert_eq!(spoof[0].subject, "x\u{1f}HEAD -> main");
         assert!(!spoof[0].is_head());
-        assert_eq!(parse_log_graph(""), Vec::<LogRow>::new());
+        assert_eq!(parse_log_graph("").unwrap(), Vec::<LogRow>::new());
+    }
+
+    #[test]
+    fn parse_log_graph_argv_disables_signature_and_color_output() {
+        assert_eq!(
+            log_graph_args("6", true),
+            vec![
+                "log",
+                "--graph",
+                "--no-show-signature",
+                "--color=never",
+                "--format=%x1f%h%x1f%D%x1f%s",
+                "-n",
+                "6",
+            ]
+        );
+        assert_eq!(
+            log_graph_args("6", false),
+            vec!["log", "--graph", "--format=%x1f%h%x1f%D%x1f%s", "-n", "6",]
+        );
+    }
+
+    #[test]
+    fn parse_log_graph_keeps_unit_separator_in_subject_and_rejects_short_rows() {
+        let rows = parse_log_graph("* \u{1f}abc1234\u{1f}\u{1f}a\u{1f}b\n").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "a\u{1f}b");
+        assert!(parse_log_graph("* \u{1f}abc1234\n").is_err());
+    }
+
+    #[test]
+    fn parse_log_graph_rejects_non_hex_sha_and_foreign_connector_text() {
+        assert!(parse_log_graph("* \u{1f}zzzz\u{1f}\u{1f}s\n").is_err());
+        assert!(parse_log_graph("|\\  \nnot a graph\n").is_err());
+        let rows = parse_log_graph("|\\  \n|/  \n").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.sha.is_empty()));
     }
 
     #[test]
@@ -4443,6 +4510,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
+        git_in(&base, &["config", "color.ui", "always"]);
         commit_empty(&base, "c0");
         commit_empty(&base, "c1");
 

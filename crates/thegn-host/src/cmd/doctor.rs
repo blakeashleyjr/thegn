@@ -150,7 +150,9 @@ fn shell_chain(cfg: &Config) -> Vec<String> {
 fn sandbox_json(cfg: &Config) -> serde_json::Value {
     let report = local_backend_report(cfg);
     let (backend, actual) = effective_first_ready(cfg, &report);
-    sandbox_json_with(cfg, backend, actual)
+    let mut value = sandbox_json_with(cfg, backend, actual);
+    value["git_metadata"] = git_metadata_json(&git_metadata_for_config(cfg, backend));
+    value
 }
 
 fn sandbox_json_with(cfg: &Config, backend: Backend, actual: IsolationClass) -> serde_json::Value {
@@ -3991,6 +3993,9 @@ fn sandbox_report(cfg: &Config) {
         cfg.sandbox.profile.as_str(),
         profile_policy(cfg.sandbox.profile)
     );
+    let (backend, _) = effective_first_ready(cfg, &report);
+    let exposure = git_metadata_for_config(cfg, backend);
+    outln!("  git metadata  {}", git_metadata_line(&exposure));
     cpu_cap_report(cfg);
     if all_weak {
         outln!("  note          even the strongest preset here shares the host kernel; for a");
@@ -4231,6 +4236,106 @@ fn network_rules_line(sb: &thegn_core::config::SandboxConfig, backend: Backend) 
         &Placement::Local,
     )
     .map(|note| note.trim_start_matches("sandbox ").to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitMetadataExposure {
+    SharedReadWrite { common_dir: std::path::PathBuf },
+    InsideWorktree,
+    HostFilesystem,
+    NotMounted,
+    NotInRepository,
+    Unmodelled,
+}
+
+fn git_metadata_exposure(
+    backend: Backend,
+    file_access: FileAccess,
+    worktree: Option<&std::path::Path>,
+    git_common: Option<&std::path::Path>,
+) -> GitMetadataExposure {
+    let (Some(worktree), Some(git_common)) = (worktree, git_common) else {
+        return GitMetadataExposure::NotInRepository;
+    };
+    if matches!(backend, Backend::Systemd | Backend::None)
+        || matches!(file_access, FileAccess::All | FileAccess::Host)
+    {
+        return GitMetadataExposure::HostFilesystem;
+    }
+    if matches!(
+        backend,
+        Backend::Wsl | Backend::WinAppContainer | Backend::WinJobObject
+    ) {
+        return GitMetadataExposure::Unmodelled;
+    }
+    if file_access == FileAccess::None {
+        return GitMetadataExposure::NotMounted;
+    }
+    if !backend.is_oci() && backend != Backend::Bwrap {
+        return GitMetadataExposure::Unmodelled;
+    }
+    if git_common == worktree || git_common.starts_with(worktree) {
+        GitMetadataExposure::InsideWorktree
+    } else {
+        GitMetadataExposure::SharedReadWrite {
+            common_dir: git_common.to_path_buf(),
+        }
+    }
+}
+
+fn git_metadata_for_config(cfg: &Config, backend: Backend) -> GitMetadataExposure {
+    if !cfg.sandbox.enabled {
+        return GitMetadataExposure::HostFilesystem;
+    }
+    let worktree = current_worktree_root();
+    let git_common = worktree.as_deref().map(thegn_core::util::git_common_dir);
+    let git_common = git_common.map(|common| std::fs::canonicalize(&common).unwrap_or(common));
+    git_metadata_exposure(
+        backend,
+        cfg.sandbox.file_access,
+        worktree.as_deref(),
+        git_common.as_deref(),
+    )
+}
+
+fn git_metadata_line(exposure: &GitMetadataExposure) -> String {
+    match exposure {
+        GitMetadataExposure::SharedReadWrite { common_dir } => format!(
+            "shared git dir {} is mounted read-write into sandboxed panes (hooks and refs writable; .git/config pinned read-only); no fenced commit path yet",
+            common_dir.display()
+        ),
+        GitMetadataExposure::InsideWorktree => {
+            "git dir is inside the worktree and shares its read-write mount (hooks writable)"
+                .to_string()
+        }
+        GitMetadataExposure::HostFilesystem => {
+            "sandboxed panes see the host filesystem (no mount boundary for git metadata)"
+                .to_string()
+        }
+        GitMetadataExposure::NotMounted => {
+            "git metadata is not mounted (file_access = none)".to_string()
+        }
+        GitMetadataExposure::NotInRepository => "not run inside a git worktree".to_string(),
+        GitMetadataExposure::Unmodelled => "not modelled for this backend".to_string(),
+    }
+}
+
+fn git_metadata_json(exposure: &GitMetadataExposure) -> serde_json::Value {
+    let (kind, path) = match exposure {
+        GitMetadataExposure::SharedReadWrite { common_dir } => {
+            ("shared_read_write", Some(common_dir.display().to_string()))
+        }
+        GitMetadataExposure::InsideWorktree => ("inside_worktree", None),
+        GitMetadataExposure::HostFilesystem => ("host_filesystem", None),
+        GitMetadataExposure::NotMounted => ("not_mounted", None),
+        GitMetadataExposure::NotInRepository => ("not_in_repository", None),
+        GitMetadataExposure::Unmodelled => ("unmodelled", None),
+    };
+    serde_json::json!({
+        "exposure": kind,
+        "path": path,
+        "detail": git_metadata_line(exposure),
+    })
 }
 
 /// The isolation floor line: the effective minimum, its source, and whether
@@ -5439,6 +5544,126 @@ args = ["--verbose"]
                 Backend::Bwrap
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn git_metadata_linked_worktree_on_bwrap_and_oci_is_shared_read_write() {
+        let worktree = std::path::Path::new("/w/feat");
+        let common = std::path::Path::new("/repo/.git");
+        for backend in [Backend::Bwrap, Backend::Podman] {
+            let exposure = git_metadata_exposure(
+                backend,
+                FileAccess::WorktreePlusCaches,
+                Some(worktree),
+                Some(common),
+            );
+            assert_eq!(
+                exposure,
+                GitMetadataExposure::SharedReadWrite {
+                    common_dir: common.to_path_buf(),
+                }
+            );
+            let line = git_metadata_line(&exposure);
+            assert!(line.contains("read-write"));
+            assert!(line.contains("hooks"));
+        }
+    }
+
+    #[test]
+    fn git_metadata_main_checkout_is_inside_worktree() {
+        let worktree = std::path::Path::new("/w/main");
+        let common = worktree.join(".git");
+        assert_eq!(
+            git_metadata_exposure(
+                Backend::Bwrap,
+                FileAccess::WorktreePlusCaches,
+                Some(worktree),
+                Some(&common),
+            ),
+            GitMetadataExposure::InsideWorktree
+        );
+    }
+
+    #[test]
+    fn git_metadata_host_backends_and_full_access_report_host_filesystem() {
+        let worktree = std::path::Path::new("/w/main");
+        let common = worktree.join(".git");
+        for (backend, file_access) in [
+            (Backend::Systemd, FileAccess::Worktree),
+            (Backend::None, FileAccess::Worktree),
+            (Backend::Bwrap, FileAccess::All),
+            (Backend::Bwrap, FileAccess::Host),
+        ] {
+            assert_eq!(
+                git_metadata_exposure(backend, file_access, Some(worktree), Some(&common),),
+                GitMetadataExposure::HostFilesystem
+            );
+        }
+        assert!(
+            git_metadata_line(&GitMetadataExposure::HostFilesystem).contains("host filesystem")
+        );
+    }
+
+    #[test]
+    fn git_metadata_none_access_unmodelled_and_no_repo() {
+        let worktree = std::path::Path::new("/w/feat");
+        let common = std::path::Path::new("/repo/.git");
+        assert_eq!(
+            git_metadata_exposure(
+                Backend::Bwrap,
+                FileAccess::None,
+                Some(worktree),
+                Some(common),
+            ),
+            GitMetadataExposure::NotMounted
+        );
+        assert_eq!(
+            git_metadata_exposure(
+                Backend::Wsl,
+                FileAccess::Worktree,
+                Some(worktree),
+                Some(common),
+            ),
+            GitMetadataExposure::Unmodelled
+        );
+        assert_eq!(
+            git_metadata_exposure(Backend::Bwrap, FileAccess::Worktree, None, Some(common)),
+            GitMetadataExposure::NotInRepository
+        );
+        assert_eq!(
+            git_metadata_exposure(Backend::Bwrap, FileAccess::Worktree, Some(worktree), None),
+            GitMetadataExposure::NotInRepository
+        );
+        let json = git_metadata_json(&GitMetadataExposure::SharedReadWrite {
+            common_dir: common.to_path_buf(),
+        });
+        assert_eq!(json["exposure"], "shared_read_write");
+        assert_eq!(json["path"], "/repo/.git");
+        assert!(
+            json["detail"]
+                .as_str()
+                .unwrap()
+                .contains("hooks and refs writable")
+        );
+    }
+
+    #[test]
+    fn git_metadata_sandbox_json_reports_disabled_host_filesystem() {
+        let cfg = Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let value = sandbox_json(&cfg);
+        assert_eq!(value["git_metadata"]["exposure"], "host_filesystem");
+        assert!(
+            value["git_metadata"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("host filesystem")
         );
     }
 

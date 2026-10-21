@@ -530,17 +530,16 @@ impl MediaBackend for MprisZbus {
     }
 
     /// Native MPRIS lists players straight off the bus.
-    fn players(&self) -> BoxFuture<'_, Vec<String>> {
-        Box::pin(async move { self.list_players().await.unwrap_or_default() })
+    fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
+        Box::pin(async move { self.list_players().await })
     }
 
     /// The D-Bus signal watcher — the native push path (no polling).
-    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+    fn watch(&self) -> BoxFuture<'_, Result<Option<Box<dyn MediaWatch + Send>>, MediaError>> {
         Box::pin(async move {
             MprisZbus::watch(self)
                 .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+                .map(|w| Some(Box::new(w) as Box<dyn MediaWatch + Send>))
         })
     }
 
