@@ -212,6 +212,7 @@ fn parse_detail(value: serde_json::Value, requested_id: &str) -> Result<CiRunDet
     Ok(CiRunDetail {
         run,
         discarded_jobs,
+        incomplete: None,
     })
 }
 

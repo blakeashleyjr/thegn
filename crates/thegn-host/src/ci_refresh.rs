@@ -925,7 +925,12 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
         }
         if detail.discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
-            // A partial matrix is not enough evidence for log ingestion or an autofix handoff.
+        }
+        if let Some(incomplete) = detail.incomplete {
+            tracing::warn!(target: "thegn::ci", reason = %incomplete.reason(), "CI job list is incomplete");
+        }
+        if detail.discarded_jobs > 0 || !detail.is_complete() {
+            // A partial or truncated job list is not enough evidence for log ingestion or an autofix handoff.
             if let Ok(mut memo) = ingest_memo().lock() {
                 memo.touch(run_key, now, cfg.poll_interval_secs, true);
             }
@@ -1218,7 +1223,15 @@ mod tests {
         thegn_svc::ci::CiRunDetail {
             run,
             discarded_jobs: 0,
+            incomplete: None,
         }
+    }
+
+    fn with_incomplete_detail(mut self, run_id: &str, sha: &str) -> Self {
+        let mut detail = ci_detail(run_id, sha);
+        detail.incomplete = Some(thegn_svc::ci::CiDetailIncomplete::PageBudget { pages: 50 });
+        self.details.insert(run_id.to_string(), detail);
+        self
     }
 
     fn ci_detail_with_job(run_id: &str, sha: &str, job_id: &str) -> thegn_svc::ci::CiRunDetail {
@@ -1293,6 +1306,17 @@ mod tests {
         let runs = [ci_run("run", "sha")];
         ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 15_000);
         ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 15_000);
+        assert_eq!(provider.detail_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn incomplete_detail_skips_log_ingestion() {
+        let temp = private_tempdir();
+        let provider = FakeCi::new(&[]).with_incomplete_detail("run", "sha");
+        let runs = [ci_run("run", "sha")];
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 15_500);
+        ingest_test(&temp, &provider, &runs, MAX_LOG_INGEST_CALLS, 15_500);
+        assert!(provider.log_calls.lock().expect("calls").is_empty());
         assert_eq!(provider.detail_calls.load(Ordering::Relaxed), 1);
     }
 

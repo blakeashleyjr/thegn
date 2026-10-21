@@ -263,16 +263,31 @@ fn runs(
     Ok(())
 }
 
+fn detail_warnings(detail: &thegn_svc::ci::CiRunDetail) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if detail.discarded_jobs > 0 {
+        warnings.push(format!(
+            "CI provider omitted {} malformed job row(s)",
+            detail.discarded_jobs
+        ));
+    }
+    if let Some(incomplete) = detail.incomplete {
+        warnings.push(format!(
+            "CI job list is incomplete: {}; showing the first {} job(s)",
+            incomplete.reason(),
+            detail.run.jobs.len()
+        ));
+    }
+    warnings
+}
+
 fn view(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     validate_id_at_cli(run_id)?;
     let (loc, client) = client(cfg, worktree)?;
     match client.run_detail(&loc, run_id) {
         Ok(detail) => {
-            if detail.discarded_jobs > 0 {
-                msg::warn(&format!(
-                    "CI provider omitted {} malformed job row(s)",
-                    detail.discarded_jobs
-                ));
+            for warning in detail_warnings(&detail) {
+                msg::warn(&warning);
             }
             print_run_detail(&detail.run);
         }
@@ -384,13 +399,10 @@ fn log(
                 }
             };
             let detail = provider.run_detail(&loc, run_id).ok();
-            if let Some(detail) = &detail
-                && detail.discarded_jobs > 0
-            {
-                msg::warn(&format!(
-                    "CI provider omitted {} malformed job row(s)",
-                    detail.discarded_jobs
-                ));
+            if let Some(detail) = &detail {
+                for warning in detail_warnings(detail) {
+                    msg::warn(&warning);
+                }
             }
             let (job_name, head_sha) = detail
                 .as_ref()
@@ -724,5 +736,37 @@ mod tests {
         };
         assert_eq!(rerun_scope(&github, false, false), Ok(RerunScope::All));
         assert_eq!(rerun_scope(&github, true, false), Ok(RerunScope::Failed));
+    }
+
+    #[test]
+    fn detail_warnings_name_an_incomplete_job_list() {
+        let incomplete = thegn_svc::ci::CiRunDetail {
+            run: CiRun {
+                jobs: vec![CiJob::default(), CiJob::default()],
+                ..CiRun::default()
+            },
+            discarded_jobs: 0,
+            incomplete: Some(thegn_svc::ci::CiDetailIncomplete::PageBudget { pages: 50 }),
+        };
+        let warnings = detail_warnings(&incomplete);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("incomplete"));
+        assert!(warnings[0].contains("2 job(s)"));
+
+        let malformed = thegn_svc::ci::CiRunDetail {
+            run: CiRun::default(),
+            discarded_jobs: 1,
+            incomplete: None,
+        };
+        let warnings = detail_warnings(&malformed);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("malformed job row"));
+
+        let clean = thegn_svc::ci::CiRunDetail {
+            run: CiRun::default(),
+            discarded_jobs: 0,
+            incomplete: None,
+        };
+        assert!(detail_warnings(&clean).is_empty());
     }
 }
