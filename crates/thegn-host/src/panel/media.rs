@@ -8,6 +8,13 @@ use crate::media_art::ArtMosaic;
 
 pub(crate) type MediaIdentity = (String, Option<String>);
 
+/// A queue row and the player whose snapshot the queue was fetched for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueueItemLease {
+    pub(crate) id: String,
+    pub(crate) player: String,
+}
+
 /// Generation and snapshot identity attached to every asynchronous media
 /// request. A matching track alone is not sufficient: it may disappear and
 /// return while an older response is still in flight.
@@ -293,6 +300,15 @@ impl MediaPanelState {
             .checked_sub(self.sources.len())
             .and_then(|i| self.queue.get(i))
     }
+
+    pub(crate) fn queue_lease_at(&self, index: usize) -> Option<QueueItemLease> {
+        let item = self.queue_at(index)?;
+        let (player, _) = self.queue_identity.as_ref()?;
+        Some(QueueItemLease {
+            id: item.id.clone(),
+            player: player.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +435,54 @@ mod tests {
 
         assert_eq!(panel.queue.len(), MAX_QUEUE_ITEMS);
         assert_eq!(panel.queue_truncated, MAX_QUEUE_ITEMS);
+    }
+
+    #[test]
+    fn queue_lease_carries_the_player_that_listed_the_queue() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.begin_request(Some(&current));
+        let request = panel.take_queue_request(Some(&current)).unwrap();
+        panel.set_queue(
+            request,
+            Some(&current),
+            Ok(vec![QueueItem {
+                id: "q1".into(),
+                ..Default::default()
+            }]),
+        );
+
+        assert_eq!(
+            panel.queue_lease_at(0),
+            Some(QueueItemLease {
+                id: "q1".into(),
+                player: "player".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn queue_lease_is_none_after_the_player_changes() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.begin_request(Some(&current));
+        let request = panel.take_queue_request(Some(&current)).unwrap();
+        panel.set_queue(
+            request,
+            Some(&current),
+            Ok(vec![QueueItem {
+                id: "q1".into(),
+                ..Default::default()
+            }]),
+        );
+
+        let changed = MediaState {
+            player: "other".into(),
+            ..current
+        };
+        panel.sync_snapshot(Some(&changed), Some(MediaCaps::default()), 0);
+
+        assert_eq!(panel.queue_lease_at(0), None);
     }
 
     #[test]
