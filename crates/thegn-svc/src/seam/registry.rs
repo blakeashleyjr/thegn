@@ -571,6 +571,7 @@ mod tests {
 
     fn hermetic_config() -> Config {
         let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false;
         cfg.managed_tools.insert(
             "bugstalker".into(),
             thegn_core::managed_tool::ToolOverride {

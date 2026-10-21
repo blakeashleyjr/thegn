@@ -113,11 +113,11 @@ dropped.
 
 Those three rendering/event points plus `IssueProvider` are the extension
 points the general compositor host accepts. `PanelSection`, `SidebarTab`,
-`Theme`, `Automation`, `HarnessAdapter`, `ProgramAdapter`, `CiProvider`, and
-`ForgeProvider` and `DebugAdapter` are wire vocabulary only there: `thegn plugin check` rejects
-them until their host runtime lands. `DataSource` has a separate,
-calendar-account-specific command adapter; it is not a general UI
-contribution. Native theme files and configured drawer tools are not runtime
+`Theme`, `Automation`, `HarnessAdapter`, `ProgramAdapter`, `CiProvider`,
+`ForgeProvider`, and `DebugAdapter` are wire vocabulary only there:
+`thegn plugin check` rejects them until their host runtime lands. `DataSource`
+has a separate, calendar-account-specific command adapter; it is not a general
+UI contribution. Native theme files and configured drawer tools are not runtime
 plugin surfaces.
 
 The machine-readable source for this classification is embedded in
