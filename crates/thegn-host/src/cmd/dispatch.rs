@@ -35,6 +35,13 @@ use thegn_core::util::{git_ok, git_out_allow_empty};
 
 /// Bound the active roster rows examined by the CLI reaper.
 const CLI_REAP_ROW_LIMIT: usize = 4096;
+const ACTIVE_STATUSES: [AgentDispatchStatus; 5] = [
+    AgentDispatchStatus::Queued,
+    AgentDispatchStatus::Spawning,
+    AgentDispatchStatus::Running,
+    AgentDispatchStatus::WaitingHuman,
+    AgentDispatchStatus::PrOpen,
+];
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
@@ -1147,18 +1154,13 @@ fn lease_renewal_outcome(
     }
 }
 
-fn list_rows(db: &Db, active: bool) -> Result<(Vec<AgentDispatch>, bool)> {
-    if !active {
-        return Ok((db.list_dispatches()?, false));
-    }
-    const ACTIVE: [AgentDispatchStatus; 5] = [
-        AgentDispatchStatus::Queued,
-        AgentDispatchStatus::Spawning,
-        AgentDispatchStatus::Running,
-        AgentDispatchStatus::WaitingHuman,
-        AgentDispatchStatus::PrOpen,
-    ];
-    let (mut rows, truncated) = db.list_dispatches_with_status(&ACTIVE, Db::ROSTER_ACTIVE_LIMIT)?;
+fn bounded_rows(
+    db: &Db,
+    statuses: &[AgentDispatchStatus],
+    what: &str,
+) -> Result<(Vec<AgentDispatch>, bool)> {
+    let (mut rows, truncated) =
+        db.list_dispatches_with_status(statuses, Db::ROSTER_ACTIVE_LIMIT)?;
     rows.sort_by(|a, b| {
         b.dispatched_at_ms
             .cmp(&a.dispatched_at_ms)
@@ -1166,11 +1168,18 @@ fn list_rows(db: &Db, active: bool) -> Result<(Vec<AgentDispatch>, bool)> {
     });
     if truncated {
         thegn_core::msg::warn(&format!(
-            "dispatch list --active shows only the oldest {} active rows",
+            "{what} only the oldest {} active rows",
             Db::ROSTER_ACTIVE_LIMIT
         ));
     }
     Ok((rows, truncated))
+}
+
+fn list_rows(db: &Db, active: bool) -> Result<(Vec<AgentDispatch>, bool)> {
+    if !active {
+        return Ok((db.list_dispatches()?, false));
+    }
+    bounded_rows(db, &ACTIVE_STATUSES, "dispatch list --active shows")
 }
 
 fn list(active: bool, json: bool) -> Result<()> {
@@ -2327,27 +2336,7 @@ pub(crate) fn read_status(
     } else if all {
         db.list_dispatches()?
     } else {
-        const ACTIVE: [AgentDispatchStatus; 5] = [
-            AgentDispatchStatus::Queued,
-            AgentDispatchStatus::Spawning,
-            AgentDispatchStatus::Running,
-            AgentDispatchStatus::WaitingHuman,
-            AgentDispatchStatus::PrOpen,
-        ];
-        let (mut rows, truncated) =
-            db.list_dispatches_with_status(&ACTIVE, Db::ROSTER_ACTIVE_LIMIT)?;
-        rows.sort_by(|a, b| {
-            b.dispatched_at_ms
-                .cmp(&a.dispatched_at_ms)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        if truncated {
-            thegn_core::msg::warn(&format!(
-                "dispatch status shows only the oldest {} active rows",
-                Db::ROSTER_ACTIVE_LIMIT
-            ));
-        }
-        rows
+        bounded_rows(db, &ACTIVE_STATUSES, "dispatch status shows")?.0
     };
 
     let row_mode = row.is_some();
@@ -2471,22 +2460,12 @@ fn wait_rows(db: &Db, row: Option<i64>) -> Result<Vec<AgentDispatch>> {
     if let Some(id) = row {
         return Ok(db.get_dispatch(id)?.into_iter().collect());
     }
-    let (mut rows, truncated) = db.list_dispatches_with_status(
+    bounded_rows(
+        db,
         &[AgentDispatchStatus::Spawning, AgentDispatchStatus::Running],
-        Db::ROSTER_ACTIVE_LIMIT,
-    )?;
-    rows.sort_by(|a, b| {
-        b.dispatched_at_ms
-            .cmp(&a.dispatched_at_ms)
-            .then_with(|| b.id.cmp(&a.id))
-    });
-    if truncated {
-        thegn_core::msg::warn(&format!(
-            "dispatch wait --any covers only the oldest {} active rows",
-            Db::ROSTER_ACTIVE_LIMIT
-        ));
-    }
-    Ok(rows)
+        "dispatch wait --any covers",
+    )
+    .map(|(rows, _)| rows)
 }
 
 fn fence_wait_targets(db: &Db, targets: Vec<WaitTarget>) -> Result<Vec<FencedWaitTarget>> {
@@ -4972,12 +4951,12 @@ mod tests {
         let path = db.file_path().unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
-            "UPDATE agent_dispatches SET dispatched_at_ms=10 WHERE id=?1",
+            "UPDATE agent_dispatches SET dispatched_at_ms=20 WHERE id=?1",
             rusqlite::params![older.id],
         )
         .unwrap();
         conn.execute(
-            "UPDATE agent_dispatches SET dispatched_at_ms=20 WHERE id=?1",
+            "UPDATE agent_dispatches SET dispatched_at_ms=10 WHERE id=?1",
             rusqlite::params![newer.id],
         )
         .unwrap();
@@ -4987,7 +4966,7 @@ mod tests {
         let (rows, truncated) = list_rows(&db, true).unwrap();
         assert_eq!(
             rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            [newer.id, older.id]
+            [older.id, newer.id]
         );
         assert!(!truncated);
     }
