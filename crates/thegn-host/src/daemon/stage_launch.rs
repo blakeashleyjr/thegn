@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Mutex;
 
-use anyhow::Context;
 use thegn_svc::control::client::ControlRequestError;
 use thegn_svc::control::{OpenSpec, SessionInfo};
 
