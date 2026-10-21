@@ -37,6 +37,18 @@ enum StaleAction {
     Destroy(crate::pool_lease::Lease),
 }
 
+enum ClaimingAction {
+    Keep,
+    Quarantine,
+}
+
+fn orphaned_claim_action(probe: LeaseProbe) -> ClaimingAction {
+    match probe {
+        LeaseProbe::Free(_lease) => ClaimingAction::Quarantine,
+        LeaseProbe::Busy | LeaseProbe::Error => ClaimingAction::Keep,
+    }
+}
+
 fn stale_provisioning_action(age: Option<u64>, probe: impl FnOnce() -> LeaseProbe) -> StaleAction {
     if age.is_none_or(|age| age < PROVISION_STALE_SECS) {
         return StaleAction::Keep;
@@ -429,6 +441,32 @@ where
                     provisioning += 1;
                 }
                 notify();
+            }
+        }
+    }
+    for s in spares.iter().filter(|s| s.state == "claiming") {
+        let probe = match crate::pool_lease::spare_lease(&s.sandbox_name) {
+            Ok(lease) => LeaseProbe::Free(lease),
+            Err(crate::pool_lease::LeaseError::Busy) => LeaseProbe::Busy,
+            Err(crate::pool_lease::LeaseError::Io(error)) => {
+                thegn_core::msg::warn(&format!(
+                    "warm pool: cannot check claim lease for spare {}: {error}; keeping row",
+                    s.sandbox_name
+                ));
+                LeaseProbe::Error
+            }
+        };
+        match orphaned_claim_action(probe) {
+            ClaimingAction::Keep => {}
+            ClaimingAction::Quarantine => {
+                if let Err(error) = db.quarantine_pool_spare(&s.sandbox_name, "claiming") {
+                    tracing::warn!(target: "thegn::lifecycle", spare = %s.sandbox_name, %error, "failed to quarantine interrupted warm-pool claim");
+                } else {
+                    thegn_core::msg::warn(&format!(
+                        "warm pool: quarantined {}: its claim was interrupted (claimer exited); reconcile inventory before reuse",
+                        s.sandbox_name
+                    ));
+                }
             }
         }
     }
@@ -957,6 +995,26 @@ mod tests {
         db.claim_pool_spare("/repo", "sprites", "/wt/z").unwrap();
         let spare = db.pool_spare_by_name("repo-pool-2").unwrap().unwrap();
         assert!(claimed_recycle_checkpoint(&spare, "sprites", "lock-a").is_none());
+    }
+
+    #[test]
+    fn orphaned_claim_with_free_lease_is_quarantined() {
+        assert!(matches!(
+            orphaned_claim_action(free_spare_probe()),
+            ClaimingAction::Quarantine
+        ));
+    }
+
+    #[test]
+    fn orphaned_claim_with_busy_or_error_probe_is_kept() {
+        assert!(matches!(
+            orphaned_claim_action(LeaseProbe::Busy),
+            ClaimingAction::Keep
+        ));
+        assert!(matches!(
+            orphaned_claim_action(LeaseProbe::Error),
+            ClaimingAction::Keep
+        ));
     }
 }
 
