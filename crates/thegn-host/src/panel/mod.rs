@@ -1317,7 +1317,7 @@ impl PanelUi {
                 self.hunks_unavailable.remove(&path);
             }
             Err(()) => {
-                self.hunks.retain(|banked_path, _| banked_path != &path);
+                self.hunks.remove(&path);
                 self.hunks_unavailable.insert(path);
             }
         }

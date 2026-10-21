@@ -1878,6 +1878,26 @@ mod tests {
     }
 
     #[test]
+    fn files_main_region_renders_unavailable_diff_without_spinner() {
+        let m = model();
+        let mut ui = ui(GitView::Files);
+        ui.hunks_unavailable.insert("src/a.rs".into());
+
+        let rows = staging_region(&m.panel, &ui, true, 120, 40);
+        let rendered = rows
+            .iter()
+            .map(|row| text_of(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("diff unavailable (git failed)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("file diff"), "{rendered}");
+    }
+
+    #[test]
     fn semantic_impact_summary_rides_the_full_frame() {
         use thegn_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
         let mut m = model();
