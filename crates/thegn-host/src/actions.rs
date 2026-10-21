@@ -465,8 +465,13 @@ pub(crate) fn spawn_ci_action(
     let tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
+        let Some(mutation) = crate::ci_refresh::begin_ci_mutation() else {
+            thegn_core::msg::warn("ci: thegn is quitting; CI action not started");
+            return;
+        };
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let Some(client) = thegn_svc::ci::provider_for(&loc, &cfg) else {
+        let Some(client) = thegn_svc::ci::provider_for_cancellable(&loc, &cfg, mutation.cancel())
+        else {
             thegn_core::msg::warn("ci: no provider for this worktree");
             return;
         };

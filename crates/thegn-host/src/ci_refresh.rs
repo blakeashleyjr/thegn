@@ -228,9 +228,14 @@ struct CiRefreshCoordinator {
     flight: CiFlight,
     queued: Option<RefreshRequest>,
     shut_down: bool,
+    mutations: Vec<Arc<AtomicBool>>,
 }
 
 impl CiRefreshCoordinator {
+    fn busy(&self) -> bool {
+        self.flight.running.is_some() || !self.mutations.is_empty()
+    }
+
     /// Rejects submissions after shutdown; this latch check is authoritative.
     /// Callers may precheck to log a refusal, but this guard remains authoritative.
     fn submit(&mut self, request: RefreshRequest) -> bool {
@@ -251,6 +256,21 @@ impl CiRefreshCoordinator {
     }
 }
 
+fn register_mutation(coordinator: &mut CiRefreshCoordinator) -> Option<Arc<AtomicBool>> {
+    if coordinator.shut_down {
+        return None;
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    coordinator.mutations.push(Arc::clone(&cancel));
+    Some(cancel)
+}
+
+fn finish_mutation(coordinator: &mut CiRefreshCoordinator, cancel: &Arc<AtomicBool>) {
+    coordinator
+        .mutations
+        .retain(|registered| !Arc::ptr_eq(registered, cancel));
+}
+
 fn ci_refresh_coordinator() -> &'static Mutex<CiRefreshCoordinator> {
     static COORDINATOR: std::sync::OnceLock<Mutex<CiRefreshCoordinator>> =
         std::sync::OnceLock::new();
@@ -264,6 +284,9 @@ fn ci_refresh_idle() -> &'static Condvar {
 
 fn cancel_coordinator_for_shutdown(coordinator: &mut CiRefreshCoordinator) {
     coordinator.shut_down = true;
+    for cancel in &coordinator.mutations {
+        cancel.store(true, Ordering::Relaxed);
+    }
     if let Some(running) = coordinator.flight.running.as_ref() {
         running.cancel.store(true, Ordering::Relaxed);
     }
@@ -282,7 +305,7 @@ fn wait_coordinator_idle(
     let mut coordinator = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while coordinator.flight.running.is_some() {
+    while coordinator.busy() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return false;
@@ -291,7 +314,7 @@ fn wait_coordinator_idle(
             .wait_timeout(coordinator, remaining)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         coordinator = next;
-        if result.timed_out() && coordinator.flight.running.is_some() {
+        if result.timed_out() && coordinator.busy() {
             return false;
         }
     }
@@ -307,6 +330,45 @@ pub(crate) fn cancel_for_shutdown() {
 
 pub(crate) fn wait_ci_idle(deadline: Instant) -> bool {
     wait_coordinator_idle(ci_refresh_coordinator(), ci_refresh_idle(), deadline)
+}
+
+pub(crate) struct CiMutationGuard {
+    lock: &'static Mutex<CiRefreshCoordinator>,
+    idle: &'static Condvar,
+    cancel: Arc<AtomicBool>,
+}
+
+impl CiMutationGuard {
+    pub(crate) fn cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+}
+
+impl Drop for CiMutationGuard {
+    fn drop(&mut self) {
+        let mut coordinator = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        finish_mutation(&mut coordinator, &self.cancel);
+        self.idle.notify_all();
+    }
+}
+
+fn begin_ci_mutation_in(
+    lock: &'static Mutex<CiRefreshCoordinator>,
+    idle: &'static Condvar,
+) -> Option<CiMutationGuard> {
+    let cancel = register_mutation(
+        &mut lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )?;
+    Some(CiMutationGuard { lock, idle, cancel })
+}
+
+pub(crate) fn begin_ci_mutation() -> Option<CiMutationGuard> {
+    begin_ci_mutation_in(ci_refresh_coordinator(), ci_refresh_idle())
 }
 
 #[cfg(test)]
@@ -1680,6 +1742,57 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         ));
         worker.join().expect("local flight completion");
+    }
+
+    #[test]
+    fn ci_shutdown_cancels_in_flight_mutations_and_refuses_new_ones() {
+        let mut coordinator = CiRefreshCoordinator::default();
+        let cancel = register_mutation(&mut coordinator).expect("mutation admitted");
+        assert!(!cancel.load(Ordering::Relaxed));
+
+        cancel_coordinator_for_shutdown(&mut coordinator);
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(register_mutation(&mut coordinator).is_none());
+    }
+
+    #[test]
+    fn ci_idle_wait_covers_in_flight_mutations() {
+        let lock = Arc::new(Mutex::new(CiRefreshCoordinator::default()));
+        let idle = Arc::new(Condvar::new());
+        let cancel = register_mutation(&mut lock.lock().expect("local coordinator"))
+            .expect("mutation admitted");
+        assert!(!wait_coordinator_idle(&lock, &idle, Instant::now()));
+
+        let worker_lock = Arc::clone(&lock);
+        let worker_idle = Arc::clone(&idle);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut coordinator = worker_lock.lock().expect("local coordinator");
+            finish_mutation(&mut coordinator, &worker_cancel);
+            worker_idle.notify_all();
+        });
+        assert!(wait_coordinator_idle(
+            &lock,
+            &idle,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        worker.join().expect("local mutation completion");
+    }
+
+    #[test]
+    fn ci_mutation_guard_unregisters_on_drop() {
+        let lock = Box::leak(Box::new(Mutex::new(CiRefreshCoordinator::default())));
+        let idle = Box::leak(Box::new(Condvar::new()));
+        let guard = begin_ci_mutation_in(lock, idle).expect("mutation admitted");
+        assert_eq!(lock.lock().expect("local coordinator").mutations.len(), 1);
+
+        drop(guard);
+
+        assert!(lock.lock().expect("local coordinator").mutations.is_empty());
+        cancel_coordinator_for_shutdown(&mut lock.lock().expect("local coordinator"));
+        assert!(begin_ci_mutation_in(lock, idle).is_none());
     }
 
     #[test]
