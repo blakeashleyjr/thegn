@@ -331,20 +331,6 @@
       "no_spec_rationale": "The delivered subtask (bounded public-share output and redacted diagnostics) archived as bound-public-share-output. The remaining credential-isolation work \u2014 keeping secrets out of public-share client argv \u2014 is still In Progress and has no proposal yet."
     },
     {
-      "issue": "THE-377",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "secure-custom-command-templates"
-      ]
-    },
-    {
-      "issue": "THE-471",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "sanitize-calendar-display-text"
-      ]
-    },
-    {
       "issue": "THE-559",
       "project": "Workspace Product & Observability",
       "changes": [
@@ -377,13 +363,6 @@
       "project": "Workspace Product & Observability",
       "changes": [
         "pane-zoom-stack"
-      ]
-    },
-    {
-      "issue": "THE-575",
-      "project": "Distribution & Release Readiness",
-      "changes": [
-        "resolve-build-git-identity"
       ]
     },
     {
