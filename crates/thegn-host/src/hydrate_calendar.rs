@@ -27,7 +27,10 @@ use thegn_core::calendar::validate::validate_event;
 use thegn_core::calendar::{CalEvent, CalendarWindow, ExpansionError};
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig};
 use thegn_core::db::Db;
-use thegn_core::store::{CalendarRow, CalendarStore};
+use thegn_core::store::{
+    CalendarCursor, CalendarPageApplied, CalendarPageWrite, CalendarRow, CalendarStore,
+    CalendarTombstones, EmptySnapshot,
+};
 use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage, PageMode};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -743,80 +746,74 @@ fn apply_page_with_generation(
     window: CalendarWindow,
     generation: Option<&crate::hydrate_schedule::ScheduleFence>,
 ) -> bool {
-    let (from_ms, to_ms) = (window.start_ms, window.end_exclusive_ms);
-
-    // A conditional fetch that came back 304: nothing to write, but the sync
-    // stamp must still advance or we would re-hit the provider every tick.
-    // The cache strategy branches on what the fetch completed, never on the
-    // cursor it returned (THE-452): a snapshot may return a token and a delta
-    // may return none.
-    let mode = page.mode();
-    if mode == PageMode::Unchanged {
-        if crate::hydrate_schedule::generation_is_current(generation) {
-            let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-        }
-        return false;
-    }
-
-    let incremental = !mode.replaces_cache();
-    // Rule 2: an EMPTY FULL fetch is only believed when there was nothing
-    // cached. Otherwise a 200-with-empty-body from a flaky proxy silently
-    // erases a month of meetings — and unlike an error, nothing would warn.
-    // (A page is always complete: an over-budget source never produces one.)
-    // A provider-requested reset is believed even when empty.
-    if mode == PageMode::Snapshot
-        && page.events().is_empty()
-        && db.has_calendar_events(account).unwrap_or(false)
-    {
-        tracing::warn!(
-            target: "thegn::calendar",
-            account = %account,
-            "empty full fetch — keeping the prior cache rather than erasing it"
-        );
-        if crate::hydrate_schedule::generation_is_current(generation) {
-            let _ = db.set_calendar_error(account, "provider returned an empty calendar"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-        }
-        return false;
-    }
-
     let rows: Vec<CalendarRow> = page
         .events()
         .iter()
         .enumerate()
         .map(|(index, event)| row_of(event, page.event_hrefs().get(index).map(String::as_str)))
         .collect();
-    if !crate::hydrate_schedule::generation_is_current(generation) {
-        return false;
-    }
-    let wrote = if incremental {
-        let put = db.put_calendar_events(account, &rows);
-        let del = if crate::hydrate_schedule::generation_is_current(generation) {
-            if page.deleted_hrefs().is_empty() {
-                db.delete_calendar_events(account, page.deleted())
+    let resources: Vec<_> = page
+        .deleted_hrefs()
+        .iter()
+        .zip(page.deleted())
+        .map(|(href, uid)| (href.clone(), uid.clone()))
+        .collect();
+    let write = match page.mode() {
+        PageMode::Unchanged => CalendarPageWrite::Unchanged,
+        PageMode::Snapshot => CalendarPageWrite::Replace {
+            rows: &rows,
+            empty: EmptySnapshot::KeepCachedEvents,
+        },
+        PageMode::Reset => CalendarPageWrite::Replace {
+            rows: &rows,
+            empty: EmptySnapshot::Believe,
+        },
+        PageMode::Delta => CalendarPageWrite::Delta {
+            rows: &rows,
+            tombstones: if page.deleted_hrefs().is_empty() {
+                CalendarTombstones::Uids(page.deleted())
             } else {
-                let resources: Vec<_> = page
-                    .deleted_hrefs()
-                    .iter()
-                    .zip(page.deleted())
-                    .map(|(href, uid)| (href.clone(), uid.clone()))
-                    .collect();
-                db.delete_calendar_events_by_href(account, &resources)
-            }
-        } else {
-            return false;
-        };
-        put.is_ok() && del.is_ok()
-    } else {
-        db.replace_calendar_account(account, &rows).is_ok()
+                CalendarTombstones::Resources(&resources)
+            },
+        },
     };
-    if !wrote {
-        return false;
-    }
+    let cursor = CalendarCursor {
+        provider,
+        sync_token: page.sync_token(),
+        horizon_from_ms: window.start_ms,
+        horizon_to_ms: window.end_exclusive_ms,
+    };
     if !crate::hydrate_schedule::generation_is_current(generation) {
         return false;
     }
-    let _ = db.put_calendar_sync(account, provider, page.sync_token(), from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    !rows.is_empty() || !page.deleted().is_empty()
+    match db.apply_calendar_page(account, &write, &cursor) {
+        Ok(CalendarPageApplied::Applied { events_changed }) => events_changed,
+        Ok(CalendarPageApplied::FreshnessOnly) => false,
+        Ok(CalendarPageApplied::RejectedEmpty) => {
+            tracing::warn!(
+                target: "thegn::calendar",
+                account = %account,
+                "empty full fetch — keeping the prior cache rather than erasing it"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::calendar",
+                account = %account,
+                %error,
+                "calendar cache write failed — keeping the previous page and cursor"
+            );
+            if let Err(error) = db.set_calendar_error(account, "calendar cache write failed") {
+                tracing::debug!(
+                    target: "thegn::calendar",
+                    %error,
+                    "could not record the calendar cache failure"
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Turn an event into its cache row.
