@@ -120,6 +120,11 @@ calendar-account-specific command adapter; it is not a general UI
 contribution. Native theme files and configured drawer tools are not runtime
 plugin surfaces.
 
+SidebarTab, Theme, and plugin key zones are adopted for a future release
+(THE-107) but are not implemented, so `thegn plugin check` still rejects them.
+Plugin themes will be data-only palettes, and plugin keys will be
+surface-local actions.
+
 The machine-readable source for this classification is embedded in
 `docs/api/plugin-api-0.3.json` as `x-thegn-extension-support`; its companion
 `x-thegn-host-verb-support` table names verb authority and permitted modes, and
