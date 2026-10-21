@@ -533,6 +533,7 @@ pub const VPS_USER: &str = "root";
 pub struct VpsProvider {
     spec: VpsSpec,
     client: reqwest::Client,
+    owner: Option<String>,
     /// Resolved public IP, cached per provider instance (registry, then API).
     ip: Mutex<Option<String>>,
 }
@@ -542,12 +543,22 @@ impl VpsProvider {
         VpsProvider {
             spec,
             client: crate::provider::provider_http_client(),
+            owner: None,
             ip: Mutex::new(None),
         }
     }
 
     pub fn spec(&self) -> &VpsSpec {
         &self.spec
+    }
+
+    pub fn with_owner(mut self, owner: String) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
     }
 
     fn shaper(&self) -> &'static dyn VpsShaper {
@@ -709,6 +720,7 @@ impl VpsProvider {
             instance_id: inst.id,
             ip: ip.clone(),
             created_at: inst.created.unwrap_or_else(thegn_core::util::now),
+            owner: String::new(),
         }) {
             tracing::debug!(target: "thegn::vps", %error, "registry cache write failed");
         }
@@ -1074,6 +1086,7 @@ impl RemoteProvider for VpsProvider {
                 instance_id: String::new(),
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
+                owner: self.owner.clone().unwrap_or_default(),
             };
             let cap = self.spec.max_instances();
             let reservation_name = name.clone();
@@ -1090,6 +1103,9 @@ impl RemoteProvider for VpsProvider {
                         "vps: {occupied} managed instances already exist (max_instances = {cap}); \
                          destroy one or raise `[env.<name>.provider] max_instances`"
                     ));
+                }
+                Err(error @ registry::ReserveError::OwnedByOther { .. }) => {
+                    return Err(anyhow!(error));
                 }
                 Err(registry::ReserveError::Store(error)) => {
                     return Err(
@@ -1152,6 +1168,7 @@ impl RemoteProvider for VpsProvider {
                 instance_id,
                 ip: ip.clone(),
                 created_at,
+                owner: self.owner.clone().unwrap_or_default(),
             })?;
             if !ip.is_empty() {
                 *self.ip.lock().unwrap() = Some(ip.clone());
@@ -1720,6 +1737,7 @@ mod tests {
             instance_id: String::new(),
             ip: String::new(),
             created_at: 1,
+            owner: String::new(),
         })
         .unwrap();
         let spec_key_path = std::path::Path::new("/tmp/nonexistent-managed-key");
@@ -1756,5 +1774,42 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn owner_mismatch_refuses_ensure_exists_before_http() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-vps-owner-check";
+        registry::write(&registry::VpsRecord {
+            name: name.into(),
+            provider: "hetzner".into(),
+            state: "ready".into(),
+            instance_id: "instance-1".into(),
+            ip: "192.0.2.1".into(),
+            created_at: 1,
+            owner: registry::worktree_owner(b"/worktree/owner-a"),
+        })
+        .unwrap();
+        let provider = VpsProvider::new(VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base: "http://127.0.0.1:1".into(),
+            token: "unused".into(),
+            name: name.into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 5,
+            max_lifetime_secs: 0,
+            key_path: "/tmp/nonexistent-managed-key".into(),
+            pubkey: TEST_PUBKEY.into(),
+            skip_ready_wait: true,
+        })
+        .with_owner(registry::worktree_owner(b"/worktree/owner-b"));
+
+        let error = crate::provider::Provider::Vps(provider)
+            .ensure_exists(name)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("bound to a different worktree"));
     }
 }

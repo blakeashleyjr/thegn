@@ -2261,7 +2261,14 @@ pub fn provision_provider_env_named(
     };
     // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
     // sandbox correctly (the id embeds the repo/worktree tokens + a path-hash).
-    let Some(provider) = provider_for_named(pc, &id) else {
+    let owner = if name_override.is_none() {
+        crate::provider_factory::provider_sandbox_owner(cfg, worktree, env_name)
+    } else {
+        None
+    };
+    let Some(provider) =
+        crate::provider_factory::provider_for_named_owned(pc, &id, owner.as_deref())
+    else {
         return Ok((false, None));
     };
     if !provider.caps().files {
@@ -3256,7 +3263,10 @@ fn auto_provision_sandbox(
     // token/keypair), NOT a legitimate no-op. Surface it as an error so the
     // caller's failover block (`prepare_sandbox_env`) halts or degrades-with-
     // notification instead of silently opening a host/bwrap shell.
-    let Some(provider) = provider_for_named(pc, &name) else {
+    let owner = crate::provider_factory::provider_sandbox_owner(cfg, worktree, env_name);
+    let Some(provider) =
+        crate::provider_factory::provider_for_named_owned(pc, &name, owner.as_deref())
+    else {
         anyhow::bail!(
             "env '{env_name}' provider '{}' could not be built (token or managed keypair unresolved)",
             pc.provider
