@@ -136,6 +136,7 @@ fn secret_string_debug_never_shows_the_value() {
 fn share_plan_env_values_are_secret_strings() {
     let frp = FrpConfig {
         server_addr: "frps.example.com".into(),
+        subdomain_host: "share.example.com".into(),
         token: "frp-canary-325".into(),
         ..FrpConfig::default()
     };
