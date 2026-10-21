@@ -1,4 +1,3 @@
-use super::*;
 use crate::ci_log::CiLogCandidate;
 use crate::db::{Db, PrRebind};
 use crate::pr_queue::{PrAgentAdmission, PrAgentAdmit, PrAgentRefusal, PrqStatus};

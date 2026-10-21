@@ -842,7 +842,7 @@ mod tests {
             expected_attempts: current.agent_attempts,
             expected_checkout_gen: row.checkout_gen,
             max_attempts: 3,
-            head: "newer-head",
+            head: "admitted-head",
             blocker: "ci",
             detail: "dispatch",
             lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
@@ -852,6 +852,14 @@ mod tests {
         let guard = crate::pr_agent_lease::PrAgentGuard::admit(&db, &request)
             .unwrap()
             .unwrap();
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::AgentRunning.as_str(),
+            Some("ci"),
+            None,
+            Some("newer-head"),
+        )
+        .unwrap();
         assert!(
             guard
                 .finish(&db, Some((PrqStatus::BlockedCi.as_str(), "finished")))
