@@ -675,6 +675,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::MountUnresolvable,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
+        RefusalClass::StrictUnsupported,
     ] {
         let error = refusal(
             &spec,
@@ -709,6 +710,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::MountUnresolvable,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
+        RefusalClass::StrictUnsupported,
     ] {
         let label = class.label();
         assert!(!label.is_empty());
@@ -4628,4 +4630,15 @@ fn placed_teardown_reports_an_unreachable_remote_host() {
         |_, _, _| panic!("disabled sandbox must not run teardown commands"),
     );
     assert!(disabled.is_ok());
+}
+
+#[test]
+fn sealed_systemd_enter_is_refused_strict() {
+    let mut sealed = spec(Backend::Systemd);
+    sealed.seal_home = Some("/home/u".into());
+    assert!(matches!(
+        enter_argv(&sealed, "sh"),
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::StrictUnsupported
+    ));
 }
