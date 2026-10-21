@@ -1,18 +1,18 @@
-//! fff-search backend — the file-search engine for the palette + test-locate.
+//! fff-search backend — file search for the palette, plus in-process content grep.
 //!
-//! Wraps [`fff_search`] (the Fabulous & Fast File Finder core) so the rest of
-//! the host talks to a small, thegn-shaped surface instead of fff's stateful
-//! `FilePicker`/LMDB API directly. Everything here is intended to be called from
-//! `spawn_blocking` (fff scans + greps synchronously); nothing touches the event
-//! loop.
+//! Wraps [`fff_search`] (the Fabulous & Fast File Finder core) for file search,
+//! so the rest of the host talks to a small, thegn-shaped surface instead of
+//! fff's stateful `FilePicker`/LMDB API directly. Content grep uses an in-process
+//! `ignore` + `regex` walk. These synchronous operations are intended to run
+//! from `spawn_blocking`; nothing touches the event loop.
 //!
 //! Design notes tying into thegn's invariants:
 //!
-//! * **Watcher-less pickers (0%-idle).** Pickers are built with `watch: false`
-//!   and a synchronous scan (`new_with_shared_state` + `wait_for_scan`), so no
-//!   fff filesystem-watcher thread persists after a search returns. The only
-//!   background threads fff owns are its rayon pools, which park at 0% CPU when
-//!   idle — same shape as tokio's blocking pool. Freshness comes from
+//! * **Watcher-less file pickers (0%-idle).** Pickers are built with `watch:
+//!   false` and a synchronous scan (`new_with_shared_state` + `wait_for_scan`),
+//!   so no fff filesystem-watcher thread persists after a search returns. The
+//!   only background threads fff owns are its rayon pools, which park at 0% CPU
+//!   when idle — same shape as tokio's blocking pool. Freshness comes from
 //!   [`rebuild`] (the palette re-warms on Files-mode entry, mirroring the old
 //!   `FileIndex::build` lifecycle).
 //! * **git is the source of truth; the LMDB is a cache.** The frecency /
@@ -20,9 +20,10 @@
 //!   `$XDG_STATE_HOME/thegn/fff/` and is strictly best-effort: if it fails to
 //!   open (corruption, version skew) we fall back to `noop()` trackers and file
 //!   ranking simply loses combo-boost — never an error on the user's path.
-//! * **Substrate boundary.** fff (LMDB + vendored libgit2) lives only here in
-//!   the host crate; the substrate-free core uses `neo_frizbee` directly for
-//!   in-memory list fuzzing.
+//! * **Substrate boundary.** fff (LMDB + vendored libgit2) is used here only
+//!   for file search; grep stays in the host on `ignore` and `regex`. The
+//!   substrate-free core uses `neo_frizbee` directly for in-memory list
+//!   fuzzing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,8 +34,8 @@ use fff_search::file_picker::FilePicker;
 use fff_search::frecency::FrecencyTracker;
 use fff_search::query_tracker::QueryTracker;
 use fff_search::{
-    FFFMode, FilePickerOptions, FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs,
-    QueryParser, SharedFilePicker, SharedFrecency, SharedQueryTracker,
+    FFFMode, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser, SharedFilePicker,
+    SharedFrecency, SharedQueryTracker,
 };
 
 /// How long a synchronous scan may take before a search proceeds without it.
@@ -309,65 +310,111 @@ pub struct ContentHit {
     pub line_text: String,
 }
 
-/// Literal-substring content search over `root` (fff grep, PlainText/SIMD).
+/// Literal-substring content search over `root` (smart-case).
 pub fn content_search(root: &Path, query: &str, limit: usize) -> Vec<ContentHit> {
-    grep_collect(root, query, GrepMode::PlainText, limit, |m, path| {
+    let Some(matcher) = plain_text_matcher(query) else {
+        return Vec::new();
+    };
+    grep_collect(root, &matcher, limit, |path, line_no, line_text| {
         ContentHit {
             path,
-            line_no: m.line_number,
-            line_text: m.line_content.clone(),
+            line_no,
+            line_text,
         }
     })
 }
 
-/// Run a fff grep over `root` and map each match through `f`. Shared by content
-/// search, the symbol sweep, and test-locate.
+/// Matches the 2 MiB text-preview cap in `preview_pane.rs`.
+const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn plain_text_matcher(query: &str) -> Option<regex::Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(!query.chars().any(char::is_uppercase))
+        .build()
+        .ok()
+}
+
+fn regex_matcher(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(pattern).ok()
+}
+
+/// Walk `root` in sorted, gitignore-aware order and map each matching line.
 fn grep_collect<T>(
     root: &Path,
-    query: &str,
-    mode: GrepMode,
+    matcher: &regex::Regex,
     limit: usize,
-    mut f: impl FnMut(&fff_search::GrepMatch, String) -> T,
+    mut f: impl FnMut(String, u64, String) -> T,
 ) -> Vec<T> {
-    let Some(shared) = picker_for(root) else {
+    if limit == 0 {
         return Vec::new();
-    };
-    let Ok(guard) = shared.read() else {
-        return Vec::new();
-    };
-    let Some(picker) = guard.as_ref() else {
-        return Vec::new();
-    };
+    }
 
-    let parsed = fff_search::parse_grep_query(query);
-    let result = picker.grep(
-        &parsed,
-        &GrepSearchOptions {
-            mode,
-            page_limit: limit,
-            ..Default::default()
-        },
-    );
-    result
-        .matches
-        .iter()
-        .map(|m| {
-            let path = result
-                .files
-                .get(m.file_index)
-                .map(|it| it.relative_path(picker))
-                .unwrap_or_default();
-            f(m, path)
-        })
-        .collect()
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .ignore(true)
+        .parents(false)
+        .require_git(false)
+        .sort_by_file_name(|left, right| left.cmp(right))
+        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"));
+
+    let mut hits = Vec::new();
+    for entry in builder.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(relative_path) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Ok(file) = crate::platform::open_read_nonblocking_nofollow(path) else {
+            continue;
+        };
+        let Ok(bytes) = crate::rasterize::read_open_regular_capped(file, GREP_MAX_FILE_BYTES)
+        else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+
+        let mut relative = None;
+        if !bytes.is_empty() {
+            let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            for (index, raw_line) in body.split(|byte| *byte == b'\n').enumerate() {
+                let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                let text = String::from_utf8_lossy(line);
+                if matcher.is_match(&text) {
+                    let relative = relative
+                        .get_or_insert_with(|| relative_path.to_string_lossy().replace('\\', "/"));
+                    hits.push(f(relative.clone(), index as u64 + 1, text.into_owned()));
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                }
+            }
+        }
+    }
+    hits
 }
 
 /// Regex grep over `root`, mapping each match to `(relative_path, line, line_text)`.
 /// Used by the symbol sweep (the caller supplies the symbol regex).
 pub fn regex_grep(root: &Path, pattern: &str, limit: usize) -> Vec<(String, u64, String)> {
-    grep_collect(root, pattern, GrepMode::Regex, limit, |m, path| {
-        (path, m.line_number, m.line_content.clone())
-    })
+    let Some(matcher) = regex_matcher(pattern) else {
+        return Vec::new();
+    };
+    grep_collect(root, &matcher, limit, |path, line, text| (path, line, text))
 }
 
 /// Best-effort locate: return the first `(relative_path, 1-based line)` matching
@@ -476,6 +523,124 @@ pub fn fuzzy_rank(needle: &str, haystacks: &[&str]) -> Vec<(usize, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_text_grep_is_literal_and_smart_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("a.txt"), "Foo.bar\nfoo-bar\nfooXbar\n").unwrap();
+
+        let hits = content_search(root, "foo.bar", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line_no, 1);
+        assert_eq!(hits[0].line_text, "Foo.bar");
+        let hits = content_search(root, "Foo", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line_text, "Foo.bar");
+        assert!(content_search(root, "", 10).is_empty());
+    }
+
+    #[test]
+    fn grep_honours_gitignore_and_never_enters_dot_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("kept.txt"), "needle\n").unwrap();
+        std::fs::write(root.join(".hidden.txt"), "needle\n").unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "needle\n").unwrap();
+
+        let mut paths = content_search(root, "needle", 10)
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, vec![".hidden.txt", "kept.txt"]);
+    }
+
+    #[test]
+    fn regex_grep_reports_one_based_lines_and_forward_slashed_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "x\nfn alpha() {}\n").unwrap();
+        std::fs::write(root.join("crlf.rs"), "first\r\nfn beta() {}\r\n").unwrap();
+
+        assert_eq!(
+            regex_grep(root, r"^fn (\w+)", 10),
+            vec![
+                ("crlf.rs".to_string(), 2, "fn beta() {}".to_string()),
+                ("src/lib.rs".to_string(), 2, "fn alpha() {}".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn grep_stops_at_the_match_limit_and_invalid_regex_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("matches.txt"), "hit\nhit\nhit\nhit\nhit\n").unwrap();
+
+        assert_eq!(regex_grep(root, "hit", 3).len(), 3);
+        assert!(regex_grep(root, "(", 10).is_empty());
+    }
+
+    #[test]
+    fn regex_grep_does_not_emit_phantom_line_after_trailing_newline() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("trailing.txt"), "needle\n").unwrap();
+
+        assert!(regex_grep(root, r"^$", 10).is_empty());
+        assert_eq!(
+            regex_grep(root, r".*", 10),
+            vec![("trailing.txt".to_string(), 1, "needle".to_string())]
+        );
+    }
+
+    #[test]
+    fn grep_skips_binary_oversized_and_symlinked_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("binary.dat"), b"needle\0hidden\n").unwrap();
+        let mut oversized = vec![b'x'; GREP_MAX_FILE_BYTES as usize + 1];
+        oversized[..6].copy_from_slice(b"needle");
+        std::fs::write(root.join("large.txt"), oversized).unwrap();
+        std::fs::write(root.join("ok.txt"), "needle\n").unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "needle\n").unwrap();
+        if crate::platform::test_symlink_supported() {
+            crate::platform::test_symlink(
+                &outside.path().join("outside.txt"),
+                &root.join("link.txt"),
+            )
+            .unwrap();
+        }
+
+        let paths = content_search(root, "needle", 10)
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["ok.txt"]);
+    }
+
+    #[test]
+    fn scan_emits_path_line_text_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("tests/foo_test.rs"),
+            "#[test]\nfn it_works() {}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            scan(root, &["*_test.rs"], &[r"fn (\w+)"], 10),
+            "tests/foo_test.rs:2:fn it_works() {}\n"
+        );
+    }
 
     #[test]
     fn glob_match_suffix_and_interior() {
