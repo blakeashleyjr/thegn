@@ -19,7 +19,14 @@ fn ready_actions<A, F, R>(attempt: A, floor: F, runner: R) -> DriveActions<A, F,
 where
     A: FnMut(&str, &thegn_core::remote::GitLoc, bool) -> anyhow::Result<AttemptOutcome>,
     F: FnMut(&str) -> crate::agent_run::AgentDispatch,
-    R: FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
+    R: FnMut(
+        &str,
+        &str,
+        &str,
+        &str,
+        &Failure,
+        Option<thegn_core::sandbox::SandboxSpec>,
+    ) -> crate::agent_run::AgentRunVerdict,
 {
     DriveActions {
         attempt,
@@ -39,8 +46,8 @@ fn unused_agent_runner(
     _: &str,
     _: &Failure,
     _: Option<thegn_core::sandbox::SandboxSpec>,
-) -> bool {
-    false
+) -> crate::agent_run::AgentRunVerdict {
+    crate::agent_run::AgentRunVerdict::Exited(Some(1))
 }
 
 fn registered_config() -> MergeQueueConfig {
@@ -265,7 +272,7 @@ fn budget_is_consumed_through_the_claim() {
                           _: &Failure,
                           _: Option<thegn_core::sandbox::SandboxSpec>| {
                 runner_runs.fetch_add(1, Ordering::Relaxed);
-                true
+                crate::agent_run::AgentRunVerdict::Exited(Some(0))
             },
         },
     );
