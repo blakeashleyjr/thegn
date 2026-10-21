@@ -497,14 +497,16 @@ pub fn claim_spare(
         // Bring the claimed spare to full parity with the local worktree, same as
         // a fresh provision (only for an `in_env` provider — a projected data mode
         // mirrors the tree by other means). Best-effort.
-        if env.data == thegn_core::config::DataMode::InEnv
-            && let Err(e) =
-                crate::parity::apply_local_parity(&provider, &name, worktree, &workdir, &[])
-        {
-            thegn_core::msg::warn(&format!(
-                "local parity on claimed spare {name}: {e}; {}.",
-                crate::parity::failure_note(&e)
-            ));
+        if env.data == thegn_core::config::DataMode::InEnv {
+            let result =
+                crate::parity::apply_local_parity(&provider, &name, worktree, &workdir, &[]);
+            crate::parity::record_outcome(worktree, &result);
+            if let Err(e) = &result {
+                thegn_core::msg::warn(&format!(
+                    "local parity on claimed spare {name}: {e}; {}; autonomous agents are held on this worktree until parity succeeds.",
+                    crate::parity::failure_note(e)
+                ));
+            }
         }
         // The worktree's DERIVED sandbox may exist as a bare husk (auto-created
         // by warm-on-open moments before the claim); after the spare takes over

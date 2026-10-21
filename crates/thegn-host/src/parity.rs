@@ -8,8 +8,66 @@ use std::path::Path;
 
 use anyhow::Context;
 use sha2::{Digest, Sha256};
+use thegn_core::db::Db;
+use thegn_core::store::WorkspaceStore;
 
 use crate::agent::block_on_provider;
+
+const DEGRADED_SCOPE: &str = "parity_degraded";
+
+fn record_outcome_in(db: &Db, worktree: &str, result: &anyhow::Result<()>) {
+    let stored = match result {
+        Ok(()) => db.del_ui_state(DEGRADED_SCOPE, worktree),
+        Err(error) => db.set_ui_state(
+            DEGRADED_SCOPE,
+            worktree,
+            &format!("{error}; {}", failure_note(error)),
+        ),
+    };
+    if let Err(error) = stored {
+        tracing::warn!(
+            target: "thegn::parity",
+            %error,
+            worktree,
+            "could not record the parity outcome"
+        );
+    }
+}
+
+pub(crate) fn record_outcome(worktree: &str, result: &anyhow::Result<()>) {
+    match Db::open() {
+        Ok(db) => record_outcome_in(&db, worktree, result),
+        Err(error) => tracing::warn!(
+            target: "thegn::parity",
+            %error,
+            worktree,
+            "could not record the parity outcome"
+        ),
+    }
+}
+
+pub(crate) fn degraded_note(db: &Db, worktree: &str) -> anyhow::Result<Option<String>> {
+    db.get_ui_state(DEGRADED_SCOPE, worktree)
+}
+
+pub(crate) fn autonomous_refusal(
+    autonomous: bool,
+    worktree: &str,
+    marker: &anyhow::Result<Option<String>>,
+) -> Option<String> {
+    if !autonomous {
+        return None;
+    }
+    match marker {
+        Ok(Some(note)) => Some(format!(
+            "local parity for {worktree} failed earlier ({note}); autonomous agents are refused on this worktree until a later provision applies parity cleanly (re-open the worktree after fixing it, or re-create its sandbox)"
+        )),
+        Err(error) => Some(format!(
+            "the parity state of {worktree} could not be read ({error}); refusing an autonomous launch"
+        )),
+        Ok(None) => None,
+    }
+}
 
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -400,9 +458,66 @@ pub(crate) fn apply_local_parity(
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureIncoherent, ReplayFailure, ReplayStage, WorktreeFingerprint, capture_coherent,
-        failure_note, fingerprint, manifest_for_artifacts, nonempty, random_staging_dir,
+        CaptureIncoherent, ReplayFailure, ReplayStage, WorktreeFingerprint, autonomous_refusal,
+        capture_coherent, degraded_note, failure_note, fingerprint, manifest_for_artifacts,
+        nonempty, random_staging_dir, record_outcome_in,
     };
+    use thegn_core::db::Db;
+    use thegn_core::store::WorkspaceStore;
+
+    #[test]
+    fn degraded_marker_round_trip() {
+        let db = Db::open_memory().expect("in-memory db");
+        let failed = Err(anyhow::anyhow!("boom"));
+        record_outcome_in(&db, "/wt/a", &failed);
+        let note = degraded_note(&db, "/wt/a")
+            .expect("read marker")
+            .expect("failed parity is marked");
+        assert!(note.contains("boom"), "got {note}");
+        assert!(
+            degraded_note(&db, "/wt/b")
+                .expect("read other worktree")
+                .is_none()
+        );
+
+        record_outcome_in(&db, "/wt/a", &Ok(()));
+        assert!(
+            degraded_note(&db, "/wt/a")
+                .expect("read cleared marker")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn degraded_autonomous_refusal_table() {
+        let worktree = "/wt/p";
+        let clear = Ok(None);
+        let marked = Ok(Some("n".to_owned()));
+        let unreadable = Err(anyhow::anyhow!("database unavailable"));
+
+        for autonomous in [false, true] {
+            for (marker, refused) in [(&clear, false), (&marked, true), (&unreadable, true)] {
+                let refusal = autonomous_refusal(autonomous, worktree, marker);
+                assert_eq!(
+                    refusal.is_some(),
+                    autonomous && refused,
+                    "autonomous={autonomous}, marker={marker:?}"
+                );
+                match (autonomous, marker) {
+                    (true, Ok(Some(note))) => {
+                        let reason = refusal.expect("degraded marker refuses");
+                        assert!(reason.contains(worktree), "got {reason}");
+                        assert!(reason.contains(note), "got {reason}");
+                    }
+                    (true, Err(_)) => {
+                        let reason = refusal.expect("unreadable marker refuses");
+                        assert!(reason.contains(worktree), "got {reason}");
+                    }
+                    (false, _) | (true, Ok(None)) => {}
+                }
+            }
+        }
+    }
 
     fn fingerprint_value(head: &str, digest: &str) -> WorktreeFingerprint {
         WorktreeFingerprint {
