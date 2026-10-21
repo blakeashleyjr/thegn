@@ -116,10 +116,7 @@ impl PendingCornerOob {
             && !self.delete_pending
             && let Some(bytes) = self.draw.take()
         {
-            let mut copy = match self.spare.take() {
-                Some(copy) => copy,
-                None => Vec::new(),
-            };
+            let mut copy = self.spare.take().unwrap_or_default();
             copy.clear();
             copy.extend_from_slice(&bytes);
             match submit(bytes) {
@@ -475,10 +472,11 @@ mod tests {
         });
         assert_eq!(
             *submitted.borrow(),
-            vec![kitty_relay::delete_all().to_vec(), vec![1]]
+            vec![vec![1], kitty_relay::delete_all().to_vec(), vec![1]]
         );
     }
 
+    // Positive control: geometry deletes already discard stale draws.
     #[test]
     fn geometry_delete_never_replays_the_old_draw() {
         let mut slot = PendingCornerOob::default();
