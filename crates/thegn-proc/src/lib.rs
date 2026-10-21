@@ -27,6 +27,11 @@ pub enum Stream {
     HeadOrFail { cap: usize },
     /// Piped and drained to EOF for the whole run; keep only the newest `cap` bytes. Never ends the run.
     Tail { cap: usize },
+    /// Piped and drained to EOF for the whole run; every stdout byte is handed, in order, to the
+    /// consumer passed to [`run_consuming`] on the calling thread. Nothing is retained
+    /// (`Capture::bytes` stays empty, `total` counts every byte). Never ends the run. On stderr it
+    /// drains and drops.
+    Consume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +115,7 @@ pub enum Leader {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capture {
-    /// Head (Head/HeadOrFail) or tail (Tail) bytes; empty for Null.
+    /// Head (Head/HeadOrFail) or tail (Tail) bytes; empty for Null and Consume.
     pub bytes: Vec<u8>,
     /// Every byte read, retained or not.
     pub total: u64,
@@ -192,12 +197,26 @@ impl Run {
 /// process group (`process_group(0)`). Blocking: call it from a worker thread, never the UI loop.
 /// Wall time <= timeout + term_grace + 2 * kill_settle + reader_grace + one BACKOFF_CAP.
 pub fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
+    run_consuming(cmd, limits, cancel, &mut |_bytes: &[u8]| {})
+}
+
+/// Spawn `cmd` and run it to a bounded, fully reaped end, passing each stdout chunk to `consume`
+/// on the calling thread. Overrides stdin (always null) and stdout/stderr (per `limits`);
+/// everything else (args, env, cwd) is the caller's. Blocking: call it from a worker thread,
+/// never the UI loop. Wall time <= timeout + term_grace + 2 * kill_settle + reader_grace + one
+/// BACKOFF_CAP.
+pub fn run_consuming(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: &mut dyn FnMut(&[u8]),
+) -> Run {
     #[cfg(unix)]
     {
-        unix::run(cmd, limits, cancel)
+        unix::run_consuming(cmd, limits, cancel, consume)
     }
     #[cfg(not(unix))]
     {
-        fallback::run(cmd, limits, cancel)
+        fallback::run_consuming(cmd, limits, cancel, consume)
     }
 }

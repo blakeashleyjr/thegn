@@ -90,13 +90,22 @@ fn append(capture: &mut Capture, stream: Stream, bytes: &[u8]) -> bool {
             }
             false
         }
+        Stream::Consume => false,
     }
 }
 
-fn drain(rx: &Receiver<Message>, run: &mut Run, limits: &Limits) -> Option<Which> {
+fn drain(
+    rx: &Receiver<Message>,
+    run: &mut Run,
+    limits: &Limits,
+    consume: &mut dyn FnMut(&[u8]),
+) -> Option<Which> {
     loop {
         match rx.try_recv() {
             Ok(Message::Bytes(which, bytes)) => {
+                if which == Which::Stdout && matches!(limits.stdout, Stream::Consume) {
+                    consume(&bytes);
+                }
                 let (capture, stream) = match which {
                     Which::Stdout => (&mut run.stdout, limits.stdout),
                     Which::Stderr => (&mut run.stderr, limits.stderr),
@@ -155,7 +164,40 @@ fn detach(child: Child) -> Leader {
     }
 }
 
+#[cfg(test)]
 pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
+    run_consuming(cmd, limits, cancel, &mut |_bytes: &[u8]| {})
+}
+
+pub(super) fn run_consuming(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: &mut dyn FnMut(&[u8]),
+) -> Run {
+    // Without the Unix Guard, contain consumer panics until the child is drained and reaped.
+    let mut panic_payload = None;
+    let mut guarded_consume = |bytes: &[u8]| {
+        if panic_payload.is_none()
+            && let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consume(bytes)))
+        {
+            panic_payload = Some(payload);
+        }
+    };
+    let run = run_inner(cmd, limits, cancel, &mut guarded_consume);
+    if let Some(payload) = panic_payload {
+        std::panic::resume_unwind(payload);
+    }
+    run
+}
+
+fn run_inner(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: &mut dyn FnMut(&[u8]),
+) -> Run {
     cmd.stdin(Stdio::null());
     cmd.stdout(match limits.stdout {
         Stream::Null => Stdio::null(),
@@ -204,7 +246,7 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
     let mut status = None;
     let mut leader_exit_at: Option<Instant> = None;
     loop {
-        if let Some(which) = drain(&rx, &mut run, limits) {
+        if let Some(which) = drain(&rx, &mut run, limits, consume) {
             run.end = End::OutputLimit(which);
             break;
         }
@@ -312,12 +354,12 @@ pub(super) fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Ru
         && (run.stderr.eof || matches!(limits.stderr, Stream::Null)))
         && grace.elapsed() < limits.reader_grace
     {
-        if let Some(which) = drain(&rx, &mut run, limits) {
+        if let Some(which) = drain(&rx, &mut run, limits, consume) {
             run.end = End::OutputLimit(which);
         }
         thread::sleep(POLL_INTERVAL);
     }
-    if let Some(which) = drain(&rx, &mut run, limits) {
+    if let Some(which) = drain(&rx, &mut run, limits, consume) {
         run.end = End::OutputLimit(which);
     }
     aggregate_fit(
