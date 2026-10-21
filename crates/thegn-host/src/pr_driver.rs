@@ -843,6 +843,35 @@ pub(crate) fn drive_queue(
                     credential_free: true,
                 });
 
+                let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
+                    forge
+                        .pr_status(&loc, PrRef::Number(item.number))
+                        .ok()
+                        .filter(|pr| {
+                            pr_queue::attest_pr_identity(
+                                item.pr_url.as_deref(),
+                                item.number,
+                                &pr.url,
+                                pr.number,
+                            )
+                            .is_ok()
+                        })
+                        .map(|pr| pr.head_ref_oid)
+                });
+                if let Some(own) = own {
+                    match guard.record_own_head(db, &head, &own) {
+                        Ok(true) => {}
+                        Ok(false) => out.warnings.push(format!(
+                            "PR #{}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push",
+                            item.number
+                        )),
+                        Err(error) => out.warnings.push(format!(
+                            "PR #{}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push ({error})",
+                            item.number
+                        )),
+                    }
+                }
+
                 match guard.finish(db, None) {
                     Ok(true) => {}
                     Ok(false) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the next refresh re-evaluates the row", item.number)),

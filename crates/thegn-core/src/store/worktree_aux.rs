@@ -473,6 +473,15 @@ pub trait WorktreeAuxStore {
         lease: &crate::pr_queue::PrAgentLease,
         finished: Option<(&str, &str)>,
     ) -> Result<bool>;
+    /// Record the head an admitted agent produced, fenced on the live lease
+    /// generation and on the admitted head still being the row's last head.
+    /// Returns false when the lease is no longer this one or the row moved.
+    fn record_pr_agent_head(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        admitted_head: &str,
+        own_head: &str,
+    ) -> Result<bool>;
 
     /// Atomically reserve the one automatic CI rerun for `head`. The
     /// `expected_head` fence prevents a stale driver from reverting a newer
