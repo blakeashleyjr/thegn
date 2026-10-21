@@ -479,7 +479,7 @@ config_enum! {
     ///                no VPN configured it behaves exactly like `sealed`.
     pub enum SandboxProfile: "sandbox profile" {
         Open = "open" | "off" | "none",
-        /// Spelled `standard` (THE-419); `hardened`/`guarded` are accepted aliases.
+        // Spelled `standard` (THE-419); `hardened`/`guarded` are accepted aliases.
         Hardened = "standard" | "hardened" | "guarded",
         Sealed = "sealed" | "locked" | "isolated",
         SealedTunnel = "sealed-tunnel" | "tunnel-only" | "vpn-only",
