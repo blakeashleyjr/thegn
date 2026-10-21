@@ -666,6 +666,7 @@ fn retry_spec_for(
         .as_deref()
         .filter(|stage| !stage.trim().is_empty())
     {
+        // Today digest inputs are registry fields, matching agent_open's overlay; keep sources aligned if that changes.
         let digest =
             thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, &row.agent_name, stage)
                 .map_err(anyhow::Error::msg)?;
