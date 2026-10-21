@@ -1963,16 +1963,16 @@ fn the_ics_backend_advertises_no_write_capabilities() {
 
 // --- the router -------------------------------------------------------------
 
-fn timed_router(
-    accounts: Vec<(
-        String,
-        FetchClass,
-        &'static str,
-        std::time::Duration,
-        bool,
-        std::sync::Arc<ActiveFetches>,
-    )>,
-) -> CalendarRouter {
+type TimedAccount = (
+    String,
+    FetchClass,
+    &'static str,
+    std::time::Duration,
+    bool,
+    std::sync::Arc<ActiveFetches>,
+);
+
+fn timed_router(accounts: Vec<TimedAccount>) -> CalendarRouter {
     CalendarRouter::from_test_backends(
         accounts
             .into_iter()
