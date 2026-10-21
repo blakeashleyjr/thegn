@@ -34,6 +34,15 @@ use super::tombstone::Tombstone;
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const SHUTDOWN_REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 const SHUTDOWN_ABORT_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+/// The longest graceful daemon shutdown (drain + reap + abort-join), plus one
+/// second of scheduling slack. `thegn daemon stop` waits at most this long in
+/// total across all verified endpoints.
+pub(crate) const SHUTDOWN_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
+    SHUTDOWN_DRAIN_DEADLINE.as_secs()
+        + SHUTDOWN_REAP_DEADLINE.as_secs()
+        + SHUTDOWN_ABORT_JOIN_DEADLINE.as_secs()
+        + 1,
+);
 
 /// One live session in the daemon's table.
 pub(crate) struct SessionEntry {

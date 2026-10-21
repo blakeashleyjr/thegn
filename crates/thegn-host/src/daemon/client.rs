@@ -40,6 +40,14 @@ pub(super) enum ScopeCheck {
     NotOurs,
 }
 
+/// Result of checking whether a stop candidate is a live Thegn daemon for one
+/// of this process's state scopes.
+pub(crate) enum StopProbe {
+    NotRunning,
+    Ours,
+    Foreign(String),
+}
+
 fn classify_scope_reply(reply: Result<Value>, expected: &[String]) -> ScopeCheck {
     let value = match reply {
         Ok(value) => value,
@@ -100,6 +108,21 @@ fn client_socket_label(client: &ControlClient) -> String {
         ControlAddr::Unix(path) => path.display().to_string(),
         ControlAddr::Tcp { addr, .. } => addr.clone(),
         ControlAddr::HttpOrigin { origin, .. } => origin.clone(),
+    }
+}
+
+pub(crate) fn socket_label(client: &ControlClient) -> String {
+    client_socket_label(client)
+}
+
+pub(crate) async fn probe_stop_target(client: &ControlClient, scopes: &[String]) -> StopProbe {
+    if client.health().await.is_err() {
+        return StopProbe::NotRunning;
+    }
+    match check_daemon_scope(client, scopes).await {
+        ScopeCheck::Match | ScopeCheck::Unknown => StopProbe::Ours,
+        ScopeCheck::Mismatch(actual) => StopProbe::Foreign(actual),
+        ScopeCheck::NotOurs => StopProbe::NotRunning,
     }
 }
 
