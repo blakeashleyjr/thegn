@@ -161,7 +161,7 @@ fn execute(
         vars: &vars,
         timeout_secs: queue.agent_timeout_secs,
         sandbox,
-        credential_free: false,
+        credential_free: true,
     }) {
         Ok(())
     } else {
