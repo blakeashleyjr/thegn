@@ -16125,7 +16125,8 @@ async fn event_loop<T: Terminal>(
                 wire.push(clear);
                 wire_renderer.invalidate();
                 preview_gfx.invalidate();
-                // A cleared screen loses the corner image too; replay its last draw after this frame's cells.
+                // A cleared screen loses the corner image too; replay its last draw
+                // after this frame's cells.
                 if corner.is_some() && corner_kitty {
                     pending_corner_oob.screen_cleared();
                 }
