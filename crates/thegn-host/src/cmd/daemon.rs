@@ -320,7 +320,7 @@ mod tests {
             vec![a, b.clone(), c.clone()],
             deadline,
             move |path| async move {
-                if path == PathBuf::from("a") {
+                if path == *"a" {
                     crate::daemon::client::StopProbe::NotRunning
                 } else {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -342,7 +342,7 @@ mod tests {
             vec![ours.clone(), foreign.clone()],
             tokio::time::Instant::now() + Duration::from_secs(1),
             move |path| async move {
-                if path == PathBuf::from("ours") {
+                if path == *"ours" {
                     crate::daemon::client::StopProbe::Ours
                 } else {
                     crate::daemon::client::StopProbe::Foreign("other".into())
