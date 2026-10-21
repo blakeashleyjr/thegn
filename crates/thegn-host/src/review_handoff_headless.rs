@@ -15,7 +15,7 @@ use thegn_core::remote::GitLoc;
 use thegn_core::review::PrReviewSnapshot;
 use thegn_core::sandbox::SandboxSpec;
 
-use crate::agent_run::{AgentDispatch, AgentTaskRun};
+use crate::agent_run::{AgentDispatch, AgentRunVerdict, AgentTaskRun};
 use crate::pr_authorship;
 
 pub(super) struct Request {
@@ -58,7 +58,7 @@ pub(super) fn run(cfg: &Config, queue: &PrQueueConfig, request: &Request) -> Res
     if !queue.own_prs_only {
         // Explicit broader policy keeps the existing path, including no new
         // database or provider prerequisites.
-        return execute(queue, request, None, prepare, crate::agent_run::run);
+        return execute(queue, request, None, prepare, crate::agent_run::run_outcome);
     }
     let db = Db::open().map_err(|_| "review handoff held: workspace DB unavailable")?;
     let loc = GitLoc::Local(request.worktree.clone());
@@ -72,7 +72,7 @@ pub(super) fn run(cfg: &Config, queue: &PrQueueConfig, request: &Request) -> Res
         request,
         Some((&db, forge)),
         prepare,
-        crate::agent_run::run,
+        crate::agent_run::run_outcome,
     )
 }
 
@@ -83,7 +83,7 @@ fn execute(
     request: &Request,
     authority: Option<(&Db, &dyn Forge)>,
     prepare: impl FnOnce() -> Result<Option<SandboxSpec>, String>,
-    launch: impl FnOnce(&AgentTaskRun<'_>) -> bool,
+    launch: impl FnOnce(&AgentTaskRun<'_>) -> AgentRunVerdict,
 ) -> Result<(), String> {
     if let Some(reason) = crate::agent_run::headless_unsupported() {
         return Err(format!("review handoff held: {reason}"));
@@ -156,7 +156,7 @@ fn execute(
     if let Some((db, forge, permit, pr)) = &admitted {
         pr_authorship::revalidate(Some(permit), db, *forge, &loc, pr, false)?;
     }
-    if launch(&AgentTaskRun {
+    match launch(&AgentTaskRun {
         kind: TaskKind::PrReview,
         worktree: &worktree,
         prompt: &prompt,
@@ -166,9 +166,14 @@ fn execute(
         sandbox,
         credential_free: true,
     }) {
-        Ok(())
-    } else {
-        Err("PR review agent handoff failed".into())
+        AgentRunVerdict::Exited(Some(0)) => Ok(()),
+        AgentRunVerdict::NotStarted(reason) => Err(format!(
+            "review handoff held: agent did not start: {reason}"
+        )),
+        AgentRunVerdict::Interrupted(reason) => {
+            Err(format!("PR review agent was cut short: {reason}"))
+        }
+        AgentRunVerdict::Exited(_) => Err("PR review agent handoff failed".into()),
     }
 }
 

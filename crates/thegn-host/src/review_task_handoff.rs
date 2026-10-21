@@ -182,7 +182,7 @@ fn handle_loaded(
         Err(error) => return format!("review task could not start durably: {error}"),
     }
 
-    let _agent_ok = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
+    let verdict = crate::agent_run::run_outcome(&crate::agent_run::AgentTaskRun {
         kind: TaskKind::PrReview,
         worktree: &task.worktree_path,
         prompt: &task.prompt,
@@ -192,6 +192,9 @@ fn handle_loaded(
         sandbox,
         credential_free: true,
     });
+    if let Some(reason) = not_started_park_reason(&verdict) {
+        return park(db, &task, &reason);
+    }
 
     // A refresh may revise the same row while the agent is running. Never let
     // the old invocation resolve work it did not see; requeue the new revision.
@@ -298,6 +301,16 @@ fn handle_loaded(
     match forge.resolve_review_thread(loc, &context.thread_id, &reply) {
         Ok(()) => finish_resolved(db, &task, context, &verified_head),
         Err(error) => park_after_forge_error(db, &task, "review thread resolve", &error),
+    }
+}
+
+fn not_started_park_reason(verdict: &crate::agent_run::AgentRunVerdict) -> Option<String> {
+    match verdict {
+        crate::agent_run::AgentRunVerdict::NotStarted(reason) => {
+            Some(format!("review agent did not start: {reason}; nothing ran"))
+        }
+        crate::agent_run::AgentRunVerdict::Exited(_)
+        | crate::agent_run::AgentRunVerdict::Interrupted(_) => None,
     }
 }
 
@@ -452,6 +465,36 @@ fn finish_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_started_review_agent_is_parked_not_judged() {
+        use crate::agent_run::AgentRunVerdict;
+
+        assert_eq!(
+            not_started_park_reason(&AgentRunVerdict::NotStarted("missing".into())),
+            Some("review agent did not start: missing; nothing ran".into())
+        );
+        assert_eq!(
+            not_started_park_reason(&AgentRunVerdict::Interrupted("timeout".into())),
+            None
+        );
+        assert_eq!(
+            not_started_park_reason(&AgentRunVerdict::Exited(Some(0))),
+            None
+        );
+
+        let source = include_str!("review_task_handoff.rs");
+        let production = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap().0;
+        let stop = production
+            .find("not_started_park_reason(&verdict)")
+            .unwrap();
+        assert!(production.contains("crate::agent_run::run_outcome("));
+        assert!(!production.contains("_agent_ok"));
+        let head_check = production
+            .find("let verified_head = match head_verdict(")
+            .unwrap();
+        assert!(stop < head_check);
+    }
 
     struct FakeForge;
     impl thegn_core::seam::Probe for FakeForge {
