@@ -202,11 +202,15 @@ fn redacted_tail(value: &str) -> String {
 }
 
 /// Check, create or claim all devcontainer volumes before container creation.
-pub fn claim_volumes(
+// A generic runner lets callers borrow launch state such as `spec`.
+pub fn claim_volumes<F>(
     spec: &SandboxSpec,
     state_home: &Path,
-    run: &mut VolumeCommandRunner,
-) -> Result<(), EnterError> {
+    run: &mut F,
+) -> Result<(), EnterError>
+where
+    F: FnMut(&[String]) -> Option<VolumeCommandOutput> + ?Sized,
+{
     if spec.volume_owners.is_empty() {
         return Ok(());
     }
@@ -407,18 +411,20 @@ mod tests {
         let state = temp.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
         let mut creates = 0;
-        let mut runner = |argv: &[String]| {
-            if argv.iter().any(|arg| arg.as_str() == "create") {
-                creates += 1;
-            }
-            Some((true, "\n".into(), String::new()))
+        let result = {
+            let mut runner = |argv: &[String]| {
+                if argv.iter().any(|arg| arg.as_str() == "create") {
+                    creates += 1;
+                }
+                Some((true, "\n".into(), String::new()))
+            };
+            claim_volumes(&spec(&"a".repeat(64)), &state, &mut runner).unwrap();
+            let entries = std::fs::read_dir(state.join("thegn/devcontainer-volumes"))
+                .unwrap()
+                .count();
+            assert_eq!(entries, 1);
+            claim_volumes(&spec(&"b".repeat(64)), &state, &mut runner)
         };
-        claim_volumes(&spec(&"a".repeat(64)), &state, &mut runner).unwrap();
-        let entries = std::fs::read_dir(state.join("thegn/devcontainer-volumes"))
-            .unwrap()
-            .count();
-        assert_eq!(entries, 1);
-        let result = claim_volumes(&spec(&"b".repeat(64)), &state, &mut runner);
         assert!(matches!(
             result,
             Err(EnterError::Refused(crate::sandbox::Refusal {
