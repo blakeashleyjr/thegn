@@ -337,6 +337,20 @@ impl NotificationStore for Db {
 
     /// Record a new agent dispatch.  Returns the new row id.
     fn put_agent_dispatch(&self, new: crate::issue::NewDispatch<'_>) -> Result<i64> {
+        for (field, value) in [
+            ("issue_id", Some(new.issue_id)),
+            ("worktree_path", Some(new.worktree_path)),
+            ("agent_name", Some(new.agent_name)),
+            ("stage", new.stage),
+            ("session_id", new.session_id),
+            ("artifact_path", new.artifact_path),
+            ("chunk_path", new.chunk_path),
+        ] {
+            if let Some(value) = value {
+                crate::pipeline_report::dispatch_text_field(field, value)
+                    .map_err(anyhow::Error::new)?;
+            }
+        }
         self.conn().execute(
             r#"INSERT INTO agent_dispatches
                  (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
@@ -816,6 +830,75 @@ mod tests {
             db.get_unread_notifications().unwrap(),
         ] {
             assert!(rows.windows(2).all(|pair| pair[0].id > pair[1].id));
+        }
+    }
+
+    #[test]
+    fn dispatch_text_field_refuses_hostile_identities_without_a_row() {
+        let db = Db::open_memory().unwrap();
+        for field in [
+            "issue_id",
+            "worktree_path",
+            "agent_name",
+            "stage",
+            "session_id",
+            "artifact_path",
+            "chunk_path",
+        ] {
+            for hostile in ["x\x1b]52;c;AAAA\x07", "x\u{202e}"] {
+                let issue_id = if field == "issue_id" {
+                    hostile
+                } else {
+                    "linear:A-1"
+                };
+                let worktree_path = if field == "worktree_path" {
+                    hostile
+                } else {
+                    "/wt/a"
+                };
+                let agent_name = if field == "agent_name" {
+                    hostile
+                } else {
+                    "claude"
+                };
+                let stage = if field == "stage" {
+                    Some(hostile)
+                } else {
+                    None
+                };
+                let session_id = if field == "session_id" {
+                    Some(hostile)
+                } else {
+                    None
+                };
+                let artifact_path = if field == "artifact_path" {
+                    Some(hostile)
+                } else {
+                    None
+                };
+                let chunk_path = if field == "chunk_path" {
+                    Some(hostile)
+                } else {
+                    None
+                };
+                let result = db.put_agent_dispatch(crate::issue::NewDispatch {
+                    issue_id,
+                    worktree_path,
+                    agent_name,
+                    stage,
+                    parent_id: None,
+                    session_id,
+                    artifact_path,
+                    chunk_path,
+                });
+                assert!(matches!(
+                    result,
+                    Err(ref error)
+                        if error.downcast_ref::<crate::pipeline_report::DispatchTextRejected>()
+                            .is_some_and(|error| error.field == field)
+                ));
+                assert!(db.list_dispatches().unwrap().is_empty());
+            }
         }
     }
 
