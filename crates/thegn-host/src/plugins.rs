@@ -258,6 +258,7 @@ pub(crate) struct PluginsHost {
     tx: PluginTx,
     waker: TerminalWaker,
     one_shot_gate: OneShotGate,
+    state_anchor: PathBuf,
 }
 
 /// Start the plugin host. A SETUP thread does discovery (fs I/O) and spawns
@@ -275,6 +276,7 @@ pub(crate) fn spawn_plugins_host(
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
     let one_shot_gate = OneShotGate::default();
+    let state_anchor = thegn_core::util::xdg_state_home().join("thegn");
     let host = PluginsHost {
         stop: stop.clone(),
         supervisor: supervisor.clone(),
@@ -283,6 +285,7 @@ pub(crate) fn spawn_plugins_host(
         tx: tx.clone(),
         waker: waker.clone(),
         one_shot_gate: one_shot_gate.clone(),
+        state_anchor: state_anchor.clone(),
     };
     let spawn = std::thread::Builder::new()
         .name("thegn-plugins".into())
@@ -299,6 +302,7 @@ pub(crate) fn spawn_plugins_host(
                 tx,
                 waker,
                 one_shot_gate.clone(),
+                state_anchor,
             )
         });
     if let Err(e) = spawn {
@@ -317,6 +321,7 @@ impl PluginsHost {
         let supervisor = self.supervisor.clone();
         let tx = self.tx.clone();
         let waker = self.waker.clone();
+        let state_anchor = self.state_anchor.clone();
         let spawn = std::thread::Builder::new()
             .name("thegn-plugin-respawn".into())
             .spawn(move || {
@@ -325,7 +330,7 @@ impl PluginsHost {
                 if stop.wait_timeout(delay) {
                     return;
                 }
-                let writer = match thegn_svc::plugin::resolve_env(&plugin) {
+                let writer = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
                     Ok(env) => {
                         match spawn_session(&supervisor, &plugin, &env, &tx, &waker) {
                             Ok(session) => {
@@ -374,13 +379,14 @@ impl PluginsHost {
         };
         let tx = self.tx.clone();
         let waker = self.waker.clone();
+        let state_anchor = self.state_anchor.clone();
         let spawn = std::thread::Builder::new()
             .name("thegn-plugin-once".into())
             .spawn(move || {
                 // Utility: the user just invoked this one-shot and is waiting on its result.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let id = plugin.spec.manifest.id.as_str().to_string();
-                let run = match thegn_svc::plugin::resolve_env(&plugin) {
+                let run = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
                     Ok(env) => thegn_svc::plugin::spawn_ndjson(
                         &plugin.spec.command,
                         &env,
@@ -606,6 +612,7 @@ fn setup_and_schedule(
     tx: PluginTx,
     waker: TerminalWaker,
     gate: OneShotGate,
+    state_anchor: PathBuf,
 ) {
     setup_and_schedule_with_waker(
         supervisor,
@@ -617,6 +624,7 @@ fn setup_and_schedule(
         tx,
         Some(waker),
         gate,
+        state_anchor,
     );
 }
 
@@ -631,6 +639,7 @@ fn setup_and_schedule_with_waker(
     tx: PluginTx,
     waker: Option<TerminalWaker>,
     gate: OneShotGate,
+    state_anchor: PathBuf,
 ) {
     // `discover` reads `cfg.plugins` + the plugins directory; hand it the
     // owned specs on a default config rather than cloning the whole config
@@ -679,7 +688,7 @@ fn setup_and_schedule_with_waker(
         let plugin = plugin.clone();
         let negotiated = negotiated.clone();
         let id = plugin.spec.manifest.id.as_str().to_string();
-        let env = match thegn_svc::plugin::resolve_env(&plugin) {
+        let env = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
             Ok(env) => env,
             Err(problem) => {
                 tracing::warn!(target: "thegn::plugin", error = %problem, "plugin refused: env secret reference");
@@ -1149,6 +1158,7 @@ mod tests {
             tx,
             waker,
             one_shot_gate: OneShotGate::default(),
+            state_anchor: tmp.path().join("state"),
         };
         let mut spec = example_spec();
         spec.manifest.id = PluginId::new("single-flight");
@@ -1249,6 +1259,7 @@ mod tests {
             tx,
             None,
             OneShotGate::default(),
+            tmp.path().join("state"),
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.is_empty()));
@@ -1293,6 +1304,7 @@ mod tests {
             tx,
             None,
             OneShotGate::default(),
+            tmp.path().join("state"),
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.is_empty()));
@@ -1336,6 +1348,7 @@ mod tests {
             tx,
             None,
             OneShotGate::default(),
+            tmp.path().join("state"),
         );
 
         assert!(matches!(
@@ -1389,6 +1402,7 @@ mod tests {
             tx,
             None,
             OneShotGate::default(),
+            tmp.path().join("state"),
         );
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
@@ -1398,6 +1412,149 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "s3cr3t");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_state_dir_reaches_the_one_shot_plugin() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = tmp.path().join("state");
+        let marker = tmp.path().join("state-dir");
+        let mut spec = example_spec();
+        spec.mode = PluginMode::OneShot;
+        spec.manifest.contributions.clear();
+        spec.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf %s \"$THEGN_PLUGIN_STATE_DIR\" > \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(StopSignal::default());
+        let (tx, mut rx) = plugin_channel();
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![spec],
+            tmp.path().to_path_buf(),
+            sessions,
+            disabled,
+            stop,
+            tx,
+            None,
+            OneShotGate::default(),
+            anchor.clone(),
+        );
+
+        assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            anchor.join("plugins/hello").to_str().unwrap()
+        );
+        assert!(anchor.join("plugins/hello").is_dir());
+    }
+
+    #[test]
+    fn startup_state_dir_refusal_skips_only_that_plugin() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = tmp.path().join("state");
+        let plugins_dir = anchor.join("plugins");
+        let other_dir = tmp.path().join("other");
+        let refused_marker = tmp.path().join("refused-ran");
+        let other_marker = tmp.path().join("other-ran");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        std::fs::create_dir(&other_dir).unwrap();
+        if let Err(error) =
+            thegn_core::fsperm::create_symlink(&other_dir, &plugins_dir.join("hello"), true)
+        {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+        let mut refused = example_spec();
+        refused.mode = PluginMode::OneShot;
+        refused.manifest.contributions.clear();
+        refused.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            refused_marker.display().to_string(),
+        ];
+        let mut survivor = example_spec();
+        survivor.manifest.id = PluginId::new("survivor");
+        survivor.mode = PluginMode::OneShot;
+        survivor.manifest.contributions.clear();
+        survivor.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            other_marker.display().to_string(),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
+        let stop = Arc::new(StopSignal::default());
+        let (tx, mut rx) = plugin_channel();
+        setup_and_schedule_with_waker(
+            supervisor,
+            vec![refused, survivor],
+            tmp.path().to_path_buf(),
+            sessions,
+            disabled,
+            stop,
+            tx,
+            None,
+            OneShotGate::default(),
+            anchor,
+        );
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Loaded(loaded)
+                if loaded.iter().any(|state| state.plugin.spec.manifest.id.as_str() == "survivor")
+                    && loaded.iter().all(|state| state.plugin.spec.manifest.id.as_str() != "hello")
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::Refused(problems)
+                if problems.iter().any(|problem| {
+                    problem.plugin == "hello" && problem.problem.contains("private state directory")
+                })
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "survivor"
+        ));
+        assert!(!refused_marker.exists());
+        assert!(other_marker.exists());
+        assert!(std::fs::read_dir(&other_dir).unwrap().next().is_none());
     }
 
     #[test]
@@ -1437,6 +1594,7 @@ mod tests {
             tx,
             None,
             OneShotGate::default(),
+            tmp.path().join("state"),
         );
 
         assert!(matches!(
