@@ -557,7 +557,10 @@ mod tests {
         };
         let result = comms.bind("work");
         assert!(matches!(
-            result.as_ref().err().and_then(|error| error.downcast_ref()),
+            result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<SubprofileStorageRefusal>()),
             Some(SubprofileStorageRefusal::Symlink { .. })
         ));
         assert_eq!(std::fs::read(target).unwrap(), b"target remains untouched");
@@ -582,10 +585,44 @@ mod tests {
         };
         let result = comms.bind("work/a");
         assert!(matches!(
-            result.as_ref().err().and_then(|error| error.downcast_ref()),
+            result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<SubprofileStorageRefusal>()),
             Some(SubprofileStorageRefusal::LegacySlugDatabase { file }) if file == "work-a.db"
         ));
         assert!(comms.bind("other").is_ok());
+    }
+
+    #[test]
+    fn hard_linked_database_leaf_is_refused() {
+        let root = private_temp_root();
+        let db_root = root.path().join("comms");
+        std::fs::create_dir(&db_root).unwrap();
+        thegn_core::fsperm::restrict_dir_to_owner(&db_root).unwrap();
+        let file = subprofile_db_file_name("work");
+        let database = db_root.join(&file);
+        std::fs::write(&database, b"database data").unwrap();
+        std::fs::hard_link(&database, db_root.join("hard-link.db")).unwrap();
+        let metadata = std::fs::symlink_metadata(&database).unwrap();
+        if thegn_core::fsperm::ensure_single_link_regular_file(&metadata).is_ok() {
+            return;
+        }
+
+        let mut comms = StubSubsystem {
+            name: "comms".into(),
+            db_root: Some(db_root),
+            active: "default".into(),
+            db: None,
+            panes: Vec::new(),
+        };
+        let result = comms.bind("work");
+        assert!(matches!(
+            result.as_ref().err().and_then(|error| {
+                error.downcast_ref::<SubprofileStorageRefusal>()
+            }),
+            Some(SubprofileStorageRefusal::HardLinked { file: refused }) if refused == &file
+        ));
     }
 
     #[test]
