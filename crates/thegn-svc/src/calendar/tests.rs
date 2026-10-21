@@ -3918,3 +3918,77 @@ async fn token_ref_tokenless_account_sends_no_authorization() {
     assert_eq!(auth.lock().unwrap().first().map(String::as_str), Some(""));
     server.abort();
 }
+
+#[test]
+fn an_ics_file_with_a_startless_event_counts_a_quarantined_event() {
+    let t = Tmp::new("ics-diagnostics-startless");
+    let path = t.0.join("calendar.ics");
+    let feed = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:e1\nSUMMARY:Standup\nDTSTART;TZID=UTC:20260821T093000\nDTEND;TZID=UTC:20260821T094500\nEND:VEVENT\nBEGIN:VEVENT\nUID:no-start\nSUMMARY:No start\nEND:VEVENT\nEND:VCALENDAR";
+    std::fs::write(&path, feed).unwrap();
+    let (from, to) = window();
+
+    let page =
+        block_on(ics_backend(&path.display().to_string()).list_events(from, to, "")).unwrap();
+
+    assert_eq!(page.events().len(), 1);
+    assert!(
+        page.diagnostics().quarantined_events >= 1,
+        "diagnostics: {:?}",
+        page.diagnostics()
+    );
+}
+
+#[test]
+fn an_ics_file_with_an_unknown_tzid_counts_an_unresolved_zone() {
+    let t = Tmp::new("ics-diagnostics-tzid");
+    let path = t.0.join("calendar.ics");
+    let feed = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:unknown-zone\nSUMMARY:Unknown zone\nDTSTART;TZID=Nowhere/Invented:20260821T090000\nDTEND;TZID=Nowhere/Invented:20260821T100000\nEND:VEVENT\nEND:VCALENDAR";
+    std::fs::write(&path, feed).unwrap();
+    let (from, to) = window();
+
+    let page =
+        block_on(ics_backend(&path.display().to_string()).list_events(from, to, "")).unwrap();
+
+    assert!(
+        page.diagnostics().unresolved_zones >= 1,
+        "diagnostics: {:?}",
+        page.diagnostics()
+    );
+}
+
+#[test]
+fn a_vdir_sums_diagnostics_across_files() {
+    let t = Tmp::new("vdir-diagnostics");
+    for uid in ["one", "two"] {
+        let path = t.0.join(format!("{uid}.ics"));
+        let feed =
+            format!("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:bad-{uid}\nEND:VEVENT\nEND:VCALENDAR");
+        std::fs::write(path, feed).unwrap();
+    }
+    let (from, to) = window();
+
+    let page = block_on(ics_backend(&t.0.display().to_string()).list_events(from, to, "")).unwrap();
+
+    assert!(
+        page.diagnostics().quarantined_events >= 2,
+        "diagnostics: {:?}",
+        page.diagnostics()
+    );
+}
+
+#[test]
+fn a_clean_ics_file_has_no_diagnostics() {
+    let t = Tmp::new("ics-diagnostics-clean");
+    let path = t.0.join("calendar.ics");
+    std::fs::write(&path, ONE_EVENT).unwrap();
+    let (from, to) = window();
+
+    let page =
+        block_on(ics_backend(&path.display().to_string()).list_events(from, to, "")).unwrap();
+
+    assert!(
+        page.diagnostics().is_empty(),
+        "diagnostics: {:?}",
+        page.diagnostics()
+    );
+}
