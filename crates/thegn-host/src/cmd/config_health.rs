@@ -185,6 +185,9 @@ fn validate_toml_file(health: &mut ConfigHealth, layer: Layer, path: &Path) {
                 ),
             );
         }
+        for warning in crate::agent_run::headless_settings_warnings(&cfg) {
+            add_warning(health, path, warning);
+        }
     }
 }
 
@@ -281,6 +284,49 @@ pub(crate) fn render_findings(health: &ConfigHealth) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_queue_settings_warn_on_unsupported_platform() {
+        let _unsupported = crate::agent_run::force_headless_unsupported();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[merge_queue]\nagent_command = \"claude -p {prompt}\"\n",
+        )
+        .unwrap();
+
+        let health = collect(&path, Some(dir.path()));
+
+        assert_eq!(health.problems(), 0);
+        assert!(health.findings().any(|finding| {
+            finding.warning
+                && finding.path == path
+                && finding.message.contains("[merge_queue]")
+                && finding.message.contains("not supported on this platform")
+        }));
+    }
+
+    // Positive control: supported Unix platforms keep this setting silent.
+    #[cfg(unix)]
+    #[test]
+    fn headless_queue_settings_silent_when_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[merge_queue]\nagent_command = \"claude -p {prompt}\"\n",
+        )
+        .unwrap();
+
+        let health = collect(&path, Some(dir.path()));
+
+        assert!(
+            health
+                .findings()
+                .all(|finding| { !finding.message.contains("[merge_queue]") })
+        );
+    }
 
     #[test]
     fn accepted_compatibility_warnings_keep_typed_severity_in_every_toml_layer() {
