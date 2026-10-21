@@ -31,6 +31,16 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    built for _this_ machine's target, so it rehearses the
    darwin leg on a Mac and the linux-gnu leg on Linux — not the musl one.
 
+   After downloading a draft release's `.deb`/`.rpm` assets with
+   `gh release download <tag> --pattern 'thegn_*_amd64.deb' --pattern 'thegn-*-1.x86_64.rpm'`, run
+   `just rehearse-packages deb=... rpm=...` (and optionally pass the previous release's packages as
+   `previous_deb=... previous_rpm=...` for the upgrade leg). Attach the generated JSON evidence to
+   THE-52. The standalone `.deb` / `.rpm` channel row changes only after a passing evidence record exists.
+
+   ```sh
+   just rehearse-packages deb=thegn_<version>_amd64.deb rpm=thegn-<version>-1.x86_64.rpm
+   ```
+
 6. **Tag + push.**
 
    ```sh

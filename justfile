@@ -1483,6 +1483,18 @@ release-verify tag:
     esac
     echo "release-verify: ok"
 
+# Rehearse standalone deb/rpm packages in fresh Debian, Ubuntu and Fedora containers.
+# This is a manual release check and is intentionally not part of ci, smoke or test.
+rehearse-packages deb="" rpm="" previous_deb="" previous_rpm="" evidence="target/package-rehearsal":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=()
+    if [ -n "{{deb}}" ]; then args+=(--deb "{{deb}}"); fi
+    if [ -n "{{rpm}}" ]; then args+=(--rpm "{{rpm}}"); fi
+    if [ -n "{{previous_deb}}" ]; then args+=(--previous-deb "{{previous_deb}}"); fi
+    if [ -n "{{previous_rpm}}" ]; then args+=(--previous-rpm "{{previous_rpm}}"); fi
+    python3 packaging/rehearse_packages.py "${args[@]}" --evidence-dir "{{evidence}}"
+
 # --- macOS launcher ----------------------------------------------------------
 
 # Generate/refresh the macOS `thegn.app` launcher in ~/Applications, pointed at
