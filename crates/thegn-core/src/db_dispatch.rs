@@ -146,16 +146,42 @@ impl std::fmt::Display for ResumeDispatchConflict {
 
 impl std::error::Error for ResumeDispatchConflict {}
 
-/// A child admission named a parent that was absent from the roster table
-/// when checked under the admission write lock.
+/// A child admission named a parent edge that failed validation under the
+/// admission write lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParentDispatchConflict {
     pub parent_id: i64,
+    pub reason: ParentEdgeReason,
+}
+
+/// Why a proposed parent edge cannot be admitted for new work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentEdgeReason {
+    Missing,
+    CrossIssue,
+    Ineligible(AgentDispatchStatus),
 }
 
 impl std::fmt::Display for ParentDispatchConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "parent dispatch {} does not exist", self.parent_id)
+        match self.reason {
+            ParentEdgeReason::Missing => {
+                write!(f, "parent dispatch {} does not exist", self.parent_id)
+            }
+            ParentEdgeReason::CrossIssue => {
+                write!(
+                    f,
+                    "parent dispatch {} belongs to another issue",
+                    self.parent_id
+                )
+            }
+            ParentEdgeReason::Ineligible(status) => write!(
+                f,
+                "parent dispatch {} is {} and cannot parent new work",
+                self.parent_id,
+                status.as_str()
+            ),
+        }
     }
 }
 
@@ -431,13 +457,43 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
     }
 
-    /// Compact indexed projection used while a claim holds SQLite's writer lock.
-    fn dispatch_parent_exists(&self, parent_id: i64) -> Result<bool> {
-        Ok(self.conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE id=?1)",
-            [parent_id],
-            |row| row.get(0),
-        )?)
+    /// Validate a parent edge while the caller holds SQLite's admission write lock.
+    fn validate_parent_edge(&self, parent_id: i64, child_issue: &str) -> Result<()> {
+        let parent = self
+            .conn()
+            .query_row(
+                "SELECT issue_id, status FROM agent_dispatches WHERE id=?1",
+                [parent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((parent_issue, stored_status)) = parent else {
+            return Err(anyhow::Error::new(ParentDispatchConflict {
+                parent_id,
+                reason: ParentEdgeReason::Missing,
+            }));
+        };
+        if crate::pipeline_run::issue_key(&parent_issue)
+            != crate::pipeline_run::issue_key(child_issue)
+        {
+            return Err(anyhow::Error::new(ParentDispatchConflict {
+                parent_id,
+                reason: ParentEdgeReason::CrossIssue,
+            }));
+        }
+        let status = AgentDispatchStatus::parse(&stored_status);
+        if matches!(
+            status,
+            AgentDispatchStatus::Failed
+                | AgentDispatchStatus::Abandoned
+                | AgentDispatchStatus::Unknown
+        ) {
+            return Err(anyhow::Error::new(ParentDispatchConflict {
+                parent_id,
+                reason: ParentEdgeReason::Ineligible(status),
+            }));
+        }
+        Ok(())
     }
 
     /// Validate and insert a non-claim dispatch row under one write lock.
@@ -449,16 +505,19 @@ impl Db {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<i64> {
             if let Some(parent_id) = new.parent_id {
-                let parent_exists: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE id=?1)",
-                    [parent_id],
-                    |row| row.get(0),
-                )?;
-                if !parent_exists {
-                    return Err(anyhow::Error::new(ParentDispatchConflict { parent_id }));
-                }
+                self.validate_parent_edge(parent_id, new.issue_id)?;
             }
-            self.put_agent_dispatch(new)
+            let id = self.put_agent_dispatch(new)?;
+            if let Some(stage) = new.stage
+                && new.artifact_path.is_none()
+            {
+                let artifact = crate::pipeline_run::artifact_path(new.issue_id, stage, id);
+                conn.execute(
+                    "UPDATE agent_dispatches SET artifact_path=?1 WHERE id=?2",
+                    rusqlite::params![artifact, id],
+                )?;
+            }
+            Ok(id)
         })();
         match result {
             Ok(id) => {
@@ -1163,10 +1222,8 @@ impl Db {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
             let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
-            if let Some(parent_id) = new.parent_id
-                && !self.dispatch_parent_exists(parent_id)?
-            {
-                return Err(anyhow::Error::new(ParentDispatchConflict { parent_id }));
+            if let Some(parent_id) = new.parent_id {
+                self.validate_parent_edge(parent_id, new.issue_id)?;
             }
             if new.chunk_path.is_some() {
                 let Some(prepared) = prepared else {
@@ -1293,6 +1350,15 @@ impl Db {
                 return Ok(Err(DispatchAdmissionDecision::Claim(decision)));
             }
             let id = self.put_agent_dispatch(new)?;
+            if let Some(stage) = new.stage
+                && new.artifact_path.is_none()
+            {
+                let artifact = crate::pipeline_run::artifact_path(new.issue_id, stage, id);
+                conn.execute(
+                    "UPDATE agent_dispatches SET artifact_path=?1 WHERE id=?2",
+                    rusqlite::params![artifact, id],
+                )?;
+            }
             if let Some(prepared) = prepared {
                 let snapshot = encode_chunk_scope(&prepared.scope.files)?;
                 conn.execute(
@@ -1400,6 +1466,16 @@ impl Db {
                     return Ok(Err(decision));
                 }
                 let finisher = self.put_agent_dispatch(new)?;
+                if let Some(stage) = new.stage
+                    && new.artifact_path.is_none()
+                {
+                    let artifact =
+                        crate::pipeline_run::artifact_path(new.issue_id, stage, finisher);
+                    conn.execute(
+                        "UPDATE agent_dispatches SET artifact_path=?1 WHERE id=?2",
+                        rusqlite::params![artifact, finisher],
+                    )?;
+                }
                 if let Some(snapshot) = source_scope {
                     conn.execute(
                         "UPDATE agent_dispatches SET chunk_scope=?1 WHERE id=?2",
@@ -1944,7 +2020,10 @@ mod tests {
         let err = db.put_dispatch_with_parent_check(missing).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ParentDispatchConflict>(),
-            Some(&ParentDispatchConflict { parent_id: 4242 })
+            Some(&ParentDispatchConflict {
+                parent_id: 4242,
+                reason: ParentEdgeReason::Missing,
+            })
         );
         let count: i64 = db
             .conn()
@@ -2366,7 +2445,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.downcast_ref::<ParentDispatchConflict>(),
-            Some(&ParentDispatchConflict { parent_id: 700 })
+            Some(&ParentDispatchConflict {
+                parent_id: 700,
+                reason: ParentEdgeReason::Missing,
+            })
         );
         assert!(
             err.to_string()
@@ -2378,7 +2460,7 @@ mod tests {
         );
 
         let parent = put_row(&db, "linear:PARENT", "/wt/x");
-        let mut child = crate::issue::NewDispatch::new("linear:CHILD", "/wt/x", "coder");
+        let mut child = crate::issue::NewDispatch::new("linear:PARENT", "/wt/x", "coder");
         child.stage = Some("code");
         child.parent_id = Some(parent);
         assert!(
@@ -2386,6 +2468,354 @@ mod tests {
                 .unwrap()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn parent_edge_table_across_put_and_claim() {
+        let refused = [
+            ("missing", None, ParentEdgeReason::Missing),
+            (
+                "cross issue",
+                Some(("linear:OTHER", None)),
+                ParentEdgeReason::CrossIssue,
+            ),
+            (
+                "failed",
+                Some(("linear:CHILD", Some(AgentDispatchStatus::Failed))),
+                ParentEdgeReason::Ineligible(AgentDispatchStatus::Failed),
+            ),
+            (
+                "abandoned",
+                Some(("linear:CHILD", Some(AgentDispatchStatus::Abandoned))),
+                ParentEdgeReason::Ineligible(AgentDispatchStatus::Abandoned),
+            ),
+            (
+                "unknown",
+                Some(("linear:CHILD", Some(AgentDispatchStatus::Unknown))),
+                ParentEdgeReason::Ineligible(AgentDispatchStatus::Unknown),
+            ),
+        ];
+        for (label, parent_spec, reason) in refused {
+            for claim in [false, true] {
+                let (db, _dir) = temp_db();
+                let parent_id = if let Some((issue, status)) = parent_spec {
+                    let id = put_row(&db, issue, "/wt/parent");
+                    match status {
+                        Some(AgentDispatchStatus::Unknown) => {
+                            db.conn()
+                                .execute(
+                                    "UPDATE agent_dispatches SET status='future_state' WHERE id=?1",
+                                    [id],
+                                )
+                                .unwrap();
+                        }
+                        Some(status) => {
+                            db.update_dispatch_status(id, status).unwrap();
+                        }
+                        None => {}
+                    }
+                    id
+                } else {
+                    77_777
+                };
+                let mut child =
+                    crate::issue::NewDispatch::new("linear:CHILD", "/wt/child", "coder");
+                child.parent_id = Some(parent_id);
+                let before = db.list_dispatches().unwrap().len();
+                let error = if claim {
+                    db.claim_dispatch_admitted(child, 10, None, None, None)
+                        .unwrap_err()
+                } else {
+                    db.put_dispatch_with_parent_check(child).unwrap_err()
+                };
+                assert_eq!(
+                    error
+                        .downcast_ref::<ParentDispatchConflict>()
+                        .map(|conflict| conflict.reason),
+                    Some(reason),
+                    "{label}; claim={claim}; error={error}"
+                );
+                let detail = match reason {
+                    ParentEdgeReason::Missing => "does not exist".to_string(),
+                    ParentEdgeReason::CrossIssue => "belongs to another issue".to_string(),
+                    ParentEdgeReason::Ineligible(status) => {
+                        format!("is {} and cannot parent new work", status.as_str())
+                    }
+                };
+                assert!(error.to_string().contains(&detail), "{label}: {error}");
+                assert_eq!(
+                    db.list_dispatches().unwrap().len(),
+                    before,
+                    "{label}; claim={claim} must not insert a child"
+                );
+            }
+        }
+
+        for (label, status, worktree) in [
+            ("queued", AgentDispatchStatus::Queued, "/wt/parent"),
+            ("running", AgentDispatchStatus::Running, "/wt/parent"),
+            ("done", AgentDispatchStatus::Done, "/wt/parent"),
+            ("merged", AgentDispatchStatus::Merged, "/wt/parent"),
+            ("cross worktree", AgentDispatchStatus::Queued, "/wt/other"),
+        ] {
+            for claim in [false, true] {
+                let (db, _dir) = temp_db();
+                let parent = put_row(&db, "linear:CHILD", worktree);
+                if status != AgentDispatchStatus::Queued {
+                    db.update_dispatch_status(parent, status).unwrap();
+                }
+                let mut child =
+                    crate::issue::NewDispatch::new("linear:CHILD", "/wt/child", "coder");
+                child.parent_id = Some(parent);
+                let outcome = if claim {
+                    db.claim_dispatch_admitted(child, 10, None, None, None)
+                        .unwrap()
+                        .is_ok()
+                } else {
+                    db.put_dispatch_with_parent_check(child).is_ok()
+                };
+                assert!(
+                    outcome,
+                    "{label}; claim={claim} should admit same-issue parent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parent_edge_resume_finisher_keeps_a_failed_source_parent() {
+        let (db, _dir) = temp_db();
+        let source = put_row(&db, "linear:RESUME", "/wt/source");
+        db.update_dispatch_status(source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let finisher = db
+            .claim_resume_dispatch(
+                source,
+                AgentDispatchStatus::Failed,
+                pipeline_row("linear:RESUME", "/wt/finisher", "code", None, Some(source)),
+                10,
+            )
+            .unwrap()
+            .expect("a failed source remains a valid resume parent");
+        assert_eq!(
+            db.get_dispatch(finisher).unwrap().unwrap().parent_id,
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn stage_artifact_is_stamped_by_claim_put_and_resume() {
+        let (db, _dir) = temp_db();
+        let put = db
+            .put_dispatch_with_parent_check(pipeline_row(
+                "linear:PUT",
+                "/wt/put",
+                "code",
+                None,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(put)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some(crate::pipeline_run::artifact_path("linear:PUT", "code", put).as_str())
+        );
+
+        let claim = db
+            .claim_dispatch_admitted(
+                pipeline_row("linear:CLAIM", "/wt/claim", "review", None, None),
+                10,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(claim)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some(crate::pipeline_run::artifact_path("linear:CLAIM", "review", claim).as_str())
+        );
+        let explicit_claim = db
+            .claim_dispatch_admitted(
+                pipeline_row(
+                    "linear:CLAIM-EXPLICIT",
+                    "/wt/claim-explicit",
+                    "review",
+                    Some("claim-chosen.md"),
+                    None,
+                ),
+                10,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(explicit_claim)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some("claim-chosen.md")
+        );
+        let plain_claim = db
+            .claim_dispatch_admitted(
+                crate::issue::NewDispatch::new("linear:CLAIM-PLAIN", "/wt/claim-plain", "coder"),
+                10,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(plain_claim).unwrap().unwrap().artifact_path,
+            None
+        );
+
+        let source = db
+            .put_agent_dispatch(pipeline_row(
+                "linear:RESUME",
+                "/wt/resume",
+                "code",
+                Some("source.md"),
+                None,
+            ))
+            .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let finisher = db
+            .claim_resume_dispatch(
+                source,
+                AgentDispatchStatus::Failed,
+                pipeline_row("linear:RESUME", "/wt/resume", "code", None, Some(source)),
+                10,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(finisher)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some(crate::pipeline_run::artifact_path("linear:RESUME", "code", finisher).as_str())
+        );
+        let explicit_source = db
+            .put_agent_dispatch(pipeline_row(
+                "linear:RESUME-EXPLICIT",
+                "/wt/resume-explicit",
+                "code",
+                Some("source-explicit.md"),
+                None,
+            ))
+            .unwrap();
+        db.update_dispatch_status(explicit_source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let explicit_finisher = db
+            .claim_resume_dispatch(
+                explicit_source,
+                AgentDispatchStatus::Failed,
+                pipeline_row(
+                    "linear:RESUME-EXPLICIT",
+                    "/wt/resume-explicit",
+                    "code",
+                    Some("finisher-chosen.md"),
+                    Some(explicit_source),
+                ),
+                10,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(explicit_finisher)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some("finisher-chosen.md")
+        );
+        let plain_source = db
+            .put_agent_dispatch(crate::issue::NewDispatch::new(
+                "linear:RESUME-PLAIN",
+                "/wt/resume-plain",
+                "coder",
+            ))
+            .unwrap();
+        db.update_dispatch_status(plain_source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let plain_finisher = db
+            .claim_resume_dispatch(
+                plain_source,
+                AgentDispatchStatus::Failed,
+                crate::issue::NewDispatch::new("linear:RESUME-PLAIN", "/wt/resume-plain", "coder"),
+                10,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(plain_finisher)
+                .unwrap()
+                .unwrap()
+                .artifact_path,
+            None
+        );
+    }
+
+    #[test]
+    fn stage_artifact_explicit_path_and_plain_rows_are_untouched() {
+        let (db, _dir) = temp_db();
+        let automatic = db
+            .claim_dispatch_admitted(
+                pipeline_row("linear:AUTO", "/wt/auto", "code", None, None),
+                10,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(automatic)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some(crate::pipeline_run::artifact_path("linear:AUTO", "code", automatic).as_str())
+        );
+        let explicit = db
+            .put_dispatch_with_parent_check(pipeline_row(
+                "linear:EXPLICIT",
+                "/wt/explicit",
+                "code",
+                Some("chosen.md"),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(explicit)
+                .unwrap()
+                .unwrap()
+                .artifact_path
+                .as_deref(),
+            Some("chosen.md")
+        );
+        let plain = db
+            .put_dispatch_with_parent_check(crate::issue::NewDispatch::new(
+                "linear:PLAIN",
+                "/wt/plain",
+                "coder",
+            ))
+            .unwrap();
+        assert_eq!(db.get_dispatch(plain).unwrap().unwrap().artifact_path, None);
     }
 
     #[test]
