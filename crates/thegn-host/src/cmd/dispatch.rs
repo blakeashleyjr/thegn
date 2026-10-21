@@ -32,6 +32,8 @@ use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
 use thegn_core::util::{git_ok, git_out_allow_empty};
+#[path = "dispatch_gate.rs"]
+mod gate;
 
 /// Bound the active roster rows examined by the CLI reaper.
 const CLI_REAP_ROW_LIMIT: usize = 4096;
@@ -208,6 +210,16 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Run the repo's merge-queue gate on a pipeline row's committed HEAD in
+    /// the isolated gate worktree and record a trusted, commit-bound
+    /// attestation (Lead-only).
+    Gate {
+        /// The dispatch row id (see `dispatch list`).
+        id: i64,
+        /// Emit the attestation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Block until an active roster row's daemon session exits (the supervisor
     /// wake primitive). A session that already exited answers immediately from
     /// the daemon's tombstone; one reaped past the tombstone TTL reports as
@@ -306,6 +318,7 @@ fn worker_route(action: &Action, token: Option<&str>) -> WorkerRoute {
         Action::Put { .. } => WorkerRoute::Refused("put"),
         Action::SetStatus { .. } => WorkerRoute::Refused("set-status"),
         Action::Lease { .. } => WorkerRoute::Refused("lease"),
+        Action::Gate { .. } => WorkerRoute::Refused("gate"),
         Action::Reap { apply: true, .. } => WorkerRoute::Refused("reap --apply"),
         Action::List { .. }
         | Action::Reap { apply: false, .. }
@@ -525,6 +538,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             json,
         } => set_status(id, &status, force, why.as_deref(), json),
         Action::Verify { id, json } => verify(id, json),
+        Action::Gate { id, json } => gate::run(cfg, id, json),
         Action::Wait {
             row,
             any,
@@ -4685,6 +4699,10 @@ mod tests {
                 WorkerRoute::Local,
             ),
             (Action::Verify { id: 1, json: false }, WorkerRoute::Local),
+            (
+                Action::Gate { id: 1, json: false },
+                WorkerRoute::Refused("gate"),
+            ),
             (
                 Action::Wait {
                     row: Some(1),

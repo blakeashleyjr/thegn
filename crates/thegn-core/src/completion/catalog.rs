@@ -511,6 +511,11 @@ pub const CATALOG: &[Slot] = &[
         SourceKind::Reserved(Reserved::DispatchRow),
     ),
     slot(
+        "dispatch gate",
+        "id",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot(
         "dispatch wait",
         "row",
         SourceKind::Reserved(Reserved::DispatchRow),
