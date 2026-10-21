@@ -30,7 +30,7 @@ struct Fixture {
 impl Fixture {
     fn new(concurrency: u32) -> Self {
         let root = Arc::new(tempfile::tempdir().unwrap());
-        for name in ["config", "state", "runtime", "home", "tmp"] {
+        for name in ["config", "state", "runtime", "home", "tmp", "worktrees"] {
             fs::create_dir(root.path().join(name)).unwrap();
         }
         let config = root.path().join("config/pipeline.toml");
@@ -53,6 +53,48 @@ impl Fixture {
         let db = root.path().join("state/thegn/thegn.db");
         Db::open_at(&db).unwrap();
         Self { root, config, db }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fixture initializes isolated Git roots outside the event loop"
+    )]
+    fn worktree(&self, name: &str) -> String {
+        let path = self.root.path().join("worktrees").join(name);
+        fs::create_dir(&path).unwrap();
+        let init = thegn_core::util::git_cmd(&path)
+            .args(["-c", "commit.gpgsign=false", "init", "--quiet"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let commit = thegn_core::util::git_cmd(&path)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Thegn Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "empty git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        path.to_string_lossy().into_owned()
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -238,12 +280,14 @@ fn serve_health(listener: UnixListener) {
 #[cfg(unix)]
 fn claim_duplicate_capacity_and_lease_contention_are_retryable_json() {
     let fixture = Fixture::new(1);
+    let worktree_a = fixture.worktree("a");
+    let worktree_b = fixture.worktree("b");
     assert_code(
         &fixture.run(&[
             "dispatch",
             "claim",
             "linear:THE-213-A",
-            "/work/a",
+            &worktree_a,
             "claude",
             "--stage",
             "code",
@@ -255,7 +299,7 @@ fn claim_duplicate_capacity_and_lease_contention_are_retryable_json() {
         "dispatch",
         "claim",
         "linear:THE-213-A",
-        "/work/a",
+        &worktree_a,
         "claude",
         "--stage",
         "code",
@@ -268,7 +312,7 @@ fn claim_duplicate_capacity_and_lease_contention_are_retryable_json() {
         "dispatch",
         "claim",
         "linear:THE-213-B",
-        "/work/b",
+        &worktree_b,
         "claude",
         "--stage",
         "code",
@@ -302,9 +346,11 @@ fn claim_duplicate_capacity_and_lease_contention_are_retryable_json() {
 #[cfg(unix)]
 fn stage_and_resume_contention_are_retryable_json_without_opening_a_session() {
     let fixture = Fixture::new(1);
+    let worktree_capacity = fixture.worktree("capacity");
+    let worktree_new = fixture.worktree("new");
     fixture.put(
         "linear:THE-213-capacity",
-        "/work/capacity",
+        &worktree_capacity,
         AgentDispatchStatus::Queued,
     );
     let socket = fixture.root.path().join("runtime/control.sock");
@@ -318,7 +364,7 @@ fn stage_and_resume_contention_are_retryable_json_without_opening_a_session() {
         "--issue",
         "linear:THE-213-new",
         "--worktree",
-        "/work/new",
+        &worktree_new,
         "--json",
     ]);
     assert_code(&stage, 2);
@@ -326,14 +372,16 @@ fn stage_and_resume_contention_are_retryable_json_without_opening_a_session() {
     server.join().unwrap();
 
     let resume = Fixture::new(1);
+    let worktree_resume = resume.worktree("resume");
+    let worktree_full = resume.worktree("full");
     let source = resume.put(
         "linear:THE-213-resume",
-        "/work/resume",
+        &worktree_resume,
         AgentDispatchStatus::WaitingHuman,
     );
     resume.put(
         "linear:THE-213-full",
-        "/work/full",
+        &worktree_full,
         AgentDispatchStatus::Queued,
     );
     let socket = resume.root.path().join("runtime/control.sock");
@@ -355,11 +403,12 @@ fn stage_and_resume_contention_are_retryable_json_without_opening_a_session() {
 #[cfg(unix)]
 fn successful_claim_is_zero_and_fatal_config_or_database_errors_are_one() {
     let success = Fixture::new(1);
+    let worktree_success = success.worktree("success");
     let output = success.run(&[
         "dispatch",
         "claim",
         "linear:THE-213-success",
-        "/work/success",
+        &worktree_success,
         "claude",
         "--stage",
         "code",
@@ -369,11 +418,12 @@ fn successful_claim_is_zero_and_fatal_config_or_database_errors_are_one() {
     assert_eq!(json_lines(&output, 1)[0]["granted"], true);
 
     let unknown = Fixture::new(1);
+    let worktree_unknown = unknown.worktree("unknown");
     let output = unknown.run(&[
         "dispatch",
         "claim",
         "linear:THE-213-unknown",
-        "/work/unknown",
+        &worktree_unknown,
         "claude",
         "--stage",
         "missing",
@@ -383,12 +433,13 @@ fn successful_claim_is_zero_and_fatal_config_or_database_errors_are_one() {
     assert!(output.stdout.is_empty(), "fatal refusal must not emit JSON");
 
     let malformed = Fixture::new(1);
+    let worktree_config = malformed.worktree("config");
     fs::write(&malformed.config, "[pipeline\n").unwrap();
     let output = malformed.run(&[
         "dispatch",
         "claim",
         "linear:THE-213-config",
-        "/work/config",
+        &worktree_config,
         "claude",
         "--stage",
         "missing",
@@ -401,13 +452,14 @@ fn successful_claim_is_zero_and_fatal_config_or_database_errors_are_one() {
     );
 
     let database = Fixture::new(1);
+    let worktree_db = database.worktree("db");
     fs::remove_file(&database.db).unwrap();
     fs::create_dir(&database.db).unwrap();
     let output = database.run(&[
         "dispatch",
         "claim",
         "linear:THE-213-db",
-        "/work/db",
+        &worktree_db,
         "claude",
         "--stage",
         "code",
