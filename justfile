@@ -1489,11 +1489,12 @@ rehearse-packages deb="" rpm="" previous_deb="" previous_rpm="" evidence="target
     #!/usr/bin/env bash
     set -euo pipefail
     args=()
-    if [ -n "{{deb}}" ]; then args+=(--deb "{{deb}}"); fi
-    if [ -n "{{rpm}}" ]; then args+=(--rpm "{{rpm}}"); fi
-    if [ -n "{{previous_deb}}" ]; then args+=(--previous-deb "{{previous_deb}}"); fi
-    if [ -n "{{previous_rpm}}" ]; then args+=(--previous-rpm "{{previous_rpm}}"); fi
-    python3 packaging/rehearse_packages.py "${args[@]}" --evidence-dir "{{evidence}}"
+    if [ -n {{quote(deb)}} ]; then args+=(--deb {{quote(deb)}}); fi
+    if [ -n {{quote(rpm)}} ]; then args+=(--rpm {{quote(rpm)}}); fi
+    if [ -n {{quote(previous_deb)}} ]; then args+=(--previous-deb {{quote(previous_deb)}}); fi
+    if [ -n {{quote(previous_rpm)}} ]; then args+=(--previous-rpm {{quote(previous_rpm)}}); fi
+    cd {{quote(invocation_directory())}}
+    python3 packaging/rehearse_packages.py "${args[@]}" --evidence-dir {{quote(evidence)}}
 
 # --- macOS launcher ----------------------------------------------------------
 

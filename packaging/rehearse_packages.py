@@ -80,12 +80,15 @@ class Evidence:
     passed: bool
     json_path: Path | None = None
     markdown_path: Path | None = None
+    interrupted: bool = False
 
 
 def _validate_package(value: str | Path | None, kind: str) -> Package | None:
     if value is None:
         return None
     path = Path(value).expanduser().absolute()
+    if ":" in str(path) or "," in str(path):
+        raise RehearsalError(f"package path {path} contains a ':' or ',' unsupported by container volume syntax")
     try:
         mode = path.lstat().st_mode
     except OSError as error:
@@ -135,7 +138,7 @@ def _steps(runtime: str, container: str, kind: str, current: Package, previous: 
         steps.append(_exec_step(runtime, container, "update", "apt-get update"))
         if previous is not None:
             steps.append(_exec_step(runtime, container, "install-previous", f"DEBIAN_FRONTEND=noninteractive apt-get install -y /rehearsal/{previous.basename}"))
-            steps.append(_exec_step(runtime, container, "previous-version", f"thegn --version | grep -F -- {shlex.quote(previous.version)}"))
+            steps.append(_exec_step(runtime, container, "previous-version", f"test \"$(thegn --version)\" = {shlex.quote('thegn ' + previous.version)}"))
         if previous is None:
             steps.append(_exec_step(runtime, container, "install", f"DEBIAN_FRONTEND=noninteractive apt-get install -y /rehearsal/{current.basename}"))
         else:
@@ -143,14 +146,14 @@ def _steps(runtime: str, container: str, kind: str, current: Package, previous: 
     else:
         if previous is not None:
             steps.append(_exec_step(runtime, container, "install-previous", f"dnf install -y /rehearsal/{previous.basename}"))
-            steps.append(_exec_step(runtime, container, "previous-version", f"thegn --version | grep -F -- {shlex.quote(previous.version)}"))
+            steps.append(_exec_step(runtime, container, "previous-version", f"test \"$(thegn --version)\" = {shlex.quote('thegn ' + previous.version)}"))
             steps.append(_exec_step(runtime, container, "upgrade-from-previous", f"dnf upgrade -y /rehearsal/{current.basename}"))
         else:
             steps.append(_exec_step(runtime, container, "install", f"dnf install -y /rehearsal/{current.basename}"))
     steps.extend(
         [
-            _exec_step(runtime, container, "version", f"thegn --version | grep -F -- {shlex.quote(current.version)}"),
-            _exec_step(runtime, container, "tg-version", f"tg --version | grep -F -- {shlex.quote(current.version)}"),
+            _exec_step(runtime, container, "version", f"test \"$(thegn --version)\" = {shlex.quote('thegn ' + current.version)}"),
+            _exec_step(runtime, container, "tg-version", f"test \"$(tg --version)\" = {shlex.quote('thegn ' + current.version)}"),
             _exec_step(runtime, container, "tg-symlink", "test -L /usr/bin/tg"),
             _exec_step(runtime, container, "licenses", "test -f /usr/share/licenses/thegn/LICENSE-MIT && test -f /usr/share/licenses/thegn/LICENSE-APACHE"),
             _exec_step(runtime, container, "doctor", "HOME=/tmp/rehearsal-home thegn doctor --json >/dev/null"),
@@ -161,8 +164,7 @@ def _steps(runtime: str, container: str, kind: str, current: Package, previous: 
     return steps
 
 
-def plan(args: argparse.Namespace) -> list[Leg]:
-    packages, _ = _validated_packages(args)
+def plan(args: argparse.Namespace, packages: list[Package]) -> list[Leg]:
     runtime = args.runtime
     legs: list[Leg] = []
     for kind, new_attr, old_attr, images_attr in (
@@ -214,59 +216,88 @@ def _run(argv: list[str], timeout: float) -> StepResult:
         return StepResult(127, b"", str(error).encode(), int((time.monotonic() - started) * 1000))
 
 
-def run_rehearsal(args: argparse.Namespace, runner: Callable[[list[str], float], StepResult]) -> Evidence:
-    packages, _ = _validated_packages(args)
-    legs = plan(args)
+def run_rehearsal(
+    args: argparse.Namespace,
+    runner: Callable[[list[str], float], StepResult],
+    packages: list[Package],
+) -> Evidence:
+    legs = plan(args, packages)
     runtime = args.runtime
-    runtime_result = runner([runtime, "--version"], args.step_timeout)
+    try:
+        runtime_result = runner([runtime, "--version"], args.step_timeout)
+    except KeyboardInterrupt:
+        return Evidence(runtime, "", packages, legs, False, interrupted=True)
     runtime_version = _tail(runtime_result.stdout)
     overall = runtime_result.rc == 0 and not runtime_result.timed_out
+    interrupted = False
     for leg in legs:
         leg_passed = True
-        result = runner(leg.pull_argv, args.step_timeout)
-        leg.results.append(_result_record("pull", leg.pull_argv, result))
-        if result.rc != 0 or result.timed_out:
-            leg_passed = False
-        else:
-            result = runner(leg.digest_argv, args.step_timeout)
-            leg.results.append(_result_record("digest", leg.digest_argv, result))
-            if result.rc == 0 and not result.timed_out:
-                try:
-                    digests = json.loads(_tail(result.stdout))
-                    leg.image_digests = digests if isinstance(digests, list) else None
-                except json.JSONDecodeError:
-                    leg.image_digests = None
-                if not leg.image_digests:
-                    leg_passed = False
+        try:
+            result = runner(leg.pull_argv, args.step_timeout)
+            leg.results.append(_result_record("pull", leg.pull_argv, result))
+            if result.rc != 0 or result.timed_out:
+                leg_passed = False
             else:
-                leg_passed = False
-        if not any(item["name"] == "digest" for item in leg.results):
-            leg.results.append(_skipped_record("digest", leg.digest_argv))
-        if not leg_passed:
-            leg.results.append(_skipped_record("start", leg.start_argv))
-            leg.results.extend(_skipped_record(step.name, step.argv) for step in leg.steps)
-        if leg_passed:
-            start = runner(leg.start_argv, args.step_timeout)
-            leg.results.append(_result_record("start", leg.start_argv, start))
-            if start.rc != 0 or start.timed_out:
-                leg_passed = False
-                leg.results.extend(_skipped_record(step.name, step.argv) for step in leg.steps)
-        if leg_passed:
-            for index, step in enumerate(leg.steps):
-                result = runner(step.argv, args.step_timeout)
-                leg.results.append(_result_record(step.name, step.argv, result))
-                if result.rc != 0 or result.timed_out:
+                result = runner(leg.digest_argv, args.step_timeout)
+                leg.results.append(_result_record("digest", leg.digest_argv, result))
+                if result.rc == 0 and not result.timed_out:
+                    try:
+                        digests = json.loads(_tail(result.stdout))
+                        leg.image_digests = digests if isinstance(digests, list) else None
+                    except json.JSONDecodeError:
+                        leg.image_digests = None
+                    if not leg.image_digests:
+                        leg_passed = False
+                else:
                     leg_passed = False
-                    for skipped in leg.steps[index + 1 :]:
-                        leg.results.append(_skipped_record(skipped.name, skipped.argv))
-                    break
-        result = runner(leg.remove_argv, args.step_timeout)
-        leg.results.append(_result_record("remove-container", leg.remove_argv, result))
-        if result.rc != 0 or result.timed_out:
+            if not any(item["name"] == "digest" for item in leg.results):
+                leg.results.append(_skipped_record("digest", leg.digest_argv))
+            if not leg_passed:
+                leg.results.append(_skipped_record("start", leg.start_argv))
+                leg.results.extend(_skipped_record(step.name, step.argv) for step in leg.steps)
+            if leg_passed:
+                try:
+                    start = runner(leg.start_argv, args.step_timeout)
+                    leg.results.append(_result_record("start", leg.start_argv, start))
+                    if start.rc != 0 or start.timed_out:
+                        leg_passed = False
+                        leg.results.extend(_skipped_record(step.name, step.argv) for step in leg.steps)
+                    if leg_passed:
+                        for index, step in enumerate(leg.steps):
+                            result = runner(step.argv, args.step_timeout)
+                            leg.results.append(_result_record(step.name, step.argv, result))
+                            if result.rc != 0 or result.timed_out:
+                                leg_passed = False
+                                for skipped in leg.steps[index + 1 :]:
+                                    leg.results.append(_skipped_record(skipped.name, skipped.argv))
+                                break
+                except KeyboardInterrupt:
+                    interrupted = True
+                    leg_passed = False
+                finally:
+                    try:
+                        result = runner(leg.remove_argv, args.step_timeout)
+                        leg.results.append(_result_record("remove-container", leg.remove_argv, result))
+                        if result.rc != 0 or result.timed_out:
+                            leg_passed = False
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        leg.results.append(_skipped_record("remove-container", leg.remove_argv))
+        except KeyboardInterrupt:
+            interrupted = True
             leg_passed = False
+            if not any(item["name"] == "pull" for item in leg.results):
+                leg.results.append(_skipped_record("pull", leg.pull_argv))
+            if not any(item["name"] == "digest" for item in leg.results):
+                leg.results.append(_skipped_record("digest", leg.digest_argv))
+            if not any(item["name"] == "start" for item in leg.results):
+                leg.results.append(_skipped_record("start", leg.start_argv))
+            leg.results.extend(_skipped_record(step.name, step.argv) for step in leg.steps)
         leg.passed = leg_passed
         overall = overall and leg_passed
-    return Evidence(runtime, runtime_version, packages, legs, overall)
+        if interrupted:
+            break
+    return Evidence(runtime, runtime_version, packages, legs, overall, interrupted=interrupted)
 
 
 def _result_record(name: str, argv: list[str], result: StepResult) -> dict[str, object]:
@@ -288,6 +319,7 @@ def _write_evidence(evidence: Evidence, directory: Path, version: str) -> None:
         "runtime_version": evidence.runtime_version,
         "packages": [{"basename": package.basename, "version": package.version, "sha256": package.sha256} for package in evidence.packages],
         "passed": evidence.passed,
+        "interrupted": evidence.interrupted,
         "legs": [{"image": leg.image, "image_digests": leg.image_digests, "passed": leg.passed, "steps": leg.results} for leg in evidence.legs],
     }
     descriptor = os.open(json_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -327,24 +359,26 @@ def main(argv: list[str] | None = None) -> int:
     args.deb_images = args.deb_images or list(DEB_IMAGES)
     args.rpm_images = args.rpm_images or list(RPM_IMAGES)
     try:
-        _validated_packages(args)
+        packages, version = _validated_packages(args)
         if not args.dry_run and args.evidence_dir is None:
             raise RehearsalError("--evidence-dir is required unless --dry-run is used")
         if args.step_timeout <= 0:
             raise RehearsalError("--step-timeout must be greater than zero")
         runtime = args.runtime or next((name for name in ("podman", "docker") if shutil.which(name)), None)
-        if runtime is None:
+        if runtime is None and args.dry_run:
+            runtime = "podman"
+            print("note: no container runtime found; using podman as the dry-run placeholder", file=sys.stderr)
+        elif runtime is None:
             raise RehearsalError("no container runtime (podman or docker) on PATH")
         args.runtime = runtime
-        legs = plan(args)
+        legs = plan(args, packages)
         if args.dry_run:
             for leg in legs:
                 commands = [leg.pull_argv, leg.digest_argv, leg.start_argv, *[step.argv for step in leg.steps], leg.remove_argv]
                 for command in commands:
                     print(shlex.join(command))
             return 0
-        evidence = run_rehearsal(args, _run)
-        _, version = _validated_packages(args)
+        evidence = run_rehearsal(args, _run, packages)
         _write_evidence(evidence, args.evidence_dir, version)
         print(f"evidence: {evidence.json_path}")
         print(f"summary: {evidence.markdown_path}")
