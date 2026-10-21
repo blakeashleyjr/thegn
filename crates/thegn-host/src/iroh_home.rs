@@ -22,6 +22,7 @@ const SECRET_ACCOUNT: &str = "iroh-home-node";
 
 static HOME: OnceLock<Arc<IrohHome>> = OnceLock::new();
 static STARTING: AtomicBool = AtomicBool::new(false);
+static WARNED_NOT_BUILT: AtomicBool = AtomicBool::new(false);
 
 /// Whether the iroh call-home reach is enabled. Opt-in (`THEGN_IROH=1`) until
 /// a config field replaces the env toggle.
@@ -54,24 +55,24 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
 
 /// Load the stable home secret key from the keyring, generating + persisting one
 /// on first use so the EndpointId is stable across restarts.
-fn secret_key() -> iroh::SecretKey {
+fn secret_key() -> [u8; 32] {
     if let Some(hex) = crate::secret::resolve(&format!("keyring:{SECRET_ACCOUNT}"))
         && let Some(bytes) = decode_hex32(&hex)
     {
-        return iroh::SecretKey::from_bytes(&bytes);
+        return bytes;
     }
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("csprng for iroh home key");
     // best-effort: a keyring failure just means an ephemeral id this session.
     let _ = crate::secret::store(SECRET_ACCOUNT, &encode_hex(&bytes));
-    iroh::SecretKey::from_bytes(&bytes)
+    bytes
 }
 
 /// The stable home EndpointId string — the value injected as `THEGN_HOME_NODE`.
 /// Derived synchronously from the persisted secret so provisioning can inject it
 /// before the endpoint has finished binding.
-pub(crate) fn home_node_id() -> String {
-    secret_key().public().to_string()
+pub(crate) fn home_node_id() -> Option<String> {
+    thegn_svc::iroh_reach::endpoint_id_for_secret(&secret_key()).ok()
 }
 
 /// Ensure the home endpoint is bound + accepting (idempotent, fire-and-forget).
@@ -133,10 +134,19 @@ pub(crate) fn injection_for(sandbox: &str) -> Option<thegn_svc::fly::IrohInject>
     if !enabled() {
         return None;
     }
+    if !thegn_svc::iroh_reach::BUILT {
+        if !WARNED_NOT_BUILT.swap(true, Ordering::SeqCst) {
+            thegn_core::msg::warn(
+                "THEGN_IROH is set but this thegn was built without the `iroh` feature; using the ssh path",
+            );
+        }
+        return None;
+    }
+    let home_node = home_node_id()?;
     ensure_started();
     let token = mint_token(sandbox)?;
     Some(thegn_svc::fly::IrohInject {
-        home_node: home_node_id(),
+        home_node,
         sandbox_auth: token,
         sandbox_id: sandbox.to_string(),
     })
@@ -154,5 +164,15 @@ mod tests {
         }
         assert_eq!(decode_hex32(&encode_hex(&b)), Some(b));
         assert_eq!(decode_hex32("short"), None);
+    }
+
+    #[test]
+    fn injection_is_none_when_not_built() {
+        if thegn_svc::iroh_reach::BUILT {
+            return;
+        }
+        let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_IROH", "1")]);
+        assert!(injection_for("wt").is_none());
+        assert!(WARNED_NOT_BUILT.load(Ordering::SeqCst));
     }
 }

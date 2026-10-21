@@ -213,6 +213,9 @@ each other. Reattach reuses a still-valid installed credential so an existing
 pane keeps working; endpoint changes, expiry, or a binding mismatch rotate it
 atomically. Recycling/destruction and SSH worktree deletion revoke the token
 before owner metadata disappears. The host persists only the token hash.
+An installed route credential is reused only while it has at least seven days
+remaining; otherwise it is rotated. SSH reads are capped and time-limited, and
+oversized or malformed credential files are refused.
 
 Route mode requires a live `thegn serve` TCP registration and a declared
 confidential topology: `[serve] topology = "tls-terminated"` behind a loopback
@@ -375,3 +378,7 @@ notices, while bookkeeping or persistence failures create inbox-only
 desktop notifications, toasts, sound, and push. The CLI `thegn merge drain`
 records the same inbox notices. An unread notice for the same row and state
 suppresses a repeat, including after a restart.
+
+A stored queue status thegn does not recognise appears as a red hold naming the
+raw status and counts as needing human attention; status writers refuse unknown
+values.

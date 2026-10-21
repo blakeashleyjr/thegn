@@ -54,6 +54,7 @@ fn spec(backend: Backend) -> SandboxSpec {
         oci_runtime: None,
         daemon_persistent: false,
         seal_home: None,
+        volume_owners: Vec::new(),
     }
 }
 

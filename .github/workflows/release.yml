@@ -199,6 +199,8 @@ jobs:
           target: ${{ matrix.target }}
           # The binary lives in the thegn-host crate.
           manifest-path: crates/thegn-host/Cargo.toml
+          # Release binaries include the optional call-home transport (THE-672).
+          features: iroh
           archive: thegn-$tag-$target
           # Both licenses and the README are included. Keep the binary at the archive
           # root: the Homebrew formula installs it with `bin.install "thegn"`.

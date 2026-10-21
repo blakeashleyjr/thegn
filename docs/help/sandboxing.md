@@ -24,11 +24,13 @@ per repo via a `.thegn.toml` overlay, or per run with
 | Profile         | What it does                                                                                                                                                                                                |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `open`          | no hardening — the escape hatch                                                                                                                                                                             |
-| `hardened`      | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact                                                                                                              |
+| `standard`      | **default.** read-only root, no-new-privileges, a process cap; network and capabilities intact                                                                                                              |
 | `sealed`        | full lockdown: `network=none`, drop ALL caps, tighter pids cap. For untrusted work                                                                                                                          |
 | `sealed-tunnel` | `sealed` plus a `[sandbox.vpn]` tunnel as the only route. **Refuses to launch while a VPN is configured**: thegn cannot yet enforce that the tunnel is the only route. With no VPN it behaves like `sealed` |
 
-Under `hardened`, **everything outside the worktree is read-only —
+`hardened` is accepted as an alias for `standard` in existing configuration.
+
+Under `standard`, **everything outside the worktree is read-only —
 including your `$HOME`**, so a sandboxed agent cannot `cd` out and modify
 host files. That is _integrity_ isolation only: the whole `$HOME` stays
 **readable**, credentials included (`~/.ssh`, `~/.aws`, `~/.gnupg`,
@@ -167,7 +169,7 @@ dirs (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, or the `~/.claude` / `~/.codex` defaul
 every non-sealed pane, so an agent CLI you run by hand can persist its
 state instead of dying on a read-only filesystem.
 
-> `~/.keychain` is carved writable for `hardened` panes but **not** for
+> `~/.keychain` is carved writable for `standard` panes but **not** for
 > `sealed` ones: it holds scripts your host login shells later _source_,
 > so a writable copy from a sealed sandbox would be a persistence vector.
 
@@ -260,7 +262,13 @@ by default for sandboxes, devcontainer `${localEnv:}` substitutions and
 provider placements. Only infrastructure names such as `PATH`, `HOME`,
 `TERM` and `LANG`, `LC_*`, `THEGN_*`, and names in
 `[profiles.<name>.sandbox] env_passthrough` are shared; that profile list
-replaces `[sandbox] env_passthrough`. The default profile is unchanged.
+replaces `[sandbox] env_passthrough`. At startup, the thegn process also unsets
+known credential environment families, keeping `SSH_AUTH_SOCK` only when the
+profile has `ssh/id`. Its git, gh and GnuPG directories are mounted read-only in
+sandboxes; a pane that needs to write them, such as `gh auth login` or GnuPG
+signing, needs an explicit `[sandbox] mounts` grant. Startup refuses if the
+profile state or credential directories cannot be created. The default profile
+is unchanged.
 `thegn doctor` lists denied and shared names, never values. The share list is
 read at startup.
 
@@ -280,6 +288,11 @@ hooks, and in-container feature installs. `overrideFeatureInstallOrder` is
 honored; fetched `installsAfter`/`dependsOn` metadata ordering, generated
 Dockerfile feature layers, and `devcontainer.metadata` image-label merging are
 reserved.
+
+The image thegn builds for a devcontainer `build` is tagged from the build
+declaration and Dockerfile contents, so changing the Dockerfile rebuilds it on
+the next launch. If the Dockerfile cannot be read for hashing, thegn warns and
+uses the declaration alone for the tag.
 
 ### Lifecycle and provider fallback
 
@@ -389,9 +402,17 @@ tier). A repo-root `.thegn.toml` may only **raise** the floor, never lower it.
 With `agent_sandbox` on, a queue agent is held to at least the `[sandbox]`
 isolation floor in force (default: shared-kernel, refusing on a miss). The
 queue floor (`agent_isolation_floor`) can raise that requirement, but
-`degrade` cannot weaken it. A fail-closed miss holds the entry as an
-infrastructure failure and never marks the branch failed. Opt out with
-`[sandbox] isolation_floor = "off"` or `agent_sandbox = false`.
+`degrade` cannot weaken it. With `agent_sandbox = false`, a fail-closed floor
+still holds the entry as an infrastructure failure and never marks the branch
+failed. Set `[sandbox] isolation_floor = "off"` or disable the sandbox to run
+queue agents uncontained.
+
+Queue agents (merge and PR fixers, CI autofix, headless review and review
+tasks) run credential-free, like autopilot: their environment and their
+sandbox's `env_passthrough` drop token, key, password, secret, agent-socket and
+GPG-agent variables. With `agent_sandbox` on, a queue agent whose sandbox
+cannot be established is held; it never falls back to the host. Interactive
+panes are unchanged.
 
 ## Choosing per worktree
 
@@ -428,7 +449,7 @@ plain rustc.
 
 ## Network
 
-By default a `hardened` sandbox keeps networking so fetch, clone, build,
+By default a `standard` sandbox keeps networking so fetch, clone, build,
 and debuggers work; `sealed` removes it entirely. `[sandbox]` also
 carries DNS-name allow/block rules for the middle ground. These rules are not
 an egress boundary; `network = "none"` is the only enforced deny, and `*` in
@@ -479,6 +500,12 @@ tools. A `(mise ~)` token means approval is pending, while `(mise !)` means
 the provider or shims are unavailable. Remote worktrees remain responsible
 for installing their tools on the remote target.
 
+Cached flake devShell injection (`[sandbox] inject_devshell`) is off by
+default. Turn it on in your own config (globally, per project or per
+environment), or approve a repository's `.thegn.toml` request with
+`thegn repo trust . --approve <id>`; an unapproved request is listed as pending
+and changes nothing.
+
 ## Lifecycle hooks and pane setup
 
 `[hooks]` commands are host-side worktree/session lifecycle jobs. They run
@@ -515,6 +542,9 @@ the remote worktree sync plan before uploading anything. A provider sandbox's
 network policy is applied and read back before its first command; a mismatch
 stops provisioning. If an existing sandbox's policy cannot be verified, thegn
 refuses to provision it and leaves it in place.
+A provider launch using `sealed-tunnel` with a VPN configured is refused before
+provisioning; if a refused launch created its provider sandbox, thegn destroys
+that sandbox.
 
 ## Inspecting
 

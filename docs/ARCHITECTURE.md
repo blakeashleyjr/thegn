@@ -33,6 +33,10 @@ the owner crates listed in `crates/thegn-core/tests/crate_boundaries.rs`.
 `vt100` and `russh` are banned outright (`deny.toml`) — both are names from
 plans that never landed.
 
+`thegn-core` may depend on the `thegn-proc` leaf for bounded process
+supervision; it has no core dependency. This is the one sanctioned core-to-leaf
+edge besides `thegn-media`, pinned in `crate_boundaries.rs`.
+
 **Gate:** `crate_boundaries.rs` (`just test`), `cargo deny check bans`
 (`just deps-audit`).
 

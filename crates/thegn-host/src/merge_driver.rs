@@ -588,71 +588,89 @@ fn drive_queue_with(
                 break 'items;
             }
         };
-        let claim = if let Some(repo) = registered_repo.as_deref() {
-            if fresh.branch != item.branch || fresh.location != item.location {
-                out.warnings.push(format!(
-                    "{}: not admitted (queue identity changed since listing); skipped",
-                    item.branch
-                ));
-                continue;
-            }
-            if !matches!(
-                fresh.status.as_str(),
-                "queued"
-                    | "deferred"
-                    | "gate_failed"
-                    | "gate_error"
-                    | "needs_human"
-                    | "ready"
-                    | "agent_blocked"
-            ) {
-                let active_claim = db.observe_merge_claim(&item.worktree);
-                match active_claim {
-                    Ok(Some(view))
-                        if view.phase != "unclaimed"
-                            && view.lease_until_ms.is_some_and(|until| until > util::now_ms()) =>
-                    {
-                        out.warnings.push(format!(
-                            "{}: claimed by another drain (generation {}, until {}); skipped",
-                            item.branch,
-                            view.generation,
-                            view.lease_until_ms.unwrap_or_default()
-                        ));
-                    }
-                    Ok(_) => out.warnings.push(format!(
-                        "{}: {} row is not claimable (stale in-progress state from an earlier drain?); remove and re-add it",
-                        item.branch, fresh.status
-                    )),
-                    Err(error) => {
-                        out.persistence_errors.push(format!(
-                            "{}: could not observe merge claim: {error}",
-                            item.worktree
-                        ));
-                        break 'items;
-                    }
-                }
-                continue;
-            }
-            match claim::RowClaim::admit(db, &item, repo, &fresh.status, &fresh.target_branch) {
-                Ok(claim::Admission::Claimed(claim)) => Some(claim),
-                Ok(
-                    claim::Admission::HeldElsewhere(warning)
-                    | claim::Admission::NotAdmitted(warning),
-                ) => {
-                    out.warnings.push(warning);
+        let (claim_repo, unregistered) = match registered_repo.as_deref() {
+            Some(repo) => (repo.to_owned(), false),
+            None => match verify_fixer_checkout(repo_root, &item.worktree, &item.branch, None) {
+                Ok(()) => (repo_root.to_string_lossy().into_owned(), true),
+                Err(reason) => {
+                    out.warnings.push(format!(
+                        "{}: unregistered queue row is not attributable to this repository ({reason}); skipped",
+                        item.branch
+                    ));
                     continue;
                 }
+            },
+        };
+        if fresh.branch != item.branch || fresh.location != item.location {
+            out.warnings.push(format!(
+                "{}: not admitted (queue identity changed since listing); skipped",
+                item.branch
+            ));
+            continue;
+        }
+        if !matches!(
+            fresh.status.as_str(),
+            "queued"
+                | "deferred"
+                | "gate_failed"
+                | "gate_error"
+                | "needs_human"
+                | "ready"
+                | "agent_blocked"
+        ) {
+            let active_claim = db.observe_merge_claim(&item.worktree);
+            match active_claim {
+                Ok(Some(view))
+                    if view.phase != "unclaimed"
+                        && view.lease_until_ms.is_some_and(|until| until > util::now_ms()) =>
+                {
+                    out.warnings.push(format!(
+                        "{}: claimed by another drain (generation {}, until {}); skipped",
+                        item.branch,
+                        view.generation,
+                        view.lease_until_ms.unwrap_or_default()
+                    ));
+                }
+                Ok(_) => out.warnings.push(format!(
+                    "{}: {} row is not claimable (stale in-progress state from an earlier drain?); remove and re-add it",
+                    item.branch, fresh.status
+                )),
                 Err(error) => {
                     out.persistence_errors.push(format!(
-                        "{}: could not claim merge row: {error}",
+                        "{}: could not observe merge claim: {error}",
                         item.worktree
                     ));
                     break 'items;
                 }
             }
+            continue;
+        }
+        let admission = if unregistered {
+            claim::RowClaim::admit_unregistered(
+                db,
+                &item,
+                &claim_repo,
+                &fresh.status,
+                &fresh.target_branch,
+            )
         } else {
-            tracing::debug!(target: "thegn::merge", worktree = item.worktree, "draining unregistered local row without merge claim fencing");
-            None
+            claim::RowClaim::admit(db, &item, &claim_repo, &fresh.status, &fresh.target_branch)
+        };
+        let claim = match admission {
+            Ok(claim::Admission::Claimed(claim)) => Some(claim),
+            Ok(
+                claim::Admission::HeldElsewhere(warning) | claim::Admission::NotAdmitted(warning),
+            ) => {
+                out.warnings.push(warning);
+                continue;
+            }
+            Err(error) => {
+                out.persistence_errors.push(format!(
+                    "{}: could not claim merge row: {error}",
+                    item.worktree
+                ));
+                break 'items;
+            }
         };
         let claim = std::cell::RefCell::new(claim);
         let write_error = std::cell::RefCell::new(None::<String>);
@@ -1024,7 +1042,7 @@ fn drive_queue_with(
                     out.agent_blocked.push(item.branch.clone());
                     break;
                 }
-                // Opt-in isolation floor for the handoff (default: host + slice).
+                // Enforce the in-force isolation floor before the handoff.
                 // Gate BEFORE consuming an attempt: a fail-closed miss, or an
                 // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
                 // failure — hold the entry and NEVER blame the branch.
@@ -1086,10 +1104,11 @@ fn drive_queue_with(
                                 ));
                                 break 'attempt;
                             }
-                            out.persistence_errors.push(format!(
-                                "{}: could not reserve agent attempt: {error}",
-                                item.worktree
-                            ));
+                            let detail = format!("could not reserve agent attempt: {error}");
+                            out.persistence_errors
+                                .push(format!("{}: {detail}", item.worktree));
+                            set(db, MqStatus::GateError, None, Some(&detail));
+                            stop_on_write_error!('attempt);
                             stop_drain.set(true);
                             break 'attempt;
                         }
@@ -1289,7 +1308,7 @@ fn run_agent(
         vars: &vars,
         timeout_secs: cfg.agent_timeout_secs,
         sandbox,
-        credential_free: false,
+        credential_free: true,
     })
 }
 
@@ -1384,6 +1403,16 @@ fn tail_line(log: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uncontained_config() -> Config {
+        Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
+                ..thegn_core::config::SandboxConfig::default()
+            },
+            ..Config::default()
+        }
+    }
 
     #[test]
     fn candidate_drift_table() {
@@ -1802,6 +1831,15 @@ mod tests {
             let (_fixture, root, feat_wt) = conflicting_repo("identity-hold");
             let sentinel = root.join("wrong-checkout-was-written");
             let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
             let queued = item(&db, &feat_wt);
             git(&feat_wt, &["switch", "-q", "-c", "other"]);
 
@@ -1928,7 +1966,7 @@ mod tests {
             let queued = item(&db, &feat_wt);
             let out_ = drive_queue(
                 &cfg(agent, 2),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
@@ -1952,7 +1990,7 @@ mod tests {
             let queued = item(&db, &feat_wt);
             let out_ = drive_queue(
                 &cfg("true", 1),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
@@ -2074,6 +2112,15 @@ mod tests {
             let (_fixture, root, feat_wt) = conflicting_repo("deleted-branch");
             let main_before = out(&root, &["rev-parse", "main"]);
             let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
             let queued = bound_item(&db, &feat_wt);
             git(&feat_wt, &["checkout", "-q", "--detach"]);
             git(&root, &["branch", "-D", "feat"]);
@@ -2103,7 +2150,7 @@ mod tests {
             let queued = bound_item(&db, &feat_wt);
             let outcome = drive_queue(
                 &cfg(FIXER, 2),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
@@ -2213,7 +2260,7 @@ mod tests {
             let mut statuses = Vec::new();
             let outcome = drive_queue(
                 &cfg(&fixer, 2),
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![queued],
@@ -2275,6 +2322,15 @@ mod tests {
             let (_fixture, root, feat_wt) = clean_repo("cancelled-drain");
             let db = Db::open_memory().unwrap();
             let first = item(&db, &feat_wt);
+            db.put_worktree(
+                "second",
+                root.to_str().unwrap(),
+                "/queued/second",
+                "second",
+                None,
+                None,
+            )
+            .unwrap();
             db.enqueue_merge("/queued/second", "second", "main")
                 .unwrap();
             let second = QueueItem {
@@ -2309,6 +2365,15 @@ mod tests {
             let (_fixture, root, feat_wt) = clean_repo("cancelled-drain-gate");
             let db = Db::open_memory().unwrap();
             let queued = item(&db, &feat_wt);
+            db.put_worktree(
+                "second",
+                root.to_str().unwrap(),
+                "/queued/second",
+                "second",
+                None,
+                None,
+            )
+            .unwrap();
             db.enqueue_merge("/queued/second", "second", "main")
                 .unwrap();
             let later = QueueItem {
@@ -2403,6 +2468,7 @@ mod tests {
                     drawer_scope: None,
                     drawer_cwd: None,
                 }],
+                sandbox: uncontained_config().sandbox,
                 ..Config::default()
             };
             // `agent_command` empty — resolution must come from `agent`.
@@ -2431,7 +2497,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &mq,
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![item(&db, &feat_wt)],
@@ -2458,7 +2524,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &mq,
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![item(&db, &feat_wt)],
@@ -2483,7 +2549,7 @@ mod tests {
             let db = Db::open_memory().unwrap();
             let out_ = drive_queue(
                 &mq,
-                &Config::default(),
+                &uncontained_config(),
                 &root,
                 &db,
                 vec![item(&db, &feat_wt)],
@@ -2491,6 +2557,89 @@ mod tests {
             );
             assert_eq!(out_.needs_human, ["feat"]);
             assert!(out_.landed.is_empty());
+        }
+
+        #[test]
+        fn unregistered_worktree_is_claimed_while_draining() {
+            let (_fixture, root, feat_wt) = clean_repo("unregistered-claim");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            let observed_worktree = queued.worktree.clone();
+            let outcome = drive_queue_with(
+                &cfg("", 1),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+                DriveActions {
+                    attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
+                        let view = db.observe_merge_claim(&observed_worktree)?.unwrap();
+                        assert_ne!(view.phase, "unclaimed");
+                        assert!(
+                            view.lease_until_ms
+                                .is_some_and(|until| until > util::now_ms())
+                        );
+                        Ok(AttemptOutcome::Ready { tip: "tip".into() })
+                    },
+                    floor: |_: &str| panic!("notify-only"),
+                    runner:
+                        |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| false,
+                },
+            );
+
+            assert_eq!(outcome.ready, ["feat"]);
+            assert_eq!(
+                db.observe_merge_claim(&observed_worktree)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                "unclaimed"
+            );
+        }
+
+        #[test]
+        fn unregistered_worktree_on_another_branch_is_skipped() {
+            let (_fixture, root, feat_wt) = clean_repo("unregistered-wrong-branch");
+            git(&feat_wt, &["checkout", "-q", "-b", "other"]);
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            let worktree = queued.worktree.clone();
+            let outcome = drive_queue_with(
+                &cfg("", 1),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+                DriveActions {
+                    attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
+                        panic!("unattributable row must not be attempted")
+                    },
+                    floor: |_: &str| panic!("notify-only"),
+                    runner:
+                        |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| false,
+                },
+            );
+
+            assert_eq!(outcome.warnings.len(), 1);
+            assert!(outcome.warnings[0].contains("refs/heads/feat"));
+            assert!(outcome.warnings[0].contains("not attributable"));
+            assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+            assert_eq!(
+                db.observe_merge_claim(&worktree).unwrap().unwrap().phase,
+                "unclaimed"
+            );
         }
     }
 }

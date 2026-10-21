@@ -469,7 +469,7 @@ config_enum! {
     /// workspace/repo via the `.thegn.toml` overlay, or `THEGN_SANDBOX_PROFILE`.
     ///
     /// - `open`     — no hardening; reproduces pre-preset behavior (back-compat).
-    /// - `hardened` — read-only root + no-new-privileges + pids cap; networking
+    /// - `standard` — read-only root + no-new-privileges + pids cap; networking
     ///                and capabilities left intact so interactive dev (fetch,
     ///                debuggers, ping) keeps working. The default.
     /// - `sealed`   — full lockdown: `network=none`, read-only root, drop ALL
@@ -479,7 +479,8 @@ config_enum! {
     ///                no VPN configured it behaves exactly like `sealed`.
     pub enum SandboxProfile: "sandbox profile" {
         Open = "open" | "off" | "none",
-        Hardened = "hardened" | "guarded",
+        // Spelled `standard` (THE-419); `hardened`/`guarded` are accepted aliases.
+        Hardened = "standard" | "hardened" | "guarded",
         Sealed = "sealed" | "locked" | "isolated",
         SealedTunnel = "sealed-tunnel" | "tunnel-only" | "vpn-only",
     } default = Hardened;
@@ -582,7 +583,7 @@ impl SandboxProfile {
         }
     }
     /// Linux capabilities to drop. `sealed`/`sealed-tunnel` drop everything;
-    /// `hardened` leaves the runtime's defaults so debuggers (ptrace), `ping`
+    /// `standard` leaves the runtime's defaults so debuggers (ptrace), `ping`
     /// (NET_RAW), and low-port binds keep working. Under `sealed-tunnel` the
     /// worktree still drops ALL caps — the tunnel's NET_ADMIN/TUN live in the
     /// VPN sidecar, never in the worktree container.
@@ -618,12 +619,12 @@ impl SandboxProfile {
     /// all, have no route to the session bus / Secret Service). A "sealed" pane
     /// that also carried the user's agent socket would contradict the tier's
     /// promise. Explicit `env_passthrough` re-adds it; `thegn doctor` flags it.
-    /// `hardened`/`open` keep whatever `env_passthrough` names.
+    /// `standard`/`open` keep whatever `env_passthrough` names.
     pub fn seals_agent_socket(self) -> bool {
         matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
     }
     /// Whether this profile hides the host `$HOME` (THE-215): sealed tiers get a
-    /// private tmpfs `$HOME` holding only an allowlist; `hardened` keeps the
+    /// private tmpfs `$HOME` holding only an allowlist; `standard` keeps the
     /// read-only ambient view (integrity, not confidentiality); `open` is
     /// writable. Confidentiality is a property of the sealed tiers alone.
     pub fn hides_home(self) -> bool {
@@ -909,15 +910,18 @@ pub struct MergeQueueConfig {
     /// Watchdog (seconds) for one agent invocation. 0 means the 6-hour ceiling, not unbounded; values over 30 days clamp to 30 days. After the agent process exits, its leftover group members get 15 s before being terminated.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: u64,
-    /// Opt in to running the fixing agent INSIDE the resolved sandbox (the
-    /// default is host + the shared resource slice, unchanged — a sandboxed
-    /// agent loses host credentials/keychains). See [`Self::agent_isolation_floor`].
+    /// Opt in to running the fixing agent INSIDE the resolved sandbox. When
+    /// false, the `[sandbox]` floor still applies: fail-closed floors hold,
+    /// explicit degrade floors label host runs, and an off floor permits them.
+    /// A sandboxed agent loses host credentials/keychains. See
+    /// [`Self::agent_isolation_floor`].
     pub agent_sandbox: bool,
     /// Minimum honest isolation class the sandboxed agent task must enter (only
     /// meaningful with `agent_sandbox = true`). The queue floor can raise, but
     /// never weaken, the `[sandbox]` floor in force (default: shared-kernel,
-    /// refusing on a miss). Set `[sandbox].isolation_floor = "off"` or disable
-    /// `agent_sandbox` to run the agent uncontained. A fail-closed miss is an
+    /// refusing on a miss). With `agent_sandbox = false`, a fail-closed floor
+    /// holds the entry. Set `[sandbox].isolation_floor = "off"` or disable the
+    /// sandbox to run the agent uncontained. A fail-closed miss is an
     /// INFRASTRUCTURE failure — the entry is held, never the branch blamed.
     pub agent_isolation_floor: crate::config::IsolationFloor,
     /// What happens when `agent_isolation_floor` can't be met: `degrade`
@@ -4343,6 +4347,9 @@ pub struct SandboxConfig {
     /// image to `image` before create instead of pulling. See [`crate::sandbox_build`].
     #[serde(skip)]
     pub build: Option<crate::sandbox_build::SandboxBuild>,
+    /// devcontainer volume name -> owning devcontainer id; set by the overlay, never from TOML.
+    #[serde(skip)]
+    pub volume_owners: std::collections::BTreeMap<String, String>,
     pub env_passthrough: Vec<String>,
     /// Add common language build caches to `worktree_plus_caches` sandboxes.
     pub auto_caches: bool,
@@ -4362,9 +4369,10 @@ pub struct SandboxConfig {
     pub warm_direnv: WarmDirenv,
     pub devenv: bool, // wrap inner cmd with `devenv shell --`
     /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
-    /// exported vars) into worktree panes from an already-existing cache. A cold
-    /// cache is a no-op; this setting never evaluates a repository on the host.
-    /// See [`crate::devenv`].
+    /// exported vars) into worktree panes from an already-existing cache. Off
+    /// by default; opt in in user config or approve a repo's request with
+    /// `thegn repo trust . --approve <id>`. A cold cache is a no-op; this
+    /// setting never evaluates a repository on the host. See [`crate::devenv`].
     pub inject_devshell: bool,
     /// Which flake devShell attribute a sandbox/sprite enters, e.g. `"sandbox"`
     /// for a lean build-only shell (`.#devShells.sandbox`). Empty ⇒ `default`.
@@ -4455,6 +4463,7 @@ impl Default for SandboxConfig {
             volumes: std::collections::HashMap::new(),
             compose: None,
             build: None,
+            volume_owners: std::collections::BTreeMap::new(),
             env_passthrough: [
                 "SSH_AUTH_SOCK",
                 "GH_TOKEN",
@@ -4490,7 +4499,7 @@ impl Default for SandboxConfig {
             prepare: Vec::new(),
             warm_direnv: WarmDirenv::Off,
             devenv: false,
-            inject_devshell: true,
+            inject_devshell: false,
             devshell: String::new(),
             nix_daemon: false,
             shell: String::new(),

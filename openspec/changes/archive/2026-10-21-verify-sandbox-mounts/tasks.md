@@ -58,15 +58,17 @@
       said "move the worktree under /Users", which fixes nothing; it now points
       at existence and readability, and a test asserts the dead-end advice is
       absent.
-- [ ] 4.6 Docker Desktop (as distinct from colima) and `wsl.exe` phrasings are
+- [x] 4.6 Docker Desktop (as distinct from colima) and `wsl.exe` phrasings are
       still unmatched — no install here to observe. They fall through to the
       generic error, which is today's behaviour.
+      Excluded (owner decision 2026-10-20, THE-124): Docker Desktop and WSL binds are best-effort; their phrasings fall through to the generic error.
 
 ## 5. Gates
 
 - [x] 5.1 `cargo nextest run --workspace` (4928 passed).
 - [x] 5.2 `cargo fmt --all` + `cargo clippy --workspace --all-targets -D warnings`.
 - [x] 5.3 `just smoke`.
-- [ ] 5.4 `just ci` — blocked on a Mac: all muse e2e baselines are `__linux`
+- [x] 5.4 `just ci` — blocked on a Mac: all muse e2e baselines are `__linux`
       and `--ci` treats a missing baseline as failure (owned by the parallel
       muse effort). `coverage` needs `nix develop`.
+      Not a gate for the Linux-only alpha (owner decision 2026-10-20, THE-124); `just ci` runs on Linux.

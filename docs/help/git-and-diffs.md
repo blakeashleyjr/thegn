@@ -21,6 +21,11 @@ The changes view omits handoff artifacts under `.thegn/pipeline` and
 `.thegn/maintenance`; other `.thegn` files, including hooks, remain visible.
 `a` (stage all) still stages those omitted paths.
 
+If git status cannot be read, the changes section says `status unavailable` or
+`status unavailable, showing last known` while retaining its previous rows; it
+never reports `working tree clean`. The commits section can say `log unavailable`,
+and a merge can show `incoming files unavailable`.
+
 Binary and mode-only changes say so instead of showing hunks. `↵` on a file
 opens line-level staging at every width; at Normal width it widens to Half,
 and Esc retracts that drill. At Half, the inline preview follows the cursor.

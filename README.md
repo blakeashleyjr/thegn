@@ -1,6 +1,6 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.21`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.22`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon has build/test coverage and a generated
 > `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
 > it as best-effort, not supported: its CI job is opt-in and the interactive
@@ -392,7 +392,7 @@ path**, so host-side git reads (sidebar, panel, PR) keep working.
 - **Backends** (`[sandbox] backend`): `auto` walks `backend_chain` —
   `podman` (rootless, preferred) → `docker` → `bwrap` (lightweight, reuses
   host tools, no image) → host. `systemd`, `apple` (macOS `container`), and
-  `wsl` are also selectable. Hardening presets: `open` / `hardened` (default)
+  `wsl` are also selectable. Hardening presets: `open` / `standard` (default)
   / `sealed` (no network, read-only root, all caps dropped).
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and

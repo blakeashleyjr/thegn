@@ -368,6 +368,15 @@ pub trait WorktreeAuxStore {
     /// Atomically acquire one eligible queue row and its fencing generation.
     fn admit_merge_claim(&self, request: &MergeClaimRequest) -> Result<Option<MergeClaim>>;
 
+    /// Atomically acquire an eligible local queue row only when the worktree
+    /// registry has no row for it. The caller must first prove that the path
+    /// belongs to `repo_root` through Git (for example, `git worktree list`).
+    /// This is THE-220 slice b; it does not replace the registered admission.
+    fn admit_unregistered_local_merge_claim(
+        &self,
+        request: &MergeClaimRequest,
+    ) -> Result<Option<MergeClaim>>;
+
     /// Observe durable claim state without exposing its owner token.
     fn observe_merge_claim(&self, worktree: &str) -> Result<Option<MergeClaimView>>;
 

@@ -1161,6 +1161,7 @@ fn channel_json() -> serde_json::Value {
     serde_json::json!({
         "channel": channel.as_str(),
         "features": features,
+        "iroh_reach": if thegn_svc::iroh_reach::BUILT { "built" } else { "not built" },
     })
 }
 
@@ -1234,6 +1235,15 @@ fn channel_report() {
             }
         );
     }
+    outln!(
+        "  {:<13} {}",
+        "iroh reach",
+        if thegn_svc::iroh_reach::BUILT {
+            "built in (THEGN_IROH=1 enables it)"
+        } else {
+            "not built (release and Nix builds include it)"
+        }
+    );
     if matches!(channel, thegn_core::channel::Channel::Stable) {
         outln!("  note          experimental features need the dev build (`nix run .#dev`)");
         outln!("                or THEGN_CHANNEL=dev. GitHub PR/issue viewing stays available.");
@@ -4383,7 +4393,10 @@ fn floor_report(cfg: &Config) {
                 actual
             ),
             FloorDecision::BypassProvider => {
-                outln!("                provider-managed placement — floor out of scope")
+                outln!(
+                    "                {} — thegn does not enforce the floor on a provider placement",
+                    thegn_core::sandbox_floor::PROVIDER_UNVERIFIED
+                )
             }
             FloorDecision::Degrade(m) => {
                 outln!(
@@ -5741,5 +5754,21 @@ args = ["--verbose"]
         let default_report =
             sandbox_json_with(&default_cfg, Backend::Bwrap, IsolationClass::SharedKernel);
         assert!(default_report["network_rules"].is_null());
+    }
+
+    #[test]
+    fn iroh_reach_json_reports_the_build() {
+        let report = channel_json();
+        let expected = if thegn_svc::iroh_reach::BUILT {
+            "built"
+        } else {
+            "not built"
+        };
+        assert_eq!(report["iroh_reach"], expected);
+    }
+
+    #[test]
+    fn iroh_reach_json_key_is_present() {
+        assert!(channel_json().get("iroh_reach").is_some());
     }
 }

@@ -3,6 +3,8 @@
 //! the workspace's existing async reqwest driven from a store-owned
 //! current-thread runtime — the trait is synchronous and only ever called off
 //! the compositor loop (same shape as `agent::block_on_provider`).
+//! S3 uploads sign and send SSE-S3 (AES256) by default; compatible stores that
+//! reject it can opt out in `[lifecycle.snapshot]`.
 //!
 //! Object layout mirrors the fs backend under the configured key prefix:
 //! `<prefix>/<repo>/<worktree>/<env>/<id>/{manifest.json,bundle,patch,tar}`.
@@ -22,6 +24,8 @@ use super::SnapshotStore;
 /// Presigned-URL validity. Requests fire immediately after signing; this only
 /// needs to outlive one slow artifact upload.
 const SIGN_TTL: Duration = Duration::from_secs(600);
+const SSE_HEADER: &str = "x-amz-server-side-encryption";
+const SSE_AES256: &str = "AES256";
 /// One artifact transfer's HTTP budget.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -65,6 +69,7 @@ pub struct S3SnapshotStore {
     bucket: Bucket,
     creds: Credentials,
     prefix: String,
+    sse: bool,
     rt: tokio::runtime::Runtime,
     http: reqwest::Client,
 }
@@ -122,6 +127,7 @@ impl S3SnapshotStore {
             bucket,
             creds: Credentials::new(access, secret),
             prefix: cfg.prefix.trim_matches('/').to_string(),
+            sse: cfg.server_side_encryption,
             rt,
             http,
         })
@@ -146,17 +152,24 @@ impl S3SnapshotStore {
         }
     }
 
+    fn put_request(&self, object: &str, data: &[u8]) -> Result<reqwest::Request> {
+        let mut action = self.bucket.put_object(Some(&self.creds), object);
+        if self.sse {
+            action.headers_mut().insert(SSE_HEADER, SSE_AES256);
+        }
+        let url = action.sign(SIGN_TTL);
+        let mut request = self.http.put(url).body(data.to_vec());
+        if self.sse {
+            request = request.header(SSE_HEADER, SSE_AES256);
+        }
+        request.build().with_context(|| format!("PUT {object}"))
+    }
+
     fn put_bytes(&self, object: &str, data: &[u8]) -> Result<()> {
-        let url = self
-            .bucket
-            .put_object(Some(&self.creds), object)
-            .sign(SIGN_TTL);
-        let body = data.to_vec();
+        let request = self.put_request(object, data)?;
         self.rt.block_on(async {
             self.http
-                .put(url)
-                .body(body)
-                .send()
+                .execute(request)
                 .await
                 .with_context(|| format!("PUT {object}"))?
                 .error_for_status()
@@ -308,6 +321,53 @@ mod tests {
             worktree_slug: "wt".into(),
             env: "hetzner".into(),
         }
+    }
+
+    fn signed_headers(url: &reqwest::Url) -> Option<String> {
+        url.query_pairs()
+            .find_map(|(key, value)| (key == "X-Amz-SignedHeaders").then(|| value.into_owned()))
+    }
+
+    #[test]
+    fn put_signs_and_sends_sse_aes256_by_default() {
+        let s = S3SnapshotStore::new(&cfg("https://minio.local:9000"), &resolver).unwrap();
+        let request = s.put_request("thegn/x/bundle", b"data").unwrap();
+
+        assert!(
+            signed_headers(request.url())
+                .is_some_and(|headers| headers.split(';').any(|header| header == SSE_HEADER))
+        );
+        assert_eq!(
+            request.headers().get(SSE_HEADER).unwrap().to_str().unwrap(),
+            SSE_AES256
+        );
+    }
+
+    #[test]
+    fn put_without_sse_when_opted_out() {
+        let cfg = SnapshotStoreConfig {
+            server_side_encryption: false,
+            ..cfg("https://minio.local:9000")
+        };
+        let s = S3SnapshotStore::new(&cfg, &resolver).unwrap();
+        let request = s.put_request("thegn/x/bundle", b"data").unwrap();
+
+        assert!(
+            !signed_headers(request.url())
+                .is_some_and(|headers| { headers.split(';').any(|header| header == SSE_HEADER) })
+        );
+        assert!(!request.headers().contains_key(SSE_HEADER));
+    }
+
+    #[test]
+    fn get_requests_never_carry_the_sse_header() {
+        let s = S3SnapshotStore::new(&cfg("https://minio.local:9000"), &resolver).unwrap();
+        let url = s
+            .bucket
+            .get_object(Some(&s.creds), "thegn/x/bundle")
+            .sign(SIGN_TTL);
+
+        assert_eq!(signed_headers(&url).as_deref(), Some("host"));
     }
 
     #[test]

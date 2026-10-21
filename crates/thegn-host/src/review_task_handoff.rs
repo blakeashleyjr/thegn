@@ -187,7 +187,7 @@ fn handle_loaded(
         vars: &vars,
         timeout_secs: queue.agent_timeout_secs,
         sandbox,
-        credential_free: false,
+        credential_free: true,
     });
 
     // A refresh may revise the same row while the agent is running. Never let

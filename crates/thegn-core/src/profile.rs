@@ -69,6 +69,36 @@ impl std::fmt::Display for ProfileSelectorError {
 
 impl std::error::Error for ProfileSelectorError {}
 
+/// A named profile could not be prepared safely, or its selector was invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RerootError {
+    /// The requested process-profile selector was not safe to admit.
+    Selector(ProfileSelectorError),
+    /// A required profile directory could not be created.
+    Root { path: PathBuf, error: String },
+}
+
+impl std::fmt::Display for RerootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Selector(error) => write!(f, "{error}"),
+            Self::Root { path, error } => write!(
+                f,
+                "could not create profile directory {}: {error}; refusing to start the profile without its isolated roots",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RerootError {}
+
+impl From<ProfileSelectorError> for RerootError {
+    fn from(error: ProfileSelectorError) -> Self {
+        Self::Selector(error)
+    }
+}
+
 /// Maximum raw process-profile selector size checked before slugification.
 pub const MAX_SELECTOR_BYTES: usize = crate::config_budget::MAX_CONTEXT_BYTES;
 
@@ -352,7 +382,7 @@ fn on_disk_name(base: &std::path::Path, name: &str) -> String {
 /// # Safety
 /// Single-threaded-startup invariant as above (same contract as
 /// [`util::scrub_git_env`]).
-pub fn reroot(cli_profile: Option<&str>) -> Result<(), ProfileSelectorError> {
+pub fn reroot(cli_profile: Option<&str>) -> Result<(), RerootError> {
     if ACTIVE.get().is_some() {
         return Ok(());
     }
@@ -361,7 +391,7 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), ProfileSelectorError> {
     // the default profile's state and credentials.
     let env_profile = std::env::var("THEGN_PROFILE").ok();
     let selector = resolve_selector(cli_profile, env_profile.as_deref())?;
-    let _ = DEFAULT_STATE_HOME.set(util::xdg_state_home());
+    let default_state_home = util::xdg_state_home();
     // Bound the name for a profile being created here; an existing one keeps
     // whatever it was created as (see `on_disk_name`).
     let base = util::thegn_dir();
@@ -370,8 +400,8 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), ProfileSelectorError> {
     let paths = match profile_root(&base, &name) {
         // Named profile: reroot storage + advertise the name to children/config.
         Some(root) => {
+            prepare_profile_dirs(&root)?;
             let state = root.join("state");
-            let _ = std::fs::create_dir_all(&state); // best-effort: dir prep: a later write reports the real failure
             unsafe {
                 std::env::set_var("THEGN_DIR", &root);
                 std::env::set_var("XDG_STATE_HOME", &state);
@@ -389,6 +419,7 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), ProfileSelectorError> {
             root: util::thegn_dir(),
         },
     };
+    let _ = DEFAULT_STATE_HOME.set(default_state_home);
     let _ = ACTIVE.set(paths); // best-effort: first-set-wins: the active profile is set once
     Ok(())
 }
@@ -428,12 +459,59 @@ pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<Strin
     out
 }
 
-/// Apply [`credential_env`] to the process and create the config dirs. Called
-/// from [`reroot`] (single-threaded startup).
+/// Return credential-shaped environment names selected by the THE-444 option
+/// B denylist. This is the decided denylist, not a full firewall.
+pub fn scrubbed_credential_vars<I: IntoIterator<Item = String>>(
+    names: I,
+    profile_has_ssh_key: bool,
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| {
+            let upper = name.to_ascii_uppercase();
+            !upper.starts_with("THEGN_")
+                && ((upper == "SSH_AUTH_SOCK" && !profile_has_ssh_key)
+                    || matches!(
+                        upper.as_str(),
+                        "GPG_AGENT_INFO"
+                            | "GOOGLE_APPLICATION_CREDENTIALS"
+                            | "AWS_ACCESS_KEY_ID"
+                            | "AWS_SESSION_TOKEN"
+                            | "AWS_SECRET_ACCESS_KEY"
+                            | "AZURE_CLIENT_SECRET"
+                            | "NPM_TOKEN"
+                            | "NODE_AUTH_TOKEN"
+                            | "CARGO_REGISTRY_TOKEN"
+                    )
+                    || ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_ACCESS_KEY"]
+                        .iter()
+                        .any(|suffix| upper.ends_with(suffix))
+                    || (upper.starts_with("CARGO_REGISTRIES_") && upper.ends_with("_TOKEN")))
+        })
+        .collect()
+}
+
+/// Create every directory a named profile needs before changing process state.
+fn prepare_profile_dirs(root: &std::path::Path) -> Result<(), RerootError> {
+    for path in [
+        root.join("state"),
+        root.join("config/git"),
+        root.join("config/gh"),
+        root.join("gnupg"),
+    ] {
+        if let Err(error) = std::fs::create_dir_all(&path) {
+            return Err(RerootError::Root {
+                path,
+                error: error.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Apply profile paths and scrub ambient credentials from the process. Called
+/// from [`reroot`] after all profile roots exist (single-threaded startup).
 fn apply_credential_env(root: &std::path::Path) {
-    let _ = std::fs::create_dir_all(root.join("config/git")); // best-effort: dir prep: a later write reports the real failure
-    let _ = std::fs::create_dir_all(root.join("config/gh")); // best-effort: dir prep: a later write reports the real failure
-    let _ = std::fs::create_dir_all(root.join("gnupg")); // best-effort: dir prep: a later write reports the real failure
     for (var, val) in credential_env(root) {
         unsafe {
             match val {
@@ -442,22 +520,33 @@ fn apply_credential_env(root: &std::path::Path) {
             }
         }
     }
+    let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
+    for name in scrubbed_credential_vars(names, root.join("ssh/id").is_file()) {
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
 }
 
 /// Path-preserving credential mounts for the active profile (config dirs that
-/// exist), so a sandboxed pane sees the profile identity at the same paths its
-/// rerooted `GIT_CONFIG_GLOBAL`/`GH_CONFIG_DIR`/`GNUPGHOME` env points at.
+/// exist), mounted read-only so a sandboxed pane sees the profile identity at
+/// the same paths its rerooted `GIT_CONFIG_GLOBAL`/`GH_CONFIG_DIR`/`GNUPGHOME`
+/// env points at.
 /// Empty for the default profile.
 pub fn sandbox_cred_mounts() -> Vec<(String, bool)> {
     let p = active();
     if p.is_default() {
         return Vec::new();
     }
+    cred_mounts_under(&p.root)
+}
+
+fn cred_mounts_under(root: &std::path::Path) -> Vec<(String, bool)> {
     ["config/git", "config/gh", "gnupg"]
         .iter()
-        .map(|sub| p.root.join(sub))
+        .map(|sub| root.join(sub))
         .filter(|path| path.exists())
-        .map(|path| (path.to_string_lossy().into_owned(), false))
+        .map(|path| (path.to_string_lossy().into_owned(), true))
         .collect()
 }
 
@@ -1199,6 +1288,80 @@ mod tests {
             .unwrap();
         assert!(command.starts_with("ssh -i '") && command.contains("profile with spaces"));
         assert!(command.ends_with(" -o IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn credential_scrub_drops_known_families_and_keeps_infrastructure() {
+        let names = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "NPM_TOKEN",
+            "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+            "LINEAR_API_KEY",
+            "GH_TOKEN",
+            "SSH_AUTH_SOCK",
+            "GPG_AGENT_INFO",
+            "PATH",
+            "HOME",
+            "TERM",
+            "GIT_CONFIG_GLOBAL",
+            "GNUPGHOME",
+            "THEGN_PROFILE",
+            "THEGN_CONTROL_TOKEN",
+            "LC_ALL",
+        ];
+        assert_eq!(
+            scrubbed_credential_vars(names.into_iter().map(str::to_owned), false),
+            names[..11]
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn credential_scrub_keeps_the_ssh_agent_only_with_a_profile_key() {
+        let names = vec!["SSH_AUTH_SOCK".to_owned()];
+        assert_eq!(scrubbed_credential_vars(names.clone(), false), names);
+        assert!(scrubbed_credential_vars(names, true).is_empty());
+    }
+
+    #[test]
+    fn prepare_profile_dirs_fails_closed_when_the_root_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        let root = blocked.join("profiles").join("work");
+        let error = match prepare_profile_dirs(&root) {
+            Err(error) => error,
+            Ok(()) => panic!("profile directories unexpectedly created below a regular file"),
+        };
+        assert!(matches!(&error, RerootError::Root { path, .. } if path.starts_with(&blocked)));
+        assert!(error.to_string().contains("refusing to start"));
+    }
+
+    #[test]
+    fn prepare_profile_dirs_creates_every_isolated_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("profiles/work");
+        prepare_profile_dirs(&root).unwrap();
+        for subdir in ["state", "config/git", "config/gh", "gnupg"] {
+            assert!(root.join(subdir).is_dir(), "missing {subdir}");
+        }
+    }
+
+    #[test]
+    fn profile_credential_mounts_are_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for subdir in ["config/git", "config/gh", "gnupg"] {
+            std::fs::create_dir_all(dir.path().join(subdir)).unwrap();
+        }
+        let mounts = cred_mounts_under(dir.path());
+        assert_eq!(mounts.len(), 3);
+        assert!(mounts.iter().all(|(_, ro)| *ro));
     }
 
     #[test]

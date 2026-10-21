@@ -20,7 +20,9 @@
 //! the floor and is reported as `provider-managed`, never counted as a tier.
 
 use crate::capabilities::IsolationClass;
-use crate::config::{FileAccess, IsolationFloor, OnFloorMiss, SandboxBackend, SandboxConfig};
+use crate::config::{
+    FileAccess, IsolationFloor, Network, OnFloorMiss, SandboxBackend, SandboxConfig, SandboxProfile,
+};
 use crate::sandbox::{Backend, BackendFamily};
 
 /// Default minimum for enabled sandbox launches that have not opted into a
@@ -196,6 +198,84 @@ pub fn decide(
     }
 }
 
+/// Explicit isolation promise that a provider-managed pane cannot enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitIsolation {
+    SealedProfile(SandboxProfile),
+    NetworkNone,
+    FailClosedFloor(IsolationFloor),
+}
+
+impl ExplicitIsolation {
+    /// Human-readable spelling of the effective isolation request.
+    pub fn describe(self) -> String {
+        match self {
+            Self::SealedProfile(profile) => format!("profile `{}`", profile.as_str()),
+            Self::NetworkNone => "`network = \"none\"`".to_string(),
+            Self::FailClosedFloor(floor) => format!(
+                "`isolation_floor = \"{}\"` with `on_floor_miss = \"fail\"`",
+                floor.as_str()
+            ),
+        }
+    }
+}
+
+/// Identify an explicit isolation request in an effective sandbox config.
+/// A default floor and a degradable explicit floor do not refuse provider use.
+pub fn provider_explicit_request(sb: &SandboxConfig) -> Option<ExplicitIsolation> {
+    if sb.profile.forces_no_network() {
+        return Some(ExplicitIsolation::SealedProfile(sb.profile));
+    }
+    if crate::sandbox::lower_universal_deny(sb.network, &sb.network_block) == Network::None {
+        return Some(ExplicitIsolation::NetworkNone);
+    }
+    if let Some(floor) = sb.isolation_floor
+        && floor.required_rank().is_some()
+        && sb.on_floor_miss == OnFloorMiss::Fail
+    {
+        return Some(ExplicitIsolation::FailClosedFloor(floor));
+    }
+    None
+}
+
+/// Stable label for provider placement whose isolation is outside thegn's control.
+pub const PROVIDER_UNVERIFIED: &str = "provider-managed (unverified)";
+
+/// Typed refusal for an explicit isolation promise on an unattested provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRefusal {
+    pub env: String,
+    pub request: ExplicitIsolation,
+}
+
+impl std::fmt::Display for ProviderRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let request = self.request.describe();
+        write!(
+            formatter,
+            "env `{}` runs on a {} placement: thegn cannot enforce {} there, so the launch is refused before any provisioning, credential or upload; use a local sandbox env for this worktree, or remove {} from this env",
+            self.env, PROVIDER_UNVERIFIED, request, request
+        )
+    }
+}
+
+impl std::error::Error for ProviderRefusal {}
+
+/// Refuse an explicit isolation request only when execution is provider-managed.
+pub fn provider_refusal(
+    is_provider: bool,
+    sb: &SandboxConfig,
+    env: &str,
+) -> Option<ProviderRefusal> {
+    if !is_provider {
+        return None;
+    }
+    provider_explicit_request(sb).map(|request| ProviderRefusal {
+        env: env.to_string(),
+        request,
+    })
+}
+
 /// The `$HOME` confidentiality gate (THE-215). A sealed profile promises the host
 /// `$HOME` is not readable; a launch whose resolved spec would expose it — a
 /// backend with no filesystem boundary (host process, Windows), `file_access =
@@ -260,6 +340,37 @@ pub fn home_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
 
 fn home_path_under(dest: &str, home: &std::path::Path) -> bool {
     std::path::Path::new(dest).starts_with(home)
+}
+
+/// Refuse a sealed spec when its backend cannot apply a requested hardening
+/// control or enforce its file scope. Hostname rules need no check here because
+/// sealed forces `network = none`; tunnel-only requests are refused by
+/// `tunnel_admission`, and provider-native requests are refused before
+/// provisioning by the separate THE-801a admission gate.
+pub fn strict_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
+    spec.seal_home.as_ref()?;
+    let mut unsupported = crate::sandbox::unsupported_hardening(spec)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if !file_access_enforced(spec.backend, spec.file_access) {
+        let scope = match spec.file_access {
+            FileAccess::Worktree => "worktree",
+            FileAccess::WorktreePlusCaches => "worktree_plus_caches",
+            FileAccess::Custom => "custom",
+            FileAccess::All => "all",
+            FileAccess::Host => "host",
+            FileAccess::None => "none",
+        };
+        unsupported.push(format!("file_access `{scope}`"));
+    }
+    (!unsupported.is_empty()).then(|| {
+        format!(
+            "sealed profiles are strict: the `{}` backend cannot enforce {} — use a backend that can (bwrap or an OCI runtime), or a non-sealed profile",
+            spec.backend.label(),
+            unsupported.join(", ")
+        )
+    })
 }
 
 /// How an opt-in agent/queue task's floor decision maps onto queue-entry state.
@@ -349,8 +460,7 @@ pub fn queue_agent_gate(
         match sandbox_gate {
             AgentGate::InfraHold(reason) => AgentGate::InfraHold(format!(
                 "{reason}; inherited from the [sandbox] isolation floor in force — set \
-                 [sandbox] isolation_floor = \"off\" or the queue's agent_sandbox = false \
-                 to run the agent uncontained"
+                 [sandbox] isolation_floor = \"off\" to run queue agents uncontained"
             )),
             other => other,
         }
@@ -362,6 +472,84 @@ pub fn queue_agent_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strict_spec(backend: Backend, file_access: FileAccess) -> crate::sandbox::SandboxSpec {
+        use crate::config::Network;
+        use crate::placement::Placement;
+        use crate::sandbox::{Mount, SandboxLimits, SandboxSpec};
+        SandboxSpec {
+            volume_owners: Vec::new(),
+            backend,
+            placement: Placement::Local,
+            image: Some("img:latest".into()),
+            worktree: std::path::PathBuf::from("/wt/feat"),
+            mounts: vec![Mount {
+                host: "/wt/feat".into(),
+                dest: "/wt/feat".into(),
+                ro: false,
+                cache: false,
+            }],
+            env: Vec::new(),
+            env_overrides: std::collections::HashMap::new(),
+            env_block: Vec::new(),
+            network: Network::None,
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
+            read_only_root: true,
+            no_new_privileges: true,
+            pids_limit: Some(256),
+            drop_capabilities: Vec::new(),
+            add_capabilities: Vec::new(),
+            file_access,
+            ports: Vec::new(),
+            gpu: None,
+            limits: SandboxLimits::default(),
+            volumes: Vec::new(),
+            compose: None,
+            build: None,
+            init_script: None,
+            devenv: false,
+            devenv_path: None,
+            name: "strict-test".into(),
+            vpn: None,
+            oci_host: None,
+            oci_runtime: None,
+            daemon_persistent: false,
+            seal_home: Some("/home/u".into()),
+        }
+    }
+
+    #[test]
+    fn strict_gate_table_across_backends() {
+        for backend in Backend::ALL {
+            for file_access in [
+                FileAccess::Worktree,
+                FileAccess::WorktreePlusCaches,
+                FileAccess::All,
+            ] {
+                let spec = strict_spec(backend, file_access);
+                let expected_supported = crate::sandbox::unsupported_hardening(&spec).is_empty()
+                    && file_access_enforced(spec.backend, spec.file_access);
+                assert_eq!(
+                    strict_gate(&spec).is_none(),
+                    expected_supported,
+                    "{backend:?} / {file_access:?}"
+                );
+            }
+        }
+        assert!(strict_gate(&strict_spec(Backend::Apple, FileAccess::Worktree)).is_some());
+        assert!(strict_gate(&strict_spec(Backend::Systemd, FileAccess::Worktree)).is_some());
+        assert!(strict_gate(&strict_spec(Backend::Bwrap, FileAccess::Worktree)).is_none());
+    }
+
+    #[test]
+    fn strict_gate_ignores_non_sealed_specs() {
+        for backend in [Backend::Apple, Backend::Systemd] {
+            let mut spec = strict_spec(backend, FileAccess::Worktree);
+            spec.seal_home = None;
+            assert_eq!(strict_gate(&spec), None, "{backend:?}");
+        }
+    }
 
     #[test]
     fn file_access_enforced_table_covers_each_backend_and_scope() {
@@ -841,5 +1029,84 @@ mod tests {
             ),
             AgentGate::Run
         );
+    }
+
+    #[test]
+    fn provider_explicit_request_table() {
+        let profiles = [
+            SandboxProfile::Open,
+            SandboxProfile::Hardened,
+            SandboxProfile::Sealed,
+            SandboxProfile::SealedTunnel,
+        ];
+        let networks = [Network::Nat, Network::None];
+        let floors = [None, Some(IsolationFloor::SharedKernel)];
+        let misses = [OnFloorMiss::Degrade, OnFloorMiss::Fail];
+
+        for profile in profiles {
+            for network in networks {
+                for floor in floors {
+                    for miss in misses {
+                        let sb = SandboxConfig {
+                            profile,
+                            network,
+                            isolation_floor: floor,
+                            on_floor_miss: miss,
+                            ..SandboxConfig::default()
+                        };
+                        let expected = if matches!(
+                            profile,
+                            SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+                        ) {
+                            Some(ExplicitIsolation::SealedProfile(profile))
+                        } else if network == Network::None {
+                            Some(ExplicitIsolation::NetworkNone)
+                        } else if floor == Some(IsolationFloor::SharedKernel)
+                            && miss == OnFloorMiss::Fail
+                        {
+                            Some(ExplicitIsolation::FailClosedFloor(
+                                IsolationFloor::SharedKernel,
+                            ))
+                        } else {
+                            None
+                        };
+                        assert_eq!(provider_explicit_request(&sb), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_universal_block_is_network_none() {
+        let sb = SandboxConfig {
+            network: Network::Nat,
+            network_block: vec!["*".into()],
+            ..SandboxConfig::default()
+        };
+        assert_eq!(
+            provider_explicit_request(&sb),
+            Some(ExplicitIsolation::NetworkNone)
+        );
+    }
+
+    #[test]
+    fn provider_refusal_only_for_provider_placements() {
+        let sealed = SandboxConfig {
+            profile: SandboxProfile::Sealed,
+            ..SandboxConfig::default()
+        };
+        assert_eq!(provider_refusal(false, &sealed, "e"), None);
+        let refusal =
+            provider_refusal(true, &sealed, "e").expect("sealed provider request refuses");
+        let message = refusal.to_string();
+        assert!(message.contains("provider-managed (unverified)"));
+        assert!(message.contains("sealed"));
+        assert!(message.contains("env `e`"));
+    }
+
+    #[test]
+    fn provider_default_config_is_not_refused() {
+        assert_eq!(provider_refusal(true, &SandboxConfig::default(), "e"), None);
     }
 }

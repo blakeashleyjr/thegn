@@ -664,7 +664,7 @@ pub(crate) fn drive_queue(
                     }
                 }
 
-                // Opt-in isolation floor for the handoff (default: host + slice).
+                // Enforce the in-force isolation floor before the handoff.
                 // Gate BEFORE consuming an attempt: a fail-closed miss, or an
                 // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
                 // failure — hold the PR and NEVER mark it needs_human.
@@ -821,7 +821,7 @@ pub(crate) fn drive_queue(
                     vars: &vars,
                     timeout_secs: cfg.agent_timeout_secs,
                     sandbox,
-                    credential_free: false,
+                    credential_free: true,
                 });
 
                 // The exit code decides nothing — the next refresh does, exactly
@@ -1274,6 +1274,16 @@ fn format_threads(threads: &[ReviewThreadRow]) -> String {
 mod tests {
     use super::*;
     use thegn_core::forge::model::PrStatus;
+
+    fn uncontained_config() -> Config {
+        Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                isolation_floor: Some(thegn_core::config::IsolationFloor::Off),
+                ..thegn_core::config::SandboxConfig::default()
+            },
+            ..Config::default()
+        }
+    }
 
     fn cfg() -> PrQueueConfig {
         PrQueueConfig {
@@ -2256,7 +2266,7 @@ mod tests {
             .unwrap();
             let out = drive_queue(
                 &cfg,
-                &Config::default(),
+                &uncontained_config(),
                 &forge,
                 Path::new("/repo"),
                 &db,
@@ -2284,7 +2294,7 @@ mod tests {
             let row = db.list_pr_queue().unwrap().remove(0);
             let out = drive_queue(
                 &cfg,
-                &Config::default(),
+                &uncontained_config(),
                 &forge,
                 Path::new("/repo"),
                 &db,
@@ -2316,7 +2326,7 @@ mod tests {
         assert_eq!(row.ci_rerun_head.as_deref(), Some("abc"));
         let out = drive_queue(
             &cfg,
-            &Config::default(),
+            &uncontained_config(),
             &forge,
             Path::new("/repo"),
             &db,
@@ -2670,7 +2680,7 @@ mod tests {
         let forge = FakeForge::new(Some(failing_ci_pr("abc"))).with_rerun_count(0);
         let out = drive_queue(
             &config,
-            &Config::default(),
+            &uncontained_config(),
             &forge,
             &checkout,
             &db,

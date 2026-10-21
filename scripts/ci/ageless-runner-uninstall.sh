@@ -1,50 +1,41 @@
 #!/usr/bin/env bash
-# Remove the self-hosted runners set up by ageless-runner-setup.sh: stop +
-# uninstall each systemd service, deregister from GitHub, and drop the runner
-# dirs. Leaves the warm caches (nix store, sccache, cargo) and host nix in place
-# unless you pass PURGE_CACHES=1. Run on ageless-studio as the runner user.
-#
-#   GH_PAT=<admin PAT> bash scripts/ci/ageless-runner-uninstall.sh
+# Stop and remove the root-owned ephemeral runner loops installed by setup.
 set -euo pipefail
 
-GH_REPO="${GH_REPO:-blakeashleyjr/thegn}"
-RUNNER_USER="${RUNNER_USER:-targe}"
-RUNNER_COUNT="${RUNNER_COUNT:-4}"
-RUNNER_BASE="${RUNNER_BASE:-/home/$RUNNER_USER/actions-runners}"
-CACHE_BASE="${CACHE_BASE:-/home/$RUNNER_USER/gha-cache}"
-PURGE_CACHES="${PURGE_CACHES:-0}"
-GH_PAT="${GH_PAT:-}"
+RUNNER_USER="${RUNNER_USER:-thegn-ci}"
+RUNNER_BASE="${RUNNER_BASE:-/var/lib/thegn-ci/runners}"
+RUNNER_TOKEN_FILE="${RUNNER_TOKEN_FILE:-/etc/thegn-ci/registration.token}"
+RUNNER_LOOP_FILE="${RUNNER_LOOP_FILE:-/usr/local/libexec/thegn-ci/runner-loop}"
+RUNNER_UNIT_FILE="${RUNNER_UNIT_FILE:-/etc/systemd/system/thegn-ci-runner@.service}"
+REMOVE_USER="${REMOVE_USER:-0}"
 
 log() { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
-
-remove_token() {
-  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-    gh api -X POST "repos/$GH_REPO/actions/runners/remove-token" --jq .token
-  elif [ -n "$GH_PAT" ]; then
-    curl -fsSL -X POST -H "Authorization: Bearer $GH_PAT" \
-      -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/repos/$GH_REPO/actions/runners/remove-token" | jq -r .token
-  fi
+die() {
+  printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2
+  exit 1
 }
 
-for i in $(seq 1 "$RUNNER_COUNT"); do
-  dir="$RUNNER_BASE/ageless-$i"
-  [ -d "$dir" ] || continue
-  log "removing runner ageless-$i…"
-  svc_name="$(cat "$dir/.service" 2>/dev/null || true)"
-  (cd "$dir" && sudo ./svc.sh stop 2>/dev/null || true)
-  (cd "$dir" && sudo ./svc.sh uninstall 2>/dev/null || true)
-  [ -n "$svc_name" ] && sudo rm -rf "/etc/systemd/system/${svc_name}.d"
-  tok="$(remove_token || true)"
-  if [ -n "${tok:-}" ] && [ -f "$dir/config.sh" ]; then
-    (cd "$dir" && ./config.sh remove --token "$tok" 2>/dev/null || true)
+main() {
+  local active_units
+  if [ "$REMOVE_USER" = 1 ] && [ -e /etc/NIXOS ]; then
+    die 'NixOS runner users are declared in configuration; remove users.users.thegn-ci from configuration.nix and rebuild instead'
   fi
-  rm -rf "$dir"
-done
-sudo systemctl daemon-reload
+  if ! sudo systemctl stop 'thegn-ci-job-*'; then
+    log 'no matching transient jobs to stop (or stop returned nonzero); checking active jobs before cleanup'
+  fi
+  active_units="$(sudo systemctl list-units 'thegn-ci-job-*' --state=active --no-legend --no-pager)" || die 'cannot verify transient jobs stopped; leaving runner files in place'
+  [ -z "$active_units" ] || die "transient jobs are still active; leaving runner files in place:\n$active_units"
+  sudo systemctl disable --now 'thegn-ci-runner@*.service' || true # best-effort: partial installs and no matching units are normal
+  active_units="$(sudo systemctl list-units 'thegn-ci-runner@*.service' --state=active --no-legend --no-pager)" || die 'cannot verify runner loops stopped; leaving runner files in place'
+  [ -z "$active_units" ] || die "runner loops are still active; leaving runner files in place:\n$active_units"
+  sudo rm -f "$RUNNER_UNIT_FILE" "$RUNNER_LOOP_FILE"
+  sudo rm -rf "$(dirname "$RUNNER_TOKEN_FILE")"
+  sudo rm -rf "$RUNNER_BASE"
+  sudo systemctl daemon-reload
+  if [ "$REMOVE_USER" = 1 ]; then
+    sudo userdel --remove "$RUNNER_USER"
+  fi
+  log 'ephemeral runner loops removed'
+}
 
-if [ "$PURGE_CACHES" = "1" ]; then
-  log "purging warm caches at $CACHE_BASE (PURGE_CACHES=1)…"
-  rm -rf "$CACHE_BASE"
-fi
-log "done."
+main "$@"
