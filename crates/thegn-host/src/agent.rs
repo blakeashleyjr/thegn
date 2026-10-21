@@ -521,49 +521,61 @@ pub fn prepare_sandbox_env(
     let base_cname = sandbox::container_name_for_config_profile(worktree, &cfg.profile);
     let hardening = sb.profile;
     let cname = base_cname;
+    if let Some(refusal) = static_tunnel_refusal(
+        matches!(placement, thegn_core::placement::Placement::Provider(_)),
+        hardening,
+        &sb.vpn,
+        &placement_label,
+    ) {
+        return Err(anyhow::Error::new(refusal));
+    }
+    let mut provisioned = None;
     // Bring the execution placement up (k8s pod / provider sandbox) BEFORE
     // resolving the backend — a no-op for the default local `in_env` env. Warm-on-
     // open: create the API sandbox first if `auto_provision` is set so the
     // subsequent ensure/clone/connect find it live (8-E).
-    if matches!(placement, thegn_core::placement::Placement::Provider(_))
-        && let Err(e) = auto_provision_sandbox(cfg, &env_name, worktree)
-    {
-        // Provider won't provision (bad token, quota, API down): surface the
-        // real cause (`{e:#}`); only an explicit local host choice may degrade.
-        if !degrade_allowed {
-            return Err(SandboxHalt {
-                env_name: env_name.clone(),
-                placement: placement_label.clone(),
-                reason: format!("{e:#}"),
-                ask,
-                dormant: None,
+    if matches!(placement, thegn_core::placement::Placement::Provider(_)) {
+        match auto_provision_sandbox(cfg, &env_name, worktree) {
+            Ok(guard) => provisioned = guard,
+            Err(e) => {
+                // Provider won't provision (bad token, quota, API down): surface the
+                // real cause (`{e:#}`); only an explicit local host choice may degrade.
+                if !degrade_allowed {
+                    return Err(SandboxHalt {
+                        env_name: env_name.clone(),
+                        placement: placement_label.clone(),
+                        reason: format!("{e:#}"),
+                        ask,
+                        dormant: None,
+                    }
+                    .into());
+                }
+                // Degrade to a BARE host shell (`none`): the git worktree exists locally,
+                // a reliable fallback when the provider is down.
+                thegn_core::msg::warn(&format!(
+                    "env '{env_name}' unavailable ({e:#}); falling back to the host"
+                ));
+                warnings.push(format!(
+                    "{env_name} unavailable ({e:#}); running on the host"
+                ));
+                placement = thegn_core::placement::Placement::Local;
+                exec_placement = thegn_core::placement::Placement::Local;
+                env_is_remote = false;
+                route_ssh_target = None;
+                // The pane now runs on the host, so the worktree is NOT at the provider
+                // location computed above — drop it (and flag the degrade) so the DB row
+                // heals to local instead of routing chrome reads at the dead provider.
+                location = None;
+                degraded_from_provider = true;
+                // Degrading to the host retires the configured backend: an explicit OCI
+                // backend (podman/smol — kept past line 316) would otherwise strand the
+                // bare-host fallback with "explicit backend 'none' did not produce a
+                // runnable sandbox". Clear it so the None candidate opens a plain shell.
+                explicit_backend = None;
+                explicit_choice = false;
+                sb.backend = thegn_core::config::SandboxBackend::None;
             }
-            .into());
         }
-        // Degrade to a BARE host shell (`none`): the git worktree exists locally,
-        // a reliable fallback when the provider is down.
-        thegn_core::msg::warn(&format!(
-            "env '{env_name}' unavailable ({e:#}); falling back to the host"
-        ));
-        warnings.push(format!(
-            "{env_name} unavailable ({e:#}); running on the host"
-        ));
-        placement = thegn_core::placement::Placement::Local;
-        exec_placement = thegn_core::placement::Placement::Local;
-        env_is_remote = false;
-        route_ssh_target = None;
-        // The pane now runs on the host, so the worktree is NOT at the provider
-        // location computed above — drop it (and flag the degrade) so the DB row
-        // heals to local instead of routing chrome reads at the dead provider.
-        location = None;
-        degraded_from_provider = true;
-        // Degrading to the host retires the configured backend: an explicit OCI
-        // backend (podman/smol — kept past line 316) would otherwise strand the
-        // bare-host fallback with "explicit backend 'none' did not produce a
-        // runnable sandbox". Clear it so the None candidate opens a plain shell.
-        explicit_backend = None;
-        explicit_choice = false;
-        sb.backend = thegn_core::config::SandboxBackend::None;
     }
     if !placement.is_local()
         && let Err(e) = placement.ensure()
@@ -668,6 +680,9 @@ pub fn prepare_sandbox_env(
                     &env_name,
                     &placement_label,
                 )?;
+                if let Some(guard) = provisioned.take() {
+                    guard.commit();
+                }
                 return Ok(SandboxOutcome {
                     backend_label: spec.backend.label().to_string(),
                     spec: Some(spec),
@@ -867,6 +882,9 @@ pub fn prepare_sandbox_env(
                 Ok(()) => {
                     if let Some(lease) = projection_lease.take() {
                         lease.commit();
+                    }
+                    if let Some(guard) = provisioned.take() {
+                        guard.commit();
                     }
                     return Ok(SandboxOutcome {
                         backend_label: spec.backend.label().to_string(),
@@ -1101,6 +1119,9 @@ pub fn prepare_sandbox_env(
     }
     if let Some(lease) = projection_lease.take() {
         lease.commit();
+    }
+    if let Some(guard) = provisioned.take() {
+        guard.commit();
     }
     Ok(SandboxOutcome {
         spec: None,
@@ -3081,24 +3102,95 @@ pub(crate) fn should_heal_degraded_location(degraded: bool, current: Option<&str
     degraded && current.is_some_and(|l| !l.is_empty())
 }
 
+fn static_tunnel_refusal(
+    is_provider: bool,
+    profile: thegn_core::config::SandboxProfile,
+    vpn: &thegn_core::config::VpnConfig,
+    backend: &str,
+) -> Option<thegn_core::sandbox::EnterError> {
+    if is_provider
+        && profile == thegn_core::config::SandboxProfile::SealedTunnel
+        && vpn.is_enabled()
+    {
+        Some(thegn_core::sandbox::EnterError::Refused(
+            thegn_core::sandbox::Refusal {
+                class: thegn_core::sandbox::RefusalClass::TunnelUnenforced,
+                backend: backend.to_string(),
+                path: None,
+                message: thegn_core::sandbox::TUNNEL_ONLY_REFUSAL.to_string(),
+            },
+        ))
+    } else {
+        None
+    }
+}
+
+type ProvisionDestroyFn = Box<dyn FnOnce(&str) -> anyhow::Result<()> + Send>;
+
+pub(crate) struct ProvisionedSandbox {
+    name: String,
+    destroy: Option<ProvisionDestroyFn>,
+}
+
+impl ProvisionedSandbox {
+    fn new(name: String, destroy: ProvisionDestroyFn) -> Self {
+        Self {
+            name,
+            destroy: Some(destroy),
+        }
+    }
+
+    fn commit(mut self) {
+        drop(self.destroy.take());
+    }
+}
+
+fn provision_guard_for_ensure_result(
+    created: bool,
+    name: String,
+    destroy: ProvisionDestroyFn,
+) -> Option<ProvisionedSandbox> {
+    created.then(|| ProvisionedSandbox::new(name, destroy))
+}
+
+impl Drop for ProvisionedSandbox {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.destroy.take()
+            && let Err(error) = destroy(&self.name)
+        {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                %error,
+                name = %self.name,
+                "could not destroy a provider sandbox created by a refused launch"
+            );
+        }
+    }
+}
+
 /// Warm-on-open (8-E): for a provider env with `auto_provision`, create the
 /// sandbox if it doesn't exist yet (API providers — CLI providers use
 /// `up_command`/`placement.ensure`). Runs off-loop. Returns `Err` if the provider
 /// rejected the request (e.g. a bad/expired token → 401); the caller decides
-/// whether that halts (failover off) or just warns (failover on). `Ok(())` on
-/// success, already-exists, or a no-op (not a provider / `auto_provision` off).
-fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyhow::Result<()> {
+/// whether that halts (failover off) or just warns (failover on). Returns a
+/// rollback guard only when this call created the sandbox; pre-existing
+/// sandboxes and no-op paths return `None`.
+fn auto_provision_sandbox(
+    cfg: &Config,
+    env_name: &str,
+    worktree: &str,
+) -> anyhow::Result<Option<ProvisionedSandbox>> {
     let Some(env) = cfg.env.get(env_name) else {
-        return Ok(());
+        return Ok(None);
     };
     let pc = &env.provider;
     if !pc.auto_provision {
-        return Ok(());
+        return Ok(None);
     }
     // Per-worktree id from the single source of truth (resolved placement).
     let Some(name) = provider_sandbox_name(cfg, worktree, env_name).filter(|s| !s.is_empty())
     else {
-        return Ok(());
+        return Ok(None);
     };
     // Pool-aware: an UNBOUND worktree with a ready spare waiting will claim it
     // in the materialize fast path — creating the derived sandbox now would
@@ -3117,7 +3209,7 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
             .map(|v| v.iter().any(|s| s.state == "ready"))
             .unwrap_or(false)
     {
-        return Ok(());
+        return Ok(None);
     }
     // Bake the RESOLVED name so `ensure_exists`→`create` names the new sandbox
     // correctly (the raw `pc.id` is a template + embeds a path-hash).
@@ -3136,7 +3228,27 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
         );
     };
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
-        Ok(true) => {
+        Ok(created) => {
+            // Rebuild the provider during rollback: provider implementations do
+            // not share a common ownership contract, while the config is cloneable.
+            let destroy_config = pc.clone();
+            let provisioned_name = name.clone();
+            let guard = provision_guard_for_ensure_result(
+                created,
+                name.clone(),
+                Box::new(move |sandbox_name| {
+                    let destroy_provider = provider_for_named(&destroy_config, sandbox_name)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("provider could not be rebuilt for destroy")
+                        })?;
+                    block_on_provider(
+                        || async move { destroy_provider.destroy(sandbox_name).await },
+                    )
+                }),
+            );
+            if !created {
+                return Ok(guard);
+            }
             let repo_root: PathBuf = Db::open()
                 .ok()
                 .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -3164,10 +3276,9 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
                     block,
                 )?;
             }
-            thegn_core::msg::info(&format!("provisioned sandbox {name}"));
-            Ok(())
+            thegn_core::msg::info(&format!("provisioned sandbox {provisioned_name}"));
+            Ok(guard)
         }
-        Ok(false) => Ok(()), // already exists
         Err(e) => Err(e),
     }
 }
@@ -4321,3 +4432,7 @@ mod vpn_tests;
 #[cfg(test)]
 #[path = "agent_projection_tests.rs"]
 mod projection_tests;
+
+#[cfg(test)]
+#[path = "agent_provision_tests.rs"]
+mod provision_tests;
