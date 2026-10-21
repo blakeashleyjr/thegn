@@ -156,7 +156,15 @@ const RESET_CREDENTIAL_HELPER: [(&str, &str); 3] = [
 /// Remove credential-bearing mounts and environment from an autonomous agent's
 /// resolved sandbox. Interactive pane specs do not pass through this helper.
 pub(crate) fn credential_free_spec(
+    spec: thegn_core::sandbox::SandboxSpec,
+) -> thegn_core::sandbox::SandboxSpec {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    credential_free_spec_at(spec, home.as_deref())
+}
+
+fn credential_free_spec_at(
     mut spec: thegn_core::sandbox::SandboxSpec,
+    home: Option<&std::path::Path>,
 ) -> thegn_core::sandbox::SandboxSpec {
     spec.env
         .retain(|(key, _)| !credential_shaped(key) && !credential_locator(key));
@@ -164,13 +172,12 @@ pub(crate) fn credential_free_spec(
         spec.env.retain(|(existing, _)| existing != key);
         spec.env.push((key.to_string(), value.to_string()));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::PathBuf::from(home);
-        let identity_dests = thegn_core::ssh_creds::identity_mounts_at(&home, &[])
+    if let Some(home) = home {
+        let identity_dests = thegn_core::ssh_creds::identity_mounts_at(home, &[])
             .into_iter()
             .map(|mount| mount.dest)
             .collect::<Vec<_>>();
-        strip_credential_mounts(&mut spec.mounts, &home, &identity_dests);
+        strip_credential_mounts(&mut spec.mounts, home, &identity_dests);
     }
     spec
 }
@@ -187,12 +194,10 @@ fn strip_credential_mounts(
     ];
     mounts.retain(|mount| {
         let dest = std::path::Path::new(&mount.dest);
-        !identity_dests
-            .iter()
-            .any(|identity| mount.dest == *identity)
+        !identity_dests.contains(&mount.dest)
             && !credential_dirs
                 .iter()
-                .any(|credential_dir| dest == credential_dir || dest.starts_with(credential_dir))
+                .any(|credential_dir| dest.starts_with(credential_dir))
     });
 }
 
@@ -1124,7 +1129,8 @@ fn credential_free_env<I>(vars: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    thegn_core::util::filter_host_env(vars, &[])
+    let resolver_markers = ["THEGN_SANDBOX".to_string()];
+    thegn_core::util::filter_host_env(vars, &resolver_markers)
         .into_iter()
         .filter(|(key, _)| !credential_shaped(key) && !credential_locator(key))
         .collect()
@@ -1142,7 +1148,7 @@ fn credential_locator(key: &str) -> bool {
     matches!(
         key,
         "GH_CONFIG_DIR" | "GNUPGHOME" | "GIT_SSH_COMMAND" | "GPG_TTY" | "DBUS_SESSION_BUS_ADDRESS"
-    ) || key.starts_with("THEGN_")
+    ) || (key.starts_with("THEGN_") && key != "THEGN_SANDBOX")
 }
 
 fn credential_shaped(key: &str) -> bool {
@@ -1242,6 +1248,7 @@ mod tests {
 
     #[test]
     fn queue_agent_sandbox_honours_a_repo_network_none_overlay() {
+        let _state = crate::testenv::IsolatedState::new();
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(
             repo.path().join(".thegn.toml"),
@@ -1275,6 +1282,7 @@ mod tests {
 
     #[test]
     fn remote_global_default_env_holds_the_queue_agent() {
+        let _state = crate::testenv::IsolatedState::new();
         let repo = tempfile::tempdir().unwrap();
         // The global default selects `x`; the repo hint is redundant here.
         std::fs::write(repo.path().join(".thegn.toml"), "env = \"x\"\n").unwrap();
@@ -1303,6 +1311,7 @@ mod tests {
 
     #[test]
     fn global_sealed_profile_holds_when_effective_env_disables_backend() {
+        let _state = crate::testenv::IsolatedState::new();
         let repo = tempfile::tempdir().unwrap();
         let full: thegn_core::config::Config = toml::from_str(
             r#"
@@ -1336,6 +1345,7 @@ mod tests {
 
     #[test]
     fn malformed_repo_overlay_holds_the_queue_agent() {
+        let _state = crate::testenv::IsolatedState::new();
         let repo = tempfile::tempdir().unwrap();
         let overlay = repo.path().join(".thegn.toml");
         std::fs::write(&overlay, "[sandbox\nnetwork = \"none\"\n").unwrap();
@@ -1490,6 +1500,7 @@ mod tests {
 
     #[test]
     fn queue_agent_spec_uses_thegn_owned_container_name() {
+        let _state = crate::testenv::IsolatedState::new();
         let spec = scope_agent_spec(sandbox_spec(), "/wt/api");
         assert!(spec.name.starts_with(thegn_core::sandbox::CONTAINER_PREFIX));
         assert_eq!(
@@ -1500,6 +1511,7 @@ mod tests {
 
     #[test]
     fn queue_agent_specs_keep_same_basename_worktrees_distinct_and_live() {
+        let _state = crate::testenv::IsolatedState::new();
         let a = scope_agent_spec(sandbox_spec(), "/wt/a/api");
         let b = scope_agent_spec(sandbox_spec(), "/wt/b/api");
         assert_ne!(a.name, b.name);
@@ -1689,6 +1701,7 @@ mod tests {
             ),
             ("THEGN_DIR".into(), "/home/u/.thegn".into()),
             ("THEGN_PROFILE".into(), "personal".into()),
+            ("THEGN_SANDBOX".into(), "1".into()),
             ("XDG_RUNTIME_DIR".into(), "/run/user/1".into()),
             ("GIT_CONFIG_GLOBAL".into(), "/tmp/identity".into()),
             ("LANG".into(), "C".into()),
@@ -1697,6 +1710,7 @@ mod tests {
             env,
             vec![
                 ("PATH".into(), "/bin".into()),
+                ("THEGN_SANDBOX".into(), "1".into()),
                 ("XDG_RUNTIME_DIR".into(), "/run/user/1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/tmp/identity".into()),
                 ("LANG".into(), "C".into()),
@@ -1744,16 +1758,15 @@ mod tests {
 
     #[test]
     fn queue_agent_spec_is_credential_free() {
-        let home = tempfile::tempdir().unwrap();
-        let _home_env =
-            crate::testenv::EnvVarGuard::set(&[("HOME", home.path().to_str().unwrap())]);
+        let state = crate::testenv::IsolatedState::new();
         let mut spec = sandbox_spec();
         spec.env = vec![
             ("GNUPGHOME".into(), "/gnupg".into()),
             ("GH_CONFIG_DIR".into(), "/gh".into()),
             ("TERM".into(), "xterm".into()),
+            ("THEGN_SANDBOX".into(), "1".into()),
         ];
-        let ssh_mount = home.path().join(".ssh");
+        let ssh_mount = state.root().join(".ssh");
         spec.mounts.push(thegn_core::sandbox::Mount {
             host: ssh_mount.to_string_lossy().into_owned(),
             dest: ssh_mount.to_string_lossy().into_owned(),
@@ -1772,6 +1785,11 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "TERM" && value == "xterm")
         );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(key, value)| key == "THEGN_SANDBOX" && value == "1")
+        );
         for (key, value) in RESET_CREDENTIAL_HELPER {
             assert!(
                 spec.env
@@ -1784,18 +1802,8 @@ mod tests {
 
     #[test]
     fn credential_free_launcher_keeps_xdg_runtime_dir() {
-        let wrapped = thegn_core::sandbox_cpucap::wrap_background_argv(vec!["/bin/true".into()]);
-        assert!(!wrapped.is_empty());
         let env = credential_free_env([("XDG_RUNTIME_DIR".into(), "/run/user/7".into())]);
-        let mut command = std::process::Command::new(&wrapped[0]);
-        command.args(&wrapped[1..]).env_clear();
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        assert!(command.get_envs().any(|(key, value)| {
-            key == std::ffi::OsStr::new("XDG_RUNTIME_DIR")
-                && value == Some(std::ffi::OsStr::new("/run/user/7"))
-        }));
+        assert_eq!(env, vec![("XDG_RUNTIME_DIR".into(), "/run/user/7".into())]);
     }
 
     #[test]
@@ -1852,6 +1860,7 @@ mod tests {
 
     #[test]
     fn queue_agent_without_a_sandbox_is_held_not_run_on_the_host() {
+        let _state = crate::testenv::IsolatedState::new();
         let repo = tempfile::tempdir().unwrap();
         let full: thegn_core::config::Config = toml::from_str(
             r#"
