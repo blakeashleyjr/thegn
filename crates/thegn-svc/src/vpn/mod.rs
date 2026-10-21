@@ -20,6 +20,7 @@
 //! `test/smoke.sh`).
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -30,6 +31,40 @@ use thegn_core::config::{VpnDnsMode, VpnMode, VpnProviderKind};
 use thegn_core::sandbox::{VpnParams, VpnSpec};
 use thegn_core::sandbox_manage::{OWNED_LABEL, owner_label_arg};
 use thegn_core::secretref::{BareAs, SecretRef};
+
+pub const VPN_PLAN_LABEL: &str = "thegn.vpn.plan";
+
+/// A running sidecar was created from a different resolved tunnel plan.
+#[derive(Debug)]
+pub struct VpnSidecarDrift {
+    pub sidecar: String,
+    pub found: Option<String>,
+}
+
+impl std::fmt::Display for VpnSidecarDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.found.is_none() {
+            write!(
+                f,
+                "vpn: sidecar {} is running with a different tunnel configuration (provider, credentials, routes or image changed, or an unlabelled pre-upgrade sidecar)",
+                self.sidecar
+            )?;
+        } else {
+            write!(
+                f,
+                "vpn: sidecar {} is running with a different tunnel configuration (provider, credentials, routes or image changed)",
+                self.sidecar
+            )?;
+        }
+        write!(
+            f,
+            "; stop this worktree's sandbox (close the worktree, or remove both the worktree container and {}) so both are recreated with the new configuration",
+            self.sidecar
+        )
+    }
+}
+
+impl std::error::Error for VpnSidecarDrift {}
 
 /// How to invoke the container CLI for the sidecar — the same runtime the
 /// worktree container uses, so the two share a user namespace and `--network
@@ -159,6 +194,65 @@ pub struct SidecarPlan {
     pub ready: ReadyProbe,
     /// Whether the worktree must use a proxy (userspace mode) and at what address.
     pub proxy: Option<Proxy>,
+}
+
+/// Fingerprint the complete resolved sidecar plan without exposing its values.
+pub(crate) fn plan_fingerprint(plan: &SidecarPlan) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"thegn/vpn-sidecar-plan/v1\0");
+    hash_plan_field(&mut hash, "image", plan.image.as_bytes());
+    for flag in &plan.run_flags {
+        hash_plan_field(&mut hash, "run-flag", flag.as_bytes());
+    }
+    for (key, value) in &plan.env {
+        hash_plan_field(&mut hash, "env-key", key.as_bytes());
+        hash_plan_field(&mut hash, "env-value", value.as_bytes());
+    }
+    for (host, dest) in &plan.mounts {
+        hash_plan_field(&mut hash, "mount-host", host.as_bytes());
+        hash_plan_field(&mut hash, "mount-dest", dest.as_bytes());
+    }
+    for file in &plan.files {
+        hash_plan_field(&mut hash, "file-dest", file.dest.as_bytes());
+        hash_plan_field(&mut hash, "file-contents", file.contents.as_bytes());
+    }
+    for arg in &plan.command {
+        hash_plan_field(&mut hash, "command-arg", arg.as_bytes());
+    }
+    for arg in &plan.ready.argv {
+        hash_plan_field(&mut hash, "ready-argv", arg.as_bytes());
+    }
+    match &plan.ready.when {
+        ReadyWhen::ExitZero => hash_plan_field(&mut hash, "ready-when", b"exit-zero"),
+        ReadyWhen::StdoutContains(text) => {
+            hash_plan_field(&mut hash, "ready-when", b"stdout-contains");
+            hash_plan_field(&mut hash, "ready-stdout-contains", text.as_bytes());
+        }
+    }
+    match &plan.proxy {
+        Some(proxy) => {
+            hash_plan_field(&mut hash, "proxy", b"some");
+            hash_plan_field(&mut hash, "proxy-all", proxy.all_proxy.as_bytes());
+            for entry in &proxy.no_proxy {
+                hash_plan_field(&mut hash, "proxy-no", entry.as_bytes());
+            }
+        }
+        None => hash_plan_field(&mut hash, "proxy", b"none"),
+    }
+    let digest = hash.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
+}
+
+fn hash_plan_field(hash: &mut Sha256, name: &str, value: &[u8]) {
+    hash.update((name.len() as u64).to_be_bytes());
+    hash.update(name.as_bytes());
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }
 
 /// The VPN provider seam. One built-in impl ([`BuiltinProvider`]) dispatches on
@@ -727,9 +821,16 @@ fn deregister_argv(spec: &VpnSpec) -> Option<Vec<String>> {
 
 /// Bring up the sidecar: materialize secret files (0600), then `run -d`.
 fn run_sidecar(rt: &OciRuntime, plan: &SidecarPlan) -> Result<()> {
-    // Already running? `run` would fail on the name clash; treat as idempotent.
-    if sidecar_running(rt, &plan.container) {
-        return Ok(());
+    let want = plan_fingerprint(plan);
+    match existing_sidecar(rt, &plan.container) {
+        ExistingSidecar::Running { plan: Some(found) } if found == want => return Ok(()),
+        ExistingSidecar::Running { plan: found } => {
+            return Err(anyhow::Error::new(VpnSidecarDrift {
+                sidecar: plan.container.clone(),
+                found,
+            }));
+        }
+        ExistingSidecar::NotRunning => {}
     }
     // A container that EXISTS but isn't running (Exited/Created — crashed daemon,
     // host reboot, thegn killed mid-teardown) also clashes on `--name`. Remove
@@ -773,6 +874,10 @@ fn sidecar_run_args(
     ];
     args.extend(["--label".into(), OWNED_LABEL.into()]);
     args.extend(["--label".into(), owner_label_arg()]);
+    args.extend([
+        "--label".into(),
+        format!("{VPN_PLAN_LABEL}={}", plan_fingerprint(plan)),
+    ]);
     args.extend(plan.run_flags.iter().cloned());
     if let Some(path) = env_file {
         args.push("--env-file".into());
@@ -955,14 +1060,44 @@ fn state_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Is the sidecar already running? (`inspect` exits 0 only for live containers.)
-fn sidecar_running(rt: &OciRuntime, container: &str) -> bool {
-    let argv = rt.argv(&["inspect", "-f", "{{.State.Running}}", container]);
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingSidecar {
+    NotRunning,
+    Running { plan: Option<String> },
+}
+
+fn classify_existing(stdout: &str) -> ExistingSidecar {
+    let Some((running, plan)) = stdout.trim().split_once('|') else {
+        return if stdout.trim() == "true" {
+            ExistingSidecar::Running { plan: None }
+        } else {
+            ExistingSidecar::NotRunning
+        };
+    };
+    if running != "true" {
+        return ExistingSidecar::NotRunning;
+    }
+    let plan = match plan.trim() {
+        "" | "<no value>" => None,
+        label => Some(label.to_string()),
+    };
+    ExistingSidecar::Running { plan }
+}
+
+/// Read both liveness and the plan label in one bounded runtime inspection.
+fn existing_sidecar(rt: &OciRuntime, container: &str) -> ExistingSidecar {
+    let argv = rt.argv(&[
+        "inspect",
+        "-f",
+        "{{.State.Running}}|{{index .Config.Labels \"thegn.vpn.plan\"}}",
+        container,
+    ]);
     match run_bounded(&argv, INSPECT_TIMEOUT, 128, 0) {
-        Ok(out) => out.success && out.stdout.trim() == "true",
+        Ok(out) if out.success => classify_existing(&out.stdout),
+        Ok(_) => ExistingSidecar::NotRunning,
         Err(error) => {
             tracing::debug!(target: "thegn::vpn", %error, "sidecar inspect failed");
-            false
+            ExistingSidecar::NotRunning
         }
     }
 }
