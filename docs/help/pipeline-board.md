@@ -146,6 +146,16 @@ result is not accepted as proof. Completion of a stage with an artifact is
 refused while thegn cannot read the worktree's git status; retry when it can,
 or record an explicit forced completion.
 
+Before `thegn dispatch set-status <row> done`, the Lead runs
+`thegn dispatch gate <row>` to record an attestation for the committed HEAD;
+without a satisfied attestation, normal completion is refused. If a worker is
+gone and its report claims PASS without an attestation for its HEAD, the reaper
+returns the row as `needs-decision` for the Lead. A live Lead lease binds claims
+and status changes to its owner; see [[cli]] for `--lease`, `--owner`, and the
+audited `--admin --why` override. If the stage or effective agent configuration
+changes between claim and launch, launch is refused and the row is marked
+`failed` for retry.
+
 Progress notes are limited to 2,000 notes and 2 MiB of text per dispatch row.
 Further `thegn dispatch note` requests are refused with a pointer to
 `thegn dispatch report`, and status JSON marks a truncated note list.

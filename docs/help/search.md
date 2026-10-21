@@ -33,6 +33,10 @@ The [[command-palette]] handles files. `/` greps **contents** in the
 focused worktree; `>` fuzzy-matches **paths**. Both open what you pick in
 the drawer or an editor pane.
 
+Content search matches the query as literal text, ignoring case unless the
+query contains an uppercase letter. It honours `.gitignore`, includes dotfiles,
+and skips `.git`, symlinks, binary files, and files over 2 MiB.
+
 This is the one people mix up: `Ctrl-/` searches what your terminals
 _printed_, the palette's `/` searches what is _on disk_.
 
