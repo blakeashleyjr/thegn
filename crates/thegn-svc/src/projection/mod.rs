@@ -103,7 +103,7 @@ fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
     }
     manifest::claim_or_verify(spec)?;
     let argv = sshfs_mount_argv_for(s, &spec.remote_dir, &spec.mountpoint);
-    run(&argv)?;
+    run_sshfs_mount(&argv, &spec.mountpoint)?;
     Ok(Mounted {
         local_cwd: Some(spec.mountpoint.clone()),
     })
@@ -357,6 +357,123 @@ fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
     Ok(())
 }
 
+/// Planner value for a slow ssh handshake plus FUSE setup, not a measured ceiling.
+const SSHFS_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn run_sshfs_mount(argv: &[String], mountpoint: &str) -> Result<()> {
+    run_mount_bounded(argv, SSHFS_MOUNT_TIMEOUT, || {
+        run_unmount_bounded(&SshPlacement::sshfs_unmount_argv(mountpoint))
+    })
+}
+
+fn run_mount_bounded(
+    argv: &[String],
+    timeout: std::time::Duration,
+    rollback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if argv.is_empty() {
+        bail!("empty projection argv");
+    }
+
+    let stderr_file = tempfile::tempfile().map_err(|error| {
+        anyhow::anyhow!("{} failed: could not capture stderr: {error}", argv[0])
+    })?;
+    let stderr_reader = stderr_file.try_clone().map_err(|error| {
+        anyhow::anyhow!("{} failed: could not capture stderr: {error}", argv[0])
+    })?;
+    let started = std::time::Instant::now();
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("{} failed: could not run: {error}", argv[0]))?;
+    let deadline = started + timeout;
+    let mut interval = thegn_proc::POLL_INTERVAL;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let tail = stderr_tail(stderr_reader)?;
+                if tail.is_empty() {
+                    bail!("{} failed: exited with {status}", argv[0]);
+                }
+                bail!("{} failed: exited with {status}: {tail}", argv[0]);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let kill_error = match child.kill() {
+                    Ok(()) => None,
+                    Err(kill_error) if kill_error.kind() == std::io::ErrorKind::InvalidInput => {
+                        None
+                    }
+                    Err(kill_error) => Some(kill_error),
+                };
+                let wait_error = child.wait().err();
+                let cleanup = kill_error
+                    .map(|kill_error| format!("; could not kill child: {kill_error}"))
+                    .unwrap_or_default();
+                let cleanup = wait_error
+                    .map(|wait_error| format!("{cleanup}; could not reap child: {wait_error}"))
+                    .unwrap_or(cleanup);
+                bail!("{} failed: could not wait: {error}{cleanup}", argv[0]);
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(interval.min(remaining));
+        interval = thegn_proc::next_backoff(interval, remaining);
+    }
+
+    let kill_error = match child.kill() {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => None,
+        Err(error) => Some(error),
+    };
+    let wait_result = child.wait();
+    let mut message = format!(
+        "{} failed: timed out after {}s",
+        argv[0],
+        timeout.as_secs_f64()
+    );
+    match stderr_tail(stderr_reader) {
+        Ok(tail) if !tail.is_empty() => {
+            message.push_str(": ");
+            message.push_str(&tail);
+        }
+        Ok(_) => {}
+        Err(error) => message.push_str(&format!("; could not read stderr tail: {error}")),
+    }
+    if let Some(error) = kill_error {
+        message.push_str(&format!("; could not kill child: {error}"));
+    }
+    if let Err(error) = wait_result {
+        message.push_str(&format!("; could not reap child: {error}"));
+    }
+    if let Err(error) = rollback() {
+        message.push_str(&format!("; rollback unmount also failed: {error}"));
+    }
+    Err(anyhow::anyhow!(message))
+}
+
+fn stderr_tail(mut file: std::fs::File) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let len = file.metadata()?.len().min(4096);
+    file.seek(SeekFrom::End(-i64::try_from(len)?))?;
+    let mut bytes = Vec::with_capacity(usize::try_from(len)?);
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
 /// Planner value for large pulls over slow links, not a measured ceiling.
 const RSYNC_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -557,22 +674,6 @@ fn push_sync(spec: &ProjectionSpec) -> Result<()> {
     argv.push(local_dir(&spec.mountpoint));
     argv.push(rsync_remote(s, &spec.remote_dir));
     run_rsync_push(&argv)
-}
-
-/// Run the sshfs mount argv to completion. Kept direct because its ssh transport
-/// child must outlive the sshfs leader; see THE-251.
-fn run(argv: &[String]) -> Result<()> {
-    if argv.is_empty() {
-        bail!("empty projection argv");
-    }
-    let status = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .map_err(|e| anyhow::anyhow!("could not run {}: {e}", argv[0]))?;
-    if !status.success() {
-        bail!("{} exited with {status}", argv[0]);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1174,5 +1275,105 @@ mod tests {
     #[test]
     fn bounded_transport_accepts_success() {
         assert!(run_bounded(&["true".into()], std::time::Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn sshfs_mount_runner_times_out_reaps_and_rolls_back() {
+        let rolled = std::cell::Cell::new(false);
+        let started = std::time::Instant::now();
+        let result = run_mount_bounded(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            std::time::Duration::from_millis(300),
+            || {
+                rolled.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(rolled.get());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sshfs_mount_runner_rollback_failure_is_visible() {
+        let result = run_mount_bounded(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            std::time::Duration::from_millis(300),
+            || Err(anyhow::anyhow!("fusermount boom")),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("fusermount boom"));
+    }
+
+    #[test]
+    fn sshfs_mount_runner_returns_when_the_leader_daemonizes() {
+        let rolled = std::cell::Cell::new(false);
+        let started = std::time::Instant::now();
+        let result = run_mount_bounded(
+            &["sh".into(), "-c".into(), "sleep 30 & exit 0".into()],
+            std::time::Duration::from_secs(5),
+            || {
+                rolled.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(!rolled.get());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn sshfs_mount_runner_reports_nonzero_exit_with_stderr_tail() {
+        let rolled = std::cell::Cell::new(false);
+        let result = run_mount_bounded(
+            &["sh".into(), "-c".into(), "echo boom >&2; exit 3".into()],
+            std::time::Duration::from_secs(5),
+            || {
+                rolled.set(true);
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("boom"));
+        assert!(error.contains("exited with"));
+        assert!(!rolled.get());
+    }
+
+    #[test]
+    fn sshfs_mount_runner_caps_the_stderr_tail() {
+        let result = run_mount_bounded(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "yes x | head -c 100000 >&2; echo END >&2; exit 1".into(),
+            ],
+            std::time::Duration::from_secs(5),
+            || Ok(()),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("END"));
+        assert!(error.len() < 4096 + 200);
+    }
+
+    #[test]
+    fn sshfs_mount_runner_reports_a_missing_binary() {
+        let rolled = std::cell::Cell::new(false);
+        let result = run_mount_bounded(
+            &["thegn-no-such-binary-xyz".into()],
+            std::time::Duration::from_secs(2),
+            || {
+                rolled.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.unwrap_err().to_string().contains("could not run"));
+        assert!(!rolled.get());
     }
 }
