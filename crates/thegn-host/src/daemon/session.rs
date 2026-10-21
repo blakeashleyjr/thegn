@@ -540,6 +540,8 @@ impl SessionActor {
             self.record_truncated = Some(reason.to_string());
         }
 
+        self.drain_mailbox_after_exit(&mut msg_rx);
+
         // Bury the corpse BEFORE anything observable. The ordering is the whole
         // fix for a real, reproduced bug: a `wait` woken by the exit event
         // re-queries the session table, and if the entry has already been
@@ -1182,6 +1184,32 @@ impl SessionActor {
         }
     }
 
+    fn answer_after_exit(&mut self, msg: SessionMsg) {
+        if let SessionMsg::Record { spec, reply } = msg {
+            let result = match spec {
+                RecordSpec::Start => Err(ControlError::Conflict(format!(
+                    "session {} ended; recording not started",
+                    self.meta.id
+                ))),
+                RecordSpec::Stop | RecordSpec::Status => Ok(self.record_status()),
+            };
+            if reply.send(result).is_err() {
+                tracing::debug!(
+                    target: "thegn::daemon",
+                    session = %self.meta.id,
+                    "record reply receiver closed after session exit"
+                );
+            }
+        }
+    }
+
+    fn drain_mailbox_after_exit(&mut self, msg_rx: &mut mpsc::Receiver<SessionMsg>) {
+        msg_rx.close();
+        while let Ok(msg) = msg_rx.try_recv() {
+            self.answer_after_exit(msg);
+        }
+    }
+
     /// Stop admission and detach finalization from the actor. The worker's
     /// bounded wait completes off-runtime and reports back through the mailbox.
     fn finalize_recording(&mut self) {
@@ -1734,7 +1762,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
-        let mut h = spawn_actor_cfg("sleep 0.2; printf finished; exit 0", None, "sh", cfg);
+        let mut h = spawn_actor_cfg("read line; printf finished; exit 0", None, "sh", cfg);
 
         let (start_tx, start_rx) = oneshot::channel();
         h.msg_tx
@@ -1759,10 +1787,16 @@ mod tests {
             })
             .await
             .expect("actor accepts recording stop");
-        stop_rx
+        tokio::time::timeout(std::time::Duration::from_secs(2), stop_rx)
             .await
+            .expect("recording stop reply")
             .expect("actor replies")
             .expect("recording stops");
+
+        h.msg_tx
+            .send(SessionMsg::Stdin(b"go\n".to_vec()))
+            .await
+            .expect("actor accepts stdin");
 
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
             loop {
@@ -1788,6 +1822,76 @@ mod tests {
         for line in lines {
             serde_json::from_str::<serde_json::Value>(line).unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopped_recording_reply_survives_session_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.recording.dir = tmp.path().to_string_lossy().into_owned();
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            mut msg_rx,
+            mut harness,
+        } = build_actor_cfg("cat", None, "sh", cfg);
+        let (completed_tx, _completed_rx) = mpsc::unbounded_channel();
+        actor.recording_done_tx = Some(completed_tx);
+
+        let started = actor
+            .on_record(RecordSpec::Start)
+            .expect("recording starts");
+        let cast_path = started.path.expect("recording path");
+        let (stop_tx, stop_rx) = oneshot::channel();
+        harness
+            .msg_tx
+            .send(SessionMsg::Record {
+                spec: RecordSpec::Stop,
+                reply: stop_tx,
+            })
+            .await
+            .expect("actor accepts recording stop");
+        let (start_tx, start_rx) = oneshot::channel();
+        harness
+            .msg_tx
+            .send(SessionMsg::Record {
+                spec: RecordSpec::Start,
+                reply: start_tx,
+            })
+            .await
+            .expect("actor accepts queued recording start");
+
+        actor.drain_mailbox_after_exit(&mut msg_rx);
+
+        let stopped = stop_rx
+            .await
+            .expect("actor answers queued stop")
+            .expect("stop status");
+        assert!(!stopped.recording, "stop status is finalized");
+        assert_eq!(
+            stopped.path.as_deref(),
+            Some(cast_path.as_str()),
+            "stop status retains the finalized recording path"
+        );
+        assert!(matches!(
+            start_rx.await.expect("actor answers queued start"),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(
+            harness.msg_tx.send(SessionMsg::Kill).await.is_err(),
+            "exit drain closes the mailbox"
+        );
+
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(harness.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actor tears down after test");
     }
 
     async fn attach(
