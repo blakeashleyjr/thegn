@@ -83,11 +83,13 @@ The transferable set SHALL additionally include the source worktree
 registration when present, selected sidebar ui_state rows under the exact
 collapse:<group>, pin:<group>, and pin_ordinal:<group> segments, every
 agent_dispatches row for the path, its agent_dispatch_notes, and only the
-active session's session_state.pin_state. It MUST preserve opaque pane
-commands, cwd data, scrollback, dispatch reports, artifact/chunk paths, and
-notes without printing their contents. It MUST exclude session_attention,
-whole-session active-tab state, and all unrelated rows. Worktree paths, artifact
-paths, branches, group ordinals, and tab ordinals remain unchanged.
+active session's session_state.pin_state. It MUST preserve cwd data without
+printing its contents. By default, it MUST drop pane commands, scrollback,
+dispatch reports, free-form dispatch notes, and dispatch note rows. With
+`--include-history`, it MUST preserve those content-history fields without
+printing their contents. Artifact and chunk paths are dropped. It MUST exclude
+session_attention, whole-session active-tab state, and all unrelated rows.
+Worktree paths, branches, group ordinals, and tab ordinals remain unchanged.
 
 The move is cold by definition. Live source daemon sessions are the union of
 sessions owning the exact worktree, daemon ids referenced by selected pane
@@ -148,10 +150,11 @@ source deletion; a different prior import MUST abort.
 journal-mode change, WAL, journal, or schema-file side effect. It MUST report
 the source/target profiles, exact worktree, selected groups, row counts, live
 and would-be-killed ids, conflict result, and an opaque-payload warning stating
-that pane commands, scrollback, dispatch reports, and notes are carried
-unchanged and are not included in the audit. This warning and all audit fields
-MUST be present in human and JSON output, including when no live sessions
-exist. Neither output mode may serialize opaque row contents or credentials.
+that pane commands, scrollback, dispatch reports, and notes are dropped by
+default unless `--include-history` is passed; their contents are not included
+in the audit. This warning and all audit fields MUST be present in human and
+JSON output, including when no live sessions exist. Neither output mode may
+serialize opaque row contents or credentials.
 
 After confirmed cleanup, target daemon notification is best effort and is
 reported as sent, unavailable, or failed; notification failure MUST NOT undo a

@@ -7,10 +7,10 @@ use crate::db::Db;
 use crate::issue::DispatchNote;
 use crate::models::{GroupTabRow, TabGroupRow};
 use crate::session_migration::{
-    HistoryPolicy, MigrationBundle, MigrationCleanupResult, MigrationCounts, MigrationDispatch,
-    MigrationGroup, MigrationImportResult, MigrationNote, MigrationPlan, MigrationTarget,
-    MigrationUiState, MigrationWorktree, imported_bundle, make_bundle, migration_tab,
-    persisted_group, persisted_tab, select_groups, select_sidebar_state,
+    MigrationBundle, MigrationCleanupResult, MigrationCounts, MigrationDispatch, MigrationGroup,
+    MigrationImportResult, MigrationNote, MigrationPlan, MigrationTarget, MigrationUiState,
+    MigrationWorktree, imported_bundle, make_bundle, migration_tab, persisted_group, persisted_tab,
+    select_groups, select_sidebar_state,
 };
 use crate::store::SessionMigrationStore;
 use anyhow::Result;
@@ -517,7 +517,7 @@ fn session_pin(db: &Db, session: &str) -> Result<(Option<String>, Option<i64>)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_migration::{MigrationConflict, plan_migration};
+    use crate::session_migration::{HistoryPolicy, MigrationConflict, plan_migration};
     use crate::store::SessionMigrationStore;
 
     fn history_fixture() -> (Db, Db, MigrationBundle) {
