@@ -15,9 +15,10 @@
 //! Pipe names are derived from the same per-state-dir socket *path* the unix
 //! side uses (`\\.\pipe\thegn-v2-<hex(sha256(identity))[..32]>`). The
 //! `thegn/daemon-pipe/v2\0` domain and 128-bit digest prefix bind the name to a
-//! normalized Windows path identity; display strings are diagnostic only and
-//! are never identity keys. The derivation and endpoint classification are
-//! pure and unit-tested on every platform; only the syscalls are `#[cfg]`-gated.
+//! normalized Windows path identity (Unix callers use the socket path itself);
+//! display strings are diagnostic only and are never identity keys. The
+//! derivation and endpoint classification are pure and unit-tested on every
+//! platform; only the syscalls are `#[cfg]`-gated.
 //! A pre-upgrade Windows daemon keeps its old pipe name and is reached through
 //! its registry row; after it stops, new daemons use the v2 name.
 //!
@@ -110,10 +111,8 @@ fn pipe_identity_bytes(path: &Path) -> Vec<u8> {
 
     let path = path.replace('/', "\\");
     let path = if let Some(verbatim_path) = path.strip_prefix(r"\\?\") {
-        let prefix = verbatim_path.get(..4);
-        if prefix
-            .is_some_and(|prefix| prefix[..3].eq_ignore_ascii_case("UNC") && prefix.ends_with('\\'))
-        {
+        let bytes = verbatim_path.as_bytes();
+        if bytes.len() >= 4 && bytes[..3].eq_ignore_ascii_case(b"UNC") && bytes[3] == b'\\' {
             format!(r"\\{}", &verbatim_path[4..])
         } else {
             verbatim_path.to_owned()
@@ -1036,6 +1035,14 @@ mod tests {
         let other = pipe_name_for_path(Path::new(r"\\server\share\other\daemon.sock"));
         assert_eq!(verbatim, plain);
         assert_ne!(plain, other);
+    }
+
+    #[test]
+    fn pipe_name_tolerates_multibyte_after_verbatim_prefix() {
+        for path in [r"\\?\a界\x", r"\\?\abé\x"] {
+            let name = pipe_name_for_path(Path::new(path));
+            assert!(name.starts_with(r"\\.\pipe\thegn-v2-"), "{name}");
+        }
     }
 
     #[cfg(unix)]
