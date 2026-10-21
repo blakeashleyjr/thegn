@@ -594,9 +594,11 @@ mod tests {
         })
     }
 
+    type PendingWatch = Option<Result<Option<Box<dyn MediaWatch + Send>>, MediaError>>;
+
     struct PlayersBackend {
         players: Result<Vec<String>, MediaError>,
-        watch: Mutex<Option<Result<Option<Box<dyn MediaWatch + Send>>, MediaError>>>,
+        watch: Mutex<PendingWatch>,
     }
 
     impl MediaBackend for PlayersBackend {
