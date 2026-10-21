@@ -840,14 +840,18 @@ jobs:
             elif [ "$OUTCOME" = unchanged ]; then
               echo "Homebrew: unchanged at ${OLD_TIP:- (unborn)}"
             elif [ "$READY" = true ]; then
-              if [ "$OBSERVED_TIP" = unknown ]; then
+              if [ -z "$BRANCH" ]; then
+                echo "Homebrew: FAILED before the target was cloned; remote state unknown"
+              elif [ "$OBSERVED_TIP" = unknown ]; then
                 remote_state="unknown"
               elif [ "$OBSERVED_TIP" = "$OLD_TIP" ]; then
                 remote_state="unchanged at ${OBSERVED_TIP:- (absent)}"
               else
                 remote_state="moved to ${OBSERVED_TIP:- (absent)}"
               fi
-              echo "Homebrew: FAILED; target tip observed before push ${OLD_TIP:-unknown}; remote $remote_state"
+              if [ -n "$BRANCH" ]; then
+                echo "Homebrew: FAILED; target tip observed before push ${OLD_TIP:-unknown}; remote $remote_state"
+              fi
             else
               echo "Homebrew publication remains pending; see the actionable warning above."
             fi
@@ -1044,14 +1048,18 @@ jobs:
             elif [ "$OUTCOME" = unchanged ]; then
               echo "AUR: unchanged at ${OLD_TIP:- (unborn)}"
             elif [ "$READY" = true ]; then
-              if [ "$OBSERVED_TIP" = unknown ]; then
+              if [ -z "$BRANCH" ]; then
+                echo "AUR: FAILED before the target was cloned; remote state unknown"
+              elif [ "$OBSERVED_TIP" = unknown ]; then
                 remote_state="unknown"
               elif [ "$OBSERVED_TIP" = "$OLD_TIP" ]; then
                 remote_state="unchanged at ${OBSERVED_TIP:- (absent)}"
               else
                 remote_state="moved to ${OBSERVED_TIP:- (absent)}"
               fi
-              echo "AUR: FAILED; target tip observed before push ${OLD_TIP:-unknown}; remote $remote_state"
+              if [ -n "$BRANCH" ]; then
+                echo "AUR: FAILED; target tip observed before push ${OLD_TIP:-unknown}; remote $remote_state"
+              fi
             else
               echo "AUR publication remains pending; see the actionable warning above."
             fi
