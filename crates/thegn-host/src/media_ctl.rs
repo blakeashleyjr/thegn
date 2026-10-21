@@ -11,7 +11,7 @@ use termwiz::terminal::TerminalWaker;
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
 
 const MAX_PENDING_MEDIA_OPS: usize = 8;
-pub(crate) const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const MEDIA_OP_BUDGET: Duration = thegn_media::MEDIA_OP_BUDGET;
 
 pub(crate) static MEDIA_DELIVERY_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1309,5 +1309,10 @@ mod tests {
 
         assert!(ran.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn media_op_budget_is_the_backend_budget() {
+        assert_eq!(super::MEDIA_OP_BUDGET, thegn_media::MEDIA_OP_BUDGET);
     }
 }
