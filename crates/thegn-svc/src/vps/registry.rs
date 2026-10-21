@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const RESERVE_LOCK: &str = ".reserve.lock";
+pub const BAKE_NAME_PREFIX: &str = "tg-bake-";
 
 #[derive(Debug, Default)]
 pub struct LedgerView {
@@ -118,6 +119,17 @@ pub struct VpsRecord {
     pub ip: String,
     /// Unix seconds at intent time (the reaper's stale-`creating` clock).
     pub created_at: i64,
+}
+
+/// Whether `name` is a bake source name: the fixed prefix and exactly sixteen
+/// lowercase hexadecimal digits.
+pub fn is_bake_name(name: &str) -> bool {
+    name.strip_prefix(BAKE_NAME_PREFIX).is_some_and(|suffix| {
+        suffix.len() == 16
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// The registry directory (created on demand).
@@ -912,5 +924,16 @@ mod tests {
         guard.preserve();
         drop(guard);
         assert_eq!(read_at(dir, "preserve").unwrap().state, "creating");
+    }
+
+    #[test]
+    fn bake_names_are_recognised_exactly() {
+        assert!(is_bake_name("tg-bake-00010203fafbfeff"));
+        assert!(!is_bake_name("tg-bake-00010203fafbfee"));
+        assert!(!is_bake_name("tg-bake-00010203fafbfeff0"));
+        assert!(!is_bake_name("tg-bake-00010203FAFBFEFF"));
+        assert!(!is_bake_name("tg-bake-0001020304050607.x"));
+        assert!(!is_bake_name("tg-auto-cx32-ab"));
+        assert!(!is_bake_name(""));
     }
 }
