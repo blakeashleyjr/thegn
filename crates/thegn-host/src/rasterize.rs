@@ -420,22 +420,20 @@ fn mermaid_args(input: &Path, output: &Path) -> Vec<OsString> {
 }
 
 fn read_mermaid_output(stage_root: &Path, name: &str, cap: u64) -> Result<Raster, String> {
-    let result = (|| {
-        let file =
-            crate::platform::open_beneath::open_regular_beneath(stage_root, Path::new(name))?;
-        let meta = file.metadata()?;
-        thegn_core::fsperm::ensure_single_link_regular_file(&meta)?;
-        if !thegn_core::fsperm::owned_by_current_user(&meta) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "not owned by the current user",
-            ));
-        }
-        read_open_regular_capped(file, cap)
-    })()
-    .map_err(|e| format!("mmdc output read failed: {e}"))?;
+    let file = crate::platform::open_beneath::open_regular_beneath(stage_root, Path::new(name))
+        .map_err(|e| format!("mmdc output read failed: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("mmdc output read failed: {e}"))?;
+    thegn_core::fsperm::ensure_single_link_regular_file(&meta)
+        .map_err(|e| format!("mmdc output read failed: {e}"))?;
+    if !thegn_core::fsperm::owned_by_current_user(&meta) {
+        return Err("mmdc output read failed: not owned by the current user".to_string());
+    }
+    let bytes =
+        read_open_regular_capped(file, cap).map_err(|e| format!("mmdc output read failed: {e}"))?;
 
-    decode_and_fit(&result, PREVIEW_LIMITS)
+    decode_and_fit(&bytes, PREVIEW_LIMITS)
 }
 
 fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
