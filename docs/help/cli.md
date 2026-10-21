@@ -213,8 +213,8 @@ best effort and a warning cannot undo a confirmed move.
 - `thegn land` is the blessed one-shot: fold, gate, advance `main`.
 - `thegn pr merge` reads the worktree's PR, then confirms `#N` at its head;
   pass `--yes` (`-y`) without a TTY. It merges only that reviewed head, prints
-  “PR merged” only on confirmation, and exits non-zero if the head moves, the
-  forge refuses, or the result is unknown.
+  “PR merged” only when the forge confirms the merge, and exits non-zero if
+  the head moves, the forge refuses, or the result is unknown.
 
 None of these check the target out, which is what makes them safe against
 a running instance. See [[merge-queue]] for the whole flow.

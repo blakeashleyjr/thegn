@@ -134,7 +134,6 @@ destination that already exists is refused rather than reused, and a rename
 whose `git worktree move` fails rolls the branch rename back. Each rename
 writes an owner-only intent record in the repository Git directory; the next
 rename resolves an interrupted move or refuses an ambiguous state and keeps the
-record.
-A path that is not a registered worktree on the old branch is refused. Worktree
-tabs are named `<repo>/<exact branch>`. See the [[config-reference]] for every
-knob.
+record. A path that is not a registered worktree on the old branch is refused.
+Worktree tabs are named `<repo>/<exact branch>`. See the [[config-reference]]
+for every knob.
