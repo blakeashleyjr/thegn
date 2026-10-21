@@ -547,7 +547,8 @@
     },
     {
       "change": "authenticate-pr-agent-authorship",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-authenticate-pr-agent-authorship/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1312,7 +1313,8 @@
     },
     {
       "change": "verify-sandbox-mounts",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-verify-sandbox-mounts/",
+      "lifecycle": "archived",
       "disposition": "residual-split",
       "owners": [
         {
@@ -1320,7 +1322,7 @@
           "project": "Cross-Platform Support & Verification"
         }
       ],
-      "summary": "Preflight and remedies shipped; Docker Desktop and WSL mount fixtures remain unverified."
+      "summary": "Preflight and remedies shipped; Docker Desktop and WSL binds are excluded/best-effort (THE-124)."
     },
     {
       "change": "verify-stage-worker-containment",

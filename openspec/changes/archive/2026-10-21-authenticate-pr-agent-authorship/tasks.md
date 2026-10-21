@@ -9,4 +9,5 @@
 - [x] Complete primary and independent review of the implemented authorship boundary and THE-634 direct handoff; resolve scoped revisions.
 - [x] Complete repository gates and authorized local-main landing.
 
-- [ ] THE-545: bind actual dispatch/mutations to immutable credential/account/configuration generation; THE-634 repeated proof does not establish this guarantee.
+- [x] THE-545: bind actual dispatch/mutations to immutable credential/account/configuration generation; THE-634 repeated proof does not establish this guarantee.
+      Superseded by THE-233 (owner decision 2026-10-20); the re-verification follow-up is THE-1057.

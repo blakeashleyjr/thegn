@@ -163,13 +163,6 @@
       ]
     },
     {
-      "issue": "THE-124",
-      "project": "Cross-Platform Support & Verification",
-      "changes": [
-        "verify-sandbox-mounts"
-      ]
-    },
-    {
       "issue": "THE-125",
       "project": "Agent & Workflow Platform",
       "changes": [
@@ -373,13 +366,6 @@
       ]
     },
     {
-      "issue": "THE-545",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "authenticate-pr-agent-authorship"
-      ]
-    },
-    {
       "issue": "THE-559",
       "project": "Workspace Product & Observability",
       "changes": [
@@ -517,13 +503,6 @@
       "project": "Workspace Product & Observability",
       "changes": [
         "repair-performance-evidence-and-log-tail"
-      ]
-    },
-    {
-      "issue": "THE-634",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "authenticate-pr-agent-authorship"
       ]
     },
     {
