@@ -354,8 +354,11 @@ pub struct CalendarAccount {
     pub url: String,
     /// `caldav`: username for Basic auth.
     pub username: String,
-    /// `ics_url` / `caldav`: secret ref (`"env:VAR"` / `"file:PATH"`), resolved
-    /// at fetch time. Note the URL itself is often a credential too.
+    /// `ics_url` / `caldav`: secret ref (`keyring:NAME`, `env:VAR`, `file:PATH`,
+    /// or a literal value), resolved through the credential broker. A configured
+    /// reference that cannot be resolved fails the account fetch instead of
+    /// sending an unauthenticated request. Note the URL itself is often a
+    /// credential too.
     pub token: String,
     /// Permit intentional local/LAN calendar destinations. This is a trusted
     /// security boundary; unspecified, multicast, and broadcast destinations
