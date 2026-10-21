@@ -821,6 +821,7 @@ mod tests {
             ))),
             native_ids: Mutex::new(HashMap::new()),
             spawning_relaunches: Arc::new(Mutex::new(HashSet::new())),
+            launches: Mutex::new(crate::daemon::stage_launch::LaunchRegistry::default()),
             events,
             db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
             grace_ms: 0,
