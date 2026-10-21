@@ -138,6 +138,13 @@ pub(crate) enum AgentDispatch {
 }
 
 /// What happened when a headless agent was dispatched.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "the Windows stub only reports NotStarted (THE-235)"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentRunVerdict {
     /// The agent ran to an exit; `None` means it was killed by a signal.
@@ -669,6 +676,7 @@ pub(crate) mod bounded {
     }
 
     impl AgentRunOutcome {
+        #[cfg(test)]
         pub(crate) fn success(&self) -> bool {
             matches!(self, Self::Exited(status) if status.success())
         }

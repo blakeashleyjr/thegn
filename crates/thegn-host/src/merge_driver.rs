@@ -1163,6 +1163,7 @@ fn drive_queue_with(
                             sandbox,
                         );
                         if let Some(reason) = verdict.not_started() {
+                            let mut refund_failed = false;
                             if let Some(row_claim) = claim.borrow().as_ref() {
                                 match row_claim.refund_attempt(db) {
                                     Ok(true) => agent_runs = agent_runs.saturating_sub(1),
@@ -1184,10 +1185,13 @@ fn drive_queue_with(
                                         ));
                                         break 'attempt;
                                     }
-                                    Err(error) => out.persistence_errors.push(format!(
-                                        "{}: could not refund agent attempt: {error}",
-                                        item.worktree
-                                    )),
+                                    Err(error) => {
+                                        refund_failed = true;
+                                        out.persistence_errors.push(format!(
+                                            "{}: could not refund agent attempt: {error}",
+                                            item.worktree
+                                        ));
+                                    }
                                 }
                             } else {
                                 let refunded_runs = agent_runs.saturating_sub(1);
@@ -1198,12 +1202,12 @@ fn drive_queue_with(
                                         "{}: could not refund agent attempt: {error}",
                                         item.worktree
                                     ));
+                                    refund_failed = true;
                                 } else {
                                     agent_runs = refunded_runs;
                                 }
                             }
-                            let detail =
-                                format!("agent did not start: {reason}; held, no attempt spent");
+                            let detail = agent_not_started_detail(reason, refund_failed);
                             thegn_core::msg::warn(&detail);
                             let fields = set(db, MqStatus::AgentBlocked, None, Some(&detail));
                             stop_on_write_error!('attempt);
@@ -1349,6 +1353,14 @@ fn drive_queue_with(
 /// Unconditional: `agent_run::run` carries its own Windows stub, so this must
 /// not be cfg-gated — gating it left `drive_queue`'s dispatch arm calling a
 /// function that did not exist on the Windows target.
+fn agent_not_started_detail(reason: &str, refund_failed: bool) -> String {
+    if refund_failed {
+        format!("agent did not start: {reason}; held (attempt refund failed)")
+    } else {
+        format!("agent did not start: {reason}; held, no attempt spent")
+    }
+}
+
 fn run_agent(
     cfg: &MergeQueueConfig,
     command_template: &str,
@@ -1466,6 +1478,18 @@ fn tail_line(log: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refund_failure_detail_does_not_claim_the_attempt_was_refunded() {
+        assert_eq!(
+            agent_not_started_detail("spawn denied", true),
+            "agent did not start: spawn denied; held (attempt refund failed)"
+        );
+        assert_eq!(
+            agent_not_started_detail("spawn denied", false),
+            "agent did not start: spawn denied; held, no attempt spent"
+        );
+    }
 
     fn uncontained_config() -> Config {
         Config {
