@@ -1488,6 +1488,7 @@ SQL
   # database, and an unguarded read would abort the suite instead of failing
   # this check.
   cold_target_rows="$(sqlite3 "$COLD_TARGET_DB" "SELECT (SELECT count(*) FROM worktrees WHERE worktree='$COLD_WT'),(SELECT count(*) FROM tab_groups WHERE worktree='$COLD_WT'),(SELECT count(*) FROM group_tabs WHERE group_name='move-cold' AND pane_sessions IS NULL),(SELECT count(*) FROM ui_state WHERE key IN ('collapse:move-cold','pin:move-cold','pin_ordinal:move-cold')),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$COLD_WT' AND session_id IS NULL),(SELECT count(*) FROM agent_dispatch_notes),(SELECT count(*) FROM session_state WHERE session_name='default' AND pin_state='SMOKE_OPAQUE_PIN');" 2>/dev/null || echo no-target-db)"
+  cold_target_history="$(sqlite3 "$COLD_TARGET_DB" "SELECT (SELECT count(*) FROM group_tabs WHERE group_name='move-cold' AND (COALESCE(pane_cmds,'')<>'' OR COALESCE(scrollback_snapshot,'')<>'')),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$COLD_WT' AND report IS NOT NULL);" 2>/dev/null || echo no-target-db)"
   cold_head_after="$(git -C "$COLD_WT" rev-parse HEAD)"
   cold_git_after="$(git -C "$COLD_WT" worktree list --porcelain)"
   cold_git_status_after="$(git -C "$COLD_WT" status --porcelain)"
@@ -1497,9 +1498,28 @@ SQL
   check "session move cold removes selected source rows" \
     "[[ \"$cold_source_rows\" == '0|0|0|0|0|0|0' ]]"
   check "session move cold imports rows and clears daemon ids" \
-    "[[ \"$cold_target_rows\" == '1|1|1|3|1|1|1' ]]"
+    "[[ \"$cold_target_rows\" == '1|1|1|3|1|0|1' ]] && [[ \"$cold_target_history\" == '0|0' ]]"
   check "session move cold leaves git files and objects unchanged" \
     "[[ \"$cold_head_after\" == \"$cold_head_before\" ]] && [[ \"$cold_git_after\" == \"$cold_git_before\" ]] && [[ \"$cold_git_status_after\" == \"$cold_git_status_before\" ]] && [[ \"$cold_git_objects_after\" == \"$cold_git_objects_before\" ]]"
+
+  # The opt-in policy carries the opaque history into the target profile.
+  INCLUDE="$TMP/session-move-include"
+  init_move_case "$INCLUDE"
+  INCLUDE_WT="$INCLUDE/git-worktree"
+  git init -q "$INCLUDE_WT"
+  git -c commit.gpgsign=false -C "$INCLUDE_WT" commit -q --allow-empty -m move-include-smoke
+  seed_move_rows "$INCLUDE" "$INCLUDE_WT" move-include ""
+  INCLUDE_TARGET_DB="$INCLUDE/thegn/profiles/target/state/thegn/thegn.db"
+  set +e
+  # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+  include_out="$(move_cli "$INCLUDE" session move "$INCLUDE_WT" --to-profile target --include-history 2>&1)"
+  # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+  include_rc=$?
+  set -e
+  # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+  include_target_history="$(sqlite3 "$INCLUDE_TARGET_DB" "SELECT (SELECT count(*) FROM group_tabs WHERE group_name='move-include' AND pane_cmds<>'' AND scrollback_snapshot='SMOKE_OPAQUE_SCROLLBACK'),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$INCLUDE_WT' AND report='SMOKE_OPAQUE_REPORT'),(SELECT count(*) FROM agent_dispatch_notes WHERE text='SMOKE_OPAQUE_PROGRESS');" 2>/dev/null || echo no-target-db)"
+  check "session move --include-history carries opaque rows" \
+    "[[ \$include_rc -eq 0 ]] && grep -q 'target confirmed: true' <<<\"\$include_out\" && [[ \"\$include_target_history\" == '1|1|1' ]]"
 
   # --kill move: a real isolated daemon provides a controllable live session;
   # the command must kill/re-list it before importing the referenced pane row.

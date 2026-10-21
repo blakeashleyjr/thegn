@@ -165,7 +165,12 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     };
     let session = thegn_core::db::session();
     let bundle = source_db.migration_snapshot(&source.name, &target.name, &session, &worktree)?;
-    fill_bundle_audit(&mut audit, &bundle);
+    let history = if include_history {
+        HistoryPolicy::Include
+    } else {
+        HistoryPolicy::Drop
+    };
+    fill_bundle_audit(&mut audit, &bundle, history);
     if bundle.worktree.is_none() && bundle.groups.is_empty() && bundle.dispatches.is_empty() {
         return fail(
             &mut audit,
@@ -180,11 +185,6 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         .map(|db| db.migration_target_snapshot(&session, &worktree))
         .transpose()?
         .unwrap_or_default();
-    let history = if include_history {
-        HistoryPolicy::Include
-    } else {
-        HistoryPolicy::Drop
-    };
     let plan = match plan_migration(bundle, target_state, history) {
         Ok(plan) => plan,
         Err(conflict) => return fail(&mut audit, json, &conflict.to_string(), false),
@@ -279,7 +279,8 @@ fn source_migration_guard(
     profile::acquire_session_migration(source, worktree).map(Some)
 }
 
-fn fill_bundle_audit(audit: &mut MigrationAudit, bundle: &MigrationBundle) {
+fn fill_bundle_audit(audit: &mut MigrationAudit, bundle: &MigrationBundle, history: HistoryPolicy) {
+    let imported = thegn_core::session_migration::imported_bundle(bundle, history);
     audit.groups = bundle
         .groups
         .iter()
@@ -291,7 +292,7 @@ fn fill_bundle_audit(audit: &mut MigrationAudit, bundle: &MigrationBundle) {
         group_tabs: bundle.groups.iter().map(|group| group.tabs.len()).sum(),
         ui_state: bundle.ui_state.len(),
         dispatches: bundle.dispatches.len(),
-        dispatch_notes: bundle.notes.len(),
+        dispatch_notes: imported.notes.len(),
         attention: 0,
     };
 }
@@ -1158,12 +1159,20 @@ mod tests {
                 report: Some("SECRET_REPORT".into()),
                 chunk_scope: Some("SECRET_SCOPE".into()),
             }],
-            notes: Vec::new(),
+            notes: vec![thegn_core::session_migration::MigrationNote {
+                source_id: 1,
+                dispatch_id: 1,
+                created_at_ms: 1,
+                text: "SECRET_NOTE_ROW".into(),
+            }],
             pin_state: Some("SECRET_PIN".into()),
             pin_updated_at: None,
         };
         let mut audit = MigrationAudit::new("source", "target", "/worktree", false);
-        fill_bundle_audit(&mut audit, &bundle);
+        fill_bundle_audit(&mut audit, &bundle, HistoryPolicy::Drop);
+        assert_eq!(audit.counts.dispatch_notes, 0);
+        fill_bundle_audit(&mut audit, &bundle, HistoryPolicy::Include);
+        assert_eq!(audit.counts.dispatch_notes, 1);
         let encoded = serde_json::to_string(&audit).unwrap();
         for secret in [
             "SECRET_CMD",
@@ -1174,6 +1183,7 @@ mod tests {
             "SECRET_DAEMON",
             "SECRET_ARTIFACT",
             "SECRET_NOTE",
+            "SECRET_NOTE_ROW",
             "SECRET_CHUNK",
             "SECRET_REPORT",
             "SECRET_SCOPE",
