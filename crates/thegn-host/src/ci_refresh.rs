@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::WorkspaceStore;
+use thegn_svc::git::{GitBackend, GixGit};
 
 const MAX_LOG_INGEST_CALLS: usize = 32;
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
@@ -452,6 +453,41 @@ pub(crate) fn cache_row_current(
         }
 }
 
+/// Resolve the local cache identity through gix regardless of the configured
+/// read backend. This is used on the refresh tick and when writing local rows,
+/// so neither path spawns a process and both agree for unborn or ambiguous refs.
+fn local_ci_cache_branch(loc: &thegn_core::remote::GitLoc) -> Option<String> {
+    if loc.is_remote() {
+        return None;
+    }
+    let branch = GixGit::new().current_branch(loc).ok()?;
+    (!branch.is_empty() && branch != "HEAD").then_some(branch)
+}
+
+fn cached_ci_row_is_current(
+    loc: &thegn_core::remote::GitLoc,
+    cached: Option<&(String, String, i64)>,
+    now: i64,
+    ttl_secs: u64,
+) -> bool {
+    let current_branch = if cached
+        .is_some_and(|(_, _, fetched_at)| ci_cache_is_fresh(Some(*fetched_at), now, ttl_secs))
+    {
+        local_ci_cache_branch(loc)
+    } else {
+        None
+    };
+    cached.is_some_and(|(_, branch, fetched_at)| {
+        cache_row_current(
+            Some(*fetched_at),
+            Some(branch),
+            current_branch.as_deref(),
+            now,
+            ttl_secs,
+        )
+    })
+}
+
 // --- fetch health: the panel note + failure backoff ------------------------
 
 /// Per-worktree CI fetch health. Process-global (same pattern as hydrate's
@@ -761,23 +797,7 @@ fn refresh_ci_cache_for(
     let now = thegn_core::util::now();
     if !force {
         let cached = db.get_ci_cache_entry(&key).ok().flatten();
-        let current_branch = if cached.as_ref().is_some_and(|(_, _, fetched_at)| {
-            ci_cache_is_fresh(Some(*fetched_at), now, cfg.ttl_secs)
-        }) && !loc.is_remote()
-        {
-            crate::git_handle::get().current_branch(loc).ok()
-        } else {
-            None
-        };
-        let row_is_current = cached.as_ref().is_some_and(|(_, branch, fetched_at)| {
-            cache_row_current(
-                Some(*fetched_at),
-                Some(branch),
-                current_branch.as_deref(),
-                now,
-                cfg.ttl_secs,
-            )
-        });
+        let row_is_current = cached_ci_row_is_current(loc, cached.as_ref(), now, cfg.ttl_secs);
         if row_is_current || backoff_active(&key, now) {
             return false;
         }
@@ -789,9 +809,12 @@ fn refresh_ci_cache_for(
     else {
         return false;
     };
-    let branch = loc
-        .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .filter(|b| !b.is_empty());
+    let branch = if loc.is_remote() {
+        loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .filter(|branch| !branch.is_empty())
+    } else {
+        local_ci_cache_branch(loc)
+    };
     match client.runs(
         loc,
         branch.as_deref(),
@@ -1652,6 +1675,41 @@ mod tests {
                 ci_cache_is_fresh(Some(100), 131, 30)
             );
         }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: create an isolated unborn Git worktree"
+    )]
+    #[test]
+    fn unborn_head_fresh_cached_row_is_not_refetched() {
+        use thegn_core::store::CacheStore;
+
+        let temp = private_tempdir();
+        let worktree = temp.path().join("unborn");
+        std::fs::create_dir(&worktree).expect("create unborn worktree");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["init", "-q", "-b", "topic"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("initialize unborn worktree");
+        assert!(status.success(), "git init failed for unborn worktree");
+
+        let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
+        let branch = local_ci_cache_branch(&loc).expect("gix resolves unborn branch name");
+        assert_eq!(branch, "topic");
+
+        let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+        let key = thegn_core::remote::GitLoc::worktree_cache_key(&worktree);
+        db.put_ci_cache(&key, &branch, r#"{"runs":[],"discarded_rows":0}"#)
+            .expect("seed fresh CI cache row");
+        let cached = db.get_ci_cache_entry(&key).expect("read cache row");
+        assert!(cached_ci_row_is_current(
+            &loc,
+            cached.as_ref(),
+            thegn_core::util::now(),
+            30
+        ));
     }
 
     #[test]
