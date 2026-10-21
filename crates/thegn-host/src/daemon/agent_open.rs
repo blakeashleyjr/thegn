@@ -168,6 +168,14 @@ fn resolve_inner(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let autonomous = headless || stage.is_some();
+    if let Some(why) = crate::parity::autonomous_refusal(
+        autonomous,
+        &worktree,
+        &crate::parity::degraded_note(db, &worktree),
+    ) {
+        bail!(why);
+    }
     let fresh =
         !launch.fork && launch.resume.as_deref().is_none_or(str::is_empty) && !launch.continue_last;
     let cmd = if launch.fork {
@@ -920,6 +928,48 @@ mod tests {
         assert!(
             interactive.starts_with("claude --resume "),
             "got {interactive}"
+        );
+    }
+
+    #[test]
+    fn parity_degraded_worktree_refuses_headless_launch() {
+        let db = Db::open_memory().expect("in-memory db");
+        db.set_ui_state("parity_degraded", "/wt/p", "x")
+            .expect("mark parity degraded");
+        let mut config = cfg();
+        config.agents.push(named("claude", "claude"));
+        let spec = OpenSpec {
+            worktree: Some("/wt/p".into()),
+            ..OpenSpec::default()
+        };
+        let headless = AgentLaunch {
+            agent: "claude".into(),
+            prompt: "do it".into(),
+            headless: None,
+            bind_worktree: false,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            fork: false,
+            native_session_id: None,
+        };
+        let err = resolve(&config, &db, &spec, &headless, None).expect_err("must refuse");
+        assert!(err.to_string().contains("local parity"), "got {err}");
+
+        let interactive = AgentLaunch {
+            prompt: String::new(),
+            headless: Some(false),
+            ..headless
+        };
+        let interactive_error = match resolve(&config, &db, &spec, &interactive, None) {
+            Ok(_) => None,
+            Err(error) => Some(error.to_string()),
+        };
+        assert!(
+            interactive_error
+                .as_deref()
+                .is_none_or(|error| !error.contains("local parity")),
+            "interactive open was refused for parity: {interactive_error:?}"
         );
     }
 }

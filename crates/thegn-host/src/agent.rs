@@ -2630,11 +2630,12 @@ pub fn provision_provider_env_named(
                 // Host-executed: capture the local worktree's unpushed commits +
                 // uncommitted + untracked state and replay it over the clone.
                 // Best-effort — the failure note reflects the replay stage.
-                if let Err(e) = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env)
-                {
+                let result = crate::parity::apply_local_parity(&provider, &id, wt, wd, &exec_env);
+                crate::parity::record_outcome(wt, &result);
+                if let Err(e) = &result {
                     thegn_core::msg::warn(&format!(
-                        "local parity: {e}; {}.",
-                        crate::parity::failure_note(&e)
+                        "local parity: {e}; {}; autonomous agents are held on this worktree until parity succeeds.",
+                        crate::parity::failure_note(e)
                     ));
                 }
                 Ok(())
