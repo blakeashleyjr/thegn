@@ -493,6 +493,12 @@ tools. A `(mise ~)` token means approval is pending, while `(mise !)` means
 the provider or shims are unavailable. Remote worktrees remain responsible
 for installing their tools on the remote target.
 
+Cached flake devShell injection (`[sandbox] inject_devshell`) is off by
+default. Turn it on in your own config (globally, per project or per
+environment), or approve a repository's `.thegn.toml` request with
+`thegn repo trust . --approve <id>`; an unapproved request is listed as pending
+and changes nothing.
+
 ## Lifecycle hooks and pane setup
 
 `[hooks]` commands are host-side worktree/session lifecycle jobs. They run

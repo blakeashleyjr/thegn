@@ -2900,11 +2900,13 @@ warm_direnv = "off"
 devenv = false
 
 # ── Nix devShell tooling ──────────────────────────────────────────────────────
-# Tier A (read-only, safe): inject an already-existing cached repo Nix flake
-# `devShell` toolchain (its PATH + safe exported vars) into worktree panes.
+# Tier A: inject an already-existing cached repo Nix flake `devShell` toolchain
+# (its PATH + safe exported vars) into worktree panes. Off by default. Opt in
+# here, per project, or per environment; a repo's `.thegn.toml` request needs
+# approval with `thegn repo trust . --approve <id>`.
 # Cold caches are a no-op; this setting never evaluates the repository on the
 # host or writes a cache. Target-side setup remains available in the sandbox.
-inject_devshell = true
+inject_devshell = false
 # Which flake devShell a sandbox/sprite enters. Empty = the flake default (same as
 # host dev — the FULL closure). Set to a leaner attr so a remote sprite builds/seeds
 # a much smaller closure. thegn's own flake ships two lean attrs: "sandbox" (rust +

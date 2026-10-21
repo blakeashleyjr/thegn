@@ -4365,9 +4365,10 @@ pub struct SandboxConfig {
     pub warm_direnv: WarmDirenv,
     pub devenv: bool, // wrap inner cmd with `devenv shell --`
     /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
-    /// exported vars) into worktree panes from an already-existing cache. A cold
-    /// cache is a no-op; this setting never evaluates a repository on the host.
-    /// See [`crate::devenv`].
+    /// exported vars) into worktree panes from an already-existing cache. Off
+    /// by default; opt in in user config or approve a repo's request with
+    /// `thegn repo trust . --approve <id>`. A cold cache is a no-op; this
+    /// setting never evaluates a repository on the host. See [`crate::devenv`].
     pub inject_devshell: bool,
     /// Which flake devShell attribute a sandbox/sprite enters, e.g. `"sandbox"`
     /// for a lean build-only shell (`.#devShells.sandbox`). Empty ⇒ `default`.
@@ -4493,7 +4494,7 @@ impl Default for SandboxConfig {
             prepare: Vec::new(),
             warm_direnv: WarmDirenv::Off,
             devenv: false,
-            inject_devshell: true,
+            inject_devshell: false,
             devshell: String::new(),
             nix_daemon: false,
             shell: String::new(),
