@@ -420,11 +420,17 @@ failed. Set `[sandbox] isolation_floor = "off"` or disable the sandbox to run
 queue agents uncontained.
 
 Queue agents (merge and PR fixers, CI autofix, headless review and review
-tasks) run credential-free, like autopilot: their environment and their
-sandbox's `env_passthrough` drop token, key, password, secret, agent-socket and
-GPG-agent variables. With `agent_sandbox` on, a queue agent whose sandbox
-cannot be established is held; it never falls back to the host. Interactive
-panes are unchanged.
+tasks) run credential-free, like autopilot. Their environment and sandbox
+passthrough drop credential-shaped variables plus `GH_CONFIG_DIR`, `GNUPGHOME`,
+`GIT_SSH_COMMAND`, `GPG_TTY`, `DBUS_SESSION_BUS_ADDRESS` and inherited `THEGN_*`
+variables. Autonomous sandbox specs also lose SSH identity mounts and mounts at
+or below `~/.ssh`, `~/.gnupg` and `~/.config/gh`; Git credential helpers are
+reset. `XDG_RUNTIME_DIR` and `GIT_CONFIG_GLOBAL` are kept for launcher plumbing
+and commit identity. A broad `[sandbox] mounts` entry that exposes the whole
+home still exposes these directories; they are not masked inside a broad home
+mount. With `agent_sandbox` on, a queue agent whose sandbox cannot be
+established is held; it never falls back to the host. Interactive panes are
+unchanged.
 
 ## Choosing per worktree
 

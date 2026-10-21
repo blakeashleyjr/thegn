@@ -287,7 +287,7 @@ fn drive_claim(
         }
     };
     let sandbox = match sealed_autopilot_sandbox(cfg, repo_root, &worktree) {
-        Ok(spec) => spec,
+        Ok(spec) => crate::agent_run::credential_free_spec(spec),
         Err(reason) => {
             mark_worker_failed(db, run_id, dispatch_id, &reason);
             return;
