@@ -11276,7 +11276,9 @@ async fn event_loop<T: Terminal>(
         // Bank a hunk preview only while its ownership token still owns the
         // path and its generation passes the acceptance cutoff. Completions
         // from before a refresh or worktree switch are dropped.
+        let mut preview_slot_freed = false;
         while let Ok((generation, token, path, hunks)) = hunk_rx.try_recv() {
+            preview_slot_freed = true;
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let owns_path = hunk_inflight.finish(&path, token);
             if owns_path && generation >= panel_ui.hunks_gen {
@@ -11337,6 +11339,7 @@ async fn event_loop<T: Terminal>(
             }
         }
         while let Ok((generation, token, path, summary)) = submodule_preview_rx.try_recv() {
+            preview_slot_freed = true;
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let owns_path = submodule_preview_inflight.finish(&path, token);
             if owns_path
@@ -11351,6 +11354,19 @@ async fn event_loop<T: Terminal>(
                 submodule.summary = Some(summary);
                 dirty = true;
             }
+        }
+        if preview_slot_freed {
+            crate::handlers::panel_changes::start_selected_preview(
+                &panel_ui,
+                &model,
+                &session,
+                &mut hunk_inflight,
+                &hunk_tx,
+                &mut submodule_preview_inflight,
+                &submodule_preview_tx,
+                &waker,
+                hydration_gen,
+            );
         }
 
         // Rasterized preview images (document-viewer graphics path) land in the
