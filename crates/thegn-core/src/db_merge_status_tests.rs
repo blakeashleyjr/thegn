@@ -486,7 +486,11 @@ fn operator_table_matches_the_database_cell_by_cell() {
         for status in MqStatus::ALL {
             for claimed in [false, true] {
                 let db = seeded();
-                db.replace_merge_status(WORKTREE, status.as_str(), &MergeStatusFields::default())
+                let fields = MergeStatusFields {
+                    result_oid: (status == MqStatus::Landed).then(|| "result-oid".into()),
+                    ..Default::default()
+                };
+                db.replace_merge_status(WORKTREE, status.as_str(), &fields)
                     .unwrap();
                 if claimed {
                     db.conn()
