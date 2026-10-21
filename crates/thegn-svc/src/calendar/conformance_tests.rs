@@ -63,6 +63,10 @@ fn verdict(result: &Result<EventPage, CalendarError>) -> (Verdict, &'static str)
 }
 
 #[tokio::test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
 async fn conformance_local_ics_file_matches_every_fixture() {
     let mut table = Vec::new();
     for fixture in FIXTURES {
@@ -105,6 +109,10 @@ async fn conformance_local_ics_file_matches_every_fixture() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
 async fn conformance_ics_url_matches_every_fixture() {
     let mut table = Vec::new();
     for fixture in FIXTURES {
@@ -142,6 +150,10 @@ async fn conformance_ics_url_matches_every_fixture() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
 async fn conformance_caldav_matches_every_fixture() {
     let mut table = Vec::new();
     for fixture in FIXTURES {

@@ -4,6 +4,10 @@ use thegn_core::calendar::{EventTime, TzRef};
 use thegn_core::store::CalendarStore;
 
 #[test]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "conformance matrix prints every fixture x seam verdict before asserting"
+)]
 fn conformance_cache_decode_matches_every_fixture() {
     let mut table = Vec::new();
     for fixture in FIXTURES {
@@ -13,6 +17,7 @@ fn conformance_cache_decode_matches_every_fixture() {
             let start = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
             let end = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
             let mut row = row_of(&event, None);
+            // Unknown-zone times have no index timestamps, so the window query would hide the row.
             if row.start_ms == 0 && row.end_ms == 0 {
                 let index_time = start
                     .and_hms_opt(9, 0, 0)
@@ -46,7 +51,7 @@ fn conformance_cache_decode_matches_every_fixture() {
             ));
         }
     }
-    tracing::info!(?table, "calendar conformance host cache table");
+    eprintln!("calendar conformance host cache table: {table:#?}");
     assert!(
         table
             .iter()
