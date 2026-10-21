@@ -1727,11 +1727,13 @@ fn set_status_on_led(
 /// 2. The row carries a non-empty report with an explicit PASS and successful
 ///    gate citation. When the report has a recorded HEAD, that commit must
 ///    still contain the unchanged artifact.
+/// 3. An artifact-bearing row has a trusted gate attestation for its current
+///    committed HEAD and clean worktree.
 ///
-/// `--force` is the deliberate override for BOTH rules (the refusal names
+/// `--force` is the deliberate override for all three checks (the refusal names
 /// it). Pane-exit auto-stamps (`pty_drain.rs:855-895`) bypass the gate
 /// entirely — that path writes the typed status for attribution, not as a
-/// handoff verdict, so it is not subject to either check.
+/// handoff verdict, so it is not subject to these checks.
 #[cfg(test)]
 fn done_gate(row: &AgentDispatch) -> Result<()> {
     let report = pipeline_run::verify_report(&verify_facts(row));
@@ -1741,7 +1743,23 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 fn done_gate_bound(db: &Db, row: &AgentDispatch) -> Result<()> {
     let report_head = db.dispatch_report_head(row.id)?;
     let facts = verify_facts_with_report_head(row, report_head.as_deref());
-    require_done_report(row.id, pipeline_run::verify_report(&facts))
+    require_done_report(row.id, pipeline_run::verify_report(&facts))?;
+    if row
+        .artifact_path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+    {
+        let latest = db.latest_gate_attestation(row.id)?;
+        let trusted = gate::trusted_gate_for(row, latest.as_ref());
+        if !trusted.is_satisfied() {
+            return Err(DoneGateRefused {
+                id: row.id,
+                reasons: vec![trusted.detail(row.id)],
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1998,12 +2016,29 @@ fn reap_plan_limited(
         })
         .map(|run| (run.id, run))
         .collect();
-    Ok((reap_plan_rows(&rows, live_ids), run_refs, truncated))
+    let mut attestations = HashMap::new();
+    for row in &rows {
+        match db.latest_gate_attestation(row.id) {
+            Ok(Some(attestation)) => {
+                attestations.insert(row.id, attestation);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(target: "thegn::pipeline", row = row.id, %error, "reap could not read latest gate attestation")
+            }
+        }
+    }
+    Ok((
+        reap_plan_rows(&rows, live_ids, &attestations),
+        run_refs,
+        truncated,
+    ))
 }
 
 fn reap_facts(
     f: &pipeline_run::VerifyFacts,
     worker: pipeline_reap::WorkerLiveness,
+    trusted_gate_ok: bool,
 ) -> pipeline_reap::ReapFacts {
     pipeline_reap::ReapFacts {
         worker,
@@ -2013,6 +2048,7 @@ fn reap_facts(
         report_verdict: f.report_verdict,
         report_gate_valid: f.report_gate_valid,
         worktree_unknown: f.worktree_state == Some(pipeline_run::WorktreeState::Unknown),
+        trusted_gate_ok,
         artifact_ok: f.stage.is_none()
             || (matches!(
                 &f.artifact_identity,
@@ -2027,6 +2063,7 @@ fn reap_facts(
 pub(crate) fn reap_plan_rows(
     rows: &[AgentDispatch],
     live_ids: Option<&[String]>,
+    attestations: &HashMap<i64, thegn_core::StoredGateAttestation>,
 ) -> Vec<pipeline_reap::Reap> {
     pipeline_reap::plan(rows, |r| {
         let facts = verify_facts(r);
@@ -2041,7 +2078,18 @@ pub(crate) fn reap_plan_rows(
         } else {
             pipeline_reap::WorkerLiveness::Unknown
         };
-        reap_facts(&facts, worker)
+        let trusted_gate_ok = if facts.tracked
+            && facts.report_present
+            && facts.report_gate_valid
+            && facts.report_verdict == pipeline_report::Verdict::Pass
+        {
+            attestations.get(&r.id).is_some_and(|attestation| {
+                gate::trusted_gate_for(r, Some(attestation)).is_satisfied()
+            })
+        } else {
+            false
+        };
+        reap_facts(&facts, worker, trusted_gate_ok)
     })
 }
 
@@ -2238,11 +2286,19 @@ fn verify(id: i64, json: bool) -> Result<()> {
     let report_head = db.dispatch_report_head(id)?;
     let facts = verify_facts_with_report_head(&row, report_head.as_deref());
     let report = pipeline_run::verify_report(&facts);
+    let latest = db.latest_gate_attestation(id)?;
+    let trusted = gate::trusted_gate_for(&row, latest.as_ref());
     if json {
         // One flat document — the report plus the row id — so a supervisor can
         // grep `"ok":false` / `"id":12` from a single line.
         let mut v = serde_json::to_value(&report)?;
         v["id"] = serde_json::json!(id);
+        v["trusted_gate"] = serde_json::json!({
+            "state": trusted.token(),
+            "detail": trusted.detail(id),
+            "attestation_id": latest.as_ref().map(|attestation| attestation.id),
+        });
+        v["worker_gate_claim"] = serde_json::json!("non-authoritative");
         super::emit_json(&v)?;
     } else {
         let (a, warnings, reasons) = verify_human_text(
@@ -2259,6 +2315,8 @@ fn verify(id: i64, json: bool) -> Result<()> {
             yes_no(report.report_present),
             yes_no(report.ok)
         );
+        outln!("  trusted gate: {}", trusted.detail(id));
+        outln!("  worker gate claim: non-authoritative");
         for warning in &warnings {
             outln!("  warning: {warning}");
         }
@@ -4358,7 +4416,7 @@ mod tests {
             done_error.contains("verdict is fail") && done_error.contains("Lead"),
             "{done_error}"
         );
-        let plan = reap_plan_rows(&[row], Some(&[]));
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
         assert_eq!(plan.len(), 1);
         assert!(!matches!(
             &plan[0].verdict,
@@ -4604,7 +4662,7 @@ mod tests {
         let mut row = row_in(std::path::Path::new("/unused"), None);
         row.exit_code = Some(0);
         row.exited_at_ms = Some(1);
-        let plan = reap_plan_rows(&[row], Some(&[]));
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
         assert!(matches!(
             &plan[0].verdict,
             pipeline_reap::ReapVerdict::MarkFailed { .. }
@@ -4806,7 +4864,7 @@ mod tests {
             report_gate_valid: true,
             report_commit_binding: pipeline_run::ReportCommitBinding::Bound,
         };
-        let reap = reap_facts(&facts, pipeline_reap::WorkerLiveness::Exited);
+        let reap = reap_facts(&facts, pipeline_reap::WorkerLiveness::Exited, false);
         assert!(reap.worktree_unknown);
         assert_eq!(reap.worker, pipeline_reap::WorkerLiveness::Exited);
     }
@@ -5103,12 +5161,125 @@ mod tests {
         let mut row = row_in(&root, Some("README.md"));
         row.report = Some("PASS\ngate: just test -- exit 0".into());
         row.exit_code = Some(0);
-        let plan = reap_plan_rows(&[row], Some(&[]));
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
         assert_eq!(plan.len(), 1);
         assert!(
             !matches!(&plan[0].verdict, pipeline_reap::ReapVerdict::CloseDone),
             "a committed non-canonical artifact must not be reaped done"
         );
+    }
+
+    fn trusted_done_fixture(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Db,
+        AgentDispatch,
+        std::path::PathBuf,
+    ) {
+        let (repo_dir, root) = git_repo(name);
+        let (db_dir, db) = db(name);
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: None,
+                ..NewDispatch::new("linear:THE-1130", root.to_str().unwrap(), "coder")
+            })
+            .unwrap();
+        let artifact = pipeline_run::artifact_path("linear:THE-1130", "code", id);
+        assert_eq!(
+            db.publish_dispatch_run(id, "trusted-session", &artifact)
+                .unwrap(),
+            thegn_core::issue::DispatchRunPublishOutcome::Published
+        );
+        let path = root.join(&artifact);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# trusted handoff\n").unwrap();
+        assert!(git_ok(&root, &["add", "--", artifact.as_str()]));
+        assert!(git_ok(&root, &["commit", "-q", "-m", "trusted artifact"]));
+        db.set_dispatch_report(id, "PASS\ngate: just test -- exit 0")
+            .unwrap();
+        let row = db.get_dispatch(id).unwrap().unwrap();
+        (repo_dir, db_dir, db, row, root)
+    }
+
+    fn record_current_gate_attestation(
+        db: &Db,
+        row: &AgentDispatch,
+        root: &std::path::Path,
+        log_path: &std::path::Path,
+    ) {
+        std::fs::write(log_path, "passed\n").unwrap();
+        let worktree = std::fs::canonicalize(root).unwrap();
+        let common = git_out_allow_empty(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap();
+        let repo = std::fs::canonicalize(common.trim()).unwrap();
+        let branch_ref = git_out_allow_empty(root, &["symbolic-ref", "-q", "HEAD"]).unwrap();
+        let commit_oid =
+            git_out_allow_empty(root, &["rev-parse", "--verify", "HEAD^{commit}"]).unwrap();
+        let tree_oid =
+            git_out_allow_empty(root, &["rev-parse", "--verify", "HEAD^{tree}"]).unwrap();
+        let attestation = thegn_core::pipeline_gate_attest::GateAttestation {
+            dispatch_row: row.id,
+            repo: repo.display().to_string(),
+            worktree: worktree.display().to_string(),
+            branch_ref: branch_ref.trim().to_string(),
+            commit_oid: commit_oid.trim().to_string(),
+            tree_oid: tree_oid.trim().to_string(),
+            command: "just test".to_string(),
+            started_ms: 1,
+            ended_ms: 2,
+            exit: Some(0),
+            log_path: log_path.display().to_string(),
+            runner: thegn_core::pipeline_gate_attest::GateRunner::LeadRunner,
+        };
+        db.record_gate_attestation(
+            &attestation,
+            thegn_core::pipeline_gate_attest::GateOutcome::Passed,
+            "",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn trusted_done_refuses_pass_without_attestation() {
+        let (_repo_dir, _db_dir, db, row, _root) = trusted_done_fixture("trusted-done-missing");
+        assert!(
+            done_gate(&row).is_ok(),
+            "the report claim is valid by itself"
+        );
+        let error = done_gate_bound(&db, &row).unwrap_err().to_string();
+        assert!(error.contains("dispatch gate"), "{error}");
+    }
+
+    #[test]
+    fn trusted_done_accepts_a_current_head_attestation() {
+        let (_repo_dir, db_dir, db, row, root) = trusted_done_fixture("trusted-done-current");
+        let log_path = db_dir.path().join("gate.log");
+        record_current_gate_attestation(&db, &row, &root, &log_path);
+        let status = git_out_allow_empty(&root, &["status", "--porcelain"]).unwrap();
+        assert!(status.is_empty(), "fixture worktree is dirty: {status}");
+        done_gate_bound(&db, &row).unwrap();
+    }
+
+    #[test]
+    fn trusted_reap_needs_decision_without_attestation() {
+        let (_repo_dir, _db_dir, _db, mut row, _root) =
+            trusted_done_fixture("trusted-reap-missing");
+        row.exit_code = Some(0);
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
+        assert!(matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::NeedsDecision { why } if why.contains("dispatch gate")
+        ));
+        assert!(!matches!(
+            &plan[0].verdict,
+            pipeline_reap::ReapVerdict::CloseDone
+        ));
     }
 
     fn poison_terminal_report(path: &std::path::Path, id: i64) {
