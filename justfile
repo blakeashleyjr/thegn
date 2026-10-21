@@ -538,6 +538,7 @@ check-features:
     cargo check -p thegn-core --features test-utils
     cargo check -p thegn-host --features profiling
     cargo check -p thegn-host --features iroh
+    cargo clippy -p thegn-svc -p thegn-host --features thegn-host/iroh --all-targets -- -D warnings
     cargo nextest run -p thegn-svc --features iroh -E 'test(iroh_reach::)'
     cargo check -p tg-kit --features standalone
 
