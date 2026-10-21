@@ -1961,7 +1961,10 @@ impl ProxyEnd {
         let message = match self {
             Self::LocalClosed | Self::PeerClosed => return Ok(()),
             Self::RemoteRejected { code, reason } => {
-                format!("provider proxy closed by the remote: code {code} ({reason})")
+                let prefix = format!("provider proxy closed by the remote: code {code} (");
+                let suffix = ")";
+                let reason = truncate_proxy_text(reason, 256 - prefix.len() - suffix.len());
+                format!("{prefix}{reason}{suffix}")
             }
             Self::TransportDropped => {
                 "provider proxy connection dropped without a close frame".to_string()
@@ -2428,6 +2431,7 @@ async fn drive_proxy<S>(
                 tokio_tungstenite::tungstenite::Error,
             >,
         > + Unpin,
+    S::Error: std::fmt::Debug,
 {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{Message, protocol::frame::coding::CloseCode};
@@ -2437,7 +2441,7 @@ async fn drive_proxy<S>(
             out = to_srv.recv() => match out {
                 Some(b) => {
                     if let Err(error) = write.send(Message::Binary(b.into())).await {
-                        break ProxyEnd::TransportError(truncate_proxy_text(error.to_string(), 256));
+                        break ProxyEnd::TransportError(truncate_proxy_text(format!("{error:?}"), 256));
                     }
                 }
                 None => break ProxyEnd::LocalClosed,
@@ -3929,14 +3933,14 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.len() <= 256);
-        assert!(error.is_char_boundary(error.len()));
+        assert!(error.ends_with("é)"));
 
         let transport_error = ProxyEnd::TransportError("界".repeat(1_000))
             .into_result()
             .unwrap_err()
             .to_string();
         assert!(transport_error.len() <= 256);
-        assert!(transport_error.is_char_boundary(transport_error.len()));
+        assert!(transport_error.ends_with('界'));
     }
 
     #[tokio::test]
