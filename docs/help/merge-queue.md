@@ -69,6 +69,8 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   worktree off that branch, the row is held `agent_blocked` with an
   `identity drift:` reason and no attempt spent. `thegn merge add` re-enqueues
   it against the current tip.
+- If a fixing agent does not start, the row is held `agent_blocked` with no
+  attempt spent; `thegn merge retry` re-arms it.
 - `thegn merge clear` removes unclaimed rows. Rows held by an active drain
   stay queued, are named in the error, and require another clear after the
   drain finishes.
@@ -206,6 +208,10 @@ drain time the branch's tip is bundle-fetched into the target store
 before it folds. A branch whose host is unreachable is **deferred** (with
 the reason), never silently dropped, and retried on the next drain.
 
+A tip from another host is streamed into private local storage in a bundle
+capped at 4 GiB and bounded by the drain's subprocess deadline. A size,
+timeout, producer, storage, or validation failure defers the row with the reason.
+
 Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
 it on — the fold, gate, and ref-advance must be co-located with `main`.
@@ -313,6 +319,12 @@ point (it tests the union, which exists nowhere else), but it means
 `gate_command` cannot rely on a project-local toolchain: no
 `node_modules`, no virtualenv, no `.direnv`. Rust works out of the box
 only because `cargo` is global.
+
+Gate setup, gate and regenerate commands, custom merge drivers and rerere,
+Tests panel runs, and command-based test discovery execute candidate code on
+the host without isolation, with access to its environment, files, and network.
+`thegn doctor` lists these under “Host execution (no isolation)”; a non-empty
+failed or errored gate log starts with a line identifying host execution.
 
 Provision it with `gate_setup_command`, which runs first and is **not**
 part of the verdict:
