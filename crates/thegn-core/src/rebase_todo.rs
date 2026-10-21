@@ -18,6 +18,8 @@
 //! cross structural ones (`label`/`reset`/`merge`/`update-ref`/unknown) whose
 //! relative order encodes rebase-merges topology.
 
+use std::collections::HashSet;
+
 /// One sequencer instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TodoAction {
@@ -231,25 +233,41 @@ fn push_arg(out: &mut String, word: &str, arg: &str) {
 }
 
 /// Build the base todo for `<base>..HEAD` from
-/// `git log --reverse --format=%x1f%H%x1f%s` output (unit-separator-prefixed
-/// records, oldest first): every commit becomes `Pick`. The unit separator
-/// cannot appear in a sha or single-line subject, so splitting on it is safe.
-pub fn todo_from_log(log_out: &str) -> Vec<TodoEntry> {
-    let mut fields = log_out.split('\x1f');
-    fields.next(); // Anything before the first record separator.
+/// `git log --reverse --format=%x1f%H%x1f%s` output (one unit-separator-
+/// prefixed record per line, oldest first): every commit becomes `Pick`.
+/// Subjects occupy the remainder of their line and may contain unit separators.
+/// Any malformed or duplicate record rejects the entire result.
+pub fn todo_from_log(log_out: &str) -> anyhow::Result<Vec<TodoEntry>> {
     let mut entries = Vec::new();
-    while let (Some(sha), Some(subject)) = (fields.next(), fields.next()) {
-        let sha = sha.trim();
-        if sha.is_empty() {
+    let mut seen = HashSet::new();
+    for (index, line) in log_out.split_terminator('\n').enumerate() {
+        let line_number = index + 1;
+        if line.is_empty() {
             continue;
+        }
+        let Some(record) = line.strip_prefix('\u{1f}') else {
+            anyhow::bail!("rebase log row {line_number}: missing record separator");
+        };
+        let Some((sha, subject)) = record.split_once('\u{1f}') else {
+            anyhow::bail!("rebase log row {line_number}: expected sha and subject");
+        };
+        if !matches!(sha.len(), 40 | 64)
+            || !sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!("rebase log row {line_number}: invalid full sha");
+        }
+        if !seen.insert(sha) {
+            anyhow::bail!("rebase log row {line_number}: duplicate commit {sha}");
         }
         entries.push(TodoEntry {
             action: TodoAction::Pick,
             sha: sha.to_string(),
-            subject: subject.trim_end_matches(['\n', '\r']).to_string(),
+            subject: subject.trim_end_matches('\r').to_string(),
         });
     }
-    entries
+    Ok(entries)
 }
 
 /// Index of the first commit entry matching `sha` by mutual prefix.
@@ -560,33 +578,69 @@ mod tests {
 
     #[test]
     fn todo_from_log_handles_empty_input() {
-        assert_eq!(todo_from_log(""), vec![]);
-        assert_eq!(todo_from_log("\n"), vec![]);
+        assert_eq!(todo_from_log("").unwrap(), vec![]);
+        assert_eq!(todo_from_log("\n").unwrap(), vec![]);
     }
 
     #[test]
     fn todo_from_log_single_commit() {
-        let got = todo_from_log("\u{1f}deadbeef\u{1f}fix: the thing\n");
-        assert_eq!(
-            got,
-            vec![commit(TodoAction::Pick, "deadbeef", "fix: the thing")]
-        );
+        let sha = "a".repeat(40);
+        let log = format!("\u{1f}{sha}\u{1f}fix: the thing\n");
+        let got = todo_from_log(&log).unwrap();
+        assert_eq!(got, vec![commit(TodoAction::Pick, &sha, "fix: the thing")]);
     }
 
     #[test]
     fn todo_from_log_three_commits_with_unicode_subjects() {
-        let log = "\u{1f}aaa1\u{1f}feat: add naïve café parser\n\
-                   \u{1f}bbb2\u{1f}fix: 修复 the 🐛 bug\n\
-                   \u{1f}ccc3\u{1f}\n";
-        let got = todo_from_log(log);
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        let third = "c".repeat(40);
+        let log = format!(
+            "\u{1f}{first}\u{1f}feat: add naïve café parser\n\
+             \u{1f}{second}\u{1f}fix: 修复 the 🐛 bug\n\
+             \u{1f}{third}\u{1f}\n"
+        );
+        let got = todo_from_log(&log).unwrap();
         assert_eq!(
             got,
             vec![
-                commit(TodoAction::Pick, "aaa1", "feat: add naïve café parser"),
-                commit(TodoAction::Pick, "bbb2", "fix: 修复 the 🐛 bug"),
-                commit(TodoAction::Pick, "ccc3", ""),
+                commit(TodoAction::Pick, &first, "feat: add naïve café parser"),
+                commit(TodoAction::Pick, &second, "fix: 修复 the 🐛 bug"),
+                commit(TodoAction::Pick, &third, ""),
             ]
         );
+    }
+
+    #[test]
+    fn todo_from_log_unit_separator_in_subject_does_not_shift_commits() {
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        let log = format!("\u{1f}{first}\u{1f}first\u{1f}subject\n\u{1f}{second}\u{1f}second\n");
+        let entries = todo_from_log(&log).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha, first);
+        assert_eq!(entries[0].subject, "first\u{1f}subject");
+        assert_eq!(entries[1].sha, second);
+        assert_eq!(entries[1].subject, "second");
+    }
+
+    #[test]
+    fn todo_from_log_rejects_malformed_lines() {
+        let sha = "a".repeat(40);
+        let cases = [
+            "\u{1f}deadbeef\u{1f}short sha\n".to_string(),
+            format!("{sha}\u{1f}missing leading separator\n"),
+            format!("\u{1f}{sha}\n"),
+            format!("\u{1f}{sha}\u{1f}first\n\u{1f}{sha}\u{1f}duplicate\n"),
+        ];
+        for log in cases {
+            assert!(
+                todo_from_log(&log).is_err(),
+                "accepted malformed log {log:?}"
+            );
+        }
+        assert_eq!(todo_from_log("").unwrap(), vec![]);
+        assert_eq!(todo_from_log("\n").unwrap(), vec![]);
     }
 
     // ---- sha matching ----
