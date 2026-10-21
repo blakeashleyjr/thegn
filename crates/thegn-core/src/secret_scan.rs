@@ -10,8 +10,8 @@
 //! job, host-side). The one process environment field with credential syntax,
 //! `MPD_HOST`, is inventoried alongside config-backed fields.
 
-use crate::config::Config;
 use crate::config::VpnConfig;
+use crate::config::{CalendarProviderKind, Config};
 use crate::secretref::{BareAs, SecretRef};
 
 /// One configured secret field: where it is, its parsed ref, and a stable
@@ -28,7 +28,7 @@ pub struct SecretFieldRef {
 
 /// Every configured secret field across the config, in a stable order.
 ///
-/// Covers provider, issue, CI, VPN, snapshot, MCP upstream, and MPD fields. The
+/// Covers provider, issue, CI, calendar, VPN, snapshot, MCP upstream, and MPD fields. The
 /// field-specific bare-string meaning is explicit at every insertion.
 pub fn secret_refs(cfg: &Config) -> Vec<SecretFieldRef> {
     let mut out = Vec::new();
@@ -67,6 +67,23 @@ pub fn secret_refs(cfg: &Config) -> Vec<SecretFieldRef> {
             path: "ci.gitlab.token".to_string(),
             reference: SecretRef::parse(gl, BareAs::Literal),
             consumer: "ci:gitlab".to_string(),
+        });
+    }
+
+    // Remote calendar tokens — bare strings are literal secrets, matching the
+    // ICS-URL and CalDAV backends' broker resolution semantics.
+    for acct in &cfg.calendar.accounts {
+        if !matches!(
+            acct.provider,
+            CalendarProviderKind::IcsUrl | CalendarProviderKind::CalDav
+        ) || acct.token.trim().is_empty()
+        {
+            continue;
+        }
+        out.push(SecretFieldRef {
+            path: format!("calendar.accounts[{}].token", acct.name),
+            reference: SecretRef::parse(&acct.token, BareAs::Literal),
+            consumer: format!("calendar:{}", acct.name),
         });
     }
 
@@ -194,6 +211,7 @@ pub fn literal_refs(cfg: &Config) -> Vec<SecretFieldRef> {
         .filter(|s| {
             s.reference.is_literal()
                 && (s.path.starts_with("issues.issue_accounts[")
+                    || s.path.starts_with("calendar.accounts[")
                     || s.path == "ci.gitlab.token"
                     || s.path == "media.mpd.password"
                     || s.path == "MPD_HOST.password")
@@ -299,6 +317,80 @@ token = "env:GITLAB_TOKEN"
         let lits = literal_refs(&cfg);
         assert_eq!(lits.len(), 1);
         assert!(lits[0].path.contains("work-linear"));
+    }
+
+    #[test]
+    fn calendar_tokens_are_scanned_for_remote_accounts_only() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[calendar.accounts]]
+name = "work"
+provider = "ics_url"
+token = "pasted-literal"
+
+[[calendar.accounts]]
+name = "dav"
+provider = "caldav"
+token = "keyring:cal-dav"
+
+[[calendar.accounts]]
+name = "cmd"
+provider = "command"
+token = "ignored"
+
+[[calendar.accounts]]
+name = "quiet"
+provider = "ics_url"
+token = "   "
+"#,
+        )
+        .unwrap();
+
+        let refs: Vec<_> = secret_refs(&cfg)
+            .into_iter()
+            .filter(|row| row.path.starts_with("calendar.accounts["))
+            .collect();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "calendar.accounts[work].token");
+        assert!(refs[0].reference.is_literal());
+        assert_eq!(refs[0].consumer, "calendar:work");
+        assert_eq!(refs[1].path, "calendar.accounts[dav].token");
+        assert_eq!(refs[1].reference.backend_kind(), "keyring");
+        assert_eq!(refs[1].consumer, "calendar:dav");
+        assert!(
+            !refs
+                .iter()
+                .any(|row| row.path.contains("[cmd]") || row.path.contains("[quiet]"))
+        );
+    }
+
+    #[test]
+    fn calendar_literal_token_is_a_migratable_literal() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[calendar.accounts]]
+name = "work"
+provider = "ics_url"
+token = "pasted-literal"
+
+[[calendar.accounts]]
+name = "dav"
+provider = "caldav"
+token = "keyring:cal-dav"
+"#,
+        )
+        .unwrap();
+
+        let refs = literal_refs(&cfg);
+        assert!(
+            refs.iter()
+                .any(|row| row.path == "calendar.accounts[work].token")
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|row| row.path == "calendar.accounts[dav].token")
+        );
     }
 
     #[test]
