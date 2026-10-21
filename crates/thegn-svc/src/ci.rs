@@ -1042,6 +1042,11 @@ fn github_run_detail_argv(run_id: &str) -> Result<Vec<String>, CiError> {
 
 fn github_rerun_argv(run_id: &str, scope: RerunScope) -> Result<Vec<String>, CiError> {
     validate_ci_id(run_id)?;
+    if scope == RerunScope::FailedOrCanceled {
+        return Err(CiError::Unsupported(
+            "GitHub has no failed-or-canceled rerun; use --failed or a full rerun".into(),
+        ));
+    }
     let mut args = vec!["run".into(), "rerun".into()];
     if scope == RerunScope::Failed {
         args.push("--failed".into());
@@ -1288,6 +1293,11 @@ impl CiProvider for GithubCi {
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
         let args = github_rerun_argv(run_id, scope)?;
+        if !self.caps().supports(scope) {
+            return Err(CiError::Unsupported(
+                "GitHub does not support this rerun scope".into(),
+            ));
+        }
         let argv: Vec<_> = args.iter().map(String::as_str).collect();
         run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
     }
@@ -1304,7 +1314,9 @@ impl CiProvider for GithubCi {
             steps: true,
             trigger: true,
             rerun: true,
+            rerun_all: true,
             rerun_failed: true,
+            rerun_failed_or_canceled: false,
             cancel: true,
         }
     }
@@ -1767,12 +1779,18 @@ impl CiProvider for GitlabCi {
         run_cli(self.command(loc, &remote, &argv)?, &self.cancel).map(|_| ())
     }
 
-    fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
+    fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
         validate_ci_id(run_id)?;
+        if !self.caps().supports(scope) {
+            return Err(CiError::Unsupported(match scope {
+                RerunScope::All => "GitLab cannot re-run every job; its retry only re-runs failed and canceled jobs".into(),
+                RerunScope::Failed => "GitLab cannot retry only failed jobs; its retry includes canceled jobs".into(),
+                RerunScope::FailedOrCanceled => unreachable!("supported GitLab scope"),
+            }));
+        }
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
-        // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
-        // call, so both scopes map to retry (it's the closest primitive).
+        // GitLab's `retry` endpoint re-runs failed and canceled jobs only.
         let endpoint = gitlab_run_endpoint(&proj, run_id, "retry")?;
         run_cli(
             self.command(loc, &remote, &["api", "-X", "POST", &endpoint])?,
@@ -1799,8 +1817,9 @@ impl CiProvider for GitlabCi {
             steps: false,
             trigger: true,
             rerun: true,
-            // Pipeline `retry` has no failed-only scope — see `rerun` above.
+            rerun_all: false,
             rerun_failed: false,
+            rerun_failed_or_canceled: true,
             cancel: true,
         }
     }
@@ -3679,8 +3698,8 @@ esac
             .trigger
         );
         assert!(GitlabCi::default().caps().cancel);
-        // GitLab's pipeline `retry` can't scope to failed jobs; offering the
-        // distinction anyway would silently retry everything.
+        // GitLab's pipeline `retry` includes canceled jobs, so it does not
+        // provide an exact failed-only operation.
         assert!(
             GithubCi {
                 remote: None,
@@ -3690,6 +3709,96 @@ esac
             .rerun_failed
         );
         assert!(!GitlabCi::default().caps().rerun_failed);
+        assert!(
+            GithubCi {
+                remote: None,
+                cancel: Arc::new(AtomicBool::new(false))
+            }
+            .caps()
+            .rerun_all
+        );
+        assert!(!GitlabCi::default().caps().rerun_all);
+        assert!(
+            !GithubCi {
+                remote: None,
+                cancel: Arc::new(AtomicBool::new(false))
+            }
+            .caps()
+            .rerun_failed_or_canceled
+        );
+        assert!(GitlabCi::default().caps().rerun_failed_or_canceled);
+    }
+
+    #[test]
+    fn rerun_scope_gitlab_refuses_all_and_failed_before_any_request() {
+        let loc = GitLoc::for_worktree(std::path::Path::new("/does/not/exist"));
+        let provider = GitlabCi::default();
+        assert!(matches!(
+            provider.rerun(&loc, "123", RerunScope::All),
+            Err(CiError::Unsupported(_))
+        ));
+        assert!(matches!(
+            provider.rerun(&loc, "123", RerunScope::Failed),
+            Err(CiError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn rerun_scope_github_refuses_failed_or_canceled_before_any_request() {
+        let loc = GitLoc::for_worktree(std::path::Path::new("/does/not/exist"));
+        let result = github_rerun_argv("123", RerunScope::FailedOrCanceled);
+        assert!(matches!(result, Err(CiError::Unsupported(_))));
+        let provider = GithubCi {
+            remote: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(matches!(
+            provider.rerun(&loc, "123", RerunScope::FailedOrCanceled),
+            Err(CiError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn rerun_scope_caps_table_matches_each_provider_rerun() {
+        let providers = [
+            (
+                "GitHub",
+                GithubCi {
+                    remote: None,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                }
+                .caps(),
+                [true, true, false],
+            ),
+            ("GitLab", GitlabCi::default().caps(), [false, false, true]),
+        ];
+        let scopes = [
+            RerunScope::All,
+            RerunScope::Failed,
+            RerunScope::FailedOrCanceled,
+        ];
+        let loc = GitLoc::for_worktree(std::path::Path::new("/does/not/exist"));
+        for (provider_name, caps, expected) in providers {
+            for (scope, expected_support) in scopes.into_iter().zip(expected) {
+                assert_eq!(
+                    caps.supports(scope),
+                    expected_support,
+                    "{provider_name} {scope:?}"
+                );
+                if !expected_support {
+                    let result = match provider_name {
+                        "GitHub" => GithubCi {
+                            remote: None,
+                            cancel: Arc::new(AtomicBool::new(false)),
+                        }
+                        .rerun(&loc, "123", scope),
+                        "GitLab" => GitlabCi::default().rerun(&loc, "123", scope),
+                        _ => unreachable!(),
+                    };
+                    assert!(matches!(result, Err(CiError::Unsupported(_))));
+                }
+            }
+        }
     }
 
     #[test]
