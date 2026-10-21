@@ -4039,6 +4039,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # prefix = "thegn"         # s3: key prefix inside the bucket
 # access_key = "env:AWS_ACCESS_KEY_ID"      # secret ref: env:VAR | keyring:<n>
 # secret_key = "env:AWS_SECRET_ACCESS_KEY"  #   | file:/path | bare env-var name
+# server_side_encryption = true              # s3: sign SSE AES256 into every upload; false only for
+#                                            #   S3-compatibles that reject it (never allows http)
 
 # ── Placement engine ─────────────────────────────────────────────────────────
 # WHERE each worktree sandbox runs: Dedicated (one sandbox, exclusive host),
