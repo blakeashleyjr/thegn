@@ -4,8 +4,68 @@
 
 use std::time::Duration;
 
-use crate::MediaError;
 use crate::model::{LoopMode, PlaybackState};
+use crate::{MediaCaps, MediaError};
+
+/// Raw, best-effort reads from one SMTC session's playback controls.
+/// `None` means the individual WinRT property read failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ControlFlags {
+    pub(crate) next: Option<bool>,
+    pub(crate) previous: Option<bool>,
+    pub(crate) position: Option<bool>,
+    pub(crate) shuffle: Option<bool>,
+    pub(crate) repeat: Option<bool>,
+}
+
+/// Action availability derived from a session's live playback controls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionCaps {
+    pub(crate) can_go_next: bool,
+    pub(crate) can_go_previous: bool,
+    pub(crate) can_seek: bool,
+    pub(crate) shuffle: bool,
+    pub(crate) loop_mode: bool,
+}
+
+/// Missing Controls or any unreadable individual flag is conservatively false.
+pub(crate) fn session_caps(flags: Option<ControlFlags>) -> SessionCaps {
+    let flags = flags.unwrap_or_default();
+    SessionCaps {
+        can_go_next: flags.next.unwrap_or(false),
+        can_go_previous: flags.previous.unwrap_or(false),
+        can_seek: flags.position.unwrap_or(false),
+        shuffle: flags.shuffle.unwrap_or(false),
+        loop_mode: flags.repeat.unwrap_or(false),
+    }
+}
+
+/// Overlay capabilities that vary with the live SMTC session.
+pub(crate) fn snapshot_caps(base: MediaCaps, session: SessionCaps) -> MediaCaps {
+    MediaCaps {
+        shuffle: session.shuffle,
+        loop_mode: session.loop_mode,
+        seek: session.can_seek,
+        ..base
+    }
+}
+
+/// Decode timeline ticks, dropping a corrupt position beyond a known end.
+pub(crate) fn timeline(
+    position_ticks: Option<i64>,
+    end_ticks: Option<i64>,
+) -> (Option<Duration>, Option<Duration>) {
+    let length = end_ticks.and_then(duration_from_ticks);
+    let position = position_ticks
+        .and_then(duration_from_ticks)
+        .filter(|position| length.is_none_or(|length| *position <= length));
+    (position, length)
+}
+
+/// Distinguish failure to open the SMTC manager from an empty player listing.
+pub(crate) fn manager_unavailable(detail: &str) -> MediaError {
+    MediaError::Unavailable(format!("SMTC session manager: {detail}"))
+}
 
 /// Convert an explicit SMTC refusal into a backend error rather than success.
 pub(crate) fn accepted(operation: &str, accepted: bool) -> Result<(), MediaError> {
@@ -123,5 +183,148 @@ mod tests {
         );
         assert_eq!(duration_from_ticks(0), None);
         assert_eq!(duration_from_ticks(-5), None);
+    }
+
+    #[test]
+    fn missing_controls_disable_every_session_action() {
+        assert_eq!(session_caps(None), SessionCaps::default());
+        assert_eq!(
+            session_caps(Some(ControlFlags::default())),
+            SessionCaps::default()
+        );
+    }
+
+    #[test]
+    fn session_caps_follow_each_flag() {
+        let disabled = ControlFlags {
+            next: Some(false),
+            previous: Some(false),
+            position: Some(false),
+            shuffle: Some(false),
+            repeat: Some(false),
+        };
+        let cases = [
+            (
+                ControlFlags {
+                    next: Some(true),
+                    ..disabled
+                },
+                SessionCaps {
+                    can_go_next: true,
+                    ..SessionCaps::default()
+                },
+            ),
+            (
+                ControlFlags {
+                    previous: Some(true),
+                    ..disabled
+                },
+                SessionCaps {
+                    can_go_previous: true,
+                    ..SessionCaps::default()
+                },
+            ),
+            (
+                ControlFlags {
+                    position: Some(true),
+                    ..disabled
+                },
+                SessionCaps {
+                    can_seek: true,
+                    ..SessionCaps::default()
+                },
+            ),
+            (
+                ControlFlags {
+                    shuffle: Some(true),
+                    ..disabled
+                },
+                SessionCaps {
+                    shuffle: true,
+                    ..SessionCaps::default()
+                },
+            ),
+            (
+                ControlFlags {
+                    repeat: Some(true),
+                    ..disabled
+                },
+                SessionCaps {
+                    loop_mode: true,
+                    ..SessionCaps::default()
+                },
+            ),
+        ];
+
+        for (flags, expected) in cases {
+            assert_eq!(session_caps(Some(flags)), expected);
+        }
+    }
+
+    #[test]
+    fn snapshot_caps_override_only_session_axes() {
+        let base = MediaCaps {
+            shuffle: true,
+            loop_mode: true,
+            volume: true,
+            playlists: true,
+            signals: true,
+            seek: true,
+            art: true,
+            queue: true,
+            abs_volume: true,
+            chapters: true,
+            fullscreen: true,
+        };
+
+        assert_eq!(
+            snapshot_caps(base, SessionCaps::default()),
+            MediaCaps {
+                shuffle: false,
+                loop_mode: false,
+                volume: true,
+                playlists: true,
+                signals: true,
+                seek: false,
+                art: true,
+                queue: true,
+                abs_volume: true,
+                chapters: true,
+                fullscreen: true,
+            }
+        );
+    }
+
+    #[test]
+    fn timeline_drops_position_past_end() {
+        assert_eq!(
+            timeline(Some(20), Some(10)),
+            (None, Some(Duration::from_nanos(1_000)))
+        );
+        assert_eq!(
+            timeline(Some(5), Some(10)),
+            (
+                Some(Duration::from_nanos(500)),
+                Some(Duration::from_nanos(1_000))
+            )
+        );
+        assert_eq!(
+            timeline(Some(5), None),
+            (Some(Duration::from_nanos(500)), None)
+        );
+        assert_eq!(
+            timeline(Some(-1), Some(10)),
+            (None, Some(Duration::from_nanos(1_000)))
+        );
+        assert_eq!(timeline(None, None), (None, None));
+    }
+
+    #[test]
+    fn manager_failure_is_unavailable_not_no_player() {
+        assert!(matches!(
+            manager_unavailable("x"),
+            MediaError::Unavailable(message) if message.contains("x")
+        ));
+        assert!(!matches!(manager_unavailable("x"), MediaError::NoPlayer));
     }
 }
