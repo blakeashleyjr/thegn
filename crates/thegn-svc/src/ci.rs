@@ -112,6 +112,7 @@ pub struct CiRunDetail {
 pub enum CiDetailIncomplete {
     PageBudget { pages: usize },
     RowBudget { rows: usize },
+    ByteBudget { bytes: usize },
 }
 
 impl CiDetailIncomplete {
@@ -122,6 +123,9 @@ impl CiDetailIncomplete {
             }
             Self::RowBudget { rows } => {
                 format!("job list stopped after {rows} rows (row budget)")
+            }
+            Self::ByteBudget { bytes } => {
+                format!("job list stopped after {bytes} bytes (byte budget)")
             }
         }
     }
@@ -1795,53 +1799,24 @@ impl CiProvider for GitlabCi {
                 run.id
             )));
         }
-        let mut jobs = Vec::new();
-        let mut ids = std::collections::HashSet::new();
-        let mut discarded_jobs = 0usize;
-        let mut bytes = 0usize;
-        let mut complete = false;
-        let mut incomplete = None;
-        for page in 1..=GITLAB_JOBS_MAX_PAGES {
-            let endpoint = format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
-            let remaining = GITLAB_JOBS_MAX_BYTES.saturating_sub(bytes);
-            let jobs_json = run_cli_capped(
-                self.command(loc, &remote, &["api", &endpoint])?,
-                remaining,
-                &self.cancel,
-            )?;
-            bytes = bytes.saturating_add(jobs_json.len());
-            let page_rows =
-                decode_provider_json::<Vec<serde_json::Value>>(&jobs_json, "GitLab jobs")
-                    .map_err(CiError::Other)?;
-            let page_length = page_rows.len();
-            let (parsed, discarded) = parse_provider_row(&page_rows, gitlab_job_from_value);
-            for job in &parsed {
-                if !ids.insert(job.id.clone()) {
-                    return Err(CiError::Other(format!(
-                        "duplicate GitLab job id {:?}",
-                        job.id
-                    )));
+        let (jobs, discarded_jobs, incomplete) =
+            collect_gitlab_jobs(GITLAB_JOBS_MAX_BYTES, |page, remaining| {
+                let endpoint =
+                    format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
+                match crate::issue::gh_run::run_blocking(
+                    self.command(loc, &remote, &["api", &endpoint])?,
+                    crate::issue::gh_run::Limits {
+                        timeout: CI_CLI_TIMEOUT,
+                        max_stdout: remaining,
+                        max_stderr: CI_CLI_MAX_STDERR,
+                    },
+                    &self.cancel,
+                ) {
+                    Ok(body) => Ok(GitlabJobPage::Body(body)),
+                    Err(crate::issue::gh_run::RunError::Truncated) => Ok(GitlabJobPage::OverBudget),
+                    Err(error) => Err(ci_run_error(error)),
                 }
-            }
-            jobs.extend(parsed);
-            discarded_jobs = discarded_jobs.saturating_add(discarded);
-            if jobs.len().saturating_add(discarded_jobs) > GITLAB_JOBS_MAX_ROWS {
-                jobs.truncate(GITLAB_JOBS_MAX_ROWS.saturating_sub(discarded_jobs));
-                incomplete = Some(CiDetailIncomplete::RowBudget {
-                    rows: GITLAB_JOBS_MAX_ROWS,
-                });
-                break;
-            }
-            if page_length < GITLAB_JOBS_PAGE_SIZE {
-                complete = true;
-                break;
-            }
-        }
-        if !complete && incomplete.is_none() {
-            incomplete = Some(CiDetailIncomplete::PageBudget {
-                pages: GITLAB_JOBS_MAX_PAGES,
-            });
-        }
+            })?;
         if discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitLab job rows");
         }
@@ -1940,6 +1915,74 @@ impl CiProvider for GitlabCi {
             cancel: true,
         }
     }
+}
+
+enum GitlabJobPage {
+    Body(String),
+    OverBudget,
+}
+
+fn collect_gitlab_jobs(
+    max_bytes: usize,
+    mut fetch: impl FnMut(usize, usize) -> Result<GitlabJobPage, CiError>,
+) -> Result<(Vec<CiJob>, usize, Option<CiDetailIncomplete>), CiError> {
+    let mut jobs = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    let mut discarded_jobs = 0usize;
+    let mut bytes = 0usize;
+    let mut complete = false;
+    let mut incomplete = None;
+    for page in 1..=GITLAB_JOBS_MAX_PAGES {
+        let remaining = max_bytes.saturating_sub(bytes);
+        if page > 1 && remaining == 0 {
+            incomplete = Some(CiDetailIncomplete::ByteBudget { bytes: max_bytes });
+            break;
+        }
+        let jobs_json = match fetch(page, remaining)? {
+            GitlabJobPage::Body(body) => body,
+            GitlabJobPage::OverBudget if page == 1 => {
+                return Err(CiError::Other(
+                    "provider output byte budget exhausted".into(),
+                ));
+            }
+            GitlabJobPage::OverBudget => {
+                incomplete = Some(CiDetailIncomplete::ByteBudget { bytes: max_bytes });
+                break;
+            }
+        };
+        bytes = bytes.saturating_add(jobs_json.len());
+        let page_rows = decode_provider_json::<Vec<serde_json::Value>>(&jobs_json, "GitLab jobs")
+            .map_err(CiError::Other)?;
+        let page_length = page_rows.len();
+        let (parsed, discarded) = parse_provider_row(&page_rows, gitlab_job_from_value);
+        for job in &parsed {
+            if !ids.insert(job.id.clone()) {
+                return Err(CiError::Other(format!(
+                    "duplicate GitLab job id {:?}",
+                    job.id
+                )));
+            }
+        }
+        jobs.extend(parsed);
+        discarded_jobs = discarded_jobs.saturating_add(discarded);
+        if jobs.len().saturating_add(discarded_jobs) > GITLAB_JOBS_MAX_ROWS {
+            jobs.truncate(GITLAB_JOBS_MAX_ROWS.saturating_sub(discarded_jobs));
+            incomplete = Some(CiDetailIncomplete::RowBudget {
+                rows: GITLAB_JOBS_MAX_ROWS,
+            });
+            break;
+        }
+        if page_length < GITLAB_JOBS_PAGE_SIZE {
+            complete = true;
+            break;
+        }
+    }
+    if !complete && incomplete.is_none() {
+        incomplete = Some(CiDetailIncomplete::PageBudget {
+            pages: GITLAB_JOBS_MAX_PAGES,
+        });
+    }
+    Ok((jobs, discarded_jobs, incomplete))
 }
 
 /// Extract a GitLab project path (`group/sub/repo`, keeping subgroups) from a
@@ -2988,6 +3031,120 @@ esac
                 .reason()
                 .contains("5000 rows (row budget)")
         );
+        assert!(
+            CiDetailIncomplete::ByteBudget { bytes: 4_194_304 }
+                .reason()
+                .contains("(byte budget)")
+        );
+    }
+
+    fn gitlab_jobs_json(ids: std::ops::RangeInclusive<u64>) -> String {
+        let rows: Vec<_> = ids
+            .map(|id| serde_json::json!({"id": id, "name": format!("job-{id}"), "status": "success"}))
+            .collect();
+        serde_json::to_string(&rows).unwrap()
+    }
+
+    #[test]
+    fn gitlab_detail_byte_budget_returns_typed_partial_prefix() {
+        let max_bytes = 4 * 1024 * 1024;
+        let page_one = gitlab_jobs_json(1..=100);
+        let (jobs, _, incomplete) = collect_gitlab_jobs(max_bytes, |page, _remaining| match page {
+            1 => Ok(GitlabJobPage::Body(page_one.clone())),
+            2 => Ok(GitlabJobPage::OverBudget),
+            _ => panic!("unexpected page {page}"),
+        })
+        .unwrap();
+
+        assert_eq!(jobs.len(), 100);
+        assert_eq!(
+            incomplete,
+            Some(CiDetailIncomplete::ByteBudget { bytes: max_bytes })
+        );
+        assert!(
+            !CiRunDetail {
+                run: CiRun::default(),
+                discarded_jobs: 0,
+                incomplete,
+            }
+            .is_complete()
+        );
+    }
+
+    #[test]
+    fn gitlab_detail_spent_byte_budget_stops_before_next_page() {
+        let page_one = gitlab_jobs_json(1..=100);
+        let max_bytes = page_one.len();
+        let mut calls = 0usize;
+        let (jobs, _, incomplete) = collect_gitlab_jobs(max_bytes, |page, remaining| {
+            calls += 1;
+            assert_eq!(page, 1);
+            assert_eq!(remaining, max_bytes);
+            Ok(GitlabJobPage::Body(page_one.clone()))
+        })
+        .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(jobs.len(), 100);
+        assert_eq!(
+            incomplete,
+            Some(CiDetailIncomplete::ByteBudget { bytes: max_bytes })
+        );
+    }
+
+    #[test]
+    fn gitlab_detail_first_page_over_byte_budget_is_an_error() {
+        let result = collect_gitlab_jobs(1, |_page, _remaining| Ok(GitlabJobPage::OverBudget));
+        assert!(matches!(
+            result,
+            Err(CiError::Other(message)) if message == "provider output byte budget exhausted"
+        ));
+    }
+
+    #[test]
+    fn gitlab_detail_collector_keeps_page_and_row_rules() {
+        let (jobs, _, page_incomplete) = collect_gitlab_jobs(usize::MAX, |page, _remaining| {
+            let first_id = ((page - 1) * GITLAB_JOBS_PAGE_SIZE + 1) as u64;
+            Ok(GitlabJobPage::Body(gitlab_jobs_json(
+                first_id..=first_id + (GITLAB_JOBS_PAGE_SIZE as u64 - 1),
+            )))
+        })
+        .unwrap();
+        assert_eq!(jobs.len(), GITLAB_JOBS_MAX_ROWS);
+        assert_eq!(
+            page_incomplete,
+            Some(CiDetailIncomplete::PageBudget {
+                pages: GITLAB_JOBS_MAX_PAGES
+            })
+        );
+
+        let (row_jobs, discarded, row_incomplete) =
+            collect_gitlab_jobs(usize::MAX, |_page, _remaining| {
+                Ok(GitlabJobPage::Body(gitlab_jobs_json(
+                    1..=(GITLAB_JOBS_MAX_ROWS as u64 + 1),
+                )))
+            })
+            .unwrap();
+        assert_eq!(row_jobs.len() + discarded, GITLAB_JOBS_MAX_ROWS);
+        assert_eq!(
+            row_incomplete,
+            Some(CiDetailIncomplete::RowBudget {
+                rows: GITLAB_JOBS_MAX_ROWS
+            })
+        );
+
+        let duplicate = collect_gitlab_jobs(usize::MAX, |page, _remaining| {
+            let body = if page == 1 {
+                gitlab_jobs_json(1..=100)
+            } else {
+                gitlab_jobs_json(1..=1)
+            };
+            Ok(GitlabJobPage::Body(body))
+        });
+        assert!(matches!(
+            duplicate,
+            Err(CiError::Other(message)) if message.contains("duplicate GitLab job id")
+        ));
     }
 
     #[test]
