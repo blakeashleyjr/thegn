@@ -417,6 +417,90 @@ const JIRA_FIELDS: &str =
     "summary,description,status,priority,assignee,labels,updated,duedate,comment";
 const MAX_LIST_PAGES: usize = 20;
 
+struct PageReasons {
+    deadline: &'static str,
+    empty_before_total: &'static str,
+    page_cap: &'static str,
+}
+
+const LIST_REASONS: PageReasons = PageReasons {
+    deadline: "Jira listing deadline exceeded",
+    empty_before_total: "Jira returned an empty page before total",
+    page_cap: "Jira listing page cap reached",
+};
+
+const SEARCH_REASONS: PageReasons = PageReasons {
+    deadline: "Jira search deadline exceeded",
+    empty_before_total: "Jira search returned an empty page before total",
+    page_cap: "Jira search page cap reached",
+};
+
+async fn collect_jira_pages(
+    op: &mut TrackerHttpOperation<'_>,
+    base_url: &str,
+    jql: &str,
+    limit: usize,
+    reasons: &PageReasons,
+) -> Result<Vec<Issue>, IssueError> {
+    let mut start_at = 0;
+    let mut issues = Vec::new();
+    let mut total = None;
+    for page in 0..MAX_LIST_PAGES {
+        let page_size = if limit == 0 {
+            100
+        } else {
+            limit.saturating_sub(issues.len()).min(100)
+        };
+        if page_size == 0 {
+            return Ok(issues);
+        }
+        let path = format!(
+            "search?jql={}&fields={JIRA_FIELDS}&startAt={start_at}&maxResults={page_size}",
+            urlencoding_simple(jql)
+        );
+        let result: SearchResult = match JiraBackend::get(op, &path).await {
+            Ok(result) => result,
+            Err(IssueError::Timeout(_)) if !issues.is_empty() => {
+                return Err(IssueError::PartialList {
+                    issues,
+                    reason: reasons.deadline,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        total = result.total.or(total);
+        let received = result.issues.len();
+        for issue in result.issues {
+            checked_jira_key(&issue.key)?;
+            issues.push(jira_issue_to_domain(issue, base_url));
+        }
+        if limit > 0 && issues.len() >= limit {
+            issues.truncate(limit);
+            return Ok(issues);
+        }
+        if received == 0 {
+            if total.is_some_and(|total| start_at < total) {
+                return Err(IssueError::PartialList {
+                    issues,
+                    reason: reasons.empty_before_total,
+                });
+            }
+            return Ok(issues);
+        }
+        start_at += received;
+        if total.is_some_and(|total| start_at >= total) {
+            return Ok(issues);
+        }
+        if page + 1 == MAX_LIST_PAGES {
+            return Err(IssueError::PartialList {
+                issues,
+                reason: reasons.page_cap,
+            });
+        }
+    }
+    Ok(issues)
+}
+
 impl IssueBackend for JiraBackend {
     fn provider_id(&self) -> &str {
         "jira"
@@ -471,60 +555,7 @@ impl IssueBackend for JiraBackend {
                 format!("{} ORDER BY updated DESC", jql_parts.join(" AND "))
             };
 
-            let mut start_at = 0;
-            let mut issues = Vec::new();
-            let mut total = None;
-            for page in 0..MAX_LIST_PAGES {
-                let page_size = if filter.limit == 0 {
-                    100
-                } else {
-                    (filter.limit - issues.len()).min(100)
-                };
-                let path = format!(
-                    "search?jql={}&fields={JIRA_FIELDS}&startAt={start_at}&maxResults={page_size}",
-                    urlencoding_simple(&jql)
-                );
-                let result: SearchResult = match Self::get(&mut op, &path).await {
-                    Ok(result) => result,
-                    Err(IssueError::Timeout(_)) if !issues.is_empty() => {
-                        return Err(IssueError::PartialList {
-                            issues,
-                            reason: "Jira listing deadline exceeded",
-                        });
-                    }
-                    Err(error) => return Err(error),
-                };
-                total = result.total.or(total);
-                let received = result.issues.len();
-                for issue in result.issues {
-                    checked_jira_key(&issue.key)?;
-                    issues.push(jira_issue_to_domain(issue, &self.base_url));
-                }
-                if filter.limit > 0 && issues.len() >= filter.limit {
-                    issues.truncate(filter.limit);
-                    return Ok(issues);
-                }
-                if received == 0 {
-                    if total.is_some_and(|total| start_at < total) {
-                        return Err(IssueError::PartialList {
-                            issues,
-                            reason: "Jira returned an empty page before total",
-                        });
-                    }
-                    return Ok(issues);
-                }
-                start_at += received;
-                if total.is_some_and(|total| start_at >= total) {
-                    return Ok(issues);
-                }
-                if page + 1 == MAX_LIST_PAGES {
-                    return Err(IssueError::PartialList {
-                        issues,
-                        reason: "Jira listing page cap reached",
-                    });
-                }
-            }
-            Ok(issues)
+            collect_jira_pages(&mut op, &self.base_url, &jql, filter.limit, &LIST_REASONS).await
         })
     }
 
@@ -930,20 +961,7 @@ impl IssueBackend for JiraBackend {
                 "text ~ \"{}\" ORDER BY updated DESC",
                 escape_jql_str(query_str)
             );
-            let limit = if limit == 0 { 100 } else { limit.min(100) };
-            let path = format!(
-                "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
-                urlencoding_simple(&jql)
-            );
-            let result: SearchResult = Self::get(&mut op, &path).await?;
-            result
-                .issues
-                .into_iter()
-                .map(|issue| {
-                    checked_jira_key(&issue.key)?;
-                    Ok(jira_issue_to_domain(issue, &self.base_url))
-                })
-                .collect()
+            collect_jira_pages(&mut op, &self.base_url, &jql, limit, &SEARCH_REASONS).await
         })
     }
 }
@@ -1383,6 +1401,58 @@ mod tests {
         (result, calls)
     }
 
+    async fn run_search(
+        query: &str,
+        limit: usize,
+        responses: Vec<FixtureResponse>,
+        budget: Arc<TrackerHttpBudget>,
+    ) -> (Result<Vec<Issue>, IssueError>, Vec<String>) {
+        use std::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let route_calls = Arc::clone(&calls);
+        let route_responses = Arc::new(responses);
+        let response_fixture = Arc::clone(&route_responses);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                let response_fixture = Arc::clone(&response_fixture);
+                async move {
+                    let mut recorded = route_calls.lock().unwrap();
+                    let index = recorded.len();
+                    recorded.push(request.uri().to_string());
+                    drop(recorded);
+                    let response = response_fixture
+                        .get(index)
+                        .or_else(|| response_fixture.last())
+                        .expect("at least one Jira fixture response")
+                        .clone();
+                    let mut result = (response.status, Body::from(response.body)).into_response();
+                    result.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    result
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = JiraBackend::new_with_budget(
+            format!("http://{address}"),
+            "user@example.test".into(),
+            "jira-secret".into(),
+            None,
+            budget,
+        );
+        let result = backend.search(query, limit).await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let calls = calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
     async fn run_get(
         responses: Vec<FixtureResponse>,
     ) -> (Result<IssueDetail, IssueError>, Vec<String>) {
@@ -1612,6 +1682,72 @@ mod tests {
             })
             .to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn search_follows_start_at_until_total_is_reached() {
+        let (result, requests) = run_search(
+            "needle",
+            150,
+            vec![
+                jira_search_page(0, 150, 100),
+                jira_search_page(100, 150, 50),
+            ],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        assert_eq!(result.unwrap().len(), 150);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("startAt=0"), "{}", requests[0]);
+        assert!(requests[1].contains("startAt=100"), "{}", requests[1]);
+    }
+
+    #[tokio::test]
+    async fn search_limit_zero_requests_a_bounded_page() {
+        let (result, requests) = run_search(
+            "needle",
+            0,
+            vec![jira_search_page(0, 0, 0)],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        assert!(result.unwrap().is_empty());
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("maxResults=100"), "{}", requests[0]);
+        assert!(requests[0].contains("startAt=0"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn search_truncates_rows_at_the_requested_limit() {
+        let (result, requests) = run_search(
+            "needle",
+            1,
+            vec![jira_search_page(0, 2, 2)],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("maxResults=1"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn search_page_cap_returns_collected_rows_as_partial() {
+        let (result, requests) = run_search(
+            "needle",
+            0,
+            vec![jira_search_page(0, usize::MAX, 100)],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        match result {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 100 * MAX_LIST_PAGES);
+                assert_eq!(reason, "Jira search page cap reached");
+            }
+            other => panic!("expected capped partial search, got {other:?}"),
+        }
+        assert_eq!(requests.len(), MAX_LIST_PAGES);
     }
 
     #[tokio::test]
