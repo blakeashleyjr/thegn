@@ -165,9 +165,10 @@ pass those same literal values to the background monitor and every later lease
 command. Never re-evaluate `$$` or `$(hostname)` during this run. Exit 2 with
 “held by …” means another Lead is driving this issue: stop and tell the user;
 do not start a second chain. Thegn checks the lease on claim, stage open and
-set-status. A row claimed with `--lease/--owner` is bound to that lease; further
-claims for that issue and status changes on its rows require the same live
-lease, or the audited `--admin --why` path.
+`dispatch put`, stage open, `--resume-work` and set-status. A row created with
+`--lease/--owner` is bound to that lease; further claims, puts, resumes and
+status changes for that issue require the same live lease, or the audited
+`--admin --why` path on the supported dispatch mutations.
 
 Have the background monitor renew the lease every 100 seconds (one third of
 the 300-second TTL):
@@ -394,7 +395,7 @@ A row that failed or was interrupted is **resumed**, not re-dispatched from
 memory:
 
 ```bash
-thegn session open --resume-work <row-id> --json
+thegn session open --resume-work <row-id> --lease "<recorded lease name>" --owner "<recorded lease owner>" --json
 ```
 
 One call composes the finisher prompt — the original stage prompt, the

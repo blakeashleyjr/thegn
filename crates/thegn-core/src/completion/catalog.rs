@@ -586,6 +586,13 @@ pub const CATALOG: &[Slot] = &[
         "why",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    slot("dispatch put", "lease", SourceKind::Structural),
+    slot("dispatch put", "owner", SourceKind::Structural),
+    slot(
+        "dispatch put",
+        "why",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("dispatch set-status", "lease", SourceKind::Structural),
     slot("dispatch set-status", "owner", SourceKind::Structural),
     slot("session open", "lease", SourceKind::Structural),

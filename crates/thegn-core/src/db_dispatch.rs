@@ -706,13 +706,36 @@ impl Db {
         &self,
         new: crate::issue::NewDispatch<'_>,
     ) -> Result<i64> {
+        self.put_dispatch_with_parent_check_led(new, LeadProof::Unbound)
+    }
+
+    /// Validate the issue's active Lead lease and insert a non-claim row under
+    /// one write lock.
+    pub fn put_dispatch_with_parent_check_led(
+        &self,
+        new: crate::issue::NewDispatch<'_>,
+        proof: LeadProof<'_>,
+    ) -> Result<i64> {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<i64> {
+            let bound = active_bound_leases(conn, new.issue_id)?;
+            let audit_note = lead_check(conn, &bound, proof, util::now_ms())?;
             if let Some(parent_id) = new.parent_id {
                 self.validate_parent_edge(parent_id, new.issue_id)?;
             }
             let id = self.put_agent_dispatch(new)?;
+            if let LeadProof::Lease { name, .. } = proof {
+                conn.execute(
+                    "UPDATE agent_dispatches SET lead_lease=?1 WHERE id=?2",
+                    rusqlite::params![name, id],
+                )?;
+            }
+            if let Some(audit) = audit_note {
+                let audit = crate::pipeline_report::note_text(&audit)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                self.append_dispatch_note(id, &audit)?;
+            }
             if let Some(stage) = new.stage
                 && new.artifact_path.is_none()
             {
@@ -1445,20 +1468,7 @@ impl Db {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<std::result::Result<i64, DispatchAdmissionDecision>> {
-            let mut stmt = conn.prepare("SELECT DISTINCT lead_lease FROM agent_dispatches WHERE issue_id=?1 AND lead_lease IS NOT NULL AND status IN (?2,?3,?4,?5,?6)")?;
-            let bound = stmt
-                .query_map(
-                    rusqlite::params![
-                        new.issue_id,
-                        AgentDispatchStatus::Queued.as_str(),
-                        AgentDispatchStatus::Spawning.as_str(),
-                        AgentDispatchStatus::Running.as_str(),
-                        AgentDispatchStatus::WaitingHuman.as_str(),
-                        AgentDispatchStatus::PrOpen.as_str()
-                    ],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let bound = active_bound_leases(conn, new.issue_id)?;
             let audit_note = lead_check(conn, &bound, proof, util::now_ms())?;
             let rows = self.admission_rows(new.issue_id, new.worktree_path)?;
             if let Some(parent_id) = new.parent_id {
@@ -1665,6 +1675,25 @@ impl Db {
         new: crate::issue::NewDispatch<'_>,
         limit: u32,
     ) -> Result<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>> {
+        self.claim_resume_dispatch_led(
+            source_id,
+            expected_source_status,
+            new,
+            limit,
+            LeadProof::Unbound,
+        )
+    }
+
+    /// Reconcile a resume source and claim its finisher under the presented
+    /// Lead lease in one write transaction.
+    pub fn claim_resume_dispatch_led(
+        &self,
+        source_id: i64,
+        expected_source_status: AgentDispatchStatus,
+        new: crate::issue::NewDispatch<'_>,
+        limit: u32,
+        proof: LeadProof<'_>,
+    ) -> Result<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>> {
         use crate::pipeline_claim::{ClaimRequest, decide};
         let req = ClaimRequest {
             issue_id: new.issue_id.to_string(),
@@ -1677,6 +1706,21 @@ impl Db {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result =
             (|| -> Result<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>> {
+                let source_lease: Option<String> = conn
+                    .query_row(
+                        "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                        [source_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| anyhow::anyhow!("dispatch {source_id} disappeared"))?;
+                let mut bound = active_bound_leases(conn, new.issue_id)?;
+                if let Some(lease) = source_lease
+                    && !bound.contains(&lease)
+                {
+                    bound.push(lease);
+                }
+                let audit_note = lead_check(conn, &bound, proof, util::now_ms())?;
                 let (stored, source_scope) = conn
                     .query_row(
                         "SELECT status, chunk_scope FROM agent_dispatches WHERE id=?1",
@@ -1724,6 +1768,17 @@ impl Db {
                     return Ok(Err(decision));
                 }
                 let finisher = self.put_agent_dispatch(new)?;
+                if let LeadProof::Lease { name, .. } = proof {
+                    conn.execute(
+                        "UPDATE agent_dispatches SET lead_lease=?1 WHERE id=?2",
+                        rusqlite::params![name, finisher],
+                    )?;
+                }
+                if let Some(audit) = audit_note {
+                    let audit = crate::pipeline_report::note_text(&audit)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    self.append_dispatch_note(finisher, &audit)?;
+                }
                 if let Some(stage) = new.stage
                     && new.artifact_path.is_none()
                 {
@@ -2099,6 +2154,24 @@ impl Db {
                 .collect::<rusqlite::Result<Vec<_>>>()?)
         }
     }
+}
+
+fn active_bound_leases(conn: &rusqlite::Connection, issue_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT lead_lease FROM agent_dispatches WHERE issue_id=?1 AND lead_lease IS NOT NULL AND status IN (?2,?3,?4,?5,?6)")?;
+    let bound = stmt
+        .query_map(
+            rusqlite::params![
+                issue_id,
+                AgentDispatchStatus::Queued.as_str(),
+                AgentDispatchStatus::Spawning.as_str(),
+                AgentDispatchStatus::Running.as_str(),
+                AgentDispatchStatus::WaitingHuman.as_str(),
+                AgentDispatchStatus::PrOpen.as_str()
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(bound)
 }
 
 fn map_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchNote> {
@@ -5234,5 +5307,444 @@ mod tests {
                 Some(LeadLeaseConflict::NotHeld { lease, .. }) if lease == "repo:linear:BOUND"
             )
         ));
+    }
+
+    #[test]
+    fn lead_lease_put_refuses_an_unbound_put_for_a_bound_issue() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:PUT";
+        db.acquire_pipeline_lease(lease, "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        lead_claim(
+            &db,
+            "linear:PUT",
+            "/wt/a",
+            LeadProof::Lease {
+                name: lease,
+                owner: "lead-a",
+            },
+        )
+        .unwrap();
+        let before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let result = db.put_dispatch_with_parent_check_led(
+            crate::issue::NewDispatch::new("linear:PUT", "/wt/b", "coder"),
+            LeadProof::Unbound,
+        );
+        assert!(
+            matches!(result, Err(ref error) if matches!(error.downcast_ref::<LeadLeaseConflict>(), Some(LeadLeaseConflict::Required { .. })))
+        );
+        let after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn lead_lease_put_with_the_lease_binds_the_row() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:PUT";
+        db.acquire_pipeline_lease(lease, "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        lead_claim(
+            &db,
+            "linear:PUT",
+            "/wt/a",
+            LeadProof::Lease {
+                name: lease,
+                owner: "lead-a",
+            },
+        )
+        .unwrap();
+        let id = db
+            .put_dispatch_with_parent_check_led(
+                crate::issue::NewDispatch::new("linear:PUT", "/wt/b", "coder"),
+                LeadProof::Lease {
+                    name: lease,
+                    owner: "lead-a",
+                },
+            )
+            .unwrap();
+        let bound: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound.as_deref(), Some(lease));
+    }
+
+    #[test]
+    fn lead_lease_put_admin_records_the_reason() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:PUT";
+        db.acquire_pipeline_lease(lease, "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        lead_claim(
+            &db,
+            "linear:PUT",
+            "/wt/a",
+            LeadProof::Lease {
+                name: lease,
+                owner: "lead-a",
+            },
+        )
+        .unwrap();
+        let id = db
+            .put_dispatch_with_parent_check_led(
+                crate::issue::NewDispatch::new("linear:PUT", "/wt/b", "coder"),
+                LeadProof::Admin { why: "manual fix" },
+            )
+            .unwrap();
+        assert!(
+            db.dispatch_notes(id, None, 10)
+                .unwrap()
+                .iter()
+                .any(|note| note.text.contains("bypassed by admin: manual fix"))
+        );
+    }
+
+    #[test]
+    fn lead_lease_resume_refuses_another_owner() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:RESUME";
+        db.acquire_pipeline_lease(lease, "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        let source = lead_claim(
+            &db,
+            "linear:RESUME",
+            "/wt/a",
+            LeadProof::Lease {
+                name: lease,
+                owner: "lead-a",
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let result = db.claim_resume_dispatch_led(
+            source,
+            AgentDispatchStatus::Failed,
+            crate::issue::NewDispatch {
+                stage: Some("code"),
+                parent_id: Some(source),
+                ..crate::issue::NewDispatch::new("linear:RESUME", "/wt/a", "coder")
+            },
+            3,
+            LeadProof::Lease {
+                name: lease,
+                owner: "lead-b",
+            },
+        );
+        assert!(
+            matches!(result, Err(ref error) if matches!(error.downcast_ref::<LeadLeaseConflict>(), Some(LeadLeaseConflict::NotHeld { .. })))
+        );
+        assert_eq!(lead_status(&db, source), AgentDispatchStatus::Failed);
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lead_lease_resume_binds_the_finisher() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:RESUME";
+        db.acquire_pipeline_lease(lease, "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        let source = lead_claim(
+            &db,
+            "linear:RESUME",
+            "/wt/a",
+            LeadProof::Lease {
+                name: lease,
+                owner: "lead-a",
+            },
+        )
+        .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let finisher = db
+            .claim_resume_dispatch_led(
+                source,
+                AgentDispatchStatus::Failed,
+                crate::issue::NewDispatch {
+                    stage: Some("code"),
+                    parent_id: Some(source),
+                    ..crate::issue::NewDispatch::new("linear:RESUME", "/wt/a", "coder")
+                },
+                3,
+                LeadProof::Lease {
+                    name: lease,
+                    owner: "lead-a",
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let bound: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                [finisher],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound.as_deref(), Some(lease));
+    }
+
+    #[test]
+    fn lead_lease_unbound_put_and_resume_keep_legacy_behaviour() {
+        let db = Db::open_memory().unwrap();
+        let put = db
+            .put_dispatch_with_parent_check_led(
+                crate::issue::NewDispatch::new("linear:FREE", "/wt/a", "coder"),
+                LeadProof::Unbound,
+            )
+            .unwrap();
+        db.update_dispatch_status(put, AgentDispatchStatus::Failed)
+            .unwrap();
+        let finisher = db
+            .claim_resume_dispatch_led(
+                put,
+                AgentDispatchStatus::Failed,
+                crate::issue::NewDispatch {
+                    stage: Some("code"),
+                    parent_id: Some(put),
+                    ..crate::issue::NewDispatch::new("linear:FREE", "/wt/a", "coder")
+                },
+                3,
+                LeadProof::Unbound,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(lead_status(&db, finisher), AgentDispatchStatus::Queued);
+    }
+
+    #[test]
+    fn lead_lease_race_two_leads_exactly_one_decision_chain() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let (db, dir) = temp_db();
+        let path = dir.path().join("thegn.db");
+        let other = Db::open_at(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let code = Arc::new(Mutex::new(None));
+        let review = Arc::new(Mutex::new(None));
+        let put = Arc::new(Mutex::new(None));
+
+        let run_lead = |db: Db,
+                        owner: &'static str,
+                        barrier: Arc<Barrier>,
+                        code: Arc<Mutex<Option<i64>>>,
+                        review: Arc<Mutex<Option<i64>>>,
+                        put: Arc<Mutex<Option<i64>>>| {
+            std::thread::spawn(move || {
+                let lease = "repo:linear:RACE";
+                let acquired = matches!(db.acquire_pipeline_lease(lease, owner, 300), Ok(Ok(())));
+                barrier.wait();
+                let proof = LeadProof::Lease { name: lease, owner };
+                let code_result = db.claim_dispatch_admitted_led(
+                    crate::issue::NewDispatch {
+                        stage: Some("code"),
+                        ..crate::issue::NewDispatch::new("linear:RACE", "/wt/race", "coder")
+                    },
+                    8,
+                    None,
+                    None,
+                    None,
+                    proof,
+                );
+                let (code_ok, code_conflict) = match code_result {
+                    Ok(Ok(id)) => {
+                        *code
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+                        (true, false)
+                    }
+                    Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some() => {
+                        (false, true)
+                    }
+                    _ => (false, false),
+                };
+                barrier.wait();
+                let code_id = code
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect("winning code claim published");
+                let status_result = db.set_dispatch_status_led(
+                    code_id,
+                    AgentDispatchStatus::Queued,
+                    AgentDispatchStatus::Running,
+                    None,
+                    proof,
+                );
+                let status_ok = status_result.is_ok();
+                let status_conflict = matches!(status_result, Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some());
+                barrier.wait();
+                let review_result = db.claim_dispatch_admitted_led(
+                    crate::issue::NewDispatch {
+                        stage: Some("review"),
+                        parent_id: Some(code_id),
+                        ..crate::issue::NewDispatch::new("linear:RACE", "/wt/race", "reviewer")
+                    },
+                    8,
+                    None,
+                    None,
+                    None,
+                    proof,
+                );
+                let (review_ok, review_conflict) = match review_result {
+                    Ok(Ok(id)) => {
+                        *review
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+                        (true, false)
+                    }
+                    Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some() => {
+                        (false, true)
+                    }
+                    _ => (false, false),
+                };
+                barrier.wait();
+                let review_id = review
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect("winning review claim published");
+                let put_result = db.put_dispatch_with_parent_check_led(
+                    crate::issue::NewDispatch {
+                        stage: Some("put"),
+                        parent_id: Some(review_id),
+                        ..crate::issue::NewDispatch::new("linear:RACE", "/wt/race", "lead")
+                    },
+                    proof,
+                );
+                let (put_ok, put_conflict) = match put_result {
+                    Ok(id) => {
+                        *put.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+                        (true, false)
+                    }
+                    Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some() => {
+                        (false, true)
+                    }
+                    _ => (false, false),
+                };
+                barrier.wait();
+                let put_id = put
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect("winning put published");
+                if acquired {
+                    db.update_dispatch_status(put_id, AgentDispatchStatus::Failed)
+                        .unwrap();
+                }
+                barrier.wait();
+                let resume_result = db.claim_resume_dispatch_led(
+                    put_id,
+                    AgentDispatchStatus::Failed,
+                    crate::issue::NewDispatch {
+                        stage: Some("finish"),
+                        parent_id: Some(put_id),
+                        ..crate::issue::NewDispatch::new("linear:RACE", "/wt/race", "lead")
+                    },
+                    8,
+                    proof,
+                );
+                let resume_ok = matches!(resume_result, Ok(Ok(_)));
+                let resume_conflict = matches!(resume_result, Err(ref error) if error.downcast_ref::<LeadLeaseConflict>().is_some());
+                barrier.wait();
+                [
+                    acquired,
+                    code_ok,
+                    code_conflict,
+                    status_ok,
+                    status_conflict,
+                    review_ok,
+                    review_conflict,
+                    put_ok,
+                    put_conflict,
+                    resume_ok,
+                    resume_conflict,
+                ]
+            })
+        };
+
+        let a = run_lead(
+            db,
+            "lead-a",
+            barrier.clone(),
+            code.clone(),
+            review.clone(),
+            put.clone(),
+        );
+        let b = run_lead(
+            other,
+            "lead-b",
+            barrier,
+            code.clone(),
+            review.clone(),
+            put.clone(),
+        );
+        let a = a.join().unwrap();
+        let b = b.join().unwrap();
+        assert_eq!(usize::from(a[0] as u8) + usize::from(b[0] as u8), 1);
+        for (success, conflict) in [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10)] {
+            assert_eq!(
+                usize::from(a[success] as u8) + usize::from(b[success] as u8),
+                1
+            );
+            assert_eq!(
+                usize::from(a[conflict] as u8) + usize::from(b[conflict] as u8),
+                1
+            );
+        }
+        let winner = if a[0] { "lead-a" } else { "lead-b" };
+        let check_db = Db::open_at(&path).unwrap();
+        let rows = check_db.list_dispatches().unwrap();
+        assert_eq!(rows.len(), 4);
+        let mut stages: Vec<Option<String>> = rows.iter().map(|row| row.stage.clone()).collect();
+        stages.sort();
+        assert_eq!(
+            stages,
+            vec![
+                Some("code".into()),
+                Some("finish".into()),
+                Some("put".into()),
+                Some("review".into())
+            ]
+        );
+        for row in rows {
+            assert_eq!(row.issue_id, "linear:RACE");
+        }
+        let bound: Vec<Option<String>> = {
+            let mut stmt = check_db
+                .conn()
+                .prepare("SELECT lead_lease FROM agent_dispatches ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(bound, vec![Some("repo:linear:RACE".into()); 4]);
+        assert_eq!(
+            check_db
+                .pipeline_lease_row("repo:linear:RACE")
+                .unwrap()
+                .unwrap()
+                .0,
+            winner
+        );
+        // Queue enrollment (`merge add`) remains outside this lease decision chain.
     }
 }
