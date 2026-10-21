@@ -537,7 +537,7 @@ impl MediaBackend for MprisZbus {
                 .map_err(map_mutation_fdo_error)?;
             let tracks: Vec<OwnedObjectPath> =
                 Vec::try_from(tracks_value).map_err(|e| MediaError::Backend(e.to_string()))?;
-            if !tracks.iter().any(|track| track == &path) {
+            if !queue_item_is_in_tracklist(&tracks, &path) {
                 return Err(MediaError::Stale(
                     "queue item is not in the current player's track list".into(),
                 ));
@@ -580,10 +580,18 @@ impl MediaBackend for MprisZbus {
             })?;
             let cur = Result::ok(bool::try_from(read));
             let next = toggled_fullscreen(cur)?;
-            write_if_same_owner(&owner, self.owner_of(&bus).await, || async {
-                self.player_set(&owner, "Fullscreen", Value::Bool(next))
-                    .await
-            })
+            write_fullscreen_if_same_owner(
+                &owner,
+                self.owner_of(&bus).await,
+                iface,
+                next,
+                |iface, value| async {
+                    proxy
+                        .set(iface, "Fullscreen", Value::Bool(value))
+                        .await
+                        .map_err(map_mutation_fdo_error)
+                },
+            )
             .await
         })
     }
@@ -665,6 +673,24 @@ fn toggled_fullscreen(current: Option<bool>) -> Result<bool, MediaError> {
     current
         .map(|c| !c)
         .ok_or_else(|| MediaError::Backend("Fullscreen state unreadable".to_string()))
+}
+
+fn queue_item_is_in_tracklist(tracks: &[OwnedObjectPath], path: &OwnedObjectPath) -> bool {
+    tracks.iter().any(|track| track == path)
+}
+
+async fn write_fullscreen_if_same_owner<W, Fut>(
+    observed: &str,
+    current: Result<String, MediaError>,
+    iface: InterfaceName<'static>,
+    value: bool,
+    write: W,
+) -> Result<(), MediaError>
+where
+    W: FnOnce(InterfaceName<'static>, bool) -> Fut,
+    Fut: Future<Output = Result<(), MediaError>>,
+{
+    write_if_same_owner(observed, current, || write(iface, value)).await
 }
 
 async fn write_if_same_owner<W, Fut>(
@@ -1037,6 +1063,50 @@ mod tests {
         assert!(!is_owner_gone_name(
             "org.freedesktop.DBus.Error.AccessDenied"
         ));
+        assert!(matches!(
+            map_mutation_fdo_error(zbus::fdo::Error::NameHasNoOwner("x".into())),
+            MediaError::Stale(_)
+        ));
+        assert!(matches!(
+            map_mutation_fdo_error(zbus::fdo::Error::ServiceUnknown("x".into())),
+            MediaError::Stale(_)
+        ));
+        assert!(matches!(
+            map_mutation_fdo_error(zbus::fdo::Error::AccessDenied("x".into())),
+            MediaError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn queue_item_membership_requires_exact_tracklist_path() {
+        let present = OwnedObjectPath::try_from("/org/mpris/MediaPlayer2/Track/1").unwrap();
+        let absent = OwnedObjectPath::try_from("/org/mpris/MediaPlayer2/Track/2").unwrap();
+        let tracks = vec![present.clone()];
+
+        for (path, expected) in [(&present, true), (&absent, false)] {
+            assert_eq!(queue_item_is_in_tracklist(&tracks, path), expected);
+        }
+        assert!(!queue_item_is_in_tracklist(&[], &present));
+    }
+
+    #[test]
+    fn fullscreen_property_uses_root_interface() {
+        let seen_iface = std::cell::RefCell::new(None);
+        let result = futures::executor::block_on(write_fullscreen_if_same_owner(
+            ":1.7",
+            Ok(":1.7".into()),
+            InterfaceName::try_from(ROOT_IFACE).unwrap(),
+            true,
+            |iface, value| {
+                *seen_iface.borrow_mut() = Some((iface.as_str().to_string(), value));
+                async { Ok(()) }
+            },
+        ));
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            seen_iface.into_inner(),
+            Some((ROOT_IFACE.to_string(), true))
+        );
     }
 
     #[test]
