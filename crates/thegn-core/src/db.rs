@@ -213,7 +213,8 @@ mod db_open_memo;
 /// v87: merge_queue.branch_ref/candidate_oid, the branch identity captured at enqueue (THE-230).
 /// v88: hashed per-row worker capabilities for dispatch report/note (THE-206).
 /// v89: append-only pipeline gate attestations from the trusted runner (THE-207).
-pub const SCHEMA_VERSION: i64 = 89;
+/// v90: agent_dispatches.lead_lease, the Lead lease a pipeline row was claimed under (THE-208).
+pub const SCHEMA_VERSION: i64 = 90;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1086,7 +1087,8 @@ pub use crate::db_dispatch::ResumeDispatchConflict;
 pub use crate::db_dispatch::{DispatchNoteQuotaExceeded, NoteQuotaKind};
 pub use crate::db_dispatch::{DispatchOverride, FORCE_REASON_MAX_CHARS};
 pub use crate::db_dispatch::{
-    DispatchTransitionConflict, MissingDispatch, set_status_transition_allowed,
+    DispatchTransitionConflict, LeadLeaseConflict, LeadProof, MissingDispatch,
+    set_status_transition_allowed,
 };
 pub use crate::db_dispatch::{
     LeaseInputError, MAX_LEASE_TTL_SECS, MIN_LEASE_TTL_SECS, ParentDispatchConflict,
@@ -1609,6 +1611,7 @@ impl Db {
                     crate::db_migrate::verify_v87_schema(&conn)?;
                     crate::db_migrate::verify_v88_schema(&conn)?;
                     crate::db_migrate::verify_v89_schema(&conn)?;
+                    crate::db_migrate::verify_v90_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2282,6 +2285,7 @@ impl Db {
         crate::db_migrate::migrate_v87(&conn)?;
         crate::db_migrate::migrate_v88(&conn)?;
         crate::db_migrate::migrate_v89(&conn)?;
+        crate::db_migrate::migrate_v90(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2309,6 +2313,7 @@ impl Db {
             crate::db_migrate::verify_v87_schema(&conn)?;
             crate::db_migrate::verify_v88_schema(&conn)?;
             crate::db_migrate::verify_v89_schema(&conn)?;
+            crate::db_migrate::verify_v90_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

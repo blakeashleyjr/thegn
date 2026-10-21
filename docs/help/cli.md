@@ -303,6 +303,8 @@ With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 ...}` with an error kind of `illegal_transition`, `stale`, `missing_evidence` or
 `missing_row` before the command fails.
 
+`dispatch claim`, `session open --stage --issue` and `dispatch set-status` take `--lease <name> --owner <id>`. A claim binds the row to that lease; further claims for that issue and status changes on bound rows require the same live lease. `--admin --why '<reason>'` on claim or set-status is the manual override and is recorded on the row. Rows claimed without a lease behave as before.
+
 The `[pipeline.transport_retry]` budget is stored on each dispatch row and
 counted once per run. It survives daemon restarts without exceeding the
 configured budget; a human re-drive starts a fresh budget. If a stage launch

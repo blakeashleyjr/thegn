@@ -998,6 +998,29 @@ mod tests {
         assert!(!monitor.contains("--timeout 600000"));
     }
 
+    #[test]
+    fn pipeline_skill_passes_the_lead_lease_to_lead_mutations() {
+        let pipeline = EMBEDDED_MANIFEST
+            .iter()
+            .find(|entry| entry.name == "pipeline")
+            .expect("pipeline skill is embedded")
+            .document;
+        let collapsed = pipeline.split_whitespace().collect::<Vec<_>>().join(" ");
+        let monitor = pipeline
+            .split("## 4. The monitor owns the watch loop")
+            .nth(1)
+            .and_then(|section| section.split("## 5.").next())
+            .expect("monitor section exists")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(monitor.contains("--lease \"$lease_name\" --owner \"$lease_owner\""));
+        assert!(collapsed.contains("--lease \"<recorded lease name>\""));
+        assert!(collapsed.contains("thegn dispatch gate"));
+        assert!(!collapsed.contains("Thegn does not yet check the lease inside `dispatch claim`, `set-status`, or `session open --stage`"));
+        assert!(!collapsed.contains("The lease is not yet checked by mutations."));
+    }
+
     fn source(name: &str) -> SkillSource {
         SkillSource::user(format!("fixture/{name}/SKILL.md"))
     }

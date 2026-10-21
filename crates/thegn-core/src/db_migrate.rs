@@ -1824,6 +1824,24 @@ pub(crate) fn verify_v89_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v90: bind dispatch rows to the Lead lease that admitted them (THE-208).
+pub(crate) fn migrate_v90(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "lead_lease") {
+        conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN lead_lease TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v90_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "agent_dispatches", "lead_lease") {
+        bail!("schema v90 migration did not add agent_dispatches.lead_lease");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2742,6 +2760,41 @@ mod tests {
         }
         let upgraded = Db::open_at(&path).unwrap();
         super::verify_v89_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v90_adds_dispatch_lead_lease_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v90_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY); PRAGMA user_version=89;",
+        )
+        .unwrap();
+        assert!(super::verify_v90_schema(&conn).is_err());
+        super::migrate_v90(&conn).unwrap();
+        super::migrate_v90(&conn).unwrap();
+        super::verify_v90_schema(&conn).unwrap();
+
+        conn.execute_batch("ALTER TABLE agent_dispatches DROP COLUMN lead_lease;")
+            .unwrap();
+        assert!(super::verify_v90_schema(&conn).is_err());
+        super::migrate_v90(&conn).unwrap();
+        super::verify_v90_schema(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v89.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE agent_dispatches DROP COLUMN lead_lease; PRAGMA user_version=89;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        super::verify_v90_schema(upgraded.conn()).unwrap();
     }
 
     #[test]
