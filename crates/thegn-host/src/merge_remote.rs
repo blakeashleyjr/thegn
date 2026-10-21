@@ -538,7 +538,7 @@ fn stream_bundle(
         .deadline
         .saturating_sub(started.elapsed())
         .min(BUNDLE_READER_GRACE);
-    let stderr_result = stderr_done_rx.recv_timeout(stderr_wait).ok();
+    let stderr_result = Result::ok(stderr_done_rx.recv_timeout(stderr_wait));
     drop(stdout_thread);
     drop(stderr_thread);
 
