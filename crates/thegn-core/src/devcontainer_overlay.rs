@@ -366,8 +366,9 @@ fn fold_image(dc: &DevContainer, sb: &mut SandboxConfig) {
 
 /// Turn a devcontainer `build` block into a [`SandboxBuild`] on `sb` (paths
 /// resolved against the devcontainer directory) + a content-addressed
-/// `sb.image` tag. No-op when the user pinned an image (their choice wins) or
-/// the config dir is unknown (bare-text parse).
+/// `sb.image` tag. Dockerfile hash failures keep the build and return a
+/// declaration-only tag warning. No-op when the user pinned an image (their
+/// choice wins) or the config dir is unknown (bare-text parse).
 fn fold_build(
     dc: &DevContainer,
     b: &crate::devcontainer::Build,
@@ -394,9 +395,20 @@ fn fold_build(
         args: b.args.clone(),
         target: b.target.clone(),
     };
-    sb.image = sandbox_build::content_tag(&tag_basename(dir), &build);
+    let dockerfile_sha256 = sandbox_build::dockerfile_sha256(Path::new(&build.dockerfile));
+    let (digest, warning) = match dockerfile_sha256 {
+        Ok(digest) => (Some(digest), None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "devcontainer: could not hash Dockerfile {} ({error}); the image tag covers the build declaration only",
+                build.dockerfile
+            )),
+        ),
+    };
+    sb.image = sandbox_build::content_tag(&tag_basename(dir), &build, digest.as_deref());
     sb.build = Some(build);
-    Vec::new()
+    warning.into_iter().collect()
 }
 
 /// Resolve a repo-authored path under its worktree. Parent traversal is
@@ -1220,9 +1232,13 @@ mod tests {
 
     #[test]
     fn build_sets_tag_and_resolved_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("proj").join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
         let dc = parse_with_dir(
             r#"{ "build": { "dockerfile": "Dockerfile", "context": ".", "args": { "V": "20" } } }"#,
-            "/home/u/proj/.devcontainer",
+            config_dir.to_str().unwrap(),
         );
         let mut sb = SandboxConfig::default();
         let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
@@ -1230,9 +1246,55 @@ mod tests {
         // image is a content tag hinting the project name (parent of .devcontainer).
         assert!(sb.image.starts_with("thegn-dc-proj:"), "{}", sb.image);
         let b = sb.build.expect("build set");
-        assert_eq!(b.dockerfile, "/home/u/proj/.devcontainer/Dockerfile");
-        assert_eq!(b.context, "/home/u/proj/.devcontainer");
+        assert_eq!(
+            b.dockerfile,
+            config_dir.join("Dockerfile").to_string_lossy().into_owned()
+        );
+        assert_eq!(b.context, config_dir.to_string_lossy().into_owned());
         assert_eq!(b.args.get("V").map(String::as_str), Some("20"));
+    }
+
+    #[test]
+    fn build_digest_edit_changes_image_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("proj").join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let dockerfile = config_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM scratch\n").unwrap();
+        let dc = parse_with_dir(
+            r#"{ "build": { "dockerfile": "Dockerfile", "context": "." } }"#,
+            config_dir.to_str().unwrap(),
+        );
+
+        let mut first = SandboxConfig::default();
+        let first_warnings = apply_to_sandbox(&dc, &mut first, &ctx());
+        assert!(first_warnings.is_empty(), "{first_warnings:?}");
+        let first_image = first.image;
+
+        std::fs::write(&dockerfile, "FROM alpine:3\n").unwrap();
+        let mut second = SandboxConfig::default();
+        let second_warnings = apply_to_sandbox(&dc, &mut second, &ctx());
+        assert!(second_warnings.is_empty(), "{second_warnings:?}");
+        assert_ne!(first_image, second.image);
+    }
+
+    #[test]
+    fn build_digest_unhashable_dockerfile_keeps_build_and_warns() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("proj").join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let dc = parse_with_dir(
+            r#"{ "build": { "dockerfile": "Dockerfile", "context": "." } }"#,
+            config_dir.to_str().unwrap(),
+        );
+        let mut sb = SandboxConfig::default();
+        let warns = apply_to_sandbox(&dc, &mut sb, &ctx());
+
+        assert!(sb.build.is_some());
+        assert!(sb.image.starts_with("thegn-dc-"));
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("could not hash Dockerfile"), "{warns:?}");
+        assert!(warns[0].contains("Dockerfile"), "{warns:?}");
     }
 
     #[test]
