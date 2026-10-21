@@ -785,6 +785,7 @@ jobs:
           printf '%s\n' "$TAP_DEPLOY_KEY" > "$PUBLISH_ROOT/keys/homebrew"
           chmod 600 "$PUBLISH_ROOT/keys/homebrew"
       - name: Publish Homebrew formula
+        id: publish
         if: steps.publication.outputs.ready == 'true'
         env:
           TAG: ${{ inputs.tag }}
@@ -799,16 +800,50 @@ jobs:
           tap_ssh="ssh -i $PUBLISH_ROOT/keys/homebrew -o IdentitiesOnly=yes $ssh_options"
           GIT_SSH_COMMAND="$tap_ssh" git clone \
             "git@github.com:$TAP_REPOSITORY.git" "$PUBLISH_ROOT/tap"
+          branch="$(git -C "$PUBLISH_ROOT/tap" symbolic-ref --short HEAD)"
+          old="$(git -C "$PUBLISH_ROOT/tap" rev-parse --verify -q HEAD || true)"
+          {
+            printf 'old=%s\n' "$old"
+            printf 'branch=%s\n' "$branch"
+            printf 'observed=unknown\n'
+          } >> "$GITHUB_OUTPUT"
           mkdir -p "$PUBLISH_ROOT/tap/Formula"
           cp "$PUBLISH_ROOT/metadata/thegn-$TAG-homebrew.rb" \
             "$PUBLISH_ROOT/tap/Formula/thegn.rb"
           git -C "$PUBLISH_ROOT/tap" add Formula/thegn.rb
-          if ! git -C "$PUBLISH_ROOT/tap" diff --cached --quiet; then
+          if git -C "$PUBLISH_ROOT/tap" diff --cached --quiet; then
+            printf 'outcome=unchanged\nnew=%s\n' "$old" >> "$GITHUB_OUTPUT"
+          else
             git -C "$PUBLISH_ROOT/tap" \
               -c user.name='thegn release automation' \
               -c user.email='actions@users.noreply.github.com' \
               commit -m "thegn $TAG"
-            GIT_SSH_COMMAND="$tap_ssh" git -C "$PUBLISH_ROOT/tap" push origin HEAD
+            new="$(git -C "$PUBLISH_ROOT/tap" rev-parse HEAD)"
+            printf 'new=%s\n' "$new" >> "$GITHUB_OUTPUT"
+            if ! GIT_SSH_COMMAND="$tap_ssh" git -C "$PUBLISH_ROOT/tap" \
+              push --force-with-lease="refs/heads/$branch:$old" origin \
+              "HEAD:refs/heads/$branch"; then
+              if remote="$(GIT_SSH_COMMAND="$tap_ssh" git -C "$PUBLISH_ROOT/tap" \
+                ls-remote origin "refs/heads/$branch" | awk '{print $1}')"; then
+                printf 'observed=%s\n' "$remote" >> "$GITHUB_OUTPUT"
+              else
+                printf 'observed=unknown\n' >> "$GITHUB_OUTPUT"
+              fi
+              echo "::error::Homebrew push failed; publication was not confirmed."
+              exit 1
+            fi
+            if ! remote="$(GIT_SSH_COMMAND="$tap_ssh" git -C "$PUBLISH_ROOT/tap" \
+              ls-remote origin "refs/heads/$branch" | awk '{print $1}')"; then
+              printf 'observed=unknown\n' >> "$GITHUB_OUTPUT"
+              echo "::error::Could not verify the Homebrew remote branch after push."
+              exit 1
+            fi
+            printf 'observed=%s\n' "$remote" >> "$GITHUB_OUTPUT"
+            if [ "$remote" != "$new" ]; then
+              echo "::error::Homebrew remote branch does not match the published candidate."
+              exit 1
+            fi
+            printf 'outcome=committed\n' >> "$GITHUB_OUTPUT"
           fi
       - name: Summarize Homebrew publication
         if: always()
@@ -816,15 +851,34 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           READY: ${{ steps.publication.outputs.ready }}
           TAG: ${{ inputs.tag }}
+          OUTCOME: ${{ steps.publish.outputs.outcome }}
+          OLD_TIP: ${{ steps.publish.outputs.old }}
+          NEW_TIP: ${{ steps.publish.outputs.new }}
+          BRANCH: ${{ steps.publish.outputs.branch }}
+          OBSERVED_TIP: ${{ steps.publish.outputs.observed }}
         run: |
           {
             echo "## Homebrew publication for $TAG"
             echo
-            if [ "$READY" = true ] && [ "$JOB_STATUS" = success ]; then
-              echo "The Homebrew formula was published or was already identical."
-              echo "An unchanged tap was left untouched."
+            if [ "$OUTCOME" = committed ]; then
+              old_tip="${OLD_TIP:- (new branch)}"
+              old_tip="${old_tip# }"
+              echo "Homebrew: committed $old_tip..$NEW_TIP on $BRANCH"
+            elif [ "$OUTCOME" = unchanged ]; then
+              echo "Homebrew: unchanged at ${OLD_TIP:- (unborn)}"
             elif [ "$READY" = true ]; then
-              echo "Homebrew publication was enabled but failed; no success claim is being made."
+              if [ -z "$BRANCH" ]; then
+                echo "Homebrew: FAILED before the target was cloned; remote state unknown"
+              elif [ "$OBSERVED_TIP" = unknown ]; then
+                remote_state="unknown"
+              elif [ "$OBSERVED_TIP" = "$OLD_TIP" ]; then
+                remote_state="unchanged at ${OBSERVED_TIP:- (absent)}"
+              else
+                remote_state="moved to ${OBSERVED_TIP:- (absent)}"
+              fi
+              if [ -n "$BRANCH" ]; then
+                echo "Homebrew: FAILED; target tip observed before push ${OLD_TIP:-unknown}; remote $remote_state"
+              fi
             else
               echo "Homebrew publication remains pending; see the actionable warning above."
             fi
@@ -940,6 +994,7 @@ jobs:
           printf '%s\n' "$AUR_DEPLOY_KEY" > "$PUBLISH_ROOT/keys/aur"
           chmod 600 "$PUBLISH_ROOT/keys/aur"
       - name: Publish generated AUR metadata
+        id: publish
         if: steps.publication.outputs.ready == 'true'
         env:
           TAG: ${{ inputs.tag }}
@@ -953,15 +1008,50 @@ jobs:
           aur_ssh="ssh -i $PUBLISH_ROOT/keys/aur -o IdentitiesOnly=yes $ssh_options"
           GIT_SSH_COMMAND="$aur_ssh" git clone \
             ssh://aur@aur.archlinux.org/thegn-bin.git "$PUBLISH_ROOT/aur"
+          branch=master
+          git -C "$PUBLISH_ROOT/aur" checkout -q -B master
+          old="$(git -C "$PUBLISH_ROOT/aur" rev-parse --verify -q HEAD || true)"
+          {
+            printf 'old=%s\n' "$old"
+            printf 'branch=%s\n' "$branch"
+            printf 'observed=unknown\n'
+          } >> "$GITHUB_OUTPUT"
           cp "$RUNNER_TEMP/aur-metadata/PKGBUILD" "$PUBLISH_ROOT/aur/PKGBUILD"
           cp "$RUNNER_TEMP/aur-metadata/.SRCINFO" "$PUBLISH_ROOT/aur/.SRCINFO"
           git -C "$PUBLISH_ROOT/aur" add PKGBUILD .SRCINFO
-          if ! git -C "$PUBLISH_ROOT/aur" diff --cached --quiet; then
+          if git -C "$PUBLISH_ROOT/aur" diff --cached --quiet; then
+            printf 'outcome=unchanged\nnew=%s\n' "$old" >> "$GITHUB_OUTPUT"
+          else
             git -C "$PUBLISH_ROOT/aur" \
               -c user.name='thegn release automation' \
               -c user.email='actions@users.noreply.github.com' \
               commit -m "thegn $TAG"
-            GIT_SSH_COMMAND="$aur_ssh" git -C "$PUBLISH_ROOT/aur" push origin HEAD
+            new="$(git -C "$PUBLISH_ROOT/aur" rev-parse HEAD)"
+            printf 'new=%s\n' "$new" >> "$GITHUB_OUTPUT"
+            if ! GIT_SSH_COMMAND="$aur_ssh" git -C "$PUBLISH_ROOT/aur" \
+              push --force-with-lease="refs/heads/$branch:$old" origin \
+              "HEAD:refs/heads/$branch"; then
+              if remote="$(GIT_SSH_COMMAND="$aur_ssh" git -C "$PUBLISH_ROOT/aur" \
+                ls-remote origin "refs/heads/$branch" | awk '{print $1}')"; then
+                printf 'observed=%s\n' "$remote" >> "$GITHUB_OUTPUT"
+              else
+                printf 'observed=unknown\n' >> "$GITHUB_OUTPUT"
+              fi
+              echo "::error::AUR push failed; publication was not confirmed."
+              exit 1
+            fi
+            if ! remote="$(GIT_SSH_COMMAND="$aur_ssh" git -C "$PUBLISH_ROOT/aur" \
+              ls-remote origin "refs/heads/$branch" | awk '{print $1}')"; then
+              printf 'observed=unknown\n' >> "$GITHUB_OUTPUT"
+              echo "::error::Could not verify the AUR remote branch after push."
+              exit 1
+            fi
+            printf 'observed=%s\n' "$remote" >> "$GITHUB_OUTPUT"
+            if [ "$remote" != "$new" ]; then
+              echo "::error::AUR remote branch does not match the published candidate."
+              exit 1
+            fi
+            printf 'outcome=committed\n' >> "$GITHUB_OUTPUT"
           fi
       - name: Summarize AUR publication
         if: always()
@@ -969,15 +1059,34 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           READY: ${{ steps.publication.outputs.ready }}
           TAG: ${{ inputs.tag }}
+          OUTCOME: ${{ steps.publish.outputs.outcome }}
+          OLD_TIP: ${{ steps.publish.outputs.old }}
+          NEW_TIP: ${{ steps.publish.outputs.new }}
+          BRANCH: ${{ steps.publish.outputs.branch }}
+          OBSERVED_TIP: ${{ steps.publish.outputs.observed }}
         run: |
           {
             echo "## AUR publication for $TAG"
             echo
-            if [ "$READY" = true ] && [ "$JOB_STATUS" = success ]; then
-              echo "Generated AUR metadata was published or was already identical."
-              echo "An unchanged repository was left untouched."
+            if [ "$OUTCOME" = committed ]; then
+              old_tip="${OLD_TIP:- (new branch)}"
+              old_tip="${old_tip# }"
+              echo "AUR: committed $old_tip..$NEW_TIP on $BRANCH"
+            elif [ "$OUTCOME" = unchanged ]; then
+              echo "AUR: unchanged at ${OLD_TIP:- (unborn)}"
             elif [ "$READY" = true ]; then
-              echo "AUR publication was enabled but failed; no success claim is being made."
+              if [ -z "$BRANCH" ]; then
+                echo "AUR: FAILED before the target was cloned; remote state unknown"
+              elif [ "$OBSERVED_TIP" = unknown ]; then
+                remote_state="unknown"
+              elif [ "$OBSERVED_TIP" = "$OLD_TIP" ]; then
+                remote_state="unchanged at ${OBSERVED_TIP:- (absent)}"
+              else
+                remote_state="moved to ${OBSERVED_TIP:- (absent)}"
+              fi
+              if [ -n "$BRANCH" ]; then
+                echo "AUR: FAILED; target tip observed before push ${OLD_TIP:-unknown}; remote $remote_state"
+              fi
             else
               echo "AUR publication remains pending; see the actionable warning above."
             fi
