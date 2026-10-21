@@ -46,7 +46,7 @@ runner_identity_preflight() {
 }
 
 runner_preflight() {
-  local failures=0 groups shell home sudo_output account_line path
+  local failures=0 groups shell home sudo_output sudo_status account_line path
   unexport_credentials
   runner_identity_preflight || failures=1
   if [ -n "$NIX_GITHUB_TOKEN" ]; then
@@ -68,6 +68,7 @@ runner_preflight() {
     printf 'cannot inspect groups for runner account %s (fix: repair the account and retry)\n' "$RUNNER_USER" >&2
     failures=1
   else
+    local group
     for group in sudo wheel admin docker podman libvirt kvm lxd; do
       if [[ " $groups " == *" $group "* ]]; then
         printf 'runner account %s belongs to privileged group %s (fix: remove it with usermod -G)\n' "$RUNNER_USER" "$group" >&2
@@ -75,18 +76,36 @@ runner_preflight() {
       fi
     done
   fi
-  if ! sudo_output="$(sudo -n -l -U "$RUNNER_USER" 2>&1)"; then
+  sudo_status=0
+  sudo_output="$(LC_ALL=C sudo -n -l -U "$RUNNER_USER" 2>&1)" || sudo_status=$?
+  if [[ $sudo_output == *"is not allowed to run sudo"* ]]; then
+    : # A clean policy may return either status depending on the sudo build.
+  elif [ "$sudo_status" -ne 0 ]; then
     printf 'cannot verify sudo rights for runner account %s (fix: make sudo -n -l -U succeed, then remove any grants)\n' "$RUNNER_USER" >&2
     failures=1
-  elif [[ $sudo_output != *"is not allowed to run sudo"* ]]; then
+  else
     printf 'runner account %s has sudo rights (fix: remove its sudoers grant)\n' "$RUNNER_USER" >&2
+    failures=1
+  fi
+  if ! sudo test -x "$home" || ! sudo test -r "$home"; then
+    printf 'cannot inspect runner HOME %s (fix: restore root traversal/read access and retry)\n' "$home" >&2
     failures=1
   fi
   for path in "$home/.config/gh/hosts.yml" "$home/.ssh" "$home/.gnupg" \
     "$home/.git-credentials" "$home/.config/nix/nix.conf" "$home/.docker/config.json"; do
-    if [ -e "$path" ] || [ -L "$path" ]; then
-      if [[ $path == */nix.conf ]] && ! grep -qi 'access-tokens' "$path"; then
-        continue
+    if sudo test -e "$path" || sudo test -L "$path"; then
+      if [[ $path == */nix.conf ]]; then
+        if sudo grep -qi 'access-tokens' "$path"; then
+          :
+        else
+          local grep_status=$?
+          if [ "$grep_status" -ne 1 ]; then
+            printf 'cannot inspect runner HOME: unreadable nix.conf at %s\n' "$path" >&2
+            failures=1
+            continue
+          fi
+          continue
+        fi
       fi
       printf 'runner HOME contains credentials or persistent auth state at %s (fix: remove it and keep credentials outside the runner account)\n' "$path" >&2
       failures=1
@@ -100,12 +119,60 @@ runner_preflight() {
 }
 
 ensure_runner_account() {
-  if getent passwd "$RUNNER_USER" >/dev/null; then return 0; fi
   if [ -e /etc/NIXOS ]; then
-    die 'NixOS does not persist useradd; add this declaration to configuration.nix and rebuild: users.users.thegn-ci = { isSystemUser = true; group = "thegn-ci"; home = "/var/lib/thegn-ci"; createHome = true; };'
+    cat >&2 <<'NIXOS'
+NixOS manages users and systemd units declaratively; /etc/systemd/system is generated and read-only.
+Add this module to configuration.nix. Provision the rendered loop at the declared ExecStart path
+through the Nix store; this script cannot write /etc/systemd/system on NixOS.
+
+{ pkgs, ... }:
+{
+users.groups.thegn-ci = {};
+users.users.thegn-ci = {
+  isSystemUser = true;
+  group = "thegn-ci";
+  home = "/var/lib/thegn-ci";
+  createHome = true;
+  shell = "${pkgs.shadow}/bin/nologin";
+};
+systemd.services."thegn-ci-runner@" = {
+  description = "Ephemeral thegn CI runner %i";
+  wantedBy = [ "multi-user.target" ];
+  after = [ "network-online.target" ];
+  wants = [ "network-online.target" ];
+  serviceConfig = {
+    Type = "simple";
+    User = "root";
+    Group = "root";
+    Restart = "always";
+    RestartSec = 5;
+    ExecStart = "/usr/local/libexec/thegn-ci/runner-loop %i";
+  };
+};
+}
+
+Setup stopped before installing anything.
+NIXOS
     return 1
   fi
-  sudo useradd --system --create-home --home-dir /var/lib/thegn-ci --shell /usr/sbin/nologin "$RUNNER_USER"
+  if getent passwd "$RUNNER_USER" >/dev/null; then return 0; fi
+  sudo useradd --system --user-group --create-home --home-dir /var/lib/thegn-ci --shell /usr/sbin/nologin "$RUNNER_USER"
+}
+
+refuse_legacy_runner_layout() {
+  local operator_home legacy_units legacy_running
+  operator_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  legacy_units="$(sudo systemctl list-unit-files 'actions.runner.*' --no-legend --no-pager 2>/dev/null || true)"
+  legacy_running="$(sudo systemctl list-units 'actions.runner.*' --all --no-legend --no-pager 2>/dev/null || true)"
+  if [ -n "$legacy_units" ] || [ -n "$legacy_running" ]; then
+    printf 'legacy actions.runner.* units are installed or loaded:\n%s\n%s\n' "$legacy_units" "$legacy_running" >&2
+    printf 'remove them with their old svc.sh stop/uninstall and config.sh remove steps before installing the hardened runner\n' >&2
+    return 1
+  fi
+  if [ -e "$operator_home/actions-runners" ]; then
+    printf 'legacy runner directory exists at %s/actions-runners; remove its old svc.sh services and run config.sh remove before installing the hardened runner\n' "$operator_home" >&2
+    return 1
+  fi
 }
 
 secure_runner_home_parent() {
@@ -171,8 +238,13 @@ cpus="__RUNNER_CPUS__"
 dir="$runner_base/runner-$index"
 job_home="$dir/home"
 work="$dir/_work"
-minimal_path="/nix/var/nix/profiles/per-user/thegn-ci/profile/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+minimal_path="/nix/var/nix/profiles/per-user/__RUNNER_USER__/profile/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 while :; do
+  job_unit="thegn-ci-job-$index.service"
+  job_state="$(systemctl show -p LoadState --value "$job_unit")"
+  if [ "$job_state" = loaded ]; then
+    systemctl stop "$job_unit"
+  fi
   # Recreate the writable runner tree from the root-owned archive every job.
   rm -rf -- "$dir"
   install -d -m 0755 "$dir"
@@ -187,15 +259,23 @@ while :; do
   payload="$(jq -nc --arg name "$runner_name" --argjson labels "$label_json" \
     '{name:$name,runner_group_id:1,labels:$labels,work_folder:"_work"}')"
   token="$(cat "$token_file")"
-  jit="$(curl -fsS --max-time 30 -X POST \
-    -H "Authorization: Bearer $token" \
-    -H 'Accept: application/vnd.github+json' \
-    "https://api.github.com/repos/$repo/actions/runners/generate-jitconfig" \
-    -d "$payload" | jq -er '.encoded_jit_config')"
+  if ! jit="$(
+    printf 'header = \"Authorization: Bearer %s\"\n' "$token" |
+      curl --config - -fsS --max-time 30 -X POST \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$repo/actions/runners/generate-jitconfig" \
+        -d "$payload" | jq -er '.encoded_jit_config'
+  )"; then
+    unset token payload label_json
+    sleep 30
+    continue
+  fi
   unset token payload label_json
   # --jitconfig is single-use and rides argv only in the thegn-ci-owned process.
-  systemd-run --wait --collect --pipe --uid="$runner_user" --gid="$runner_group" \
+  systemd-run --wait --collect --pipe --unit="thegn-ci-job-$index" --uid="$runner_user" --gid="$runner_group" \
     -p "CPUQuota=$((cpus * 100))%" -p MemoryHigh=12G \
+    -p PrivateTmp=yes -p ProtectHome=read-only -p NoNewPrivileges=yes \
+    -p "PartOf=thegn-ci-runner@$index.service" \
     -p "WorkingDirectory=$dir" --setenv="HOME=$job_home" --setenv="PATH=$minimal_path" \
     -- "$dir/run.sh" --jitconfig "$jit"
   unset jit
@@ -259,6 +339,7 @@ install_runner_loop() {
   local index
   for ((index = 1; index <= RUNNER_COUNT; index++)); do
     sudo systemctl enable --now "thegn-ci-runner@$index.service"
+    sudo systemctl restart "thegn-ci-runner@$index.service"
   done
 }
 
@@ -307,11 +388,17 @@ main() {
     die 'run setup as an operator, never as root'
     return 1
   fi
+  sudo -v || {
+    die 'sudo authentication is required before setup preflight'
+    return 1
+  }
+  refuse_legacy_runner_layout || return 1
   runner_preflight
   command -v systemctl >/dev/null || {
     die 'systemd is required'
     return 1
   }
+  local tool
   for tool in curl tar jq; do command -v "$tool" >/dev/null || {
     die "missing '$tool'"
     return 1

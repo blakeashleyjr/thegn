@@ -28,7 +28,9 @@ The runner setup script is in `scripts/ci/ageless-runner-setup.sh`. Run it on
 ageless-studio as an operator account, never as root or `thegn-ci`. The runner
 uses a dedicated system account named `thegn-ci`, with no login shell and no
 sudo access. On NixOS, add the declaration printed by the script to
-`configuration.nix` and rebuild; the script does not use `useradd` there.
+`configuration.nix` and rebuild. NixOS generates `/etc/systemd/system`, so the
+script prints the declarative user/group module and refuses to install units
+there.
 
 Place a repository administration PAT in `/etc/thegn-ci/registration.token`
 with owner `root:root` and mode `0600`, or provide `GH_PAT` once in the setup
@@ -54,6 +56,11 @@ sudo rights or an uncheckable sudo policy, has an interactive shell, or has
 GitHub, SSH, GPG, Git, Docker, or Nix access-token credentials in its HOME.
 Remove the credentials or group membership, remove sudo grants, and set the
 shell to `/usr/sbin/nologin` before retrying.
+It also refuses to proceed while legacy `actions.runner.*` systemd units or
+`$HOME/actions-runners` from the persistent runner layout remain. Stop and
+uninstall each old service with its runner directory's `sudo ./svc.sh stop`
+and `sudo ./svc.sh uninstall`, remove its systemd drop-in, then deregister it
+with `./config.sh remove --token <remove-token>` before retrying setup.
 
 The root-owned systemd template starts a root-owned loop for each runner. Each
 iteration deletes and recreates that runner's `_work` directory and HOME with
@@ -70,6 +77,12 @@ each job's HOME is wiped before use. Authenticated runner/Nix installer bytes
 are not yet pinned and verified (THE-413); untrusted-event rejection,
 task-bound short-lived credentials for protected jobs, authenticated shared
 caches, and canary jobs also remain open on THE-414.
+
+Two isolation gaps remain open: all concurrent jobs use the same `thegn-ci`
+UID, so one job may inspect or modify another job's processes and files; and
+the account has no cron/at denial configured, so persistence through `crontab`
+or `at` has not been closed. Do not treat the shared runner as suitable for
+untrusted jobs until both are addressed.
 
 ## Verify runners
 
@@ -140,6 +153,10 @@ bash scripts/ci/ageless-runner-uninstall.sh
 # Also remove the dedicated account (not available for a NixOS-declared user)
 REMOVE_USER=1 bash scripts/ci/ageless-runner-uninstall.sh
 ```
+
+The uninstaller handles the hardened ephemeral layout. For a legacy persistent
+installation, use the manual `svc.sh` and `config.sh remove` steps above before
+removing its old runner directory and drop-in.
 
 Self-hosted jobs queue while the runner loop is offline; see the rollback
 section above to restore GitHub-hosted Linux runners.
