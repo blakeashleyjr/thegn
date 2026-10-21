@@ -11,6 +11,7 @@
 //! through the provider, so no call site can forget the bookkeeping.
 //! Count-and-reserve is serialised by a lock file, and unreadable records count as occupied.
 
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -194,6 +195,9 @@ fn open_root(d: &Path, create: bool) -> Result<Option<thegn_core::fsperm::Privat
             && thegn_core::fsperm::owned_by_current_user(&metadata),
         "vps registry: registry root is not an owned real directory"
     );
+    // A concurrent root swap could make this path-based chmod follow a new
+    // symlink before open_private_dir's O_NOFOLLOW check; mutation requires
+    // write access to the owner-only registry directory.
     thegn_core::fsperm::restrict_dir_to_owner(d)
         .context("vps registry: registry root is not an owned private directory")?;
     thegn_core::fsperm::open_private_dir(d)
