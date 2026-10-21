@@ -13,11 +13,13 @@
 //! worktree path and, when a read errors, reuse it instead of a placeholder.
 //! Only successful reads overwrite the cache, so a worktree whose git reads are
 //! failing freezes at its last real header until they recover.
+//! The status, log, and merge-incoming lists use a parallel per-worktree cache.
+//! Failed list reads retain their last successful rows and expose unavailable flags.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use thegn_svc::git::MergeInfo;
+use thegn_svc::git::{FileStatus, LogRow, MergeInfo};
 
 /// One worktree's last-known-good header fields.
 #[derive(Clone, Default)]
@@ -33,6 +35,71 @@ struct HeaderRow {
 fn cache() -> &'static Mutex<HashMap<String, HeaderRow>> {
     static CACHE: OnceLock<Mutex<HashMap<String, HeaderRow>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Default)]
+struct ListRow {
+    status: Vec<FileStatus>,
+    log: Vec<LogRow>,
+    incoming: std::collections::HashSet<String>,
+}
+
+fn list_cache() -> &'static Mutex<HashMap<String, ListRow>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ListRow>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) struct MergedLists {
+    pub status: Vec<FileStatus>,
+    pub status_unavailable: bool,
+    pub log: Vec<LogRow>,
+    pub log_unavailable: bool,
+    pub incoming: std::collections::HashSet<String>,
+    pub incoming_unavailable: bool,
+}
+
+/// Adopt successful list reads and retain each prior list independently on error.
+/// A log read omitted for this pass is deliberately empty and leaves its cache alone.
+pub(crate) fn merge_lists(
+    path: &str,
+    status: Result<Vec<FileStatus>, ()>,
+    log: Option<Result<Vec<LogRow>, ()>>,
+    incoming: Result<std::collections::HashSet<String>, ()>,
+) -> MergedLists {
+    let mut map = list_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let prior = map.get(path).cloned().unwrap_or_else(ListRow::default);
+    let log_requested = log.is_some();
+    let (status, status_unavailable) = match status {
+        Ok(value) => (value, false),
+        Err(()) => (prior.status.clone(), true),
+    };
+    let (log, log_unavailable) = match log {
+        Some(Ok(value)) => (value, false),
+        Some(Err(())) => (prior.log.clone(), true),
+        None => (Vec::new(), false),
+    };
+    let (incoming, incoming_unavailable) = match incoming {
+        Ok(value) => (value, false),
+        Err(()) => (prior.incoming.clone(), true),
+    };
+    let row = map.entry(path.to_string()).or_default();
+    if !status_unavailable {
+        row.status.clone_from(&status);
+    }
+    if log_requested && !log_unavailable {
+        row.log.clone_from(&log);
+    }
+    if !incoming_unavailable {
+        row.incoming.clone_from(&incoming);
+    }
+    MergedLists {
+        status,
+        status_unavailable,
+        log,
+        log_unavailable,
+        incoming,
+        incoming_unavailable,
+    }
 }
 
 /// Merge freshly-read header fields against the last-known-good row for `path`.
@@ -146,5 +213,96 @@ mod tests {
         let (b, ab, _m) = merge_header(p, Ok("main".into()), Err(()), Ok(None));
         assert_eq!(b, "main");
         assert_eq!(ab, Some((5, 0)));
+    }
+
+    fn status(path: &str) -> FileStatus {
+        FileStatus {
+            path: path.to_string(),
+            staged: ' ',
+            unstaged: 'M',
+        }
+    }
+
+    fn log_row(subject: &str) -> LogRow {
+        LogRow {
+            graph: "* ".to_string(),
+            sha: "abc1234".to_string(),
+            subject: subject.to_string(),
+            refs: String::new(),
+        }
+    }
+
+    #[test]
+    fn lists_status_failure_keeps_last_known_rows() {
+        let p = "lists_status_failure_keeps_last_known_rows";
+        let first = merge_lists(
+            p,
+            Ok(vec![status("src/a.rs"), status("src/b.rs")]),
+            None,
+            Ok(Default::default()),
+        );
+        assert!(!first.status_unavailable);
+
+        let failed = merge_lists(p, Err(()), None, Ok(Default::default()));
+        assert_eq!(
+            failed
+                .status
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs"]
+        );
+        assert!(failed.status_unavailable);
+
+        let clean = merge_lists(p, Ok(Vec::new()), None, Ok(Default::default()));
+        assert!(clean.status.is_empty());
+        assert!(!clean.status_unavailable);
+    }
+
+    #[test]
+    fn lists_first_failure_is_empty_and_flagged() {
+        let failed = merge_lists(
+            "lists_first_failure_is_empty_and_flagged",
+            Err(()),
+            None,
+            Err(()),
+        );
+        assert!(failed.status.is_empty());
+        assert!(failed.status_unavailable);
+        assert!(failed.incoming.is_empty());
+        assert!(failed.incoming_unavailable);
+    }
+
+    #[test]
+    fn lists_log_not_requested_keeps_cache_untouched() {
+        let p = "lists_log_not_requested_keeps_cache_untouched";
+        let first = merge_lists(
+            p,
+            Ok(Vec::new()),
+            Some(Ok(vec![log_row("known")])),
+            Ok(Default::default()),
+        );
+        assert_eq!(first.log.len(), 1);
+
+        let skipped = merge_lists(p, Ok(Vec::new()), None, Ok(Default::default()));
+        assert!(skipped.log.is_empty());
+        assert!(!skipped.log_unavailable);
+
+        let failed = merge_lists(p, Ok(Vec::new()), Some(Err(())), Ok(Default::default()));
+        assert_eq!(failed.log, vec![log_row("known")]);
+        assert!(failed.log_unavailable);
+    }
+
+    #[test]
+    fn lists_incoming_failure_reuses_prior() {
+        let p = "lists_incoming_failure_reuses_prior";
+        let mut incoming = std::collections::HashSet::new();
+        incoming.insert("src/incoming.rs".to_string());
+        let first = merge_lists(p, Ok(Vec::new()), None, Ok(incoming));
+        assert!(!first.incoming_unavailable);
+
+        let failed = merge_lists(p, Ok(Vec::new()), None, Err(()));
+        assert!(failed.incoming.contains("src/incoming.rs"));
+        assert!(failed.incoming_unavailable);
     }
 }
