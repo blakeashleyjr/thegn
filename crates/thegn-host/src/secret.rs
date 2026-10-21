@@ -31,7 +31,10 @@ const MAX_ACCOUNT_BYTES: usize = 1024;
 const MAX_INDEX_BYTES: u64 = 64 * 1024;
 const MAX_INDEX_ENTRIES: usize = 4096;
 const SECRETS_LOCK: &str = "secrets.lock";
-const SECRETS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+// Bounded so a UI-loop caller can never hang on another process's lock, but long
+// enough that ordinary CLI/worker contention (each op is a short fsync'd write)
+// waits its turn instead of failing as busy.
+const SECRETS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The keyring "service" all thegn secrets live under.
 const KEYRING_SERVICE: &str = "thegn";
