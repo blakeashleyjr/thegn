@@ -31,6 +31,7 @@ const MAX_ACCOUNT_BYTES: usize = 1024;
 const MAX_INDEX_BYTES: u64 = 64 * 1024;
 const MAX_INDEX_ENTRIES: usize = 4096;
 const SECRETS_LOCK: &str = "secrets.lock";
+const SECRETS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The keyring "service" all thegn secrets live under.
 const KEYRING_SERVICE: &str = "thegn";
@@ -228,7 +229,7 @@ fn store_with_dir(
         }
     }
     let dir = dir()?;
-    let _lock = open_dir_lock(&dir, SECRETS_LOCK, "file secrets")?;
+    let _lock = lock_secrets_in(&dir)?;
     let private = open_secrets_in(&dir)?;
     let token_name = resolve_token_name(&private, name)?;
     write_account_sidecar_with(&private, &token_name, name)?;
@@ -256,7 +257,7 @@ pub fn store_file(name: &str, token: &str) -> Result<String> {
         m.clear();
     }
     let dir = secrets_dir()?;
-    let _lock = open_dir_lock(&dir, SECRETS_LOCK, "file secrets")?;
+    let _lock = lock_secrets_in(&dir)?;
     let private = open_secrets_in(&dir)?;
     let token_name = resolve_token_name(&private, name)?;
     write_account_sidecar_with(&private, &token_name, name)?;
@@ -352,8 +353,8 @@ fn forget_in(
     // automatic legacy cleanup could delete a different account's credential.
     // Existing `file:` refs remain directly resolvable and can be removed by
     // their explicit path during a user-directed migration.
-    let file = match open_dir_lock(dir, SECRETS_LOCK, "file secrets") {
-        Err(error) => ForgetFileOutcome::Failed(error),
+    let file = match lock_secrets_in(dir) {
+        Err(error) => ForgetFileOutcome::Failed(error.to_string()),
         Ok(_lock) => match open_secrets_in(dir) {
             Err(error) => ForgetFileOutcome::Failed(error.to_string()),
             Ok(private) => match file_entry_exists(&private, name) {
@@ -1079,7 +1080,7 @@ fn file_get_in(dir: &std::path::Path, account: &str) -> Result<String, SecretErr
 
 fn file_set_at(dir: &std::path::Path, account: &str, value: &str) -> Result<(), SecretError> {
     let _lock =
-        open_dir_lock(dir, SECRETS_LOCK, "file secrets").map_err(SecretError::unavailable)?;
+        lock_secrets_in(dir).map_err(|error| SecretError::unavailable(error.to_string()))?;
     let private = open_secrets_in(dir).map_err(|e| SecretError::unavailable(e.to_string()))?;
     file_set_with(&private, account, value)
 }
@@ -1101,7 +1102,7 @@ fn file_set_with(
 
 fn file_del_at(dir: &std::path::Path, account: &str) -> Result<(), SecretError> {
     let _lock =
-        open_dir_lock(dir, SECRETS_LOCK, "file secrets").map_err(SecretError::unavailable)?;
+        lock_secrets_in(dir).map_err(|error| SecretError::unavailable(error.to_string()))?;
     let private = open_secrets_in(dir).map_err(|e| SecretError::unavailable(e.to_string()))?;
     file_del_with(&private, account)
 }
@@ -1139,7 +1140,7 @@ fn remove_sidecar_with(
 
 fn file_list_at(dir: &std::path::Path) -> Result<Vec<String>, SecretError> {
     let _lock =
-        open_dir_lock(dir, SECRETS_LOCK, "file secrets").map_err(SecretError::unavailable)?;
+        lock_secrets_in(dir).map_err(|error| SecretError::unavailable(error.to_string()))?;
     let private = open_secrets_in(dir).map_err(|e| SecretError::unavailable(e.to_string()))?;
     file_list_with(&private)
 }
@@ -1355,6 +1356,16 @@ fn open_dir_lock(
     lock_name: &str,
     what: &str,
 ) -> Result<std::fs::File, String> {
+    let file = open_dir_lock_file(dir, lock_name, what)?;
+    file.lock().map_err(|e| format!("lock {what}: {e}"))?;
+    Ok(file)
+}
+
+fn open_dir_lock_file(
+    dir: &std::path::Path,
+    lock_name: &str,
+    what: &str,
+) -> Result<std::fs::File, String> {
     let path = dir.join(lock_name);
     let file = loop {
         match thegn_core::fsperm::open_regular_file_nofollow(&path) {
@@ -1376,8 +1387,50 @@ fn open_dir_lock(
     ) {
         return Err(format!("{what} lock is owned by another user"));
     }
-    file.lock().map_err(|e| format!("lock {what}: {e}"))?;
     Ok(file)
+}
+
+#[derive(Debug)]
+enum SecretsLockError {
+    Busy,
+    Other(String),
+}
+
+impl std::fmt::Display for SecretsLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("secrets store busy"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for SecretsLockError {}
+
+fn lock_secrets_in(dir: &std::path::Path) -> Result<std::fs::File, SecretsLockError> {
+    secrets_dir_at(dir).map_err(|error| SecretsLockError::Other(error.to_string()))?;
+    let file =
+        open_dir_lock_file(dir, SECRETS_LOCK, "file secrets").map_err(SecretsLockError::Other)?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let elapsed = started.elapsed();
+                if elapsed >= SECRETS_LOCK_WAIT {
+                    return Err(SecretsLockError::Busy);
+                }
+                std::thread::sleep(
+                    std::time::Duration::from_millis(5).min(SECRETS_LOCK_WAIT - elapsed),
+                );
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(SecretsLockError::Other(format!(
+                    "lock file secrets: {error}"
+                )));
+            }
+        }
+    }
 }
 
 fn with_index_lock<T>(
@@ -2050,7 +2103,7 @@ mod tests {
         });
 
         started_rx.recv().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let entries: Vec<_> = std::fs::read_dir(temp.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -2078,12 +2131,48 @@ mod tests {
         });
 
         started_rx.recv().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "v1");
 
         drop(lock);
         worker.join().unwrap().unwrap();
         assert!(file_get_in(temp.path(), "acct").is_err());
+    }
+
+    #[test]
+    fn secrets_lock_store_creates_missing_directory() {
+        let temp = private_temp();
+        let secrets = temp.path().join("secrets");
+        let result = store_in(&secrets, "acct", "tok", |_, _| {
+            KeyringOutcome::Completed(Err(anyhow::anyhow!("denied")))
+        })
+        .unwrap();
+
+        assert!(result.starts_with("file:"));
+        assert_eq!(file_get_in(&secrets, "acct").unwrap(), "tok");
+    }
+
+    #[test]
+    fn secrets_lock_forget_creates_missing_directory_and_reports_absent() {
+        let temp = private_temp();
+        let secrets = temp.path().join("secrets");
+        let report = forget_in(&secrets, "acct", |_| KeyringOutcome::Completed(Ok(())));
+
+        assert_eq!(report.file, ForgetFileOutcome::Absent);
+        assert!(secrets.join(SECRETS_LOCK).exists());
+    }
+
+    #[test]
+    fn secrets_lock_does_not_write_through_symlinked_root() {
+        let temp = private_temp();
+        let outside = temp.path().join("outside");
+        let secrets = temp.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        thegn_core::fsperm::ensure_private_dir(&outside).unwrap();
+        thegn_core::fsperm::create_symlink(&outside, &secrets, true).unwrap();
+
+        assert!(file_set_at(&secrets, "acct", "tok").is_err());
+        assert!(!outside.join(SECRETS_LOCK).exists());
     }
 
     #[test]
