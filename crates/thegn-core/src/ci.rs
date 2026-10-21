@@ -499,6 +499,9 @@ pub enum CiSystem {
     Woodpecker,
     Jenkins,
     Argo,
+    /// A resident plugin backend bridged over `provider.call` (seam "ci");
+    /// never detected from repo files or selected by `[ci] provider` yet.
+    Plugin,
 }
 
 impl CiSystem {
@@ -510,6 +513,7 @@ impl CiSystem {
             CiSystem::Woodpecker => "Woodpecker",
             CiSystem::Jenkins => "Jenkins",
             CiSystem::Argo => "Argo",
+            CiSystem::Plugin => "Plugin CI",
         }
     }
 }
