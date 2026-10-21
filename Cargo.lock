@@ -7984,6 +7984,7 @@ dependencies = [
  "tracing",
  "url",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

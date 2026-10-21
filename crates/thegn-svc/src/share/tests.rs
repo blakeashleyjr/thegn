@@ -85,7 +85,7 @@ fn bore_args_full() {
     assert!(
         plan.env
             .iter()
-            .any(|(key, value)| { key == "BORE_SECRET" && value == "literal-secret" })
+            .any(|(key, value)| { key == "BORE_SECRET" && value.expose() == "literal-secret" })
     );
 }
 
@@ -111,7 +111,112 @@ fn bore_secret_never_reaches_argv() {
     assert!(
         plan.env
             .iter()
-            .any(|(key, value)| key == "BORE_SECRET" && value == secret)
+            .any(|(key, value)| key == "BORE_SECRET" && value.expose() == secret)
+    );
+}
+
+#[test]
+fn secret_string_debug_never_shows_the_value() {
+    let secret = "canary-325";
+    let wrapped = SecretString::from(secret);
+    assert!(!format!("{wrapped:?}").contains(secret));
+
+    let spec = spec_with(
+        BoreConfig {
+            secret: secret.into(),
+            ..BoreConfig::default()
+        },
+        3000,
+    );
+    let plan = process_plan(&spec);
+    assert!(!format!("{plan:?}").contains(secret));
+}
+
+#[test]
+fn share_plan_env_values_are_secret_strings() {
+    let frp = FrpConfig {
+        server_addr: "frps.example.com".into(),
+        subdomain_host: "share.example.com".into(),
+        token: "frp-canary-325".into(),
+        ..FrpConfig::default()
+    };
+    let plan = process_plan(&frp_spec(frp, "wt", 3000));
+    let _: &Vec<(String, SecretString)> = &plan.env;
+    let _: &SecretString = &plan.files[0].contents;
+}
+
+#[test]
+fn frp_token_reaches_only_the_materialized_file() {
+    let token = "frp-canary-325";
+    let frp = FrpConfig {
+        server_addr: "frps.example.com".into(),
+        subdomain_host: "share.example.com".into(),
+        proxy_type: FrpProxyType::Https,
+        token: token.into(),
+        ..FrpConfig::default()
+    };
+    let plan = process_plan(&frp_spec(frp, "wt", 3000));
+
+    assert!(plan.files[0].contents.expose().contains(token));
+    assert!(!plan.args.iter().any(|arg| arg.contains(token)));
+    assert!(
+        plan.env
+            .iter()
+            .all(|(key, value)| { !key.contains(token) && !value.expose().contains(token) })
+    );
+    assert!(!format!("{plan:?}").contains(token));
+}
+
+#[test]
+fn iroh_plan_carries_no_secret_channel() {
+    let cfg = ShareConfig {
+        provider: ShareProviderKind::Iroh,
+        iroh: thegn_core::config::IrohShareConfig {
+            extra_args: vec!["--relay".into(), "https://relay.example".into()],
+        },
+        ..ShareConfig::default()
+    };
+    let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
+    let plan = process_plan(&spec);
+
+    assert!(plan.env.is_empty());
+    assert!(plan.files.is_empty());
+    assert_eq!(
+        plan.args,
+        vec![
+            "listen-tcp",
+            "--host",
+            "127.0.0.1:3000",
+            "--relay",
+            "https://relay.example",
+        ]
+    );
+}
+
+#[test]
+fn bore_secret_is_only_in_the_child_env() {
+    let secret = "canary-325";
+    let spec = spec_with(
+        BoreConfig {
+            secret: secret.into(),
+            ..BoreConfig::default()
+        },
+        3000,
+    );
+    let plan = process_plan(&spec);
+
+    assert_eq!(
+        plan.env
+            .iter()
+            .filter(|(key, value)| key == "BORE_SECRET" && value.expose() == secret)
+            .count(),
+        1
+    );
+    assert!(plan.args.iter().all(|arg| !arg.contains(secret)));
+    assert!(
+        plan.files
+            .iter()
+            .all(|file| !file.contents.expose().contains(secret))
     );
 }
 
@@ -528,7 +633,7 @@ fn frp_https_materializes_toml_and_derives_subdomain_url() {
         Some("https://app-feat-3000.share.example.com")
     );
 
-    let toml = &plan.files[0].contents;
+    let toml = plan.files[0].contents.expose();
     assert_eq!(plan.files[0].dest, "frpc.toml");
     assert!(toml.contains("serverAddr = \"frps.example.com\""));
     assert!(toml.contains("type = \"https\""));
@@ -556,7 +661,7 @@ fn frp_token_and_explicit_subdomain_and_vhost_port() {
             .as_deref(),
         Some("https://demo.ex.com:8443")
     );
-    let toml = &plan.files[0].contents;
+    let toml = plan.files[0].contents.expose();
     assert!(toml.contains("[auth]"));
     assert!(toml.contains("token = \"literal-token\""));
     assert!(toml.contains("subdomain = \"demo\""));
@@ -580,7 +685,7 @@ fn frp_tcp_derives_host_port_and_no_subdomain() {
             .as_deref(),
         Some("frps.example.com:6000")
     );
-    let toml = &plan.files[0].contents;
+    let toml = plan.files[0].contents.expose();
     assert!(toml.contains("type = \"tcp\""));
     assert!(toml.contains("remotePort = 6000"));
     assert!(!toml.contains("subdomain"));
@@ -619,6 +724,7 @@ fn frp_http_https_and_udp_keep_their_explicit_wire_shapes() {
         assert!(
             plan.files[0]
                 .contents
+                .expose()
                 .contains(&format!("type = \"{expected_type}\""))
         );
     }
@@ -638,8 +744,13 @@ fn frp_http_https_and_udp_keep_their_explicit_wire_shapes() {
             .as_deref(),
         Some("frps.example.com:6001")
     );
-    assert!(plan.files[0].contents.contains("type = \"udp\""));
-    assert!(plan.files[0].contents.contains("remotePort = 6001"));
+    assert!(plan.files[0].contents.expose().contains("type = \"udp\""));
+    assert!(
+        plan.files[0]
+            .contents
+            .expose()
+            .contains("remotePort = 6001")
+    );
 }
 
 #[test]
@@ -795,11 +906,13 @@ fn frp_ipv6_is_unbracketed_in_toml_and_bracketed_in_url() {
     assert!(
         plan.files[0]
             .contents
+            .expose()
             .contains("serverAddr = \"2001:db8::7\"")
     );
     assert!(
         !plan.files[0]
             .contents
+            .expose()
             .contains("serverAddr = \"[2001:db8::7]\"")
     );
 }
@@ -815,7 +928,7 @@ fn frp_escapes_utf8_token_and_redacts_plan_debug() {
     };
     let spec = frp_spec(frp, "wt", 3000);
     let plan = process_plan(&spec);
-    let document = &plan.files[0].contents;
+    let document = plan.files[0].contents.expose();
     assert!(document.contains("[auth]"));
     let parsed: super::FrpDocument = toml::from_str(document).expect("generated frpc TOML");
     assert_eq!(
@@ -901,7 +1014,7 @@ fn frp_preserves_a_63_byte_label_for_tcp_proxy_name() {
     let spec = frp_spec(frp, &label, 5432);
     let plan = process_plan(&spec);
     let expected = format!("name = \"tg-{label}-5432\"");
-    assert!(plan.files[0].contents.contains(&expected));
+    assert!(plan.files[0].contents.expose().contains(&expected));
 }
 
 // ── tailscale ────────────────────────────────────────────────────────────────
@@ -1185,7 +1298,10 @@ fn spawned_client_sees_only_allowlisted_env() {
             script_path.to_string_lossy().into_owned(),
             dump_path.to_string_lossy().into_owned(),
         ],
-        env: vec![("RUST_LOG".into(), "info".into())],
+        env: vec![
+            ("RUST_LOG".into(), "info".into()),
+            ("BORE_SECRET".into(), SecretString::from("child-canary-325")),
+        ],
         files: Vec::new(),
         url_rule: UrlRule::AfterMarker {
             marker: "listening at ".into(),
@@ -1218,6 +1334,11 @@ fn spawned_client_sees_only_allowlisted_env() {
             .any(|line| line == format!("PATH={}", path.to_string_lossy()))
     );
     assert!(dumped_env.lines().any(|line| line == "RUST_LOG=info"));
+    assert!(
+        dumped_env
+            .lines()
+            .any(|line| line == "BORE_SECRET=child-canary-325")
+    );
     assert!(!dumped_env.contains("THEGN_TEST_CANARY_SECRET"));
     assert!(!dumped_env.contains("canary-value"));
     assert!(!dumped_env.contains("HOME="));
@@ -1225,7 +1346,7 @@ fn spawned_client_sees_only_allowlisted_env() {
     let allowed_keys = DIRECT_CLIENT_ENV_KEYS
         .iter()
         .copied()
-        .chain(["RUST_LOG", "PWD", "SHLVL", "_", "OLDPWD"])
+        .chain(["RUST_LOG", "BORE_SECRET", "PWD", "SHLVL", "_", "OLDPWD"])
         .collect::<Vec<_>>();
     for line in dumped_env.lines() {
         let (key, _) = line.split_once('=').expect("environment entry has key");

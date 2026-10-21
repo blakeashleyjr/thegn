@@ -91,6 +91,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = "0.1"
 http-body-util = "0.1"
 sha2 = "0.10"
+# Zeroize share plan secrets on drop (THE-325); already in the graph via thegn-media.
+zeroize = "1"
 getrandom = "0.4"
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
