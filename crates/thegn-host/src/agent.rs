@@ -794,6 +794,14 @@ pub fn prepare_sandbox_env(
                 home_miss = Some(m);
                 continue;
             }
+            if let Some(m) = thegn_core::sandbox_floor::strict_gate(&spec) {
+                if explicit_choice {
+                    anyhow::bail!("{m} for {worktree}");
+                }
+                thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                home_miss = Some(m);
+                continue;
+            }
             if let Some(m) = thegn_core::sandbox::compose_policy_refusal(&spec) {
                 if explicit_choice {
                     anyhow::bail!("{m} for {worktree}");
