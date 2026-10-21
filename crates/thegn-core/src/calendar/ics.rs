@@ -79,6 +79,7 @@ pub struct IcsReport {
     diagnostics: Vec<IcsDiagnostic>,
     overflow: usize,
     document_failure: bool,
+    cancelled: Vec<String>,
 }
 
 pub const MAX_ICS_DIAGNOSTICS: usize = 32;
@@ -97,6 +98,11 @@ impl IcsReport {
     /// Whether component boundaries or document completeness cannot be trusted.
     pub fn is_document_failure(&self) -> bool {
         self.document_failure
+    }
+
+    /// Series UIDs removed by effective cancellation-only master components.
+    pub fn cancelled_uids(&self) -> &[String] {
+        &self.cancelled
     }
 
     fn record(&mut self, diagnostic: IcsDiagnostic) {
@@ -545,6 +551,7 @@ fn is_retained_property(name: &str) -> bool {
             | "EXDATE"
             | "LAST-MODIFIED"
             | "DTSTAMP"
+            | "SEQUENCE"
     ) || name.starts_with("X-")
 }
 
@@ -620,6 +627,10 @@ pub fn parse_ics_window_reported(
     report.diagnostics.clear();
     report.overflow = 0;
     report.document_failure = false;
+    report.cancelled.clear();
+    let first = out.len();
+    let mut sequences = Vec::new();
+    let mut tombstones: Vec<(String, u32)> = Vec::new();
     let timezone_bindings = prescan_timezones(input, &mut check, report)?;
     let mut timezone_matches = BTreeMap::new();
     let mut cur: Option<Builder> = None;
@@ -732,10 +743,19 @@ pub fn parse_ics_window_reported(
                         components.truncate(depth);
                     }
                     event_depth = None;
-                    match cur.take() {
+                    let ended = cur.take().map(|mut builder| {
+                        builder.adopt_cancelled_override();
+                        builder
+                    });
+                    match ended {
                         Some(b) if b.quarantined => {
                             report.record(IcsDiagnostic::InvalidEvent);
                             meter.abandon_event();
+                        }
+                        Some(b) if b.is_series_tombstone() => {
+                            meter.charge_event(b.uid.len(), 0)?;
+                            meter.admit_event()?;
+                            tombstones.push((b.uid, b.sequence.unwrap_or(0)));
                         }
                         Some(b) if b.start.is_none() => {
                             report.record(IcsDiagnostic::EventWithoutStart);
@@ -749,9 +769,11 @@ pub fn parse_ics_window_reported(
                                 cal_name.len() + if b.uid.is_empty() { ENTRY_OVERHEAD } else { 0 };
                             meter.charge_event(extra, 0)?;
                             meter.admit_event()?;
+                            let sequence = b.sequence.unwrap_or(0);
                             if let Some(mut e) = b.finish(default_zone, report) {
                                 e.calendar = cal_name.clone();
                                 out.push(e);
+                                sequences.push(sequence);
                             } else {
                                 report.record(IcsDiagnostic::InvalidEvent);
                             }
@@ -833,6 +855,47 @@ pub fn parse_ics_window_reported(
     if !saw_calendar || !closed_calendar {
         report.record(IcsDiagnostic::MissingEnvelope);
     }
+    let mut newest = BTreeMap::new();
+    for (event, sequence) in out[first..].iter().zip(&sequences) {
+        let key = (event.uid.clone(), event.recurrence_key());
+        newest
+            .entry(key)
+            .and_modify(|current: &mut u32| *current = (*current).max(*sequence))
+            .or_insert(*sequence);
+    }
+    let mut retained: Vec<(CalEvent, u32)> =
+        out.split_off(first).into_iter().zip(sequences).collect();
+    retained.retain(|(event, sequence)| {
+        newest
+            .get(&(event.uid.clone(), event.recurrence_key()))
+            .is_some_and(|maximum| *sequence >= *maximum)
+    });
+    let mut newest_tombstones = BTreeMap::new();
+    for (uid, sequence) in tombstones {
+        newest_tombstones
+            .entry(uid)
+            .and_modify(|current: &mut u32| *current = (*current).max(sequence))
+            .or_insert(sequence);
+    }
+    let mut newest_surviving_by_uid = BTreeMap::new();
+    for (event, sequence) in &retained {
+        newest_surviving_by_uid
+            .entry(event.uid.clone())
+            .and_modify(|current: &mut u32| *current = (*current).max(*sequence))
+            .or_insert(*sequence);
+    }
+    let cancelled: BTreeSet<_> = newest_tombstones
+        .into_iter()
+        .filter_map(|(uid, sequence)| {
+            newest_surviving_by_uid
+                .get(&uid)
+                .is_none_or(|newest| *newest <= sequence)
+                .then_some(uid)
+        })
+        .collect();
+    report.cancelled.extend(cancelled.iter().cloned());
+    retained.retain(|(event, _)| !cancelled.contains(&event.uid));
+    out.extend(retained.into_iter().map(|(event, _)| event));
     // A document that ends mid-event keeps nothing of it, as before.
     meter.abandon_event();
     Ok(())
@@ -1089,6 +1152,7 @@ struct Builder {
     organizer: String,
     categories: String,
     last_modified: i64,
+    sequence: Option<u32>,
     extra: BTreeMap<String, String>,
     seen_singletons: BTreeSet<&'static str>,
     quarantined: bool,
@@ -1117,6 +1181,7 @@ fn singleton_property(name: &str) -> Option<&'static str> {
         "ORGANIZER" => Some("ORGANIZER"),
         "LAST-MODIFIED" => Some("LAST-MODIFIED"),
         "DTSTAMP" => Some("DTSTAMP"),
+        "SEQUENCE" => Some("SEQUENCE"),
         _ => None,
     }
 }
@@ -1131,6 +1196,29 @@ fn day_of(t: &EventTime) -> NaiveDate {
 }
 
 impl Builder {
+    fn adopt_cancelled_override(&mut self) {
+        if !self.quarantined
+            && self.start.is_none()
+            && self.end.is_none()
+            && !self.duration_seen
+            && self.status == Some(EventStatus::Cancelled)
+            && !self.uid.is_empty()
+            && let Some(recurrence_id) = self.recurrence_id.clone()
+        {
+            self.start = Some(recurrence_id);
+        }
+    }
+
+    fn is_series_tombstone(&self) -> bool {
+        !self.quarantined
+            && self.start.is_none()
+            && self.end.is_none()
+            && !self.duration_seen
+            && self.status == Some(EventStatus::Cancelled)
+            && !self.uid.is_empty()
+            && self.recurrence_id.is_none()
+    }
+
     /// Whether any occurrence of this event can touch `[from, to]`. Errs on
     /// the side of "yes": only provably-outside events are excluded.
     fn may_occur_in(&self, (from, to): (NaiveDate, NaiveDate), default_zone: &str) -> bool {
@@ -1307,6 +1395,13 @@ impl Builder {
                     }
                 }
             }
+            "SEQUENCE" => match line.value.trim().parse::<u32>() {
+                Ok(sequence) => self.sequence = Some(sequence),
+                Err(_) => {
+                    self.sequence = None;
+                    report.record(IcsDiagnostic::InvalidEvent);
+                }
+            },
             "TRANSP" => {
                 self.transp = match line.value.trim().to_ascii_uppercase().as_str() {
                     "TRANSPARENT" => Some(Busy::Free),
