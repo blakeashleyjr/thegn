@@ -396,6 +396,15 @@ fn migrate_calendar_tokens(
             );
             continue;
         }
+        if config_write::calendar_account_token_in_file(config_path, &acct.name)?.as_deref()
+            != Some(acct.token.as_str())
+        {
+            outln!(
+                "skipped {path}: the token in {} is not the effective one; move it by hand",
+                config_path.display()
+            );
+            continue;
+        }
         if dry_run {
             outln!("would migrate {path} (plaintext -> 0600 file)");
             moved += 1;
@@ -405,7 +414,8 @@ fn migrate_calendar_tokens(
             &format!("calendar-{}", acct.name),
             reference.expose_literal().unwrap_or_default(),
         )?;
-        config_write::set_calendar_account_token(config_path, &acct.name, &new_ref)?;
+        config_write::set_calendar_account_token(config_path, &acct.name, &new_ref)
+            .with_context(|| format!("stored {new_ref} but could not rewrite {path}"))?;
         outln!("migrated {path} -> {new_ref}");
         moved += 1;
     }
@@ -494,6 +504,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let source = "[calendar]\n";
+        std::fs::write(&path, source).unwrap();
+        let cfg: Config = toml::from_str(
+            "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\ntoken = \"pasted\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut calls = Vec::new();
+        let moved = migrate_calendar_tokens(&cfg, &path, false, &mut |name, value| {
+            calls.push((name.to_string(), value.to_string()));
+            Ok(format!("file:/fake/{name}"))
+        })
+        .unwrap();
+        assert_eq!(moved, 0);
+        assert!(calls.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn calendar_migrate_skips_a_token_defined_in_another_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\ntoken = \"keyring:x\"\n";
         std::fs::write(&path, source).unwrap();
         let cfg: Config = toml::from_str(
             "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\ntoken = \"pasted\"\n",

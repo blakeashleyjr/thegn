@@ -28,8 +28,9 @@ pub struct SecretFieldRef {
 
 /// Every configured secret field across the config, in a stable order.
 ///
-/// Covers provider, issue, CI, calendar, VPN, snapshot, MCP upstream, and MPD fields. The
-/// field-specific bare-string meaning is explicit at every insertion.
+/// Covers provider, issue, CI, calendar, VPN, snapshot, MCP upstream, and MPD
+/// fields. The field-specific bare-string meaning is explicit at every
+/// insertion.
 pub fn secret_refs(cfg: &Config) -> Vec<SecretFieldRef> {
     let mut out = Vec::new();
 
