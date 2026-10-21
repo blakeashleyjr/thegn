@@ -16,6 +16,33 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Start the bundle producer in a process group that can be terminated as one
+/// unit when streaming exceeds its budget.
+pub(crate) fn spawn_bundle_producer(
+    cmd: &mut std::process::Command,
+) -> io::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+}
+
+/// Kill the producer group while its leader still identifies that group.
+pub(crate) fn kill_bundle_producer(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        if let Err(error) = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL) {
+            tracing::debug!(target: "thegn::merge", %error, "failed to kill bundle producer process group");
+        }
+    }
+    if let Err(error) = child.kill() {
+        tracing::debug!(target: "thegn::merge", %error, "failed to kill bundle producer leader");
+    }
+}
+
 /// Own a private directory and its exclusively-created bundle leaf until the
 /// fetch has consumed it. Drop only removes identities that still match the
 /// retained handles; a replacement is preserved for inspection.
