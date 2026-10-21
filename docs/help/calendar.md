@@ -206,6 +206,11 @@ restart. A sync that fails leaves the cache alone — you get yesterday's calend
 rather than an empty one — and a provider that returns an empty calendar when
 thegn has events cached is treated as suspect rather than believed.
 
+An event thegn cannot read (for example, one with a missing start, an invalid or
+duplicated field, or an unknown time zone) is left out rather than guessed. For
+local calendars, subscribed calendar URLs, and CalDAV, thegn tells you once per
+calendar how many problems it found; the notice returns only when the count changes.
+
 Accounts sync independently: up to four network accounts (subscribed links and
 CalDAV) are fetched at once, while command plugins run one at a time. Each
 account's events appear as soon as it finishes, so one slow or unreachable
