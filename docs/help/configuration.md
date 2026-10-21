@@ -106,6 +106,9 @@ The file is watched: edits apply live, no restart.
   language; `thegn doctor` lists every server and whether its command
   resolves. Servers named in a repo-local `.thegn.*` are ignored (a
   language-server command is untrusted) — declare them in your user config.
+  A config reload restarts only servers whose registry entry changed; turning
+  LSP off retires every server, while unchanged servers stay running. A newly
+  configured server starts without an earlier unavailable or backoff result.
 - `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
   persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
   and reuses the existing trusted PR-queue agent policy.

@@ -211,6 +211,10 @@ best effort and a warning cannot undo a confirmed move.
   confirming first (`--dry-run` to preview, `--yes` for scripts). It folds
   only what you queued unless you pass `--all`.
 - `thegn land` is the blessed one-shot: fold, gate, advance `main`.
+- `thegn pr merge` reads the worktree's PR, then confirms `#N` at its head;
+  pass `--yes` (`-y`) without a TTY. It merges only that reviewed head, prints
+  “PR merged” only on confirmation, and exits non-zero if the head moves, the
+  forge refuses, or the result is unknown.
 
 None of these check the target out, which is what makes them safe against
 a running instance. See [[merge-queue]] for the whole flow.
@@ -235,7 +239,7 @@ blocking provider lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
 
-When a GitLab job list reaches its page or row budget, `thegn ci view` and
+When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
 details are not used to ingest job logs, so their logs are not cached and CI
 autofix does not start from them. `thegn ci trigger -i KEY=VALUE` inputs are
