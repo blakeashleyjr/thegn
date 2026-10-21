@@ -369,36 +369,37 @@ fn kind_name(kind: BackendKind) -> &'static str {
 /// Resolve the media backend from lowered config, preserving why resolution failed.
 pub async fn client_for(mut opts: ResolveOpts) -> Result<MediaClient, Unavailable> {
     let kind = opts.backend;
-    if kind == BackendKind::None {
-        return Err(Unavailable::Disabled);
-    }
-    if matches!(kind, BackendKind::Spotify | BackendKind::Jellyfin) {
-        match kind {
-            BackendKind::Spotify => {
-                tracing::debug!(target: "thegn::media", "spotify backend reserved; use MPRIS/SMTC/AppleScript for desktop control")
-            }
-            BackendKind::Jellyfin => {
-                tracing::debug!(target: "thegn::media", "jellyfin backend not implemented yet")
-            }
-            _ => {}
-        }
-        return Err(Unavailable::Reserved(kind));
-    }
-    if (kind == BackendKind::Mpris && !cfg!(target_os = "linux"))
-        || (kind == BackendKind::Smtc && !cfg!(windows))
-        || (kind == BackendKind::AppleScript && !cfg!(target_os = "macos"))
-    {
-        return Err(Unavailable::NotOnThisPlatform(kind));
-    }
-    let client: Option<MediaClient> = match opts.backend {
-        BackendKind::None => unreachable!("disabled handled above"),
+    let client: Option<MediaClient> = match kind {
+        BackendKind::None => return Err(Unavailable::Disabled),
         BackendKind::Auto => auto_client(&mut opts).await,
-        BackendKind::Mpris => mpris_client(&opts).await,
+        BackendKind::Mpris => {
+            if !cfg!(target_os = "linux") {
+                return Err(Unavailable::NotOnThisPlatform(kind));
+            }
+            mpris_client(&opts).await
+        }
         BackendKind::Mpv => mpv_client(&opts),
         BackendKind::Mpd => mpd_client(&mut opts).await,
-        BackendKind::Smtc => smtc_client(&opts).await,
-        BackendKind::AppleScript => applescript_client(&opts),
-        BackendKind::Spotify | BackendKind::Jellyfin => unreachable!("reserved handled above"),
+        BackendKind::Smtc => {
+            if !cfg!(windows) {
+                return Err(Unavailable::NotOnThisPlatform(kind));
+            }
+            smtc_client(&opts).await
+        }
+        BackendKind::AppleScript => {
+            if !cfg!(target_os = "macos") {
+                return Err(Unavailable::NotOnThisPlatform(kind));
+            }
+            applescript_client(&opts)
+        }
+        BackendKind::Spotify => {
+            tracing::debug!(target: "thegn::media", "spotify backend reserved; use MPRIS/SMTC/AppleScript for desktop control");
+            return Err(Unavailable::Reserved(kind));
+        }
+        BackendKind::Jellyfin => {
+            tracing::debug!(target: "thegn::media", "jellyfin backend not implemented yet");
+            return Err(Unavailable::Reserved(kind));
+        }
     };
     client
         .map(|client| Box::new(admit::Admitted(client)) as MediaClient)

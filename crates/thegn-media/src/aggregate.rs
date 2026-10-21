@@ -516,8 +516,9 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_child_watch_does_not_hold_up_healthy_watchers() {
-        let healthy =
-            Box::pin(async { Ok(Some(Box::new(TestWatch) as Box<dyn MediaWatch + Send>)) });
+        let healthy = Box::pin(async {
+            Ok::<_, MediaError>(Some(Box::new(TestWatch) as Box<dyn MediaWatch + Send>))
+        });
         let stalled = Box::pin(std::future::pending());
         let watches = join_all([
             bounded_watch(0, stalled, std::time::Duration::from_millis(10)),
