@@ -37,8 +37,19 @@ pub(crate) fn enqueue_bound_local(
     branch: &str,
     target: &str,
 ) -> Result<()> {
+    enqueue_bound_local_with(db, worktree, branch, target, None)
+}
+
+pub(crate) fn enqueue_bound_local_with(
+    db: &Db,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+    admin_why: Option<&str>,
+) -> Result<()> {
     let branch_ref = format!("refs/heads/{branch}");
     let candidate_oid = CliGit.rev_parse(&GitLoc::from_db(worktree, None), &branch_ref)?;
+    crate::cmd::dispatch::gate::pipeline_merge_admission(db, worktree, &candidate_oid, admin_why)?;
     db.enqueue_merge_candidate(
         worktree,
         branch,
@@ -250,6 +261,15 @@ fn resolve_repo_root(worktree: &Path) -> Result<PathBuf> {
 /// outcome (queued / skipped). Errors only on a genuinely broken worktree
 /// (detached HEAD, not a repo) or a DB write failure.
 pub fn enqueue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<String> {
+    enqueue_worktree_with(cfg, db, worktree, None)
+}
+
+pub fn enqueue_worktree_with(
+    cfg: &Config,
+    db: &Db,
+    worktree: &Path,
+    admin_why: Option<&str>,
+) -> Result<String> {
     let worktree = &canonical_worktree(worktree);
     let root = resolve_repo_root(worktree)?;
     // Takes the whole `Config` rather than a `MergeQueueConfig`: only here is the
@@ -262,7 +282,7 @@ pub fn enqueue_worktree(cfg: &Config, db: &Db, worktree: &Path) -> Result<String
     if branch == target {
         return Ok(format!("skipped {branch} (that's the target branch)"));
     }
-    enqueue_bound_local(db, &wt_s, &branch, &target)?;
+    enqueue_bound_local_with(db, &wt_s, &branch, &target, admin_why)?;
     crate::merge_lifecycle::apply(mq, db, &root, &wt_s, &branch, LifecycleEvent::Enqueued);
     Ok(format!("queued {branch}"))
 }

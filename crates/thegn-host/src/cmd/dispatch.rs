@@ -33,7 +33,7 @@ use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
 use thegn_core::util::{git_ok, git_out_allow_empty};
 #[path = "dispatch_gate.rs"]
-mod gate;
+pub(crate) mod gate;
 
 /// Bound the active roster rows examined by the CLI reaper.
 const CLI_REAP_ROW_LIMIT: usize = 4096;

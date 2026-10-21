@@ -385,6 +385,10 @@ thegn merge add <branch>     # enqueue
 thegn integrate              # serial fold + gate + CAS advance
 ```
 
+Before `merge add`, ensure the newest pipeline row that is not failed or
+abandoned is finished and has been gated with `thegn dispatch gate <row-id>` on
+the commit being enqueued. Later commits need a new gate before enqueue.
+
 `integrate` already carries its own conflict / gate-failure agent handoff from
 `[merge_queue]`; do not build a "merger" stage that reimplements it.
 

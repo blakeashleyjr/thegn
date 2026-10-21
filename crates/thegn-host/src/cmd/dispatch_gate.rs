@@ -9,6 +9,7 @@ use thegn_core::pipeline_gate_attest::{
     AttestationContext, AttestationRefusal, GateAttestation, GateOutcome, GateRunner, TrustedGate,
     evaluate_latest,
 };
+use thegn_core::pipeline_merge_admission::{GatingRow, PipelineMergeRefused, gating_row};
 use thegn_core::store::NotificationStore;
 use thegn_core::util;
 
@@ -33,6 +34,69 @@ pub(super) fn trusted_gate_for(
         Some((latest.id, &attestation, latest.outcome, &latest.reason)),
         context.as_ref().map_err(String::as_str),
     )
+}
+
+/// Admit a local merge enqueue only when its newest pipeline row has a trusted
+/// attestation for both the observed worktree HEAD and the enqueued candidate.
+pub(crate) fn pipeline_merge_admission(
+    db: &Db,
+    worktree: &str,
+    candidate_oid: &str,
+    admin_why: Option<&str>,
+) -> Result<()> {
+    if let Some(why) = admin_why
+        && why.trim().is_empty()
+    {
+        anyhow::bail!("--admin requires a non-empty --why");
+    }
+    let canonical = std::fs::canonicalize(worktree)
+        .unwrap_or_else(|_| std::path::PathBuf::from(worktree))
+        .to_string_lossy()
+        .to_string();
+    let rows = db.pipeline_rows_for_worktree(worktree, &canonical)?;
+    let (row, gate_state, reason) = match gating_row(&rows) {
+        GatingRow::None => return Ok(()),
+        GatingRow::Unfinished(row) => (
+            row,
+            "unfinished".to_string(),
+            format!("is still {}", row.status.as_str()),
+        ),
+        GatingRow::Unrecognized(row) => (
+            row,
+            "unrecognized".to_string(),
+            "has an unrecognized status".to_string(),
+        ),
+        GatingRow::Finished(row) => {
+            let latest = db.latest_gate_attestation(row.id)?;
+            let trusted = trusted_gate_for(row, latest.as_ref());
+            let reason = if !trusted.is_satisfied() {
+                trusted.detail(row.id)
+            } else if let Some(attestation) = latest.as_ref()
+                && attestation.commit_oid != candidate_oid
+            {
+                format!(
+                    "was gated on {} but the enqueued commit is {candidate_oid}",
+                    attestation.commit_oid
+                )
+            } else {
+                return Ok(());
+            };
+            (row, trusted.token().to_string(), reason)
+        }
+    };
+    if let Some(why) = admin_why {
+        let note = thegn_core::pipeline_report::note_text(&format!(
+            "merge admitted without a satisfied gate attestation (admin): {why}; gate state {gate_state}: {reason}; candidate {candidate_oid}"
+        ))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        db.append_dispatch_note(row.id, &note)?;
+        return Ok(());
+    }
+    Err(anyhow::Error::new(PipelineMergeRefused {
+        worktree: worktree.to_string(),
+        row: row.id,
+        reason,
+    }))
 }
 
 fn observe_attestation_context(
@@ -390,14 +454,14 @@ fn valid_oid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{gate_row, trusted_gate_for};
+    use super::{gate_row, pipeline_merge_admission, trusted_gate_for};
     use crate::integrate::{GateErrorClass, GatePhase, GateVerdict};
     use std::path::{Path, PathBuf};
     use thegn_core::StoredGateAttestation;
     use thegn_core::config::{Config, MergeQueueConfig};
     use thegn_core::db::Db;
     use thegn_core::fsperm::ensure_private_dir_beneath;
-    use thegn_core::issue::NewDispatch;
+    use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
     use thegn_core::pipeline_gate_attest::{
         AttestationContext, AttestationRefusal, AttestationVerdict, GateAttestation, GateOutcome,
         GateRunner, TrustedGate,
@@ -468,6 +532,42 @@ mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let logs = ensure_private_dir_beneath(log_dir.path(), Path::new("gates")).unwrap();
         (db, id, cfg, log_dir, logs)
+    }
+
+    fn pipeline_setup(
+        worktree: &Path,
+    ) -> (
+        Db,
+        i64,
+        Config,
+        tempfile::TempDir,
+        thegn_core::fsperm::PrivateDir,
+    ) {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&db_dir.path().join("state.db")).unwrap();
+        let path = worktree.display().to_string();
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("code"),
+                artifact_path: Some(".thegn/pipeline/THE-1103/code/1.md"),
+                ..NewDispatch::new("linear:THE-1103", &path, "fixture")
+            })
+            .unwrap();
+        let cfg = Config {
+            merge_queue: MergeQueueConfig {
+                gate_command: "just test".to_string(),
+                ..MergeQueueConfig::default()
+            },
+            ..Config::default()
+        };
+        let log_dir = tempfile::tempdir().unwrap();
+        let logs = ensure_private_dir_beneath(log_dir.path(), Path::new("gates")).unwrap();
+        (db, id, cfg, log_dir, logs)
+    }
+
+    fn finish_pipeline_row(db: &Db, id: i64) {
+        db.update_dispatch_status(id, AgentDispatchStatus::Done)
+            .unwrap();
     }
 
     fn assert_refused(result: anyhow::Result<StoredGateAttestation>, row: i64) {
@@ -737,5 +837,139 @@ mod tests {
         let (db, id, _cfg, _log_dir, _logs) = setup(&repo_path);
         let row = db.get_dispatch(id).unwrap().unwrap();
         assert_eq!(trusted_gate_for(&row, None), TrustedGate::Missing);
+    }
+
+    #[test]
+    fn merge_admission_refuses_an_ungated_finished_row() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, _cfg, _log_dir, _logs) = pipeline_setup(&repo_path);
+        finish_pipeline_row(&db, id);
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        let result =
+            pipeline_merge_admission(&db, &repo_path.display().to_string(), &candidate, None);
+        assert!(matches!(
+            result,
+            Err(error) if error.downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
+                .is_some_and(|refusal| refusal.reason.contains("dispatch gate"))
+        ));
+    }
+
+    #[test]
+    fn merge_admission_refuses_a_failed_gate_attestation() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
+        assert!(matches!(
+            gate_row(
+                &db,
+                &cfg,
+                id,
+                &logs,
+                &|_, _, _| Ok(GateVerdict::Failed {
+                    log: "fixture failure".to_string(),
+                }),
+                &|| 100,
+            ),
+            Err(_)
+        ));
+        finish_pipeline_row(&db, id);
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        let result =
+            pipeline_merge_admission(&db, &repo_path.display().to_string(), &candidate, None);
+        assert!(matches!(
+            result,
+            Err(error) if error.downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
+                .is_some_and(|refusal| refusal.reason.contains("did not pass"))
+        ));
+    }
+
+    #[test]
+    fn merge_admission_admits_a_gated_finished_row_for_its_commit() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        finish_pipeline_row(&db, id);
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        pipeline_merge_admission(&db, &repo_path.display().to_string(), &candidate, None).unwrap();
+    }
+
+    #[test]
+    fn merge_admission_refuses_after_a_new_commit() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(&repo_path);
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        finish_pipeline_row(&db, id);
+        std::fs::write(repo_path.join("next.txt"), "new commit\n").unwrap();
+        git(&repo_path, &["add", "next.txt"]);
+        git(
+            &repo_path,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "next"],
+        );
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        let result =
+            pipeline_merge_admission(&db, &repo_path.display().to_string(), &candidate, None);
+        assert!(matches!(
+            result,
+            Err(error) if error.downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>().is_some()
+        ));
+    }
+
+    #[test]
+    fn merge_admission_refuses_an_unfinished_row() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, _id, _cfg, _log_dir, _logs) = pipeline_setup(&repo_path);
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        let result =
+            pipeline_merge_admission(&db, &repo_path.display().to_string(), &candidate, None);
+        assert!(matches!(
+            result,
+            Err(error) if error.downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
+                .is_some_and(|refusal| refusal.reason.contains("still queued"))
+        ));
+    }
+
+    #[test]
+    fn merge_admission_admin_override_records_a_note() {
+        let (_repo_dir, repo_path) = repo();
+        let (db, id, _cfg, _log_dir, _logs) = pipeline_setup(&repo_path);
+        finish_pipeline_row(&db, id);
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        pipeline_merge_admission(
+            &db,
+            &repo_path.display().to_string(),
+            &candidate,
+            Some("hotfix"),
+        )
+        .unwrap();
+        let notes = db.dispatch_notes(id, None, 0).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| { note.text.contains("hotfix") && note.text.contains(&candidate) })
+        );
+    }
+
+    #[test]
+    fn merge_admission_ignores_worktrees_without_pipeline_rows() {
+        let (_repo_dir, repo_path) = repo();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&db_dir.path().join("state.db")).unwrap();
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        pipeline_merge_admission(&db, &repo_path.display().to_string(), &candidate, None).unwrap();
     }
 }
