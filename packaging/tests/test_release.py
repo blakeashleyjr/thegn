@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -539,8 +540,33 @@ class ReleaseManifestTests(unittest.TestCase):
 
     def test_manifest_cli_exits_nonzero_on_refusal(self) -> None:
         (self.assets / f"thegn-{self.tag}-completions.tar.gz").unlink()
+        stderr = io.StringIO()
         with self.assertRaises(SystemExit) as raised:
-            release.main(
+            with contextlib.redirect_stderr(stderr):
+                release.main(
+                    [
+                        "manifest",
+                        "--tag",
+                        self.tag,
+                        "--assets-dir",
+                        str(self.assets),
+                        "--record",
+                        str(self.record_path),
+                        "--commit",
+                        self.commit,
+                        "--output",
+                        str(self.temp / "manifest.json"),
+                    ]
+                )
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("missing:", stderr.getvalue())
+        self.assertIn("completions", stderr.getvalue())
+
+    def test_manifest_cli_writes_and_prints_the_manifest(self) -> None:
+        output = self.temp / "manifest.json"
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = release.main(
                 [
                     "manifest",
                     "--tag",
@@ -552,10 +578,13 @@ class ReleaseManifestTests(unittest.TestCase):
                     "--commit",
                     self.commit,
                     "--output",
-                    str(self.temp / "manifest.json"),
+                    str(output),
                 ]
             )
-        self.assertEqual(2, raised.exception.code)
+        self.assertEqual(0, result)
+        self.assertTrue(output.is_file())
+        self.assertEqual(self.build(), json.loads(output.read_text(encoding="utf-8")))
+        self.assertEqual(output.as_posix(), stdout.getvalue().strip())
 
 
 if __name__ == "__main__":
