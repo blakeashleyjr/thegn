@@ -1359,3 +1359,60 @@ fn calendar_sync_uses_shared_runtime() {
     assert!(!source.contains("new_current_thread"));
     assert!(source.contains("thegn_svc::bg_runtime::block_on("));
 }
+
+// THE-470 regression lock: expected to pass on main.
+#[test]
+fn transp_free_survives_the_cache_round_trip_with_overrides() {
+    let t = TmpDb::new("transp-round-trip");
+    let (from, to) = window();
+
+    let mut master = event("series");
+    master.busy = thegn_core::calendar::Busy::Free;
+    master.recurrence = Some(thegn_core::calendar::Recurrence {
+        rules: vec![thegn_core::calendar::RRule::parse("FREQ=WEEKLY").unwrap()],
+        ..Default::default()
+    });
+
+    let mut override_event = event("series");
+    override_event.recurrence_id = Some(EventTime::Zoned {
+        local: d(2026, 8, 28).and_hms_opt(9, 0, 0).unwrap(),
+        zone: TzRef::new("UTC"),
+    });
+
+    let mut one_shot = event("free-once");
+    one_shot.busy = thegn_core::calendar::Busy::Free;
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![master, override_event, one_shot], vec![], ""),
+        from,
+        to,
+    );
+
+    let cached = load_cached(&t.db, from, to).unwrap().events;
+    let cached_master = cached
+        .iter()
+        .find(|cached_event| cached_event.uid == "series" && cached_event.recurrence_id.is_none())
+        .unwrap();
+    assert_eq!(cached_master.busy, thegn_core::calendar::Busy::Free);
+
+    let cached_override = cached
+        .iter()
+        .find(|cached_event| cached_event.uid == "series" && cached_event.recurrence_id.is_some())
+        .unwrap();
+    assert_eq!(cached_override.busy, thegn_core::calendar::Busy::Busy);
+    assert_eq!(
+        cached_override.recurrence_id,
+        Some(EventTime::Zoned {
+            local: d(2026, 8, 28).and_hms_opt(9, 0, 0).unwrap(),
+            zone: TzRef::new("UTC"),
+        })
+    );
+
+    let cached_one_shot = cached
+        .iter()
+        .find(|cached_event| cached_event.uid == "free-once")
+        .unwrap();
+    assert_eq!(cached_one_shot.busy, thegn_core::calendar::Busy::Free);
+}

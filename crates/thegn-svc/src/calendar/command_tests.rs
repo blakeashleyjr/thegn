@@ -134,3 +134,21 @@ fn plugin_event_with_mixed_date_and_timed_end_is_refused() {
     ));
     assert!(sink.admitted.events.is_empty());
 }
+
+// THE-470 regression lock: expected to pass on main.
+#[test]
+fn transp_command_plugin_value_is_kept_as_sent() {
+    let mut sink = sink();
+    let line = r#"{"method":"events","params":{"events":[{"uid":"plugin-free","title":"Travel","start":{"kind":"date","date":"2026-10-12"},"end":{"kind":"date","date":"2026-10-13"},"busy":"free"},{"uid":"plugin-default","title":"Meeting","start":{"kind":"date","date":"2026-10-14"},"end":{"kind":"date","date":"2026-10-15"}}]}}"#;
+
+    assert!(sink.line(line));
+    assert_eq!(sink.admitted.events.len(), 2);
+    assert_eq!(
+        sink.admitted.events[0].busy,
+        thegn_core::calendar::Busy::Free
+    );
+    assert_eq!(
+        sink.admitted.events[1].busy,
+        thegn_core::calendar::Busy::Busy
+    );
+}
