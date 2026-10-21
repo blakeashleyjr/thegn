@@ -416,7 +416,8 @@ fn read_script(worktree: &str) -> String {
     let path = credential_path(worktree);
     format!(
         "p=\"$HOME/{path}\"; [ -r \"$p\" ] || exit 44; \
-         printf '%s\\n' __THEGN_ROUTE_V1__; head -c {} -- \"$p\"",
+         printf '%s\\n' __THEGN_ROUTE_V1__; head -c {} -- \"$p\"; \
+         printf '%s\\n' __THEGN_ROUTE_END__",
         CREDENTIAL_READ_CAP + 1
     )
 }
@@ -458,12 +459,18 @@ fn read_provider_credential(
 }
 
 fn parse_credential_response(text: &str) -> Result<Option<(String, String)>> {
-    let Some(payload) = text
-        .split_once("__THEGN_ROUTE_V1__\n")
-        .map(|(_, tail)| tail)
-    else {
+    let Some((_, tail)) = text.split_once("__THEGN_ROUTE_V1__\n") else {
         anyhow::bail!("route-to-host credential response was missing its protocol marker");
     };
+    let search_len = CREDENTIAL_READ_CAP + 1 + "\n__THEGN_ROUTE_END__\n".len();
+    let Some(end) = tail.find("\n__THEGN_ROUTE_END__\n") else {
+        anyhow::bail!("route-to-host credential file was oversized or malformed");
+    };
+    anyhow::ensure!(
+        end + "\n__THEGN_ROUTE_END__\n".len() <= search_len,
+        "route-to-host credential file was oversized or malformed"
+    );
+    let payload = &tail[..end + 1];
     anyhow::ensure!(
         payload.len() <= CREDENTIAL_READ_CAP,
         "route-to-host credential file was oversized or malformed"
@@ -585,7 +592,7 @@ fn ssh_command(target: &SshTarget, remote_script: &str) -> Command {
 }
 
 fn read_ssh_credential(target: &SshTarget, worktree: &str) -> Result<Option<(String, String)>> {
-    let (code, output) = run_ssh_bounded(
+    let (code, output, stderr) = run_ssh_bounded(
         ssh_command(target, &read_script(worktree)),
         SSH_CREDENTIAL_TIMEOUT,
     )
@@ -595,8 +602,9 @@ fn read_ssh_credential(target: &SshTarget, worktree: &str) -> Result<Option<(Str
     }
     anyhow::ensure!(
         code == Some(0),
-        "SSH rejected route-to-host credential read (exit {})",
-        code.unwrap_or(-1)
+        "SSH rejected route-to-host credential read (exit {}): {}",
+        code.unwrap_or(-1),
+        String::from_utf8_lossy(&stderr).trim()
     );
     let text = String::from_utf8(output).context("SSH credential response was not UTF-8")?;
     parse_credential_response(&text)
@@ -626,32 +634,47 @@ fn ssh_install_script(worktree: &str) -> String {
     )
 }
 
-fn run_ssh_bounded(mut command: Command, timeout: Duration) -> Result<(Option<i32>, Vec<u8>)> {
+fn run_ssh_bounded(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
     let output_cap = CREDENTIAL_READ_CAP + 64;
     let limits = thegn_proc::Limits {
         stdout: thegn_proc::Stream::HeadOrFail { cap: output_cap },
-        stderr: thegn_proc::Stream::Null,
+        stderr: thegn_proc::Stream::Tail { cap: 1024 },
         quiesce_after_leader: Some(Duration::ZERO),
         ..thegn_proc::Limits::silent(timeout)
     };
     let run = thegn_proc::run(&mut command, &limits, &AtomicBool::new(false));
+    let stderr = String::from_utf8_lossy(&run.stderr.bytes)
+        .trim()
+        .to_string();
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    };
     match &run.end {
         thegn_proc::End::LeaderExited => Ok((
             run.exit_status().and_then(|status| status.code()),
             run.stdout.bytes,
+            run.stderr.bytes,
         )),
-        thegn_proc::End::TimedOut => anyhow::bail!(
-            "SSH credential command timed out after {}s",
-            timeout.as_secs()
-        ),
+        thegn_proc::End::TimedOut => {
+            anyhow::bail!("SSH credential command timed out after {timeout:?}{detail}")
+        }
         thegn_proc::End::OutputLimit(_) => {
-            anyhow::bail!("SSH credential command output over {output_cap} bytes")
+            anyhow::bail!("SSH credential command output over {output_cap} bytes{detail}")
         }
-        thegn_proc::End::Spawn(error) => anyhow::bail!("start SSH credential command: {error}"),
+        thegn_proc::End::Spawn(error) => {
+            anyhow::bail!("start SSH credential command: {error}{detail}")
+        }
         thegn_proc::End::Supervise(error) => {
-            anyhow::bail!("supervise SSH credential command: {error}")
+            anyhow::bail!("supervise SSH credential command: {error}{detail}")
         }
-        thegn_proc::End::Cancelled => anyhow::bail!("SSH credential command was cancelled"),
+        thegn_proc::End::Cancelled => {
+            anyhow::bail!("SSH credential command was cancelled{detail}")
+        }
     }
 }
 
@@ -688,15 +711,16 @@ fn stream_credential(mut command: Command, credential: &RouteCredential) -> Resu
 
 fn remove_ssh_credential(target: &SshTarget, worktree: &str) -> Result<()> {
     let path = credential_path(worktree);
-    let (code, _) = run_ssh_bounded(
+    let (code, _, stderr) = run_ssh_bounded(
         ssh_command(target, &format!("rm -f \"$HOME/{path}\"")),
         SSH_CREDENTIAL_TIMEOUT,
     )
     .context("remove route-to-host credential over SSH")?;
     anyhow::ensure!(
         code == Some(0),
-        "SSH rejected route-to-host credential removal (exit {})",
-        code.unwrap_or(-1)
+        "SSH rejected route-to-host credential removal (exit {}): {}",
+        code.unwrap_or(-1),
+        String::from_utf8_lossy(&stderr).trim()
     );
     Ok(())
 }
@@ -1363,8 +1387,24 @@ mod tests {
     #[test]
     fn credential_parser_accepts_only_two_bounded_lines() {
         assert_eq!(
-            parse_credential_response("banner\n__THEGN_ROUTE_V1__\nhttps://o\ntok\n").unwrap(),
+            parse_credential_response(
+                "banner\n__THEGN_ROUTE_V1__\nhttps://o\ntok\n__THEGN_ROUTE_END__\n"
+            )
+            .unwrap(),
             Some(("https://o".into(), "tok".into()))
+        );
+        assert_eq!(
+            parse_credential_response(
+                "__THEGN_ROUTE_V1__\nhttps://o\ntok\n__THEGN_ROUTE_END__\nprofile warning\n"
+            )
+            .unwrap(),
+            Some(("https://o".into(), "tok".into()))
+        );
+        assert!(
+            parse_credential_response(
+                "__THEGN_ROUTE_V1__\nhttps://o\ntok\njunk\n__THEGN_ROUTE_END__\n"
+            )
+            .is_err()
         );
         for payload in [
             "https://o\ntok\nextra\n".to_string(),
@@ -1374,7 +1414,7 @@ mod tests {
             format!("{}\ntok\n", "o".repeat(CREDENTIAL_LINE_MAX + 1)),
             format!("{}\n", "x".repeat(CREDENTIAL_READ_CAP + 1)),
         ] {
-            let response = format!("__THEGN_ROUTE_V1__\n{payload}");
+            let response = format!("__THEGN_ROUTE_V1__\n{payload}__THEGN_ROUTE_END__\n");
             assert!(
                 parse_credential_response(&response).is_err(),
                 "accepted malformed payload with {} bytes",
@@ -1398,6 +1438,7 @@ mod tests {
     fn read_scripts_cap_the_remote_read() {
         let script = read_script("/host/worktree-a");
         assert!(script.contains("head -c 4097"));
+        assert!(script.contains("__THEGN_ROUTE_END__"));
         assert!(!script.contains("cat --"));
     }
 
