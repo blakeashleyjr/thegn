@@ -492,3 +492,101 @@ fn gc_owner_argv_only_for_filter_verified_backends() {
 fn owner_label_arg_has_the_key() {
     assert!(owner_label_arg().starts_with("thegn.owner="));
 }
+
+#[test]
+fn suffix_like_live_main_container_is_never_removed() {
+    let active = vec!["/w/foo-tgagent".into(), "/w/bar-tgvpn".into()];
+    let foo = crate::sandbox::container_name("/w/foo-tgagent");
+    let bar = crate::sandbox::container_name("/w/bar-tgvpn");
+    let all = vec![foo.clone(), bar.clone()];
+    let plain = plan_gc(&active, &all, Some(&all), Some(&all));
+    assert_eq!(plain.remove, all, "documents the suffix-like name-rule bug");
+
+    let plan = refine_gc_plan(plain, &active, &mut |name| {
+        let path = if name == foo.as_str() {
+            b"/w/foo-tgagent".as_slice()
+        } else {
+            b"/w/bar-tgvpn".as_slice()
+        };
+        Some((MAIN_ROLE.to_string(), worktree_label_value(path)))
+    });
+
+    assert!(plan.remove.is_empty());
+    assert!(plan.unverified.is_empty());
+}
+
+#[test]
+fn dead_labelled_container_is_removed_and_legacy_keeps_the_name_rule() {
+    let plan = GcPlan {
+        remove: vec!["thegn-dead".into(), "thegn-legacy".into()],
+        unverified: Vec::new(),
+    };
+    let refined = refine_gc_plan(plan, &[], &mut |name| {
+        if name == "thegn-dead" {
+            Some((MAIN_ROLE.into(), worktree_label_value(b"/w/gone")))
+        } else {
+            Some((String::new(), String::new()))
+        }
+    });
+
+    assert_eq!(refined.remove, vec!["thegn-dead", "thegn-legacy"]);
+    assert!(refined.unverified.is_empty());
+}
+
+#[test]
+fn ambiguous_or_unreadable_labels_are_kept_and_surfaced() {
+    let valid = worktree_label_value(b"/w/path");
+    let cases = [
+        ("thegn-no-worktree", Some((MAIN_ROLE.into(), String::new()))),
+        ("thegn-no-role", Some((String::new(), valid.clone()))),
+        ("thegn-sidecar", Some(("sidecar".into(), valid.clone()))),
+        (
+            "thegn-malformed",
+            Some((MAIN_ROLE.into(), "not-a-digest".into())),
+        ),
+        ("thegn-unreadable", None),
+    ];
+    for (name, labels) in cases {
+        let plan = GcPlan {
+            remove: vec![name.into()],
+            unverified: Vec::new(),
+        };
+        let refined = refine_gc_plan(plan, &[], &mut |_| labels.clone());
+        assert!(refined.remove.is_empty(), "{name}");
+        assert_eq!(refined.unverified, vec![name], "{name}");
+    }
+}
+
+#[test]
+fn label_verdict_table() {
+    use std::collections::HashSet;
+
+    let live_label = worktree_label_value(b"/w/live");
+    let active = HashSet::from([live_label.clone()]);
+    let dead_label = worktree_label_value(b"/w/dead");
+    let malformed_label = format!("v1-{}", "g".repeat(32));
+    let cases = [
+        ("", "", LabelVerdict::Legacy),
+        (MAIN_ROLE, live_label.as_str(), LabelVerdict::Live),
+        (MAIN_ROLE, dead_label.as_str(), LabelVerdict::Dead),
+        (MAIN_ROLE, "", LabelVerdict::Ambiguous),
+        ("", live_label.as_str(), LabelVerdict::Ambiguous),
+        ("sidecar", live_label.as_str(), LabelVerdict::Ambiguous),
+        (MAIN_ROLE, "not-a-digest", LabelVerdict::Ambiguous),
+        (MAIN_ROLE, "v1-short", LabelVerdict::Ambiguous),
+        (MAIN_ROLE, malformed_label.as_str(), LabelVerdict::Ambiguous),
+    ];
+    for (role, worktree, expected) in cases {
+        assert_eq!(label_verdict(role, worktree, &active), expected);
+    }
+}
+
+#[test]
+fn worktree_label_value_is_versioned_and_path_exact() {
+    let value = worktree_label_value(b"/w/a");
+    assert!(value.starts_with("v1-"));
+    assert_eq!(value.len(), 35);
+    assert_eq!(value, worktree_label_value(b"/w/a"));
+    assert_ne!(value, worktree_label_value(b"/w/a/"));
+    assert_ne!(value, worktree_label_value(b"/w/A"));
+}
