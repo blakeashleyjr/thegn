@@ -2,9 +2,8 @@
 
 ## Purpose
 
-Superset's terminal presets (name, description, working dir, commands, split-vs-tab
-mode, one-click bar) are the comparable: named, reusable, multi-command launch
-shapes.
+Named, reusable launch configurations (`[[presets]]`) layered on the program
+registry, and the runtime launch menu that summons them into the active worktree.
 
 ## Requirements
 
