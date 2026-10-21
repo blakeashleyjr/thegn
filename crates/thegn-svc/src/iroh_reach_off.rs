@@ -88,8 +88,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stub_is_marked_not_built() {
-        assert!(!BUILT);
-    }
+    // The stub must report itself as not built; checked at compile time.
+    const _: () = assert!(!BUILT);
 }
