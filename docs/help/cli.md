@@ -138,6 +138,11 @@ remove`, `post_destroy`, and DB cleanup. A failed blocking destroy hook leaves
 the worktree in place and names `--force`; that existing flag is also the
 explicit confirmation and skips the veto. Repo hooks are still warn-only.
 
+Close keeps a worktree's files and records that you closed it, so automatic
+discovery will not bring it back. Run `thegn wt reopen <path>` to clear that
+record and register it again without starting a pane. Worktrees closed before
+this release have no close record.
+
 To put an agent in it without a pane on screen:
 
 ```sh
