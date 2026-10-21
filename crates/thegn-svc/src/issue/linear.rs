@@ -469,6 +469,7 @@ const SEARCH_REASONS: PageReasons = PageReasons {
 
 /// `limit == 0` means "no cap" to our callers (`cmd/issue.rs` only truncates
 /// when `limit > 0`), so it maps to the page maximum, not to 1.
+#[cfg(test)]
 fn page_size(limit: usize) -> usize {
     if limit == 0 {
         MAX_PAGE_SIZE
