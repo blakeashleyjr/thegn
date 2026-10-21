@@ -325,31 +325,10 @@
       ]
     },
     {
-      "issue": "THE-286",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "repair-kitty-stream-parser"
-      ]
-    },
-    {
-      "issue": "THE-310",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "bound-shared-framed-protocols"
-      ]
-    },
-    {
       "issue": "THE-325",
       "project": "Client API & Remote Access",
       "changes": [],
       "no_spec_rationale": "The delivered subtask (bounded public-share output and redacted diagnostics) archived as bound-public-share-output. The remaining credential-isolation work \u2014 keeping secrets out of public-share client argv \u2014 is still In Progress and has no proposal yet."
-    },
-    {
-      "issue": "THE-343",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "admit-set-only-pane-clipboard"
-      ]
     },
     {
       "issue": "THE-377",
