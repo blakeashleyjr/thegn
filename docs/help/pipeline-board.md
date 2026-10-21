@@ -149,3 +149,18 @@ or record an explicit forced completion.
 Progress notes are limited to 2,000 notes and 2 MiB of text per dispatch row.
 Further `thegn dispatch note` requests are refused with a pointer to
 `thegn dispatch report`, and status JSON marks a truncated note list.
+
+A pipeline row uses its own handoff file,
+`.thegn/pipeline/<issue>/<stage>/<row>.md`. `thegn dispatch verify`,
+`set-status done` and the wake handoff refuse a different artifact or an
+empty committed handoff. Plain dispatch rows keep their existing behavior.
+
+A chunk's `after:` names resolve only to rows in the same stage. The newest
+attempt of each chunk name governs, and a done or merged row satisfies the
+dependency. If same-stage rows make a name ambiguous, admission is refused
+and names every matching row.
+
+Dispatch identity fields reject terminal control and Unicode format characters.
+`dispatch put` also refuses a missing, cross-issue or ineligible parent row;
+the control API reports identity text as an invalid argument and parent
+refusals as failed preconditions.
