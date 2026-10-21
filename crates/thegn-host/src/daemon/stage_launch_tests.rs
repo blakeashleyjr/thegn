@@ -1,6 +1,5 @@
 use std::sync::Mutex;
 
-use anyhow::Context;
 use thegn_svc::control::client::{ControlBoundError, ControlRequestError};
 use thegn_svc::control::{OpenSpec, SessionInfo};
 
