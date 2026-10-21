@@ -4289,6 +4289,7 @@ fn git_metadata_for_config(cfg: &Config, backend: Backend) -> GitMetadataExposur
     }
     let worktree = current_worktree_root();
     let git_common = worktree.as_deref().map(thegn_core::util::git_common_dir);
+    let git_common = git_common.map(|common| std::fs::canonicalize(&common).unwrap_or(common));
     git_metadata_exposure(
         backend,
         cfg.sandbox.file_access,
@@ -5639,7 +5640,12 @@ args = ["--verbose"]
         });
         assert_eq!(json["exposure"], "shared_read_write");
         assert_eq!(json["path"], "/repo/.git");
-        assert!(json["detail"].as_str().unwrap().contains("hooks writable"));
+        assert!(
+            json["detail"]
+                .as_str()
+                .unwrap()
+                .contains("hooks and refs writable")
+        );
     }
 
     #[test]
