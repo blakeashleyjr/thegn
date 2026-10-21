@@ -1237,31 +1237,30 @@ impl Db {
                     )));
                 }
                 if allow_scope.is_none() {
-                    use crate::issue::AgentDispatchStatus as Status;
                     let mut active = Vec::new();
                     let mut snapshot_rows = std::collections::HashSet::new();
-                    let mut done = std::collections::HashSet::new();
+                    let mut after_candidates = Vec::new();
                     for row in &rows {
                         if row.issue_id != new.issue_id || row.worktree_path != new.worktree_path {
                             continue;
                         }
-                        let Some(path) = row
-                            .chunk_path
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|p| !p.is_empty())
+                        let Some(path) = row.chunk_path.as_deref().filter(|p| !p.trim().is_empty())
                         else {
                             continue;
                         };
+                        if row.stage.as_deref() == new.stage {
+                            after_candidates.push(crate::pipeline_chunk::AfterCandidate {
+                                row: row.id,
+                                path: path.to_string(),
+                                status: row.status,
+                            });
+                        }
+                        let path = path.trim();
                         let name = std::path::Path::new(path)
                             .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("")
                             .to_string();
-                        if row.status == Status::Done {
-                            done.insert(name);
-                            continue;
-                        }
                         if !row.status.is_active() {
                             continue;
                         }
@@ -1290,7 +1289,9 @@ impl Db {
                             files,
                         });
                     }
-                    let verdict = crate::pipeline_chunk::verdict(&prepared.scope, &active, &done);
+                    let after = crate::pipeline_chunk::after_index(&after_candidates);
+                    let verdict =
+                        crate::pipeline_chunk::verdict(&prepared.scope, &active, &after.done);
                     let mut reasons = Vec::new();
                     match verdict {
                         crate::pipeline_chunk::ScopeVerdict::Conflict { overlaps } => {
@@ -1318,23 +1319,30 @@ impl Db {
                         }
                         _ => {}
                     }
-                    for name in crate::pipeline_chunk::after_unmet(&prepared.scope.after, &done) {
-                        let holder = rows.iter().find(|r| {
-                            r.issue_id == new.issue_id
-                                && r.worktree_path == new.worktree_path
-                                && r.chunk_path.as_deref().is_some_and(|p| {
-                                    std::path::Path::new(p).file_stem().and_then(|s| s.to_str())
-                                        == Some(name.as_str())
-                                })
-                        });
-                        reasons.push(match holder {
-                            Some(r) => format!(
-                                "after {name} is not done (row {}: {})",
-                                r.id,
-                                r.status.as_str()
-                            ),
-                            None => format!("after {name} is not done (no dispatch row for it)"),
-                        });
+                    for name in
+                        crate::pipeline_chunk::after_unmet(&prepared.scope.after, &after.done)
+                    {
+                        if let Some(candidates) = after.ambiguous.get(&name) {
+                            let rows_and_paths = candidates
+                                .iter()
+                                .map(|(row, path)| format!("{row} ({path})"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            reasons.push(format!(
+                                "after {name} is ambiguous: rows {rows_and_paths} share that chunk name in stage {}",
+                                new.stage.unwrap_or("")
+                            ));
+                        } else if let Some((row, status)) = after.governing.get(&name) {
+                            reasons.push(format!(
+                                "after {name} is not done (row {row}: {})",
+                                status.as_str()
+                            ));
+                        } else {
+                            reasons.push(format!(
+                                "after {name} is not done (no {} dispatch row for it)",
+                                new.stage.unwrap_or("")
+                            ));
+                        }
                     }
                     if !reasons.is_empty() {
                         return Ok(Err(DispatchAdmissionDecision::ScopeRefused(format!(
@@ -4245,5 +4253,123 @@ mod tests {
             matches!(result, Err(ref error) if error.to_string().contains("roster row 99 does not exist"))
         );
         assert_eq!(db.dispatch_note_count(99, None).unwrap(), 0);
+    }
+
+    fn after_gate_put(db: &Db, stage: &str, path: &str, status: AgentDispatchStatus) -> i64 {
+        let row = db
+            .put_agent_dispatch(crate::issue::NewDispatch {
+                stage: Some(stage),
+                chunk_path: Some(path),
+                ..crate::issue::NewDispatch::new("linear:THE-1094", "/wt/after-gate", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(row, status).unwrap();
+        row
+    }
+
+    fn after_gate_claim(
+        db: &Db,
+        stage: &str,
+        path: &str,
+        after: &[&str],
+    ) -> std::result::Result<i64, DispatchAdmissionDecision> {
+        let mut prepared = admitted_chunk(path, Vec::new(), Vec::new());
+        prepared.scope.after = after.iter().map(|name| (*name).to_string()).collect();
+        db.claim_dispatch_admitted(
+            crate::issue::NewDispatch {
+                stage: Some(stage),
+                chunk_path: Some(path),
+                ..crate::issue::NewDispatch::new("linear:THE-1094", "/wt/after-gate", "claude")
+            },
+            10,
+            None,
+            Some(&prepared),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn after_gate_ignores_a_done_row_of_another_stage() {
+        let db = Db::open_memory().unwrap();
+        after_gate_put(
+            &db,
+            "review",
+            "review/chunk-1.md",
+            AgentDispatchStatus::Done,
+        );
+        let result = after_gate_claim(&db, "code", "code/chunk-3.md", &["chunk-1"]);
+        let Err(DispatchAdmissionDecision::ScopeRefused(reason)) = result else {
+            panic!("expected a stage-scoped after refusal, got {result:?}");
+        };
+        assert!(
+            reason.contains("after chunk-1 is not done (no code dispatch row for it)"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn after_gate_newest_attempt_governs_over_a_stale_done() {
+        let db = Db::open_memory().unwrap();
+        after_gate_put(&db, "code", "code/a/chunk-1.md", AgentDispatchStatus::Done);
+        let newer = after_gate_put(
+            &db,
+            "code",
+            "code/a/chunk-1.md",
+            AgentDispatchStatus::Failed,
+        );
+        let result = after_gate_claim(&db, "code", "code/chunk-3.md", &["chunk-1"]);
+        let Err(DispatchAdmissionDecision::ScopeRefused(reason)) = result else {
+            panic!("expected a newest-attempt refusal, got {result:?}");
+        };
+        assert!(
+            reason.contains(&format!("after chunk-1 is not done (row {newer}: failed)")),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn after_gate_stays_satisfied_when_the_prerequisite_is_merged() {
+        let db = Db::open_memory().unwrap();
+        after_gate_put(&db, "code", "code/chunk-1.md", AgentDispatchStatus::Merged);
+        let result = after_gate_claim(&db, "code", "code/chunk-3.md", &["chunk-1"]);
+        assert!(
+            result.is_ok(),
+            "merged prerequisite should satisfy after: {result:?}"
+        );
+    }
+
+    #[test]
+    fn after_gate_refuses_an_ambiguous_stem_naming_every_row() {
+        let db = Db::open_memory().unwrap();
+        let first = after_gate_put(&db, "code", "code/a/chunk-1.md", AgentDispatchStatus::Done);
+        let second = after_gate_put(&db, "code", "code/b/chunk-1.md", AgentDispatchStatus::Done);
+        let result = after_gate_claim(&db, "code", "code/chunk-3.md", &["chunk-1"]);
+        let Err(DispatchAdmissionDecision::ScopeRefused(reason)) = result else {
+            panic!("expected an ambiguous-stem refusal, got {result:?}");
+        };
+        assert!(
+            reason.contains(&format!("{first} (code/a/chunk-1.md)")),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!("{second} (code/b/chunk-1.md)")),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("share that chunk name in stage code"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn after_gate_same_stage_done_prerequisite_admits() {
+        let db = Db::open_memory().unwrap();
+        after_gate_put(&db, "code", "code/chunk-1.md", AgentDispatchStatus::Done);
+        let result = after_gate_claim(&db, "code", "code/chunk-3.md", &["chunk-1"]);
+        assert!(
+            result.is_ok(),
+            "same-stage done prerequisite should admit: {result:?}"
+        );
     }
 }
