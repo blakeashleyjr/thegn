@@ -156,6 +156,8 @@ pub enum PrViewAction {
     /// Merge the PR with the selected method.
     Merge {
         method: thegn_core::forge::model::MergeMethod,
+        number: u64,
+        expected_head: String,
     },
     /// Approve (no body).
     Approve,

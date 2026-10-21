@@ -9,7 +9,7 @@
 use anyhow::Result;
 use thegn_core::db::Db;
 use thegn_core::forge::model::{CreateOpts, MergeMethod, PanelState, PrPanel, ReviewState};
-use thegn_core::forge::{PrDepth, PrRef};
+use thegn_core::forge::{Forge, PrDepth, PrRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::CacheStore;
 use thegn_core::{msg, outln};
@@ -272,12 +272,22 @@ fn merge(
     yes: bool,
 ) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let forges = forges();
+    let forge = forges.for_loc(&loc);
+    let pr = match forge.pr_status(&loc, PrRef::Current) {
+        Ok(pr) => pr,
+        Err(e) => msg::die(&format!(
+            "pr merge failed: could not read the PR: {}",
+            e.describe()
+        )),
+    };
+    let short_head = pr.head_ref_oid.chars().take(12).collect::<String>();
     // Confirmation is required unless `--yes` is passed. Without a TTY (CI /
     // piped scripts) a stdin prompt can't be answered, so refuse with a
     // non-zero exit rather than silently cancelling and reporting success —
     // scripts branch on the exit code.
     if !yes {
-        let prompt = format!("Merge this PR ({method:?})?");
+        let prompt = format!("Merge PR #{} at {} ({method:?})?", pr.number, short_head);
         if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
             anyhow::bail!("{prompt} refusing to merge without confirmation — pass --yes");
         }
@@ -285,14 +295,75 @@ fn merge(
             anyhow::bail!("merge cancelled");
         }
     }
-    match forges()
-        .for_loc(&loc)
-        .merge_pr(&loc, PrRef::Current, method, delete_branch, None, auto)
-    {
-        Ok(()) => msg::info("PR merged"),
-        Err(e) => msg::die(&format!("pr merge failed: {}", e.describe())),
+    let outcome = merge_reviewed_head(
+        forge,
+        &loc,
+        &ReviewedPr {
+            number: pr.number,
+            head: &pr.head_ref_oid,
+        },
+        method,
+        delete_branch,
+        auto,
+    );
+    match merge_outcome_text(&outcome) {
+        Ok(text) => msg::info(&text),
+        Err(text) => msg::die(&format!("pr merge failed: {text}")),
     }
     Ok(())
+}
+
+pub(crate) struct ReviewedPr<'a> {
+    pub number: u64,
+    pub head: &'a str,
+}
+
+pub(crate) fn merge_reviewed_head(
+    forge: &dyn Forge,
+    loc: &GitLoc,
+    reviewed: &ReviewedPr<'_>,
+    method: MergeMethod,
+    delete_branch: bool,
+    auto: bool,
+) -> thegn_core::pr_merge_outcome::MergeOutcome {
+    use thegn_core::pr_merge_outcome::{MergeOutcome, classify_merge};
+
+    if reviewed.number == 0
+        || !matches!(reviewed.head.len(), 40 | 64)
+        || !reviewed.head.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return MergeOutcome::Rejected("PR head unknown; refresh before merging".into());
+    }
+
+    let pr = PrRef::Number(reviewed.number);
+    let result = forge.merge_pr(loc, pr, method, delete_branch, Some(reviewed.head), auto);
+    let after = match forge.pr_status(loc, pr) {
+        Ok(status) if status.number == reviewed.number => Some(status),
+        Ok(_) | Err(_) => None,
+    };
+    classify_merge(!auto, &result, after.as_ref(), Some(reviewed.head))
+}
+
+pub(crate) fn merge_outcome_text(
+    outcome: &thegn_core::pr_merge_outcome::MergeOutcome,
+) -> std::result::Result<String, String> {
+    use thegn_core::pr_merge_outcome::MergeOutcome;
+
+    match outcome {
+        MergeOutcome::Confirmed => Ok("PR merged".into()),
+        MergeOutcome::Requested => Ok("merge requested; the forge has not confirmed it yet".into()),
+        MergeOutcome::AutoMergeArmed => {
+            Ok("auto-merge armed; the forge merges when its rules allow".into())
+        }
+        MergeOutcome::StaleHead { observed } => Err(format!(
+            "PR head moved to {} after it was reviewed; nothing was merged. Refresh and confirm again",
+            observed.chars().take(12).collect::<String>()
+        )),
+        MergeOutcome::Rejected(reason) => Err(format!("merge refused: {reason}")),
+        MergeOutcome::Unknown(reason) => Err(format!(
+            "merge result unknown ({reason}); check the PR before retrying"
+        )),
+    }
 }
 
 fn rerun(worktree: Option<String>) -> Result<()> {
@@ -374,4 +445,268 @@ fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
         Err(e) => msg::die(&format!("pr auto-merge failed: {}", e.describe())),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReviewedPr, merge_outcome_text, merge_reviewed_head};
+    use std::sync::Mutex;
+    use thegn_core::forge::model::{MergeMethod, PrHeader, PrStatus};
+    use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef};
+    use thegn_core::remote::GitLoc;
+    use thegn_core::seam::{Availability, Probe, ProbeReport};
+
+    struct FakeForge {
+        result: Mutex<std::result::Result<(), ForgeError>>,
+        after: Mutex<std::result::Result<PrStatus, ForgeError>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeForge {
+        fn new(
+            result: std::result::Result<(), ForgeError>,
+            after: std::result::Result<PrStatus, ForgeError>,
+        ) -> Self {
+            Self {
+                result: Mutex::new(result),
+                after: Mutex::new(after),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Probe for FakeForge {
+        fn probe(&self) -> ProbeReport {
+            ProbeReport::new("forge", "fake", Availability::Ready)
+        }
+    }
+
+    impl Forge for FakeForge {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn caps(&self) -> ForgeCaps {
+            ForgeCaps::ALL
+        }
+
+        fn repo_ref(&self, _: &GitLoc) -> Option<thegn_core::forge::RepoRef> {
+            None
+        }
+
+        fn pr_status(&self, _: &GitLoc, pr: PrRef) -> std::result::Result<PrStatus, ForgeError> {
+            self.calls.lock().unwrap().push(format!("status {pr:?}"));
+            self.after.lock().unwrap().clone()
+        }
+
+        fn pr_list(&self, _: &GitLoc, _: usize) -> std::result::Result<Vec<PrHeader>, ForgeError> {
+            Ok(Vec::new())
+        }
+
+        fn merge_pr(
+            &self,
+            _: &GitLoc,
+            pr: PrRef,
+            method: MergeMethod,
+            delete_branch: bool,
+            expected_head: Option<&str>,
+            auto: bool,
+        ) -> std::result::Result<(), ForgeError> {
+            self.calls.lock().unwrap().push(format!(
+                "merge {pr:?} {method:?} {delete_branch} {expected_head:?} {auto}"
+            ));
+            self.result.lock().unwrap().clone()
+        }
+    }
+
+    fn status(number: u64, state: &str, head: &str) -> PrStatus {
+        PrStatus {
+            number,
+            state: state.into(),
+            head_ref_oid: head.into(),
+            ..PrStatus::default()
+        }
+    }
+
+    fn loc() -> GitLoc {
+        GitLoc::Local(std::path::PathBuf::from("/tmp/pr-merge-reviewed-head"))
+    }
+
+    fn reviewed(number: u64) -> ReviewedPr<'static> {
+        ReviewedPr {
+            number,
+            head: "0123456789abcdef0123456789abcdef01234567",
+        }
+    }
+
+    #[test]
+    fn merge_reviewed_head_passes_the_pr_number_and_expected_head() {
+        let forge = FakeForge::new(Ok(()), Ok(status(7, "MERGED", reviewed(7).head)));
+        let outcome = merge_reviewed_head(
+            &forge,
+            &loc(),
+            &reviewed(7),
+            MergeMethod::Squash,
+            true,
+            false,
+        );
+        assert_eq!(
+            forge.calls(),
+            vec![
+                "merge Number(7) Squash true Some(\"0123456789abcdef0123456789abcdef01234567\") false",
+                "status Number(7)"
+            ]
+        );
+        assert_eq!(
+            outcome,
+            thegn_core::pr_merge_outcome::MergeOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn moved_head_is_stale_and_never_reported_merged() {
+        let forge = FakeForge::new(
+            Err(ForgeError::Other("head mismatch".into())),
+            Ok(status(
+                7,
+                "OPEN",
+                "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            )),
+        );
+        let outcome = merge_reviewed_head(
+            &forge,
+            &loc(),
+            &reviewed(7),
+            MergeMethod::Squash,
+            false,
+            false,
+        );
+        assert!(matches!(
+            &outcome,
+            thegn_core::pr_merge_outcome::MergeOutcome::StaleHead { .. }
+        ));
+        assert!(merge_outcome_text(&outcome).is_err());
+    }
+
+    #[test]
+    fn unknown_or_short_head_refuses_without_calling_the_forge() {
+        for head in ["", "1234567", "0123456789abcdef0123456789abcdef0123456g"] {
+            let forge = FakeForge::new(Ok(()), Ok(status(7, "MERGED", head)));
+            let reviewed = ReviewedPr { number: 7, head };
+            assert!(matches!(
+                merge_reviewed_head(&forge, &loc(), &reviewed, MergeMethod::Squash, false, false),
+                thegn_core::pr_merge_outcome::MergeOutcome::Rejected(_)
+            ));
+            assert!(forge.calls().is_empty());
+        }
+        let forge = FakeForge::new(Ok(()), Ok(status(0, "MERGED", reviewed(0).head)));
+        assert!(matches!(
+            merge_reviewed_head(
+                &forge,
+                &loc(),
+                &reviewed(0),
+                MergeMethod::Squash,
+                false,
+                false
+            ),
+            thegn_core::pr_merge_outcome::MergeOutcome::Rejected(_)
+        ));
+        assert!(forge.calls().is_empty());
+    }
+
+    #[test]
+    fn armed_and_requested_are_not_reported_merged() {
+        let forge = FakeForge::new(Ok(()), Ok(status(7, "OPEN", reviewed(7).head)));
+        let armed = merge_reviewed_head(
+            &forge,
+            &loc(),
+            &reviewed(7),
+            MergeMethod::Squash,
+            false,
+            true,
+        );
+        assert_eq!(
+            merge_outcome_text(&armed).unwrap(),
+            "auto-merge armed; the forge merges when its rules allow"
+        );
+
+        let forge = FakeForge::new(Ok(()), Ok(status(7, "OPEN", reviewed(7).head)));
+        let requested = merge_reviewed_head(
+            &forge,
+            &loc(),
+            &reviewed(7),
+            MergeMethod::Squash,
+            false,
+            false,
+        );
+        assert_eq!(
+            merge_outcome_text(&requested).unwrap(),
+            "merge requested; the forge has not confirmed it yet"
+        );
+    }
+
+    #[test]
+    fn confirmed_merge_reads_merged() {
+        let forge = FakeForge::new(Ok(()), Ok(status(7, "MERGED", reviewed(7).head)));
+        let outcome = merge_reviewed_head(
+            &forge,
+            &loc(),
+            &reviewed(7),
+            MergeMethod::Squash,
+            false,
+            false,
+        );
+        assert_eq!(
+            outcome,
+            thegn_core::pr_merge_outcome::MergeOutcome::Confirmed
+        );
+        assert_eq!(merge_outcome_text(&outcome).unwrap(), "PR merged");
+    }
+
+    #[test]
+    fn offline_merge_without_a_read_is_unknown() {
+        let forge = FakeForge::new(Err(ForgeError::Offline), Err(ForgeError::Offline));
+        let outcome = merge_reviewed_head(
+            &forge,
+            &loc(),
+            &reviewed(7),
+            MergeMethod::Squash,
+            false,
+            false,
+        );
+        assert!(matches!(
+            &outcome,
+            thegn_core::pr_merge_outcome::MergeOutcome::Unknown(_)
+        ));
+        assert!(
+            merge_outcome_text(&outcome)
+                .unwrap_err()
+                .contains("check the PR")
+        );
+    }
+
+    #[test]
+    fn a_follow_up_read_of_another_pr_is_not_evidence() {
+        let forge = FakeForge::new(Ok(()), Ok(status(8, "MERGED", reviewed(7).head)));
+        let outcome = merge_reviewed_head(
+            &forge,
+            &loc(),
+            &reviewed(7),
+            MergeMethod::Squash,
+            false,
+            false,
+        );
+        assert_eq!(
+            outcome,
+            thegn_core::pr_merge_outcome::MergeOutcome::Requested
+        );
+        assert_eq!(
+            forge.calls().last().map(String::as_str),
+            Some("status Number(7)")
+        );
+    }
 }
