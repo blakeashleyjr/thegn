@@ -94,6 +94,7 @@ impl MediaBackend for Admitted {
             })
         })
     }
+    /// The total may include rows dropped during admission because their IDs are invalid.
     fn queue_page(&self) -> BoxFuture<'_, Result<QueuePage, MediaError>> {
         Box::pin(async move {
             let page = self.0.queue_page().await?;

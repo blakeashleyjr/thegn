@@ -179,6 +179,8 @@ impl MediaPanelState {
         Some(self.request_for(state.map(Self::identity)))
     }
 
+    /// Vec-shaped test entry point; delegates to `set_queue_page`.
+    #[cfg(test)]
     pub(crate) fn set_queue(
         &mut self,
         request: MediaRequest,
