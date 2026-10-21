@@ -1894,7 +1894,8 @@ mod tests {
             rendered.contains("diff unavailable (git failed)"),
             "{rendered}"
         );
-        assert!(!rendered.contains("file diff"), "{rendered}");
+        // Only the "selected file diff" heading: no "file diff" loading spinner.
+        assert_eq!(rendered.matches("file diff").count(), 1, "{rendered}");
     }
 
     #[test]
