@@ -542,9 +542,9 @@ impl Mpd {
     ) -> Result<(), MediaError> {
         let mut conn = match self.conn().await {
             Ok(conn) => conn,
-            Err(_) => {
+            Err(error) => {
                 return self
-                    .restore_loop_after_unreadable(previous, stage, cause)
+                    .restore_loop_after_unreadable(previous, stage, error.to_string(), cause)
                     .await;
             }
         };
@@ -579,8 +579,8 @@ impl Mpd {
                     "mpd {stage} update failed; loop mode was rolled back: {cause}"
                 )))
             }
-            Err(_) => {
-                self.restore_loop_after_unreadable(previous, stage, cause)
+            Err(error) => {
+                self.restore_loop_after_unreadable(previous, stage, error, cause)
                     .await
             }
         }
@@ -590,28 +590,23 @@ impl Mpd {
         &self,
         previous: (u8, &str),
         stage: &str,
+        status_error: String,
         cause: MediaError,
     ) -> Result<(), MediaError> {
         let restore = match self.conn().await {
             Ok(mut conn) => {
-                let repeat_result = conn.command(&format!("repeat {}", previous.0)).await;
-                let single_result = conn.command(&format!("single {}", previous.1)).await;
-                match (repeat_result, single_result) {
-                    (Ok(_), Ok(_)) => Ok(()),
-                    (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
-                    (Err(first), Err(second)) => {
-                        Err(MediaError::Backend(format!("{first}; {second}")))
-                    }
-                }
+                conn.command(&format!("repeat {}", previous.0)).await?;
+                conn.command(&format!("single {}", previous.1)).await?;
+                Ok(())
             }
             Err(error) => Err(error),
         };
         match restore {
             Ok(()) => Err(MediaError::Backend(format!(
-                "mpd {stage} update failed; status could not be re-read; restored previous loop mode: {cause}"
+                "mpd {stage} update failed; status could not be re-read ({status_error}); restored previous loop mode: {cause}"
             ))),
             Err(error) => Err(MediaError::Backend(format!(
-                "mpd {stage} update failed; status could not be re-read; restore failed: {cause}; {error}"
+                "mpd {stage} update failed; status could not be re-read ({status_error}); restore failed: {cause}; {error}"
             ))),
         }
     }
@@ -1631,7 +1626,8 @@ mod tests {
             "repeat: 0\nsingle: oneshot\nOK\n",
             "OK\n",
             "ACK [4@0] {single} denied\n",
-            "repeat: 1\nsingle: oneshot\nOK\n",
+            "repeat: 1\nsingle: 0\nOK\n",
+            "OK\n",
             "OK\n",
         ])
         .await;
@@ -1648,6 +1644,40 @@ mod tests {
                 "status".to_string(),
                 "repeat 1".to_string(),
                 "single 0".to_string(),
+                "status".to_string(),
+                "repeat 0".to_string(),
+                "single oneshot".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_unreadable_status_reports_cause_and_stops_after_failed_restore_repeat() {
+        let (ep, seen) = scripted_server(vec![
+            "repeat: 0\nsingle: 0\nOK\n",
+            "OK\n",
+            "ACK [4@0] {single} denied\n",
+            "ACK [4@0] {status} unavailable\n",
+            "ACK [4@0] {repeat} denied\n",
+        ])
+        .await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let error = m.set_loop(LoopMode::Track).await.unwrap_err();
+        assert!(
+            error.to_string().contains("status could not be re-read"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("unavailable"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 1".to_string(),
                 "status".to_string(),
                 "repeat 0".to_string(),
             ]
