@@ -448,7 +448,13 @@ pub struct DetailOverlay {
     live_ci: Option<thegn_core::ci::CiRun>,
     /// A human-authorized CI autofix action, populated only after a bounded
     /// redacted log entry has landed in the in-place CI drill.
-    ci_autofix: Option<DetailAction>,
+    ci_autofix: Option<CiAutofixAvailability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CiAutofixAvailability {
+    Available(DetailAction),
+    Refused(DetailRefusal),
 }
 
 /// What a key delivered to the detail overlay meant.
@@ -458,6 +464,23 @@ pub enum DetailOutcome {
     Close,
     /// The overlay fired a row action; the loop executes it and closes.
     Act(DetailAction),
+    /// An action was refused because the displayed evidence was incomplete.
+    Refused(DetailRefusal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailRefusal {
+    IncompleteCiJobList,
+}
+
+impl DetailRefusal {
+    pub fn notice(self) -> &'static str {
+        match self {
+            Self::IncompleteCiJobList => {
+                "CI autofix refused: the job list is incomplete; refresh the run before authorizing a fix"
+            }
+        }
+    }
 }
 
 impl DetailOverlay {
@@ -588,9 +611,16 @@ impl DetailOverlay {
         }
         if key == &KeyCode::Char('f')
             && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-            && let Some(action) = self.ci_autofix.clone()
         {
-            return DetailOutcome::Act(action);
+            match self.ci_autofix.clone() {
+                Some(CiAutofixAvailability::Refused(refusal)) => {
+                    return DetailOutcome::Refused(refusal);
+                }
+                Some(CiAutofixAvailability::Available(action)) => {
+                    return DetailOutcome::Act(action);
+                }
+                None => {}
+            }
         }
         if mods.contains(Modifiers::CTRL) {
             return match key {

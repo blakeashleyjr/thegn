@@ -19,6 +19,7 @@ use thegn_core::theme::Hue;
 pub struct CiDetailPayload {
     pub run: thegn_core::ci::CiRun,
     pub discarded_jobs: usize,
+    pub incomplete: Option<String>,
     pub log_tail: Vec<String>,
     /// Cache metadata for each displayed failed-job excerpt.  The text is
     /// already bounded and redacted by the producer.
@@ -150,20 +151,27 @@ impl DetailOverlay {
         discarded_jobs: usize,
         log_tail: Vec<String>,
         log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
+        incomplete: Option<&str>,
     ) {
         let now = thegn_core::util::now();
         let mut secs = vec![ci_header_section(run)];
+        let mut note_parts = Vec::new();
+        if discarded_jobs > 0 {
+            note_parts.push(format!("{discarded_jobs} malformed job row(s) omitted"));
+        }
+        if let Some(reason) = incomplete {
+            note_parts.push(format!("job list incomplete: {reason}"));
+        }
+        let note = (!note_parts.is_empty()).then(|| note_parts.join("; "));
         if run.jobs.is_empty() {
             secs.push(Section::Heading {
                 label: "no job detail".into(),
-                note: (discarded_jobs > 0)
-                    .then(|| format!("{discarded_jobs} malformed job row(s) omitted")),
+                note: note.clone(),
             });
         } else {
             secs.push(Section::Heading {
                 label: "jobs".into(),
-                note: (discarded_jobs > 0)
-                    .then(|| format!("{discarded_jobs} malformed job row(s) omitted")),
+                note,
             });
             for job in &run.jobs {
                 let (g, _) = ci_glyph_marker(job.state);
@@ -197,7 +205,8 @@ impl DetailOverlay {
                 note: Some(
                     if log_entries.iter().any(|entry| {
                         !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty()
-                    }) {
+                    }) && incomplete.is_none()
+                    {
                         format!("{} · f authorize fix", log_metadata(&log_entries))
                     } else {
                         log_metadata(&log_entries)
@@ -248,12 +257,20 @@ impl DetailOverlay {
         // its complete candidate identity is carried into the blocking worker.
         // Entries without text or a head SHA fail closed and never become UI
         // actions.
-        self.ci_autofix = log_entries
-            .iter()
-            .find(|entry| !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty())
-            .map(|entry| super::DetailAction::CiAutofix {
-                candidate: entry.candidate(),
-            });
+        self.ci_autofix = if incomplete.is_some() {
+            Some(super::CiAutofixAvailability::Refused(
+                super::DetailRefusal::IncompleteCiJobList,
+            ))
+        } else {
+            log_entries
+                .iter()
+                .find(|entry| !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty())
+                .map(|entry| {
+                    super::CiAutofixAvailability::Available(super::DetailAction::CiAutofix {
+                        candidate: entry.candidate(),
+                    })
+                })
+        };
         // Keep re-polling until the run settles (live drill updates).
         self.live_ci = (!run.state.is_terminal()).then(|| run.clone());
     }
@@ -299,6 +316,7 @@ pub fn apply_ci_detail(slot: &mut Option<DetailOverlay>, payload: CiDetailPayloa
             payload.discarded_jobs,
             payload.log_tail,
             payload.log_entries,
+            payload.incomplete.as_deref(),
         );
         return true;
     }
@@ -386,6 +404,7 @@ mod tests {
                     ..run.clone()
                 },
                 discarded_jobs: 0,
+                incomplete: None,
                 log_tail: vec![],
                 log_entries: vec![],
             },
@@ -417,6 +436,7 @@ mod tests {
             CiDetailPayload {
                 run: filled,
                 discarded_jobs: 1,
+                incomplete: None,
                 log_tail: vec!["error: boom".into()],
                 log_entries: vec![thegn_core::ci_log::CiLogEntry {
                     worktree: "/wt/repo".into(),
@@ -484,23 +504,101 @@ mod tests {
         // While the first fetch is in flight, no repoll piles on.
         assert!(ov.live_ci_repoll().is_none());
         // A fill that's still running arms the live repoll…
-        ov.set_ci_detail(&running, 0, vec![], vec![]);
+        ov.set_ci_detail(&running, 0, vec![], vec![], None);
         ov.scroll = 3;
         let again = ov.live_ci_repoll().expect("running run repolls");
         assert_eq!(again.id, "7");
         assert_eq!(ov.pending_ci.as_deref(), Some("7"), "pending re-armed");
         // …a live re-fill of the same run preserves the scroll position…
-        ov.set_ci_detail(&running, 0, vec![], vec![]);
+        ov.set_ci_detail(&running, 0, vec![], vec![], None);
         assert_eq!(ov.scroll, 3);
         // …and a terminal fill stops the polling.
         let done = CiRun {
             state: CiState::Pass,
             ..running
         };
-        ov.set_ci_detail(&done, 0, vec![], vec![]);
+        ov.set_ci_detail(&done, 0, vec![], vec![], None);
         assert!(
             ov.live_ci_repoll().is_none(),
             "terminal run stops repolling"
+        );
+    }
+
+    #[test]
+    fn incomplete_job_list_note_is_shown() {
+        use thegn_core::ci::{CiJob, CiRun, CiState};
+        let run = CiRun {
+            id: "42".into(),
+            name: "CI".into(),
+            state: CiState::Running,
+            jobs: vec![CiJob {
+                id: "job-1".into(),
+                name: "build".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                ci_runs: vec![run.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut overlay = open_detail_for(
+            &BarItemId::Badge(BarBadge::Ci),
+            item_at(39),
+            &model,
+            &StatusCtx::new_for_test(&TelemetryHistory::default()),
+        )
+        .expect("ci badge opens");
+        assert!(matches!(
+            overlay.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::DrillCiRun { .. })
+        ));
+        let mut slot = Some(overlay);
+        assert!(apply_ci_detail(
+            &mut slot,
+            CiDetailPayload {
+                run,
+                discarded_jobs: 0,
+                incomplete: Some("job list stopped after 50 pages (page budget)".into()),
+                log_tail: Vec::new(),
+                log_entries: vec![thegn_core::ci_log::CiLogEntry {
+                    worktree: "/wt/repo".into(),
+                    run_id: "42".into(),
+                    job_id: "j1".into(),
+                    job_name: "build".into(),
+                    text: "error: boom\n".into(),
+                    truncated: false,
+                    redacted: true,
+                    policy_version: thegn_core::ci_log::REDACTION_POLICY_VERSION,
+                    fetched_at: 7,
+                    head_sha: "abc123".into(),
+                }],
+            }
+        ));
+        let mut overlay = slot.expect("overlay remains");
+        let DetailContent::Sections(detail) = &overlay.content else {
+            panic!("expected sections");
+        };
+        let Some(Section::Heading { label, note }) = detail.sections.get(1) else {
+            panic!("expected jobs heading");
+        };
+        assert_eq!(label, "jobs");
+        assert!(
+            note.as_deref()
+                .unwrap_or_default()
+                .contains("job list incomplete")
+        );
+        assert!(
+            crate::detail::DetailRefusal::IncompleteCiJobList
+                .notice()
+                .contains("job list is incomplete")
+        );
+        assert_eq!(
+            overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
+            DetailOutcome::Refused(crate::detail::DetailRefusal::IncompleteCiJobList)
         );
     }
 
