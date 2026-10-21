@@ -934,6 +934,7 @@ fn lead_proof<'a>(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_admitted_with_refresh(
     db: &Db,

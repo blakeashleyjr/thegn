@@ -2324,6 +2324,7 @@ mod resume_work_tests {
         )
         .unwrap_err();
         assert!(error.downcast_ref::<LeadLeaseConflict>().is_some());
+        assert!(error.downcast_ref::<crate::cmd::Retryable>().is_none());
         assert!(!resume_claim_is_conflict(&error));
         assert_eq!(db.list_dispatches().unwrap().len(), 1);
         assert_eq!(

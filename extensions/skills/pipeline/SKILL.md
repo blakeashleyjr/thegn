@@ -164,7 +164,7 @@ Compute the owner once, record the literal name and owner printed above, and
 pass those same literal values to the background monitor and every later lease
 command. Never re-evaluate `$$` or `$(hostname)` during this run. Exit 2 with
 “held by …” means another Lead is driving this issue: stop and tell the user;
-do not start a second chain. Thegn checks the lease on claim, stage open and
+do not start a second chain. Thegn checks the lease on claim,
 `dispatch put`, stage open, `--resume-work` and set-status. A row created with
 `--lease/--owner` is bound to that lease; further claims, puts, resumes and
 status changes for that issue require the same live lease, or the audited
