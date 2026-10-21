@@ -378,6 +378,7 @@ fn empty_exdate_members_are_skipped() {
 }
 
 #[test]
+// positive control: passes on main too
 fn conflicting_repeated_timezone_parameter_quarantines_event() {
     let input =
         one_event("UID:x\nDTSTART;TZID=America/New_York;TZID=Europe/London:20261012T090000");
@@ -389,13 +390,101 @@ fn conflicting_repeated_timezone_parameter_quarantines_event() {
 }
 
 #[test]
+// positive control: passes on main too
 fn identical_repeated_timezone_parameter_is_accepted() {
     let line = parse_line("DTSTART;TZID=Europe/London;TZID=Europe/London:20261012T090000");
     assert!(line.is_some());
     assert_eq!(
-        line.and_then(|line| line.params.get("TZID").cloned()),
+        line.and_then(|line| line.param("TZID").map(str::to_string)),
         Some("Europe/London".to_string())
     );
+}
+
+#[test]
+fn param_cardinality_repeated_member_keeps_both() {
+    let line =
+        parse_line(r#"ATTENDEE;MEMBER="mailto:a@x";MEMBER="mailto:b@x":mailto:c@x"#).unwrap();
+    assert_eq!(line.param_values("MEMBER"), ["mailto:a@x", "mailto:b@x"]);
+}
+
+#[test]
+fn param_cardinality_comma_delegated_to_is_two_members() {
+    let line = parse_line(r#"ATTENDEE;DELEGATED-TO="mailto:a@x","mailto:b@x":mailto:c@x"#).unwrap();
+    assert_eq!(
+        line.param_values("DELEGATED-TO"),
+        ["mailto:a@x", "mailto:b@x"]
+    );
+    assert_eq!(line.param("DELEGATED-TO"), None);
+}
+
+#[test]
+fn param_cardinality_quoted_comma_is_one_member() {
+    let line = parse_line(r#"ATTENDEE;MEMBER="mailto:a,b@x":mailto:c@x"#).unwrap();
+    assert_eq!(line.param_values("MEMBER"), ["mailto:a,b@x"]);
+}
+
+#[test]
+fn param_cardinality_conflicting_singleton_repeat_rejects_the_line() {
+    assert!(parse_line("TRIGGER;RELATED=START;RELATED=END:-PT15M").is_none());
+    assert!(parse_line("ATTENDEE;ROLE=CHAIR;ROLE=OPT-PARTICIPANT:mailto:a@x").is_none());
+
+    let input = one_event(
+        "UID:x\nDTSTART:20261012T090000Z\nBEGIN:VALARM\nTRIGGER;RELATED=START;RELATED=END:-PT15M\nEND:VALARM",
+    );
+    let (_, report) = parse_report(&input);
+    assert!(report.diagnostics().contains(&IcsDiagnostic::MalformedLine));
+}
+
+#[test]
+fn param_cardinality_identical_singleton_repeat_is_kept_once() {
+    let line = parse_line("ATTENDEE;CN=A;CN=A:mailto:a@x").unwrap();
+    assert_eq!(line.param_values("CN"), ["A"]);
+    assert_eq!(line.param("CN"), Some("A"));
+}
+
+#[test]
+fn param_cardinality_unknown_x_param_accumulates() {
+    let line = parse_line("ATTENDEE;X-TAG=a;X-TAG=b:mailto:a@x").unwrap();
+    assert_eq!(line.param_values("X-TAG"), ["a", "b"]);
+}
+
+#[test]
+fn param_cardinality_multi_member_tzid_is_rejected() {
+    assert!(parse_line("DTSTART;TZID=Europe/London,Europe/Paris:20261012T090000").is_none());
+}
+
+#[test]
+fn param_cardinality_multi_member_related_is_rejected() {
+    assert!(parse_line("TRIGGER;RELATED=START,END:-PT15M").is_none());
+}
+
+#[test]
+fn param_cardinality_value_date_and_tzid_still_parse() {
+    let date_input = one_event("UID:date\nDTSTART;VALUE=DATE:20261012");
+    let (date_events, date_report) = parse_report(&date_input);
+    assert_eq!(date_events.len(), 1);
+    assert_eq!(
+        date_events[0].start,
+        EventTime::Date {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+        }
+    );
+    assert!(date_report.diagnostics().is_empty());
+
+    let zoned_input = one_event("UID:zoned\nDTSTART;TZID=Europe/Berlin:20261012T090000");
+    let (zoned_events, zoned_report) = parse_report(&zoned_input);
+    assert_eq!(zoned_events.len(), 1);
+    assert_eq!(
+        zoned_events[0].start,
+        EventTime::Zoned {
+            local: chrono::NaiveDate::from_ymd_opt(2026, 10, 12)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            zone: super::super::TzRef::new("Europe/Berlin"),
+        }
+    );
+    assert!(zoned_report.diagnostics().is_empty());
 }
 
 #[test]

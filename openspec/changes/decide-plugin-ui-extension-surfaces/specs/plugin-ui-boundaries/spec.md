@@ -31,6 +31,60 @@ arbitrary host actions, or introduce their own global key conflict policy.
 - **THEN** the host truncates, throttles, rejects, or degrades it within the
   published bound while preserving UI responsiveness
 
+### Requirement: Adopted SidebarTab contributions are host-rendered rows
+
+An implemented `SidebarTab` SHALL contribute only bounded rows rendered by the
+host from semantic `View`/`Span`/`StyleRole` data, with optional badges. The
+host MUST retain ownership of native navigation, sidebar mode, layout,
+selection, scrolling, hit targets, narrow-layout truncation, and focus
+restoration. Plugin rows MUST follow native navigation and MUST activate only
+a declared, namespaced plugin action. Row-count and per-row byte limits SHALL
+be set from a measured budget by the implementation change. A crash, removal,
+or API-version mismatch MUST remove that plugin's rows without changing
+sidebar mode.
+
+#### Scenario: A plugin crashes while its sidebar rows are visible
+
+- **WHEN** the host detects that a contributing plugin has crashed
+- **THEN** the host removes its rows and moves focus to the nearest remaining
+  sidebar row, or to native navigation when none remain, while preserving the
+  current sidebar mode and all other rows
+
+### Requirement: Adopted Theme contributions are complete data-only palettes
+
+An implemented `Theme` contribution SHALL use the complete closed `UserTheme`
+shape and the existing importer validation, contrast audit, and terminal
+capability token resolution. The host MUST require `surface:theme`, enforce a
+size cap no larger than the existing theme-file limit, show plugin provenance,
+and expose the palette only through normal user theme selection. A contribution
+MUST NOT be executable styling, contain terminal escape sequences, or be
+auto-applied. If a selected plugin theme is removed, the host MUST select the
+default preset and show a status message.
+
+#### Scenario: A theme contribution omits a required token
+
+- **WHEN** a plugin submits a palette that does not cover the complete
+  `UserTheme` shape
+- **THEN** the host rejects the contribution and does not expose or apply it
+
+### Requirement: Adopted key zones are limited to a plugin's focused surfaces
+
+An implemented plugin key zone SHALL declare versioned namespaced action ids
+and suggested chords only for that plugin's own focused sidebar rows or
+statusbar segment. The host MUST own conflict resolution, focus attribution,
+dispatch, help and which-key projection, and user overrides. A host or user
+binding MUST take precedence over a conflicting plugin chord. Plugins MUST
+NOT bind global chords, intercept pane input, dispatch undeclared host actions,
+or bind reserved escape, focus, or safety chords. Removal or API-version
+mismatch MUST remove the plugin's bindings without changing host or user
+bindings.
+
+#### Scenario: A suggested chord conflicts with a host binding
+
+- **WHEN** a plugin suggests a chord already bound by the host or user
+- **THEN** the plugin chord remains unbound, the existing binding still
+  dispatches, and the conflict is reported
+
 ### Requirement: PanelSection remains separately owned
 
 This decision SHALL NOT redefine plugin `PanelSection` negotiation, rendering,

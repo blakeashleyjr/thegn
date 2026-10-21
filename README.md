@@ -1,6 +1,6 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.22`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.23`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon has build/test coverage and a generated
 > `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
 > it as best-effort, not supported: its CI job is opt-in and the interactive
@@ -168,8 +168,14 @@ home.packages = [
 Invoke that installed launcher as `thegn-batteries`. The derivation is
 build-tested on x86_64 Linux; a clean-host interactive rehearsal remains an
 entry criterion before this path is listed as verified on additional hosts.
-The batteries scope deliberately stops here: there is no
-`install.sh --batteries`, distro package-manager mutation, Homebrew cask,
+The Linux standalone installer also has an explicit `./install.sh --batteries`
+mode: it reuses host Alacritty or builds pinned Alacritty 0.17.0 under
+`~/.local/share/thegn/batteries`, verifies Nerd Fonts v3.5.0 FiraCode by
+SHA-256 into `~/.local/share/fonts/thegn-nerd-fonts`, and creates a writable
+`~/.config/thegn/alacritty.toml` only when absent. `thegn doctor` reports its
+terminal, font, config, and launcher components. This mode has no clean-host
+rehearsal evidence yet. The batteries scope otherwise deliberately stops here:
+there is no distro package-manager mutation, Homebrew cask,
 downloadable unsigned macOS app, Windows Terminal profile, or
 Flatpak/AppImage/nix-bundle. Each needs its relevant host, signing, or driver
 rehearsal before it becomes an install instruction.
@@ -180,13 +186,13 @@ rehearsal before it becomes an install instruction.
 state; “host” remains the user's responsibility. A buildable path is not called
 supported until its clean-host rehearsal is recorded.
 
-| Path                        | Terminal                                            | Font                       | Config                                                   | Binary                                | Status and fallback                                                                                                                                                                                   |
-| --------------------------- | --------------------------------------------------- | -------------------------- | -------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux, Nix batteries        | bundled Alacritty                                   | bundled FiraCode Nerd Font | generated user-local copy                                | flake-built Thegn                     | shipped x86_64 Linux path; run `nix run github:blakeashleyjr/thegn#batteries`                                                                                                                         |
-| Linux, standalone installer | host terminal; host Alacritty for `tg --standalone` | host                       | generated Thegn config; checkout-bound Alacritty profile | installed source build                | partial; use the ordinary current-terminal path or the Nix batteries path                                                                                                                             |
-| macOS, Nix batteries        | bundled Alacritty                                   | bundled FiraCode Nerd Font | generated user-local copy                                | flake-built Thegn                     | composition exists, but remains best-effort until the macOS clean-host checklist passes                                                                                                               |
-| macOS app launcher          | selected host terminal                              | host                       | generated Thegn config and local `.app` launcher         | installed source build or PATH binary | partial; use Nix or the source install while signing and full bundle rehearsal remain open                                                                                                            |
-| Windows native              | host Windows Terminal                               | host                       | host                                                     | source build only                     | deferred to [THE-140](https://linear.app/blakeashley/issue/THE-140) and [THE-145](https://linear.app/blakeashley/issue/THE-145); use a supported x86_64 Linux host when verified behavior is required |
+| Path                        | Terminal                                                                                      | Font                                                                      | Config                                                                          | Binary                                | Status and fallback                                                                                                                                                                                   |
+| --------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | shipped x86_64 Linux path; run `nix run github:blakeashleyjr/thegn#batteries`                                                                                                                         |
+| Linux, standalone installer | host terminal; host Alacritty reused or pinned user-local Alacritty 0.17.0 with `--batteries` | host, or verified FiraCode Nerd Font v3.5.0 user-local with `--batteries` | generated Thegn config; writable user-local Alacritty config with `--batteries` | installed source build                | partial; no clean-host rehearsal; use the ordinary current-terminal path or the Nix batteries path                                                                                                    |
+| macOS, Nix batteries        | bundled Alacritty                                                                             | bundled FiraCode Nerd Font                                                | generated user-local copy                                                       | flake-built Thegn                     | composition exists, but remains best-effort until the macOS clean-host checklist passes                                                                                                               |
+| macOS app launcher          | selected host terminal                                                                        | host                                                                      | generated Thegn config and local `.app` launcher                                | installed source build or PATH binary | partial; use Nix or the source install while signing and full bundle rehearsal remain open                                                                                                            |
+| Windows native              | host Windows Terminal                                                                         | host                                                                      | host                                                                            | source build only                     | deferred to [THE-140](https://linear.app/blakeashley/issue/THE-140) and [THE-145](https://linear.app/blakeashley/issue/THE-145); use a supported x86_64 Linux host when verified behavior is required |
 
 ### nix-darwin (macOS)
 

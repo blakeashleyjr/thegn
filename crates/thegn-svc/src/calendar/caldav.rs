@@ -21,6 +21,7 @@ use thegn_core::calendar::CalendarWindow;
 use thegn_core::config_calendar::CalendarAccount;
 use tokio::time::Instant;
 
+use super::ics_url::{Credential, resolve_credential};
 use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
 use crate::http::{
     CalendarHttpClient, CalendarHttpError, ExpectedMedia, MAX_BODY_BYTES, MAX_REQUEST_BYTES,
@@ -42,7 +43,7 @@ pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
 
 pub struct CalDavBackend {
     username: String,
-    token: String,
+    credential: Credential,
     zone: thegn_core::calendar::Tz,
     calendar_ids: Vec<String>,
     timeout: Duration,
@@ -67,7 +68,7 @@ impl CalDavBackend {
         };
         CalDavBackend {
             username: a.username.clone(),
-            token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
+            credential: resolve_credential(a),
             zone: admission.zone(),
             calendar_ids: a
                 .calendar_ids
@@ -98,14 +99,13 @@ impl CalDavBackend {
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if self.token.is_empty() {
-            return req;
-        }
-        if self.username.is_empty() {
-            req.bearer_auth(&self.token)
-        } else {
-            // The common case: Nextcloud/Radicale/Fastmail app passwords.
-            req.basic_auth(&self.username, Some(&self.token))
+        match &self.credential {
+            Credential::None | Credential::Unresolved => req,
+            Credential::Token(token) if self.username.is_empty() => req.bearer_auth(token),
+            Credential::Token(token) => {
+                // The common case: Nextcloud/Radicale/Fastmail app passwords.
+                req.basic_auth(&self.username, Some(token))
+            }
         }
     }
 }
@@ -421,6 +421,11 @@ impl CalDavBackend {
             }
             if let Some(error) = self.init_error {
                 return Err(CalendarError::Policy(map_error(error)));
+            }
+            if matches!(&self.credential, Credential::Unresolved) {
+                return Err(CalendarError::Auth(
+                    "calendar token reference could not be resolved".into(),
+                ));
             }
             let http = self.http.as_ref().expect("checked above");
             let deadline = Instant::now() + self.timeout;

@@ -1939,12 +1939,14 @@ check "set-status done --force overrides and says so" \
 # Untracked: the artifact exists but git does not track it — the exact pilot
 # failure ("session exit ≠ done") the gate exists to catch. Committing it
 # flips the gate open; a forced completion stays visible in the output.
-untracked_row="$("$SZ" dispatch put linear:SMOKE-4 "$R" claude --stage review --artifact .thegn/pipeline/SMOKE-7/untracked/3.md | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+untracked_row_json="$("$SZ" dispatch put linear:SMOKE-4 "$R" claude --stage review --json)"
+untracked_row="$(printf '%s' "$untracked_row_json" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+untracked_artifact="$(printf '%s' "$untracked_row_json" | sed -n 's/.*"artifact_path":"\([^"]*\)".*/\1/p')"
 "$SZ" dispatch set-status "$untracked_row" running >/dev/null
 check "dispatch put records an untracked artifact row" \
-  "[[ -n '$untracked_row' ]]"
-mkdir -p "$R/.thegn/pipeline/SMOKE-7/untracked"
-echo handoff >"$R/.thegn/pipeline/SMOKE-7/untracked/3.md"
+  "[[ -n '$untracked_row' && -n '$untracked_artifact' ]]"
+mkdir -p "$R/$(dirname "$untracked_artifact")"
+echo handoff >"$R/$untracked_artifact"
 set +e
 utr_out="$("$SZ" dispatch set-status "$untracked_row" "done" 2>&1)"
 utr_rc=$?
@@ -1953,8 +1955,8 @@ utr_ok=1
 [[ $utr_rc -ne 0 ]] && grep -q 'not committed' <<<"$utr_out" || utr_ok=0
 check "set-status done is refused while the artifact is untracked" \
   "[[ $utr_ok -eq 1 ]]"
-git -C "$R" add .thegn/pipeline/SMOKE-7/untracked/3.md
-git -C "$R" commit -q -m 'smoke: commit the artifact'
+git -C "$R" add "$untracked_artifact"
+git -C "$R" -c commit.gpgsign=false commit -q -m 'smoke: commit the artifact'
 # THE-88: a tracked artifact is not enough — `done` also needs the worker's
 # structured report on the row, so the Lead never has to re-read the artifact.
 check "set-status done is refused while the report is missing" \

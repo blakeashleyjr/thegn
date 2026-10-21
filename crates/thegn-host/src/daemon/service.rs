@@ -553,6 +553,22 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
     ControlError::Internal(error)
 }
 
+fn map_dispatch_put_error(error: anyhow::Error) -> ControlError {
+    if error
+        .downcast_ref::<thegn_core::db::ParentDispatchConflict>()
+        .is_some()
+    {
+        return ControlError::FailedPrecondition(error.to_string());
+    }
+    if error
+        .downcast_ref::<thegn_core::pipeline_report::DispatchTextRejected>()
+        .is_some()
+    {
+        return ControlError::InvalidArgument(error.to_string());
+    }
+    ControlError::Internal(error)
+}
+
 enum BindAction {
     Proceed,
     Refuse(String),
@@ -1908,18 +1924,33 @@ impl ControlApi for DaemonService {
             let path_string = path.to_string_lossy().into_owned();
             self.confine_worktree(&path_string).await?;
             let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
+            let branch_path = path.clone();
+            let branch = tokio::task::spawn_blocking(move || {
+                let loc = thegn_core::remote::GitLoc::for_worktree(&branch_path);
+                loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                    .filter(|branch| !branch.is_empty())
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?;
             let cached = self
                 .with_db({
                     let key = key.clone();
                     move |db| {
                         use thegn_core::store::CacheStore;
-                        db.get_ci_cache(&key)
+                        db.get_ci_cache_entry(&key)
                     }
                 })
                 .await
                 .ok()
                 .flatten();
-            if let Some((json, fetched_at)) = cached
+            if let Some((json, cached_branch, fetched_at)) = cached
+                && crate::ci_refresh::daemon_ci_cache_usable(
+                    &cached_branch,
+                    branch.as_deref(),
+                    fetched_at,
+                    thegn_core::util::now(),
+                    self.config.ci.ttl_secs,
+                )
                 && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
             {
                 let before = cache.runs.len();
@@ -1939,15 +1970,13 @@ impl ControlApi for DaemonService {
 
             let cfg = self.config.ci.clone();
             let provider_path = path.clone();
+            let provider_branch = branch.clone();
             let fetched = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
                 let client = thegn_svc::ci::provider_for(&loc, &cfg)
                     .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
-                let branch = loc
-                    .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-                    .filter(|branch| !branch.is_empty());
                 client
-                    .runs(&loc, branch.as_deref(), requested)
+                    .runs(&loc, provider_branch.as_deref(), requested)
                     .map_err(|error| anyhow::anyhow!("CI provider: {error}"))
             })
             .await
@@ -1959,10 +1988,18 @@ impl ControlApi for DaemonService {
                 discarded_rows: fetched.discarded_rows,
             }) {
                 let key_for_write = key.clone();
+                let branch_for_write = branch.clone();
                 let _ = self
                     .with_db(move |db| {
                         use thegn_core::store::CacheStore;
-                        db.put_ci_cache(&key_for_write, "", &json)
+                        db.put_ci_cache(
+                            &key_for_write,
+                            branch_for_write
+                                .as_deref()
+                                .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+                                .unwrap_or(""),
+                            &json,
+                        )
                     })
                     .await;
             }
@@ -2502,7 +2539,7 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
-                let id = db.put_agent_dispatch(thegn_core::issue::NewDispatch {
+                let id = db.put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                     issue_id: &req.issue_id,
                     worktree_path: &req.worktree_path,
                     agent_name: &req.agent_name,
@@ -2516,6 +2553,10 @@ impl ControlApi for DaemonService {
                     .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
             })
             .await
+            .map_err(|error| match error {
+                ControlError::Internal(error) => map_dispatch_put_error(error),
+                other => other,
+            })
         })
     }
 
@@ -4997,6 +5038,87 @@ mod tests {
             svc.dispatch_set_status(9999, St::Done).await,
             Err(ControlError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_refuses_a_missing_parent_without_a_row() {
+        let (svc, _rx) = service(0);
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                parent_id: Some(4242),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message)) if message.contains("4242")
+        ));
+        assert!(svc.dispatches_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_refuses_a_cross_issue_parent() {
+        let (svc, _rx) = service(0);
+        let parent = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:B-2".into(),
+                worktree_path: "/wt/b".into(),
+                agent_name: "claude".into(),
+                parent_id: Some(parent.id),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message)) if message.contains("another issue")
+        ));
+        assert_eq!(svc.dispatches_list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_refuses_terminal_controls_as_invalid_argument() {
+        let (svc, _rx) = service(0);
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1\x1b[2J".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+        assert!(svc.dispatches_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_assigns_the_canonical_artifact_to_a_stage_row() {
+        let (svc, _rx) = service(0);
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                stage: Some("code".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            row.artifact_path.as_deref(),
+            Some(thegn_core::pipeline_run::artifact_path("linear:A-1", "code", row.id).as_str())
+        );
     }
 
     #[test]

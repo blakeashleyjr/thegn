@@ -426,6 +426,7 @@ mod tests {
                     text: "error: boom\n".into(),
                     truncated: false,
                     redacted: true,
+                    policy_version: thegn_core::ci_log::REDACTION_POLICY_VERSION,
                     fetched_at: 7,
                     head_sha: "abc123".into(),
                 }],

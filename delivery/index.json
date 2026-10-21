@@ -498,7 +498,8 @@
     },
     {
       "change": "admit-set-only-pane-clipboard",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-admit-set-only-pane-clipboard/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -606,7 +607,8 @@
     },
     {
       "change": "bound-shared-framed-protocols",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-bound-shared-framed-protocols/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -996,7 +998,8 @@
     },
     {
       "change": "repair-kitty-stream-parser",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-21-repair-kitty-stream-parser/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {

@@ -12,6 +12,7 @@
 //! long-lived watcher, and over LSP-style `Content-Length` framing because that
 //! makes shell-script plugins impossible to write.
 
+pub mod ci_provider;
 mod env;
 #[cfg(test)]
 mod frame_corpus_tests;
@@ -21,6 +22,7 @@ pub mod proc;
 pub mod provider;
 pub mod session;
 
+pub use ci_provider::PluginCiProvider;
 pub use env::resolve_env;
 pub use loader::{
     LoadedPlugin, SpecProblem, check_spec, check_specs, discover, host_contract, negotiate,

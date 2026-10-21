@@ -113,12 +113,17 @@ dropped.
 
 Those three rendering/event points plus `IssueProvider` are the extension
 points the general compositor host accepts. `PanelSection`, `SidebarTab`,
-`Theme`, `Automation`, `HarnessAdapter`, `ProgramAdapter`, `CiProvider`, and
-`ForgeProvider` are wire vocabulary only there: `thegn plugin check` rejects
-them until their host runtime lands. `DataSource` has a separate,
-calendar-account-specific command adapter; it is not a general UI
-contribution. Native theme files and configured drawer tools are not runtime
+`Theme`, `Automation`, `HarnessAdapter`, `ProgramAdapter`, `CiProvider`,
+`ForgeProvider`, and `DebugAdapter` are wire vocabulary only there:
+`thegn plugin check` rejects them until their host runtime lands. `DataSource`
+has a separate, calendar-account-specific command adapter; it is not a general
+UI contribution. Native theme files and configured drawer tools are not runtime
 plugin surfaces.
+
+SidebarTab, Theme, and plugin key zones are adopted for a future release
+(THE-107) but are not implemented, so `thegn plugin check` still rejects them.
+Plugin themes will be data-only palettes, and plugin keys will be
+surface-local actions.
 
 The machine-readable source for this classification is embedded in
 `docs/api/plugin-api-0.3.json` as `x-thegn-extension-support`; its companion

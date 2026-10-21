@@ -477,3 +477,69 @@ fn every_canonical_status_is_writable() {
         assert_eq!(row(&db).status, status.as_str(), "{status:?}");
     }
 }
+
+#[test]
+fn operator_table_matches_the_database_cell_by_cell() {
+    use crate::attention::{MqOperation, MqStatus, MqTransition};
+
+    for operation in [MqOperation::Retry, MqOperation::Remove] {
+        for status in MqStatus::ALL {
+            for claimed in [false, true] {
+                let db = seeded();
+                let fields = MergeStatusFields {
+                    result_oid: (status == MqStatus::Landed).then(|| "result-oid".into()),
+                    ..Default::default()
+                };
+                db.replace_merge_status(WORKTREE, status.as_str(), &fields)
+                    .unwrap();
+                if claimed {
+                    db.conn()
+                        .execute(
+                            "UPDATE merge_queue SET claim_owner='other-drain' WHERE worktree=?1",
+                            [WORKTREE],
+                        )
+                        .unwrap();
+                }
+                let before = row(&db);
+                let cell = format!("{} / {status:?} / claimed={claimed}", operation.as_str());
+                match (operation.transition(status, claimed), operation) {
+                    (MqTransition::Requeue, MqOperation::Retry) => {
+                        assert_eq!(
+                            db.retry_held_merge_entry(WORKTREE).unwrap(),
+                            MergeRetryOutcome::Rearmed,
+                            "{cell}"
+                        );
+                        assert_eq!(row(&db).status, "queued", "{cell}");
+                    }
+                    (MqTransition::Delete, MqOperation::Remove) => {
+                        db.remove_merge_entry(WORKTREE).unwrap();
+                        assert!(db.list_merge_queue().unwrap().is_empty(), "{cell}");
+                    }
+                    (MqTransition::Refuse, MqOperation::Retry) => {
+                        let outcome = db.retry_held_merge_entry(WORKTREE).unwrap();
+                        assert!(
+                            matches!(
+                                outcome,
+                                MergeRetryOutcome::Claimed | MergeRetryOutcome::NotRetryable { .. }
+                            ),
+                            "{cell}: {outcome:?}"
+                        );
+                        assert_eq!(row(&db), before, "{cell}");
+                    }
+                    (MqTransition::Refuse, MqOperation::Remove) => {
+                        let result = db.remove_merge_entry(WORKTREE);
+                        assert_eq!(
+                            result.unwrap_err().to_string(),
+                            crate::store::MERGE_CLAIM_ACTIVE,
+                            "{cell}"
+                        );
+                        assert_eq!(row(&db), before, "{cell}");
+                    }
+                    (transition, operation) => {
+                        panic!("unexpected table cell {operation:?} / {status:?}: {transition:?}");
+                    }
+                }
+            }
+        }
+    }
+}
