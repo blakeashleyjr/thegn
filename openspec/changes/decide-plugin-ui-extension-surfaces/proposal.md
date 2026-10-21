@@ -12,11 +12,14 @@ adopt/defer/reject decision.
 
 ## What Changes
 
-- Produce and publish a decision matrix for `SidebarTab`, `Theme`, and plugin
-  key-zone contributions.
-- Define the minimum host contract and acceptance gates for any adopted surface.
-- Keep reserved/absent surfaces rejected by negotiation and described honestly.
-- Create separate implementation changes only for adopted surfaces.
+- Adopt `SidebarTab`, `Theme`, and plugin key zones, with the decision matrix
+  and minimum host contracts recorded in the design and spec delta.
+- Keep all three surfaces Reserved and rejected by negotiation until their
+  implementation changes land.
+- Plan three follow-up implementation changes: `add-plugin-sidebar-tab`,
+  `add-plugin-theme-contributions`, and `add-plugin-key-zones`. They will
+  implement the adopted contracts and are out of scope for this decision.
+- Keep public documentation clear that the whole UI is not plugin-editable.
 
 PanelSection negotiation/render/cache/placement is exclusively THE-108 and is
 out of scope here. General v0.3 docs/host truth alignment is THE-106.

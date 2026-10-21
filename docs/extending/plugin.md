@@ -61,6 +61,7 @@ the plugin.
 | `IssueProvider`      | wired            | `surface:provider`     | resident           | on-demand           | issue provider bridge     |
 | `CiProvider`         | reserved         | `surface:provider`     | —                  | —                   | no dynamic selector       |
 | `ForgeProvider`      | reserved         | `surface:provider`     | —                  | —                   | no dynamic selector       |
+| `DebugAdapter`       | reserved         | `surface:debug`        | —                  | —                   | THE-102                   |
 
 The host verb matrix is also embedded as `x-thegn-host-verb-support`, and the
 exact currently dispatchable catalog ids are in

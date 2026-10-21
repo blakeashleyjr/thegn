@@ -15,6 +15,12 @@ pub const REDACTION_MARKER: &str = "***redacted***";
 pub const HARD_MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// An absolute line ceiling used by the cache as a last-resort guard.
 pub const HARD_MAX_LOG_LINES: usize = 100_000;
+/// Version of the redaction rules applied to an entry's text. 0 = never
+/// redacted (or unknown), 1 = every cached row written before versioning (the
+/// integer `redacted` column held 1), 2 = the current `redact` rules. Bump it
+/// whenever `redact`/`redact_stream_line` learn a new secret shape, so cached
+/// rows are re-redacted on their next read.
+pub const REDACTION_POLICY_VERSION: u32 = 2;
 
 /// A redacted, bounded log entry suitable for persistence or transport.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,10 +32,13 @@ pub struct CiLogEntry {
     pub text: String,
     #[serde(default)]
     pub truncated: bool,
-    /// True when the current redaction pass was applied; it does not prove
-    /// that every possible secret shape was recognized.
+    /// True when a redaction pass was applied; this does not prove that every
+    /// possible secret shape was recognized.
     #[serde(default)]
     pub redacted: bool,
+    /// Redaction policy version applied to this entry; 0 for older producers.
+    #[serde(default)]
+    pub policy_version: u32,
     pub fetched_at: i64,
     #[serde(default)]
     pub head_sha: String,
@@ -67,9 +76,24 @@ impl CiLogEntry {
             text: bounded,
             truncated,
             redacted: true,
+            policy_version: REDACTION_POLICY_VERSION,
             fetched_at,
             head_sha: String::new(),
         }
+    }
+
+    /// Reapply current redaction and hard bounds to an entry from an older
+    /// policy. Entries produced by a newer policy are preserved unchanged.
+    pub fn revalidated(mut self) -> Self {
+        if self.policy_version < REDACTION_POLICY_VERSION {
+            let (text, truncated) =
+                bounded_tail(&redact(&self.text), HARD_MAX_LOG_LINES, HARD_MAX_LOG_BYTES);
+            self.text = text;
+            self.truncated |= truncated;
+            self.redacted = true;
+            self.policy_version = REDACTION_POLICY_VERSION;
+        }
+        self
     }
 
     pub fn candidate(&self) -> CiLogCandidate {
@@ -264,6 +288,62 @@ mod tests {
         let (out, truncated) = bounded_tail("éé\nlast\n", 10, 6);
         assert_eq!(out, "last\n");
         assert!(truncated);
+    }
+
+    #[test]
+    fn policy_version_new_entry_carries_the_current_version() {
+        let entry = CiLogEntry::new("/wt", "run", "job", "tests", "ordinary\n", 10, 100, 1);
+        assert_eq!(entry.policy_version, REDACTION_POLICY_VERSION);
+    }
+
+    #[test]
+    fn policy_version_revalidated_re_redacts_older_entries() {
+        let entry = CiLogEntry {
+            text: "token=SYNTHETIC_TOKEN\nordinary\n".into(),
+            policy_version: 1,
+            ..Default::default()
+        }
+        .revalidated();
+
+        assert!(!entry.text.contains("SYNTHETIC_TOKEN"));
+        assert!(entry.text.contains("ordinary"));
+        assert_eq!(entry.policy_version, REDACTION_POLICY_VERSION);
+        assert!(entry.redacted);
+    }
+
+    #[test]
+    fn policy_version_revalidated_enforces_hard_bounds() {
+        let entry = CiLogEntry {
+            text: "x".repeat(HARD_MAX_LOG_BYTES + 1),
+            policy_version: 1,
+            ..Default::default()
+        }
+        .revalidated();
+
+        assert!(entry.text.len() <= HARD_MAX_LOG_BYTES);
+        assert!(entry.truncated);
+    }
+
+    #[test]
+    fn policy_version_revalidated_keeps_current_and_newer_entries() {
+        for policy_version in [REDACTION_POLICY_VERSION, u32::MAX] {
+            let entry = CiLogEntry {
+                text: "token=SYNTHETIC_TOKEN\n".into(),
+                policy_version,
+                ..Default::default()
+            };
+            assert_eq!(entry.clone().revalidated(), entry);
+        }
+    }
+
+    #[test]
+    fn policy_version_defaults_to_zero_for_json_without_it() {
+        let entry: CiLogEntry = serde_json::from_str(
+            r#"{"worktree":"/wt","run_id":"run","job_id":"job","job_name":"tests","text":"ordinary","truncated":false,"redacted":true,"fetched_at":1,"head_sha":""}"#,
+        )
+        .unwrap();
+
+        assert_eq!(entry.policy_version, 0);
     }
 
     #[test]

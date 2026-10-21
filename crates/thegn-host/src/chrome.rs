@@ -226,7 +226,7 @@ pub fn draw_text_bold(
     surface.add_change(Change::Attribute(AttributeChange::Intensity(
         termwiz::cell::Intensity::Bold,
     )));
-    let safe_text = thegn_core::neutralize_bidi_controls(text);
+    let safe_text = crate::chrome_text::chrome_safe_text(text);
     let clipped: String = crate::seg::take_cols(&safe_text, max_cols).to_string();
     surface.add_change(Change::Text(clipped));
     surface.add_change(Change::Attribute(AttributeChange::Intensity(
@@ -251,7 +251,7 @@ pub fn draw_text(
     });
     surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
     surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
-    let safe_text = thegn_core::neutralize_bidi_controls(text);
+    let safe_text = crate::chrome_text::chrome_safe_text(text);
     let clipped: String = crate::seg::take_cols(&safe_text, max_cols).to_string();
     surface.add_change(Change::Text(clipped));
 }

@@ -2903,6 +2903,45 @@ async fn a_structurally_failed_remote_ics_feed_is_not_a_snapshot() {
     server.abort();
 }
 
+// THE-470 regression lock: expected to pass on main.
+#[tokio::test]
+async fn transp_ics_url_feed_round_trips_free_and_busy() {
+    let body = concat!(
+        "BEGIN:VCALENDAR\r\n",
+        "VERSION:2.0\r\n",
+        "BEGIN:VEVENT\r\n",
+        "UID:free\r\n",
+        "DTSTART:20260821T090000Z\r\n",
+        "DTEND:20260821T093000Z\r\n",
+        "TRANSP:TRANSPARENT\r\n",
+        "END:VEVENT\r\n",
+        "BEGIN:VEVENT\r\n",
+        "UID:busy\r\n",
+        "DTSTART:20260821T090000Z\r\n",
+        "DTEND:20260821T093000Z\r\n",
+        "END:VEVENT\r\n",
+        "END:VCALENDAR\r\n",
+    );
+    let (address, _hits, server) =
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", body.to_owned()).await;
+    let backend = ics_url::IcsUrlBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/feed.ics"),
+            allow_private_network: true,
+            ..account("transp", CalendarProviderKind::IcsUrl)
+        },
+        adm(),
+    );
+    let (from, to) = window();
+    let page = backend.list_events(from, to, "").await.unwrap();
+    let events = page.events();
+    let free = events.iter().find(|event| event.uid == "free").unwrap();
+    assert_eq!(free.busy, thegn_core::calendar::Busy::Free);
+    let busy = events.iter().find(|event| event.uid == "busy").unwrap();
+    assert_eq!(busy.busy, thegn_core::calendar::Busy::Busy);
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_saturated_global_budget_refuses_before_any_request() {
     let (address, hits, server) =
@@ -3637,4 +3676,245 @@ fn a_plugin_declares_its_page_mode() {
     )
     .unwrap();
     assert_eq!(legacy.mode(), PageMode::Delta);
+}
+
+async fn token_ref_server() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let listener = CountingListener {
+        inner: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        accepts: Arc::clone(&accepts),
+    };
+    let address = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let auth_headers = Arc::new(Mutex::new(Vec::new()));
+    let observed_hits = Arc::clone(&hits);
+    let observed_auth = Arc::clone(&auth_headers);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(any(
+                move |request: axum::http::Request<axum::body::Body>| {
+                    let observed_hits = Arc::clone(&observed_hits);
+                    let observed_auth = Arc::clone(&observed_auth);
+                    async move {
+                        observed_hits.fetch_add(1, Ordering::SeqCst);
+                        let auth = request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        observed_auth.lock().unwrap().push(auth);
+                        if request.method().as_str() == "REPORT" {
+                            (
+                                axum::http::StatusCode::MULTI_STATUS,
+                                [("content-type", "application/xml")],
+                                multistatus(0, 0),
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                axum::http::StatusCode::OK,
+                                [("content-type", "text/calendar")],
+                                ics_feed(1),
+                            )
+                                .into_response()
+                        }
+                    }
+                },
+            )),
+        )
+        .await
+        .unwrap();
+    });
+    (address, hits, auth_headers, accepts, server)
+}
+
+#[tokio::test]
+async fn token_ref_unresolved_env_sends_no_request() {
+    for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+        let (address, hits, _auth, accepts, server) = token_ref_server().await;
+        let acct = CalendarAccount {
+            url: format!("http://{address}/calendar"),
+            token: "env:THEGN_TEST_UNSET_CALENDAR_TOKEN_486".into(),
+            allow_private_network: true,
+            ..account("token-ref-env", provider)
+        };
+        let (from, to) = window();
+        let result = match provider {
+            CalendarProviderKind::IcsUrl => {
+                ics_url::IcsUrlBackend::new(&acct, adm())
+                    .list_events(from, to, "")
+                    .await
+            }
+            CalendarProviderKind::CalDav => {
+                caldav::CalDavBackend::new(&acct, adm())
+                    .list_events(from, to, "")
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        assert!(matches!(result, Err(CalendarError::Auth(_))));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn token_ref_empty_file_and_keyring_fail_closed() {
+    let empty_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(empty_file.path(), "\n").unwrap();
+    let refs = [
+        format!("file:{}", empty_file.path().display()),
+        "keyring:the486-no-resolver".to_owned(),
+    ];
+    for token_ref in refs {
+        for provider in [CalendarProviderKind::IcsUrl, CalendarProviderKind::CalDav] {
+            let (address, hits, _auth, accepts, server) = token_ref_server().await;
+            let acct = CalendarAccount {
+                url: format!("http://{address}/calendar"),
+                token: token_ref.clone(),
+                allow_private_network: true,
+                ..account("token-ref-file", provider)
+            };
+            let (from, to) = window();
+            let result = match provider {
+                CalendarProviderKind::IcsUrl => {
+                    ics_url::IcsUrlBackend::new(&acct, adm())
+                        .list_events(from, to, "")
+                        .await
+                }
+                CalendarProviderKind::CalDav => {
+                    caldav::CalDavBackend::new(&acct, adm())
+                        .list_events(from, to, "")
+                        .await
+                }
+                _ => unreachable!(),
+            };
+            assert!(matches!(result, Err(CalendarError::Auth(_))));
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn token_ref_error_text_is_redacted() {
+    let (address, _hits, _auth, _accepts, server) = token_ref_server().await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/calendar"),
+        token: "env:THEGN_TEST_UNSET_CALENDAR_TOKEN_486".into(),
+        allow_private_network: true,
+        ..account("token-ref-redacted", CalendarProviderKind::IcsUrl)
+    };
+    let (from, to) = window();
+    let result = ics_url::IcsUrlBackend::new(&acct, adm())
+        .list_events(from, to, "")
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("unresolved calendar credential unexpectedly fetched"),
+    };
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    for text in [display, debug] {
+        assert!(!text.contains("THEGN_TEST_UNSET_CALENDAR_TOKEN_486"));
+        assert!(!text.contains("env:"));
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn token_ref_literal_and_file_tokens_still_authenticate() {
+    // positive control: passes on main too
+    // The historic literal token remains Basic auth for ICS URL accounts.
+    let (address, _hits, auth, _accepts, server) = token_ref_server().await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        username: "u".into(),
+        token: "lit-secret".into(),
+        allow_private_network: true,
+        ..account("token-ref-literal", CalendarProviderKind::IcsUrl)
+    };
+    let (from, to) = window();
+    ics_url::IcsUrlBackend::new(&acct, adm())
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.lock().unwrap().first().map(String::as_str),
+        Some("Basic dTpsaXQtc2VjcmV0")
+    );
+    server.abort();
+
+    // positive control: passes on main too; file tokens use bearer auth here.
+    let token_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token_file.path(), "file-secret\n").unwrap();
+    let (address, _hits, auth, _accepts, server) = token_ref_server().await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        token: format!("file:{}", token_file.path().display()),
+        allow_private_network: true,
+        ..account("token-ref-file", CalendarProviderKind::IcsUrl)
+    };
+    ics_url::IcsUrlBackend::new(&acct, adm())
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.lock().unwrap().first().map(String::as_str),
+        Some("Bearer file-secret")
+    );
+    server.abort();
+
+    // positive control: passes on main too; CalDAV preserves literal Basic auth.
+    let (address, _hits, auth, _accepts, server) = token_ref_server().await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/dav/"),
+        username: "u".into(),
+        token: "lit-secret".into(),
+        allow_private_network: true,
+        ..account("token-ref-dav", CalendarProviderKind::CalDav)
+    };
+    caldav::CalDavBackend::new(&acct, adm())
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.lock().unwrap().first().map(String::as_str),
+        Some("Basic dTpsaXQtc2VjcmV0")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn token_ref_tokenless_account_sends_no_authorization() {
+    // positive control: passes on main too
+    let (address, hits, auth, _accepts, server) = token_ref_server().await;
+    let acct = CalendarAccount {
+        url: format!("http://{address}/feed.ics"),
+        allow_private_network: true,
+        ..account("token-ref-absent", CalendarProviderKind::IcsUrl)
+    };
+    let (from, to) = window();
+    ics_url::IcsUrlBackend::new(&acct, adm())
+        .list_events(from, to, "")
+        .await
+        .unwrap();
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(auth.lock().unwrap().first().map(String::as_str), Some(""));
+    server.abort();
 }

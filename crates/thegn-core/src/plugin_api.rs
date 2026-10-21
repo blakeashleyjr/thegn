@@ -182,6 +182,7 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
         ExtensionPoint::IssueProvider
         | ExtensionPoint::CiProvider
         | ExtensionPoint::ForgeProvider => "provider",
+        ExtensionPoint::DebugAdapter => "debug",
         ExtensionPoint::HarnessAdapter => "harness",
         ExtensionPoint::ProgramAdapter => "program",
         ExtensionPoint::Theme => "theme",
@@ -221,6 +222,10 @@ pub enum ExtensionPoint {
     /// Reserved vocabulary: a plugin-backed forge. Same status as
     /// [`ExtensionPoint::CiProvider`].
     ForgeProvider,
+    /// Reserved vocabulary: a plugin-backed debugger adapter (DAP) provider.
+    /// Accepted by the wire, negotiated unsupported until the host's debug
+    /// seam can bridge plugin adapters.
+    DebugAdapter,
     #[serde(untagged)]
     Unknown(String),
 }
@@ -242,6 +247,7 @@ impl ExtensionPoint {
             Self::IssueProvider => "IssueProvider",
             Self::CiProvider => "CiProvider",
             Self::ForgeProvider => "ForgeProvider",
+            Self::DebugAdapter => "DebugAdapter",
             Self::Unknown(name) => name,
         }
     }
@@ -2232,6 +2238,16 @@ pub static HOST_EXTENSION_SUPPORT: &[ExtensionPointSupport] = &[
         callbacks: NO_CALLBACKS,
         owner: "no dynamic forge provider selector",
     },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::DebugAdapter,
+        since: ApiVersion::new(0, 3, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:debug"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "THE-102",
+    },
 ];
 
 /// Complete plugin→host verb contract. `host.call` is resident-only because a
@@ -2503,6 +2519,7 @@ mod wire_tests {
             (ExtensionPoint::Theme, Some("theme")),
             (ExtensionPoint::Automation, Some("automation")),
             (ExtensionPoint::DataSource, Some("data")),
+            (ExtensionPoint::DebugAdapter, Some("debug")),
             (ExtensionPoint::Unknown("future".into()), None),
         ] {
             assert_eq!(
@@ -3740,6 +3757,7 @@ timeout_secs = 5
             "IssueProvider",
             "CiProvider",
             "ForgeProvider",
+            "DebugAdapter",
         ];
         let actual = HOST_EXTENSION_SUPPORT
             .iter()
@@ -3754,6 +3772,26 @@ timeout_secs = 5
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(verbs.len(), HOST_VERB_SUPPORT.len());
         assert_eq!(verbs, HostVerb::ALL.iter().copied().collect());
+    }
+
+    #[test]
+    fn debug_adapter_extension_point_negotiates_reserved() {
+        let point = ExtensionPoint::DebugAdapter;
+        let encoded = serde_json::to_value(&point).unwrap();
+        assert_eq!(encoded, serde_json::json!("DebugAdapter"));
+        let decoded: ExtensionPoint = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, point);
+
+        let spec = support_spec(
+            point,
+            vec![Capability::new("surface", "debug")],
+            PluginMode::Resident,
+        );
+        let negotiation = current_host_contract().negotiate_spec(&spec).unwrap();
+        assert_eq!(
+            negotiation.rejected_contributions[0].reason,
+            "unsupported extension point DebugAdapter: reserved by THE-102"
+        );
     }
 
     #[test]

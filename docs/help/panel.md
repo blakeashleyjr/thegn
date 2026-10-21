@@ -268,7 +268,8 @@ off by default and can suggest or safely hand a verified failure to the
 existing PR-queue agent. The action rechecks PR context, head, agent policy,
 and attempt budget off-loop, and fails closed if any check no longer holds.
 In the section and in its popup, **r** reruns failed jobs, **R** reruns all
-jobs, and **c** cancels after a second press.
+jobs, and **c** cancels after a second press. On GitLab, **r** retries failed
+and canceled jobs together, while **R** is refused because GitLab has no full rerun.
 
 ### merge — the local merge queue
 

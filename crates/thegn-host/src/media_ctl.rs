@@ -11,14 +11,22 @@ use termwiz::terminal::TerminalWaker;
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
 
 const MAX_PENDING_MEDIA_OPS: usize = 8;
-const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
 
 pub(crate) static MEDIA_DELIVERY_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-type MediaOpTail = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+#[derive(Default)]
+struct MediaOpChain {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
+    drain: Option<tokio::task::JoinHandle<()>>,
+}
 
-static MEDIA_OP_TAIL: LazyLock<MediaOpTail> = LazyLock::new(|| Arc::new(Mutex::new(None)));
+type MediaOpTail = Arc<Mutex<MediaOpChain>>;
+
+static MEDIA_OP_TAIL: LazyLock<MediaOpTail> =
+    LazyLock::new(|| Arc::new(Mutex::new(MediaOpChain::default())));
 static MEDIA_OP_PENDING: LazyLock<Arc<AtomicUsize>> =
     LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 static MEDIA_PICK_IN_FLIGHT: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
@@ -225,16 +233,19 @@ where
         return false;
     }
 
-    let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
-    let previous = tail.take();
+    let mut chain = tail.lock().unwrap_or_else(|error| error.into_inner());
+    chain.handles.retain(|handle| !handle.is_finished());
+    let previous = chain.tail.take();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let pending_guard = PendingOp(pending.clone());
-    *tail = Some(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let _pending = pending_guard;
         if let Some(previous) = previous {
             match previous.await {
                 Ok(()) | Err(_) => {}
             }
         }
+        let _done = done_tx;
         if tokio::time::timeout(MEDIA_OP_BUDGET, future).await.is_err() {
             tracing::warn!(target: "thegn::media", budget_secs = MEDIA_OP_BUDGET.as_secs(), "media operation exceeded its time budget");
             record_outcome(&MEDIA_OP_OUTCOME, MediaOpOutcome::TimedOut);
@@ -242,7 +253,11 @@ where
                 pulse(&waker);
             }
         }
-    }));
+        drop(_pending);
+        drop(_done);
+    });
+    chain.handles.push(handle);
+    chain.tail = Some(done_rx);
     true
 }
 
@@ -449,6 +464,7 @@ pub(crate) fn restart_media_watch(
     waker: &TerminalWaker,
 ) {
     let generation_value = generation.advance();
+    cancel_op_chain(&MEDIA_OP_TAIL);
     let previous = handle.take();
     if !cfg.enabled {
         *handle = previous.map(|previous| {
@@ -473,6 +489,38 @@ pub(crate) fn restart_media_watch(
         return;
     }
     *handle = spawn_media_watch(cfg, generation_value, tx.clone(), waker.clone(), previous);
+}
+
+fn cancel_op_chain(tail: &MediaOpTail) {
+    let mut chain = tail.lock().unwrap_or_else(|error| error.into_inner());
+    if chain.handles.is_empty() {
+        return;
+    }
+    let handles = std::mem::take(&mut chain.handles);
+    for handle in &handles {
+        handle.abort();
+    }
+    let previous_drain = chain.drain.take();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let joiner = tokio::spawn(async move {
+        if let Some(previous_drain) = previous_drain {
+            match previous_drain.await {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        for handle in handles {
+            match handle.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    tracing::warn!(target: "thegn::media", %error, "media operation chain join failed");
+                }
+            }
+        }
+        let _done = done_tx;
+    });
+    chain.tail = Some(done_rx);
+    chain.drain = Some(joiner);
 }
 
 /// Fire a transport op off-thread, then push the resulting snapshot so the badge/
@@ -763,15 +811,31 @@ pub(crate) fn spawn_media_sources(
 #[cfg(test)]
 mod tests {
     use super::{
-        Latest, MediaGeneration, MediaOp, MediaOpOutcome, MediaPick, MediaPreflightError, chain_op,
-        chain_op_with_outcome, delivery_from_read, generation_is_current, loop_target,
-        op_supported, pick_palette, record_refusal, replace_in_flight, shuffle_target,
-        take_outcome, within_media_budget,
+        Latest, MediaGeneration, MediaOp, MediaOpChain, MediaOpOutcome, MediaOpTail, MediaPick,
+        MediaPreflightError, cancel_op_chain, chain_op, chain_op_with_outcome, delivery_from_read,
+        generation_is_current, loop_target, op_supported, pick_palette, record_refusal,
+        replace_in_flight, shuffle_target, take_outcome, within_media_budget,
     };
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState};
 
+    async fn finish_op_chain(tail: &MediaOpTail) {
+        let (handles, drain) = {
+            let mut chain = tail.lock().unwrap_or_else(|error| error.into_inner());
+            (std::mem::take(&mut chain.handles), chain.drain.take())
+        };
+        for handle in handles {
+            match handle.await {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        if let Some(drain) = drain {
+            match drain.await {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
     type GatedOperation = (MediaOp, fn(&mut MediaCaps));
 
     #[test]
@@ -937,7 +1001,7 @@ mod tests {
 
     #[tokio::test]
     async fn transport_operations_run_in_enqueue_order() {
-        let tail = Arc::new(Mutex::new(None));
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
         let pending = Arc::new(AtomicUsize::new(0));
         let records = Arc::new(Mutex::new(Vec::new()));
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -953,14 +1017,13 @@ mod tests {
         }));
 
         release_tx.send(()).unwrap();
-        let last = tail.lock().unwrap().take().unwrap();
-        last.await.unwrap();
+        finish_op_chain(&tail).await;
         assert_eq!(*records.lock().unwrap(), vec![1, 2]);
     }
 
     #[tokio::test]
     async fn transport_operation_queue_rejects_work_over_its_cap() {
-        let tail = Arc::new(Mutex::new(None));
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
         let pending = Arc::new(AtomicUsize::new(0));
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
@@ -971,8 +1034,7 @@ mod tests {
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 1);
 
         release_tx.send(()).unwrap();
-        let last = tail.lock().unwrap().take().unwrap();
-        last.await.unwrap();
+        finish_op_chain(&tail).await;
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
@@ -1002,7 +1064,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_queue_records_busy_outcome() {
-        let tail = Arc::new(Mutex::new(None));
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
         let pending = Arc::new(AtomicUsize::new(0));
         let outcome = Mutex::new(None);
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -1024,13 +1086,12 @@ mod tests {
         ));
         assert_eq!(take_outcome(&outcome), Some(MediaOpOutcome::Busy));
         release_tx.send(()).unwrap();
-        let last = tail.lock().unwrap().take().unwrap();
-        last.await.unwrap();
+        finish_op_chain(&tail).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn timed_out_transport_operation_does_not_block_the_queue() {
-        let tail = Arc::new(Mutex::new(None));
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
         let pending = Arc::new(AtomicUsize::new(0));
         let (second_tx, second_rx) = tokio::sync::oneshot::channel();
 
@@ -1041,8 +1102,7 @@ mod tests {
             assert!(second_tx.send(()).is_ok());
         }));
 
-        let last = tail.lock().unwrap().take().unwrap();
-        last.await.unwrap();
+        finish_op_chain(&tail).await;
         second_rx.await.unwrap();
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
     }
@@ -1075,5 +1135,179 @@ mod tests {
     async fn media_fetch_budget_resolves_pending_work_as_timeout() {
         let outcome = within_media_budget(std::future::pending::<()>()).await;
         assert!(outcome.is_none(), "pending provider work must time out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn op_chain_cancel_stops_a_running_op_before_its_effect() {
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let effect_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_effect_ran = effect_ran.clone();
+
+        assert!(chain_op(&tail, &pending, 8, async move {
+            started_tx.send(()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            task_effect_ran.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        started_rx.await.unwrap();
+        cancel_op_chain(&tail);
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        finish_op_chain(&tail).await;
+
+        assert!(!effect_ran.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn op_chain_cancel_cancels_queued_ops_behind_the_running_one() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_second_ran = second_ran.clone();
+
+        assert!(chain_op(&tail, &pending, 8, async move {
+            let _drop_flag = DropFlag(task_dropped);
+            started_tx.send(()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }));
+        assert!(chain_op(&tail, &pending, 8, async move {
+            task_second_ran.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        started_rx.await.unwrap();
+        cancel_op_chain(&tail);
+        {
+            let chain = tail.lock().unwrap();
+            assert!(
+                chain.tail.is_some(),
+                "cancellation must replace the chain tail"
+            );
+            assert!(chain.drain.is_some(), "cancellation must install a joiner");
+        }
+        let saw_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_saw_drop = saw_drop.clone();
+        let task_dropped = dropped.clone();
+        assert!(chain_op(&tail, &pending, 8, async move {
+            task_saw_drop.store(
+                task_dropped.load(std::sync::atomic::Ordering::Acquire),
+                std::sync::atomic::Ordering::Release,
+            );
+        }));
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        finish_op_chain(&tail).await;
+
+        assert!(!second_ran.load(std::sync::atomic::Ordering::Acquire));
+        assert!(saw_drop.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn op_chain_cancel_next_op_waits_for_the_joined_chain() {
+        struct DropFlag {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                if let Some(started) = self.started.take() {
+                    started.send(()).unwrap();
+                }
+                self.release.recv().unwrap();
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (drop_started_tx, drop_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        assert!(chain_op(&tail, &pending, 8, async move {
+            let _drop_flag = DropFlag {
+                started: Some(drop_started_tx),
+                release: release_rx,
+                dropped: task_dropped,
+            };
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+        assert!(chain_op(&tail, &pending, 8, async {}));
+
+        cancel_op_chain(&tail);
+        {
+            let chain = tail.lock().unwrap();
+            assert!(
+                chain.tail.is_some(),
+                "cancellation must replace the chain tail"
+            );
+            assert!(chain.drain.is_some(), "cancellation must install a joiner");
+        }
+        drop_started_rx.await.unwrap();
+
+        let saw_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_saw_drop = saw_drop.clone();
+        let task_dropped = dropped.clone();
+        let (next_started_tx, mut next_started_rx) = tokio::sync::oneshot::channel();
+        assert!(chain_op(&tail, &pending, 8, async move {
+            task_saw_drop.store(
+                task_dropped.load(std::sync::atomic::Ordering::Acquire),
+                std::sync::atomic::Ordering::Release,
+            );
+            next_started_tx.send(()).unwrap();
+        }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut next_started_rx,)
+                .await
+                .is_err(),
+            "the next generation must wait while the old operation is still dropping"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut next_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        finish_op_chain(&tail).await;
+
+        assert!(saw_drop.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn op_chain_cancel_on_an_empty_chain_is_a_no_op() {
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
+        let pending = Arc::new(AtomicUsize::new(0));
+        cancel_op_chain(&tail);
+        {
+            let chain = tail.lock().unwrap();
+            assert!(chain.handles.is_empty());
+            assert!(chain.tail.is_none());
+            assert!(chain.drain.is_none());
+        }
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_ran = ran.clone();
+        assert!(chain_op(&tail, &pending, 8, async move {
+            task_ran.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        finish_op_chain(&tail).await;
+
+        assert!(ran.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }

@@ -93,6 +93,24 @@ impl CacheStore for Db {
         Ok(r)
     }
 
+    fn get_ci_cache_entry(&self, worktree: &str) -> Result<Option<(String, String, i64)>> {
+        let r = self
+            .conn()
+            .query_row(
+                "SELECT json, branch, fetched_at FROM ci_runs_cache WHERE worktree=?1",
+                params![worktree],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
+        Ok(r)
+    }
+
     fn put_ci_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()> {
         self.conn().execute(
             r#"INSERT INTO ci_runs_cache(worktree,branch,json,fetched_at)
@@ -506,5 +524,33 @@ mod tests {
             .unwrap()
         );
         assert!(!db.claim_ci_autofix(&entry.candidate()).unwrap());
+    }
+
+    #[test]
+    fn ci_runs_cache_entry_returns_the_stored_branch() {
+        let db = Db::open_memory().unwrap();
+        db.put_ci_cache("/wt/a", "feature", "{\"runs\":[]}")
+            .unwrap();
+        let (json, branch, fetched_at) = db
+            .get_ci_cache_entry("/wt/a")
+            .unwrap()
+            .expect("cached CI run entry");
+        assert_eq!(json, "{\"runs\":[]}");
+        assert_eq!(branch, "feature");
+        assert!(fetched_at > 0);
+
+        db.put_ci_cache("/wt/a", "main", "{\"runs\":[1]}").unwrap();
+        let (json, branch, _) = db
+            .get_ci_cache_entry("/wt/a")
+            .unwrap()
+            .expect("replaced CI run entry");
+        assert_eq!(json, "{\"runs\":[1]}");
+        assert_eq!(branch, "main");
+    }
+
+    #[test]
+    fn ci_runs_cache_entry_missing_row_is_none() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.get_ci_cache_entry("/wt/missing").unwrap().is_none());
     }
 }

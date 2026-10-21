@@ -195,4 +195,78 @@ mod tests {
         assert!(db.worktree_record("/repo/first").unwrap().is_some());
         assert!(!reopen(&db, &first, "repo/first", "/repo", "/repo/first", "first").unwrap());
     }
+
+    #[test]
+    fn suppression_survives_reopening_the_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database_path = temp.path().join("s.db");
+        let worktree_path = temp.path().join("worktree");
+        std::fs::create_dir(&worktree_path).unwrap();
+        let worktree = worktree_path.to_string_lossy().into_owned();
+        let db = Db::open_at(&database_path).unwrap();
+        db.put_worktree("repo/feature", "/repo", &worktree, "feature", None, None)
+            .unwrap();
+        let keys = keys_for(Path::new(&worktree)).unwrap();
+
+        close_with_suppression(
+            &db,
+            &worktree,
+            &keys,
+            &record_json(&worktree, "repo/feature"),
+        )
+        .unwrap();
+        drop(db);
+
+        let reopened = Db::open_at(&database_path).unwrap();
+        assert!(is_suppressed(&reopened, &keys).unwrap());
+        assert!(reopened.worktree_record(&worktree).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unrelated_worktree_is_not_suppressed() {
+        let db = db();
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("first");
+        let second_path = temp.path().join("second");
+        std::fs::create_dir(&first_path).unwrap();
+        std::fs::create_dir(&second_path).unwrap();
+        let first_worktree = first_path.to_string_lossy().into_owned();
+        let second_worktree = second_path.to_string_lossy().into_owned();
+        db.put_worktree("repo/first", "/repo", &first_worktree, "first", None, None)
+            .unwrap();
+        db.put_worktree(
+            "repo/second",
+            "/repo",
+            &second_worktree,
+            "second",
+            None,
+            None,
+        )
+        .unwrap();
+        let first_keys = keys_for(&first_path).unwrap();
+        let second_keys = keys_for(&second_path).unwrap();
+
+        close_with_suppression(
+            &db,
+            &first_worktree,
+            &first_keys,
+            &record_json(&first_worktree, "repo/first"),
+        )
+        .unwrap();
+
+        assert!(!is_suppressed(&db, &second_keys).unwrap());
+        assert!(
+            reopen(
+                &db,
+                &first_keys,
+                "repo/first",
+                "/repo",
+                &first_worktree,
+                "first"
+            )
+            .unwrap()
+        );
+        assert!(!is_suppressed(&db, &second_keys).unwrap());
+        assert!(db.worktree_record(&second_worktree).unwrap().is_some());
+    }
 }

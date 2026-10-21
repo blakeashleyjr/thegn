@@ -481,6 +481,66 @@ impl MqStatus {
     }
 }
 
+/// Operator actions and their permitted effects. This table is separate from
+/// merge-driver transitions (the remaining THE-229 work). Unknown stored
+/// statuses are refused by retry and deleted by remove/clear, matching the
+/// current database operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MqOperation {
+    Retry,
+    Remove,
+    Clear,
+}
+
+impl MqOperation {
+    pub const ALL: [Self; 3] = [Self::Retry, Self::Remove, Self::Clear];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Remove => "remove",
+            Self::Clear => "clear",
+        }
+    }
+
+    pub const fn transition(self, status: MqStatus, claimed: bool) -> MqTransition {
+        if claimed {
+            return MqTransition::Refuse;
+        }
+        match (self, status) {
+            (Self::Retry, MqStatus::Deferred)
+            | (Self::Retry, MqStatus::GateFailed)
+            | (Self::Retry, MqStatus::GateError)
+            | (Self::Retry, MqStatus::AgentBlocked)
+            | (Self::Retry, MqStatus::NeedsHuman) => MqTransition::Requeue,
+            (Self::Retry, MqStatus::Queued)
+            | (Self::Retry, MqStatus::Folding)
+            | (Self::Retry, MqStatus::Verifying)
+            | (Self::Retry, MqStatus::Landed)
+            | (Self::Retry, MqStatus::Ready)
+            | (Self::Retry, MqStatus::AgentRunning) => MqTransition::Refuse,
+            (Self::Remove | Self::Clear, MqStatus::Queued)
+            | (Self::Remove | Self::Clear, MqStatus::Folding)
+            | (Self::Remove | Self::Clear, MqStatus::Verifying)
+            | (Self::Remove | Self::Clear, MqStatus::Landed)
+            | (Self::Remove | Self::Clear, MqStatus::Ready)
+            | (Self::Remove | Self::Clear, MqStatus::Deferred)
+            | (Self::Remove | Self::Clear, MqStatus::GateFailed)
+            | (Self::Remove | Self::Clear, MqStatus::GateError)
+            | (Self::Remove | Self::Clear, MqStatus::AgentBlocked)
+            | (Self::Remove | Self::Clear, MqStatus::AgentRunning)
+            | (Self::Remove | Self::Clear, MqStatus::NeedsHuman) => MqTransition::Delete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MqTransition {
+    Requeue,
+    Delete,
+    Refuse,
+}
+
 /// The worktree's merge-queue entry: status + when it last changed (real
 /// event time from the `updated_at` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1576,5 +1636,30 @@ mod tests {
         assert_eq!(d.tier, T::Idle);
         assert!(!d.needs_user());
         assert!(score(&AttentionInputs::default()).sort_key() < d.sort_key());
+    }
+
+    #[test]
+    fn mq_operation_table_is_exhaustive_and_claim_refuses_all() {
+        for operation in MqOperation::ALL {
+            for status in MqStatus::ALL {
+                assert_eq!(
+                    operation.transition(status, true),
+                    MqTransition::Refuse,
+                    "{} with {status:?} claimed",
+                    operation.as_str()
+                );
+                let expected = match operation {
+                    MqOperation::Retry if status.is_held() => MqTransition::Requeue,
+                    MqOperation::Retry => MqTransition::Refuse,
+                    MqOperation::Remove | MqOperation::Clear => MqTransition::Delete,
+                };
+                assert_eq!(
+                    operation.transition(status, false),
+                    expected,
+                    "{} with {status:?} unclaimed",
+                    operation.as_str()
+                );
+            }
+        }
     }
 }

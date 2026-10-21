@@ -6,7 +6,7 @@
 //!
 //! Seams are added here as they adopt `thegn_core::seam`; today the registry
 //! covers ci, forges, issues, calendar, weather, git, editor, files (the drawer
-//! file manager), sandbox and media. A reserved selection reports
+//! file manager), sandbox, media and debug. A reserved selection reports
 //! [`ProbeReport::reserved`] so doctor explains *why* a seam is unavailable
 //! rather than silently omitting it.
 
@@ -38,7 +38,12 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(structural_probes(cfg));
     out.extend(host_discovery_probes(cfg));
     out.extend(voice_probes(cfg));
+    out.extend(debug_probes(cfg));
     out
+}
+
+fn debug_probes(cfg: &Config) -> Vec<ProbeReport> {
+    thegn_core::debug::probes(cfg)
 }
 
 fn voice_probes(cfg: &Config) -> Vec<ProbeReport> {
@@ -564,9 +569,22 @@ fn media_probes(cfg: &Config) -> Vec<ProbeReport> {
 mod tests {
     use super::*;
 
+    fn hermetic_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false;
+        cfg.managed_tools.insert(
+            "bugstalker".into(),
+            thegn_core::managed_tool::ToolOverride {
+                path: "/fixture/bs".into(),
+                args: Vec::new(),
+            },
+        );
+        cfg
+    }
+
     #[test]
     fn default_config_reports_every_seam_once_and_nothing_reserved() {
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         // Keep the probe hermetic: don't shell out to a real `tailscale` client
         // from a unit test (the disabled path still reports the seam).
         cfg.host_discovery.tailnet.enabled = false;
@@ -582,6 +600,7 @@ mod tests {
             "sandbox",
             "media",
             "host_discovery",
+            "debug",
         ] {
             assert!(seams.contains(s), "missing seam {s}: {reports:?}");
         }
@@ -606,7 +625,7 @@ mod tests {
         // note). The bit is a static profile-table property, so every
         // assertion holds whether or not the runtime is installed here.
         let row = |backend| {
-            let mut cfg = Config::default();
+            let mut cfg = hermetic_config();
             cfg.sandbox.enabled = true;
             cfg.sandbox.backend = backend;
             let mut r = sandbox_probes(&cfg);
@@ -690,7 +709,7 @@ mod tests {
     #[test]
     fn host_discovery_reserved_and_disabled_paths() {
         // A reserved discovery kind reports as reserved (never silently omitted).
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.host_discovery.kind = thegn_core::config::HostDiscoveryKind::Consul;
         let r = host_discovery_probes(&cfg);
         assert_eq!(r.len(), 1);
@@ -700,7 +719,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // Disabled tailnet: reported (id `tailnet`), Ready, no subprocess.
-        let mut off = Config::default();
+        let mut off = hermetic_config();
         off.host_discovery.tailnet.enabled = false;
         let r = host_discovery_probes(&off);
         assert_eq!(r[0].id, "tailnet");
@@ -710,7 +729,7 @@ mod tests {
 
     #[test]
     fn reserved_selections_are_reported_as_reserved() {
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.ci.provider = thegn_core::config::CiProviderKind::Drone;
         cfg.media.enabled = true;
         cfg.media.backend = thegn_core::config::MediaBackendKind::Spotify;
@@ -743,7 +762,7 @@ mod tests {
 
     #[test]
     fn explicit_selections_probe_binaries() {
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.ci.provider = thegn_core::config::CiProviderKind::Gitlab;
         cfg.sandbox.enabled = true;
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Docker;
@@ -773,7 +792,7 @@ mod tests {
     #[test]
     fn weather_reports_only_when_enabled() {
         use thegn_core::config_weather::WeatherProviderKind;
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.host_discovery.tailnet.enabled = false; // hermetic: no real tailscale exec
         let weather_rows = |rs: &[ProbeReport]| rs.iter().filter(|r| r.seam == "weather").count();
 
@@ -831,7 +850,7 @@ mod tests {
 
     #[test]
     fn explicit_gitlab_ci_probe_sees_the_configured_token() {
-        let mut cfg = Config::default();
+        let mut cfg = hermetic_config();
         cfg.ci.provider = thegn_core::config::CiProviderKind::Gitlab;
         assert!(std::env::var_os("THE541_SURELY_UNSET_VAR").is_none());
         cfg.ci.gitlab.token = "env:THE541_SURELY_UNSET_VAR".into();
@@ -856,5 +875,17 @@ mod tests {
                 .iter()
                 .all(|note| !note.contains("fixture-secret-token"))
         );
+    }
+
+    #[test]
+    fn debug_seam_is_reported_once() {
+        let reports = probes(&hermetic_config());
+        let debug_reports: Vec<_> = reports
+            .iter()
+            .filter(|report| report.seam == "debug")
+            .collect();
+        assert_eq!(debug_reports.len(), 1, "{reports:?}");
+        assert_eq!(debug_reports[0].id, "bugstalker");
+        crate::conformance::assert_report_invariants(&reports);
     }
 }
