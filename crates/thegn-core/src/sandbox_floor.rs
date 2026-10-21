@@ -20,7 +20,9 @@
 //! the floor and is reported as `provider-managed`, never counted as a tier.
 
 use crate::capabilities::IsolationClass;
-use crate::config::{FileAccess, IsolationFloor, OnFloorMiss, SandboxBackend, SandboxConfig};
+use crate::config::{
+    FileAccess, IsolationFloor, Network, OnFloorMiss, SandboxBackend, SandboxConfig, SandboxProfile,
+};
 use crate::sandbox::{Backend, BackendFamily};
 
 /// Default minimum for enabled sandbox launches that have not opted into a
@@ -194,6 +196,84 @@ pub fn decide(
         OnFloorMiss::Degrade => FloorDecision::Degrade(miss),
         OnFloorMiss::Fail => FloorDecision::Fail(miss),
     }
+}
+
+/// Explicit isolation promise that a provider-managed pane cannot enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitIsolation {
+    SealedProfile(SandboxProfile),
+    NetworkNone,
+    FailClosedFloor(IsolationFloor),
+}
+
+impl ExplicitIsolation {
+    /// Human-readable spelling of the effective isolation request.
+    pub fn describe(self) -> String {
+        match self {
+            Self::SealedProfile(profile) => format!("profile `{}`", profile.as_str()),
+            Self::NetworkNone => "`network = \"none\"`".to_string(),
+            Self::FailClosedFloor(floor) => format!(
+                "`isolation_floor = \"{}\"` with `on_floor_miss = \"fail\"`",
+                floor.as_str()
+            ),
+        }
+    }
+}
+
+/// Identify an explicit isolation request in an effective sandbox config.
+/// A default floor and a degradable explicit floor do not refuse provider use.
+pub fn provider_explicit_request(sb: &SandboxConfig) -> Option<ExplicitIsolation> {
+    if sb.profile.forces_no_network() {
+        return Some(ExplicitIsolation::SealedProfile(sb.profile));
+    }
+    if crate::sandbox::lower_universal_deny(sb.network, &sb.network_block) == Network::None {
+        return Some(ExplicitIsolation::NetworkNone);
+    }
+    if let Some(floor) = sb.isolation_floor
+        && floor.required_rank().is_some()
+        && sb.on_floor_miss == OnFloorMiss::Fail
+    {
+        return Some(ExplicitIsolation::FailClosedFloor(floor));
+    }
+    None
+}
+
+/// Stable label for provider placement whose isolation is outside thegn's control.
+pub const PROVIDER_UNVERIFIED: &str = "provider-managed (unverified)";
+
+/// Typed refusal for an explicit isolation promise on an unattested provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRefusal {
+    pub env: String,
+    pub request: ExplicitIsolation,
+}
+
+impl std::fmt::Display for ProviderRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let request = self.request.describe();
+        write!(
+            formatter,
+            "env `{}` runs on a {} placement: thegn cannot enforce {} there, so the launch is refused before any provisioning, credential or upload; use a local sandbox env for this worktree, or remove {} from this env",
+            self.env, PROVIDER_UNVERIFIED, request, request
+        )
+    }
+}
+
+impl std::error::Error for ProviderRefusal {}
+
+/// Refuse an explicit isolation request only when execution is provider-managed.
+pub fn provider_refusal(
+    is_provider: bool,
+    sb: &SandboxConfig,
+    env: &str,
+) -> Option<ProviderRefusal> {
+    if !is_provider {
+        return None;
+    }
+    provider_explicit_request(sb).map(|request| ProviderRefusal {
+        env: env.to_string(),
+        request,
+    })
 }
 
 /// The `$HOME` confidentiality gate (THE-215). A sealed profile promises the host
@@ -840,5 +920,84 @@ mod tests {
             ),
             AgentGate::Run
         );
+    }
+
+    #[test]
+    fn provider_explicit_request_table() {
+        let profiles = [
+            SandboxProfile::Open,
+            SandboxProfile::Hardened,
+            SandboxProfile::Sealed,
+            SandboxProfile::SealedTunnel,
+        ];
+        let networks = [Network::Nat, Network::None];
+        let floors = [None, Some(IsolationFloor::SharedKernel)];
+        let misses = [OnFloorMiss::Degrade, OnFloorMiss::Fail];
+
+        for profile in profiles {
+            for network in networks {
+                for floor in floors {
+                    for miss in misses {
+                        let sb = SandboxConfig {
+                            profile,
+                            network,
+                            isolation_floor: floor,
+                            on_floor_miss: miss,
+                            ..SandboxConfig::default()
+                        };
+                        let expected = if matches!(
+                            profile,
+                            SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+                        ) {
+                            Some(ExplicitIsolation::SealedProfile(profile))
+                        } else if network == Network::None {
+                            Some(ExplicitIsolation::NetworkNone)
+                        } else if floor == Some(IsolationFloor::SharedKernel)
+                            && miss == OnFloorMiss::Fail
+                        {
+                            Some(ExplicitIsolation::FailClosedFloor(
+                                IsolationFloor::SharedKernel,
+                            ))
+                        } else {
+                            None
+                        };
+                        assert_eq!(provider_explicit_request(&sb), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_universal_block_is_network_none() {
+        let sb = SandboxConfig {
+            network: Network::Nat,
+            network_block: vec!["*".into()],
+            ..SandboxConfig::default()
+        };
+        assert_eq!(
+            provider_explicit_request(&sb),
+            Some(ExplicitIsolation::NetworkNone)
+        );
+    }
+
+    #[test]
+    fn provider_refusal_only_for_provider_placements() {
+        let sealed = SandboxConfig {
+            profile: SandboxProfile::Sealed,
+            ..SandboxConfig::default()
+        };
+        assert_eq!(provider_refusal(false, &sealed, "e"), None);
+        let refusal =
+            provider_refusal(true, &sealed, "e").expect("sealed provider request refuses");
+        let message = refusal.to_string();
+        assert!(message.contains("provider-managed (unverified)"));
+        assert!(message.contains("sealed"));
+        assert!(message.contains("env `e`"));
+    }
+
+    #[test]
+    fn provider_default_config_is_not_refused() {
+        assert_eq!(provider_refusal(true, &SandboxConfig::default(), "e"), None);
     }
 }
