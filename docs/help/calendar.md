@@ -187,6 +187,10 @@ last time, which is how a deletion on the server becomes a deletion here rather
 than an event that lingers until the next full refetch. Syncs are floored at one
 minute apart no matter what `refresh_interval_secs` says.
 
+CalDAV replies are read strictly. A malformed, truncated or unauthorised reply
+fails the sync and keeps the cache instead of appearing as an empty calendar.
+Only a response-level 404 removes an event; a failed property does not.
+
 Each background sync also refreshes the month on screen as well as the current
 month. If you page through months quickly, only the last month you land on is
 fetched and drawn.
