@@ -21,7 +21,7 @@ use thegn_core::config::{CiConfig, CiProviderKind};
 use thegn_core::remote::GitLoc;
 use thegn_core::secretref::BareAs;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -993,6 +993,57 @@ pub fn validate_workflow_selector(value: &str) -> Result<&str, CiError> {
     }
 }
 
+/// Validate the inputs passed to a manually triggered workflow.
+/// Error messages identify keys only and never include input values.
+pub fn validate_trigger_inputs(inputs: &[(String, String)]) -> Result<(), CiError> {
+    let mut seen = HashSet::with_capacity(inputs.len());
+    for (key, value) in inputs {
+        let mut chars = key.chars();
+        let valid_key = chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+        let reason = if key.is_empty() {
+            Some("key is empty")
+        } else if key.len() > 256 {
+            Some("key exceeds 256 bytes")
+        } else if !valid_key {
+            Some("key has invalid syntax")
+        } else if !seen.insert(key.as_str()) {
+            Some("duplicate key")
+        } else if value.len() > MAX_PROVIDER_FIELD_BYTES {
+            Some("value exceeds provider field limit")
+        } else if value.chars().any(char::is_control) {
+            Some("value contains a control character")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(CiError::Other(format!(
+                "invalid workflow input {key:?}: {reason}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse `KEY=VALUE` workflow inputs, rejecting malformed entries instead of
+/// silently dropping them. Values may contain further `=` characters.
+pub fn parse_trigger_inputs(raw: &[String]) -> Result<Vec<(String, String)>, CiError> {
+    let mut inputs = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let Some((key, value)) = entry.split_once('=') else {
+            let excerpt: String = entry.chars().take(64).collect();
+            return Err(CiError::Other(format!(
+                "invalid workflow input {excerpt:?}: expected KEY=VALUE"
+            )));
+        };
+        inputs.push((key.to_string(), value.to_string()));
+    }
+    validate_trigger_inputs(&inputs)?;
+    Ok(inputs)
+}
+
 /// Validate a Git branch ref using the forbidden forms from git-check-ref-format.
 /// Query-reserved characters such as `&`, `=`, `%` and `#` remain valid data.
 pub fn validate_branch_ref(value: &str) -> Result<&str, CiError> {
@@ -1290,6 +1341,8 @@ impl CiProvider for GithubCi {
         workflow: &str,
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
+        validate_workflow_selector(workflow)?;
+        validate_trigger_inputs(inputs)?;
         let args = github_workflow_argv(workflow, inputs)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         run_cli(self.command(loc, &argv)?, &self.cancel).map(|_| ())
@@ -1455,13 +1508,12 @@ pub fn parse_gh_workflows(json: &str) -> Result<Vec<CiWorkflow>, String> {
                 id: json_id(v, "id")?,
                 name: nonempty(v, "name")?,
                 path: nonempty(v, "path")?,
-                // `gh workflow list` doesn't expose the trigger set; treat
-                // active workflows as dispatchable (trigger degrades with a
-                // readable error if a given one isn't). Input prompting +
-                // accurate dispatchability come in Phase B.
+                // `gh workflow list` exposes neither the trigger set nor the
+                // input schema. Only an active reported state is dispatchable;
+                // missing or unknown state is not evidence of a manual trigger.
                 dispatchable: nonempty(v, "state")
                     .map(|s| s.eq_ignore_ascii_case("active"))
-                    .unwrap_or(true),
+                    .unwrap_or(false),
                 inputs: Vec::new(),
             })
         })
@@ -1771,6 +1823,7 @@ impl CiProvider for GitlabCi {
         inputs: &[(String, String)],
     ) -> Result<(), CiError> {
         validate_workflow_selector(workflow)?;
+        validate_trigger_inputs(inputs)?;
         let remote = self.remote(loc)?;
         let proj = Self::project_seg(&remote);
         let mut args = vec!["api".to_string(), "-X".into(), "POST".into()];
@@ -3631,13 +3684,76 @@ esac
     fn parse_gh_workflow_list() {
         let json = r#"[
           {"id":1,"name":"CI","path":".github/workflows/ci.yml","state":"active"},
-          {"id":2,"name":"Stale","path":".github/workflows/stale.yml","state":"disabled_manually"}
+          {"id":2,"name":"Stale","path":".github/workflows/stale.yml","state":"disabled_manually"},
+          {"id":3,"name":"NoState","path":".github/workflows/x.yml"}
         ]"#;
         let wfs = parse_gh_workflows(json).unwrap();
-        assert_eq!(wfs.len(), 2);
+        assert_eq!(wfs.len(), 3);
         assert_eq!(wfs[0].id, "1");
         assert!(wfs[0].dispatchable);
         assert!(!wfs[1].dispatchable);
+        assert!(!wfs[2].dispatchable);
+    }
+
+    #[test]
+    fn trigger_inputs_parse_table() {
+        let valid = [
+            (vec!["k=v"], vec![("k", "v")]),
+            (vec!["k="], vec![("k", "")]),
+            (vec!["a=b=c"], vec![("a", "b=c")]),
+            (vec!["_x-1=v"], vec![("_x-1", "v")]),
+        ];
+        for (raw, expected) in valid {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            let expected: Vec<(String, String)> = expected
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(parse_trigger_inputs(&raw).unwrap(), expected);
+        }
+
+        let oversized = "sensitive-value".repeat(MAX_PROVIDER_FIELD_BYTES / 15 + 2);
+        let invalid = [
+            vec!["novalue".to_string()],
+            vec!["=v".to_string()],
+            vec![format!("{}=v", "k".repeat(257))],
+            vec!["-k=v".to_string()],
+            vec!["1k=v".to_string()],
+            vec!["k k=v".to_string()],
+            vec!["k=1".to_string(), "k=2".to_string()],
+            vec!["k=a\u{1b}b".to_string()],
+            vec![format!("k={oversized}")],
+        ];
+        for raw in invalid {
+            let error = parse_trigger_inputs(&raw).unwrap_err().to_string();
+            assert!(error.contains("invalid workflow input"), "{error}");
+            assert!(!error.contains(&oversized));
+        }
+    }
+
+    #[test]
+    fn trigger_inputs_refused_before_any_provider_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(temp.path().to_path_buf());
+        let invalid_control = [("k".to_string(), "a\u{7}".to_string())];
+        let gitlab_error = GitlabCi::default()
+            .trigger(&loc, "ci", &invalid_control)
+            .unwrap_err()
+            .to_string();
+        assert!(gitlab_error.contains("invalid workflow input"));
+
+        let duplicate = [
+            ("k".to_string(), "one".to_string()),
+            ("k".to_string(), "two".to_string()),
+        ];
+        let github_error = GithubCi {
+            remote: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+        .trigger(&loc, "ci", &duplicate)
+        .unwrap_err()
+        .to_string();
+        assert!(github_error.contains("invalid workflow input"));
     }
 
     #[test]
