@@ -13,6 +13,7 @@ use std::time::Duration;
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
+use thegn_core::secretref::BareAs;
 
 use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
 use crate::http::{
@@ -26,6 +27,21 @@ use tokio::time::Instant;
 const _: () = assert!(MAX_BODY_BYTES <= thegn_core::calendar::admission::MAX_SOURCE_DOCUMENT_BYTES);
 
 const ZONE_CURSOR_PREFIX: &str = "tgz1:";
+
+pub(super) enum Credential {
+    None,
+    Token(String),
+    Unresolved,
+}
+
+pub(super) fn resolve_credential(a: &CalendarAccount) -> Credential {
+    match crate::secret::resolve_outcome(&a.token, BareAs::Literal, &format!("calendar:{}", a.name))
+    {
+        crate::secret::SecretResolution::Absent => Credential::None,
+        crate::secret::SecretResolution::Resolved(value) => Credential::Token(value),
+        crate::secret::SecretResolution::Failed => Credential::Unresolved,
+    }
+}
 
 pub(super) fn request_etag<'a>(zone: &str, stored: &'a str) -> &'a str {
     let Some(rest) = stored.strip_prefix(ZONE_CURSOR_PREFIX) else {
@@ -60,7 +76,7 @@ pub(super) fn map_transport_error(error: CalendarHttpError) -> CalendarError {
 
 pub struct IcsUrlBackend {
     username: String,
-    token: String,
+    credential: Credential,
     zone: thegn_core::calendar::Tz,
     timeout: Duration,
     admission: AccountAdmission,
@@ -84,7 +100,7 @@ impl IcsUrlBackend {
         };
         IcsUrlBackend {
             username: a.username.clone(),
-            token: thegn_core::config::expand_env_ref(&a.token).unwrap_or_default(),
+            credential: resolve_credential(a),
             zone: admission.zone(),
             timeout: Duration::from_secs(a.timeout_secs.clamp(5, 120)),
             admission,
@@ -118,6 +134,11 @@ impl CalendarBackend for IcsUrlBackend {
             if let Some(error) = self.init_error {
                 return Err(CalendarError::Policy(map_error(error)));
             }
+            if matches!(&self.credential, Credential::Unresolved) {
+                return Err(CalendarError::Auth(
+                    "calendar token reference could not be resolved".into(),
+                ));
+            }
             let http = self.http.as_ref().expect("checked above");
             // Reserve the largest body the transport will accept before asking
             // for it, so concurrent fetches can't jointly exceed the shared
@@ -132,11 +153,11 @@ impl CalendarBackend for IcsUrlBackend {
             if !cursor_etag.is_empty() {
                 req = req.header(reqwest::header::IF_NONE_MATCH, cursor_etag);
             }
-            if !self.token.is_empty() {
+            if let Credential::Token(token) = &self.credential {
                 if self.username.is_empty() {
-                    req = req.bearer_auth(&self.token);
+                    req = req.bearer_auth(token);
                 } else {
-                    req = req.basic_auth(&self.username, Some(&self.token));
+                    req = req.basic_auth(&self.username, Some(token));
                 }
             }
             let deadline = Instant::now() + self.timeout;
