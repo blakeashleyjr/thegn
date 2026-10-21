@@ -48,6 +48,10 @@ local player, without leaving the compositor. Hidden unless
   [[drawer-and-corner]].
 - If listing playlists or players fails, the picker reports the error in the
   status line; an empty list means there is nothing to pick.
+- A control is skipped with “Media operation skipped because the player
+  changed” if the selected player went away or another process took over its
+  MPRIS name. Changing media configuration or player selection cancels waiting
+  controls from before the change.
 
 Spotify remains a reserved backend kind: the supported desktop route is the
 existing MPRIS integration (or SMTC/AppleScript on their platforms), with no
