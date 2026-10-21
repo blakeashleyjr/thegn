@@ -50,11 +50,30 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             ),
         ])));
     }
-    if data.changes.is_empty() {
+    if data.status_unavailable {
+        let message = if data.changes.is_empty() {
+            "status unavailable"
+        } else {
+            "status unavailable, showing last known"
+        };
         rows.push(PanelRow::plain(Line::segs(vec![seg(
-            g(),
-            "working tree clean",
+            hue(Hue::Amber),
+            message,
         )])));
+    }
+    if data.incoming_unavailable && data.merge.is_some() {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            "incoming files unavailable",
+        )])));
+    }
+    if data.changes.is_empty() {
+        if !data.status_unavailable {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                g(),
+                "working tree clean",
+            )])));
+        }
         return rows;
     }
     // Rows are sorted local-first, then the merge's incoming files. When a merge
@@ -1056,6 +1075,86 @@ mod tests {
         };
 
         assert!(flat(&content(&ctx)).contains("unavailable"));
+    }
+
+    fn render_changes(data: crate::panel::PanelData) -> String {
+        let model = crate::chrome::FrameModel {
+            panel: data,
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Changes,
+            width: crate::layout::PanelWidth::Normal,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 44,
+            rows: 28,
+        };
+        flat(&content(&ctx))
+    }
+
+    #[test]
+    fn status_unavailable_never_says_working_tree_clean() {
+        let rendered = render_changes(crate::panel::PanelData {
+            status_unavailable: true,
+            ..Default::default()
+        });
+        assert!(
+            rendered.contains("status unavailable"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("working tree clean"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn status_unavailable_keeps_last_known_rows_visible() {
+        let rendered = render_changes(crate::panel::PanelData {
+            changes: vec![chg("src/last-known.rs", false, 3)],
+            status_unavailable: true,
+            ..Default::default()
+        });
+        assert!(
+            rendered.contains("status unavailable"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("src/last-known.rs"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn status_unavailable_merge_shows_incoming_read_failure() {
+        let rendered = render_changes(crate::panel::PanelData {
+            merge: Some(crate::panel::MergeBanner {
+                label: "MERGING".into(),
+                onto: "main".into(),
+                unresolved: 0,
+                total: None,
+            }),
+            status_unavailable: true,
+            incoming_unavailable: true,
+            ..Default::default()
+        });
+        assert!(
+            rendered.contains("incoming files unavailable"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn status_unavailable_clean_tree_still_says_clean() {
+        let rendered = render_changes(crate::panel::PanelData::default());
+        assert!(
+            rendered.contains("working tree clean"),
+            "rendered: {rendered}"
+        );
     }
 
     #[test]
