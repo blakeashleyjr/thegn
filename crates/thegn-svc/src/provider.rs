@@ -813,29 +813,137 @@ pub struct PolicyRule {
     pub action: String, // "allow" | "deny"
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRuleError {
+    NonAscii { entry: String },
+    IpLiteral { entry: String },
+    Malformed { entry: String, reason: &'static str },
+}
+
+impl std::fmt::Display for PolicyRuleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonAscii { entry } => write!(
+                formatter,
+                "network policy entry {entry:?} is not ASCII; use the punycode (xn--) form"
+            ),
+            Self::IpLiteral { entry } => write!(
+                formatter,
+                "network policy entry {entry:?} is an IP literal; provider rules require domains"
+            ),
+            Self::Malformed { entry, reason } => {
+                write!(
+                    formatter,
+                    "network policy entry {entry:?} is malformed: {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PolicyRuleError {}
+
+fn canonical_domain(entry: &str) -> std::result::Result<Option<String>, PolicyRuleError> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !trimmed.is_ascii() {
+        return Err(PolicyRuleError::NonAscii {
+            entry: trimmed.to_string(),
+        });
+    }
+
+    let without_dot = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    let lowered = without_dot.to_ascii_lowercase();
+    if lowered.parse::<std::net::IpAddr>().is_ok() || lowered.starts_with('[') {
+        return Err(PolicyRuleError::IpLiteral { entry: lowered });
+    }
+    if lowered == "*." {
+        return Err(PolicyRuleError::Malformed {
+            entry: lowered,
+            reason: "wildcard must be followed by a domain",
+        });
+    }
+    if lowered == "*" {
+        return Ok(Some(lowered));
+    }
+
+    let domain = lowered.strip_prefix("*.").unwrap_or(&lowered);
+    if domain.contains('*') {
+        return Err(PolicyRuleError::Malformed {
+            entry: lowered,
+            reason: "wildcards are only valid as * or a leading *.",
+        });
+    }
+    if lowered.len() > 253 {
+        return Err(PolicyRuleError::Malformed {
+            entry: lowered,
+            reason: "domain pattern exceeds 253 bytes",
+        });
+    }
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err(PolicyRuleError::Malformed {
+                entry: lowered,
+                reason: "domain contains an empty label",
+            });
+        }
+        if label.len() > 63 {
+            return Err(PolicyRuleError::Malformed {
+                entry: lowered,
+                reason: "label exceeds 63 bytes",
+            });
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(PolicyRuleError::Malformed {
+                entry: lowered,
+                reason: "labels may not start or end with a hyphen",
+            });
+        }
+        if !label.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        }) {
+            return Err(PolicyRuleError::Malformed {
+                entry: lowered,
+                reason: "labels may contain only ASCII letters, digits, hyphens and underscores",
+            });
+        }
+    }
+    Ok(Some(lowered))
+}
+
 /// Lower thegn's `network_allow`/`network_block` domain lists to a provider
 /// network policy. **Pure** (unit-tested). Order encodes the precedence:
 /// deny rules first (a block beats an allow), then allow rules, then a trailing
 /// default-`deny *` **only when an allow-list is present** (an allow-list means
 /// "deny everything else") — exactly the local DNS-filter semantics
 /// ([`thegn_core::dns_filter`]). Empty + empty ⇒ no rules (allow all).
-pub fn rules_from(allow: &[String], block: &[String]) -> Vec<PolicyRule> {
+pub fn rules_from(
+    allow: &[String],
+    block: &[String],
+) -> std::result::Result<Vec<PolicyRule>, PolicyRuleError> {
     let mut rules = Vec::new();
+    let mut denied = std::collections::HashSet::new();
     for d in block {
-        let d = d.trim();
-        if !d.is_empty() {
+        if let Some(domain) = canonical_domain(d)?
+            && denied.insert(domain.clone())
+        {
             rules.push(PolicyRule {
-                domain: d.to_string(),
+                domain,
                 action: "deny".into(),
             });
         }
     }
     let mut any_allow = false;
+    let mut allowed = std::collections::HashSet::new();
     for d in allow {
-        let d = d.trim();
-        if !d.is_empty() {
+        if let Some(domain) = canonical_domain(d)?
+            && !denied.contains(&domain)
+            && allowed.insert(domain.clone())
+        {
             rules.push(PolicyRule {
-                domain: d.to_string(),
+                domain,
                 action: "allow".into(),
             });
             any_allow = true;
@@ -847,7 +955,44 @@ pub fn rules_from(allow: &[String], block: &[String]) -> Vec<PolicyRule> {
             action: "deny".into(),
         });
     }
+    Ok(rules)
+}
+
+pub(crate) fn parse_policy_rules(body: &serde_json::Value) -> Result<Vec<PolicyRule>> {
+    let rules = body
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("sprites GET /policy/network: response has no rules array"))?;
     rules
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let object = value.as_object().ok_or_else(|| {
+                anyhow!("sprites GET /policy/network: rule {index} is not an object")
+            })?;
+            let domain = object
+                .get("domain")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!("sprites GET /policy/network: rule {index} has no string domain")
+                })?;
+            let action = object
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!("sprites GET /policy/network: rule {index} has no string action")
+                })?;
+            if action != "allow" && action != "deny" {
+                return Err(anyhow!(
+                    "sprites GET /policy/network: rule {index} has unknown action {action:?}"
+                ));
+            }
+            Ok(PolicyRule {
+                domain: domain.to_string(),
+                action: action.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Egress-policy translation — realizes `EgressKind::Translate`
@@ -877,8 +1022,9 @@ impl ProviderEgress for SpritesProvider {
         block: &'a [String],
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let rules = rules_from(allow, block)?;
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
-            let body = serde_json::json!({ "rules": rules_from(allow, block) });
+            let body = serde_json::json!({ "rules": rules });
             let resp = self
                 .client
                 .post(self.policy_network_url(id)?)
@@ -913,20 +1059,7 @@ impl ProviderEgress for SpritesProvider {
                 return Err(anyhow!("sprites GET /policy/network failed ({status})"));
             }
             let body = response_json(resp, "sprites", "GET /policy/network").await?;
-            Ok(body
-                .get("rules")
-                .and_then(|r| r.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| {
-                            Some(PolicyRule {
-                                domain: v.get("domain")?.as_str()?.to_string(),
-                                action: v.get("action")?.as_str()?.to_string(),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default())
+            parse_policy_rules(&body)
         })
     }
 }
@@ -3653,12 +3786,12 @@ mod tests {
 
     #[test]
     fn rules_from_empty_is_allow_all() {
-        assert!(rules_from(&[], &[]).is_empty());
+        assert!(rules_from(&[], &[]).unwrap().is_empty());
     }
 
     #[test]
     fn rules_from_block_only_denies_listed_no_default() {
-        let r = rules_from(&[], &["evil.com".into()]);
+        let r = rules_from(&[], &["evil.com".into()]).unwrap();
         assert_eq!(
             r,
             vec![PolicyRule {
@@ -3673,7 +3806,8 @@ mod tests {
         let r = rules_from(
             &["github.com".into(), " *.npmjs.org ".into(), "  ".into()],
             &["bad.com".into()],
-        );
+        )
+        .unwrap();
         // deny(block) first, then allow rules, then trailing default-deny.
         assert_eq!(
             r,
@@ -3695,6 +3829,114 @@ mod tests {
                     action: "deny".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn rules_from_canonicalizes_case_trailing_dot_and_duplicates() {
+        assert_eq!(
+            rules_from(&["GitHub.COM.".into(), "github.com".into()], &[]).unwrap(),
+            vec![
+                PolicyRule {
+                    domain: "github.com".into(),
+                    action: "allow".into(),
+                },
+                PolicyRule {
+                    domain: "*".into(),
+                    action: "deny".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_from_drops_an_allow_shadowed_by_the_same_block() {
+        assert_eq!(
+            rules_from(&["a.test".into()], &["A.test".into()]).unwrap(),
+            vec![
+                PolicyRule {
+                    domain: "a.test".into(),
+                    action: "deny".into(),
+                },
+                PolicyRule {
+                    domain: "*".into(),
+                    action: "deny".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_from_refuses_non_ascii_ip_and_misplaced_wildcards() {
+        assert!(matches!(
+            rules_from(&["bücher.example".into()], &[]),
+            Err(PolicyRuleError::NonAscii { .. })
+        ));
+        for entry in ["192.0.2.1", "2001:db8::1", "[2001:db8::1]"] {
+            assert!(matches!(
+                rules_from(&[entry.into()], &[]),
+                Err(PolicyRuleError::IpLiteral { .. })
+            ));
+        }
+        for entry in ["a.*.example", "*example.com", "*.", "a..b", "-a.example"] {
+            assert!(matches!(
+                rules_from(&[entry.into()], &[]),
+                Err(PolicyRuleError::Malformed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn rules_from_keeps_star_and_wildcard_forms() {
+        assert_eq!(
+            rules_from(&[], &["*".into()]).unwrap(),
+            vec![PolicyRule {
+                domain: "*".into(),
+                action: "deny".into(),
+            }]
+        );
+        assert_eq!(
+            rules_from(&["*.npmjs.org".into()], &[]).unwrap(),
+            vec![
+                PolicyRule {
+                    domain: "*.npmjs.org".into(),
+                    action: "allow".into(),
+                },
+                PolicyRule {
+                    domain: "*".into(),
+                    action: "deny".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_policy_rules_refuses_missing_rules_and_malformed_elements() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"rules": null}),
+            serde_json::json!({"rules": {}}),
+            serde_json::json!({"rules": [{"domain": "a.test"}]}),
+            serde_json::json!({"rules": [{"action": "allow"}]}),
+            serde_json::json!({"rules": [{"domain": "a.test", "action": null}]}),
+            serde_json::json!({"rules": [{"domain": "a.test", "action": "maybe"}]}),
+            serde_json::json!({"rules": [1]}),
+        ] {
+            assert!(parse_policy_rules(&body).is_err(), "accepted {body}");
+        }
+        assert!(
+            parse_policy_rules(&serde_json::json!({"rules": []}))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            parse_policy_rules(&serde_json::json!({"rules": [
+                {"domain": "github.com", "action": "allow"},
+                {"domain": "*", "action": "deny"}
+            ]}))
+            .unwrap()
+            .len(),
+            2
         );
     }
 
