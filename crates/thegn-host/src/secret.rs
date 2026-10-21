@@ -30,6 +30,11 @@ const MAX_SECRET_BYTES: u64 = 64 * 1024;
 const MAX_ACCOUNT_BYTES: usize = 1024;
 const MAX_INDEX_BYTES: u64 = 64 * 1024;
 const MAX_INDEX_ENTRIES: usize = 4096;
+const SECRETS_LOCK: &str = "secrets.lock";
+// Bounded so a UI-loop caller can never hang on another process's lock, but long
+// enough that ordinary CLI/worker contention (each op is a short fsync'd write)
+// waits its turn instead of failing as busy.
+const SECRETS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The keyring "service" all thegn secrets live under.
 const KEYRING_SERVICE: &str = "thegn";
@@ -227,6 +232,7 @@ fn store_with_dir(
         }
     }
     let dir = dir()?;
+    let _lock = lock_secrets_in(&dir)?;
     let private = open_secrets_in(&dir)?;
     let token_name = resolve_token_name(&private, name)?;
     write_account_sidecar_with(&private, &token_name, name)?;
@@ -254,6 +260,7 @@ pub fn store_file(name: &str, token: &str) -> Result<String> {
         m.clear();
     }
     let dir = secrets_dir()?;
+    let _lock = lock_secrets_in(&dir)?;
     let private = open_secrets_in(&dir)?;
     let token_name = resolve_token_name(&private, name)?;
     write_account_sidecar_with(&private, &token_name, name)?;
@@ -349,14 +356,17 @@ fn forget_in(
     // automatic legacy cleanup could delete a different account's credential.
     // Existing `file:` refs remain directly resolvable and can be removed by
     // their explicit path during a user-directed migration.
-    let file = match open_secrets_in(dir) {
+    let file = match lock_secrets_in(dir) {
         Err(error) => ForgetFileOutcome::Failed(error.to_string()),
-        Ok(private) => match file_entry_exists(&private, name) {
+        Ok(_lock) => match open_secrets_in(dir) {
             Err(error) => ForgetFileOutcome::Failed(error.to_string()),
-            Ok(existed) => match file_del_with(&private, name) {
-                Ok(()) if existed => ForgetFileOutcome::Removed,
-                Ok(()) => ForgetFileOutcome::Absent,
-                Err(error) => ForgetFileOutcome::Failed(error.message().to_string()),
+            Ok(private) => match file_entry_exists(&private, name) {
+                Err(error) => ForgetFileOutcome::Failed(error.to_string()),
+                Ok(existed) => match file_del_with(&private, name) {
+                    Ok(()) if existed => ForgetFileOutcome::Removed,
+                    Ok(()) => ForgetFileOutcome::Absent,
+                    Err(error) => ForgetFileOutcome::Failed(error.message().to_string()),
+                },
             },
         },
     };
@@ -1072,6 +1082,8 @@ fn file_get_in(dir: &std::path::Path, account: &str) -> Result<String, SecretErr
 }
 
 fn file_set_at(dir: &std::path::Path, account: &str, value: &str) -> Result<(), SecretError> {
+    let _lock =
+        lock_secrets_in(dir).map_err(|error| SecretError::unavailable(error.to_string()))?;
     let private = open_secrets_in(dir).map_err(|e| SecretError::unavailable(e.to_string()))?;
     file_set_with(&private, account, value)
 }
@@ -1092,6 +1104,8 @@ fn file_set_with(
 }
 
 fn file_del_at(dir: &std::path::Path, account: &str) -> Result<(), SecretError> {
+    let _lock =
+        lock_secrets_in(dir).map_err(|error| SecretError::unavailable(error.to_string()))?;
     let private = open_secrets_in(dir).map_err(|e| SecretError::unavailable(e.to_string()))?;
     file_del_with(&private, account)
 }
@@ -1128,6 +1142,8 @@ fn remove_sidecar_with(
 }
 
 fn file_list_at(dir: &std::path::Path) -> Result<Vec<String>, SecretError> {
+    let _lock =
+        lock_secrets_in(dir).map_err(|error| SecretError::unavailable(error.to_string()))?;
     let private = open_secrets_in(dir).map_err(|e| SecretError::unavailable(e.to_string()))?;
     file_list_with(&private)
 }
@@ -1338,11 +1354,22 @@ fn index_write_in(dir: &std::path::Path, names: &[String]) -> Result<(), String>
     thegn_core::fsperm::sync_parent_dir(dir).map_err(|e| e.to_string())
 }
 
-fn with_index_lock<T>(
+fn open_dir_lock(
     dir: &std::path::Path,
-    action: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    let path = dir.join("mcp-index.lock");
+    lock_name: &str,
+    what: &str,
+) -> Result<std::fs::File, String> {
+    let file = open_dir_lock_file(dir, lock_name, what)?;
+    file.lock().map_err(|e| format!("lock {what}: {e}"))?;
+    Ok(file)
+}
+
+fn open_dir_lock_file(
+    dir: &std::path::Path,
+    lock_name: &str,
+    what: &str,
+) -> Result<std::fs::File, String> {
+    let path = dir.join(lock_name);
     let file = loop {
         match thegn_core::fsperm::open_regular_file_nofollow(&path) {
             Ok(file) => break file,
@@ -1350,21 +1377,88 @@ fn with_index_lock<T>(
                 match thegn_core::fsperm::create_owner_only_exclusive(&path) {
                     Ok(file) => break file,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => return Err(format!("open MCP secret index lock: {error}")),
+                    Err(error) => return Err(format!("open {what} lock: {error}")),
                 }
             }
-            Err(error) => return Err(format!("open MCP secret index lock: {error}")),
+            Err(error) => return Err(format!("open {what} lock: {error}")),
         }
     };
     if !thegn_core::fsperm::owned_by_current_user(
         &file
             .metadata()
-            .map_err(|e| format!("inspect MCP secret index lock: {e}"))?,
+            .map_err(|e| format!("inspect {what} lock: {e}"))?,
     ) {
-        return Err("MCP secret index lock is owned by another user".into());
+        return Err(format!("{what} lock is owned by another user"));
     }
-    file.lock()
-        .map_err(|e| format!("lock MCP secret index: {e}"))?;
+    Ok(file)
+}
+
+#[derive(Debug)]
+enum SecretsLockError {
+    Busy,
+    Other(String),
+}
+
+impl std::fmt::Display for SecretsLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("secrets store busy"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for SecretsLockError {}
+
+/// Held for one file-backend operation. Threads of this process queue on the
+/// mutex first, so they never starve each other while polling the bounded
+/// cross-process file lock (fields drop in order: file lock, then mutex).
+struct SecretsLock {
+    _file: std::fs::File,
+    _process: std::sync::MutexGuard<'static, ()>,
+}
+
+static SECRETS_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_secrets_in(dir: &std::path::Path) -> Result<SecretsLock, SecretsLockError> {
+    let process = SECRETS_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    secrets_dir_at(dir).map_err(|error| SecretsLockError::Other(error.to_string()))?;
+    let file =
+        open_dir_lock_file(dir, SECRETS_LOCK, "file secrets").map_err(SecretsLockError::Other)?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                return Ok(SecretsLock {
+                    _file: file,
+                    _process: process,
+                });
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let elapsed = started.elapsed();
+                if elapsed >= SECRETS_LOCK_WAIT {
+                    return Err(SecretsLockError::Busy);
+                }
+                std::thread::sleep(
+                    std::time::Duration::from_millis(5).min(SECRETS_LOCK_WAIT - elapsed),
+                );
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(SecretsLockError::Other(format!(
+                    "lock file secrets: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn with_index_lock<T>(
+    dir: &std::path::Path,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _lock = open_dir_lock(dir, "mcp-index.lock", "MCP secret index")?;
     action()
 }
 
@@ -2016,6 +2110,121 @@ mod tests {
         file_set_at(temp.path(), "complete", "value").unwrap();
 
         assert_eq!(file_list_at(temp.path()).unwrap(), vec!["complete"]);
+    }
+
+    #[test]
+    fn secrets_lock_blocks_file_set_until_released() {
+        let temp = private_temp();
+        let dir = temp.path().to_path_buf();
+        let lock = open_dir_lock(&dir, SECRETS_LOCK, "file secrets").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            file_set_at(&dir, "acct", "v1")
+        });
+
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let entries: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(entries.iter().all(|entry| {
+            let name = entry.to_string_lossy();
+            !name.ends_with(".token") && !name.ends_with(".account")
+        }));
+
+        drop(lock);
+        worker.join().unwrap().unwrap();
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "v1");
+    }
+
+    #[test]
+    fn secrets_lock_blocks_file_delete_until_released() {
+        let temp = private_temp();
+        file_set_at(temp.path(), "acct", "v1").unwrap();
+        let dir = temp.path().to_path_buf();
+        let lock = open_dir_lock(&dir, SECRETS_LOCK, "file secrets").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            file_del_at(&dir, "acct")
+        });
+
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "v1");
+
+        drop(lock);
+        worker.join().unwrap().unwrap();
+        assert!(file_get_in(temp.path(), "acct").is_err());
+    }
+
+    #[test]
+    fn secrets_lock_store_creates_missing_directory() {
+        let temp = private_temp();
+        let secrets = temp.path().join("secrets");
+        let result = store_in(&secrets, "acct", "tok", |_, _| {
+            KeyringOutcome::Completed(Err(anyhow::anyhow!("denied")))
+        })
+        .unwrap();
+
+        assert!(result.starts_with("file:"));
+        assert_eq!(file_get_in(&secrets, "acct").unwrap(), "tok");
+    }
+
+    #[test]
+    fn secrets_lock_forget_creates_missing_directory_and_reports_absent() {
+        let temp = private_temp();
+        let secrets = temp.path().join("secrets");
+        let report = forget_in(&secrets, "acct", |_| KeyringOutcome::Completed(Ok(())));
+
+        assert_eq!(report.file, ForgetFileOutcome::Absent);
+        assert!(secrets.join(SECRETS_LOCK).exists());
+    }
+
+    #[test]
+    fn secrets_lock_does_not_write_through_symlinked_root() {
+        let temp = private_temp();
+        let outside = temp.path().join("outside");
+        let secrets = temp.path().join("secrets");
+        std::fs::create_dir(&outside).unwrap();
+        thegn_core::fsperm::ensure_private_dir(&outside).unwrap();
+        thegn_core::fsperm::create_symlink(&outside, &secrets, true).unwrap();
+
+        assert!(file_set_at(&secrets, "acct", "tok").is_err());
+        assert!(!outside.join(SECRETS_LOCK).exists());
+    }
+
+    #[test]
+    fn concurrent_file_set_and_delete_keep_token_and_sidecar_paired() {
+        // Positive control: this checks the final invariant without asserting
+        // that the unsynchronized implementation must lose a particular race.
+        let temp = private_temp();
+        let dir = temp.path().to_path_buf();
+        let workers: Vec<_> = (0..8)
+            .map(|worker_id| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for iteration in 0..20 {
+                        file_set_at(&dir, "shared", &format!("{worker_id}-{iteration}")).unwrap();
+                        file_del_at(&dir, "shared").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let token = token_name("shared").unwrap();
+        let sidecar = account_name(&token).unwrap();
+        let private = open_secrets_in(temp.path()).unwrap();
+        assert_eq!(
+            private.entry_exists_nofollow(&token).unwrap(),
+            private.entry_exists_nofollow(&sidecar).unwrap()
+        );
+        assert!(file_list_at(temp.path()).is_ok());
     }
 
     #[test]
