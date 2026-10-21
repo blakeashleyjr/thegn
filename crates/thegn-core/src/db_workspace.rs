@@ -497,6 +497,14 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    fn restore_worktree_location(&self, wt: &str, location: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE worktrees SET location=?2 WHERE worktree=?1",
+            params![wt, location],
+        )?;
+        Ok(())
+    }
+
     /// The remote-location descriptor for a worktree (None/empty = local).
     fn location_for(&self, wt: &str) -> Result<Option<String>> {
         self.conn()
@@ -2178,6 +2186,14 @@ mod tests {
             db.location_for("/wt/r").unwrap().as_deref(),
             Some("new-blob")
         );
+        db.restore_worktree_location("/wt/r", Some("old-blob"))
+            .unwrap();
+        assert_eq!(
+            db.location_for("/wt/r").unwrap().as_deref(),
+            Some("old-blob")
+        );
+        db.restore_worktree_location("/wt/r", None).unwrap();
+        assert_eq!(db.location_for("/wt/r").unwrap(), None);
         // Unknown path: Ok no-op — no row materializes.
         db.set_worktree_location("/wt/ghost", "blob").unwrap();
         assert_eq!(db.location_for("/wt/ghost").unwrap(), None);
