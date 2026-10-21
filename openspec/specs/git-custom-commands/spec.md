@@ -2,7 +2,7 @@
 
 ## Purpose
 
-THE-377 repairs implicit repository-text injection into the existing custom command shell path.
+Custom Git commands run user-configured argv or shell templates against the selected repository object, and repository-controlled values stay inert arguments.
 
 ## Requirements
 
