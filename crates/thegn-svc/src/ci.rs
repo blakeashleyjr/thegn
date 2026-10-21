@@ -1785,7 +1785,9 @@ impl CiProvider for GitlabCi {
             return Err(CiError::Unsupported(match scope {
                 RerunScope::All => "GitLab cannot re-run every job; its retry only re-runs failed and canceled jobs".into(),
                 RerunScope::Failed => "GitLab cannot retry only failed jobs; its retry includes canceled jobs".into(),
-                RerunScope::FailedOrCanceled => unreachable!("supported GitLab scope"),
+                RerunScope::FailedOrCanceled => {
+                    "GitLab cannot retry failed and canceled jobs here".into()
+                }
             }));
         }
         let remote = self.remote(loc)?;

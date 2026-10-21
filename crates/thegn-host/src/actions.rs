@@ -417,11 +417,10 @@ pub(crate) fn open_status(result: Result<(), OpenError>, ok: impl FnOnce() -> St
     }
 }
 
-/// Run a CI mutation (rerun / cancel) off the loop, then pulse a CI refresh so
-/// the badge + panel repaint. The provider is resolved inside the blocking task;
-/// ops it can't perform are declined with a warning (mirrors `cmd::ci`, keeping
-/// the provider the single authority on capabilities). Non-mutation actions are
-/// ignored here — they're handled inline on the loop.
+/// Map the CI popup's `r`/`R` keys to a scope the provider supports.
+///
+/// `r` prefers failed-only and can fall back to a combined failed-and-canceled
+/// retry; `R` requires support for rerunning every job.
 pub(crate) fn ci_rerun_scope(
     caps: &thegn_core::ci::CiCaps,
     failed: bool,
@@ -449,6 +448,11 @@ pub(crate) fn ci_rerun_scope(
     Err("ci: this provider can't re-run runs")
 }
 
+/// Run a CI mutation (rerun / cancel) off the loop, then pulse a CI refresh so
+/// the badge + panel repaint. The provider is resolved inside the blocking task;
+/// ops it can't perform are declined with a warning (mirrors `cmd::ci`, keeping
+/// the provider the single authority on capabilities). Non-mutation actions are
+/// ignored here — they're handled inline on the loop.
 pub(crate) fn spawn_ci_action(
     session: &Session,
     cfg: &thegn_core::config::CiConfig,
