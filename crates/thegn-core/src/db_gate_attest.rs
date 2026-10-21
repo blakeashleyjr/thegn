@@ -197,6 +197,35 @@ mod tests {
     }
 
     #[test]
+    fn refusal_display_covers_every_variant() {
+        let refusals = [
+            (GateAttestationRefusal::WorkerRunner, "worker"),
+            (
+                GateAttestationRefusal::MalformedOid {
+                    field: "commit_oid",
+                },
+                "object ID",
+            ),
+            (GateAttestationRefusal::EmptyCommand, "empty"),
+            (GateAttestationRefusal::EmptyLog, "empty"),
+            (GateAttestationRefusal::InvertedClock, "precedes"),
+            (GateAttestationRefusal::PassWithoutZeroExit, "exit status 0"),
+            (
+                GateAttestationRefusal::MissingDispatch { id: 7 },
+                "does not exist",
+            ),
+        ];
+
+        for (refusal, distinctive_word) in refusals {
+            let message = refusal.to_string();
+            assert!(
+                message.contains(distinctive_word),
+                "{refusal:?} formatted unexpectedly: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn records_and_reads_newest_first() {
         let (db, row, att) = fixture();
         let first = db
