@@ -260,6 +260,11 @@ fn notify_drop_target(message: &str) {
     }
 }
 
+/// Raise an Alert toast from a DB-writer job; no-op when no UI target is installed.
+pub(crate) fn alert(message: &str) {
+    notify_drop_target(message);
+}
+
 fn enqueue(writer: &Writer, job: impl FnOnce(&Db) + Send + 'static) -> bool {
     if !reserve(&writer.state) {
         note_drop(&writer.state);
