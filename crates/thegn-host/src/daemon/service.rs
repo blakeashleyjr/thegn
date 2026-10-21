@@ -2626,14 +2626,21 @@ impl ControlApi for DaemonService {
                     )?;
                     match verified {
                         Err(refusal) => Ok(Err(refusal)),
-                        Ok(_grant) => {
-                            let note = db.append_dispatch_note_record(id, &req.text)?;
-                            Ok(Ok(thegn_svc::control::DispatchNoteReply {
+                        Ok(_grant) => match db.append_dispatch_note_record(id, &req.text) {
+                            Ok(note) => Ok(Ok(Ok(thegn_svc::control::DispatchNoteReply {
                                 id,
                                 note_id: note.id,
                                 created_at_ms: note.created_at_ms,
-                            }))
-                        }
+                            }))),
+                            Err(error)
+                                if error
+                                    .downcast_ref::<thegn_core::db::DispatchNoteQuotaExceeded>()
+                                    .is_some() =>
+                            {
+                                Ok(Ok(Err(error.to_string())))
+                            }
+                            Err(error) => Err(error),
+                        },
                     }
                 })
                 .await?;
@@ -2644,7 +2651,8 @@ impl ControlApi for DaemonService {
                 } else {
                     ControlError::FailedPrecondition(format!("dispatch capability refused: {}", refusal.kind()))
                 }
-            })
+            })?
+            .map_err(ControlError::ResourceExhausted)
         })
     }
 
