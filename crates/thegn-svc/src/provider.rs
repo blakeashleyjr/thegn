@@ -379,14 +379,24 @@ impl DaytonaProvider {
             .map(str::to_string)
     }
 
-    /// Parse a list response (an array, or `{ "sandboxes": [...] }`).
-    fn parse_list(v: &serde_json::Value) -> Vec<String> {
+    /// Parse a complete list response (an array, or `{ "sandboxes": [...] }`).
+    fn parse_list(v: &serde_json::Value) -> Result<Vec<String>> {
         let arr = v
             .as_array()
-            .cloned()
-            .or_else(|| v.get("sandboxes").and_then(|s| s.as_array()).cloned())
-            .unwrap_or_default();
-        arr.iter().filter_map(Self::parse_id).collect()
+            .or_else(|| v.get("sandboxes").and_then(serde_json::Value::as_array))
+            .ok_or_else(|| {
+                anyhow!("daytona: GET /sandbox returned an unrecognised list envelope")
+            })?;
+        arr.iter()
+            .enumerate()
+            .map(|(index, sandbox)| {
+                Self::parse_id(sandbox)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("daytona: GET /sandbox element {index} has no sandbox id")
+                    })
+            })
+            .collect()
     }
 
     /// The exec handle for a created sandbox id: the `daytona` CLI ssh bridge
@@ -462,8 +472,12 @@ impl RemoteProvider for DaytonaProvider {
                 .send()
                 .await
                 .context("daytona: GET /sandbox")?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(anyhow!("daytona list failed ({status})"));
+            }
             let body = response_json(resp, "daytona", "GET /sandbox").await?;
-            Ok(Self::parse_list(&body))
+            Self::parse_list(&body)
         })
     }
 }
@@ -588,14 +602,36 @@ impl SpritesProvider {
             .map(str::to_string)
     }
 
-    /// Parse a list response (an array, or `{ "sprites": [...] }`).
-    fn parse_list(v: &serde_json::Value) -> Vec<String> {
+    /// Parse a complete list response (an array, or `{ "sprites": [...] }`).
+    fn parse_list(v: &serde_json::Value) -> Result<Vec<String>> {
+        if let Some(has_more) = v.get("has_more") {
+            let Some(has_more) = has_more.as_bool() else {
+                return Err(anyhow!(
+                    "sprites: GET /sprites returned a partial inventory (invalid has_more)"
+                ));
+            };
+            if has_more {
+                return Err(anyhow!(
+                    "sprites: GET /sprites returned a partial inventory (has_more); refusing to treat it as complete"
+                ));
+            }
+        }
         let arr = v
             .as_array()
-            .cloned()
-            .or_else(|| v.get("sprites").and_then(|s| s.as_array()).cloned())
-            .unwrap_or_default();
-        arr.iter().filter_map(Self::parse_name).collect()
+            .or_else(|| v.get("sprites").and_then(serde_json::Value::as_array))
+            .ok_or_else(|| {
+                anyhow!("sprites: GET /sprites returned an unrecognised list envelope")
+            })?;
+        arr.iter()
+            .enumerate()
+            .map(|(index, sprite)| {
+                Self::parse_name(sprite)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("sprites: GET /sprites element {index} has no sprite name")
+                    })
+            })
+            .collect()
     }
 
     /// The exec handle for a sprite: the `sprite` CLI exec bridge (PTY-capable).
@@ -734,7 +770,7 @@ impl RemoteProvider for SpritesProvider {
                         let status = resp.status();
                         if status.is_success() {
                             let body = response_json(resp, "sprites", "GET /sprites").await?;
-                            return Ok(Self::parse_list(&body));
+                            return Self::parse_list(&body);
                         }
                         last = Some(status.to_string());
                         if !transient_status(status) {
@@ -932,7 +968,11 @@ impl SpritesProvider {
     }
     /// Parse a checkpoint list element (`{ "id", "comment"? }`).
     fn parse_checkpoint(v: &serde_json::Value) -> Option<CheckpointInfo> {
-        let id = v.get("id").and_then(|i| i.as_str())?.to_string();
+        let id = v
+            .get("id")
+            .and_then(|i| i.as_str())
+            .filter(|id| !id.is_empty())?
+            .to_string();
         let label = v
             .get("comment")
             .or_else(|| v.get("label"))
@@ -940,6 +980,24 @@ impl SpritesProvider {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         Some(CheckpointInfo { id, label })
+    }
+
+    /// Parse a complete checkpoint list (an array, or `{ "checkpoints": [...] }`).
+    fn parse_checkpoint_list(v: &serde_json::Value) -> Result<Vec<CheckpointInfo>> {
+        let arr = v
+            .as_array()
+            .or_else(|| v.get("checkpoints").and_then(serde_json::Value::as_array))
+            .ok_or_else(|| {
+                anyhow!("sprites: GET /checkpoints returned an unrecognised list envelope")
+            })?;
+        arr.iter()
+            .enumerate()
+            .map(|(index, checkpoint)| {
+                Self::parse_checkpoint(checkpoint).ok_or_else(|| {
+                    anyhow!("sprites: GET /checkpoints element {index} has no checkpoint id")
+                })
+            })
+            .collect()
     }
     /// Extract the new checkpoint id from the create stream's NDJSON lines. The
     /// `complete` message reads `Checkpoint <id> created successfully`; an info
@@ -1010,13 +1068,12 @@ impl ProviderCheckpoints for SpritesProvider {
                 .send()
                 .await
                 .context("sprites: GET /checkpoints")?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(anyhow!("sprites checkpoint list failed ({status})"));
+            }
             let v = response_json(resp, "sprites", "GET /checkpoints").await?;
-            let arr = v
-                .as_array()
-                .cloned()
-                .or_else(|| v.get("checkpoints").and_then(|c| c.as_array()).cloned())
-                .unwrap_or_default();
-            Ok(arr.iter().filter_map(Self::parse_checkpoint).collect())
+            Self::parse_checkpoint_list(&v)
         })
     }
 
@@ -2406,8 +2463,8 @@ impl Provider {
     pub async fn list(&self) -> Result<Vec<String>> {
         match self.remote() {
             Some(p) => p.list().await,
-            // Exec-only: it manages no sandboxes of its own, so it lists none.
-            None => Ok(Vec::new()),
+            // Exec-only: listing belongs to the sandbox's underlying provider.
+            None => Err(iroh_exec_only("list")),
         }
     }
 
@@ -2762,6 +2819,27 @@ mod tests {
         SpritesProvider::new("https://api.sprites.dev/v1/", "tok", "my-sprite")
     }
 
+    async fn list_response(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let status = status.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
     #[test]
     fn sprites_default_base_and_urls() {
         let p = sprites();
@@ -3103,11 +3181,39 @@ mod tests {
 
     #[test]
     fn sprites_parse_list_array_and_envelope() {
-        let arr = serde_json::json!([{"name": "a"}, {"name": "b"}, {"id": "no-name"}]);
-        assert_eq!(SpritesProvider::parse_list(&arr), vec!["a", "b"]);
+        let arr = serde_json::json!([{"name": "a"}, {"name": "b"}]);
+        assert_eq!(SpritesProvider::parse_list(&arr).unwrap(), vec!["a", "b"]);
         let env = serde_json::json!({"sprites": [{"name": "c"}]});
-        assert_eq!(SpritesProvider::parse_list(&env), vec!["c"]);
-        assert!(SpritesProvider::parse_list(&serde_json::json!({})).is_empty());
+        assert_eq!(SpritesProvider::parse_list(&env).unwrap(), vec!["c"]);
+        assert!(SpritesProvider::parse_list(&serde_json::json!([{"id": "no-name"}])).is_err());
+        assert!(SpritesProvider::parse_list(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn sprites_parse_list_is_strict() {
+        assert!(SpritesProvider::parse_list(&serde_json::json!({})).is_err());
+        let partial = SpritesProvider::parse_list(&serde_json::json!({
+            "sprites": [{"name": "a"}],
+            "has_more": true
+        }));
+        assert!(partial.unwrap_err().to_string().contains("has_more"));
+        assert!(
+            SpritesProvider::parse_list(&serde_json::json!({
+                "sprites": [],
+                "has_more": "no"
+            }))
+            .is_err()
+        );
+        let real_shape = serde_json::json!({
+            "name": "blake-270",
+            "sprites": [{"id": "sprite-abc", "name": "tgtest1", "status": "warm"}],
+            "has_more": false
+        });
+        assert_eq!(
+            SpritesProvider::parse_list(&real_shape).unwrap(),
+            vec!["tgtest1"]
+        );
+        assert!(SpritesProvider::parse_list(&serde_json::json!([{"id": "no-name"}])).is_err());
     }
 
     #[test]
@@ -3787,11 +3893,72 @@ mod tests {
 
     #[test]
     fn parse_list_handles_array_and_envelope() {
-        let arr = serde_json::json!([{"id": "a"}, {"id": "b"}, {"name": "no-id"}]);
-        assert_eq!(DaytonaProvider::parse_list(&arr), vec!["a", "b"]);
+        let arr = serde_json::json!([{"id": "a"}, {"id": "b"}]);
+        assert_eq!(DaytonaProvider::parse_list(&arr).unwrap(), vec!["a", "b"]);
         let env = serde_json::json!({"sandboxes": [{"id": "c"}]});
-        assert_eq!(DaytonaProvider::parse_list(&env), vec!["c"]);
-        assert!(DaytonaProvider::parse_list(&serde_json::json!({})).is_empty());
+        assert_eq!(DaytonaProvider::parse_list(&env).unwrap(), vec!["c"]);
+        assert!(DaytonaProvider::parse_list(&serde_json::json!([{"name": "no-id"}])).is_err());
+        assert!(DaytonaProvider::parse_list(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn daytona_parse_list_is_strict() {
+        assert!(DaytonaProvider::parse_list(&serde_json::json!({})).is_err());
+        assert!(DaytonaProvider::parse_list(&serde_json::Value::Null).is_err());
+        let malformed = DaytonaProvider::parse_list(&serde_json::json!([
+            {"id": "a"},
+            {"name": "no-id"}
+        ]));
+        assert!(malformed.unwrap_err().to_string().contains("element 1"));
+        assert!(DaytonaProvider::parse_list(&serde_json::json!([{"id": ""}])).is_err());
+        assert_eq!(
+            DaytonaProvider::parse_list(&serde_json::json!([{"id": "a"}])).unwrap(),
+            vec!["a"]
+        );
+        assert_eq!(
+            DaytonaProvider::parse_list(&serde_json::json!({"sandboxes": [{"id": "c"}]})).unwrap(),
+            vec!["c"]
+        );
+    }
+
+    #[test]
+    fn sprites_checkpoint_list_parse_is_strict() {
+        let checkpoints = serde_json::json!([
+            {"id": "cp-1", "create_time": "2025-01-01", "is_auto": true},
+            {"id": "cp-2", "create_time": "2025-01-02", "is_auto": false}
+        ]);
+        let parsed = SpritesProvider::parse_checkpoint_list(&checkpoints).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|checkpoint| checkpoint.label.is_none()));
+        assert!(
+            SpritesProvider::parse_checkpoint_list(&serde_json::json!({"checkpoints": {}}))
+                .is_err()
+        );
+        assert!(SpritesProvider::parse_checkpoint_list(&serde_json::json!([{"x": 1}])).is_err());
+        assert!(SpritesProvider::parse_checkpoint_list(&serde_json::json!([{"id": ""}])).is_err());
+    }
+
+    #[tokio::test]
+    async fn daytona_list_refuses_a_non_success_status() {
+        let (base, server) =
+            list_response("500 Internal Server Error", r#"{"sandboxes":[]}"#).await;
+        let error = DaytonaProvider::new(&base, "tok", "snap")
+            .list()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("500"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sprites_checkpoint_list_refuses_a_non_success_status() {
+        let (base, server) = list_response("403 Forbidden", "[]").await;
+        let error = SpritesProvider::new(&base, "tok", "sprite")
+            .list_checkpoints("sprite")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("403"));
+        server.await.unwrap();
     }
 
     #[test]
