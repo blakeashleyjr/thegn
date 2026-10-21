@@ -174,9 +174,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // earlier in-memory indices stay valid without opening SQLite on the loop.
     let cfg = cx.cfg.clone();
     crate::db_task::persist_critical(move |db| {
-        for group in &removed_groups {
-            crate::run::forget_worktree_group(db, &session_id, group, true, Some(&cfg));
-        }
+        close_groups_durably(db, &session_id, &removed_groups, Some(&cfg));
     });
 
     // Plan the landing against the rows still on screen, then close from the
@@ -215,6 +213,42 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         cx.drawer_runtime
             .reconcile(cx.cfg, &dir, cx.panes, cx.center);
     }
+}
+
+pub(crate) fn close_groups_durably(
+    db: &thegn_core::db::Db,
+    session_id: &str,
+    groups: &[crate::session::WorktreeGroup],
+    cfg: Option<&thegn_core::config::Config>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for group in groups {
+        if group.path.is_empty() {
+            crate::run::forget_worktree_group(db, session_id, group, true, cfg);
+            continue;
+        }
+        let result = thegn_core::worktree_suppress::keys_for(std::path::Path::new(&group.path))
+            .and_then(|keys| {
+                thegn_core::worktree_suppress::close_with_suppression(
+                    db,
+                    &group.path,
+                    &keys,
+                    &thegn_core::worktree_suppress::record_json(&group.path, &group.name),
+                )
+            });
+        if let Err(error) = result {
+            tracing::warn!(
+                target: "thegn::worktree",
+                path = %group.path,
+                %error,
+                "close kept the worktree registered: could not record the close"
+            );
+            failures.push(format!("{}: {error}", group.path));
+        } else {
+            crate::run::forget_worktree_group(db, session_id, group, true, cfg);
+        }
+    }
+    failures
 }
 
 /// What the cached sidebar status says about a delete target's working tree.
@@ -649,8 +683,9 @@ fn landing_for_slug(session: &crate::session::Session, slug: Option<&str>) -> Op
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetState, group_names_for, hide_pending_deletes, landing_for_slug, next_or_prev,
-        pending_delete_refusal, pending_target_refusal, resolve_group_indices, target_state,
+        TargetState, close_groups_durably, group_names_for, hide_pending_deletes, landing_for_slug,
+        next_or_prev, pending_delete_refusal, pending_target_refusal, resolve_group_indices,
+        target_state,
     };
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use std::collections::HashSet;
@@ -1004,5 +1039,39 @@ mod tests {
         hide_pending_deletes(&mut rows, &HashSet::from(["/tmp/pending".to_string()]));
 
         assert_eq!(rows[0].child_count, 3);
+    }
+
+    #[test]
+    fn close_suppress_records_and_forgets() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        use thegn_core::store::WorkspaceStore;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("external");
+        let path = path.to_string_lossy().into_owned();
+        db.put_worktree("repo/feature", "/repo", &path, "feature", None, None)
+            .unwrap();
+        let group = WorktreeGroup::new("repo/feature".to_string(), GroupKind::Branch, path.clone());
+
+        assert!(close_groups_durably(&db, "session", &[group], None).is_empty());
+
+        assert!(db.worktree_record(&path).unwrap().is_none());
+        let keys = thegn_core::worktree_suppress::keys_for(std::path::Path::new(&path)).unwrap();
+        assert!(thegn_core::worktree_suppress::is_suppressed(&db, &keys).unwrap());
+    }
+
+    #[test]
+    fn close_suppress_keeps_the_row_when_identity_fails() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        use thegn_core::store::WorkspaceStore;
+        let path = "rel/wt";
+        db.put_worktree("repo/feature", "/repo", path, "feature", None, None)
+            .unwrap();
+        let group = WorktreeGroup::new("repo/feature".to_string(), GroupKind::Branch, path);
+
+        let failures = close_groups_durably(&db, "session", &[group], None);
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains(path));
+        assert!(db.worktree_record(path).unwrap().is_some());
     }
 }
