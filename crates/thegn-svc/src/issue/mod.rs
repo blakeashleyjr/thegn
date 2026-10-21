@@ -2974,7 +2974,7 @@ mod tests {
             }
         }
 
-        fn read<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        fn read(&self, limit: usize) -> BoxFuture<'_, Result<Vec<Issue>, IssueError>> {
             Box::pin(async move {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2992,7 +2992,9 @@ mod tests {
                         Ok(rows)
                     }
                     MatrixMode::Fail => Err(IssueError::Api("matrix failure".into())),
-                    MatrixMode::Hang => std::future::pending::<()>().await,
+                    MatrixMode::Hang => {
+                        std::future::pending::<Result<Vec<Issue>, IssueError>>().await
+                    }
                 }
             })
         }
