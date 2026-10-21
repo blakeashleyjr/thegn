@@ -4466,20 +4466,9 @@ pub(crate) fn credential_overlay_gate(
     }
     if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
         cfg.workspace_overlay_for_tab_slug(db, slug)
+        && thegn_core::workspace_overlay::refusal_carries_credentials(&cfg.workspace, &refusal)
     {
-        let key = match &refusal {
-            thegn_core::workspace_overlay::OverlayRefusal::AliasCollision { key, .. }
-            | thegn_core::workspace_overlay::OverlayRefusal::NonCanonicalKey {
-                canonical: key,
-                ..
-            }
-            | thegn_core::workspace_overlay::OverlayRefusal::AmbiguousRepositories {
-                key, ..
-            } => key,
-        };
-        if thegn_core::workspace_overlay::candidates_carry_credentials(&cfg.workspace, key) {
-            anyhow::bail!("agent launch refused: {refusal}");
-        }
+        anyhow::bail!("agent launch refused: {refusal}");
     }
     Ok(())
 }
