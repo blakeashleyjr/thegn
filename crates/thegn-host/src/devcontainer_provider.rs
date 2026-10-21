@@ -300,7 +300,7 @@ pub(crate) fn install_failing_test_session(
     }
 
     let content = std::fs::read(config_path)?;
-    let digest = config_digest_bytes(&content);
+    let digest = config_digest(config_path)?;
     let snapshot = snapshot_config(config_path, &digest, &content)?;
     let handle = DevcontainerHandle {
         executable: "fake-devcontainer".into(),
@@ -613,20 +613,55 @@ impl DevcontainerProvider for CliProvider {
     }
 }
 
-/// Hash the selected file's bytes for the provider trust boundary. The
-/// provider snapshot is kept beside the original so the devcontainer CLI
-/// resolves Dockerfile, Compose, and mount paths relative to the same
-/// directory.
+/// Hash the selected config and its referenced files for the provider trust
+/// boundary. The provider snapshot is kept beside the original so the
+/// devcontainer CLI resolves Dockerfile, Compose, and mount paths relative to
+/// the same directory.
 pub(crate) fn config_digest(path: &Path) -> anyhow::Result<[u8; 32]> {
     let bytes = std::fs::read(path)
         .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", path.display()))?;
-    Ok(config_digest_bytes(&bytes))
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "devcontainer config has no parent directory: {}",
+            path.display()
+        )
+    })?;
+    closure_digest(parent, &bytes)
 }
 
-fn config_digest_bytes(bytes: &[u8]) -> [u8; 32] {
+fn closure_digest(config_dir: &Path, config_bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let text = std::str::from_utf8(config_bytes)
+        .map_err(|error| anyhow::anyhow!("devcontainer config is not UTF-8: {error}"))?;
+    let config = thegn_core::devcontainer::parse(text)
+        .map_err(|error| anyhow::anyhow!("cannot parse devcontainer config: {error}"))?;
+    let references = thegn_core::devcontainer_overlay::referenced_files(&config, config_dir)
+        .map_err(anyhow::Error::msg)?;
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
+    hasher.update(b"thegn.devcontainer.closure.v1\0");
+    hasher.update((config_bytes.len() as u64).to_le_bytes());
+    hasher.update(config_bytes);
+    for reference in references {
+        let relative = reference.strip_prefix(config_dir).map_err(|error| {
+            anyhow::anyhow!(
+                "devcontainer reference {} is outside its config directory: {error}",
+                reference.display()
+            )
+        })?;
+        let relative = relative.to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "devcontainer reference {} has a non-UTF-8 relative path",
+                reference.display()
+            )
+        })?;
+        let bytes = std::fs::read(&reference).map_err(|error| {
+            anyhow::anyhow!("cannot read devcontainer reference `{relative}`: {error}")
+        })?;
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn snapshot_config(
@@ -634,8 +669,14 @@ fn snapshot_config(
     expected: &[u8; 32],
     content: &[u8],
 ) -> anyhow::Result<Arc<tempfile::NamedTempFile>> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "devcontainer config has no parent directory: {}",
+            path.display()
+        )
+    })?;
     anyhow::ensure!(
-        config_digest_bytes(content) == *expected,
+        closure_digest(parent, content)? == *expected,
         "parsed devcontainer config content no longer matches its trust digest"
     );
     // Reject an already-observed repository change, but never pass this
@@ -952,6 +993,95 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("failed with"), "{message}");
         assert!(message.contains("provider broke"), "{message}");
+    }
+
+    #[test]
+    fn closure_digest_changes_when_the_dockerfile_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "build": { "dockerfile": "Dockerfile" } }"#,
+        )
+        .unwrap();
+        let dockerfile = config_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM scratch\n").unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        std::fs::write(&dockerfile, "FROM alpine:3\n").unwrap();
+        let error = verify_config_digest(&config_path, &digest).unwrap_err();
+        assert!(error.to_string().contains("refusing provider use"));
+    }
+
+    #[test]
+    fn closure_digest_changes_when_a_compose_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        let compose = config_dir.join("compose.yml");
+        std::fs::write(&compose, "services: {}\n").unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        std::fs::write(&compose, "services:\n  app: {}\n").unwrap();
+        let error = verify_config_digest(&config_path, &digest).unwrap_err();
+        assert!(error.to_string().contains("refusing provider use"));
+    }
+
+    #[test]
+    fn closure_digest_refuses_a_missing_or_escaping_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "build": { "dockerfile": "Dockerfile" } }"#,
+        )
+        .unwrap();
+        let error = config_digest(&config_path).unwrap_err();
+        assert!(error.to_string().contains("Dockerfile"));
+        assert!(error.to_string().contains("cannot read"));
+
+        std::fs::write(
+            &config_path,
+            r#"{ "build": { "dockerfile": "../../outside/Dockerfile" } }"#,
+        )
+        .unwrap();
+        let error = config_digest(&config_path).unwrap_err();
+        assert!(error.to_string().contains("../../outside/Dockerfile"));
+        assert!(error.to_string().contains("escapes the repository"));
+    }
+
+    #[test]
+    fn closure_digest_is_stable_for_unchanged_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "build": { "dockerfile": "Dockerfile" } }"#,
+        )
+        .unwrap();
+        std::fs::write(config_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        assert_eq!(
+            config_digest(&config_path).unwrap(),
+            config_digest(&config_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn closure_digest_of_an_image_config_needs_no_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(&config_path, r#"{ "image": "repo" }"#).unwrap();
+        assert!(config_digest(&config_path).is_ok());
     }
 
     #[test]
