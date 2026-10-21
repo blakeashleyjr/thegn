@@ -96,7 +96,7 @@ fn active_projection_and_sync_refuse_before_hooks_or_explicit_runtime_teardown()
             &before_queue[0],
             true,
         );
-        let CleanupOutcome::Refused { reason } = result else {
+        let CleanupOutcome::Refused { reason, .. } = result else {
             panic!("attached resource admitted automatic cleanup: {result:?}");
         };
         assert!(reason.contains("projection/provider sync"), "{reason}");
