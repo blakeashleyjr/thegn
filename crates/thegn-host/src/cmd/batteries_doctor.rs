@@ -391,6 +391,11 @@ mod tests {
     use super::{BatteriesEnv, ComponentState, inspect_with, lines};
     use std::fs;
 
+    fn write_executable(path: &std::path::Path) {
+        fs::copy(std::env::current_exe().expect("test executable path"), path)
+            .expect("copy executable fixture");
+    }
+
     fn env(root: &std::path::Path) -> BatteriesEnv {
         BatteriesEnv {
             os: "linux",
@@ -512,12 +517,16 @@ mod tests {
             "  terminal  present — Alacritty at {}",
             bin.display()
         )));
-        assert!(rendered.contains("  font  MISSING — FiraCode Nerd Font files not found"));
+        assert!(
+            rendered.contains(&"  font  MISSING — FiraCode Nerd Font files not found".to_string())
+        );
         assert!(rendered.contains(&format!(
             "  alacritty config  present — writable {}",
             config.display()
         )));
-        assert!(rendered.contains("  launcher  MISSING — tg launcher not found on PATH"));
+        assert!(
+            rendered.contains(&"  launcher  MISSING — tg launcher not found on PATH".to_string())
+        );
         assert_eq!(
             rendered
                 .iter()
