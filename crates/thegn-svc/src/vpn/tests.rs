@@ -187,7 +187,7 @@ fn plan_fingerprint_tracks_credentials_routes_and_image() {
     );
 
     let mut image = ts_cfg();
-    image.sidecar_image = Some("example.invalid/tailscale:test".into());
+    image.sidecar_image = "example.invalid/tailscale:test".into();
     assert_ne!(
         first,
         plan_fingerprint(

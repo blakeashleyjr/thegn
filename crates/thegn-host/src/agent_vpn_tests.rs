@@ -268,11 +268,17 @@ fn drifted_sidecar_is_refused_and_not_rolled_back() {
     let mut provider = fake(false);
     provider.up_drift = true;
     let calls = provider.calls.clone();
+    let sidecar = thegn_core::sandbox::vpn_sidecar_name(&spec.name);
     let rt = OciRuntime::new(vec!["unused-runtime".into()]);
 
     let result = attach_vpn_with(&mut spec, &provider, &rt, record_removal(&calls));
 
     assert!(result.is_err());
+    assert_eq!(*calls.ups.lock().unwrap(), vec![sidecar]);
+    assert!(result.as_ref().err().is_some_and(|error| {
+        let message = error.to_string();
+        message.starts_with("vpn: sidecar ") && message.contains("different tunnel configuration")
+    }));
     assert!(calls.downs.lock().unwrap().is_empty());
     assert!(calls.removals.lock().unwrap().is_empty());
 }
