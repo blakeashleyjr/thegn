@@ -146,7 +146,8 @@ result is not accepted as proof. Completion of a stage with an artifact is
 refused while thegn cannot read the worktree's git status; retry when it can,
 or record an explicit forced completion.
 
-Before `thegn dispatch set-status <row> done`, the Lead runs
+Before `thegn dispatch set-status <row> done` on a stage row with a worktree,
+the Lead runs
 `thegn dispatch gate <row>` to record an attestation for the committed HEAD;
 without a satisfied attestation, normal completion is refused. If a worker is
 gone and its report claims PASS without an attestation for its HEAD, the reaper
