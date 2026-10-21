@@ -101,6 +101,22 @@ pub(crate) fn stderr_with_timeout(argv: &[String], timeout: Duration) -> Option<
     .into_stderr()
 }
 
+/// Run an OCI command while retaining bounded stdout and stderr for fail-closed probes.
+pub(crate) fn output_and_stderr_with_timeout(
+    argv: &[String],
+    timeout: Duration,
+) -> Option<(bool, String, String)> {
+    proc::run_bounded(
+        argv,
+        timeout,
+        proc::Capture {
+            stdout: Some(256 * 1024),
+            stderr: Some(256 * 1024),
+        },
+    )
+    .into_stdout_and_stderr()
+}
+
 /// Run a control command while delivering a bounded secret payload on stdin.
 /// The feeder owns only the pipe; this function retains ownership of the child
 /// and kills and waits for it on write failure or timeout.
@@ -554,6 +570,8 @@ pub struct SandboxSpec {
     /// never mounted wholesale. A backend that cannot honor this is refused by
     /// [`crate::sandbox_floor::home_gate`] rather than silently exposing `$HOME`.
     pub seal_home: Option<String>,
+    /// Named volumes bound to a devcontainer owner id; empty for every non-devcontainer launch.
+    pub volume_owners: Vec<(String, String)>,
 }
 
 /// Why a programmatic/configured named volume was refused. The error carries
@@ -610,6 +628,8 @@ pub enum RefusalClass {
     HostnamePolicy,
     /// A local mount source could not be resolved to a stable host path.
     MountUnresolvable,
+    /// A named devcontainer volume belongs to another devcontainer identity.
+    VolumeOwner,
     /// A tunnel-only profile was requested but thegn cannot enforce that the tunnel is the only route.
     TunnelUnenforced,
     /// A mounted bind source no longer matches the identity admitted before create.
@@ -630,6 +650,7 @@ impl RefusalClass {
             Self::ComposeServiceMissing => "compose-service-missing",
             Self::HostnamePolicy => "hostname-policy",
             Self::MountUnresolvable => "mount-unresolvable",
+            Self::VolumeOwner => "volume-owner",
             Self::TunnelUnenforced => "tunnel-unenforced",
             Self::MountDrift => "mount-drift",
             Self::StrictUnsupported => "strict-unsupported",
@@ -662,6 +683,10 @@ impl RefusalClass {
             }
             Self::MountUnresolvable => {
                 "create the mount source or remove the mount from the config, then relaunch"
+            }
+            Self::VolumeOwner => {
+                "a named volume belongs to another devcontainer: rename the volume in devcontainer.json, \
+                 or remove the other volume after checking its contents"
             }
             Self::TunnelUnenforced => {
                 "use profile 'standard' with [sandbox.vpn], or 'sealed' for no network"
@@ -735,7 +760,7 @@ impl From<VolumeAdmissionError> for EnterError {
     }
 }
 
-fn refusal(
+pub(crate) fn refusal(
     spec: &SandboxSpec,
     class: RefusalClass,
     path: Option<String>,
@@ -1645,6 +1670,11 @@ fn resolve_placed_with(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        volume_owners: cfg
+            .volume_owners
+            .iter()
+            .map(|(name, owner)| (name.clone(), owner.clone()))
+            .collect(),
         compose: cfg.compose.clone(),
         build: cfg.build.clone(),
         init_script: (!cfg.init_script.trim().is_empty()).then(|| cfg.init_script.clone()),
@@ -2532,6 +2562,19 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
     crate::sandbox_build::build_image(spec)?;
+    if !spec.volume_owners.is_empty() {
+        let mut runner = |argv: &[String]| {
+            let full = spec.placement.control_argv(argv);
+            let timeout = if spec.placement.is_local() {
+                PROBE_TIMEOUT
+            } else {
+                REMOTE_PROBE_TIMEOUT
+            };
+            output_and_stderr_with_timeout(&full, timeout)
+        };
+        crate::sandbox_volume_owner::claim_volumes(spec, &util::xdg_state_home(), &mut runner)
+            .map_err(anyhow::Error::new)?;
+    }
     let admitted = crate::sandbox_mountcheck::admitted_identities(spec);
     use crate::progress::{SandboxPhase, emit};
     emit(SandboxPhase::ContainerCreate {
