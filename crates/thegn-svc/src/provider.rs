@@ -853,17 +853,17 @@ fn canonical_domain(entry: &str) -> std::result::Result<Option<String>, PolicyRu
             entry: trimmed.to_string(),
         });
     }
+    if trimmed == "*." {
+        return Err(PolicyRuleError::Malformed {
+            entry: trimmed.to_ascii_lowercase(),
+            reason: "wildcard must be followed by a domain",
+        });
+    }
 
     let without_dot = trimmed.strip_suffix('.').unwrap_or(trimmed);
     let lowered = without_dot.to_ascii_lowercase();
     if lowered.parse::<std::net::IpAddr>().is_ok() || lowered.starts_with('[') {
         return Err(PolicyRuleError::IpLiteral { entry: lowered });
-    }
-    if lowered == "*." {
-        return Err(PolicyRuleError::Malformed {
-            entry: lowered,
-            reason: "wildcard must be followed by a domain",
-        });
     }
     if lowered == "*" {
         return Ok(Some(lowered));
@@ -909,6 +909,16 @@ fn canonical_domain(entry: &str) -> std::result::Result<Option<String>, PolicyRu
                 reason: "labels may contain only ASCII letters, digits, hyphens and underscores",
             });
         }
+    }
+    if domain
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(PolicyRuleError::Malformed {
+            entry: lowered,
+            reason: "final domain label may not be numeric",
+        });
     }
     Ok(Some(lowered))
 }
@@ -3883,6 +3893,19 @@ mod tests {
                 rules_from(&[entry.into()], &[]),
                 Err(PolicyRuleError::Malformed { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn rules_from_refuses_domains_with_numeric_final_labels() {
+        for entry in ["1.2.3", "0x7f.1", "*.example.123"] {
+            assert!(
+                matches!(
+                    rules_from(&[entry.into()], &[]),
+                    Err(PolicyRuleError::Malformed { .. })
+                ),
+                "accepted numeric final label in {entry:?}"
+            );
         }
     }
 
