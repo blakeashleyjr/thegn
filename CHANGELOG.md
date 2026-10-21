@@ -7,6 +7,8 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.26] — 2026-10-21 (maintenance batch 63)
+
 ## [0.1.0-alpha.25] — 2026-10-21 (maintenance batch 62)
 
 - VPN sidecar reuse now checks the resolved tunnel configuration. An unlabelled
@@ -1325,7 +1327,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.25...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.26...HEAD
+[0.1.0-alpha.26]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.25...v0.1.0-alpha.26
 [0.1.0-alpha.25]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.24...v0.1.0-alpha.25
 [0.1.0-alpha.24]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.23...v0.1.0-alpha.24
 [0.1.0-alpha.23]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.22...v0.1.0-alpha.23
