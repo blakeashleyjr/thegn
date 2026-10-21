@@ -37,8 +37,9 @@ with owner `root:root` and mode `0600`, or provide `GH_PAT` once in the setup
 environment. The script writes that environment value directly to the
 root-only token file and removes it from its environment. The operator's `gh`
 login is not used, and the token is never stored in the runner account or
-passed to a job. Do not set `NIX_GITHUB_TOKEN`: setup refuses it, and it is not
-written to a runner `nix.conf`.
+passed to a job. `NIX_GITHUB_TOKEN` is optional: all flake inputs are public, so
+no token is needed. Keep it unset because setup refuses it and it is not written
+to a runner `nix.conf`.
 
 To enter the token without putting it in shell history, run:
 
