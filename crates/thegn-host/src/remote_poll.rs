@@ -284,7 +284,14 @@ fn repo_key(host_path: &str, loc: &GitLoc) -> Option<String> {
     if let Some(k) = lock().repo_of.get(host_path) {
         return Some(k.clone());
     }
-    let common = loc.git_out(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = match loc.git_text(&["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
+        Ok(common) if !common.is_empty() => common,
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::debug!(target: "thegn::git", worktree = %host_path, %error, "could not resolve the repo for auto-fetch");
+            return None;
+        }
+    };
     let key = match loc {
         GitLoc::Local(_) => common,
         GitLoc::Remote { ssh, .. } => format!("ssh:{}:{}:{common}", ssh.host, ssh.port),
@@ -300,20 +307,25 @@ fn repo_key(host_path: &str, loc: &GitLoc) -> Option<String> {
 
 /// The remote to poll for the checked-out branch: its configured
 /// `branch.<name>.remote`, else `origin` when the repo has one, else the first
-/// remote. `None` for a repo with no remotes at all (nothing to poll).
-fn remote_for(loc: &GitLoc) -> Option<String> {
-    if let Some(branch) = loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+/// remote. `Ok(None)` means a readable repo has no remotes; a failed deciding
+/// remote-list read is returned so the caller can back off.
+fn remote_for(loc: &GitLoc) -> Result<Option<String>, thegn_core::git_run::GitTextError> {
+    if let Ok(branch) = loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"])
         && branch != "HEAD"
-        && let Some(r) = loc.git_out(&["config", "--get", &format!("branch.{branch}.remote")])
+        && let Ok(r) = loc.git_text(&["config", "--get", &format!("branch.{branch}.remote")])
+        && !r.is_empty()
     {
-        return Some(r);
+        return Ok(Some(r));
     }
-    let remotes = loc.git_out(&["remote"])?;
+    let remotes = loc.git_text(&["remote"])?;
+    if remotes.is_empty() {
+        return Ok(None);
+    }
     let mut names = remotes.lines().map(str::trim).filter(|s| !s.is_empty());
     if remotes.lines().any(|l| l.trim() == "origin") {
-        return Some("origin".to_string());
+        return Ok(Some("origin".to_string()));
     }
-    names.next().map(str::to_string)
+    Ok(names.next().map(str::to_string))
 }
 
 /// Run the background fetch. Non-interactive by construction: no terminal
@@ -404,8 +416,12 @@ fn parse_remote_worktree_branches(porcelain: &str) -> Vec<(String, Option<String
 }
 
 fn session_checkouts(loc: &GitLoc, session_worktrees: &[String]) -> Vec<(String, Option<String>)> {
-    let Some(porcelain) = loc.git_out(&["worktree", "list", "--porcelain"]) else {
-        return Vec::new();
+    let porcelain = match loc.git_text(&["worktree", "list", "--porcelain"]) {
+        Ok(porcelain) => porcelain,
+        Err(error) => {
+            tracing::debug!(target: "thegn::git", %error, "could not list remote checkouts after auto-fetch");
+            return Vec::new();
+        }
     };
     let worktrees = parse_remote_worktree_branches(&porcelain);
     let session: HashMap<std::path::PathBuf, &String> =
@@ -611,7 +627,7 @@ fn poll_one(
         return FetchOutcome::NotRun;
     }
     let result = match remote_for(&loc) {
-        Some(remote) => {
+        Ok(Some(remote)) => {
             let before = remote_ref_fingerprint(&loc, &common_dir);
             let result = run_fetch(&loc, &remote);
             let ok = result.is_ok();
@@ -620,7 +636,8 @@ fn poll_one(
         }
         // No remotes configured: nothing to poll, but treat it as a success so
         // the repo just rides the normal interval instead of backing off.
-        None => (Ok(()), FetchOutcome::NotRun),
+        Ok(None) => (Ok(()), FetchOutcome::NotRun),
+        Err(error) => (Err(error.to_string()), FetchOutcome::NotRun),
     };
     let (result, outcome) = result;
     let ok = result.is_ok();
@@ -709,6 +726,23 @@ fn next_sweep_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_for_reports_an_unreadable_repo_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(dir.path().join("missing"));
+        assert!(matches!(remote_for(&loc), Err(_)));
+    }
+
+    #[test]
+    fn remote_for_is_none_only_for_a_readable_repo_without_remotes() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        assert!(matches!(
+            remote_for(&GitLoc::Local(dir.path().to_path_buf())),
+            Ok(None)
+        ));
+    }
 
     #[test]
     #[expect(
@@ -1067,7 +1101,7 @@ mod tests {
         let loc = GitLoc::Local(clone.clone());
 
         // The clone tracks `origin/main` and starts level with it.
-        assert_eq!(remote_for(&loc).as_deref(), Some("origin"));
+        assert_eq!(remote_for(&loc).unwrap().as_deref(), Some("origin"));
         assert_eq!(tracked(&loc, "main"), Some(("origin/main".into(), 0)));
         // …and the post-fetch pass maps the checkout back to its branch, which is
         // what scopes both the badge refresh and the opt-in notice to this repo.
@@ -1154,7 +1188,7 @@ mod tests {
         let bare = fixture.path().join("solo");
         std::fs::create_dir_all(&bare).unwrap();
         git(&bare, &["init", "-q", "-b", "main"]);
-        assert_eq!(remote_for(&GitLoc::Local(bare.clone())), None);
+        assert_eq!(remote_for(&GitLoc::Local(bare.clone())).unwrap(), None);
     }
 
     #[test]
