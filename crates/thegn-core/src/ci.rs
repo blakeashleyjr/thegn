@@ -353,7 +353,7 @@ pub struct CiWorkflow {
     /// Repo-relative source path, when known (`.github/workflows/ci.yml`).
     #[serde(default)]
     pub path: String,
-    /// Whether the workflow can be triggered manually.
+    /// True only when the provider reported an active manually-triggerable state.
     #[serde(default)]
     pub dispatchable: bool,
     #[serde(default)]

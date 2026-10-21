@@ -527,17 +527,12 @@ fn trigger(
 ) -> Result<()> {
     thegn_svc::ci::validate_workflow_selector(workflow)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let inputs = thegn_svc::ci::parse_trigger_inputs(&input)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let (loc, client) = client(cfg, worktree)?;
     if !client.caps().trigger {
         msg::die("this provider can't trigger workflows");
     }
-    let inputs: Vec<(String, String)> = input
-        .iter()
-        .filter_map(|kv| {
-            kv.split_once('=')
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-        })
-        .collect();
     match client.trigger(&loc, workflow, &inputs) {
         Ok(()) => msg::info(&format!("triggered {workflow}")),
         Err(e) => msg::die(&format!(
@@ -724,5 +719,21 @@ mod tests {
         };
         assert_eq!(rerun_scope(&github, false, false), Ok(RerunScope::All));
         assert_eq!(rerun_scope(&github, true, false), Ok(RerunScope::Failed));
+    }
+
+    #[test]
+    fn trigger_inputs_cli_refuses_malformed_entries_before_provider_access() {
+        let result = trigger(
+            &Config::default(),
+            Some("/path/that/need-not-exist".into()),
+            "ci.yml",
+            vec!["novalue".into()],
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid workflow input")
+        );
     }
 }
