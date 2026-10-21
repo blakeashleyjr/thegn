@@ -7,6 +7,10 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+- VPN sidecar reuse now checks the resolved tunnel configuration. An unlabelled
+  sidecar left running from before this upgrade is refused; stop that worktree's
+  sandbox so the sidecar can be recreated with the current configuration.
+
 ## [0.1.0-alpha.23] — 2026-10-21 (maintenance batch 60)
 
 ## [0.1.0-alpha.22] — 2026-10-20 (maintenance batch 59)

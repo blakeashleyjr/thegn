@@ -1254,6 +1254,11 @@ fn attach_vpn_with<P: VpnProvider>(
     let attach = match provider.up(rt, &sidecar) {
         Ok(attach) => attach,
         Err(e) => {
+            if e.downcast_ref::<thegn_svc::vpn::VpnSidecarDrift>()
+                .is_some()
+            {
+                return apply_vpn_error(spec, on_error, true, e.to_string());
+            }
             rollback_vpn(provider, rt, &sidecar, remove_sidecar);
             return apply_vpn_error(spec, on_error, true, format!("vpn: bring-up failed: {e}"));
         }
