@@ -156,6 +156,9 @@ zbus.workspace = true
 windows-sys = { workspace = true }
 [dev-dependencies]
 crc32fast = "1"
+# Paused-clock tests (`start_paused`, `time::advance`). This used to arrive only through
+# feature unification with iroh; declare it so the default (iroh-off) test build has it.
+tokio = { workspace = true, features = ["test-util"] }
 sysinfo.workspace = true
 tracing-subscriber.workspace = true
 # The architecture ratchets (`test/*-ratchet.txt`) share one helper.
