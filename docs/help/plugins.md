@@ -41,6 +41,12 @@ the reason in the status line and log. Config output shows a reference as
 written, never its resolved value, and masks literal values under
 secret-looking names such as `*_TOKEN`.
 
+Every plugin gets `THEGN_PLUGIN_STATE_DIR`, a private (owner-only) directory
+under thegn's state directory (`plugins/<id>`), created before the plugin
+starts; if it cannot be created safely (for example a symlink sits in its
+place) that plugin is refused and the others still start. It is a place to
+keep state, not a sandbox: every plugin runs as your user.
+
 Check what thegn sees with `thegn plugin list`; validate everything (api
 compatibility, command presence, contribution acceptance) with
 `thegn plugin check` — it exits non-zero on problems, so it fits a hook.

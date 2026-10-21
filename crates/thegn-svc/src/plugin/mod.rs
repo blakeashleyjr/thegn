@@ -23,7 +23,7 @@ pub mod provider;
 pub mod session;
 
 pub use ci_provider::PluginCiProvider;
-pub use env::resolve_env;
+pub use env::{PLUGIN_STATE_DIR_ENV, ensure_plugin_state_dir, resolve_env, resolve_launch_env};
 pub use loader::{
     LoadedPlugin, SpecProblem, check_spec, check_specs, discover, host_contract, negotiate,
 };

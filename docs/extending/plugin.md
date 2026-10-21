@@ -79,6 +79,11 @@ plugin subprocess itself; installing a plugin grants that executable the same
 ambient OS access it would have when launched directly.
 Capability-gated plugins require `trusted_native = true` in the user's
 `[[plugins]]` entry.
+Each plugin also receives `THEGN_PLUGIN_STATE_DIR`, a private (owner-only)
+directory under thegn's state directory (`plugins/<id>`), created before
+launch; a plugin whose directory cannot be created safely is refused. Use this
+directory for persistent state instead of XDG paths, which untrusted plugins do
+not receive; it is not containment, and every plugin runs as the same user.
 
 `state.set` keys are limited to 256 bytes, values to 64 KiB and depth 32;
 each plugin can keep 256 keys and 1 MiB total state. `emit` payloads have the
