@@ -2255,11 +2255,10 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // Cross-profile migration is a local, admin-scoped CLI operation rather
     // than a control route, but it is still a catalog-owned CLI surface.
     v.push("sessions.migrate");
-    // Pipeline run-completion verbs (THE-76/THE-88): local `thegn dispatch
-    // verify|wait|report|note|status`
-    // — the first reads the worktree + roster directly, the second composes the
-    // routed `sessions.wait`. Neither is a control route, so they cover the CLI
-    // surface here rather than through `API_CALLS`.
+    // Pipeline run-completion verbs (THE-76/THE-88). `verify` and `status`
+    // remain local, while `wait` composes the routed `sessions.wait`. Report
+    // and note also appear in `API_CALLS`; the final dedup keeps this explicit
+    // CLI list harmless and documents the dedicated subcommands.
     v.extend([
         "dispatches.verify",
         "dispatches.wait",

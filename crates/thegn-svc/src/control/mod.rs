@@ -760,6 +760,37 @@ pub struct DispatchPutReq {
     pub artifact_path: Option<String>,
 }
 
+/// A capability-authenticated worker write. The token is never included in
+/// formatted diagnostics.
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DispatchWorkerWriteReq {
+    pub text: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for DispatchWorkerWriteReq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchWorkerWriteReq")
+            .field("text", &self.text)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DispatchReportReply {
+    pub id: i64,
+    pub bytes: usize,
+    pub pass_without_gate_evidence: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DispatchNoteReply {
+    pub id: i64,
+    pub note_id: i64,
+    pub created_at_ms: i64,
+}
+
 /// Why a control call failed. Adapters map these to transport status codes
 /// (HTTP 404/403/409/501/500; gRPC NotFound/PermissionDenied/…).
 #[derive(Debug)]
@@ -1184,6 +1215,22 @@ pub trait ControlApi: Send + Sync + 'static {
         _id: i64,
         _status: thegn_core::issue::AgentDispatchStatus,
     ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    fn dispatch_report(
+        &self,
+        _id: i64,
+        _req: DispatchWorkerWriteReq,
+    ) -> BoxFuture<'_, ControlResult<DispatchReportReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    fn dispatch_note(
+        &self,
+        _id: i64,
+        _req: DispatchWorkerWriteReq,
+    ) -> BoxFuture<'_, ControlResult<DispatchNoteReply>> {
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
     }
 
