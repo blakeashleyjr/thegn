@@ -945,15 +945,29 @@ pub(crate) fn destroy_one_checked(
         }
     } else if keep_files {
         let marker = worktree.join(".git");
-        match std::fs::remove_file(&marker) {
-            Ok(()) => thegn_core::util::git_ok(repo_root, &["worktree", "prune"]),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                thegn_core::util::git_ok(repo_root, &["worktree", "prune"])
-            }
+        let marker_removed = match std::fs::remove_file(&marker) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
             Err(error) => {
                 thegn_core::msg::warn(&format!("could not detach kept worktree: {error}"));
                 false
             }
+        };
+        if marker_removed {
+            match thegn_core::worktree::prune_registrations(repo_root) {
+                Ok(()) => true,
+                Err(why) => {
+                    return (
+                        false,
+                        format!(
+                            "could not detach kept worktree at {}: git worktree prune failed: {why}",
+                            worktree.display()
+                        ),
+                    );
+                }
+            }
+        } else {
+            false
         }
     } else {
         match thegn_core::worktree::remove_detailed(
@@ -1146,15 +1160,23 @@ pub fn rollback_remove_with_branch_created(
         // that case, but the speculative branch and worktree metadata still
         // need the same force-cleanup treatment.
         let mut failures = Vec::new();
-        if !thegn_core::util::git_ok(repo_root, &["worktree", "prune"]) {
-            failures.push("could not prune failed worktree metadata".to_string());
+        if let Err(why) = thegn_core::worktree::prune_registrations(repo_root) {
+            failures.push(format!("could not prune failed worktree metadata: {why}"));
         }
-        if branch_created
-            && !branch.is_empty()
-            && thegn_core::worktree::branch_exists(repo_root, branch)
-            && !thegn_core::util::git_ok(repo_root, &["branch", "-D", branch])
-        {
-            failures.push(format!("could not delete speculative branch {branch}"));
+        if branch_created && !branch.is_empty() {
+            match thegn_core::worktree::branch_exists_checked(repo_root, branch) {
+                Ok(true) => {
+                    if let Err(why) = thegn_core::worktree::delete_branch(repo_root, branch) {
+                        failures.push(format!(
+                            "could not delete speculative branch {branch}: {why}"
+                        ));
+                    }
+                }
+                Ok(false) => {}
+                Err(why) => failures.push(format!(
+                    "could not verify speculative branch {branch}: {why}"
+                )),
+            }
         }
         let post = run_event_with_db(
             cfg,
@@ -2450,6 +2472,27 @@ mod tests {
         );
         assert!(result.is_ok(), "rollback failed: {result:?}");
         assert!(thegn_core::worktree::branch_exists(&root, "preexisting"));
+    }
+
+    #[test]
+    fn rollback_reports_an_unverifiable_speculative_branch() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let result = rollback_remove_with_branch_created(
+            &Config::default(),
+            dir.path(),
+            &dir.path().join("missing"),
+            "partial",
+            true,
+        );
+        let Err(message) = result else {
+            panic!("rollback unexpectedly succeeded for an unverifiable repository");
+        };
+        assert!(
+            message.contains("could not verify speculative branch partial"),
+            "{message}"
+        );
+        assert!(message.contains("not a git repository"), "{message}");
     }
 
     fn completion_test_session() -> crate::session::Session {
