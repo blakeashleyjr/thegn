@@ -463,7 +463,6 @@ mod tests {
         nonempty, random_staging_dir, record_outcome_in,
     };
     use thegn_core::db::Db;
-    use thegn_core::store::WorkspaceStore;
 
     #[test]
     fn degraded_marker_round_trip() {
