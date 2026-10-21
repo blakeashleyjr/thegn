@@ -614,6 +614,8 @@ pub enum RefusalClass {
     TunnelUnenforced,
     /// A mounted bind source no longer matches the identity admitted before create.
     MountDrift,
+    /// A sealed profile requested a control this backend cannot enforce.
+    StrictUnsupported,
 }
 
 impl RefusalClass {
@@ -630,6 +632,7 @@ impl RefusalClass {
             Self::MountUnresolvable => "mount-unresolvable",
             Self::TunnelUnenforced => "tunnel-unenforced",
             Self::MountDrift => "mount-drift",
+            Self::StrictUnsupported => "strict-unsupported",
         }
     }
 
@@ -665,6 +668,9 @@ impl RefusalClass {
             }
             Self::MountDrift => {
                 "a mount source changed during launch (check for a symlink swap), then relaunch"
+            }
+            Self::StrictUnsupported => {
+                "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile"
             }
         }
     }
@@ -835,6 +841,14 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     }
     if let Some(message) = hostname_policy_refusal_with(HOSTNAME_RULES, spec) {
         return Err(refusal(spec, RefusalClass::HostnamePolicy, None, message));
+    }
+    if let Some(message) = crate::sandbox_floor::strict_gate(spec) {
+        return Err(refusal(
+            spec,
+            RefusalClass::StrictUnsupported,
+            None,
+            message,
+        ));
     }
     tunnel_admission(spec)?;
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {

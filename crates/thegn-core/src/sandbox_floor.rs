@@ -262,6 +262,39 @@ fn home_path_under(dest: &str, home: &std::path::Path) -> bool {
     std::path::Path::new(dest).starts_with(home)
 }
 
+/// Refuse a sealed spec when its backend cannot apply a requested hardening
+/// control or enforce its file scope. Hostname rules need no check here because
+/// sealed forces `network = none`; tunnel-only requests are refused by
+/// `tunnel_admission`, and provider-native requests are refused before
+/// provisioning by the separate THE-801a admission gate.
+pub fn strict_gate(spec: &crate::sandbox::SandboxSpec) -> Option<String> {
+    if spec.seal_home.is_none() {
+        return None;
+    }
+    let mut unsupported = crate::sandbox::unsupported_hardening(spec)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if !file_access_enforced(spec.backend, spec.file_access) {
+        let scope = match spec.file_access {
+            FileAccess::Worktree => "worktree",
+            FileAccess::WorktreePlusCaches => "worktree_plus_caches",
+            FileAccess::Custom => "custom",
+            FileAccess::All => "all",
+            FileAccess::Host => "host",
+            FileAccess::None => "none",
+        };
+        unsupported.push(format!("file_access `{scope}`"));
+    }
+    (!unsupported.is_empty()).then(|| {
+        format!(
+            "sealed profiles are strict: the `{}` backend cannot enforce {} — use a backend that can (bwrap or an OCI runtime), or a non-sealed profile",
+            spec.backend.label(),
+            unsupported.join(", ")
+        )
+    })
+}
+
 /// How an opt-in agent/queue task's floor decision maps onto queue-entry state.
 /// The load-bearing rule (the merge-guard doctrine): a fail-closed floor miss or
 /// a sandbox setup failure is an **infrastructure** failure — the entry is
@@ -362,6 +395,84 @@ pub fn queue_agent_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strict_spec(backend: Backend, file_access: FileAccess) -> crate::sandbox::SandboxSpec {
+        use crate::config::Network;
+        use crate::config::SandboxLimits;
+        use crate::placement::Placement;
+        use crate::sandbox::{Mount, SandboxSpec};
+        SandboxSpec {
+            backend,
+            placement: Placement::Local,
+            image: Some("img:latest".into()),
+            worktree: std::path::PathBuf::from("/wt/feat"),
+            mounts: vec![Mount {
+                host: "/wt/feat".into(),
+                dest: "/wt/feat".into(),
+                ro: false,
+                cache: false,
+            }],
+            env: Vec::new(),
+            env_overrides: std::collections::HashMap::new(),
+            env_block: Vec::new(),
+            network: Network::None,
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
+            read_only_root: true,
+            no_new_privileges: true,
+            pids_limit: Some(256),
+            drop_capabilities: Vec::new(),
+            add_capabilities: Vec::new(),
+            file_access,
+            ports: Vec::new(),
+            gpu: None,
+            limits: SandboxLimits::default(),
+            volumes: Vec::new(),
+            compose: None,
+            build: None,
+            init_script: None,
+            devenv: false,
+            devenv_path: None,
+            name: "strict-test".into(),
+            vpn: None,
+            oci_host: None,
+            oci_runtime: None,
+            daemon_persistent: false,
+            seal_home: Some("/home/u".into()),
+        }
+    }
+
+    #[test]
+    fn strict_gate_table_across_backends() {
+        for backend in Backend::ALL {
+            for file_access in [
+                FileAccess::Worktree,
+                FileAccess::WorktreePlusCaches,
+                FileAccess::All,
+            ] {
+                let spec = strict_spec(backend, file_access);
+                let expected_supported = crate::sandbox::unsupported_hardening(&spec).is_empty()
+                    && file_access_enforced(spec.backend, spec.file_access);
+                assert_eq!(
+                    strict_gate(&spec).is_none(),
+                    expected_supported,
+                    "{backend:?} / {file_access:?}"
+                );
+            }
+        }
+        assert!(strict_gate(&strict_spec(Backend::Apple, FileAccess::Worktree)).is_some());
+        assert!(strict_gate(&strict_spec(Backend::Systemd, FileAccess::Worktree)).is_some());
+        assert!(strict_gate(&strict_spec(Backend::Bwrap, FileAccess::Worktree)).is_none());
+    }
+
+    #[test]
+    fn strict_gate_ignores_non_sealed_specs() {
+        for backend in [Backend::Apple, Backend::Systemd] {
+            let mut spec = strict_spec(backend, FileAccess::Worktree);
+            spec.seal_home = None;
+            assert_eq!(strict_gate(&spec), None, "{backend:?}");
+        }
+    }
 
     #[test]
     fn file_access_enforced_table_covers_each_backend_and_scope() {
