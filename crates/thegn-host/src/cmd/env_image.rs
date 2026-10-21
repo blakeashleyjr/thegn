@@ -50,7 +50,15 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         .context("create bake instance")
         .and_then(|_| bake(&rt, &provider, &name, &bake_pc));
     outln!("destroying bake instance {name}…");
-    let cleanup = rt.block_on(provider.destroy(&name));
+    let cleanup = rt.block_on(provider.destroy(&name)).and_then(|()| {
+        outln!("verifying bake instance {name} is gone…");
+        rt.block_on(await_absence(
+            || provider.list_detailed(),
+            &name,
+            ABSENCE_ATTEMPTS,
+            ABSENCE_INTERVAL,
+        ))
+    });
     let snapshot = bake_outcome(result, cleanup, &name)?;
     outln!("baked snapshot {snapshot}. To use it, set:");
     outln!("  [env.{}.provider]", env.name);
@@ -79,6 +87,60 @@ fn bake_outcome(bake: Result<String>, cleanup: Result<()>, name: &str) -> Result
         )),
         (Err(bake), Ok(())) => Err(anyhow!(
             "bake failed: {bake:#}; source instance {name} cleanup succeeded"
+        )),
+    }
+}
+
+const ABSENCE_ATTEMPTS: u32 = 36;
+const ABSENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+enum Absence {
+    Gone,
+    Listed,
+    Unknown(String),
+}
+
+fn absence(listing: &Result<Vec<thegn_svc::vps::VpsInstance>>, name: &str) -> Absence {
+    match listing {
+        Ok(instances) if instances.iter().any(|instance| instance.name == name) => Absence::Listed,
+        Ok(_) => Absence::Gone,
+        Err(error) => Absence::Unknown(format!("{error:#}")),
+    }
+}
+
+async fn await_absence<F, Fut>(
+    mut list: F,
+    name: &str,
+    attempts: u32,
+    interval: std::time::Duration,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<thegn_svc::vps::VpsInstance>>>,
+{
+    let attempts = attempts.max(1);
+    let mut attempt = 0;
+    let last = loop {
+        let current = absence(&list().await, name);
+        match &current {
+            Absence::Gone => return Ok(()),
+            Absence::Listed | Absence::Unknown(_) => {
+                attempt += 1;
+                if attempt == attempts {
+                    break current;
+                }
+                tokio::time::sleep(interval).await;
+            }
+        }
+    };
+    match last {
+        Absence::Gone => Ok(()),
+        Absence::Listed => Err(anyhow!(
+            "cleanup pending: source instance {name} is still listed after its delete was accepted"
+        )),
+        Absence::Unknown(error) => Err(anyhow!(
+            "cleanup pending: cannot verify that source instance {name} is gone: {error}"
         )),
     }
 }
@@ -177,5 +239,91 @@ mod tests {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         }));
         assert!(thegn_svc::vps::registry::is_bake_name(&name));
+    }
+
+    fn absence_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    fn bake_instance(name: &str) -> thegn_svc::vps::VpsInstance {
+        thegn_svc::vps::VpsInstance {
+            id: "1".to_string(),
+            name: name.to_string(),
+            ip: None,
+            running: true,
+            created: None,
+            labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn absence_is_proven_only_by_a_listing_without_the_name() {
+        assert_eq!(absence(&Ok(vec![]), "tg-bake-a"), Absence::Gone);
+        assert_eq!(
+            absence(&Ok(vec![bake_instance("tg-bake-a")]), "tg-bake-a"),
+            Absence::Listed
+        );
+        assert_eq!(
+            absence(&Err(anyhow!("api down")), "tg-bake-a"),
+            Absence::Unknown("api down".to_string())
+        );
+    }
+
+    #[test]
+    fn absence_still_listed_after_every_attempt_is_cleanup_pending() {
+        let runtime = absence_runtime();
+        let calls = std::cell::Cell::new(0_u32);
+        let result = runtime.block_on(await_absence(
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(vec![bake_instance("tg-bake-a")]))
+            },
+            "tg-bake-a",
+            3,
+            std::time::Duration::ZERO,
+        ));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("cleanup pending"));
+        assert!(error.contains("tg-bake-a"));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn absence_listing_error_after_every_attempt_is_cleanup_pending() {
+        let runtime = absence_runtime();
+        let result = runtime.block_on(await_absence(
+            || std::future::ready(Err(anyhow!("api down"))),
+            "tg-bake-a",
+            3,
+            std::time::Duration::ZERO,
+        ));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("cannot verify"));
+        assert!(error.contains("api down"));
+    }
+
+    #[test]
+    fn absence_disappearing_on_a_later_attempt_is_gone() {
+        let runtime = absence_runtime();
+        let calls = std::cell::Cell::new(0_u32);
+        let result = runtime.block_on(await_absence(
+            || {
+                let attempt = calls.get();
+                calls.set(attempt + 1);
+                std::future::ready(match attempt {
+                    0 => Ok(vec![bake_instance("tg-bake-a")]),
+                    1 => Err(anyhow!("api down")),
+                    _ => Ok(vec![]),
+                })
+            },
+            "tg-bake-a",
+            3,
+            std::time::Duration::ZERO,
+        ));
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 3);
     }
 }
