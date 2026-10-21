@@ -3537,6 +3537,50 @@ fn judge_inspect_accepts_exact_policy() {
 }
 
 #[test]
+fn image_id_normalises_docker_and_podman_shapes() {
+    let podman = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        normalize_image_id(&format!("sha256:{podman}")),
+        Some(podman.into())
+    );
+    assert_eq!(normalize_image_id(podman), Some(podman.into()));
+    assert_eq!(
+        normalize_image_id("ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"),
+        Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into())
+    );
+    assert_eq!(normalize_image_id(""), None);
+    assert_eq!(normalize_image_id("<no value>"), None);
+    assert_eq!(normalize_image_id(&podman[..63]), None);
+    assert_eq!(normalize_image_id("debian:stable"), None);
+}
+
+#[test]
+fn image_reuse_requires_equal_ids() {
+    let id = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let same = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let other = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    assert!(image_reusable(Some(id), Some(same)));
+    assert!(!image_reusable(Some(id), Some(other)));
+    assert!(!image_reusable(None, Some(same)));
+    assert!(!image_reusable(Some(id), None));
+}
+
+#[test]
+fn split_image_line_keeps_judge_inspect_input_unchanged() {
+    let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let stdout = format!("RUNNING\n0\nnew-fp\n/wt\nthegn-image:x\nthegn-image:sha256:{id}\n");
+    let (inspect, image) = split_image_line(&stdout);
+    assert_eq!(inspect, "RUNNING\n0\nnew-fp\n/wt\nthegn-image:x\n");
+    let expected_image = format!("sha256:{id}");
+    assert_eq!(image.as_deref(), Some(expected_image.as_str()));
+    let required: std::collections::HashSet<&str> = ["/wt"].into_iter().collect();
+    assert_eq!(
+        judge_inspect(&inspect, &required, false, false, "new-fp"),
+        (true, true)
+    );
+}
+
+#[test]
 fn expected_policy_is_stable_across_sealed_view() {
     let mut s = spec(Backend::Podman);
     s.seal_home = Some("/home/u".into());

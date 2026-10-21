@@ -2403,8 +2403,11 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
     let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
 }
 
-/// Return `(running, reusable)` after checking the policy label and mounts.
-/// Apple retains its mount-only check because its CLI has no verified label.
+/// Return `(running, reusable)` after checking the policy label, mounts, and
+/// the runtime image id against the current local image id. Docker reports
+/// both ids as `sha256:<64 hex>`; Podman reports both as bare 64-hex ids.
+/// Apple retains its mount-only check because its CLI has no verified Go
+/// templates or image-id probe (THE-513 residual).
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let sealed = spec.seal_home.is_some();
     let nix_expected = emits_nix_bind(spec);
@@ -2419,7 +2422,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
     // bind-mount source per line. A container in "created" state passes inspect
     // but cannot accept exec sessions — we must not treat it as healthy.
-    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{index .Config.Labels \"thegn.seal_home\"}}\n{{index .Config.Labels \"thegn.policy\"}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}thegn-image:{{.Image}}\n";
     let mut argv = oci_prefix(spec);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
@@ -2455,7 +2458,25 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false); // container doesn't exist
         }
         // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
-        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
+        let (inspect_stdout, container_image) = split_image_line(&stdout);
+        let verdict = judge_inspect(
+            &inspect_stdout,
+            &required,
+            sealed,
+            nix_expected,
+            &expected_fp,
+        );
+        if verdict != (true, true) {
+            return verdict;
+        }
+        let image_argv = image_id_argv(spec);
+        match output_with_timeout(&image_argv, PROBE_TIMEOUT) {
+            Some((true, expected_image)) => (
+                true,
+                image_reusable(container_image.as_deref(), Some(expected_image.as_str())),
+            ),
+            Some((false, _)) | None => (true, false),
+        }
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
         let mut remote_argv = oci_prefix(spec);
@@ -2469,8 +2490,80 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
             return (false, false);
         };
-        judge_inspect(&stdout, &required, sealed, nix_expected, &expected_fp)
+        let (inspect_stdout, container_image) = split_image_line(&stdout);
+        let verdict = judge_inspect(
+            &inspect_stdout,
+            &required,
+            sealed,
+            nix_expected,
+            &expected_fp,
+        );
+        if verdict != (true, true) {
+            return verdict;
+        }
+        let image_argv = image_id_argv(spec);
+        match output_control_owned(spec, &image_argv, PROBE_TIMEOUT) {
+            Some((true, expected_image)) => (
+                true,
+                image_reusable(container_image.as_deref(), Some(expected_image.as_str())),
+            ),
+            Some((false, _)) | None => (true, false),
+        }
     }
+}
+
+/// Build the runtime probe for the local id of the spec's effective image.
+fn image_id_argv(spec: &SandboxSpec) -> Vec<String> {
+    let mut argv = oci_prefix(spec);
+    argv.extend([
+        "image".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{.Id}}".into(),
+        effective_image(spec),
+    ]);
+    argv
+}
+
+/// Docker and Podman expose image ids with and without the `sha256:` prefix.
+/// Empty, placeholder, abbreviated, and non-hex values are deliberately
+/// unparseable so an uncertain runtime identity can never authorize reuse.
+fn normalize_image_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let id = trimmed.strip_prefix("sha256:").unwrap_or(trimmed);
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(id.to_ascii_lowercase())
+}
+
+/// Reuse is allowed only when both runtime-reported ids normalize and match.
+fn image_reusable(container: Option<&str>, expected: Option<&str>) -> bool {
+    match (
+        container.and_then(normalize_image_id),
+        expected.and_then(normalize_image_id),
+    ) {
+        (Some(container), Some(expected)) => container == expected,
+        _ => false,
+    }
+}
+
+/// Remove the trailing image-id line before passing inspect output to
+/// `judge_inspect`, whose remaining lines retain their established positions.
+/// Only the final line is metadata: a bind source named `thegn-image:x` earlier
+/// in the output remains an ordinary mount source.
+fn split_image_line(stdout: &str) -> (String, Option<String>) {
+    let without_final_newline = stdout.strip_suffix('\n').unwrap_or(stdout);
+    let Some((rest, final_line)) = without_final_newline.rsplit_once('\n') else {
+        return (stdout.to_string(), None);
+    };
+    let Some(image_id) = final_line.strip_prefix("thegn-image:") else {
+        return (stdout.to_string(), None);
+    };
+    (
+        format!("{rest}\n"),
+        Some(image_id.trim_end_matches('\r').to_string()),
+    )
 }
 
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
@@ -2554,7 +2647,7 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
         }
         // Stale policy or mounts — force-remove and fall through to recreate.
         msg::warn(&format!(
-            "sandbox: container '{}' policy or mounts changed (config changed); recreating",
+            "sandbox: container '{}' policy, image or mounts changed (config changed); recreating",
             spec.name
         ));
         remove_container(spec);
