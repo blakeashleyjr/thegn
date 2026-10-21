@@ -73,6 +73,14 @@ impl PendingCornerOob {
         }
     }
 
+    /// A full terminal clear (writer recovery, redraw, refocus) leaves the outer
+    /// terminal's image state unknown: delete the corner block and replay the
+    /// last shown draw once the corner is visible. A newer retained draw wins
+    /// over the replay.
+    pub(crate) fn screen_cleared(&mut self) {
+        self.occlude();
+    }
+
     #[cfg(test)]
     pub(crate) fn is_pending(&self) -> bool {
         self.delete_pending || self.draw.is_some()
@@ -510,6 +518,72 @@ mod tests {
         });
         slot.occlude();
         slot.require_delete();
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![vec![1], kitty_relay::delete_all().to_vec()]
+        );
+    }
+
+    #[test]
+    fn screen_clear_replays_the_last_shown_draw_once() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.screen_cleared();
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![vec![1], kitty_relay::delete_all().to_vec(), vec![1]]
+        );
+    }
+
+    #[test]
+    fn screen_clear_keeps_a_newer_retained_draw() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.offer_draw(vec![2], false, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.screen_cleared();
+        slot.retry(true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        assert_eq!(
+            *submitted.borrow(),
+            vec![vec![1], kitty_relay::delete_all().to_vec(), vec![2]]
+        );
+    }
+
+    #[test]
+    fn screen_clear_after_geometry_delete_replays_nothing() {
+        let mut slot = PendingCornerOob::default();
+        let submitted = RefCell::new(Vec::new());
+        slot.offer_draw(vec![1], true, |bytes| {
+            submitted.borrow_mut().push(bytes);
+            Ok(())
+        });
+        slot.require_delete();
+        slot.screen_cleared();
         slot.retry(true, |bytes| {
             submitted.borrow_mut().push(bytes);
             Ok(())
