@@ -37,6 +37,10 @@ MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_MEMBERS = 64
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_EXPANDED_BYTES = 512 * 1024 * 1024
+# Expanded bytes may be at most this multiple of the archive's on-disk size.
+# Release archives compress about 3-4x; gzip's ceiling is about 1032x, so 100
+# refuses decompression bombs with wide headroom.
+MAX_COMPRESSION_RATIO = 100
 MANAGER_PLACEHOLDERS = {
     "homebrew": {
         "VERSION",
@@ -317,6 +321,7 @@ def _validate_archive_layout(
     expanded = 0
     count = 0
     try:
+        compressed = path.stat().st_size
         if platform == "unix":
             with tarfile.open(path, "r:gz") as archive:
                 names: set[str] = set()
@@ -349,10 +354,19 @@ def _validate_archive_layout(
                     if not member.isfile():
                         unsafe.append(member.name)
                         continue
+                    mode = member.mode
+                    if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o002):
+                        raise ReleaseError(
+                            f"archive {path} member {member.name!r} has unsafe mode {oct(mode)}"
+                        )
                     expanded += member.size
                     if expanded > MAX_EXPANDED_BYTES:
                         raise ReleaseError(
                             f"archive {path} exceeds {MAX_EXPANDED_BYTES} expanded bytes"
+                        )
+                    if expanded > MAX_COMPRESSION_RATIO * max(compressed, 1):
+                        raise ReleaseError(
+                            f"archive {path} exceeds compression ratio {MAX_COMPRESSION_RATIO}"
                         )
                     regular.add(member.name.rstrip("/"))
                     if member.name.rstrip("/") == "thegn" and not member.mode & 0o111:
@@ -388,10 +402,20 @@ def _validate_archive_layout(
                     if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
                         unsafe.append(member.filename)
                     elif not member.is_dir():
+                        if mode and mode & (
+                            stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o002
+                        ):
+                            raise ReleaseError(
+                                f"archive {path} member {member.filename!r} has unsafe mode {oct(mode)}"
+                            )
                         expanded += member.file_size
                         if expanded > MAX_EXPANDED_BYTES:
                             raise ReleaseError(
                                 f"archive {path} exceeds {MAX_EXPANDED_BYTES} expanded bytes"
+                            )
+                        if expanded > MAX_COMPRESSION_RATIO * max(compressed, 1):
+                            raise ReleaseError(
+                                f"archive {path} exceeds compression ratio {MAX_COMPRESSION_RATIO}"
                             )
                         regular.add(member.filename.rstrip("/"))
     except (OSError, tarfile.TarError, zipfile.BadZipFile) as error:

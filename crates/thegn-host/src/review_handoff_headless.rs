@@ -85,6 +85,9 @@ fn execute(
     prepare: impl FnOnce() -> Result<Option<SandboxSpec>, String>,
     launch: impl FnOnce(&AgentTaskRun<'_>) -> bool,
 ) -> Result<(), String> {
+    if let Some(reason) = crate::agent_run::headless_unsupported() {
+        return Err(format!("review handoff held: {reason}"));
+    }
     let worktree = selected_worktree_key(request, queue.own_prs_only)?;
     let loc = GitLoc::Local(request.worktree.clone());
     let admitted = if queue.own_prs_only {

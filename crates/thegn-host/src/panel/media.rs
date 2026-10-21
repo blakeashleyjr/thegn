@@ -1,7 +1,7 @@
 //! Loop-owned state for the docked Media section.
 
 use std::collections::HashSet;
-use thegn_core::media::{MAX_QUEUE_ITEMS, MAX_SOURCES};
+use thegn_core::media::{MAX_QUEUE_ITEMS, MAX_SOURCES, QueuePage};
 use thegn_core::media::{MediaCaps, MediaState, QueueItem};
 
 use crate::media_art::ArtMosaic;
@@ -28,7 +28,7 @@ pub(crate) struct MediaRequest {
 #[derive(Debug)]
 pub(crate) struct MediaQueueDelivery {
     pub(crate) request: MediaRequest,
-    pub(crate) queue: Result<Vec<QueueItem>, String>,
+    pub(crate) queue: Result<QueuePage, String>,
 }
 
 #[derive(Debug)]
@@ -47,6 +47,7 @@ pub(crate) struct MediaPanelState {
     pub(crate) queue_truncated: usize,
     pub(crate) queue_error: Option<String>,
     pub(crate) art: Option<ArtMosaic>,
+    pub(crate) health: crate::media_watch::MediaHealth,
     caps: Option<MediaCaps>,
     generation: u64,
     watcher_generation: u64,
@@ -179,11 +180,22 @@ impl MediaPanelState {
         Some(self.request_for(state.map(Self::identity)))
     }
 
+    /// Vec-shaped test entry point; delegates to `set_queue_page`.
+    #[cfg(test)]
     pub(crate) fn set_queue(
         &mut self,
         request: MediaRequest,
         state: Option<&MediaState>,
         queue: Result<Vec<QueueItem>, String>,
+    ) {
+        self.set_queue_page(request, state, queue.map(QueuePage::from_rows));
+    }
+
+    pub(crate) fn set_queue_page(
+        &mut self,
+        request: MediaRequest,
+        state: Option<&MediaState>,
+        page: Result<QueuePage, String>,
     ) {
         let Some(state) = state else { return };
         if request.generation == self.generation
@@ -191,11 +203,12 @@ impl MediaPanelState {
             && request.identity.as_ref() == Some(&Self::identity(state))
         {
             self.queue_identity = Some(Self::identity(state));
-            match queue {
-                Ok(mut queue) => {
-                    self.queue_truncated = queue.len().saturating_sub(MAX_QUEUE_ITEMS);
-                    queue.truncate(MAX_QUEUE_ITEMS);
-                    self.queue = queue;
+            match page {
+                Ok(mut page) => {
+                    self.queue_truncated =
+                        page.hidden() + page.items.len().saturating_sub(MAX_QUEUE_ITEMS);
+                    page.items.truncate(MAX_QUEUE_ITEMS);
+                    self.queue = page.items;
                     self.queue_error = None;
                 }
                 Err(error) => {
@@ -535,5 +548,29 @@ mod tests {
         panel.set_sources(old_sources, Some(&current), vec!["stale".into()]);
         assert!(panel.queue.is_empty());
         assert!(panel.sources.is_empty());
+    }
+
+    #[test]
+    fn queue_page_delivery_reports_backend_hidden_rows() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.begin_request(Some(&current));
+        let request = panel.take_queue_request(Some(&current)).unwrap();
+        panel.set_queue_page(
+            request,
+            Some(&current),
+            Ok(QueuePage {
+                items: (0..3)
+                    .map(|index| QueueItem {
+                        id: format!("row-{index}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                total: 900,
+            }),
+        );
+
+        assert_eq!(panel.queue.len(), 3);
+        assert_eq!(panel.queue_truncated, 897);
     }
 }

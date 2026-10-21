@@ -86,6 +86,14 @@ pub fn stdin_script(script: &str, cwd: Option<&str>, env: &[(String, String)]) -
 }
 
 impl SshShim {
+    /// Ensure OpenSSH can persist this instance's first-contact host key.
+    pub fn prepare_known_hosts(&self) -> Result<()> {
+        registry::checked_name(&self.name)?;
+        registry::ensure_known_hosts_dir()
+            .context("vps ssh: cannot create the per-instance known_hosts directory")?;
+        Ok(())
+    }
+
     /// The shared ssh option set (control plane): batch, safe multiplexing,
     /// pinned per-instance host key, quiet. Pure over `self` (unit-tested).
     pub fn base_argv(&self) -> Vec<String> {
@@ -160,6 +168,7 @@ impl SshShim {
     /// base64 (see [`write`](Self::write)), so there is never a second stdin
     /// channel to multiplex.
     async fn run_raw(&self, full_script: &str) -> Result<(i32, Vec<u8>)> {
+        self.prepare_known_hosts()?;
         let mut argv = self.base_argv();
         argv.push("--".into());
         argv.push("/bin/sh".into());
@@ -407,6 +416,18 @@ pub fn parse_find_listing(out: &str) -> Vec<crate::provider::FileEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_known_hosts_refuses_an_invalid_name() {
+        let shim = SshShim {
+            name: "../x".into(),
+            ip: "203.0.113.7".into(),
+            user: "root".into(),
+            key_path: "/state/ssh/key".into(),
+        };
+
+        assert!(shim.prepare_known_hosts().is_err());
+    }
 
     #[test]
     fn script_from_argv_unwraps_shell_invocations() {

@@ -137,6 +137,38 @@ pub(crate) enum AgentDispatch {
     InfraHold(String),
 }
 
+/// What happened when a headless agent was dispatched.
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "the Windows stub only reports NotStarted (THE-235)"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentRunVerdict {
+    /// The agent ran to an exit; `None` means it was killed by a signal.
+    Exited(Option<i32>),
+    /// The agent ran but was cut short (timeout, cancellation, unsettled group, or reap failure).
+    /// It consumed its attempt.
+    Interrupted(String),
+    /// No agent process ever did any work. This infrastructure failure must not consume an attempt.
+    NotStarted(String),
+}
+
+impl AgentRunVerdict {
+    pub(crate) fn exited_zero(&self) -> bool {
+        matches!(self, Self::Exited(Some(0)))
+    }
+
+    pub(crate) fn not_started(&self) -> Option<&str> {
+        match self {
+            Self::NotStarted(reason) => Some(reason),
+            Self::Exited(_) | Self::Interrupted(_) => None,
+        }
+    }
+}
+
 /// Give each queue agent a thegn-owned OCI name derived from its full worktree
 /// path, so same-basename worktrees cannot collide.
 fn scope_agent_spec(
@@ -425,13 +457,13 @@ fn stricter_agent_gate(
     }
 }
 
-/// Run the agent to completion and report whether it exited zero.
+/// Run the agent to completion and preserve whether it started, exited, or was interrupted.
 ///
 /// **The exit code is advisory.** Callers decide by re-checking the world (the
 /// merge queue re-attempts the fold), because an agent can exit non-zero having
 /// committed a good fix, or exit zero having done nothing.
 #[cfg(unix)]
-pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
+pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
     use std::process::{Command, Stdio};
     use thegn_core::util;
 
@@ -449,7 +481,9 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
                 max_command_bytes = MAX_RENDERED_COMMAND_BYTES,
                 "agent command exceeds the safe argument limit even without the prompt; not dispatching"
             );
-            return false;
+            return AgentRunVerdict::NotStarted(
+                "agent command exceeds the safe argument limit even without the prompt".into(),
+            );
         }
         Err(e) => {
             // Validation runs at config time; reaching here means a template
@@ -460,7 +494,9 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
                 error = %e,
                 "agent command template is invalid; not dispatching"
             );
-            return false;
+            return AgentRunVerdict::NotStarted(
+                "agent command template is invalid; not dispatching".into(),
+            );
         }
     };
     if kept_prompt_bytes < task.prompt.len() {
@@ -484,7 +520,9 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
             Ok(guarded) => guarded.into_parts(),
             Err(error) => {
                 tracing::error!("{error}; refusing queued agent sandbox launch");
-                return false;
+                return AgentRunVerdict::NotStarted(format!(
+                    "{error}; refusing queued agent sandbox launch"
+                ));
             }
         },
         None => (
@@ -580,7 +618,16 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
             "agent run finished"
         ),
     }
-    result.outcome.success()
+    bounded::verdict(&result.outcome, task.sandbox.is_some())
+}
+
+/// Run the agent to completion and report whether it exited zero.
+///
+/// **The exit code is advisory.** Callers decide by re-checking the world (the
+/// merge queue re-attempts the fold), because an agent can exit non-zero having
+/// committed a good fix, or exit zero having done nothing.
+pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
+    run_outcome(task).exited_zero()
 }
 
 /// Bounded, drained, fully reaped execution of one agent process group (unix).
@@ -629,6 +676,7 @@ pub(crate) mod bounded {
     }
 
     impl AgentRunOutcome {
+        #[cfg(test)]
         pub(crate) fn success(&self) -> bool {
             matches!(self, Self::Exited(status) if status.success())
         }
@@ -637,6 +685,33 @@ pub(crate) mod bounded {
         /// not be supervised. Callers must re-check the world, not blame code.
         pub(crate) fn is_infrastructure(&self) -> bool {
             !matches!(self, Self::Exited(_))
+        }
+    }
+
+    pub(crate) fn verdict(outcome: &AgentRunOutcome, sandboxed: bool) -> super::AgentRunVerdict {
+        use super::AgentRunVerdict;
+
+        match outcome {
+            AgentRunOutcome::Spawn(error) => {
+                AgentRunVerdict::NotStarted(format!("agent failed to spawn: {error}"))
+            }
+            AgentRunOutcome::Exited(status) => match status.code() {
+                Some(code @ (126 | 127)) => AgentRunVerdict::NotStarted(format!(
+                    "agent command could not be executed (exit {code})"
+                )),
+                Some(125) if sandboxed => AgentRunVerdict::NotStarted(
+                    "sandbox engine refused the agent entry (exit 125)".into(),
+                ),
+                code => AgentRunVerdict::Exited(code),
+            },
+            AgentRunOutcome::TimedOut => AgentRunVerdict::Interrupted("timed out".into()),
+            AgentRunOutcome::Cancelled => AgentRunVerdict::Interrupted("cancelled".into()),
+            AgentRunOutcome::Unsettled => {
+                AgentRunVerdict::Interrupted("unsettled process group".into())
+            }
+            AgentRunOutcome::Reap(error) => {
+                AgentRunVerdict::Interrupted(format!("could not reap: {error}"))
+            }
         }
     }
 
@@ -770,6 +845,57 @@ pub(crate) mod bounded {
 
         fn run(script: &str, timeout: Duration) -> AgentRun {
             run_bounded(&mut sh(script), timeout, &AtomicBool::new(false))
+        }
+
+        #[test]
+        fn verdict_classifies_not_started_and_interrupted_runs() {
+            let status = |code| std::process::ExitStatus::from_raw(code << 8);
+            for code in [126, 127] {
+                assert!(matches!(
+                    verdict(&AgentRunOutcome::Exited(status(code)), false),
+                    super::super::AgentRunVerdict::NotStarted(_)
+                ));
+                assert!(matches!(
+                    verdict(&AgentRunOutcome::Exited(status(code)), true),
+                    super::super::AgentRunVerdict::NotStarted(_)
+                ));
+            }
+            assert!(matches!(
+                verdict(&AgentRunOutcome::Exited(status(125)), true),
+                super::super::AgentRunVerdict::NotStarted(_)
+            ));
+            assert_eq!(
+                verdict(&AgentRunOutcome::Exited(status(125)), false),
+                super::super::AgentRunVerdict::Exited(Some(125))
+            );
+            assert_eq!(
+                verdict(&AgentRunOutcome::Exited(status(0)), false),
+                super::super::AgentRunVerdict::Exited(Some(0))
+            );
+            assert_eq!(
+                verdict(&AgentRunOutcome::Exited(status(1)), false),
+                super::super::AgentRunVerdict::Exited(Some(1))
+            );
+            assert!(matches!(
+                verdict(&AgentRunOutcome::TimedOut, false),
+                super::super::AgentRunVerdict::Interrupted(_)
+            ));
+            assert!(matches!(
+                verdict(&AgentRunOutcome::Cancelled, false),
+                super::super::AgentRunVerdict::Interrupted(_)
+            ));
+            assert!(matches!(
+                verdict(&AgentRunOutcome::Unsettled, false),
+                super::super::AgentRunVerdict::Interrupted(_)
+            ));
+            assert!(matches!(
+                verdict(&AgentRunOutcome::Reap(std::io::Error::other("x")), false),
+                super::super::AgentRunVerdict::Interrupted(_)
+            ));
+            assert!(matches!(
+                verdict(&AgentRunOutcome::Spawn(std::io::Error::other("x")), false),
+                super::super::AgentRunVerdict::NotStarted(_)
+            ));
         }
 
         const MIB2: usize = 2 << 20;
@@ -1175,13 +1301,15 @@ fn credential_shaped(key: &str) -> bool {
 /// through `$SHELL -lc`, neither of which maps onto pwsh/cmd. Port the quoting
 /// before enabling this path on Windows.
 #[cfg(not(unix))]
-pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
+pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
     tracing::warn!(
         target: "thegn::agent",
         kind = %task.kind,
         "headless agent runs are not yet supported on Windows"
     );
-    false
+    AgentRunVerdict::NotStarted(
+        "headless agent runs are not yet supported on this platform (THE-235)".into(),
+    )
 }
 
 #[cfg(test)]
@@ -1206,6 +1334,34 @@ mod tests {
             sandbox: None,
             credential_free: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_outcome_reports_a_missing_command_as_not_started() {
+        let worktree = tempfile::tempdir().unwrap();
+        let vars = vars();
+        let missing = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            command_template: "thegn-no-such-agent-b62",
+            ..task(TaskKind::MergeConflict, &vars)
+        };
+        assert!(matches!(
+            run_outcome(&missing),
+            AgentRunVerdict::NotStarted(_)
+        ));
+
+        let nonzero = AgentTaskRun {
+            command_template: "exit 3",
+            ..missing
+        };
+        assert_eq!(run_outcome(&nonzero), AgentRunVerdict::Exited(Some(3)));
+        let successful = AgentTaskRun {
+            command_template: "true",
+            ..nonzero
+        };
+        assert_eq!(run_outcome(&successful), AgentRunVerdict::Exited(Some(0)));
+        assert!(run(&successful));
     }
 
     fn sandbox_spec() -> thegn_core::sandbox::SandboxSpec {

@@ -330,6 +330,12 @@ The memory is dropped when the config is reloaded, and for a worktree when you
 retry, start its runtime, or run it on the host. An explicitly chosen backend is
 always probed.
 
+The `devcontainer` CLI provider's trust digest covers the selected
+`devcontainer.json` and the bytes of its referenced Dockerfile and Compose
+files inside the repository. The digest is checked before `devcontainer up`
+and each exec; changing one of those files requires fresh approval. A missing,
+absolute, or repository-escaping reference refuses provider use.
+
 `thegn doctor` shows the `Devcontainer support` block: mode, repo, candidates,
 selected file or selection error, provider, status, trust counts, and backend
 honorability. It reads config and approvals and may run bounded
@@ -486,6 +492,13 @@ the only honest option for bwrap/systemd), `in_container`, or `netns`.
 `on_error` decides what happens when the tunnel will not come up: `fail`
 refuses to launch, `warn` launches anyway, `offline` forces
 `network=none` so nothing leaks onto the host network.
+
+A running VPN sidecar is reused only when its tunnel configuration matches.
+Otherwise the result follows `on_error`: `fail` refuses launch, `warn`
+continues without the VPN, and `offline` forces `network=none`. The sidecar
+stays running. Stop this worktree's sandbox (close the worktree, or remove both
+the worktree container and sidecar) so both are recreated with the new
+configuration. An unlabelled sidecar from before this check counts as changed.
 
 Separately, `[network]` auto-detects when the machine is offline and
 pauses remote refreshes rather than hammering unreachable endpoints;

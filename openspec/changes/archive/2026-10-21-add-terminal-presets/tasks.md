@@ -52,6 +52,8 @@
 
 ## 6. Validation
 
-- [ ] 6.1 Re-record affected e2e baselines (picker frames) with
+- [x] 6.1 Re-record affected e2e baselines (picker frames) with
       `just e2e-update`; review the diff.
-- [ ] 6.2 Run `just ci` once, pre-PR (includes openspec validate).
+      Superseded, not performed as a separate check: the owner issue THE-146 was closed on 2026-10-13 as a duplicate of THE-705 (Done), whose scope is archiving delivered changes without inventing residual work from generic gate boxes; the change is archived in batch 62.
+- [x] 6.2 Run `just ci` once, pre-PR (includes openspec validate).
+      Superseded, not performed as a separate check: the owner issue THE-146 was closed on 2026-10-13 as a duplicate of THE-705 (Done), whose scope is archiving delivered changes without inventing residual work from generic gate boxes; the change is archived in batch 62.

@@ -55,8 +55,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    admitted tag, then publishes the archives and checksums to a **draft**
    GitHub Release. The broker also adds `thegn-<tag>-release.json`, recording
    the tag, tag object, commit, workflow SHA, run id, and sorted asset digests.
-   Each archive receives keyless GitHub build-provenance attestation; verify a
-   downloaded archive with:
+   Each archive receives keyless GitHub build-provenance attestation. Before
+   validation or packaging, the package job verifies every downloaded archive
+   against the `release.yml` signer workflow and the signing run's `github.sha`,
+   then requires each attestation's run invocation URL to identify that same
+   workflow run. The upload job has already checked the tag against the admitted
+   commit before creating the attestations. Downloaders can verify an archive
+   with:
 
    ```sh
    gh attestation verify thegn-v<version>-<target>.tar.gz \
@@ -101,8 +106,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    published release and runs `makepkg --printsrcinfo`, then passes `PKGBUILD`
    and `.SRCINFO` to the AUR publisher as an artifact. The Homebrew publisher
    pushes `Formula/thegn.rb` to the configured tap. The AUR publisher checks
-   the artifact's `PKGBUILD` against the release asset and pushes both files to
-   the AUR `thegn-bin` repository without interpreting the PKGBUILD.
+   the artifact's `PKGBUILD` against the release asset before pushing both
+   files to the AUR `thegn-bin` repository without interpreting the PKGBUILD.
+   Each publisher records its cloned branch tip and uses a force-with-lease
+   push against that observed tip, then verifies the remote branch with
+   `git ls-remote`. The per-target job summary reports the committed old and
+   new OIDs, an unchanged tip, or a failure and the observed remote state, so a
+   Homebrew success and AUR failure are visible separately.
    Re-dispatching the same tag makes no commit when the repositories already
    contain identical output.
 

@@ -280,6 +280,127 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, scripts)
 
+    def test_package_verifies_attestations_before_validation(self) -> None:
+        job = read_workflow("release.yml")["jobs"]["package"]
+        steps = job.get("steps", [])
+        names = [step.get("name") for step in steps]
+        verify_index = names.index("Verify archive provenance")
+        download_index = names.index("Download this tag's source assets")
+        validation_index = names.index("Validate all active inputs and render metadata")
+        self.assertLess(download_index, verify_index)
+        self.assertLess(verify_index, validation_index)
+        script = steps[verify_index].get("run", "")
+        for expected in (
+            "gh attestation verify",
+            "--signer-workflow",
+            "--source-digest",
+            "--deny-self-hosted-runners",
+            "--format json",
+            "runInvocationURI",
+            "$GITHUB_RUN_ID",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, script)
+        self.assertEqual("read", job.get("permissions", {}).get("attestations"))
+
+    def test_package_provenance_rehearsal(self) -> None:
+        if shutil.which("bash") is None:
+            self.skipTest("bash is required for the package provenance rehearsal")
+        job = read_workflow("release.yml")["jobs"]["package"]
+        step = next(
+            candidate
+            for candidate in job.get("steps", [])
+            if candidate.get("name") == "Verify archive provenance"
+        )
+        script = step["run"]
+        admitted_sha = "38ea6674e95abc580c473ed708332cd3d14e97ea"
+        signing_sha = "e45b37fb590f7aac8d3580ab22be6cd2b450c43f"
+        self.assertNotEqual(admitted_sha, signing_sha)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            assets = temporary_path / "assets"
+            assets.mkdir()
+            for name in ("thegn-v1.2.3-a.tar.gz", "thegn-v1.2.3-b.tar.gz"):
+                (assets / name).write_bytes(b"")
+            (assets / "thegn-v1.2.3-a.tar.gz.sha256").write_text(
+                "not an archive\n", encoding="utf-8"
+            )
+            stub_dir = temporary_path / "bin"
+            stub_dir.mkdir()
+            log_path = temporary_path / "gh.log"
+            stub = stub_dir / "gh"
+            stub.write_text(
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$*" >> "$GH_LOG"\n'
+                'if [ -n "$GH_FAIL" ]; then\n'
+                '  case "$*" in *"/$GH_FAIL "*) exit 1;; esac\n'
+                "fi\n"
+                'if [ "$GH_FOREIGN_RUN" = 1 ]; then\n'
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/other/attempts/1"\n'
+                "else\n"
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1"\n'
+                "fi\n"
+                'printf \'[{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"%s"}}}}]\\n\' "$run_uri"\n',
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+
+            def run_case(
+                *, fail: str = "", foreign_run: bool = False, empty: bool = False
+            ) -> subprocess.CompletedProcess[str]:
+                log_path.write_text("", encoding="utf-8")
+                if empty:
+                    for archive in assets.glob("*.tar.gz"):
+                        archive.unlink()
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "PATH": f"{stub_dir}{os.pathsep}{environment.get('PATH', '')}",
+                        "PACKAGE_ROOT": str(temporary_path),
+                        "TAG": "v1.2.3",
+                        "GITHUB_REPOSITORY": "o/r",
+                        "ADMITTED_SHA": admitted_sha,
+                        "GITHUB_SHA": signing_sha,
+                        "GITHUB_SERVER_URL": "https://github.com",
+                        "GITHUB_RUN_ID": "12345",
+                        "GITHUB_TOKEN": "x",
+                        "GH_LOG": str(log_path),
+                        "GH_FAIL": fail,
+                        "GH_FOREIGN_RUN": "1" if foreign_run else "0",
+                    }
+                )
+                return subprocess.run(
+                    ["bash", "-c", script],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            result = run_case(fail="")
+            self.assertEqual(0, result.returncode, result.stderr)
+            calls = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(2, len(calls))
+            for call in calls:
+                self.assertTrue(call.startswith("attestation verify "))
+                self.assertIn(f"--source-digest {signing_sha}", call)
+                self.assertIn("--repo o/r", call)
+                self.assertIn("--format json", call)
+            self.assertTrue(any("thegn-v1.2.3-a.tar.gz" in call for call in calls))
+            self.assertTrue(any("thegn-v1.2.3-b.tar.gz" in call for call in calls))
+            self.assertFalse(any(".sha256" in call for call in calls))
+
+            result = run_case(fail="thegn-v1.2.3-b.tar.gz")
+            self.assertNotEqual(0, result.returncode)
+
+            result = run_case(foreign_run=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not bound to this workflow run", result.stdout)
+
+            result = run_case(fail="", empty=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual("", log_path.read_text(encoding="utf-8"))
+
     def test_no_job_holds_both_deploy_keys(self) -> None:
         jobs = read_workflow("release.yml")["jobs"]
         serialized = {name: yaml.safe_dump(job) for name, job in jobs.items()}
@@ -362,6 +483,214 @@ class WorkflowPolicyTests(unittest.TestCase):
                                 match.lstrip('"').startswith("$RUNNER_TEMP/"),
                                 f"mktemp directory must be under RUNNER_TEMP: {match!r}",
                             )
+
+    def test_publishers_push_with_lease(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        for job_name, step_name in (
+            ("publish-homebrew", "Publish Homebrew formula"),
+            ("publish-aur", "Publish generated AUR metadata"),
+        ):
+            steps = jobs[job_name]["steps"]
+            step = next(item for item in steps if item.get("name") == step_name)
+            script = step.get("run", "")
+            summary_name = (
+                "Summarize Homebrew publication"
+                if job_name == "publish-homebrew"
+                else "Summarize AUR publication"
+            )
+            summary = next(item for item in steps if item.get("name") == summary_name)
+            summary_script = summary.get("run", "")
+            with self.subTest(job=job_name):
+                self.assertEqual("publish", step.get("id"))
+                self.assertIn("--force-with-lease=", script)
+                self.assertIn("ls-remote", script)
+                self.assertIn("GITHUB_OUTPUT", script)
+                self.assertNotRegex(script, r"(?m)^\s*git .*push origin HEAD\s*$")
+                self.assertIn('[ -z "$BRANCH" ]', summary_script)
+                self.assertIn(
+                    "before the target was cloned; remote state unknown", summary_script
+                )
+
+    def test_publish_cas_rehearsal(self) -> None:
+        if shutil.which("git") is None or shutil.which("bash") is None:
+            self.skipTest("git and bash are required for the local publication rehearsal")
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+
+        jobs = read_workflow("release.yml")["jobs"]
+        publishers = (
+            ("publish-homebrew", "Publish Homebrew formula", "main"),
+            ("publish-aur", "Publish generated AUR metadata", "master"),
+        )
+
+        def git(*args: str, env: dict[str, str] | None = None) -> str:
+            git_environment = os.environ.copy()
+            git_environment.update(
+                {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+            )
+            if env is not None:
+                git_environment.update(env)
+            completed = subprocess.run(
+                ["git", "-c", "commit.gpgsign=false", *args],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=git_environment,
+            )
+            return completed.stdout.strip()
+
+        def make_remote(root: Path, branch: str) -> tuple[Path, str]:
+            bare = root / "target.git"
+            git("init", "--bare", f"--initial-branch={branch}", str(bare))
+            seed = root / "seed"
+            git("clone", str(bare), str(seed))
+            git("-C", str(seed), "config", "user.name", "Fixture")
+            git("-C", str(seed), "config", "user.email", "fixture@example.invalid")
+            (seed / "README").write_text("initial\n", encoding="utf-8")
+            git("-C", str(seed), "add", "README")
+            git(
+                "-C", str(seed), "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid", "commit", "-m", "initial",
+            )
+            git("-C", str(seed), "push", "origin", f"HEAD:refs/heads/{branch}")
+            return bare, git("-C", str(seed), "rev-parse", "HEAD")
+
+        def run_publisher(
+            parent: Path,
+            script: str,
+            url: str,
+            bare: Path,
+            *,
+            content: str,
+            wrapper_path: Path | None = None,
+        ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+            root = parent / f"run-{len(list(parent.glob('run-*')))}"
+            publish_root = root / "root"
+            (publish_root / "metadata").mkdir(parents=True)
+            (publish_root / "keys").mkdir()
+            runner_temp = root / "runner"
+            (runner_temp / "aur-metadata").mkdir(parents=True)
+            (publish_root / "metadata" / "thegn-v1.2.3-homebrew.rb").write_text(
+                content, encoding="utf-8"
+            )
+            (runner_temp / "aur-metadata" / "PKGBUILD").write_text(
+                content, encoding="utf-8"
+            )
+            (runner_temp / "aur-metadata" / ".SRCINFO").write_text(
+                f"pkgname = thegn-bin\ncontent = {content}", encoding="utf-8"
+            )
+            output = root / "github-output"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            git_config = {
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": f"url.file://{bare}.insteadOf",
+                "GIT_CONFIG_VALUE_0": url,
+                "GIT_CONFIG_KEY_1": "commit.gpgsign",
+                "GIT_CONFIG_VALUE_1": "false",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "PUBLISH_ROOT": str(publish_root),
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_WORKSPACE": str(ROOT),
+                "GITHUB_OUTPUT": str(output),
+                "TAG": "v1.2.3",
+                "TAP_REPOSITORY": "o/homebrew-tap",
+            }
+            environment = os.environ.copy()
+            environment.update(git_config)
+            if wrapper_path is not None:
+                environment["PATH"] = f"{wrapper_path.parent}:{environment['PATH']}"
+                environment["REAL_GIT"] = real_git or "git"
+                environment["BARE_REPO"] = str(bare)
+                environment["CONCURRENT_CLONE"] = str(parent / "concurrent")
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            values = {}
+            if output.exists():
+                values = dict(
+                    line.split("=", 1)
+                    for line in output.read_text(encoding="utf-8").splitlines()
+                    if "=" in line
+                )
+            return completed, values
+
+        for job_name, step_name, branch in publishers:
+            url = (
+                "git@github.com:o/homebrew-tap.git"
+                if job_name == "publish-homebrew"
+                else "ssh://aur@aur.archlinux.org/thegn-bin.git"
+            )
+            step = next(
+                item for item in jobs[job_name]["steps"]
+                if item.get("name") == step_name
+            )
+            with self.subTest(job=job_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    parent = Path(temporary)
+                    bare, initial = make_remote(parent, branch)
+                    changed, changed_values = run_publisher(
+                        parent, step["run"], url, bare, content="changed\n"
+                    )
+                    self.assertEqual(0, changed.returncode, changed.stderr)
+                    self.assertEqual("committed", changed_values.get("outcome"))
+                    self.assertEqual(initial, changed_values.get("old"))
+                    self.assertEqual(
+                        changed_values.get("new"),
+                        git("--git-dir", str(bare), "rev-parse", f"refs/heads/{branch}"),
+                    )
+
+                    unchanged, unchanged_values = run_publisher(
+                        parent, step["run"], url, bare, content="changed\n"
+                    )
+                    self.assertEqual(0, unchanged.returncode, unchanged.stderr)
+                    self.assertEqual("unchanged", unchanged_values.get("outcome"))
+                    self.assertEqual(
+                        changed_values.get("new"),
+                        git("--git-dir", str(bare), "rev-parse", f"refs/heads/{branch}"),
+                    )
+
+                    wrapper_dir = parent / "wrapper-bin"
+                    wrapper_dir.mkdir()
+                    wrapper = wrapper_dir / "git"
+                    wrapper.write_text(
+                        "#!/usr/bin/env python3\n"
+                        "import os, pathlib, subprocess, sys\n"
+                        "real = os.environ['REAL_GIT']\n"
+                        "args = sys.argv[1:]\n"
+                        "if 'push' in args:\n"
+                        "    clone = pathlib.Path(os.environ['CONCURRENT_CLONE'])\n"
+                        "    subprocess.run([real, '-c', 'commit.gpgsign=false', 'clone', os.environ['BARE_REPO'], str(clone)], check=True)\n"
+                        "    subprocess.run([real, '-c', 'commit.gpgsign=false', '-C', str(clone), 'config', 'user.name', 'Maintainer'], check=True)\n"
+                        "    subprocess.run([real, '-c', 'commit.gpgsign=false', '-C', str(clone), 'config', 'user.email', 'maintainer@example.invalid'], check=True)\n"
+                        "    (clone / 'maintainer-change').write_text('concurrent\\n')\n"
+                        "    subprocess.run([real, '-c', 'commit.gpgsign=false', '-C', str(clone), 'add', 'maintainer-change'], check=True)\n"
+                        "    subprocess.run([real, '-c', 'commit.gpgsign=false', '-C', str(clone), '-c', 'user.name=Maintainer', '-c', 'user.email=maintainer@example.invalid', 'commit', '-m', 'concurrent'], check=True)\n"
+                        "    subprocess.run([real, '-c', 'commit.gpgsign=false', '-C', str(clone), 'push', 'origin', 'HEAD'], check=True)\n"
+                        "os.execv(real, [real, *args])\n",
+                        encoding="utf-8",
+                    )
+                    wrapper.chmod(0o755)
+                    concurrent, concurrent_values = run_publisher(
+                        parent,
+                        step["run"],
+                        url,
+                        bare,
+                        content="candidate after race\n",
+                        wrapper_path=wrapper,
+                    )
+                    remote_tip = git(
+                        "--git-dir", str(bare), "rev-parse", f"refs/heads/{branch}"
+                    )
+                    self.assertNotEqual(0, concurrent.returncode)
+                    self.assertEqual(changed_values.get("new"), concurrent_values.get("old"))
+                    self.assertEqual(concurrent_values.get("observed"), remote_tip)
+                    self.assertNotEqual(concurrent_values.get("old"), remote_tip)
+                    self.assertNotEqual(concurrent_values.get("new"), remote_tip)
 
     def test_sandbox_publication_is_serialized(self) -> None:
         workflow = read_workflow("sandbox-image.yml")

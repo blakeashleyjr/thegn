@@ -942,14 +942,25 @@ impl IssueBackend for KaneoBackend {
             // Kaneo has no workspace-wide text search over REST that we rely on, so
             // list within scope and filter titles client-side.
             let filter = IssueFilter {
-                limit: limit.max(1),
+                limit: 0,
                 ..Default::default()
             };
             let needle = query.to_ascii_lowercase();
-            let mut issues = self.list_issues_with_op(&mut op, &filter).await?;
-            issues.retain(|i| i.title.to_ascii_lowercase().contains(&needle));
-            issues.truncate(limit.max(1));
-            Ok(issues)
+            let filter_matches = |mut issues: Vec<Issue>| {
+                issues.retain(|i| i.title.to_ascii_lowercase().contains(&needle));
+                if limit > 0 {
+                    issues.truncate(limit);
+                }
+                issues
+            };
+            match self.list_issues_with_op(&mut op, &filter).await {
+                Ok(issues) => Ok(filter_matches(issues)),
+                Err(IssueError::PartialList { issues, reason }) => Err(IssueError::PartialList {
+                    issues: filter_matches(issues),
+                    reason,
+                }),
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -1636,6 +1647,106 @@ mod tests {
                 assert_eq!(reason, "Kaneo project listing was incomplete");
             }
             other => panic!("expected partial project listing, got {other:?}"),
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    fn search_board() -> serde_json::Value {
+        json!({
+            "data": {"workspaceId": "ws-1", "columns": [{
+                "slug": "todo", "name": "To Do", "tasks": [
+                    {"id":"newest","number":3,"title":"unrelated","status":"todo","projectId":"p1","createdAt":"1970-01-01T00:00:09Z"},
+                    {"id":"older-a","number":2,"title":"Fix needle A","status":"todo","projectId":"p1","createdAt":"1970-01-01T00:00:08Z"},
+                    {"id":"older-b","number":1,"title":"needle B","status":"todo","projectId":"p1","createdAt":"1970-01-01T00:00:07Z"}
+                ]
+            }]}
+        })
+    }
+
+    #[tokio::test]
+    async fn search_filters_titles_before_truncating_to_limit() {
+        let (backend, server, calls) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                search_board().to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+        let issues = backend.search("needle", 1).await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].title.to_ascii_lowercase().contains("needle"));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["GET /api/task/tasks/p1?limit=100"]
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn search_limit_zero_returns_every_bounded_match() {
+        let (backend, server, calls) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                search_board().to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+        let issues = backend.search("needle", 0).await.unwrap();
+        assert_eq!(issues.len(), 2);
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.title.to_ascii_lowercase().contains("needle"))
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["GET /api/task/tasks/p1?limit=100"]
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn search_partial_project_listing_keeps_filtered_rows() {
+        let mut board = search_board();
+        board["data"]["columns"][0]["tasks"] = json!([
+            {"id":"needle","number":1,"title":"needle task","status":"todo","projectId":"p1"},
+            {"id":"other","number":2,"title":"other task","status":"todo","projectId":"p1"}
+        ]);
+        let (backend, server, _) = kaneo_fixture(
+            vec![
+                (
+                    "/api/project".into(),
+                    StatusCode::OK,
+                    json!([{"id":"p1"},{"id":"p2"}]).to_string(),
+                ),
+                (
+                    "/api/task/tasks/p1".into(),
+                    StatusCode::OK,
+                    board.to_string(),
+                ),
+                (
+                    "/api/task/tasks/p2".into(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "project failure".into(),
+                ),
+            ],
+            None,
+        )
+        .await;
+        match backend.search("needle", 0).await {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].title, "needle task");
+                assert_eq!(reason, "Kaneo project listing was incomplete");
+            }
+            other => panic!("expected filtered partial search, got {other:?}"),
         }
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());

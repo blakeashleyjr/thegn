@@ -1373,6 +1373,42 @@ fn capture_verdict(
     result: super::super::gate_capture::CaptureResult,
     setup: bool,
 ) -> (GateVerdict, bool) {
+    let (verdict, keep) = capture_verdict_inner(result, setup);
+    (label_host_execution(verdict), keep)
+}
+
+fn label_host_execution(verdict: GateVerdict) -> GateVerdict {
+    match verdict {
+        GateVerdict::Failed { log } => GateVerdict::Failed {
+            log: label_host_execution_log(log),
+        },
+        GateVerdict::Error {
+            reason,
+            log,
+            phase,
+            class,
+        } => GateVerdict::Error {
+            reason,
+            log: label_host_execution_log(log),
+            phase,
+            class,
+        },
+        GateVerdict::Passed => GateVerdict::Passed,
+    }
+}
+
+fn label_host_execution_log(log: String) -> String {
+    if log.trim().is_empty() {
+        log
+    } else {
+        format!("{}{log}", gate::HOST_EXECUTION_LOG_HEADER)
+    }
+}
+
+fn capture_verdict_inner(
+    result: super::super::gate_capture::CaptureResult,
+    setup: bool,
+) -> (GateVerdict, bool) {
     use super::super::gate_capture::CaptureResult as Capture;
     match result {
         Capture::Completed { status, log } if setup && !status.success() => (

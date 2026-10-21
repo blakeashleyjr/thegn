@@ -23,6 +23,7 @@ use std::sync::Arc;
 use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use thegn_core::calendar::ics::{IcsDiagnostic, IcsReport};
 use thegn_core::calendar::{
     AdmissionBudget, AdmissionError, AdmissionLease, AdmissionMeter, AdmissionPool, CalEvent,
     CalendarWindow,
@@ -261,10 +262,87 @@ pub struct EventPage {
     /// sync-token). Empty means "no cursor": the next fetch is a full one.
     /// Independent of `mode`.
     sync_token: String,
+    diagnostics: PageDiagnostics,
     lease: AdmissionLease,
 }
 
+/// Value-free counts of parser diagnostics accumulated while building a page.
+/// Counts are diagnostic records, not events: one event may contribute more
+/// than one count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageDiagnostics {
+    /// Invalid or incomplete events that the parser quarantined.
+    pub quarantined_events: usize,
+    /// Time-zone references the parser could not resolve or map.
+    pub unresolved_zones: usize,
+    /// Other malformed lines, values, or document structure.
+    pub other: usize,
+    /// Diagnostics beyond the parser's bounded report capacity, counted but not retained.
+    pub overflow: usize,
+}
+
+impl PageDiagnostics {
+    pub fn from_report(report: &IcsReport) -> Self {
+        let mut diagnostics = Self {
+            overflow: report.overflow(),
+            ..Default::default()
+        };
+        for diagnostic in report.diagnostics() {
+            match diagnostic {
+                IcsDiagnostic::InvalidEvent
+                | IcsDiagnostic::EventWithoutStart
+                | IcsDiagnostic::DuplicateProperty(_) => {
+                    diagnostics.quarantined_events =
+                        diagnostics.quarantined_events.saturating_add(1);
+                }
+                IcsDiagnostic::UnknownTimeZone | IcsDiagnostic::UnmappedTimeZone => {
+                    diagnostics.unresolved_zones = diagnostics.unresolved_zones.saturating_add(1);
+                }
+                IcsDiagnostic::MalformedLine
+                | IcsDiagnostic::MissingEnvelope
+                | IcsDiagnostic::InvalidRecurrenceValue(_)
+                | IcsDiagnostic::Truncated
+                | IcsDiagnostic::MismatchedEnd
+                | IcsDiagnostic::NestedEvent
+                | IcsDiagnostic::UnclosedChild => {
+                    diagnostics.other = diagnostics.other.saturating_add(1);
+                }
+            }
+        }
+        diagnostics
+    }
+
+    pub fn absorb(&mut self, other: PageDiagnostics) {
+        self.quarantined_events = self
+            .quarantined_events
+            .saturating_add(other.quarantined_events);
+        self.unresolved_zones = self.unresolved_zones.saturating_add(other.unresolved_zones);
+        self.other = self.other.saturating_add(other.other);
+        self.overflow = self.overflow.saturating_add(other.overflow);
+    }
+
+    pub fn total(&self) -> usize {
+        self.quarantined_events
+            .saturating_add(self.unresolved_zones)
+            .saturating_add(self.other)
+            .saturating_add(self.overflow)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
 impl EventPage {
+    pub fn diagnostics(&self) -> PageDiagnostics {
+        self.diagnostics
+    }
+
+    pub(crate) fn with_diagnostics(mut self, diagnostics: PageDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     /// Nothing changed since `sync_token`: keep the cache, keep the cursor.
     pub fn unchanged(sync_token: impl Into<String>) -> Self {
         EventPage {
@@ -344,6 +422,7 @@ impl EventPage {
             event_hrefs,
             deleted_hrefs,
             sync_token,
+            diagnostics: PageDiagnostics::default(),
             lease: meter.into_lease(),
         })
     }

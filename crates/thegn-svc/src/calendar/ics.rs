@@ -15,7 +15,10 @@ use thegn_core::calendar::admission::{AdmissionLimit, MAX_SOURCE_DOCUMENT_BYTES}
 use thegn_core::calendar::{AdmissionError, AdmissionMeter, CalEvent};
 use thegn_core::config_calendar::CalendarAccount;
 
-use super::{AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageMode};
+use super::{
+    AccountAdmission, CalendarBackend, CalendarCaps, CalendarError, EventPage, PageDiagnostics,
+    PageMode,
+};
 
 /// Maximum eligible `.ics` files in one vdir.
 pub const MAX_FILES: usize = 20_000;
@@ -58,7 +61,7 @@ impl IcsBackend {
         out: &mut Vec<CalEvent>,
         remaining_bytes: usize,
         deadline: Instant,
-    ) -> Result<usize, ReadFailure> {
+    ) -> Result<(usize, PageDiagnostics), ReadFailure> {
         check_deadline(deadline).map_err(ReadFailure::Io)?;
         let file = thegn_core::fsperm::open_regular_file_nofollow(path).map_err(ReadFailure::Io)?;
         let declared =
@@ -123,7 +126,7 @@ impl IcsBackend {
                             Err(ReadFailure::Document)
                         } else {
                             check_deadline(deadline).map_err(ReadFailure::Io)?;
-                            Ok(count)
+                            Ok((count, PageDiagnostics::from_report(&report)))
                         }
                     }
                 }
@@ -152,7 +155,16 @@ impl IcsBackend {
                 MAX_AGGREGATE_SOURCE_BYTES,
                 deadline,
             ) {
-                Ok(_) => {}
+                Ok((_, diagnostics)) => {
+                    return EventPage::from_meter(
+                        meter,
+                        PageMode::Snapshot,
+                        out,
+                        Vec::new(),
+                        String::new(),
+                    )
+                    .map(|page| page.with_diagnostics(diagnostics));
+                }
                 Err(ReadFailure::Io(e)) => {
                     return Err(CalendarError::Io(format!("{}: {e}", self.path)));
                 }
@@ -164,13 +176,6 @@ impl IcsBackend {
                     )));
                 }
             }
-            return EventPage::from_meter(
-                meter,
-                PageMode::Snapshot,
-                out,
-                Vec::new(),
-                String::new(),
-            );
         }
         if !metadata.file_type().is_dir() {
             return Err(CalendarError::Io(format!(
@@ -216,6 +221,7 @@ impl IcsBackend {
         }
         candidates = select_candidates(candidates)?;
         let mut total_bytes = 0usize;
+        let mut diagnostics = PageDiagnostics::default();
         for path in candidates {
             check_deadline(deadline)
                 .map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
@@ -229,7 +235,10 @@ impl IcsBackend {
                 remaining,
                 deadline,
             ) {
-                Ok(n) => total_bytes += n,
+                Ok((n, file_diagnostics)) => {
+                    total_bytes += n;
+                    diagnostics.absorb(file_diagnostics);
+                }
                 Err(ReadFailure::Io(e)) => {
                     return Err(CalendarError::Io(format!("{}: {e}", path.display())));
                 }
@@ -243,6 +252,7 @@ impl IcsBackend {
             }
         }
         EventPage::from_meter(meter, PageMode::Snapshot, out, Vec::new(), String::new())
+            .map(|page| page.with_diagnostics(diagnostics))
     }
 }
 

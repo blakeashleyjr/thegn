@@ -1460,6 +1460,52 @@ fn setup_failure_keeps_exit_code_and_does_not_run_gate() {
 }
 
 #[test]
+fn host_execution_header_prefixes_a_failed_gate_log() {
+    let mut f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    f.config.gate_command = "printf red-marker; exit 3".into();
+    match gate_tip(&f.repo, &f.first, &f.config).unwrap() {
+        GateVerdict::Failed { log } => {
+            assert!(log.starts_with(thegn_core::gate::HOST_EXECUTION_LOG_HEADER));
+            assert!(log.contains("red-marker"));
+        }
+        other => panic!("expected failed gate verdict: {other:?}"),
+    }
+}
+
+#[test]
+fn host_execution_keeps_silent_failed_gate_log_empty() {
+    let mut f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    f.config.gate_command = "exit 3".into();
+    match gate_tip(&f.repo, &f.first, &f.config).unwrap() {
+        GateVerdict::Failed { log } => assert!(log.is_empty()),
+        other => panic!("expected failed gate verdict: {other:?}"),
+    }
+}
+
+#[test]
+fn host_execution_entries_are_in_doctor_json() {
+    let report = crate::cmd::doctor::doctor_json(&thegn_core::config::Config::default());
+    let entries = report["host_execution"]
+        .as_array()
+        .expect("doctor host_execution should be an array");
+    let routes: Vec<_> = entries
+        .iter()
+        .map(|entry| entry["route"].as_str().expect("route should be text"))
+        .collect();
+    let expected: Vec<_> = thegn_core::gate::HOST_EXECUTION_ROUTES
+        .iter()
+        .map(|route| route.id)
+        .collect();
+    assert_eq!(routes, expected);
+}
+
+#[test]
 fn setup_timeout_is_an_infrastructure_hold_and_does_not_run_gate() {
     if !posix_shell_gate_only() {
         return;

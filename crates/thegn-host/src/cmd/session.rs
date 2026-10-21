@@ -9,7 +9,7 @@ use base64::Engine as _;
 use std::path::Path;
 use thegn_core::agent_task::template_vars;
 use thegn_core::config::Config;
-use thegn_core::db::{Db, ResumeDispatchConflict};
+use thegn_core::db::{Db, LeadProof, ResumeDispatchConflict};
 use thegn_core::issue::{AgentDispatchStatus, DispatchRunPublishOutcome, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_report::display_cell;
@@ -126,6 +126,12 @@ pub enum SessionAction {
         /// `dispatch put --chunk … --force`.
         #[arg(long, requires = "stage", conflicts_with = "resume_work")]
         chunk: Option<String>,
+        /// The Lead lease this stage dispatch is made under.
+        #[arg(long, value_name = "NAME", requires_all = ["stage", "issue", "owner"], conflicts_with = "resume_work")]
+        lease: Option<String>,
+        /// The owner id holding `--lease`.
+        #[arg(long, value_name = "ID", requires = "lease")]
+        owner: Option<String>,
         /// Resume an eligible unfinished pipeline roster row (THE-86): an
         /// unstamped spawning/running row is refused because its worker may
         /// still be live; otherwise the source is reconciled and the fresh
@@ -457,6 +463,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             parent,
             parent_artifact,
             chunk,
+            lease,
+            owner,
             resume_work: resume_row,
             json,
         } => {
@@ -484,6 +492,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         parent,
                         parent_artifact: parent_artifact.as_deref(),
                         chunk: chunk.as_deref(),
+                        lease: lease.as_deref(),
+                        owner: owner.as_deref(),
                         agent: agent.as_deref(),
                         // clap requires --worktree unless --resume-work (and
                         // the two conflict), so this is always Some here.
@@ -800,6 +810,8 @@ struct StageDispatch<'a> {
     /// The chunk file this dispatch runs under (the scope gate reads it
     /// before the insert; the row records the path).
     chunk: Option<&'a str>,
+    lease: Option<&'a str>,
+    owner: Option<&'a str>,
     /// Explicit `--agent`, overriding the stage's configured one.
     agent: Option<&'a str>,
     worktree: &'a str,
@@ -994,7 +1006,11 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     // the previous attempt is unaffected — only rows still occupying a slot
     // refuse. The deliberate-duplicate escape hatch lives on `dispatch claim
     // --allow-duplicate <reason>`, which records the justification.
-    let outcome = super::dispatch::claim_admitted_with_refresh(
+    let proof = match (d.lease, d.owner) {
+        (Some(name), Some(owner)) => LeadProof::Lease { name, owner },
+        _ => LeadProof::Unbound,
+    };
+    let outcome = super::dispatch::claim_admitted_with_refresh_led(
         &db,
         NewDispatch {
             issue_id: d.issue,
@@ -1012,6 +1028,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         d.issue,
         d.chunk,
         None,
+        proof,
     )?;
     let row_id = match outcome {
         Ok(id) => id,
@@ -1087,6 +1104,13 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         .map(str::to_string)
         .unwrap_or(parent_artifact);
     let opened = async {
+        // Keep the daemon's configured-agent refusal and the row-closing
+        // behavior for an unknown override. This is deliberately after claim:
+        // resolution failures belong to the named failed roster row.
+        crate::daemon::agent_open::ensure_configured_agent(cfg, &agent_name)?;
+        let config_digest =
+            thegn_core::pipeline_launch_digest::stage_launch_digest(cfg, &agent_name, &stage.name)
+                .map_err(anyhow::Error::msg)?;
         let launch = crate::daemon::stage_launch::mint_launch_id()
             .ok_or_else(|| anyhow::anyhow!("no entropy for a stage launch id"))?;
         let vars = stage_task_vars(
@@ -1109,6 +1133,10 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                     row_id.to_string(),
                 ),
                 (crate::daemon::stage_launch::STAGE_LAUNCH_ENV.into(), launch),
+                (
+                    thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+                    config_digest,
+                ),
             ],
             rows: 24,
             cols: 80,

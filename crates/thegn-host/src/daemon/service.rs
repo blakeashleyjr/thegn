@@ -34,6 +34,15 @@ use super::tombstone::Tombstone;
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const SHUTDOWN_REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 const SHUTDOWN_ABORT_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+/// The longest graceful daemon shutdown (drain + reap + abort-join), plus one
+/// second of scheduling slack. `thegn daemon stop` waits at most this long in
+/// total across all verified endpoints.
+pub(crate) const SHUTDOWN_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
+    SHUTDOWN_DRAIN_DEADLINE.as_secs()
+        + SHUTDOWN_REAP_DEADLINE.as_secs()
+        + SHUTDOWN_ABORT_JOIN_DEADLINE.as_secs()
+        + 1,
+);
 
 /// One live session in the daemon's table.
 pub(crate) struct SessionEntry {
@@ -289,6 +298,7 @@ pub(crate) fn session_identity_env(
             k != "THEGN_SESSION_ID"
                 && k != "THEGN_CONTROL_SOCKET"
                 && k != super::stage_launch::STAGE_LAUNCH_ENV
+                && k != thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV
         })
         .cloned()
         .collect();
@@ -539,6 +549,12 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
                 ControlError::InvalidArgument(status_error.to_string())
             }
         };
+    }
+    if error
+        .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+        .is_some()
+    {
+        return ControlError::FailedPrecondition(error.to_string());
     }
     if let Some(conflict) = error.downcast_ref::<thegn_core::db::DispatchTransitionConflict>() {
         return match conflict {
@@ -5041,6 +5057,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_set_status_bound_row_maps_lease_refusal_to_failed_precondition() {
+        use thegn_core::db::LeadProof;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+
+        let (svc, _rx) = service(0);
+        let row_id = svc
+            .with_db(|db| {
+                db.acquire_pipeline_lease("repo:linear:A-1", "lead-a", 300)?
+                    .map_err(anyhow::Error::msg)?;
+                db.claim_dispatch_admitted_led(
+                    NewDispatch::new("linear:A-1", "/wt/a", "coder"),
+                    20,
+                    None,
+                    None,
+                    None,
+                    LeadProof::Lease {
+                        name: "repo:linear:A-1",
+                        owner: "lead-a",
+                    },
+                )?
+                .map_err(|decision| anyhow::anyhow!("unexpected admission refusal: {decision:?}"))
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            svc.dispatch_set_status(row_id, St::Running).await,
+            Err(ControlError::FailedPrecondition(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn dispatch_put_refuses_a_missing_parent_without_a_row() {
         let (svc, _rx) = service(0);
         let result = svc
@@ -6900,5 +6948,17 @@ mod identity_env_tests {
             out.iter()
                 .all(|(key, _)| key != super::super::stage_launch::STAGE_LAUNCH_ENV)
         );
+    }
+
+    #[test]
+    fn session_identity_env_strips_the_stage_config_digest() {
+        let env = vec![(
+            thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV.into(),
+            "a".repeat(64),
+        )];
+        let out = session_identity_env("session", "/run/x/daemon.sock", &env);
+        assert!(out.iter().all(|(key, _)| {
+            key != thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV
+        }));
     }
 }

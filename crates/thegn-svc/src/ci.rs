@@ -668,10 +668,9 @@ fn run_cli_capped(cmd: Command, max: usize, cancel: &AtomicBool) -> Result<Strin
 /// Run a log-producing command while retaining only its newest complete lines.
 ///
 /// `Command::output` is unsuitable for CI logs: it buffers the complete child
-/// stdout before the caller can impose a cap.  Drain stdout in a fixed-size
-/// reader instead and keep a bounded deque; stderr is drained concurrently so
-/// a noisy failed provider cannot deadlock the child.  The status and error
-/// classification remain identical to [`run_cli`].
+/// stdout before the caller can impose a cap. Feed stdout chunks directly into
+/// a bounded line collector; the shared process runner drains stderr alongside
+/// it. The status and error classification remain identical to [`run_cli`].
 fn run_bounded_log(cmd: Command, cancel: &AtomicBool) -> Result<CiLog, CiError> {
     run_bounded_log_within(
         cmd,
@@ -695,12 +694,12 @@ fn run_bounded_log_within(
     use crate::plugin::proc::bounded_group_termination_supported;
 
     if bounded_group_termination_supported() {
-        let (log_result, _status) =
-            run_blocking_streaming(cmd, limits, cancel, |reader: &mut dyn Read| {
-                collect_log(reader)
-            })
-            .map_err(ci_run_error)?;
-        let (text, truncated) = log_result?;
+        let mut collector = LogCollector::new();
+        run_blocking_streaming(cmd, limits, cancel, &mut |bytes: &[u8]| {
+            collector.feed(bytes);
+        })
+        .map_err(ci_run_error)?;
+        let (text, truncated) = collector.finish();
         return Ok(CiLog { text, truncated });
     }
 
@@ -713,89 +712,112 @@ fn run_bounded_log_within(
     Ok(CiLog { text, truncated })
 }
 
-/// Read at most a fixed number of bytes per chunk and discard old complete
-/// lines as new output arrives.  An over-sized line is discarded rather than
-/// allowing one pathological line to defeat the byte ceiling.
+/// Stateful push collector shared by bounded subprocess streaming and the reader wrapper.
+struct LogCollector {
+    line: Vec<u8>,
+    lines: VecDeque<String>,
+    kept_bytes: usize,
+    truncated: bool,
+    discard_line: bool,
+    discard_line_last_marker: Option<bool>,
+    in_pem: bool,
+    marker_tail: Vec<u8>,
+}
+
+impl LogCollector {
+    fn new() -> Self {
+        Self {
+            line: Vec::new(),
+            lines: VecDeque::new(),
+            kept_bytes: 0,
+            truncated: false,
+            discard_line: false,
+            discard_line_last_marker: None,
+            in_pem: false,
+            marker_tail: Vec::with_capacity(b"-----BEGIN ".len()),
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.marker_tail.push(byte);
+            if self.marker_tail.len() > b"-----BEGIN ".len() {
+                self.marker_tail.remove(0);
+            }
+            if self.marker_tail.ends_with(b"-----BEGIN ") {
+                self.in_pem = true;
+                self.discard_line_last_marker = Some(true);
+            } else if self.marker_tail.ends_with(b"-----END ") {
+                self.in_pem = false;
+                self.discard_line_last_marker = Some(false);
+            }
+            if self.discard_line {
+                if byte == b'\n' {
+                    self.discard_line = false;
+                    if let Some(begin) = self.discard_line_last_marker {
+                        self.in_pem = begin;
+                    }
+                    self.discard_line_last_marker = None;
+                    self.marker_tail.clear();
+                    self.truncated = true;
+                }
+                continue;
+            }
+            self.line.push(byte);
+            if self.line.len() > PROVIDER_LOG_MAX_BYTES {
+                self.line.clear();
+                self.discard_line = true;
+                self.truncated = true;
+                if byte == b'\n' {
+                    self.discard_line = false;
+                    if let Some(begin) = self.discard_line_last_marker {
+                        self.in_pem = begin;
+                    }
+                    self.discard_line_last_marker = None;
+                    self.marker_tail.clear();
+                }
+            } else if byte == b'\n' {
+                push_log_line(
+                    &mut self.lines,
+                    &mut self.kept_bytes,
+                    &self.line,
+                    &mut self.truncated,
+                    &mut self.in_pem,
+                );
+                self.line.clear();
+                self.discard_line_last_marker = None;
+                self.marker_tail.clear();
+            }
+        }
+    }
+
+    fn finish(mut self) -> (String, bool) {
+        if !self.line.is_empty() && !self.discard_line {
+            push_log_line(
+                &mut self.lines,
+                &mut self.kept_bytes,
+                &self.line,
+                &mut self.truncated,
+                &mut self.in_pem,
+            );
+        }
+        (self.lines.into_iter().collect(), self.truncated)
+    }
+}
+
+/// Read fixed-size chunks into the push collector and finish it at EOF.
 fn collect_log<R: Read>(mut reader: R) -> Result<(String, bool), CiError> {
     let mut bytes = [0u8; 8192];
-    let mut line = Vec::new();
-    let mut lines: VecDeque<String> = VecDeque::new();
-    let mut kept_bytes = 0usize;
-    let mut truncated = false;
-    let mut discard_line = false;
-    let mut discard_line_last_marker = None;
-    let mut in_pem = false;
-    let mut marker_tail = Vec::with_capacity(b"-----BEGIN ".len());
-
+    let mut collector = LogCollector::new();
     loop {
         let n = reader
             .read(&mut bytes)
             .map_err(|e| CiError::Other(e.to_string()))?;
         if n == 0 {
-            if !line.is_empty() && !discard_line {
-                push_log_line(
-                    &mut lines,
-                    &mut kept_bytes,
-                    &line,
-                    &mut truncated,
-                    &mut in_pem,
-                );
-            }
-            break;
+            return Ok(collector.finish());
         }
-        for &byte in &bytes[..n] {
-            marker_tail.push(byte);
-            if marker_tail.len() > b"-----BEGIN ".len() {
-                marker_tail.remove(0);
-            }
-            if marker_tail.ends_with(b"-----BEGIN ") {
-                in_pem = true;
-                discard_line_last_marker = Some(true);
-            } else if marker_tail.ends_with(b"-----END ") {
-                in_pem = false;
-                discard_line_last_marker = Some(false);
-            }
-            if discard_line {
-                if byte == b'\n' {
-                    discard_line = false;
-                    if let Some(begin) = discard_line_last_marker {
-                        in_pem = begin;
-                    }
-                    discard_line_last_marker = None;
-                    marker_tail.clear();
-                    truncated = true;
-                }
-                continue;
-            }
-            line.push(byte);
-            if line.len() > PROVIDER_LOG_MAX_BYTES {
-                line.clear();
-                discard_line = true;
-                truncated = true;
-                if byte == b'\n' {
-                    discard_line = false;
-                    if let Some(begin) = discard_line_last_marker {
-                        in_pem = begin;
-                    }
-                    discard_line_last_marker = None;
-                    marker_tail.clear();
-                }
-            } else if byte == b'\n' {
-                push_log_line(
-                    &mut lines,
-                    &mut kept_bytes,
-                    &line,
-                    &mut truncated,
-                    &mut in_pem,
-                );
-                line.clear();
-                discard_line_last_marker = None;
-                marker_tail.clear();
-            }
-        }
+        collector.feed(&bytes[..n]);
     }
-
-    Ok((lines.into_iter().collect(), truncated))
 }
 
 fn push_log_line(
@@ -2175,6 +2197,29 @@ fn warn_unknown_gitlab_state(status: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_collector_matches_collect_log_for_any_chunking() {
+        let mut many_lines = String::new();
+        for n in 0..2100 {
+            many_lines.push_str(&format!("line {n}\n"));
+        }
+        let inputs: [&[u8]; 3] = [
+            b"before\n-----BEGIN PRIVATE KEY-----\nsecret-body\n-----END PRIVATE KEY-----\nafter\n",
+            b"build\tstep\t2024-01-01T00:00:00.0000000Z -----BEGIN OPENSSH PRIVATE KEY-----\nSYNTHETICKEYBODY\nbuild\tstep\t2024-01-01T00:00:01.0000000Z -----END OPENSSH PRIVATE KEY-----\nafter\n",
+            many_lines.as_bytes(),
+        ];
+        for input in inputs {
+            let expected = collect_log(input).unwrap();
+            for chunk_size in [1, 7, 8192] {
+                let mut collector = LogCollector::new();
+                for chunk in input.chunks(chunk_size) {
+                    collector.feed(chunk);
+                }
+                assert_eq!(collector.finish(), expected, "chunk size {chunk_size}");
+            }
+        }
+    }
 
     fn shell_available() -> bool {
         Command::new("sh").arg("-c").arg("sleep 0").output().is_ok()

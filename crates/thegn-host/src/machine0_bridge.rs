@@ -303,6 +303,8 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
         user,
         key_path: key,
     };
+    shim.prepare_known_hosts()
+        .context("machine0-ssh: prepare the per-instance known_hosts pin")?;
 
     // Interactive pane over mosh (default) when the local client + the VM's
     // mosh-server are both present AND mosh isn't already known-bad for this VM.

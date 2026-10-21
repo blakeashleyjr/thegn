@@ -30,7 +30,7 @@ use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
 use thegn_svc::git::{CasOutcome, CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 
-const DRIVER_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const DRIVER_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RefusedDrivers {
@@ -1336,7 +1336,7 @@ fn record_gate(diagnostics: &mut String, phase: &str, verdict: &GateVerdict) {
     if diagnostics.ends_with(TRUNCATED) {
         return;
     }
-    let (headline, log) = match verdict {
+    let (headline, mut log) = match verdict {
         GateVerdict::Passed => ("passed".to_string(), ""),
         GateVerdict::Failed { log } => ("failed".to_string(), log.as_str()),
         GateVerdict::Error {
@@ -1349,6 +1349,14 @@ fn record_gate(diagnostics: &mut String, phase: &str, verdict: &GateVerdict) {
             log.as_str(),
         ),
     };
+    let host_execution_header = thegn_core::gate::HOST_EXECUTION_LOG_HEADER;
+    let has_host_execution_header = log.starts_with(host_execution_header);
+    if has_host_execution_header {
+        log = &log[host_execution_header.len()..];
+        if !diagnostics.starts_with(host_execution_header) {
+            diagnostics.insert_str(0, host_execution_header);
+        }
+    }
     let entry = format!("[{phase}] {headline}\n{}\n", tail(log, 4000));
     let mut clean = String::new();
     for c in entry.chars().take(5000) {

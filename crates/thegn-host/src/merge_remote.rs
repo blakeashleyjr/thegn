@@ -13,15 +13,85 @@
 //! is what the fold merges and an attempt-scoped guard removes it afterward.
 //!
 //! Runs off the event loop (from the merge-queue drain in `spawn_blocking` / the
-//! CLI). It shells `git bundle`/`git fetch`, so the `.output()` sites carry the
-//! host crate's off-loop `#[expect(clippy::disallowed_methods)]`.
+//! CLI). Producer pipes are drained off-loop and the consumer uses the bounded
+//! Git executor.
 
-use crate::platform::bundle_custody::BundleTemp;
+use crate::platform::bundle_custody::{BundleTemp, kill_bundle_producer, spawn_bundle_producer};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::fmt;
+use std::io::{self, Read};
+use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thegn_core::remote::GitLoc;
 use thegn_svc::git::{CliGit, PlumbingOps};
+
+const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const BUNDLE_STDERR_TAIL: usize = 64 * 1024;
+const BUNDLE_READER_GRACE: Duration = Duration::from_millis(100);
+
+struct BundleLimits {
+    max_bytes: u64,
+    deadline: Duration,
+    stderr_tail: usize,
+}
+
+impl BundleLimits {
+    fn production() -> Self {
+        Self {
+            max_bytes: MAX_BUNDLE_BYTES,
+            deadline: crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+            stderr_tail: BUNDLE_STDERR_TAIL,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum IngestError {
+    Timeout {
+        after: Duration,
+    },
+    SizeLimit {
+        cap: u64,
+    },
+    Remote {
+        code: Option<i32>,
+        stderr_tail: String,
+    },
+    LocalStorage(io::Error),
+    InvalidBundle(String),
+}
+
+impl fmt::Display for IngestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout { after } => write!(
+                f,
+                "bundle ingestion timed out after {} seconds",
+                after.as_secs()
+            ),
+            Self::SizeLimit { cap } => write!(f, "bundle exceeded the {cap}-byte size limit"),
+            Self::Remote { code, stderr_tail } => write!(
+                f,
+                "bundle producer failed with status {code:?}: {stderr_tail}"
+            ),
+            Self::LocalStorage(error) => write!(f, "bundle local storage failed: {error}"),
+            Self::InvalidBundle(detail) => write!(f, "invalid bundle: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for IngestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LocalStorage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// The fenced source tip used by the fold. The ingested source ref stays owned
 /// by this guard for the full integration attempt. Same-store sources have no
@@ -83,9 +153,23 @@ fn ingest_tip_with_expected(
     };
     prune_refs(target, branch_loc, branch)?;
     let ref_name = generation_ref(branch_loc, branch)?;
-    let bundle = bundle_bytes(branch_loc, branch)
-        .with_context(|| format!("branch host unreachable while bundling {branch}"))?;
-    fetch_bundle(target, branch, &bundle, &ref_name, &expected)
+    let mut tmp = BundleTemp::new().map_err(IngestError::LocalStorage)?;
+    let src = format!("refs/heads/{branch}");
+    if let Err(error) = stream_bundle(
+        branch_loc.git_command(&["bundle", "create", "-", &src]),
+        &mut tmp,
+        &BundleLimits::production(),
+    ) {
+        let cleanup = tmp.finish();
+        return match cleanup {
+            Ok(()) => Err(anyhow::Error::new(error)
+                .context(format!("branch host unreachable while bundling {branch}"))),
+            Err(cleanup) => Err(anyhow::Error::new(error).context(format!(
+                "branch host unreachable while bundling {branch}; cleanup failed: {cleanup}"
+            ))),
+        };
+    }
+    fetch_from_custody(target, branch, tmp, &ref_name, &expected)
         .with_context(|| format!("fetching {branch} into the target store"))?;
     let guard = IngestRef {
         target: target.clone(),
@@ -227,26 +311,307 @@ fn needs_ingest(target: &GitLoc, branch: &GitLoc) -> bool {
     host_id(target) != host_id(branch)
 }
 
-/// Bundle the branch ref on its own host and return the bundle bytes. `git
-/// bundle create -` writes the bundle to stdout (progress goes to stderr, which
-/// we keep separate), so this works verbatim over ssh/provider.
-#[expect(clippy::disallowed_methods)] // off-loop: merge-queue drain (spawn_blocking / CLI)
-fn bundle_bytes(branch_loc: &GitLoc, branch: &str) -> Result<Vec<u8>> {
-    let src = format!("refs/heads/{branch}");
-    let out = branch_loc
-        .git_command(&["bundle", "create", "-", &src])
-        .output()
-        .context("spawn git bundle create")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git bundle create failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+#[expect(
+    clippy::disallowed_methods,
+    reason = "off-loop: merge-queue drain (spawn_blocking) / CLI; the killed producer must be reaped"
+)]
+fn stream_bundle(
+    mut producer: Command,
+    tmp: &mut BundleTemp,
+    limits: &BundleLimits,
+) -> std::result::Result<u64, IngestError> {
+    producer
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let started = Instant::now();
+    let mut child = spawn_bundle_producer(&mut producer).map_err(|error| IngestError::Remote {
+        code: None,
+        stderr_tail: error.to_string(),
+    })?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_bundle_producer(&mut child);
+            if let Err(error) = child.wait() {
+                tracing::debug!(target: "thegn::merge", %error, "failed waiting for bundle producer without stdout pipe");
+            }
+            return Err(IngestError::Remote {
+                code: None,
+                stderr_tail: "producer stdout pipe unavailable".to_string(),
+            });
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            kill_bundle_producer(&mut child);
+            if let Err(error) = child.wait() {
+                tracing::debug!(target: "thegn::merge", %error, "failed waiting for bundle producer without stderr pipe");
+            }
+            return Err(IngestError::Remote {
+                code: None,
+                stderr_tail: "producer stderr pipe unavailable".to_string(),
+            });
+        }
+    };
+    let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+    let (stdout_done_tx, stdout_done_rx) = mpsc::sync_channel(1);
+    let stdout_thread = thegn_core::thread_name::spawn_named("thegn-bndl-out", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let mut reader = stdout;
+        loop {
+            let mut chunk = vec![0_u8; 64 * 1024];
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    chunk.truncate(count);
+                    if let Err(unsent) = tx.send(Ok(chunk)) {
+                        tracing::debug!(target: "thegn::merge", "bundle stdout receiver closed: {unsent:?}");
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if let Err(unsent) = tx.send(Err(error)) {
+                        tracing::debug!(target: "thegn::merge", "bundle stdout receiver closed after read error: {unsent:?}");
+                    }
+                    break;
+                }
+            }
+        }
+        if let Err(error) = stdout_done_tx.send(()) {
+            tracing::debug!(target: "thegn::merge", "bundle stdout completion receiver closed: {error}");
+        }
+    });
+    let stderr_limit = limits.stderr_tail;
+    let stderr_tail = Arc::new(Mutex::new((
+        Vec::with_capacity(stderr_limit.min(64 * 1024)),
+        false,
+    )));
+    let stderr_tail_reader = Arc::clone(&stderr_tail);
+    let (stderr_done_tx, stderr_done_rx) = mpsc::sync_channel(1);
+    let stderr_thread = thegn_core::thread_name::spawn_named("thegn-bndl-err", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let mut reader = stderr;
+        let mut chunk = [0_u8; 8192];
+        let read_result = loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break Ok(()),
+                Ok(count) => {
+                    let incoming = &chunk[..count];
+                    let (tail, truncated) = &mut *stderr_tail_reader
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if stderr_limit == 0 {
+                        *truncated |= !incoming.is_empty();
+                    } else if incoming.len() >= stderr_limit {
+                        *truncated |= !tail.is_empty() || incoming.len() > stderr_limit;
+                        tail.clear();
+                        tail.extend_from_slice(&incoming[incoming.len() - stderr_limit..]);
+                    } else {
+                        let excess = tail
+                            .len()
+                            .saturating_add(incoming.len())
+                            .saturating_sub(stderr_limit);
+                        if excess > 0 {
+                            tail.drain(..excess);
+                            *truncated = true;
+                        }
+                        tail.extend_from_slice(incoming);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        if let Err(error) = stderr_done_tx.send(read_result) {
+            tracing::debug!(target: "thegn::merge", "bundle stderr completion receiver closed: {error}");
+        }
+    });
+
+    let mut bytes = 0_u64;
+    let mut terminal_error = None;
+    let mut status = None;
+    loop {
+        let remaining = limits.deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            terminal_error = Some(IngestError::Timeout {
+                after: limits.deadline,
+            });
+            kill_bundle_producer(&mut child);
+            break;
+        }
+        let poll_wait = remaining.min(Duration::from_millis(10));
+        match rx.recv_timeout(poll_wait) {
+            Ok(Ok(chunk)) => {
+                bytes = bytes.saturating_add(chunk.len() as u64);
+                if bytes > limits.max_bytes {
+                    terminal_error = Some(IngestError::SizeLimit {
+                        cap: limits.max_bytes,
+                    });
+                    kill_bundle_producer(&mut child);
+                    break;
+                }
+                if let Err(error) = tmp.write(&chunk) {
+                    terminal_error = Some(IngestError::LocalStorage(error));
+                    kill_bundle_producer(&mut child);
+                    break;
+                }
+            }
+            Ok(Err(error)) => {
+                terminal_error = Some(IngestError::Remote {
+                    code: None,
+                    stderr_tail: error.to_string(),
+                });
+                kill_bundle_producer(&mut child);
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                match crate::platform::gate_child_exited(&mut child) {
+                    Ok(true) => {
+                        kill_bundle_producer(&mut child);
+                        match child.wait() {
+                            Ok(exited) => status = Some(exited),
+                            Err(error) => {
+                                terminal_error = Some(IngestError::Remote {
+                                    code: None,
+                                    stderr_tail: error.to_string(),
+                                });
+                            }
+                        }
+                        break;
+                    }
+                    Ok(false) => continue,
+                    Err(error) => {
+                        terminal_error = Some(IngestError::Remote {
+                            code: None,
+                            stderr_tail: error.to_string(),
+                        });
+                        kill_bundle_producer(&mut child);
+                        break;
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                match crate::platform::gate_child_exited(&mut child) {
+                    Ok(true) => {
+                        kill_bundle_producer(&mut child);
+                        match child.wait() {
+                            Ok(exited) => status = Some(exited),
+                            Err(error) => {
+                                terminal_error = Some(IngestError::Remote {
+                                    code: None,
+                                    stderr_tail: error.to_string(),
+                                });
+                            }
+                        }
+                        break;
+                    }
+                    Ok(false) => std::thread::sleep(thegn_proc::next_backoff(
+                        Duration::from_millis(10),
+                        remaining,
+                    )),
+                    Err(error) => {
+                        terminal_error = Some(IngestError::Remote {
+                            code: None,
+                            stderr_tail: error.to_string(),
+                        });
+                        kill_bundle_producer(&mut child);
+                        break;
+                    }
+                }
+            }
+        }
     }
-    if out.stdout.is_empty() {
-        anyhow::bail!("git bundle create produced no data");
+
+    drop(rx);
+    if status.is_none()
+        && let Err(error) = child.wait()
+    {
+        tracing::debug!(target: "thegn::merge", %error, "failed waiting for bundle producer after termination");
     }
-    Ok(out.stdout)
+    let reader_wait = limits
+        .deadline
+        .saturating_sub(started.elapsed())
+        .min(BUNDLE_READER_GRACE);
+    let stdout_finished = stdout_done_rx.recv_timeout(reader_wait).is_ok();
+    let stderr_wait = limits
+        .deadline
+        .saturating_sub(started.elapsed())
+        .min(BUNDLE_READER_GRACE);
+    let stderr_result = Result::ok(stderr_done_rx.recv_timeout(stderr_wait));
+    drop(stdout_thread);
+    drop(stderr_thread);
+
+    let (tail, truncated) = stderr_tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut stderr_text = String::new();
+    if truncated {
+        stderr_text.push_str("[... stderr truncated ...]");
+    }
+    stderr_text.push_str(&String::from_utf8_lossy(&tail));
+    if !stdout_finished {
+        tracing::debug!(target: "thegn::merge", "bundle stdout reader did not finish during grace period");
+    }
+    let stderr_reader_missing = stderr_result.is_none();
+    match stderr_result {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            if !stderr_text.is_empty() {
+                stderr_text.push_str("; ");
+            }
+            stderr_text.push_str(&format!("stderr read failed: {error}"));
+        }
+        None => {
+            if !stderr_text.is_empty() {
+                stderr_text.push_str("; ");
+            }
+            stderr_text.push_str("[... stderr reader did not finish ...]");
+        }
+    }
+    let max_text_bytes = limits.stderr_tail.saturating_add(96);
+    if stderr_text.len() > max_text_bytes {
+        let mut end = max_text_bytes;
+        while !stderr_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        stderr_text.truncate(end);
+    }
+
+    if let Some(error) = terminal_error {
+        return Err(match error {
+            IngestError::Remote {
+                code: None,
+                stderr_tail: read_error,
+            } if !stderr_text.is_empty() => IngestError::Remote {
+                code: None,
+                stderr_tail: format!("{read_error}; stderr: {stderr_text}"),
+            },
+            IngestError::Remote {
+                code: None,
+                stderr_tail: read_error,
+            } if stderr_reader_missing => IngestError::Remote {
+                code: None,
+                stderr_tail: format!("{read_error}; [... stderr reader did not finish ...]"),
+            },
+            other => other,
+        });
+    }
+    let status =
+        status.unwrap_or_else(|| unreachable!("producer status or terminal error is required"));
+    if !status.success() {
+        return Err(IngestError::Remote {
+            code: status.code(),
+            stderr_tail: stderr_text,
+        });
+    }
+    if bytes == 0 {
+        return Err(IngestError::InvalidBundle(
+            "git bundle create produced no data".to_string(),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Materialize the bundle on the target host and fetch its branch ref into the
@@ -254,52 +619,28 @@ fn bundle_bytes(branch_loc: &GitLoc, branch: &str) -> Result<Vec<u8>> {
 /// target host, so `target` is `Local`; a remote target means the caller should
 /// have dispatched to that host's drain daemon (see Milestone B), so we fail
 /// loudly rather than trying to push a bundle the wrong way.
-fn fetch_bundle(
+fn fetch_from_custody(
     target: &GitLoc,
     branch: &str,
-    bundle: &[u8],
+    tmp: BundleTemp,
     target_ref: &str,
     expected: &str,
-) -> Result<()> {
-    fetch_bundle_with_root(target, branch, bundle, target_ref, expected, None)
-}
-
-fn fetch_bundle_with_root(
-    target: &GitLoc,
-    branch: &str,
-    bundle: &[u8],
-    target_ref: &str,
-    expected: &str,
-    temp_root: Option<&Path>,
 ) -> Result<()> {
     if target.is_remote() {
         anyhow::bail!(
-            "remote target store: run the drain on the target host (merge daemon), \
-             not by pushing a bundle over ssh"
+            "remote target store: run the drain on the target host (merge daemon), not by pushing a bundle over ssh"
         );
-    }
-    let mut tmp = match temp_root {
-        Some(root) => BundleTemp::new_in(root),
-        None => BundleTemp::new(),
-    }
-    .context("create private temp bundle custody")?;
-    if let Err(error) = tmp.write(bundle) {
-        let cleanup = tmp.finish();
-        return match cleanup {
-            Ok(()) => Err(anyhow::Error::new(error).context("write temp bundle")),
-            Err(cleanup) => Err(anyhow::Error::new(error)
-                .context(format!("write temp bundle; cleanup failed: {cleanup}"))),
-        };
     }
     if let Err(error) = tmp.verify() {
         let cleanup = tmp.finish();
         return match cleanup {
-            Ok(()) => {
-                Err(anyhow::Error::new(error).context("verify temp bundle custody before fetch"))
-            }
-            Err(cleanup) => Err(anyhow::Error::new(error).context(format!(
-                "verify temp bundle custody before fetch; cleanup failed: {cleanup}"
-            ))),
+            Ok(()) => Err(anyhow::Error::new(IngestError::LocalStorage(error))
+                .context("verify temp bundle custody before fetch")),
+            Err(cleanup) => Err(
+                anyhow::Error::new(IngestError::LocalStorage(error)).context(format!(
+                    "verify temp bundle custody before fetch; cleanup failed: {cleanup}"
+                )),
+            ),
         };
     }
     let tmp_s = tmp.path().to_string_lossy().to_string();
@@ -307,12 +648,32 @@ fn fetch_bundle_with_root(
     // The random generation makes this an isolated fetch destination. The final
     // ref is published separately with an all-zero old OID, making it create-only.
     let refspec = format!("refs/heads/{branch}:{staging_ref}");
-    let ok = target.git_ok(&["fetch", &tmp_s, &refspec]);
-    if !ok {
+    let outcome = thegn_core::git_run::run_command(
+        &mut target.git_command(&["fetch", &tmp_s, &refspec]),
+        &thegn_core::git_run::GitPolicy::read(crate::integrate::DRIVER_SUBPROCESS_TIMEOUT),
+        &AtomicBool::new(false),
+    );
+    if !outcome.is_success() {
+        let outcome_text = outcome.to_string();
+        if let Some(actual) = target.git_out(&["rev-parse", &staging_ref])
+            && !target.git_ok(&["update-ref", "-d", &staging_ref, &actual])
+        {
+            tracing::warn!(ref_name = %staging_ref, "failed to remove staging ref after bundle fetch failure");
+        }
+        let error = match outcome {
+            thegn_core::git_run::GitOutcome::Timeout => IngestError::Timeout {
+                after: crate::integrate::DRIVER_SUBPROCESS_TIMEOUT,
+            },
+            thegn_core::git_run::GitOutcome::Exit { .. } => {
+                IngestError::InvalidBundle(outcome_text)
+            }
+            other => IngestError::LocalStorage(io::Error::other(other.to_string())),
+        };
         match tmp.finish() {
-            Ok(()) => anyhow::bail!("git fetch from bundle failed"),
+            Ok(()) => return Err(anyhow::Error::new(error)),
             Err(cleanup) => {
-                anyhow::bail!("git fetch from bundle failed; cleanup failed: {cleanup}")
+                return Err(anyhow::Error::new(error)
+                    .context(format!("bundle custody cleanup failed: {cleanup}")));
             }
         };
     }
@@ -487,21 +848,133 @@ mod tests {
         .collect()
     }
 
+    fn shell(script: &str) -> Command {
+        let shell = thegn_core::util::which_path("sh").expect("sh checked by caller");
+        let mut command = Command::new(shell);
+        command.args(["-c", script]);
+        command
+    }
+
+    fn small_limits(max_bytes: u64, deadline: Duration, stderr_tail: usize) -> BundleLimits {
+        BundleLimits {
+            max_bytes,
+            deadline,
+            stderr_tail,
+        }
+    }
+
     #[test]
-    fn bundle_and_fetch_moves_a_tip_between_stores() {
+    fn bundle_stream_stops_an_infinite_producer_at_the_cap() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let started = Instant::now();
+        let result = stream_bundle(
+            shell("yes thegn-bundle"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(30), 64 * 1024),
+        );
+        assert!(matches!(
+            result,
+            Err(IngestError::SizeLimit { cap }) if cap == 1 << 20
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_times_out_a_silent_producer() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let started = Instant::now();
+        let result = stream_bundle(
+            shell("sleep 30"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(1), 4096),
+        );
+        assert!(matches!(result, Err(IngestError::Timeout { .. })));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_quiesces_background_pipe_inheritor() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let started = Instant::now();
+        let result = stream_bundle(
+            shell("sleep 30 >&2 & printf x"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(5), 4096),
+        );
+        assert!(matches!(result, Ok(1)));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_keeps_only_a_bounded_stderr_tail() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let result = stream_bundle(
+            shell("yes err-line | head -c 300000 >&2; exit 3"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(30), 4096),
+        );
+        assert!(
+            matches!(result, Err(IngestError::Remote { code: Some(3), stderr_tail }) if stderr_tail.len() <= 4096 + 64 && stderr_tail.starts_with("[... stderr truncated ...]"))
+        );
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_refuses_an_empty_bundle() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tmp = BundleTemp::new_in(root.path()).unwrap();
+        let result = stream_bundle(
+            shell("exit 0"),
+            &mut tmp,
+            &small_limits(1 << 20, Duration::from_secs(30), 4096),
+        );
+        assert!(matches!(result, Err(IngestError::InvalidBundle(_))));
+        tmp.finish().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_stream_round_trip_moves_a_tip() {
         use thegn_core::util;
         let fixture = stores("source");
         let temp_root = fixture._root.path().join("bundle-temp");
         std::fs::create_dir(&temp_root).unwrap();
         let generated = generation_ref(&GitLoc::Local(fixture.source.clone()), "feat").unwrap();
+        let mut garbage = BundleTemp::new_in(&temp_root).unwrap();
+        garbage.write(b"not a bundle").unwrap();
         assert!(
-            fetch_bundle_with_root(
+            fetch_from_custody(
                 &GitLoc::Local(fixture.target.clone()),
                 "feat",
-                b"not a bundle",
+                garbage,
                 &generated,
-                &fixture.oid,
-                Some(&temp_root),
+                &fixture.oid
             )
             .is_err()
         );
@@ -510,14 +983,17 @@ mod tests {
             &fixture.target,
             &["cat-file", "-e", &fixture.oid]
         ));
-        let bundle = bundle_bytes(&GitLoc::Local(fixture.source.clone()), "feat").unwrap();
-        fetch_bundle_with_root(
+        assert!(list_refs(&fixture.target).is_empty());
+        let mut custody = BundleTemp::new_in(&temp_root).unwrap();
+        let source = GitLoc::Local(fixture.source.clone());
+        let bundle_command = source.git_command(&["bundle", "create", "-", "refs/heads/feat"]);
+        stream_bundle(bundle_command, &mut custody, &BundleLimits::production()).unwrap();
+        fetch_from_custody(
             &GitLoc::Local(fixture.target.clone()),
             "feat",
-            &bundle,
+            custody,
             &generated,
             &fixture.oid,
-            Some(&temp_root),
         )
         .unwrap();
         assert_eq!(std::fs::read_dir(&temp_root).unwrap().count(), 0);
