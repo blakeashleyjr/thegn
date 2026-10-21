@@ -127,7 +127,7 @@ pub enum SessionAction {
         #[arg(long, requires = "stage", conflicts_with = "resume_work")]
         chunk: Option<String>,
         /// The Lead lease this stage dispatch is made under.
-        #[arg(long, value_name = "NAME", requires_all = ["stage", "issue", "owner"], conflicts_with = "resume_work")]
+        #[arg(long, value_name = "NAME", requires = "owner")]
         lease: Option<String>,
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
@@ -469,13 +469,22 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             json,
         } => {
             use thegn_svc::control::{AgentLaunch, OpenSpec};
+            if lease.is_some() && resume_row.is_none() && (stage.is_none() || issue.is_none()) {
+                anyhow::bail!(
+                    "--lease applies to a stage dispatch (--stage --issue) or --resume-work"
+                );
+            }
+            let resume_proof = match (lease.as_deref(), owner.as_deref()) {
+                (Some(name), Some(owner)) => LeadProof::Lease { name, owner },
+                _ => LeadProof::Unbound,
+            };
             if let Some(row_id) = resume_row {
                 // The resume-of-a-failed-row composition (THE-86): the
                 // offline row checks already ran pre-`connect`; this renders
                 // the finisher prompt and opens the fresh dispatch.
                 // `--bind`/`--adopt`/`--json` shape the new session exactly
                 // as they shape a fresh one.
-                resume_work(cfg, &client, row_id, bind, adopt, json).await?;
+                resume_work(cfg, &client, row_id, bind, adopt, json, resume_proof).await?;
             } else if let (Some(stage_name), Some(issue_id)) = (stage.as_deref(), issue.as_deref())
             {
                 // The one-call stage dispatch (THE-76): the whole
@@ -1393,8 +1402,9 @@ fn claim_resume_dispatch(
     worktree: &str,
     agent_name: &str,
     json: bool,
+    proof: LeadProof<'_>,
 ) -> Result<i64> {
-    let claim = match db.claim_resume_dispatch(
+    let claim = match db.claim_resume_dispatch_led(
         row.id,
         row.status,
         NewDispatch {
@@ -1408,6 +1418,7 @@ fn claim_resume_dispatch(
             chunk_path: row.chunk_path.as_deref(),
         },
         stage.concurrency,
+        proof,
     ) {
         Ok(claim) => claim,
         Err(error) => {
@@ -1522,6 +1533,7 @@ async fn resume_work(
     bind: bool,
     adopt: bool,
     json: bool,
+    proof: LeadProof<'_>,
 ) -> Result<()> {
     use thegn_svc::control::{AgentLaunch, OpenSpec};
     let db = Db::open()?;
@@ -1558,7 +1570,7 @@ async fn resume_work(
     // the freed slot first, this attempt is safely refused rather than
     // oversubscribing the stage.
     policy_admission(cfg, &agent_name, &stage.name)?;
-    let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name, json)?;
+    let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name, json, proof)?;
     let artifact = match db.get_dispatch(new_row).and_then(|row| {
         row.and_then(|dispatch| dispatch.artifact_path)
             .ok_or_else(|| anyhow::anyhow!("stage artifact path was not stamped"))
@@ -1950,7 +1962,7 @@ mod resume_work_tests {
         resume_claim_is_conflict, resume_conflict_payload, resume_row_checks,
     };
     use thegn_core::config_pipeline::PipelineStage;
-    use thegn_core::db::{Db, ResumeDispatchConflict};
+    use thegn_core::db::{Db, LeadLeaseConflict, LeadProof, ResumeDispatchConflict};
     use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
     use thegn_core::store::NotificationStore;
 
@@ -2131,8 +2143,16 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let finisher = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude", false)
-            .expect("reconciled source frees its slot");
+        let finisher = claim_resume_dispatch(
+            &db,
+            &source_row,
+            &stage,
+            "/wt/121",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .expect("reconciled source frees its slot");
         let source_after = db.get_dispatch(source).unwrap().unwrap();
         let finisher = db.get_dispatch(finisher).unwrap().unwrap();
         assert_eq!(source_after.status, AgentDispatchStatus::Failed);
@@ -2165,8 +2185,16 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let error = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude", false)
-            .unwrap_err();
+        let error = claim_resume_dispatch(
+            &db,
+            &source_row,
+            &stage,
+            "/wt/121",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .unwrap_err();
         assert!(
             error.downcast_ref::<crate::cmd::Retryable>().is_some(),
             "capacity refusal must be retryable: {error:#}"
@@ -2228,8 +2256,16 @@ mod resume_work_tests {
             ..Default::default()
         };
 
-        let error = claim_resume_dispatch(&db, &stale_source, &stage, "/wt/121", "claude", false)
-            .unwrap_err();
+        let error = claim_resume_dispatch(
+            &db,
+            &stale_source,
+            &stage,
+            "/wt/121",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .unwrap_err();
         assert!(
             error.downcast_ref::<crate::cmd::Retryable>().is_some(),
             "concurrent verdict refusal must be retryable: {error:#}"
@@ -2244,6 +2280,55 @@ mod resume_work_tests {
         assert_eq!(
             db.get_dispatch(source).unwrap().unwrap().status,
             AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn resume_claim_lead_lease_conflict_is_not_retryable() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:X";
+        db.acquire_pipeline_lease(lease, "lead-a", 300)
+            .unwrap()
+            .unwrap();
+        let source = db
+            .claim_dispatch_admitted_led(
+                thegn_core::issue::NewDispatch::new("linear:X", "/wt/a", "claude"),
+                2,
+                None,
+                None,
+                None,
+                LeadProof::Lease {
+                    name: lease,
+                    owner: "lead-a",
+                },
+            )
+            .unwrap()
+            .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::Failed)
+            .unwrap();
+        let source_row = db.get_dispatch(source).unwrap().unwrap();
+        let stage = PipelineStage {
+            name: "code".into(),
+            concurrency: 2,
+            ..Default::default()
+        };
+
+        let error = claim_resume_dispatch(
+            &db,
+            &source_row,
+            &stage,
+            "/wt/a",
+            "claude",
+            false,
+            LeadProof::Unbound,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<LeadLeaseConflict>().is_some());
+        assert!(!resume_claim_is_conflict(&error));
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+        assert_eq!(
+            db.get_dispatch(source).unwrap().unwrap().status,
+            AgentDispatchStatus::Failed
         );
     }
 }
