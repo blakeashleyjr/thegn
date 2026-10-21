@@ -553,6 +553,22 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
     ControlError::Internal(error)
 }
 
+fn map_dispatch_put_error(error: anyhow::Error) -> ControlError {
+    if error
+        .downcast_ref::<thegn_core::db::ParentDispatchConflict>()
+        .is_some()
+    {
+        return ControlError::FailedPrecondition(error.to_string());
+    }
+    if error
+        .downcast_ref::<thegn_core::pipeline_report::DispatchTextRejected>()
+        .is_some()
+    {
+        return ControlError::InvalidArgument(error.to_string());
+    }
+    ControlError::Internal(error)
+}
+
 enum BindAction {
     Proceed,
     Refuse(String),
@@ -2502,7 +2518,7 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
-                let id = db.put_agent_dispatch(thegn_core::issue::NewDispatch {
+                let id = db.put_dispatch_with_parent_check(thegn_core::issue::NewDispatch {
                     issue_id: &req.issue_id,
                     worktree_path: &req.worktree_path,
                     agent_name: &req.agent_name,
@@ -2516,6 +2532,10 @@ impl ControlApi for DaemonService {
                     .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
             })
             .await
+            .map_err(|error| match error {
+                ControlError::Internal(error) => map_dispatch_put_error(error),
+                other => other,
+            })
         })
     }
 
@@ -4997,6 +5017,87 @@ mod tests {
             svc.dispatch_set_status(9999, St::Done).await,
             Err(ControlError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_refuses_a_missing_parent_without_a_row() {
+        let (svc, _rx) = service(0);
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                parent_id: Some(4242),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message)) if message.contains("4242")
+        ));
+        assert!(svc.dispatches_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_refuses_a_cross_issue_parent() {
+        let (svc, _rx) = service(0);
+        let parent = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:B-2".into(),
+                worktree_path: "/wt/b".into(),
+                agent_name: "claude".into(),
+                parent_id: Some(parent.id),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlError::FailedPrecondition(message)) if message.contains("another issue")
+        ));
+        assert_eq!(svc.dispatches_list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_refuses_terminal_controls_as_invalid_argument() {
+        let (svc, _rx) = service(0);
+        let result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1\x1b[2J".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+        assert!(svc.dispatches_list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_put_assigns_the_canonical_artifact_to_a_stage_row() {
+        let (svc, _rx) = service(0);
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                stage: Some("code".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            row.artifact_path.as_deref(),
+            Some(thegn_core::pipeline_run::artifact_path("linear:A-1", "code", row.id).as_str())
+        );
     }
 
     #[test]

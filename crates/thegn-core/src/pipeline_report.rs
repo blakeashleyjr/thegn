@@ -33,6 +33,52 @@ pub fn is_format_control(c: char) -> bool {
         0xE0020..=0xE007F)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchTextClass {
+    Control,
+    Format,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchTextRejected {
+    pub field: &'static str,
+    pub class: DispatchTextClass,
+    pub at: usize,
+}
+
+impl fmt::Display for DispatchTextRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let class = match self.class {
+            DispatchTextClass::Control => "terminal control",
+            DispatchTextClass::Format => "Unicode format",
+        };
+        write!(
+            f,
+            "dispatch {} contains a {class} character at character {}",
+            self.field, self.at
+        )
+    }
+}
+
+impl std::error::Error for DispatchTextRejected {}
+
+/// Reject terminal controls and Unicode format characters in persisted dispatch identity fields.
+pub fn dispatch_text_field(field: &'static str, value: &str) -> Result<(), DispatchTextRejected> {
+    for (at, c) in value.chars().enumerate() {
+        let class = if c.is_control() {
+            Some(DispatchTextClass::Control)
+        } else if is_format_control(c) {
+            Some(DispatchTextClass::Format)
+        } else {
+            None
+        };
+        if let Some(class) = class {
+            return Err(DispatchTextRejected { field, class, at });
+        }
+    }
+    Ok(())
+}
+
 /// Render untrusted text as a single terminal-safe cell while preserving its
 /// scalar positions for diagnostics.
 pub fn display_cell(s: &str) -> String {
@@ -646,6 +692,55 @@ mod tests {
     fn format_control_policy_covers_both_branches() {
         assert!(is_format_control('\u{202e}'));
         assert!(!is_format_control('x'));
+    }
+
+    #[test]
+    fn dispatch_text_field_rejects_controls_and_format_characters() {
+        for (value, class, at) in [
+            ("a\x1b[2J", DispatchTextClass::Control, 1),
+            ("a\u{0085}", DispatchTextClass::Control, 1),
+            ("a\u{009b}", DispatchTextClass::Control, 1),
+            ("a\t", DispatchTextClass::Control, 1),
+            ("a\n", DispatchTextClass::Control, 1),
+            ("a\u{202e}", DispatchTextClass::Format, 1),
+            ("a\u{2066}", DispatchTextClass::Format, 1),
+            ("a\u{200d}", DispatchTextClass::Format, 1),
+            ("a\u{2028}", DispatchTextClass::Format, 1),
+            ("a\u{feff}", DispatchTextClass::Format, 1),
+        ] {
+            assert_eq!(
+                dispatch_text_field("identity", value),
+                Err(DispatchTextRejected {
+                    field: "identity",
+                    class,
+                    at
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_text_field_accepts_ordinary_identities() {
+        for value in [
+            "linear:THE-74",
+            "/home/u/wt/my repo",
+            "claude",
+            ".thegn/pipeline/THE-74/code/3.md",
+            "\u{05d0}\u{4e2d}\u{1f600}",
+            "",
+        ] {
+            assert_eq!(dispatch_text_field("identity", value), Ok(()));
+        }
+    }
+
+    #[test]
+    fn dispatch_text_rejected_message_never_echoes_the_value() {
+        let value = "secret\x1b[2J";
+        let error = dispatch_text_field("issue_id", value).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("issue_id"));
+        assert!(!message.contains(value));
+        assert!(!message.contains('\x1b'));
     }
 
     #[test]
