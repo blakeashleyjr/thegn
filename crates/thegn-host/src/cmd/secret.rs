@@ -297,6 +297,10 @@ fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result
         }
     }
 
+    moved += migrate_calendar_tokens(cfg, config_path, dry_run, &mut |name: &str, value: &str| {
+        secret::store_file(name, value)
+    })?;
+
     // MPD config password (bare = historical literal). The stable config key
     // remains unchanged so existing daemon credentials continue to work.
     if let Some(password) = cfg
@@ -362,6 +366,62 @@ fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result
     Ok(())
 }
 
+/// Migrate literal tokens for remote calendar accounts. The account must be
+/// present in this file before anything is stored, because another config
+/// layer may own the effective account definition.
+fn migrate_calendar_tokens(
+    cfg: &Config,
+    config_path: &std::path::Path,
+    dry_run: bool,
+    store: &mut dyn FnMut(&str, &str) -> Result<String>,
+) -> Result<usize> {
+    let mut moved = 0;
+    for acct in &cfg.calendar.accounts {
+        if !matches!(
+            acct.provider,
+            thegn_core::config::CalendarProviderKind::IcsUrl
+                | thegn_core::config::CalendarProviderKind::CalDav
+        ) {
+            continue;
+        }
+        let reference = SecretRef::parse(&acct.token, BareAs::Literal);
+        if !(reference.is_literal() && reference.is_configured()) {
+            continue;
+        }
+        let path = format!("calendar.accounts[{}].token", acct.name);
+        if !config_write::calendar_account_in_file(config_path, &acct.name)? {
+            outln!(
+                "skipped {path}: the account is not defined in {}; move its token by hand",
+                config_path.display()
+            );
+            continue;
+        }
+        if config_write::calendar_account_token_in_file(config_path, &acct.name)?.as_deref()
+            != Some(acct.token.as_str())
+        {
+            outln!(
+                "skipped {path}: the token in {} is not the effective one; move it by hand",
+                config_path.display()
+            );
+            continue;
+        }
+        if dry_run {
+            outln!("would migrate {path} (plaintext -> 0600 file)");
+            moved += 1;
+            continue;
+        }
+        let new_ref = store(
+            &format!("calendar-{}", acct.name),
+            reference.expose_literal().unwrap_or_default(),
+        )?;
+        config_write::set_calendar_account_token(config_path, &acct.name, &new_ref)
+            .with_context(|| format!("stored {new_ref} but could not rewrite {path}"))?;
+        outln!("migrated {path} -> {new_ref}");
+        moved += 1;
+    }
+    Ok(moved)
+}
+
 /// Rotate recorded managed SSH authorizations transactionally. Values and
 /// private-key material never enter output or argv.
 fn ssh_rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<()> {
@@ -380,4 +440,106 @@ fn ssh_rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrate_calendar_tokens;
+    use thegn_core::config::Config;
+
+    #[test]
+    fn calendar_migrate_moves_a_literal_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\nurl = \"https://example.test/work.ics\"\ntoken = \"pasted\"\n";
+        std::fs::write(&path, source).unwrap();
+        let cfg: Config = toml::from_str(source).unwrap();
+        let mut calls = Vec::new();
+        let moved = migrate_calendar_tokens(&cfg, &path, false, &mut |name, value| {
+            calls.push((name.to_string(), value.to_string()));
+            Ok(format!("file:/fake/{name}"))
+        })
+        .unwrap();
+        assert_eq!(moved, 1);
+        assert_eq!(calls, [("calendar-work".to_string(), "pasted".to_string())]);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["calendar"]["accounts"][0]["token"].as_str(),
+            Some("file:/fake/calendar-work")
+        );
+
+        let updated: Config = toml::from_str(&body).unwrap();
+        let second = migrate_calendar_tokens(&updated, &path, false, &mut |name, value| {
+            calls.push((name.to_string(), value.to_string()));
+            Ok(format!("file:/fake/{name}"))
+        })
+        .unwrap();
+        assert_eq!(second, 0);
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn calendar_migrate_dry_run_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source =
+            "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\ntoken = \"pasted\"\n";
+        std::fs::write(&path, source).unwrap();
+        let cfg: Config = toml::from_str(source).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut calls = Vec::new();
+        let moved = migrate_calendar_tokens(&cfg, &path, true, &mut |name, value| {
+            calls.push((name.to_string(), value.to_string()));
+            Ok(format!("file:/fake/{name}"))
+        })
+        .unwrap();
+        assert_eq!(moved, 1);
+        assert!(calls.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn calendar_migrate_skips_an_account_outside_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = "[calendar]\n";
+        std::fs::write(&path, source).unwrap();
+        let cfg: Config = toml::from_str(
+            "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\ntoken = \"pasted\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut calls = Vec::new();
+        let moved = migrate_calendar_tokens(&cfg, &path, false, &mut |name, value| {
+            calls.push((name.to_string(), value.to_string()));
+            Ok(format!("file:/fake/{name}"))
+        })
+        .unwrap();
+        assert_eq!(moved, 0);
+        assert!(calls.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn calendar_migrate_skips_a_token_defined_in_another_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let source = "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\ntoken = \"keyring:x\"\n";
+        std::fs::write(&path, source).unwrap();
+        let cfg: Config = toml::from_str(
+            "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\ntoken = \"pasted\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut calls = Vec::new();
+        let moved = migrate_calendar_tokens(&cfg, &path, false, &mut |name, value| {
+            calls.push((name.to_string(), value.to_string()));
+            Ok(format!("file:/fake/{name}"))
+        })
+        .unwrap();
+        assert_eq!(moved, 0);
+        assert!(calls.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 }
