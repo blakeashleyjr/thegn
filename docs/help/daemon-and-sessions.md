@@ -25,8 +25,10 @@ not a replay.
 (registered current and pre-upgrade daemons, the configured socket, and a live
 legacy socket), skips sockets that belong to another state directory, waits
 for each to stop answering, and exits non-zero naming any that are still
-running. With none running it prints "no thegn pane daemon is running" and
-succeeds.
+running. A listener or the registry it cannot check before the stop deadline
+is reported as unknown and makes the command exit non-zero naming it. It prints
+"no thegn pane daemon is running" only when every listener was checked and none
+is running.
 
 When the UI exits, in-flight custom git commands and CI refreshes are cancelled.
 Thegn waits up to two seconds for them before exiting; work still running after
