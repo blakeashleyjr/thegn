@@ -357,12 +357,10 @@ fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
     Ok(())
 }
 
-/// Large working trees over slow links need room for a real pull; the deadline
-/// bounds a wedged rsync transport without racing ordinary transfers.
+/// Planner value for large pulls over slow links, not a measured ceiling.
 const RSYNC_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Large working trees over slow links need room for a real push; the deadline
-/// bounds a wedged rsync transport without racing ordinary transfers.
+/// Planner value for large pushes over slow links, not a measured ceiling.
 const RSYNC_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn run_rsync_pull(argv: &[String]) -> Result<()> {
@@ -375,7 +373,7 @@ fn run_rsync_push(argv: &[String]) -> Result<()> {
 
 /// `rsync -e` transport flag carrying the placement's ssh knobs.
 fn rsync_ssh_opt(s: &SshPlacement) -> Vec<String> {
-    let mut ssh = vec!["ssh".to_string()];
+    let mut ssh = vec!["ssh".to_string(), "-o".into(), "BatchMode=yes".into()];
     if s.port != 22 {
         ssh.extend(["-p".into(), s.port.to_string()]);
     }
@@ -683,12 +681,15 @@ mod tests {
         use thegn_core::placement::SshPlacement;
         let mut p = SshPlacement::plain("dev-box".into(), 2222, false, TransportKind::Ssh);
         p.identity = Some("/k/id".into());
-        assert_eq!(rsync_ssh_opt(&p), vec!["-e", "ssh -p 2222 -i /k/id"]);
+        assert_eq!(
+            rsync_ssh_opt(&p),
+            vec!["-e", "ssh -o BatchMode=yes -p 2222 -i /k/id"]
+        );
         assert_eq!(rsync_remote(&p, "/srv/work/"), "dev-box:/srv/work/");
         assert_eq!(local_dir("/tmp/m/"), "/tmp/m/");
         // Default port omits -p.
         let q = SshPlacement::plain("h".into(), 22, false, TransportKind::Ssh);
-        assert_eq!(rsync_ssh_opt(&q), vec!["-e", "ssh"]);
+        assert_eq!(rsync_ssh_opt(&q), vec!["-e", "ssh -o BatchMode=yes"]);
     }
 
     #[test]
@@ -699,7 +700,7 @@ mod tests {
 
         assert_eq!(
             rsync_ssh_opt(&placement),
-            vec!["-e", "ssh -F /cfg -J bastion"]
+            vec!["-e", "ssh -o BatchMode=yes -F /cfg -J bastion"]
         );
     }
 
@@ -711,7 +712,17 @@ mod tests {
 
         assert_eq!(
             rsync_ssh_opt(&placement),
-            vec!["-e", "ssh -i '/k/my id' -v"]
+            vec!["-e", "ssh -o BatchMode=yes -i '/k/my id' -v"]
+        );
+    }
+
+    #[test]
+    fn rsync_ssh_opt_disables_interactive_prompts() {
+        let placement = SshPlacement::plain("dev-box".into(), 22, false, TransportKind::Ssh);
+
+        assert_eq!(
+            rsync_ssh_opt(&placement),
+            vec!["-e", "ssh -o BatchMode=yes"]
         );
     }
 
