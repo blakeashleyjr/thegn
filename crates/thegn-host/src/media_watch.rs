@@ -244,6 +244,12 @@ async fn next_push_wake(
     }
 }
 
+fn reset_probe_on_activation(was_active: bool, active: bool, probe: &mut tokio::time::Interval) {
+    if !was_active && active {
+        probe.reset();
+    }
+}
+
 /// What to do with a freshly read snapshot given whether a badge was already up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlapAction {
@@ -466,6 +472,7 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                     match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await
                     {
                         Some(a) => {
+                            reset_probe_on_activation(active, a, &mut probe);
                             note_cleared(active, a);
                             active = a;
                         }
@@ -603,7 +610,8 @@ mod tests {
     use super::{
         FlapAction, Freshness, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join,
         backoff_after_stream, drain_snapshots, flap_action, interval, jittered, join_within,
-        next_push_wake, offer, should_confirm_flap, should_deliver, stale_grace,
+        next_push_wake, offer, reset_probe_on_activation, should_confirm_flap, should_deliver,
+        stale_grace,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
@@ -902,17 +910,31 @@ mod tests {
         safety.tick().await;
         let mut probe = interval(STREAM_STABILITY);
         probe.tick().await;
+        let started = tokio::time::Instant::now();
         let wake = next_push_wake(&mut watch, true, None, &mut safety, &mut probe);
         tokio::pin!(wake);
         tokio::select! {
             result = &mut wake => panic!("silent stream woke before the probe: {result}"),
             _ = tokio::time::sleep(STREAM_STABILITY - std::time::Duration::from_millis(1)) => {},
         }
-        tokio::select! {
-            result = &mut wake => panic!("silent stream woke before the probe: {result}"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {},
-        }
-        assert!(wake.await);
+        let result = wake.await;
+        assert!(result);
+        assert_eq!(tokio::time::Instant::now() - started, STREAM_STABILITY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_activation_resets_an_overdue_probe() {
+        let mut watch = SilentWatch;
+        let mut safety = interval(std::time::Duration::from_secs(3));
+        safety.tick().await;
+        let mut probe = interval(STREAM_STABILITY);
+        probe.tick().await;
+        tokio::time::sleep(STREAM_STABILITY * 2).await;
+
+        reset_probe_on_activation(false, true, &mut probe);
+        let started = tokio::time::Instant::now();
+        assert!(next_push_wake(&mut watch, true, None, &mut safety, &mut probe).await);
+        assert_eq!(tokio::time::Instant::now() - started, STREAM_STABILITY);
     }
 
     #[tokio::test(start_paused = true)]
