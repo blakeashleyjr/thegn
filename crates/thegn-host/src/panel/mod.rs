@@ -1188,6 +1188,9 @@ pub struct PanelUi {
     /// Acceptance cutoff for arriving hunk fetches: results tagged with an
     /// older generation (pre-worktree-switch strays) are dropped.
     pub hunks_gen: u64,
+    /// Paths whose hunk fetch failed; banked like `hunks` to prevent a
+    /// per-frame refetch storm while the selection stays on the path.
+    pub hunks_unavailable: std::collections::HashSet<String>,
     /// Scroll offset for the tall full-view bodies (sbs diff, git log, the
     /// cheatsheet). Reset on section open and width cycle.
     pub scroll: usize,
@@ -1272,6 +1275,7 @@ impl Default for PanelUi {
             impact_open: false,
             hunks: std::collections::HashMap::new(),
             hunks_gen: 0,
+            hunks_unavailable: std::collections::HashSet::new(),
             scroll: 0,
             docs: docs::PanelDocs::default(),
             git: gitui::GitUi::default(),
@@ -1305,6 +1309,31 @@ impl Default for PanelUi {
 }
 
 impl PanelUi {
+    /// Bank a hunk fetch outcome, replacing any prior success or failure.
+    pub fn bank_hunks(&mut self, path: String, result: Result<Vec<thegn_svc::git::Hunk>, ()>) {
+        match result {
+            Ok(hunks) => {
+                self.hunks.insert(path.clone(), hunks);
+                self.hunks_unavailable.remove(&path);
+            }
+            Err(()) => {
+                self.hunks.retain(|banked_path, _| banked_path != &path);
+                self.hunks_unavailable.insert(path);
+            }
+        }
+    }
+
+    /// Whether this path has a completed hunk fetch, successful or failed.
+    pub fn hunks_banked(&self, path: &str) -> bool {
+        self.hunks.contains_key(path) || self.hunks_unavailable.contains(path)
+    }
+
+    /// Clear successful and failed hunk outcomes together.
+    pub fn clear_hunks(&mut self) {
+        self.hunks.clear();
+        self.hunks_unavailable.clear();
+    }
+
     /// Reset when focus leaves the panel: drop back to section mode and
     /// dismiss the change preview. The open section, width, and row cursor
     /// are intentionally kept so returning lands where you left off.
