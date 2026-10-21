@@ -110,6 +110,8 @@ per kind under `[pr_queue.prompts]`; keep those rules if you do.
 Before waking an agent on a red build thegn re-runs the failed checks
 once, since plenty of red CI is a flake.
 
+Each PR-agent run holds a durable per-PR lease, so the PR queue and CI autofix cannot run two agents on the same PR at once; each admitted run spends exactly one attempt. A second dispatcher is refused while the lease is live. If thegn exits mid-run, the lease lapses within five minutes and a later pass may dispatch again.
+
 ## Review comment tasks
 
 An explicitly queued row whose `watch` includes `"review"` gets one durable

@@ -200,6 +200,7 @@ mod plugin_damage;
 mod plugin_providers;
 mod plugins;
 mod pool_lease;
+mod pr_agent_lease;
 mod pr_authorship;
 mod pr_driver;
 mod pr_view;

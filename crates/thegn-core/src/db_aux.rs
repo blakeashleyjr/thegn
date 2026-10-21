@@ -164,6 +164,10 @@ mod cleanup_hold_tests;
 #[path = "db_merge_claim_tests.rs"]
 mod merge_claim_tests;
 
+#[cfg(test)]
+#[path = "db_pr_agent_lease_tests.rs"]
+mod pr_agent_lease_tests;
+
 static MERGE_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The token is a row ownership identity, not a secret: any database writer can rewrite the row.
@@ -1305,12 +1309,15 @@ impl WorktreeAuxStore for Db {
         let tx = self.conn().unchecked_transaction()?;
         let old = tx
             .query_row(
-                "SELECT repo_root,number FROM pr_queue WHERE key=?1",
+                "SELECT repo_root,number,agent_claim_owner,agent_claim_lease_until_ms FROM pr_queue WHERE key=?1",
                 [old_key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<i64>>(3)?)),
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("PR queue row {old_key} no longer exists"))?;
+        if old.2.is_some() && old.3.is_some_and(|until| until >= util::now_ms()) {
+            anyhow::bail!("a PR agent is running for this row; rebind after it finishes");
+        }
         anyhow::ensure!(
             crate::pr_queue::pr_url_number_matches(&binding.pr_url, old.1.max(0) as u64),
             "PR URL does not match the queued PR number"
@@ -1370,6 +1377,151 @@ impl WorktreeAuxStore for Db {
             params![key, attempts, util::now()],
         )?;
         Ok(())
+    }
+
+    fn admit_pr_agent(
+        &self,
+        request: &crate::pr_queue::PrAgentAdmit<'_>,
+    ) -> Result<crate::pr_queue::PrAgentAdmission> {
+        use crate::pr_queue::{PrAgentAdmission, PrAgentLease, PrAgentRefusal, PrAgentRowSnapshot};
+
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let now = util::now_ms();
+        if request.lease_until_ms <= now
+            || request.lease_until_ms.saturating_sub(now) > crate::pr_queue::PR_AGENT_MAX_LEASE_MS
+        {
+            return Ok(PrAgentAdmission::Refused(PrAgentRefusal::InvalidLease));
+        }
+        let row = tx
+            .query_row(
+                "SELECT status,agent_attempts,checkout_gen,agent_claim_owner IS NOT NULL,
+                        agent_claim_generation,agent_claim_lease_until_ms
+                 FROM pr_queue WHERE key=?1",
+                [request.key],
+                |row| {
+                    Ok(PrAgentRowSnapshot {
+                        status: row.get(0)?,
+                        agent_attempts: u32::try_from(row.get::<_, i64>(1)?.max(0))
+                            .unwrap_or(u32::MAX),
+                        checkout_gen: row.get(2)?,
+                        claim_owner_present: row.get(3)?,
+                        claim_generation: row.get(4)?,
+                        claim_lease_until_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(PrAgentAdmission::Refused(PrAgentRefusal::Missing));
+        };
+        if let Err(refusal) = crate::pr_queue::decide_pr_agent_admission(&row, request, now) {
+            return Ok(PrAgentAdmission::Refused(refusal));
+        }
+        if let Some(candidate) = request.ci_candidate {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO ci_autofix_dedupe
+                 (worktree,run_id,job_id,head_sha,claimed_at) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    candidate.worktree,
+                    candidate.run_id,
+                    candidate.job_id,
+                    candidate.head_sha,
+                    util::now()
+                ],
+            )?;
+            if inserted == 0 {
+                return Ok(PrAgentAdmission::Refused(
+                    PrAgentRefusal::DuplicateCandidate,
+                ));
+            }
+        }
+        let token = mint_claim_token();
+        let changed = tx.execute(
+            "UPDATE pr_queue SET status='agent_running',blocker=?1,detail=?2,last_head_oid=?3,
+               agent_attempts=agent_attempts+1,agent_claim_owner=?4,
+               agent_claim_generation=agent_claim_generation+1,agent_claim_lease_until_ms=?5,
+               agent_claim_owner_hint=?6,updated_at=?7
+             WHERE key=?8 AND agent_claim_generation=?9",
+            params![
+                request.blocker,
+                request.detail,
+                request.head,
+                token,
+                request.lease_until_ms,
+                request.owner_hint,
+                util::now(),
+                request.key,
+                row.claim_generation
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "PR-agent admission row changed during immediate transaction"
+        );
+        tx.commit()?;
+        Ok(PrAgentAdmission::Admitted(PrAgentLease {
+            key: request.key.to_owned(),
+            generation: row.claim_generation + 1,
+            attempt: row.agent_attempts + 1,
+            lease_until_ms: request.lease_until_ms,
+            owner_token: token,
+        }))
+    }
+
+    fn renew_pr_agent(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        lease_until_ms: i64,
+    ) -> Result<crate::pr_queue::PrAgentLease> {
+        let now = util::now_ms();
+        anyhow::ensure!(
+            lease_until_ms > now
+                && lease_until_ms.saturating_sub(now) <= crate::pr_queue::PR_AGENT_MAX_LEASE_MS,
+            "invalid PR-agent lease"
+        );
+        let changed = self.conn().execute(
+            "UPDATE pr_queue SET agent_claim_lease_until_ms=?1
+             WHERE key=?2 AND agent_claim_owner=?3 AND agent_claim_generation=?4
+               AND agent_claim_lease_until_ms>=?5",
+            params![
+                lease_until_ms,
+                lease.key,
+                lease.owner_token,
+                lease.generation,
+                now
+            ],
+        )?;
+        anyhow::ensure!(changed == 1, "{}", crate::pr_queue::PR_AGENT_LEASE_LOST);
+        let mut renewed = lease.clone();
+        renewed.lease_until_ms = lease_until_ms;
+        Ok(renewed)
+    }
+
+    fn release_pr_agent(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        finished: Option<(&str, &str)>,
+    ) -> Result<bool> {
+        let (status, detail) = finished.map_or((None, None), |(status, detail)| {
+            (Some(status), Some(detail))
+        });
+        let changed = self.conn().execute(
+            "UPDATE pr_queue SET agent_claim_owner=NULL,agent_claim_lease_until_ms=NULL,
+               agent_claim_owner_hint=NULL,
+               status=CASE WHEN ?3 IS NOT NULL AND status='agent_running' THEN ?3 ELSE status END,
+               detail=CASE WHEN ?3 IS NOT NULL AND status='agent_running' THEN ?4 ELSE detail END,
+               updated_at=?5
+             WHERE key=?1 AND agent_claim_owner=?2 AND agent_claim_generation=?6",
+            params![
+                lease.key,
+                lease.owner_token,
+                status,
+                detail,
+                util::now(),
+                lease.generation
+            ],
+        )?;
+        Ok(changed == 1)
     }
 
     fn reserve_pr_ci_rerun(

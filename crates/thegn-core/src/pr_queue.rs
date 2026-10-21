@@ -486,6 +486,152 @@ pub enum AgentAdmissionRefusal {
     IsolationRefused(String),
 }
 
+/// Maximum lifetime of a PR-agent claim, shared with merge-queue claims.
+pub const PR_AGENT_MAX_LEASE_MS: i64 = crate::store::MERGE_CLAIM_MAX_LEASE_MS;
+pub const PR_AGENT_LEASE_LOST: &str = "PR agent lease lost";
+
+pub struct PrAgentAdmit<'a> {
+    pub key: &'a str,
+    pub expected_attempts: u32,
+    pub expected_checkout_gen: i64,
+    pub max_attempts: u32,
+    pub head: &'a str,
+    pub blocker: &'a str,
+    pub detail: &'a str,
+    pub lease_until_ms: i64,
+    pub owner_hint: Option<&'a str>,
+    pub ci_candidate: Option<&'a crate::ci_log::CiLogCandidate>,
+}
+
+#[derive(Clone)]
+pub struct PrAgentLease {
+    pub key: String,
+    pub generation: i64,
+    pub attempt: u32,
+    pub lease_until_ms: i64,
+    pub(crate) owner_token: String,
+}
+
+impl fmt::Debug for PrAgentLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrAgentLease")
+            .field("key", &self.key)
+            .field("generation", &self.generation)
+            .field("attempt", &self.attempt)
+            .field("lease_until_ms", &self.lease_until_ms)
+            .field("owner_token", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrAgentRefusal {
+    Missing,
+    InvalidLease,
+    Settled {
+        status: String,
+    },
+    Held {
+        generation: i64,
+        lease_until_ms: i64,
+    },
+    Stale {
+        reason: String,
+    },
+    BudgetExhausted {
+        attempts: u32,
+        max: u32,
+    },
+    DuplicateCandidate,
+}
+
+impl fmt::Display for PrAgentRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("the PR queue row no longer exists; not dispatched"),
+            Self::InvalidLease => {
+                f.write_str("the requested PR-agent lease is invalid; not dispatched")
+            }
+            Self::Settled { status } => {
+                write!(f, "the PR queue row is settled ({status}); not dispatched")
+            }
+            Self::Held { generation, .. } => write!(
+                f,
+                "another PR agent holds this PR (generation {generation}); not dispatched"
+            ),
+            Self::Stale { reason } => write!(
+                f,
+                "the queue row changed since it was read ({reason}); not dispatched"
+            ),
+            Self::BudgetExhausted { attempts, max } => write!(
+                f,
+                "the PR-queue agent budget is exhausted ({attempts}/{max})"
+            ),
+            Self::DuplicateCandidate => f.write_str("this CI candidate was already dispatched"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PrAgentAdmission {
+    Admitted(PrAgentLease),
+    Refused(PrAgentRefusal),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrAgentRowSnapshot {
+    pub status: String,
+    pub agent_attempts: u32,
+    pub checkout_gen: i64,
+    pub claim_owner_present: bool,
+    pub claim_generation: i64,
+    pub claim_lease_until_ms: Option<i64>,
+}
+
+pub fn decide_pr_agent_admission(
+    row: &PrAgentRowSnapshot,
+    request: &PrAgentAdmit<'_>,
+    now_ms: i64,
+) -> Result<(), PrAgentRefusal> {
+    let Some(status) = PrqStatus::parse(&row.status) else {
+        return Err(PrAgentRefusal::Settled {
+            status: row.status.clone(),
+        });
+    };
+    if status.is_settled() {
+        return Err(PrAgentRefusal::Settled {
+            status: row.status.clone(),
+        });
+    }
+    if row.claim_owner_present
+        && row
+            .claim_lease_until_ms
+            .is_some_and(|until| until >= now_ms)
+    {
+        return Err(PrAgentRefusal::Held {
+            generation: row.claim_generation,
+            lease_until_ms: row.claim_lease_until_ms.unwrap_or(now_ms),
+        });
+    }
+    if row.checkout_gen != request.expected_checkout_gen {
+        return Err(PrAgentRefusal::Stale {
+            reason: "checkout generation differs".into(),
+        });
+    }
+    if row.agent_attempts != request.expected_attempts {
+        return Err(PrAgentRefusal::Stale {
+            reason: "attempt count differs".into(),
+        });
+    }
+    if row.agent_attempts >= request.max_attempts {
+        return Err(PrAgentRefusal::BudgetExhausted {
+            attempts: row.agent_attempts,
+            max: request.max_attempts,
+        });
+    }
+    Ok(())
+}
+
 impl fmt::Display for AgentAdmissionRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -608,6 +754,97 @@ mod tests {
         PrQueueConfig {
             enabled: true,
             ..PrQueueConfig::default()
+        }
+    }
+
+    #[test]
+    fn pr_agent_admission_decision_table() {
+        let request = PrAgentAdmit {
+            key: "k",
+            expected_attempts: 0,
+            expected_checkout_gen: 0,
+            max_attempts: 1,
+            head: "h",
+            blocker: "ci",
+            detail: "d",
+            lease_until_ms: 10_000,
+            owner_hint: None,
+            ci_candidate: None,
+        };
+        for status in [
+            "watching",
+            "blocked_ci",
+            "blocked_conflict",
+            "blocked_review",
+            "agent_running",
+            "ready",
+            "merging",
+            "merged",
+            "needs_human",
+            "closed",
+            "unknown",
+        ] {
+            for (owner, expiry) in [(false, None), (true, Some(100)), (true, Some(99))] {
+                for (attempts, checkout, budget) in [(0, 0, 1), (1, 0, 1), (0, 1, 1), (0, 0, 0)] {
+                    let row = PrAgentRowSnapshot {
+                        status: status.into(),
+                        agent_attempts: attempts,
+                        checkout_gen: checkout,
+                        claim_owner_present: owner,
+                        claim_generation: 4,
+                        claim_lease_until_ms: expiry,
+                    };
+                    let request = PrAgentAdmit {
+                        max_attempts: budget,
+                        ..request_for_test(&request)
+                    };
+                    let actual = decide_pr_agent_admission(&row, &request, 100).err();
+                    let expected = match PrqStatus::parse(status) {
+                        None => Some(PrAgentRefusal::Settled {
+                            status: status.into(),
+                        }),
+                        Some(status) if status.is_settled() => Some(PrAgentRefusal::Settled {
+                            status: status.as_str().into(),
+                        }),
+                        Some(_) if owner && expiry.is_some_and(|until| until >= 100) => {
+                            Some(PrAgentRefusal::Held {
+                                generation: 4,
+                                lease_until_ms: expiry.unwrap_or(100),
+                            })
+                        }
+                        Some(_) if checkout != 0 => Some(PrAgentRefusal::Stale {
+                            reason: "checkout generation differs".into(),
+                        }),
+                        Some(_) if attempts != 0 => Some(PrAgentRefusal::Stale {
+                            reason: "attempt count differs".into(),
+                        }),
+                        Some(_) if attempts >= budget => Some(PrAgentRefusal::BudgetExhausted {
+                            attempts,
+                            max: budget,
+                        }),
+                        Some(_) => None,
+                    };
+                    assert_eq!(
+                        actual, expected,
+                        "status={status}, owner={owner}, expiry={expiry:?}, attempts={attempts}, checkout={checkout}, budget={budget}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn request_for_test(request: &PrAgentAdmit<'_>) -> PrAgentAdmit<'_> {
+        PrAgentAdmit {
+            key: request.key,
+            expected_attempts: request.expected_attempts,
+            expected_checkout_gen: request.expected_checkout_gen,
+            max_attempts: request.max_attempts,
+            head: request.head,
+            blocker: request.blocker,
+            detail: request.detail,
+            lease_until_ms: request.lease_until_ms,
+            owner_hint: request.owner_hint,
+            ci_candidate: request.ci_candidate,
         }
     }
 
