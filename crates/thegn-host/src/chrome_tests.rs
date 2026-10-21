@@ -30,6 +30,15 @@ fn draw_text_neutralizes_bidi_controls_before_clipping() {
 }
 
 #[test]
+fn draw_text_replaces_controls_like_seg() {
+    let mut s = Surface::new(8, 2);
+    draw_text(&mut s, 0, 0, "ab\ncd", col(S::Text), col(S::Bg1), 8);
+    let rendered = lines(&s);
+    assert!(rendered[0].contains("ab\u{FFFD}cd"), "{rendered:?}");
+    assert_eq!(rendered[1], "        ");
+}
+
+#[test]
 fn draw_text_bold_neutralizes_bidi_controls_before_clipping() {
     let mut s = Surface::new(8, 1);
     draw_text_bold(&mut s, 0, 0, "ab\u{202e}cd", col(S::Text), col(S::Bg1), 4);

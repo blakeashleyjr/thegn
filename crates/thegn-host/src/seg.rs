@@ -1206,23 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn draw_text_replaces_controls_like_seg() {
-        let mut surface = Surface::new(8, 2);
-        crate::chrome::draw_text(
-            &mut surface,
-            0,
-            0,
-            "ab\ncd",
-            ColorAttribute::Default,
-            ColorAttribute::Default,
-            8,
-        );
-
-        assert!(row_text(&mut surface, 0).contains("ab\u{FFFD}cd"));
-        assert_eq!(row_text(&mut surface, 1), "        ");
-    }
-
-    #[test]
     fn chrome_safe_text_drops_invisible_format_controls() {
         let segment = seg(Tok::Slot(S::Text), "a\u{200B}b\u{2060}c\u{FEFF}d\u{202E}e");
         assert_eq!(segment.text, "abcde");
