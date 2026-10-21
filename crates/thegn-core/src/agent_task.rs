@@ -838,6 +838,12 @@ impl EffectiveAgent {
         permission_suffix(&self.harness, &self.permissions)
     }
 
+    /// Settings-source suffix for autonomous launches (leading space, each
+    /// token shell-quoted), or empty when the harness has no known source flag.
+    pub fn autonomous_args(&self) -> String {
+        autonomous_suffix(&self.harness)
+    }
+
     /// The env overlay with secrets expanded, in key order. A value the secret
     /// indirection cannot resolve is dropped (and warned about) rather than
     /// exported as the literal `env:`/`file:` string.
@@ -855,6 +861,18 @@ impl EffectiveAgent {
                 }
             })
             .collect()
+    }
+}
+
+/// Render the harness's autonomous settings-source argv as a shell-quoted
+/// suffix. Unknown harnesses and harnesses without such a setting return `""`.
+pub fn autonomous_suffix(harness: &str) -> String {
+    match crate::harness::harness(harness).and_then(|h| h.autonomous_args()) {
+        Some(args) => args
+            .iter()
+            .map(|arg| format!(" {}", util::sh_quote(arg)))
+            .collect(),
+        None => String::new(),
     }
 }
 
@@ -1238,7 +1256,7 @@ mod tests {
         );
         assert_eq!(
             plain.headless_template().unwrap(),
-            "claude -p {prompt} --permission-mode acceptEdits --model claude-sonnet-5 \
+            "claude -p {prompt} --permission-mode acceptEdits --setting-sources user --model claude-sonnet-5 \
              --settings '{{\"permissions\":{{\"allow\":[\"Read\"]}}}}'"
         );
 
@@ -1357,7 +1375,9 @@ mod tests {
                 .unwrap();
         assert_eq!(
             rendered,
-            format!("claude -p 'do it' --permission-mode acceptEdits{suffix}")
+            format!(
+                "claude -p 'do it' --permission-mode acceptEdits --setting-sources user{suffix}"
+            )
         );
         let empty = EffectiveAgent {
             permissions: Vec::new(),
@@ -1961,7 +1981,7 @@ mod tests {
     fn known_providers_get_headless_flags() {
         assert_eq!(
             headless_command("claude", "claude"),
-            "claude -p {prompt} --permission-mode acceptEdits"
+            "claude -p {prompt} --permission-mode acceptEdits --setting-sources user"
         );
         assert_eq!(headless_command("codex", "codex"), "codex exec {prompt}");
         assert_eq!(
@@ -2031,7 +2051,30 @@ mod tests {
         let cfg = cfg_with_agents(&[("claude", "claude", None)]);
         assert_eq!(
             resolve_agent(&cfg, "claude", "").as_deref(),
-            Some("claude -p {prompt} --permission-mode acceptEdits")
+            Some("claude -p {prompt} --permission-mode acceptEdits --setting-sources user")
+        );
+    }
+
+    #[test]
+    fn autonomous_suffix_is_quoted_and_claude_only() {
+        assert_eq!(autonomous_suffix("claude"), " --setting-sources user");
+        for harness in ["codex", "pi", "nope"] {
+            assert_eq!(autonomous_suffix(harness), "", "{harness}");
+        }
+    }
+
+    #[test]
+    fn autonomous_resolve_agent_drops_project_settings() {
+        let cfg = cfg_with_agents(&[("claude", "claude", None)]);
+        assert!(
+            resolve_agent(&cfg, "claude", "")
+                .unwrap()
+                .contains("--setting-sources user")
+        );
+        assert_eq!(
+            resolve_agent(&cfg, "claude", "my-fixer {prompt}").as_deref(),
+            Some("my-fixer {prompt}"),
+            "an explicit agent_command remains the operator's literal command"
         );
     }
 
