@@ -549,7 +549,7 @@ pub(crate) fn spawn_ci_detail(
             let payload = crate::detail::CiDetailPayload {
                 run: detail,
                 discarded_jobs,
-                incomplete: incomplete.clone(),
+                incomplete,
                 log_tail: Vec::new(),
                 log_entries: Vec::new(),
             };

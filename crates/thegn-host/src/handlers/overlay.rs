@@ -197,6 +197,7 @@ pub(crate) fn pre_dispatch(
                     // A click/wheel that navigated in place still needs a
                     // repaint; `detail_act` carries anything the loop must run.
                     crate::detail::DetailOutcome::Pending => *dirty = true,
+                    crate::detail::DetailOutcome::Refused(_) => *dirty = true,
                     crate::detail::DetailOutcome::Act(a) => {
                         *dirty = true;
                         *detail_act = Some(a);

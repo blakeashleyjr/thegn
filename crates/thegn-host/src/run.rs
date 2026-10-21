@@ -18395,6 +18395,9 @@ async fn event_loop<T: Terminal>(
                     match d.handle_key(&k.key, k.modifiers) {
                         crate::detail::DetailOutcome::Close => bar_detail = None,
                         crate::detail::DetailOutcome::Pending => {}
+                        crate::detail::DetailOutcome::Refused(refusal) => {
+                            model.status = refusal.notice().into();
+                        }
                         // Expanding into the monitor needs the monitor slot and
                         // the saved prefs, which only the loop holds.
                         crate::detail::DetailOutcome::Act(

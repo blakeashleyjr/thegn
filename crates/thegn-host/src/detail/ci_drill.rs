@@ -205,7 +205,8 @@ impl DetailOverlay {
                 note: Some(
                     if log_entries.iter().any(|entry| {
                         !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty()
-                    }) {
+                    }) && incomplete.is_none()
+                    {
                         format!("{} · f authorize fix", log_metadata(&log_entries))
                     } else {
                         log_metadata(&log_entries)
@@ -256,12 +257,20 @@ impl DetailOverlay {
         // its complete candidate identity is carried into the blocking worker.
         // Entries without text or a head SHA fail closed and never become UI
         // actions.
-        self.ci_autofix = log_entries
-            .iter()
-            .find(|entry| !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty())
-            .map(|entry| super::DetailAction::CiAutofix {
-                candidate: entry.candidate(),
-            });
+        self.ci_autofix = if incomplete.is_some() {
+            Some(super::CiAutofixAvailability::Refused(
+                super::DetailRefusal::IncompleteCiJobList,
+            ))
+        } else {
+            log_entries
+                .iter()
+                .find(|entry| !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty())
+                .map(|entry| {
+                    super::CiAutofixAvailability::Available(super::DetailAction::CiAutofix {
+                        candidate: entry.candidate(),
+                    })
+                })
+        };
         // Keep re-polling until the run settles (live drill updates).
         self.live_ci = (!run.state.is_terminal()).then(|| run.clone());
     }
@@ -555,10 +564,21 @@ mod tests {
                 discarded_jobs: 0,
                 incomplete: Some("job list stopped after 50 pages (page budget)".into()),
                 log_tail: Vec::new(),
-                log_entries: Vec::new(),
+                log_entries: vec![thegn_core::ci_log::CiLogEntry {
+                    worktree: "/wt/repo".into(),
+                    run_id: "42".into(),
+                    job_id: "j1".into(),
+                    job_name: "build".into(),
+                    text: "error: boom\n".into(),
+                    truncated: false,
+                    redacted: true,
+                    policy_version: thegn_core::ci_log::REDACTION_POLICY_VERSION,
+                    fetched_at: 7,
+                    head_sha: "abc123".into(),
+                }],
             }
         ));
-        let overlay = slot.expect("overlay remains");
+        let mut overlay = slot.expect("overlay remains");
         let DetailContent::Sections(detail) = &overlay.content else {
             panic!("expected sections");
         };
@@ -570,6 +590,15 @@ mod tests {
             note.as_deref()
                 .unwrap_or_default()
                 .contains("job list incomplete")
+        );
+        assert!(
+            DetailRefusal::IncompleteCiJobList
+                .notice()
+                .contains("job list is incomplete")
+        );
+        assert_eq!(
+            overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
+            DetailOutcome::Refused(DetailRefusal::IncompleteCiJobList)
         );
     }
 
