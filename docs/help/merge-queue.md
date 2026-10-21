@@ -122,9 +122,10 @@ structured message is available to the conflict handoff; ordinary text
 conflicts retain the usual fold behavior.
 
 Lockfile regeneration accepts content changes and deletions only within the
-conflicted paths. Added or replaced outputs must be regular files; a mode
-change, symlink or submodule pointer replacement, or a change to another path,
-defers the branch. Each accepted regeneration prints one audit line: “merge
+conflicted paths. Only the conflicted paths may change: a new path must be a
+regular file, an existing path must keep its mode, and deleting one is allowed.
+Anything else, or a change to any other path, falls back to the usual conflict
+handling. Each accepted regeneration prints one audit line: “merge
 queue: regenerated <paths> (approved outputs: exactly the conflict set) with
 command `<command>` (timeout Ns) -> tree <oid>”.
 
