@@ -7389,6 +7389,7 @@ async fn event_loop<T: Terminal>(
         std::collections::HashSet::new();
     // Bumped per root-set change; orders the off-loop reconcile tasks.
     let mut lsp_reconcile_epoch: u64 = 0;
+    let mut lsp_config_epoch: u64 = 0;
     let mut lsp_evict_due = std::time::Instant::now();
     {
         let wake_rx = lsp_diag_rx.clone();
@@ -13747,6 +13748,20 @@ async fn event_loop<T: Terminal>(
                     if let Some(picker) = workspace_picker.as_mut() {
                         picker.config_reloaded(new_cfg.clone(), waker.clone());
                     }
+                    lsp_config_epoch += 1;
+                    let epoch = lsp_config_epoch;
+                    let (enabled, servers) = (new_cfg.lsp.enabled, new_cfg.lsp.servers.clone());
+                    let lsp = lsp_supervisor.handle();
+                    tokio::task::spawn_blocking(move || {
+                        let released = lsp.reconfigure(epoch, enabled, &servers);
+                        if released > 0 {
+                            tracing::debug!(
+                                target: "thegn::lsp",
+                                released,
+                                "reconciled LSP servers after config reload"
+                            );
+                        }
+                    });
                     current_config = new_cfg;
                     // Rebuild only the effective hydration schedule. This is
                     // intentionally after successful config admission; the
