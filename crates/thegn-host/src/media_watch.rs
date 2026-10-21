@@ -48,7 +48,9 @@ pub(crate) enum MediaHealth {
 pub(crate) struct MediaSnapshotDelivery {
     pub(crate) generation: u64,
     pub(crate) snapshot: Option<MediaSnapshot>,
-    pub(crate) health: MediaHealth,
+    /// Watcher health when present; authoritative media-control reads preserve
+    /// the watcher's health because a one-off success does not prove liveness.
+    pub(crate) health: Option<MediaHealth>,
 }
 
 pub(crate) type SnapshotSender = tokio_watch::Sender<Option<MediaSnapshotDelivery>>;
@@ -218,7 +220,7 @@ fn deliver(
         MediaSnapshotDelivery {
             generation,
             snapshot: snapshot.clone(),
-            health,
+            health: Some(health),
         },
     )?;
     if accepted {
@@ -423,7 +425,7 @@ async fn push_snapshot(
     ) {
         return Some(active);
     }
-    if let Err(()) = deliver(tx, waker, generation, state, snap, health, epoch) {
+    if deliver(tx, waker, generation, state, snap, health, epoch).is_err() {
         return None;
     }
     Some(active)
@@ -475,8 +477,8 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                         &snapshot,
                         state.last_health,
                         health,
-                    ) && let Err(()) =
-                        deliver(&tx, &waker, generation, &mut state, snapshot, health, epoch)
+                    ) && deliver(&tx, &waker, generation, &mut state, snapshot, health, epoch)
+                        .is_err()
                     {
                         return;
                     }
@@ -627,7 +629,7 @@ pub(crate) fn drain_snapshots(
     perf.tick(crate::perf::WakeSource::Refresh);
     let shown = if enabled { newest } else { None };
     let shown_health = if enabled {
-        delivery.health
+        delivery.health.unwrap_or(*health)
     } else {
         MediaHealth::Fresh
     };
@@ -918,7 +920,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 1,
                 snapshot: Some(current.clone()),
-                health: MediaHealth::Fresh,
+                health: Some(MediaHealth::Fresh),
             },
         )
         .unwrap();
@@ -927,7 +929,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 0,
                 snapshot: Some(stale),
-                health: MediaHealth::Fresh,
+                health: Some(MediaHealth::Fresh),
             },
         )
         .unwrap();
@@ -978,7 +980,7 @@ mod tests {
                 MediaSnapshotDelivery {
                     generation: 7,
                     snapshot: Some(snapshot),
-                    health: MediaHealth::Fresh,
+                    health: Some(MediaHealth::Fresh),
                 },
             )
             .unwrap();
@@ -1014,7 +1016,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 1,
                 snapshot: Some(snapshot.clone()),
-                health: MediaHealth::Degraded,
+                health: Some(MediaHealth::Degraded),
             },
         )
         .unwrap();
@@ -1022,7 +1024,7 @@ mod tests {
         let mut media = Some(snapshot.state.clone());
         let mut caps = Some(snapshot.caps);
         let mut health = MediaHealth::Fresh;
-        let mut last_full = None;
+        let mut last_full = Some(std::time::Instant::now());
         let repaint = drain_snapshots(
             &mut rx,
             &mut perf,
@@ -1043,7 +1045,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 1,
                 snapshot: Some(snapshot.clone()),
-                health: MediaHealth::Degraded,
+                health: Some(MediaHealth::Degraded),
             },
         )
         .unwrap();
@@ -1065,6 +1067,48 @@ mod tests {
     }
 
     #[test]
+    fn drain_preserves_watcher_health_on_authoritative_read() {
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "player".into(),
+                title: "track".into(),
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        let (tx, mut rx) = watch::channel(None);
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: Some(snapshot.clone()),
+                health: None,
+            },
+        )
+        .unwrap();
+        let mut perf = crate::perf::LoopPerf::new();
+        let mut media = Some(snapshot.state.clone());
+        let mut caps = Some(snapshot.caps);
+        let mut health = MediaHealth::Degraded;
+        let mut last_full = None;
+
+        let repaint = drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            1,
+            &mut media,
+            &mut caps,
+            &mut health,
+            false,
+            &mut last_full,
+        );
+
+        assert_eq!(health, MediaHealth::Degraded);
+        assert_eq!(repaint, (false, false));
+    }
+
+    #[test]
     fn offer_keeps_newest_generation() {
         let (tx, rx) = watch::channel(None);
         offer(
@@ -1072,7 +1116,7 @@ mod tests {
             MediaSnapshotDelivery {
                 generation: 1,
                 snapshot: None,
-                health: MediaHealth::Fresh,
+                health: Some(MediaHealth::Fresh),
             },
         )
         .unwrap();
@@ -1082,7 +1126,7 @@ mod tests {
                 MediaSnapshotDelivery {
                     generation: 0,
                     snapshot: None,
-                    health: MediaHealth::Fresh,
+                    health: Some(MediaHealth::Fresh),
                 }
             )
             .unwrap()
@@ -1103,7 +1147,7 @@ mod tests {
                 MediaSnapshotDelivery {
                     generation: 1,
                     snapshot: None,
-                    health: MediaHealth::Fresh,
+                    health: Some(MediaHealth::Fresh),
                 }
             )
             .is_err()
