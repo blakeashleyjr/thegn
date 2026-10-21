@@ -677,6 +677,8 @@ mod tests {
         assert!(children.is_empty());
         assert_eq!(complete_window.len(), 5);
         let got = complete_window.iter().map(|row| row.id).collect::<Vec<_>>();
+        assert!(got.contains(&running_first));
+        assert!(got.contains(&running_second));
         assert!(got.contains(&done_first));
         assert!(!got.contains(&failed));
     }
