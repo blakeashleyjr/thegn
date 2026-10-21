@@ -214,7 +214,8 @@ mod db_open_memo;
 /// v88: hashed per-row worker capabilities for dispatch report/note (THE-206).
 /// v89: append-only pipeline gate attestations from the trusted runner (THE-207).
 /// v90: agent_dispatches.lead_lease, the Lead lease a pipeline row was claimed under (THE-208).
-pub const SCHEMA_VERSION: i64 = 90;
+/// v91: pr_queue.agent_claim_*, the PR-agent lease (THE-546).
+pub const SCHEMA_VERSION: i64 = 91;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1614,6 +1615,7 @@ impl Db {
                     crate::db_migrate::verify_v88_schema(&conn)?;
                     crate::db_migrate::verify_v89_schema(&conn)?;
                     crate::db_migrate::verify_v90_schema(&conn)?;
+                    crate::db_migrate::verify_v91_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2288,6 +2290,7 @@ impl Db {
         crate::db_migrate::migrate_v88(&conn)?;
         crate::db_migrate::migrate_v89(&conn)?;
         crate::db_migrate::migrate_v90(&conn)?;
+        crate::db_migrate::migrate_v91(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2316,6 +2319,7 @@ impl Db {
             crate::db_migrate::verify_v88_schema(&conn)?;
             crate::db_migrate::verify_v89_schema(&conn)?;
             crate::db_migrate::verify_v90_schema(&conn)?;
+            crate::db_migrate::verify_v91_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

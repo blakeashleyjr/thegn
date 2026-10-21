@@ -1842,6 +1842,37 @@ pub(crate) fn verify_v90_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_v91(conn: &Connection) -> Result<()> {
+    for (column, definition) in [
+        ("agent_claim_owner", "TEXT"),
+        ("agent_claim_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("agent_claim_lease_until_ms", "INTEGER"),
+        ("agent_claim_owner_hint", "TEXT"),
+    ] {
+        if !has_column(conn, "pr_queue", column) {
+            conn.execute(
+                &format!("ALTER TABLE pr_queue ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v91_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "agent_claim_owner",
+        "agent_claim_generation",
+        "agent_claim_lease_until_ms",
+        "agent_claim_owner_hint",
+    ] {
+        if !has_column(conn, "pr_queue", column) {
+            bail!("schema v91 migration did not add pr_queue.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2795,6 +2826,26 @@ mod tests {
         }
         let upgraded = Db::open_at(&path).unwrap();
         super::verify_v90_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v91_adds_pr_agent_claim_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v91_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE pr_queue (key TEXT PRIMARY KEY); PRAGMA user_version=90;")
+            .unwrap();
+        assert!(super::verify_v91_schema(&conn).is_err());
+        super::migrate_v91(&conn).unwrap();
+        super::migrate_v91(&conn).unwrap();
+        super::verify_v91_schema(&conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE pr_queue DROP COLUMN agent_claim_owner; PRAGMA user_version=90;",
+        )
+        .unwrap();
+        assert!(super::verify_v91_schema(&conn).is_err());
+        super::migrate_v91(&conn).unwrap();
+        super::verify_v91_schema(&conn).unwrap();
     }
 
     #[test]

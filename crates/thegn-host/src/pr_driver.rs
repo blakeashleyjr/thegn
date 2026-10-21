@@ -801,16 +801,35 @@ pub(crate) fn drive_queue(
                     continue;
                 }
                 let next = attempts + 1;
-                let _ = db.set_pr_agent_attempts(&item.key, next); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let note = format!("agent fixing ({next}/{})", cfg.agent_max_attempts);
-                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                let _ = db.update_pr_status(
-                    &item.key,
-                    PrqStatus::AgentRunning.as_str(),
-                    Some(blocker.as_str()),
-                    Some(&note),
-                    Some(&head),
-                );
+                let owner = crate::pr_agent_lease::owner_hint();
+                let request = pr_queue::PrAgentAdmit {
+                    key: &item.key,
+                    expected_attempts: attempts,
+                    expected_checkout_gen: item.checkout_gen,
+                    max_attempts: cfg.agent_max_attempts,
+                    head: &head,
+                    blocker: blocker.as_str(),
+                    detail: &note,
+                    lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+                    owner_hint: Some(&owner),
+                    ci_candidate: None,
+                };
+                let guard = match crate::pr_agent_lease::PrAgentGuard::admit(db, &request) {
+                    Ok(Ok(guard)) => guard,
+                    Ok(Err(refusal)) => {
+                        let text = format!("PR #{}: agent not dispatched: {refusal}", item.number);
+                        out.warnings.push(text.clone());
+                        out.blocked.push(item.number);
+                        step(&current_status(db, &item.key), &text, &mut progress);
+                        continue;
+                    }
+                    Err(error) => {
+                        out.warnings.push(format!("PR #{}: could not record the agent dispatch ({error}); agent not started", item.number));
+                        out.blocked.push(item.number);
+                        continue;
+                    }
+                };
                 step(PrqStatus::AgentRunning.as_str(), &note, &mut progress);
 
                 crate::agent_run::run(&crate::agent_run::AgentTaskRun {
@@ -823,6 +842,12 @@ pub(crate) fn drive_queue(
                     sandbox,
                     credential_free: true,
                 });
+
+                match guard.finish(db, None) {
+                    Ok(true) => {}
+                    Ok(false) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the next refresh re-evaluates the row", item.number)),
+                    Err(error) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the next refresh re-evaluates the row ({error})", item.number)),
+                }
 
                 // The exit code decides nothing — the next refresh does, exactly
                 // as in the merge queue. An agent can exit non-zero having pushed
@@ -3388,5 +3413,52 @@ mod tests {
         let config = ci_agent_config(&sentinel);
 
         assert_ci_agent_held_without_effects(&checkout, &db, &row, &forge, &config, &sentinel);
+    }
+
+    #[test]
+    fn agent_dispatch_holds_while_ci_autofix_lease_is_live() {
+        let (dir, db) = temp_db("prq-agent-lease-held");
+        let (checkout, item) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        let head = GitLoc::from_db(checkout.to_str().unwrap(), None)
+            .git_out(&["rev-parse", "HEAD"])
+            .unwrap();
+        let request = pr_queue::PrAgentAdmit {
+            key: &item.key,
+            expected_attempts: 0,
+            expected_checkout_gen: item.checkout_gen,
+            max_attempts: 3,
+            head: &head,
+            blocker: "ci",
+            detail: "CI autofix dispatch",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("CI autofix"),
+            ci_candidate: None,
+        };
+        assert!(matches!(
+            db.admit_pr_agent(&request).unwrap(),
+            pr_queue::PrAgentAdmission::Admitted(_)
+        ));
+        let sentinel = dir.path().join("agent-must-not-run");
+        let config = ci_agent_config(&sentinel);
+        let forge = FakeForge::new(Some(failing_ci_pr(&head)));
+        let out = drive_queue(
+            &config,
+            &uncontained_config(),
+            &forge,
+            &checkout,
+            &db,
+            vec![item],
+            |_| {},
+        );
+        assert!(!sentinel.exists());
+        assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 1);
+        assert!(out.blocked.contains(&7), "{out:?}");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| warning.contains("agent not dispatched")),
+            "{out:?}"
+        );
     }
 }
