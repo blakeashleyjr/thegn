@@ -386,18 +386,21 @@ fn subscribe(tx: tokio::sync::mpsc::Sender<()>) -> Result<Subscription, MediaErr
     let mgr_for_handler = manager.clone();
     let bind_for_handler = bind.clone();
     let failed_for_handler = failed.clone();
-    let session_changed_token = match manager.CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
-            if let Err(error) = rebind(&mgr_for_handler, &bind_for_handler, &tx) {
-                tracing::warn!(target: "thegn::media", %error, "smtc session rebind failed; ending watcher");
-                failed_for_handler.store(true, Ordering::Release);
-            }
-            let _ = tx.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
-            Ok(())
-        })) {
+    let handler = TypedEventHandler::new(move |_, _| {
+        if let Err(error) = rebind(&mgr_for_handler, &bind_for_handler, &tx) {
+            tracing::warn!(target: "thegn::media", %error, "smtc session rebind failed; ending watcher");
+            failed_for_handler.store(true, Ordering::Release);
+        }
+        let _ = tx.try_send(()); // best-effort: Full means a wake is already pending; Closed means listener is gone
+        Ok(())
+    });
+    let session_changed_token = match manager.CurrentSessionChanged(&handler) {
         Ok(token) => token,
         Err(error) => {
             let old = lock_unpoisoned(&bind).close();
-            if let Some(old) = old && let Err(removal_error) = detach(old) {
+            if let Some(old) = old
+                && let Err(removal_error) = detach(old)
+            {
                 tracing::warn!(target: "thegn::media", error = %removal_error, "smtc handler removal failed");
             }
             return Err(win_err(error));

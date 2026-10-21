@@ -271,7 +271,7 @@ mod tests {
         let mut removed = None;
         let result = register_pair(
             || Ok::<_, &str>(11),
-            || Err("second"),
+            || Err::<u8, _>("second"),
             |token| {
                 removed = Some(token);
                 Ok(())
@@ -285,7 +285,11 @@ mod tests {
 
     #[test]
     fn register_pair_reports_a_failed_rollback() {
-        let result = register_pair(|| Ok::<_, &str>(11), || Err("second"), |_| Err("remove"));
+        let result = register_pair(
+            || Ok::<_, &str>(11),
+            || Err::<u8, _>("second"),
+            |_| Err("remove"),
+        );
         assert!(
             matches!(result, Err(MediaError::Backend(message)) if message.contains("registration failed") && message.contains("rollback failed"))
         );
