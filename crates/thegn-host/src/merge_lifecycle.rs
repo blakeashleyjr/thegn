@@ -29,6 +29,31 @@ mod cleanup;
 pub(crate) use cleanup::TestIsolation;
 pub(crate) use cleanup::common as repository_identity;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupRefusal {
+    Database,
+    Identity,
+    ClaimBusy,
+    Unsafe,
+    Remote,
+    Resources,
+    Removal,
+}
+
+impl CleanupRefusal {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Database => "database unavailable",
+            Self::Identity => "queue identity changed",
+            Self::ClaimBusy => "cleanup already in progress",
+            Self::Unsafe => "unsafe or unverified checkout",
+            Self::Remote => "remote worktree",
+            Self::Resources => "attached runtime resources",
+            Self::Removal => "removal failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CleanupOutcome {
     Removed {
@@ -36,11 +61,13 @@ pub(crate) enum CleanupOutcome {
         queue_removed: bool,
         discarded_build_state: bool,
         discarded_tool_state: bool,
+        branch_held: bool,
         bookkeeping_errors: Vec<String>,
     },
     KeptDirty,
     KeptChanged,
     Refused {
+        class: CleanupRefusal,
         reason: String,
     },
 }
@@ -221,6 +248,7 @@ fn apply_inner(
                 CleanupOutcome::Removed {
                     discarded_build_state,
                     discarded_tool_state,
+                    branch_held,
                     bookkeeping_errors,
                     ..
                 } => {
@@ -236,6 +264,12 @@ fn apply_inner(
                             crate::merge_sweep::safe_display(branch)
                         ));
                     }
+                    if branch_held {
+                        thegn_core::msg::info(&format!(
+                            "merge cleanup: removed {}; branch kept for explicit cleanup",
+                            crate::merge_sweep::safe_display(branch)
+                        ));
+                    }
                     for error in bookkeeping_errors {
                         thegn_core::msg::warn(&crate::merge_sweep::safe_display(&error));
                     }
@@ -248,9 +282,10 @@ fn apply_inner(
                     "merge cleanup: kept {} — changed during cleanup",
                     crate::merge_sweep::safe_display(branch)
                 )),
-                CleanupOutcome::Refused { reason } => thegn_core::msg::warn(&format!(
-                    "merge cleanup: kept {} — {}",
+                CleanupOutcome::Refused { class, reason } => thegn_core::msg::warn(&format!(
+                    "merge cleanup: kept {} — {}: {}",
                     crate::merge_sweep::safe_display(branch),
+                    class.label(),
                     crate::merge_sweep::safe_display(&reason)
                 )),
             }
@@ -406,6 +441,7 @@ pub(crate) fn remove_landed(
         Ok(rows) => rows.into_iter().find(|row| row.worktree == worktree),
         Err(error) => {
             return CleanupOutcome::Refused {
+                class: CleanupRefusal::Database,
                 reason: format!("queue identity unavailable: {error}"),
             };
         }
@@ -418,6 +454,7 @@ pub(crate) fn remove_landed(
             && row.result_oid.as_deref() == landed
     }) else {
         return CleanupOutcome::Refused {
+            class: CleanupRefusal::Identity,
             reason: "committed outcome does not match a current landed queue row".into(),
         };
     };
@@ -455,6 +492,7 @@ pub(crate) fn remove_landed_with_config(
         || expected_queue.result_oid.as_deref() != landed
     {
         return CleanupOutcome::Refused {
+            class: CleanupRefusal::Identity,
             reason: "selected landed queue identity is invalid".into(),
         };
     }
@@ -465,6 +503,7 @@ pub(crate) fn remove_landed_with_config(
         crate::worktree_lifecycle::try_scoped_destroy_path(Path::new(worktree))
     else {
         return CleanupOutcome::Refused {
+            class: CleanupRefusal::ClaimBusy,
             reason: "cleanup is already in progress".into(),
         };
     };
@@ -481,6 +520,7 @@ pub(crate) fn remove_landed_with_config(
         Err(cleanup::Refusal::Dirty) => return CleanupOutcome::KeptDirty,
         Err(error) => {
             return CleanupOutcome::Refused {
+                class: CleanupRefusal::Unsafe,
                 reason: error.to_string(),
             };
         }
@@ -489,12 +529,14 @@ pub(crate) fn remove_landed_with_config(
         Ok(rows) => rows.into_iter().find(|r| r.worktree == worktree),
         Err(error) => {
             return CleanupOutcome::Refused {
+                class: CleanupRefusal::Database,
                 reason: format!("queue identity unavailable: {error}"),
             };
         }
     };
     if queue_before.as_ref() != Some(expected_queue) {
         return CleanupOutcome::Refused {
+            class: CleanupRefusal::Identity,
             reason: "selected landed queue entry changed or was revoked".into(),
         };
     }
@@ -502,6 +544,7 @@ pub(crate) fn remove_landed_with_config(
         Ok(row) => row,
         Err(error) => {
             return CleanupOutcome::Refused {
+                class: CleanupRefusal::Database,
                 reason: format!("worktree cache identity unavailable: {error}"),
             };
         }
@@ -515,6 +558,7 @@ pub(crate) fn remove_landed_with_config(
         .is_some_and(|r| r.branch != branch || (!r.location.is_empty() && r.location != "local"))
     {
         return CleanupOutcome::Refused {
+            class: CleanupRefusal::Remote,
             reason: "cache identity is remote or disagrees with Git".into(),
         };
     }
@@ -522,12 +566,18 @@ pub(crate) fn remove_landed_with_config(
         && let Err(error) = verified.verify_cached_repository(Path::new(&row.repo_root))
     {
         return CleanupOutcome::Refused {
+            class: CleanupRefusal::Unsafe,
             reason: error.to_string(),
         };
     }
     let resources = match cleanup::LocalResources::settle(cfg, db, repo_root, worktree) {
         Ok(resources) => resources,
-        Err(reason) => return CleanupOutcome::Refused { reason },
+        Err(reason) => {
+            return CleanupOutcome::Refused {
+                class: CleanupRefusal::Resources,
+                reason,
+            };
+        }
     };
     let discarded_build_state = verified.discarded_build_state();
     let discarded_tool_state = verified.discarded_tool_state();
@@ -616,10 +666,14 @@ pub(crate) fn remove_landed_with_config(
         if dirty_during_cleanup.get() {
             return CleanupOutcome::KeptDirty;
         }
-        return CleanupOutcome::Refused { reason: message };
+        return CleanupOutcome::Refused {
+            class: CleanupRefusal::Removal,
+            reason: message,
+        };
     }
     if let Err(error) = verified.verify_removed() {
         return CleanupOutcome::Refused {
+            class: CleanupRefusal::Removal,
             reason: error.to_string(),
         };
     }
@@ -627,11 +681,6 @@ pub(crate) fn remove_landed_with_config(
     // THE-596: no-deref/OID checks alone cannot atomically prove direct ref
     // type. Automatic cleanup never mutates a source/victim/target ref.
     let branch_deleted = false;
-    if delete_branch {
-        bookkeeping_errors.push(format!(
-            "{branch}: worktree removed; branch retained pending explicit cleanup (THE-596)"
-        ));
-    }
     // No retry record is discarded for a refused physical cleanup. After real
     // removal, report partial bookkeeping failure rather than claiming tidy DB.
     let queue_removed = match db.transaction(|db| {
@@ -693,6 +742,7 @@ pub(crate) fn remove_landed_with_config(
         queue_removed,
         discarded_build_state,
         discarded_tool_state,
+        branch_held: delete_branch,
         bookkeeping_errors,
     }
 }
@@ -1623,6 +1673,32 @@ mod tests {
             "branch kept"
         );
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn cleanup_outcome_claim_busy_is_typed() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-claim-busy-typed");
+        let feat_s = feat.to_string_lossy().to_string();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        let before = db.list_merge_queue().unwrap();
+        let _claim = crate::worktree_lifecycle::try_scoped_destroy_path(&feat)
+            .expect("test should own the destroy claim");
+
+        let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+
+        assert!(matches!(
+            outcome,
+            CleanupOutcome::Refused {
+                class: CleanupRefusal::ClaimBusy,
+                ..
+            }
+        ));
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+        assert!(feat.is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&feat).unwrap();
     }
 
     // A `thegn land` files the worktree into Merged in place: the sidebar folder
