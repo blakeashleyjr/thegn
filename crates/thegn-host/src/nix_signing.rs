@@ -131,7 +131,7 @@ fn load_secret(secret: &Path) -> anyhow::Result<String> {
     }
     let mut secret_line = String::new();
     file.read_to_string(&mut secret_line)?;
-    let secret_line = secret_line.trim_end_matches(|character| matches!(character, '\r' | '\n'));
+    let secret_line = secret_line.trim_end_matches(['\r', '\n']);
     if parse_public_key(secret_line).is_none() {
         return Err(anyhow!("Nix signing secret has an invalid key line"));
     }
@@ -143,7 +143,7 @@ fn load_public(public: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("open Nix signing public key {}", public.display()))?;
     let mut public_line = String::new();
     file.read_to_string(&mut public_line)?;
-    let public_line = public_line.trim_end_matches(|character| matches!(character, '\r' | '\n'));
+    let public_line = public_line.trim_end_matches(['\r', '\n']);
     if parse_public_key(public_line).is_none() {
         return Err(anyhow!("Nix signing public key has an invalid key line"));
     }
