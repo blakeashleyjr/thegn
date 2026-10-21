@@ -60,7 +60,7 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
 }
 
 fn bake_name(bytes: [u8; 8]) -> String {
-    let mut name = String::from("tg-bake-");
+    let mut name = String::from(thegn_svc::vps::registry::BAKE_NAME_PREFIX);
     for byte in bytes {
         use std::fmt::Write as _;
         write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
@@ -176,5 +176,6 @@ mod tests {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         }));
+        assert!(thegn_svc::vps::registry::is_bake_name(&name));
     }
 }

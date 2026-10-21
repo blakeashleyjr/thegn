@@ -3,15 +3,18 @@
 //! state), so on a slow cadence we reconcile the provider's live, label-scoped
 //! instance list against the ledger:
 //!
-//! - instance labeled ours (`tg-host = <this host>`) with NO ledger record and
-//!   older than [`ORPHAN_AGE_SECS`] ⇒ destroy (a crash between POST and the
-//!   ledger finalize, or a record lost out-of-band);
+//! - instance labeled ours (`tg-ctl = <this controller id>`) with NO ledger
+//!   record and older than [`ORPHAN_AGE_SECS`] ⇒ destroy (a crash between POST
+//!   and the ledger finalize, or a record lost out-of-band);
+//! - legacy `tg-host`-only orphans are quarantined because their owner is
+//!   ambiguous;
 //! - ledger record stuck `creating` past [`CREATING_STALE_SECS`] with no live
 //!   instance ⇒ drop the record (the POST never landed);
 //! - `ready` record whose instance is gone ⇒ drop the record (destroyed
 //!   out-of-band — heals the attach bridge's IP cache);
 //! - instance older than the env's `max_lifetime_secs` (when set) ⇒ destroy
-//!   (the hard spend ceiling).
+//!   (the hard spend ceiling); bake sources also expire at
+//!   [`BAKE_MAX_AGE_SECS`] even when that policy is disabled.
 //!
 //! Runs from the hydration thread ([`tick`] self-throttles to
 //! [`TICK_INTERVAL`]) and does all network work on its own spawned thread. A
@@ -28,6 +31,10 @@ const TICK_INTERVAL: Duration = Duration::from_secs(300);
 /// Mirrors the warm-pool stale-provisioning threshold (`reconcile_pool`).
 const ORPHAN_AGE_SECS: u64 = 20 * 60;
 const CREATING_STALE_SECS: u64 = 10 * 60;
+/// Two 1,800 s bake steps plus 180 s to wait for running, 120 s to power off,
+/// and 600 s to snapshot take about 75 minutes. Three hours is more than twice
+/// that worst case; a bake source past this age is a leak by construction.
+const BAKE_MAX_AGE_SECS: u64 = 3 * 60 * 60;
 
 /// Throttled entry: schedule one reconcile pass when due. Cheap when not due
 /// or when no VPS env is configured; network work runs on its own thread.
@@ -124,6 +131,16 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             return;
         }
     };
+    let ours_ctl = match vps::controller::controller_id() {
+        Ok(id) => id,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: skipped {}: controller id unavailable ({error:#}); no provider or ledger actions attempted",
+                pc.provider.trim()
+            ));
+            return;
+        }
+    };
     let ours = vps::host_label();
     let kind = pc.provider.trim();
     // The outer gate permits exactly one account/policy per provider kind.
@@ -141,12 +158,30 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
     };
     let now = thegn_core::util::now();
     let mut live_anywhere = std::collections::HashSet::new();
-    for inst in instances
-        .iter()
-        .filter(|i| i.labels.get("tg-host").map(String::as_str) == Some(ours.as_str()))
-    {
-        live_anywhere.insert(inst.name.clone());
+    for inst in &instances {
+        let class = vps::controller::classify_ownership(&inst.labels, &ours_ctl, &ours);
         let state = ledger_state_for(&view, &inst.name);
+        if counts_as_live(class, state) {
+            live_anywhere.insert(inst.name.clone());
+        }
+        match owner_admission(class, state) {
+            OwnerAdmission::Proceed => {}
+            OwnerAdmission::Quarantine(reason) => {
+                thegn_core::msg::warn(&format!(
+                    "vps reaper: quarantined {}: {reason}; no deletion attempted",
+                    inst.name
+                ));
+                continue;
+            }
+            OwnerAdmission::Skip => {
+                tracing::debug!(
+                    target: "thegn::lifecycle",
+                    name = %inst.name,
+                    "vps reap: skipping resource not owned by this controller"
+                );
+                continue;
+            }
+        }
         let record = match state {
             LedgerState::Recorded(record) => Some(record),
             LedgerState::Unreadable => {
@@ -158,6 +193,17 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             }
             LedgerState::Absent => None,
         };
+        if record.is_some_and(|record| !recorded_identity_matches(record, kind, &inst.id))
+            && registry::is_bake_name(&inst.name)
+            && record
+                .is_some_and(|record| record.state == "creating" && record.instance_id.is_empty())
+        {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: quarantined {}: bake source with an unfinalized ledger record; destroy it with the provider console or `thegn env image-bake` cleanup; no deletion attempted",
+                inst.name
+            ));
+            continue;
+        }
         if record.is_some_and(|record| !recorded_identity_matches(record, kind, &inst.id)) {
             thegn_core::msg::warn(&format!(
                 "vps reaper: quarantined {}: inventory identity differs from the ledger; reconcile ownership; no deletion attempted",
@@ -168,7 +214,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         let decision = thegn_core::time_policy::resource_expiry(
             now,
             inst.created,
-            pc.max_lifetime_secs,
+            lifetime_for(&inst.name, pc.max_lifetime_secs),
             orphan_age_for(state),
         );
         if !admit_reap(decision, |reason| {
@@ -224,6 +270,49 @@ enum LedgerState<'a> {
     Recorded(&'a registry::VpsRecord),
     Unreadable,
     Absent,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerAdmission {
+    Proceed,
+    Quarantine(&'static str),
+    Skip,
+}
+
+fn owner_admission(class: vps::controller::Ownership, state: LedgerState<'_>) -> OwnerAdmission {
+    use vps::controller::Ownership::{Foreign, LegacyHost, Ours, Unlabelled};
+    match (class, state) {
+        (Ours, _) | (LegacyHost, LedgerState::Recorded(_) | LedgerState::Unreadable) => {
+            OwnerAdmission::Proceed
+        }
+        (LegacyHost, LedgerState::Absent) => OwnerAdmission::Quarantine(
+            "legacy tg-host label with no controller id and no ledger record; ownership is ambiguous",
+        ),
+        (Foreign | Unlabelled, LedgerState::Absent) => OwnerAdmission::Skip,
+        (Foreign | Unlabelled, LedgerState::Recorded(_) | LedgerState::Unreadable) => {
+            OwnerAdmission::Quarantine(
+                "a ledger record names an instance another controller labels",
+            )
+        }
+    }
+}
+
+fn counts_as_live(class: vps::controller::Ownership, state: LedgerState<'_>) -> bool {
+    matches!(
+        class,
+        vps::controller::Ownership::Ours | vps::controller::Ownership::LegacyHost
+    ) || !matches!(state, LedgerState::Absent)
+}
+
+fn lifetime_for(name: &str, configured: u64) -> u64 {
+    if registry::is_bake_name(name) {
+        match configured {
+            0 => BAKE_MAX_AGE_SECS,
+            _ => configured.min(BAKE_MAX_AGE_SECS),
+        }
+    } else {
+        configured
+    }
 }
 
 fn ledger_state_for<'a>(view: &'a registry::LedgerView, name: &str) -> LedgerState<'a> {
@@ -333,6 +422,112 @@ mod tests {
         record.provider = "hetzner".into();
         record.instance_id = "id".into();
         assert!(recorded_identity_matches(&record, "hetzner", "id"));
+    }
+
+    #[test]
+    fn ownership_admission_matrix() {
+        use vps::controller::Ownership::{Foreign, LegacyHost, Ours, Unlabelled};
+
+        let record = rec("resource", "ready", 1);
+        let absent = LedgerState::Absent;
+        let unreadable = LedgerState::Unreadable;
+        let recorded = LedgerState::Recorded(&record);
+
+        assert_eq!(owner_admission(Ours, recorded), OwnerAdmission::Proceed);
+        assert_eq!(owner_admission(Ours, unreadable), OwnerAdmission::Proceed);
+        assert_eq!(owner_admission(Ours, absent), OwnerAdmission::Proceed);
+        assert!(counts_as_live(Ours, recorded));
+        assert!(counts_as_live(Ours, unreadable));
+        assert!(counts_as_live(Ours, absent));
+
+        assert_eq!(
+            owner_admission(LegacyHost, recorded),
+            OwnerAdmission::Proceed
+        );
+        assert_eq!(
+            owner_admission(LegacyHost, unreadable),
+            OwnerAdmission::Proceed
+        );
+        assert_eq!(
+            owner_admission(LegacyHost, absent),
+            OwnerAdmission::Quarantine(
+                "legacy tg-host label with no controller id and no ledger record; ownership is ambiguous"
+            )
+        );
+        assert!(counts_as_live(LegacyHost, recorded));
+        assert!(counts_as_live(LegacyHost, unreadable));
+        assert!(counts_as_live(LegacyHost, absent));
+
+        assert_eq!(
+            owner_admission(Foreign, recorded),
+            OwnerAdmission::Quarantine(
+                "a ledger record names an instance another controller labels"
+            )
+        );
+        assert_eq!(
+            owner_admission(Foreign, unreadable),
+            OwnerAdmission::Quarantine(
+                "a ledger record names an instance another controller labels"
+            )
+        );
+        assert_eq!(owner_admission(Foreign, absent), OwnerAdmission::Skip);
+        assert!(counts_as_live(Foreign, recorded));
+        assert!(counts_as_live(Foreign, unreadable));
+        assert!(!counts_as_live(Foreign, absent));
+
+        assert_eq!(
+            owner_admission(Unlabelled, recorded),
+            OwnerAdmission::Quarantine(
+                "a ledger record names an instance another controller labels"
+            )
+        );
+        assert_eq!(
+            owner_admission(Unlabelled, unreadable),
+            OwnerAdmission::Quarantine(
+                "a ledger record names an instance another controller labels"
+            )
+        );
+        assert_eq!(owner_admission(Unlabelled, absent), OwnerAdmission::Skip);
+        assert!(counts_as_live(Unlabelled, recorded));
+        assert!(counts_as_live(Unlabelled, unreadable));
+        assert!(!counts_as_live(Unlabelled, absent));
+    }
+
+    #[test]
+    fn legacy_label_without_ledger_is_never_an_orphan() {
+        match owner_admission(vps::controller::Ownership::LegacyHost, LedgerState::Absent) {
+            OwnerAdmission::Quarantine(reason) => assert!(reason.contains("legacy")),
+            other => panic!("expected legacy ownership quarantine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bake_lifetime_is_capped_even_when_lifetime_policy_is_off() {
+        let bake = "tg-bake-00010203fafbfeff";
+        assert_eq!(lifetime_for(bake, 0), BAKE_MAX_AGE_SECS);
+        assert_eq!(lifetime_for(bake, 600), 600);
+        assert_eq!(lifetime_for(bake, 99_999_999), BAKE_MAX_AGE_SECS);
+        assert_eq!(lifetime_for("tg-dev-1", 0), 0);
+
+        let now = 2_000_000_000;
+        assert_eq!(
+            thegn_core::time_policy::resource_expiry(
+                now,
+                Some(now - BAKE_MAX_AGE_SECS as i64 - 1),
+                lifetime_for(bake, 0),
+                orphan_age_for(LedgerState::Recorded(&rec(bake, "ready", now - 1))),
+            ),
+            thegn_core::time_policy::ResourceExpiry::Expired
+        );
+        assert_eq!(
+            thegn_core::time_policy::resource_expiry(
+                now,
+                Some(now - BAKE_MAX_AGE_SECS as i64 + 60),
+                lifetime_for(bake, 0),
+                orphan_age_for(LedgerState::Recorded(&rec(bake, "ready", now - 1))),
+            ),
+            thegn_core::time_policy::ResourceExpiry::Keep
+        );
     }
 
     #[test]
