@@ -839,8 +839,12 @@ impl CalendarRouter {
     ///
     /// Accounts run concurrently under per-class caps, so several pages can be
     /// alive at once (at most the sum of those caps). The shared admission pool
-    /// still bounds their total; a pool refusal is the existing contention
-    /// backoff. Results reach the sink in completion order.
+    /// still bounds their total. Concurrent network fetches can contend for
+    /// that pool and receive an immediate typed refusal even when a serial
+    /// fetch could have succeeded after its predecessor's page was applied;
+    /// the next pass retries refused work. Results reach the sink in completion
+    /// order. The no-starvation guarantee holds within each class, not across a
+    /// class's concurrent fetches.
     pub async fn list_events_each(
         &self,
         window: CalendarWindow,
@@ -861,7 +865,7 @@ impl CalendarRouter {
                 {
                     running[class_index] += 1;
                     let token = tokens.get(&account.name).map(String::as_str).unwrap_or("");
-                    in_flight.push(async move { fetch_account(account, &window, token).await });
+                    in_flight.push(fetch_account(account, &window, token));
                 }
             }
             let Some((class, result)) = in_flight.next().await else {
