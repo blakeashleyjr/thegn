@@ -396,11 +396,8 @@ fn run_mount_bounded(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                let tail = stderr_tail(stderr_reader)?;
-                if tail.is_empty() {
-                    bail!("{} failed: exited with {status}", argv[0]);
-                }
-                bail!("{} failed: exited with {status}: {tail}", argv[0]);
+                let message = nonzero_exit_message(&argv[0], status, stderr_tail(stderr_reader));
+                bail!("{message}");
             }
             Ok(None) => {}
             Err(error) => {
@@ -444,14 +441,7 @@ fn run_mount_bounded(
         argv[0],
         timeout.as_secs_f64()
     );
-    match stderr_tail(stderr_reader) {
-        Ok(tail) if !tail.is_empty() => {
-            message.push_str(": ");
-            message.push_str(&tail);
-        }
-        Ok(_) => {}
-        Err(error) => message.push_str(&format!("; could not read stderr tail: {error}")),
-    }
+    append_stderr_tail(&mut message, stderr_tail(stderr_reader));
     if let Some(error) = kill_error {
         message.push_str(&format!("; could not kill child: {error}"));
     }
@@ -459,9 +449,37 @@ fn run_mount_bounded(
         message.push_str(&format!("; could not reap child: {error}"));
     }
     if let Err(error) = rollback() {
-        message.push_str(&format!("; rollback unmount also failed: {error}"));
+        if !rollback_means_not_mounted(&error) {
+            message.push_str(&format!("; rollback unmount also failed: {error}"));
+        }
     }
     Err(anyhow::anyhow!(message))
+}
+
+fn append_stderr_tail(message: &mut String, tail: Result<String>) {
+    match tail {
+        Ok(tail) if !tail.is_empty() => {
+            message.push_str(": ");
+            message.push_str(&tail);
+        }
+        Ok(_) => {}
+        Err(error) => message.push_str(&format!("; could not read stderr tail: {error}")),
+    }
+}
+
+fn nonzero_exit_message(
+    argv0: &str,
+    status: impl std::fmt::Display,
+    tail: Result<String>,
+) -> String {
+    let mut message = format!("{argv0} failed: exited with {status}");
+    append_stderr_tail(&mut message, tail);
+    message
+}
+
+fn rollback_means_not_mounted(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("not mounted") || message.contains("not found in /etc/mtab")
 }
 
 fn stderr_tail(mut file: std::fs::File) -> Result<String> {
@@ -1306,6 +1324,35 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("timed out"));
         assert!(error.contains("fusermount boom"));
+    }
+
+    #[test]
+    fn sshfs_mount_runner_omits_not_mounted_rollback_diagnostic() {
+        let result = run_mount_bounded(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            std::time::Duration::from_millis(300),
+            || {
+                Err(anyhow::anyhow!(
+                    "fusermount3: entry for /mnt/test not found in /etc/mtab"
+                ))
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+        assert!(!error.contains("rollback unmount also failed"));
+    }
+
+    #[test]
+    fn sshfs_mount_runner_preserves_exit_status_when_stderr_tail_read_fails() {
+        let message = nonzero_exit_message(
+            "sshfs",
+            "exit status: 3",
+            Err(std::io::Error::other("tail unavailable").into()),
+        );
+
+        assert!(message.contains("exited with exit status: 3"));
+        assert!(message.contains("could not read stderr tail: tail unavailable"));
     }
 
     #[test]
