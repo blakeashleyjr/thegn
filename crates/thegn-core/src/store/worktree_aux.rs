@@ -398,6 +398,10 @@ pub trait WorktreeAuxStore {
         max: u32,
     ) -> Result<MergeAttemptResult>;
 
+    /// Give back one attempt consumed by this live claim when the agent never started.
+    /// Returns false when the claim is no longer live (nothing changes).
+    fn refund_merge_agent_attempt(&self, claim: &MergeClaim) -> Result<bool>;
+
     /// Replace status fields while this claim owns the row with a live lease, or is settled.
     fn replace_merge_status_claimed(
         &self,

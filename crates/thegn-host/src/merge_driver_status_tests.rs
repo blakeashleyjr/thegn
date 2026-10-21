@@ -388,7 +388,7 @@ fn failed_attempt_reservation_prevents_agent_dispatch() {
                      _: &super::Failure,
                      _: Option<thegn_core::sandbox::SandboxSpec>| {
                 dispatched = true;
-                true
+                crate::agent_run::AgentRunVerdict::Exited(Some(0))
             },
         },
     );
@@ -849,7 +849,7 @@ fn unexpected_runner(
     _: &str,
     _: &Failure,
     _: Option<thegn_core::sandbox::SandboxSpec>,
-) -> bool {
+) -> crate::agent_run::AgentRunVerdict {
     panic!("fixture must not dispatch an agent")
 }
 
@@ -1242,7 +1242,7 @@ fn hold_then_recover(failure: RetryFailure) {
                 assert_eq!(fixture.row("held").agent_attempts, 2);
                 assert_eq!(fixture.row("held").status, "agent_running");
                 assert!(!repaired.replace(true));
-                true
+                crate::agent_run::AgentRunVerdict::Exited(Some(0))
             },
         },
     );
@@ -1337,7 +1337,8 @@ fn unchanged_agent_result_exhausts_only_remaining_budget_for_conflict_and_red_ga
                         runs += 1;
                         assert!(runs <= 2, "no agent after remaining budget");
                         assert_eq!(fixture.row("budget").agent_attempts, 1 + runs);
-                        false // advisory failure must still consume the admitted attempt
+                        // Advisory failure must still consume the admitted attempt.
+                        crate::agent_run::AgentRunVerdict::Exited(Some(1))
                     },
             },
         );
