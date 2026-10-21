@@ -1473,3 +1473,22 @@ fn an_empty_snapshot_records_the_suspect_error_and_keeps_the_old_cursor() {
     assert_eq!(sync.last_error, "provider returned an empty calendar");
     assert_eq!(sync.sync_token, "t1", "token: {}", sync.sync_token);
 }
+
+#[test]
+fn stale_calendar_cache_failure_does_not_stamp_the_account() {
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    let t = TmpDb::new("stale-cache-failure");
+    let current = Arc::new(AtomicU64::new(2));
+    let stale = (Arc::clone(&current), 1);
+    record_calendar_cache_failure(&t.db, "work", Some(&stale));
+    assert!(
+        t.db.get_calendar_sync("work").unwrap().is_none(),
+        "stale cache failure must not create or stamp sync metadata"
+    );
+
+    let current_fence = (current, 2);
+    record_calendar_cache_failure(&t.db, "work", Some(&current_fence));
+    let sync = t.db.get_calendar_sync("work").unwrap().unwrap();
+    assert_eq!(sync.last_error, "calendar cache write failed");
+}

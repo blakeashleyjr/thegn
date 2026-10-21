@@ -239,10 +239,11 @@ impl CalendarStore for Db {
                 write_calendar_cursor(&tx, account, cursor)?;
                 CalendarPageApplied::FreshnessOnly
             }
-            CalendarPageWrite::Replace { rows, empty }
-                if rows.is_empty() && matches!(empty, EmptySnapshot::KeepCachedEvents) =>
-            {
-                if calendar_account_has_events(&tx, account)? {
+            CalendarPageWrite::Replace { rows, empty } => {
+                let reject = rows.is_empty()
+                    && matches!(empty, EmptySnapshot::KeepCachedEvents)
+                    && calendar_account_has_events(&tx, account)?;
+                if reject {
                     write_calendar_error(&tx, account, "provider returned an empty calendar")?;
                     CalendarPageApplied::RejectedEmpty
                 } else {
@@ -251,13 +252,6 @@ impl CalendarStore for Db {
                     CalendarPageApplied::Applied {
                         events_changed: removed > 0 || !rows.is_empty(),
                     }
-                }
-            }
-            CalendarPageWrite::Replace { rows, .. } => {
-                let removed = replace_calendar_rows(&tx, account, rows)?;
-                write_calendar_cursor(&tx, account, cursor)?;
-                CalendarPageApplied::Applied {
-                    events_changed: removed > 0 || !rows.is_empty(),
                 }
             }
             CalendarPageWrite::Delta { rows, tombstones } => {
@@ -295,6 +289,8 @@ fn write_calendar_cursor(
            VALUES (?1, ?2, ?3, ?4, '', ?5, ?6)
            ON CONFLICT(account) DO UPDATE SET
              provider = ?2, sync_token = ?3, fetched_at = ?4,
+             -- A success clears the previous error; otherwise a one-off
+             -- failure would be reported forever.
              last_error = '', horizon_from_ms = ?5, horizon_to_ms = ?6"#,
         params![
             account,
