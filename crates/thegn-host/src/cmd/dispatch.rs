@@ -1611,17 +1611,6 @@ fn set_status_error_kind(err: &anyhow::Error) -> Option<&'static str> {
     None
 }
 
-fn set_status_on(
-    db: &Db,
-    id: i64,
-    parsed: AgentDispatchStatus,
-    force: bool,
-    why: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    set_status_on_led(db, id, parsed, force, why, LeadProof::Unbound, json)
-}
-
 fn set_status_on_led(
     db: &Db,
     id: i64,
@@ -2989,8 +2978,16 @@ mod tests {
         db.update_dispatch_status(id, AgentDispatchStatus::Done)
             .unwrap();
 
-        let err =
-            set_status_on(&db, id, AgentDispatchStatus::Running, false, None, true).unwrap_err();
+        let err = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Running,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("done to running"));
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
@@ -3032,8 +3029,16 @@ mod tests {
         let id = db
             .put_agent_dispatch(NewDispatch::new("linear:THE-977", "/wt/queued", "claude"))
             .unwrap();
-        let error =
-            set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        let error = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(set_status_error_kind(&error), Some("illegal_transition"));
         assert!(error.to_string().contains("queued to done"));
     }
@@ -3049,8 +3054,16 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
-        let error =
-            set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        let error = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(set_status_error_kind(&error), Some("missing_evidence"));
         assert!(error.to_string().contains("not verifiably finished"));
     }
@@ -3067,7 +3080,16 @@ mod tests {
         db.update_dispatch_status(id, AgentDispatchStatus::Merged)
             .unwrap();
 
-        let err = set_status_on(&db, id, AgentDispatchStatus::Done, false, None, true).unwrap_err();
+        let err = set_status_on_led(
+            &db,
+            id,
+            AgentDispatchStatus::Done,
+            false,
+            None,
+            LeadProof::Unbound,
+            true,
+        )
+        .unwrap_err();
         assert!(matches!(
             err.downcast_ref::<thegn_core::db::DispatchTransitionConflict>(),
             Some(thegn_core::db::DispatchTransitionConflict::Illegal {
@@ -3089,7 +3111,18 @@ mod tests {
             ))
             .unwrap();
         for why in [None, Some("  ")] {
-            assert!(set_status_on(&db, id, AgentDispatchStatus::Done, true, why, true).is_err());
+            assert!(
+                set_status_on_led(
+                    &db,
+                    id,
+                    AgentDispatchStatus::Done,
+                    true,
+                    why,
+                    LeadProof::Unbound,
+                    true,
+                )
+                .is_err()
+            );
             assert_eq!(
                 db.get_dispatch(id).unwrap().unwrap().status,
                 AgentDispatchStatus::Queued
@@ -3098,7 +3131,16 @@ mod tests {
             assert_eq!(db.dispatch_note_count(id, None).unwrap(), 0);
         }
         assert!(
-            set_status_on(&db, id, AgentDispatchStatus::Running, true, Some("x"), true).is_err()
+            set_status_on_led(
+                &db,
+                id,
+                AgentDispatchStatus::Running,
+                true,
+                Some("x"),
+                LeadProof::Unbound,
+                true,
+            )
+            .is_err()
         );
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().status,
@@ -3119,12 +3161,13 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, AgentDispatchStatus::Running)
             .unwrap();
-        set_status_on(
+        set_status_on_led(
             &db,
             id,
             AgentDispatchStatus::Done,
             true,
             Some("reviewed"),
+            LeadProof::Unbound,
             true,
         )
         .unwrap();
