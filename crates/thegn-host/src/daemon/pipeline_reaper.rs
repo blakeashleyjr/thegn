@@ -16,9 +16,10 @@
 //!
 //! - **`CloseDone` → `done`.** Allowed. This verdict fires only when the
 //!   artifact exists, is committed and unchanged in `HEAD`, and a report with
-//!   valid PASS gate evidence is filed — bit for bit
-//!   the gate `dispatch set-status done` already enforces on the supervisor's
-//!   behalf. Applying it is arithmetic on recorded facts, not a judgement about
+//!   valid PASS gate evidence is filed and the latest trusted gate attestation
+//!   satisfies the row's current HEAD — the same gate `dispatch set-status
+//!   done` enforces on the supervisor's behalf. Applying it is arithmetic on
+//!   recorded facts, not a judgement about
 //!   whether the work was any good, so there is nothing here for a human to
 //!   decide differently. Refusing to apply it would not protect anything; it
 //!   would only mean the row keeps lying about being live.
@@ -177,7 +178,7 @@ fn reap_running(
     // Snapshot under the shared mutex, then release it before any filesystem
     // or git work. A large stale roster must not stop unrelated daemon DB
     // operations for the duration of hundreds of subprocesses.
-    let (rows, runs) = match db.lock() {
+    let (rows, runs, attestations) = match db.lock() {
         Ok(db) => {
             // Never include `Spawning`: a retry reserves the row that way
             // mid-relaunch without bumping `run_gen`, so its old session and
@@ -194,7 +195,19 @@ fn reap_running(
                     // Same lock as the roster snapshot: the generation each plan
                     // entry is fenced on. A row we cannot fence is not planned.
                     let runs = db.running_dispatch_run_refs().unwrap_or_default();
-                    (rows, runs)
+                    let mut attestations = std::collections::HashMap::new();
+                    for row in &rows {
+                        match db.latest_gate_attestation(row.id) {
+                            Ok(Some(attestation)) => {
+                                attestations.insert(row.id, attestation);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(target: "thegn::pipeline", row = row.id, %error, "reap could not read latest gate attestation")
+                            }
+                        }
+                    }
+                    (rows, runs, attestations)
                 }
                 Err(e) => {
                     tracing::debug!(target: "thegn::pipeline", error = %e, "reap pass could not snapshot");
@@ -204,7 +217,7 @@ fn reap_running(
         }
         Err(_) => return,
     };
-    let plan = crate::cmd::dispatch::reap_plan_rows(&rows, Some(live_ids));
+    let plan = crate::cmd::dispatch::reap_plan_rows(&rows, Some(live_ids), &attestations);
     // One fresh liveness read for the whole apply phase.
     let fresh: Option<std::collections::HashSet<String>> =
         fresh_live().map(|v| v.into_iter().collect());
@@ -310,6 +323,7 @@ mod tests {
     use std::sync::Mutex;
     use thegn_core::db::Db;
     use thegn_core::issue::NewDispatch;
+    use thegn_core::pipeline_gate_attest::{GateAttestation, GateOutcome, GateRunner};
     use thegn_core::store::NotificationStore;
 
     #[expect(
@@ -419,6 +433,39 @@ mod tests {
         let id = row(&db, &wt, artifact);
         db.set_dispatch_report(id, "PASS\ngate: just test — exit 0")
             .unwrap();
+        let repo = std::fs::canonicalize(&wt).unwrap();
+        let repo_common = thegn_core::util::git_out_allow_empty(
+            &wt,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .unwrap();
+        let repo_common = std::fs::canonicalize(repo_common.trim()).unwrap();
+        let branch_ref =
+            thegn_core::util::git_out_allow_empty(&wt, &["symbolic-ref", "-q", "HEAD"]).unwrap();
+        let commit_oid =
+            thegn_core::util::git_out_allow_empty(&wt, &["rev-parse", "--verify", "HEAD^{commit}"])
+                .unwrap();
+        let tree_oid =
+            thegn_core::util::git_out_allow_empty(&wt, &["rev-parse", "--verify", "HEAD^{tree}"])
+                .unwrap();
+        let log_path = dir.path().join("gate.log");
+        std::fs::write(&log_path, "passed\n").unwrap();
+        let attestation = GateAttestation {
+            dispatch_row: id,
+            repo: repo_common.display().to_string(),
+            worktree: repo.display().to_string(),
+            branch_ref: branch_ref.trim().to_string(),
+            commit_oid: commit_oid.trim().to_string(),
+            tree_oid: tree_oid.trim().to_string(),
+            command: "just test".to_string(),
+            started_ms: 1,
+            ended_ms: 2,
+            exit: Some(0),
+            log_path: log_path.display().to_string(),
+            runner: GateRunner::LeadRunner,
+        };
+        db.record_gate_attestation(&attestation, GateOutcome::Passed, "")
+            .unwrap();
         let shared = Arc::new(Mutex::new(db));
 
         reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
@@ -433,6 +480,39 @@ mod tests {
                 .unwrap()
                 .status,
             AgentDispatchStatus::Done
+        );
+    }
+
+    #[test]
+    fn production_pass_leaves_an_unattested_pass_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        git(&wt, &["init", "-q"]);
+        git(&wt, &["config", "user.email", "test@example.com"]);
+        git(&wt, &["config", "user.name", "Test"]);
+        let artifact = ".thegn/pipeline/THE-1/code/1.md";
+        std::fs::create_dir_all(wt.join(".thegn/pipeline/THE-1/code")).unwrap();
+        std::fs::write(wt.join(artifact), "handoff").unwrap();
+        git(&wt, &["add", artifact]);
+        git(&wt, &["commit", "-qm", "handoff"]);
+        let id = row(&db, &wt, artifact);
+        db.set_dispatch_report(id, "PASS\ngate: just test — exit 0")
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+        reap_pass_with_in_flight(&shared, &[], &std::collections::HashSet::new(), &|| {
+            Some(Vec::new())
+        });
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .get_dispatch(id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentDispatchStatus::Running
         );
     }
 

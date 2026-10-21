@@ -292,8 +292,11 @@ through the isolated fold-gate executor and records a trusted attestation bound
 to that worktree's committed HEAD. This explicit Lead-only invocation runs even
 when `[merge_queue] gate_on = false`; that switch controls automatic fold gating.
 It is refused under a worker dispatch capability, when no gate is configured,
-or when the row's worktree is missing, detached, or dirty. `dispatch verify` and
-`dispatch set-status done` do not consume this attestation yet.
+or when the row's worktree is missing, detached, or dirty. `dispatch set-status done`
+on an artifact-bearing row, `dispatch reap`, and the daemon's periodic reap require
+a satisfied attestation for the row's current HEAD; `dispatch verify` shows its
+state. The worker's own `gate:` line is a claim, not evidence. `--force --why`
+remains the recorded override.
 
 `dispatch set-status` follows a transition table: `merged` is reachable only
 from `done` or `pr_open`; `done` only from `running`, `spawning`,

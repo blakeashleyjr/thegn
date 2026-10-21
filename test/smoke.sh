@@ -1937,8 +1937,8 @@ check "dispatch put --force without --chunk is refused" \
 check "set-status done --force overrides and says so" \
   "'$SZ' dispatch set-status '$artifact_row' done --force --why 'smoke' | grep -q forced"
 # Untracked: the artifact exists but git does not track it — the exact pilot
-# failure ("session exit ≠ done") the gate exists to catch. Committing it
-# flips the gate open; a forced completion stays visible in the output.
+# failure ("session exit ≠ done") the artifact gate exists to catch. A commit
+# satisfies the artifact check; trusted gate evidence is checked separately.
 untracked_row_json="$("$SZ" dispatch put linear:SMOKE-4 "$R" claude --stage review --json)"
 untracked_row="$(printf '%s' "$untracked_row_json" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
 untracked_artifact="$(printf '%s' "$untracked_row_json" | sed -n 's/.*"artifact_path":"\([^"]*\)".*/\1/p')"
@@ -1957,15 +1957,23 @@ check "set-status done is refused while the artifact is untracked" \
   "[[ $utr_ok -eq 1 ]]"
 git -C "$R" add "$untracked_artifact"
 git -C "$R" -c commit.gpgsign=false commit -q -m 'smoke: commit the artifact'
-# THE-88: a tracked artifact is not enough — `done` also needs the worker's
-# structured report on the row, so the Lead never has to re-read the artifact.
+# THE-207: a tracked artifact and worker report are not enough — `done` also
+# needs the Lead's trusted attestation for the current committed HEAD.
 check "set-status done is refused while the report is missing" \
   "! '$SZ' dispatch set-status '$untracked_row' done 2>&1 | grep -q '→ done'"
 check "dispatch report files the handoff report" \
   "'$SZ' dispatch report '$untracked_row' --text 'verdict: DONE; commits: 1
 gate: just smoke -- exit 0' --json | grep -q '\"bytes\"'"
-check "set-status done passes once the artifact is tracked and reported" \
-  "'$SZ' dispatch set-status '$untracked_row' done | grep -q 'done'"
+set +e
+untrusted_done_out="$("$SZ" dispatch set-status "$untracked_row" done 2>&1)"
+untrusted_done_rc=$?
+set -e
+untrusted_done_ok=1
+[[ $untrusted_done_rc -ne 0 ]] && grep -q 'dispatch gate' <<<"$untrusted_done_out" || untrusted_done_ok=0
+check "set-status done is refused without a trusted gate attestation (THE-207)" \
+  "[[ $untrusted_done_ok -eq 1 ]]"
+check "set-status done --force --why records an unattested completion" \
+  "'$SZ' dispatch set-status '$untracked_row' done --force --why 'smoke: no gate configured' | grep -q forced"
 # `session open` shares the control-client connect path, so it degrades with
 # the same clear no-daemon message rather than crashing.
 set +e
@@ -2201,8 +2209,8 @@ if command -v curl >/dev/null 2>&1; then
 
   # The deterministic worker consumes the rendered handles, commits the
   # artifact, files its report, and exits. The supervisor then observes that
-  # exit, verifies the tracked artifact, and is allowed to record Done. This is
-  # the complete incident-regression loop in one hermetic worktree.
+  # exit and verifies the tracked artifact. The smoke fixture has no configured
+  # trusted gate command, so the recorded completion uses the explicit override.
   live_stage_json="$($SZ session open --stage smoke-live \
     --issue linear:SMOKE-LIVE --worktree "$R" --json)"
   live_stage_row="$(sed -n 's/.*\"row\":\([0-9][0-9]*\).*/\1/p' <<<"$live_stage_json")"
@@ -2228,8 +2236,8 @@ if command -v curl >/dev/null 2>&1; then
     "[[ $live_stage_exit_ok -eq 1 ]]"
   check "stage worker's artifact is tracked and its report verifies" \
     "'$SZ' dispatch verify '$live_stage_row' --json | grep -q '\"ok\":true'"
-  check "verified stage-worker row reaches done" \
-    "'$SZ' dispatch set-status '$live_stage_row' done | grep -q 'done'"
+  check "verified stage-worker row records an explicit forced completion" \
+    "'$SZ' dispatch set-status '$live_stage_row' done --force --why 'smoke: no gate configured' | grep -q forced"
 
   # Orchestration control routes over the same socket (THE-57): the dispatch
   # roster records and re-statuses a row, and `worktrees.create` spins up a
