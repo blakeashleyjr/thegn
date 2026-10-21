@@ -23,7 +23,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use thegn_core::config::Config;
-use thegn_core::db::Db;
+use thegn_core::db::{Db, DispatchNoteQuotaExceeded, NoteQuotaKind};
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_chunk;
@@ -2190,7 +2190,15 @@ fn note(id: i64, text: &str, json: bool) -> Result<()> {
 /// THE-88 — the DB-bound half of `dispatch note`.
 pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
     let validated = pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let note = db.append_dispatch_note_record(id, &validated)?;
+    let note = match db.append_dispatch_note_record(id, &validated) {
+        Ok(note) => note,
+        Err(error) => {
+            if json && let Some(quota) = error.downcast_ref::<DispatchNoteQuotaExceeded>() {
+                super::emit_json(&note_quota_error_json(id, quota))?;
+            }
+            return Err(error);
+        }
+    };
     if json {
         super::emit_json(&note_json(id, &note))?;
     } else {
@@ -2201,6 +2209,19 @@ pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn note_quota_error_json(id: i64, quota: &DispatchNoteQuotaExceeded) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "error": "note_quota_exceeded",
+        "kind": match quota.kind {
+            NoteQuotaKind::Count => "count",
+            NoteQuotaKind::Bytes => "bytes",
+        },
+        "notes": quota.notes,
+        "bytes": quota.bytes,
+    })
 }
 
 fn note_json(id: i64, note: &DispatchNote) -> serde_json::Value {
@@ -2293,7 +2314,9 @@ pub(crate) fn read_status(
                 })
             })
             .collect::<Vec<_>>();
+            let notes_shown = notes.len();
             v["notes"] = serde_json::Value::Array(notes);
+            attach_note_quota_status(&mut v, digest.note_count, notes_shown);
             annotate_override(&mut v, overrides.get(&digest.id));
             super::emit_json(&v)?;
         } else {
@@ -2346,6 +2369,16 @@ pub(crate) fn read_status(
         }
     }
     Ok(())
+}
+
+fn attach_note_quota_status(value: &mut serde_json::Value, notes_total: usize, notes_shown: usize) {
+    value["notes_total"] = serde_json::json!(notes_total);
+    value["notes_shown"] = serde_json::json!(notes_shown);
+    value["truncated"] = serde_json::json!(notes_total > notes_shown);
+    value["quota"] = serde_json::json!({
+        "max_notes": pipeline_report::NOTE_MAX_PER_ROW,
+        "max_bytes": pipeline_report::NOTE_MAX_BYTES_PER_ROW,
+    });
 }
 
 fn yes_no(b: bool) -> &'static str {
@@ -3137,6 +3170,57 @@ mod tests {
             note_cell(Some(two_lines)),
             "transport: connection error. (at…"
         );
+    }
+
+    #[test]
+    fn note_quota_status_json_reports_total_shown_truncated_and_quota() {
+        let (_dir, db) = db("note-quota-status");
+        let row = put(
+            &db,
+            NewDispatch::new("linear:THE-243-status", "/wt/note-status", "claude"),
+        )
+        .unwrap();
+        for _ in 0..25 {
+            db.append_dispatch_note_record(row.id, "progress").unwrap();
+        }
+        let total = db.dispatch_note_count(row.id, None).unwrap();
+        let page = db.newest_dispatch_notes(row.id, None, 20).unwrap();
+        let mut value = serde_json::json!({
+            "notes": page.iter().map(|note| note.text.as_str()).collect::<Vec<_>>()
+        });
+        attach_note_quota_status(&mut value, total, page.len());
+        assert_eq!(value["notes_total"], 25);
+        assert_eq!(value["notes_shown"], 20);
+        assert!(value["truncated"].as_bool().unwrap());
+        assert_eq!(
+            value["quota"]["max_notes"],
+            pipeline_report::NOTE_MAX_PER_ROW
+        );
+        assert_eq!(
+            value["quota"]["max_bytes"],
+            pipeline_report::NOTE_MAX_BYTES_PER_ROW
+        );
+    }
+
+    #[test]
+    fn note_quota_write_note_json_error_names_the_kind() {
+        let quota = DispatchNoteQuotaExceeded {
+            dispatch_id: 42,
+            kind: NoteQuotaKind::Count,
+            notes: pipeline_report::NOTE_MAX_PER_ROW,
+            bytes: 2_000,
+        };
+        let value = note_quota_error_json(42, &quota);
+        assert_eq!(value["id"], 42);
+        assert_eq!(value["error"], "note_quota_exceeded");
+        assert_eq!(value["kind"], "count");
+        assert_eq!(value["notes"], 2_000);
+        assert_eq!(value["bytes"], 2_000);
+        let byte_quota = DispatchNoteQuotaExceeded {
+            kind: NoteQuotaKind::Bytes,
+            ..quota
+        };
+        assert_eq!(note_quota_error_json(42, &byte_quota)["kind"], "bytes");
     }
 
     #[test]
