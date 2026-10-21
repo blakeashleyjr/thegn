@@ -1381,14 +1381,14 @@ fn transp_free_survives_the_cache_round_trip_with_overrides() {
 
     let mut one_shot = event("free-once");
     one_shot.busy = thegn_core::calendar::Busy::Free;
-    apply_page(
+    assert!(apply_page(
         &t.db,
         "work",
         "ics",
         &page(vec![master, override_event, one_shot], vec![], ""),
         from,
         to,
-    );
+    ));
 
     let cached = load_cached(&t.db, from, to).unwrap().events;
     let cached_master = cached

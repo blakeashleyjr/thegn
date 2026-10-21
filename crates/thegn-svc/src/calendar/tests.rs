@@ -2923,7 +2923,7 @@ async fn transp_ics_url_feed_round_trips_free_and_busy() {
         "END:VCALENDAR\r\n",
     );
     let (address, _hits, server) =
-        serve_fixed(axum::http::StatusCode::OK, "text/calendar", body).await;
+        serve_fixed(axum::http::StatusCode::OK, "text/calendar", body.to_owned()).await;
     let backend = ics_url::IcsUrlBackend::new(
         &CalendarAccount {
             url: format!("http://{address}/feed.ics"),
