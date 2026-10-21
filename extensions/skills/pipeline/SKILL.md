@@ -296,7 +296,7 @@ reason, stop and report the failure to the Lead immediately.
 
 ```text
 until `thegn dispatch list --active --json` is empty:
-  thegn dispatch wait --any --timeout 100000 --json      # or wait_ms when smaller
+  thegn dispatch wait --any --timeout 100000 --json
   thegn dispatch lease renew --name "$lease_name" --owner "$lease_owner" --ttl 300
   row = .row; report = .report                          # read the report ONLY
   thegn dispatch verify row   -> not ok: re-wait / on_blocked per chart
