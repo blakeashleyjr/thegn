@@ -105,6 +105,9 @@ trusted. Dropped `[sandbox] mounts` are listed by `thegn doctor`; a
 user-authored one also warns once per path. The ssh identity-key mounts and
 shell-state XDG write carve-outs are not applied to sealed profiles. Extend the
 allowlist with `[sandbox] mounts` (paths outside the deny list only).
+A kept container is also reused only while it runs the image id that its
+configured image resolves to; a different id or failed image probe recreates
+it.
 
 Local Compose services carry the `thegn.policy` label; a missing or stale label
 recreates them on the next launch. Pane entry and launch preflight both select
@@ -157,6 +160,10 @@ anchored at `$HOME` itself. Setting `[sandbox] enabled = false` is your
 explicit choice and is not overridden: the profile is then simply not
 enforced, and `thegn doctor` says so. `thegn doctor` prints
 `home  hidden | read-only | writable` for the configured profile.
+
+A sealed profile is strict: if a backend cannot enforce every sealed control,
+the launch is refused. With `backend = "auto"`, thegn tries the next backend;
+an explicitly selected backend is refused with the unsupported controls.
 
 Writable carve-outs (non-sealed): the worktree and its git dir, build
 caches, `/tmp`, and a narrow set of shell-state paths (`~/tmp`,
@@ -281,6 +288,11 @@ compose overrides — are reported as reserved. Unknown top-level keys are also
 reported and not applied; editor-only `customizations` is ignored silently.
 This is the supported subset for this thegn version, not a promise to mirror
 every current or future containers.dev field.
+
+Named volumes declared by a devcontainer carry an owner label. Thegn refuses a
+volume labelled for another devcontainer; a legacy unlabelled volume is claimed
+on first local use, while an unlabelled volume on a remote host is refused.
+Volumes configured under `[sandbox] volumes` are not owner-bound.
 
 Supported native OCI behavior includes image, Dockerfile build, compose
 service, mounts, forwarded ports, container/process environment, lifecycle
@@ -536,6 +548,23 @@ connection is skipped.
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
 
+On provider placements, an explicit isolation request thegn cannot enforce is
+refused before provisioning, credential access or upload. Without such a
+request, the placement runs as `provider-managed (unverified)`; `thegn doctor`
+shows that floor.
+
+A thegn-derived VPS or Fly sandbox name is bound to the worktree that created
+it. Another worktree resolving to the same name is refused before a provider
+call.
+
+If local parity fails during provider provisioning, autonomous launches on
+that worktree are refused until a later provision applies parity cleanly;
+interactive panes can still open. Host-parity closure pushes use a
+per-installation signing key and are skipped with a warning rather than sent
+unsigned when signing is unavailable. The iroh call-home reach is available
+only in builds with the `iroh` feature; `thegn doctor` reports whether it is
+built in.
+
 For remote and provider worktrees, thegn reads `.gitmodules` from the remote
 commit and rechecks approved submodules before initializing them. It validates
 the remote worktree sync plan before uploading anything. A provider sandbox's
@@ -589,6 +618,10 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   for sidecars it removes, plus staging directories older than an hour whose
   sidecar is gone when at least one runtime could be listed; symlinks are
   never followed.
+  New containers carry `thegn.worktree` and `thegn.role` labels. The sweep
+  keeps a labelled container for a known worktree, removes one only when its
+  worktree is gone, and keeps one whose labels it cannot interpret. Containers
+  without those labels are judged as before.
   At startup, the sweep runs only when the effective configuration can produce
   a sandbox container (enabled globally or by the active profile, an env
   overlay, or a repo overlay for a known worktree); `thegn sandbox gc` runs it
