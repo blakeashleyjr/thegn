@@ -104,6 +104,13 @@ user-authored one also warns once per path. The ssh identity-key mounts and
 shell-state XDG write carve-outs are not applied to sealed profiles. Extend the
 allowlist with `[sandbox] mounts` (paths outside the deny list only).
 
+Local Compose services carry the `thegn.policy` label; a missing or stale label
+recreates them on the next launch. Pane entry and launch preflight both select
+the first service replica, so they enter the same container. A refused sandbox
+entry names its refusal class and gives a one-line remediation; for example,
+`mount-unresolvable` advises creating the mount source or removing the mount
+from the config, then relaunching.
+
 Before launch, every local mount source is resolved to a real path. If a
 required source cannot be resolved, the launch is refused with its source and
 destination; an unresolvable cache mount is dropped with a warning. A source
@@ -495,6 +502,10 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 
 > Remote worktrees and cloud providers are **dev-channel only** — see
 > [[release-channels]].
+
+The bridge helper is uploaded to a staged file and checked by SHA-256 before
+it is moved into place. If the install cannot be verified, the bridge
+connection is skipped.
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
 
