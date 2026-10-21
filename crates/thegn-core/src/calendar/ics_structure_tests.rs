@@ -454,6 +454,11 @@ fn param_cardinality_multi_member_tzid_is_rejected() {
 }
 
 #[test]
+fn param_cardinality_multi_member_related_is_rejected() {
+    assert!(parse_line("TRIGGER;RELATED=START,END:-PT15M").is_none());
+}
+
+#[test]
 fn param_cardinality_value_date_and_tzid_still_parse() {
     let date_input = one_event("UID:date\nDTSTART;VALUE=DATE:20261012");
     let (date_events, date_report) = parse_report(&date_input);

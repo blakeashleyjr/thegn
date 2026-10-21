@@ -301,7 +301,7 @@ pub fn parse_line(line: &str) -> Option<ContentLine> {
     if name.is_empty() {
         return None;
     }
-    let mut params = BTreeMap::new();
+    let mut params: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in parts {
         let (k, v) = p.split_once('=')?;
         let key = k.trim().to_ascii_uppercase();
@@ -315,7 +315,7 @@ pub fn parse_line(line: &str) -> Option<ContentLine> {
             .iter()
             .map(|value| decode_param_value(value.trim()))
             .collect::<Option<Vec<_>>>()?;
-        if matches!(key.as_str(), "TZID" | "VALUE") && decoded.len() != 1 {
+        if matches!(key.as_str(), "TZID" | "VALUE" | "RELATED") && decoded.len() != 1 {
             return None;
         }
         if let Some(previous) = params.get_mut(&key) {
@@ -1203,7 +1203,7 @@ impl Builder {
                         .and_then(parse_ics_datetime)
                         .map(|d| d.year());
                     let matched = year.and_then(|year| {
-                        let key = (tzid.to_string(), year);
+                        let key = (tzid.clone(), year);
                         if let Some(zone) = timezone_matches.get(&key) {
                             return *zone;
                         }
@@ -1229,7 +1229,7 @@ impl Builder {
                     report.record(IcsDiagnostic::UnknownTimeZone);
                     line
                 }
-                None => match resolve_tzid(tzid) {
+                None => match resolve_tzid(&tzid) {
                     Some(zone) => {
                         normalized = line.clone();
                         normalized.set_param("TZID", zone.name().to_string());
