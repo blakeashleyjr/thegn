@@ -2959,8 +2959,9 @@ fn enqueue_git_op(
         // nothing observable outlives a panic here — the panic becomes an error
         // result, which is what the UI is already built to render.
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let worktree_key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::gitmut::execute(op, &loc, override_gpg)
+            crate::gitmut::execute_at(op, &loc, &worktree_key, override_gpg)
         }))
         .unwrap_or_else(|_| {
             tracing::error!(

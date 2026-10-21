@@ -6,9 +6,11 @@
 //! message (queueing compound git operations invites disaster; lazygit does
 //! the same).
 //!
-//! History-rewriting ops record the pre-op HEAD in `undo_marks` so the
-//! reflog undo planner can tell our resets from user actions, and one `z`
-//! undoes a whole composite (e.g. a custom-patch split).
+//! History-rewriting ops record the pre-op HEAD in `undo_marks`, keyed by the
+//! host-side worktree path, so the reflog undo planner can tell our resets from
+//! user actions. An unreadable mark set refuses undo/redo planning rather than
+//! treating the provenance as empty, and one `z` undoes a whole composite
+//! (e.g. a custom-patch split).
 
 use anyhow::Result;
 
@@ -410,25 +412,59 @@ pub(crate) fn validate_line_selection(
     Ok(())
 }
 
-/// Record the pre-op HEAD as an undo mark (best-effort — the undo planner
-/// degrades to treating our reset as a user action when the DB is away).
-fn record_mark(loc: &GitLoc) {
-    if let Some(head) = loc.git_out(&["rev-parse", "HEAD"])
-        && let Ok(db) = thegn_core::db::Db::open()
-    {
-        let _ = db.add_undo_mark(&loc.path(), &head); // best-effort: cache write: the undo mark is resurrection state; git is the source of truth
+fn add_mark(
+    db: &thegn_core::db::Db,
+    worktree_key: &str,
+    sha: &str,
+) -> std::result::Result<(), String> {
+    db.add_undo_mark(worktree_key, sha)
+        .map_err(|error| format!("could not write undo mark: {error:#}"))
+}
+
+/// Record the pre-op HEAD as an undo mark. The git mutation still runs when
+/// durable provenance cannot be recorded, but its result reports the failure.
+fn record_mark(loc: &GitLoc, worktree_key: &str) -> std::result::Result<(), String> {
+    let head = loc
+        .git_out(&["rev-parse", "HEAD"])
+        .ok_or_else(|| "could not read HEAD for undo mark".to_string())?;
+    let db = thegn_core::db::Db::open()
+        .map_err(|error| format!("could not open undo mark database: {error:#}"))?;
+    add_mark(&db, worktree_key, &head)
+}
+
+fn marks_from(
+    read: Result<Vec<String>>,
+) -> std::result::Result<thegn_core::reflog::OurMarks, String> {
+    read.map(thegn_core::reflog::OurMarks::new)
+        .map_err(|error| format!("undo provenance unavailable: {error:#}"))
+}
+
+fn with_provenance_note(result: GitOpResult, label: &str, failure: Option<String>) -> GitOpResult {
+    let Some(failure) = failure else {
+        return result;
+    };
+    match result {
+        GitOpResult::Ok(note) => {
+            let provenance = format!("undo provenance not recorded: {failure}");
+            GitOpResult::Ok(Some(match note {
+                Some(note) => format!("{note}; {provenance}"),
+                None => format!("{label} done; {provenance}"),
+            }))
+        }
+        other => other,
     }
 }
 
 /// Run one op to completion on the current (blocking) thread.
-pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
+pub fn execute_at(op: GitOp, loc: &GitLoc, worktree_key: &str, override_gpg: bool) -> GitOpResult {
     let label = op.label();
     let jj_note = touches_index(&op)
         && matches!(loc, GitLoc::Local(path) if thegn_core::jj::is_colocated(path));
     let opts = RebaseOpts { override_gpg };
-    if op.rewrites_history() {
-        record_mark(loc);
-    }
+    let provenance_failure = op
+        .rewrites_history()
+        .then(|| record_mark(loc, worktree_key))
+        .and_then(std::result::Result::err);
     let g = CliGit;
     let done = |r: Result<()>| match r {
         Ok(()) => GitOpResult::Ok(None),
@@ -668,9 +704,11 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
             stopped(g.move_patch_to_index(loc, &sha, &patch, &opts))
         }
         GitOp::UndoPlan { redo } => {
-            let marks = match thegn_core::db::Db::open().and_then(|db| db.undo_marks(&loc.path())) {
-                Ok(m) => thegn_core::reflog::OurMarks::new(m),
-                Err(_) => thegn_core::reflog::OurMarks::default(),
+            let marks = match marks_from(
+                thegn_core::db::Db::open().and_then(|db| db.undo_marks(worktree_key)),
+            ) {
+                Ok(marks) => marks,
+                Err(message) => return GitOpResult::Err(message),
             };
             let plan = if redo {
                 g.redo_plan(loc, &marks)
@@ -684,12 +722,17 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
         }
         GitOp::UndoApply { plan, autostash } => match g.undo_apply(loc, &plan, autostash) {
             Ok(mark) => {
-                if let Some(sha) = mark
-                    && let Ok(db) = thegn_core::db::Db::open()
-                {
-                    let _ = db.add_undo_mark(&loc.path(), &sha); // best-effort: cache write: the undo mark is resurrection state; git is the source of truth
-                }
-                GitOpResult::Ok(Some("undone".into()))
+                let write_failure = mark.and_then(|sha| {
+                    thegn_core::db::Db::open()
+                        .map_err(|error| format!("could not open undo mark database: {error:#}"))
+                        .and_then(|db| add_mark(&db, worktree_key, &sha))
+                        .err()
+                });
+                with_provenance_note(
+                    GitOpResult::Ok(Some("undone".into())),
+                    "undo",
+                    write_failure,
+                )
             }
             Err(e) => GitOpResult::Err(first_line(&e)),
         },
@@ -723,6 +766,7 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
             )
         }
     };
+    let result = with_provenance_note(result, &label, provenance_failure);
     match result {
         GitOpResult::Ok(note) if jj_note => GitOpResult::Ok(Some(format!(
             "{} — jj ignores the git index",
@@ -730,6 +774,11 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
         ))),
         other => other,
     }
+}
+
+#[cfg(test)]
+fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
+    execute_at(op, loc, &loc.path(), override_gpg)
 }
 
 /// Make popup text safe for terminal rendering and redact secrets after
@@ -811,6 +860,73 @@ fn first_line_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undo_marks_are_keyed_by_host_worktree_not_sandbox_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_at(&temp.path().join("t.db")).unwrap();
+        let loc_a = GitLoc::Provider {
+            control_prefix: Vec::new(),
+            path: "/workspace".into(),
+        };
+        let loc_b = GitLoc::Provider {
+            control_prefix: Vec::new(),
+            path: "/workspace".into(),
+        };
+        let key_a = GitLoc::worktree_cache_key(std::path::Path::new("/host/a"));
+        let key_b = GitLoc::worktree_cache_key(std::path::Path::new("/host/b"));
+
+        assert_eq!(loc_a.path(), loc_b.path());
+        assert_ne!(key_a, key_b);
+        add_mark(&db, &key_a, "abc").unwrap();
+
+        assert_eq!(db.undo_marks(&key_b).unwrap(), Vec::<String>::new());
+        assert_eq!(db.undo_marks(&key_a).unwrap(), vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn unreadable_undo_marks_refuse_the_plan() {
+        let unavailable = marks_from(Err(anyhow::anyhow!("disk I/O error")));
+        assert!(matches!(
+            unavailable,
+            Err(message)
+                if message.starts_with("undo provenance unavailable")
+                    && message.contains("disk I/O error")
+        ));
+
+        let marks = marks_from(Ok(vec!["abc".into()])).unwrap();
+        assert!(marks.contains("abc"));
+    }
+
+    #[test]
+    fn failed_mark_record_is_reported_in_the_result_note() {
+        assert!(matches!(
+            with_provenance_note(
+                GitOpResult::Ok(None),
+                "commit",
+                Some("database unavailable".into())
+            ),
+            GitOpResult::Ok(Some(note))
+                if note == "commit done; undo provenance not recorded: database unavailable"
+        ));
+        assert!(matches!(
+            with_provenance_note(
+                GitOpResult::Ok(Some("committed".into())),
+                "commit",
+                Some("database unavailable".into())
+            ),
+            GitOpResult::Ok(Some(note))
+                if note == "committed; undo provenance not recorded: database unavailable"
+        ));
+        assert!(matches!(
+            with_provenance_note(
+                GitOpResult::Err("git failed".into()),
+                "commit",
+                Some("database unavailable".into())
+            ),
+            GitOpResult::Err(message) if message == "git failed"
+        ));
+    }
 
     #[test]
     fn cancelled_custom_outcome_has_quit_message() {
