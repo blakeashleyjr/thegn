@@ -47,6 +47,27 @@ impl RowClaim {
         status: &str,
         target_branch: &str,
     ) -> anyhow::Result<Admission> {
+        Self::admit_with(db, item, repo_path, status, target_branch, false)
+    }
+
+    pub(super) fn admit_unregistered(
+        db: &Db,
+        item: &QueueItem,
+        repo_path: &str,
+        status: &str,
+        target_branch: &str,
+    ) -> anyhow::Result<Admission> {
+        Self::admit_with(db, item, repo_path, status, target_branch, true)
+    }
+
+    fn admit_with(
+        db: &Db,
+        item: &QueueItem,
+        repo_path: &str,
+        status: &str,
+        target_branch: &str,
+        unregistered: bool,
+    ) -> anyhow::Result<Admission> {
         let request = MergeClaimRequest {
             worktree: item.worktree.clone(),
             branch: item.branch.clone(),
@@ -57,7 +78,12 @@ impl RowClaim {
             lease_until_ms: thegn_core::util::now_ms() + LEASE_MS,
             owner_hint: Some(format!("thegn pid {}", std::process::id())),
         };
-        let Some(claim) = db.admit_merge_claim(&request)? else {
+        let admission_result = if unregistered {
+            db.admit_unregistered_local_merge_claim(&request)?
+        } else {
+            db.admit_merge_claim(&request)?
+        };
+        let Some(claim) = admission_result else {
             let view = db.observe_merge_claim(&item.worktree)?;
             let admission = match view {
                 Some(view)
@@ -74,8 +100,13 @@ impl RowClaim {
                     ))
                 }
                 _ => Admission::NotAdmitted(format!(
-                    "{}: not admitted (registry identity or status changed since the queue was listed); skipped",
-                    item.branch
+                    "{}: not admitted ({} since the queue was listed); skipped",
+                    item.branch,
+                    if unregistered {
+                        "the row was registered or changed"
+                    } else {
+                        "registry identity or status changed"
+                    }
                 )),
             };
             return Ok(admission);
