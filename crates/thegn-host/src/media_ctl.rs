@@ -11,7 +11,7 @@ use termwiz::terminal::TerminalWaker;
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
 
 const MAX_PENDING_MEDIA_OPS: usize = 8;
-const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
 
 pub(crate) static MEDIA_DELIVERY_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);

@@ -85,12 +85,25 @@ pub(crate) fn spawn(
 pub(crate) async fn abort_and_join(previous: Option<tokio::task::JoinHandle<()>>) {
     if let Some(previous) = previous {
         previous.abort();
-        if let Err(error) = previous.await
-            && error.is_panic()
-        {
-            tracing::warn!(target: "thegn::media", error = %error, "previous media watcher panicked while stopping");
+        let joined = join_within(
+            async {
+                if let Err(error) = previous.await
+                    && error.is_panic()
+                {
+                    tracing::warn!(target: "thegn::media", error = %error, "previous media watcher panicked while stopping");
+                }
+            },
+            crate::media_ctl::MEDIA_OP_BUDGET,
+        )
+        .await;
+        if !joined {
+            tracing::warn!(target: "thegn::media", budget_secs = crate::media_ctl::MEDIA_OP_BUDGET.as_secs(), "previous media watcher did not stop within its time budget");
         }
     }
+}
+
+async fn join_within<F: std::future::Future>(fut: F, budget: std::time::Duration) -> bool {
+    tokio::time::timeout(budget, fut).await.is_ok()
 }
 
 /// Grace applied on the badge active→inactive edge before we believe a player
@@ -184,6 +197,50 @@ fn backoff_after_stream(
         std::time::Duration::from_secs(1)
     } else {
         backoff
+    }
+}
+
+fn jittered(backoff: std::time::Duration, sample: u32) -> std::time::Duration {
+    let lower = backoff.as_nanos() / 2;
+    let span = backoff.as_nanos() - lower;
+    let nanos = lower + span * u128::from(sample) / u128::from(u32::MAX);
+    std::time::Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
+}
+
+fn jitter_sample() -> u32 {
+    let mut bytes = [0_u8; 4];
+    if getrandom::fill(&mut bytes).is_err() {
+        return u32::MAX;
+    }
+    u32::from_le_bytes(bytes)
+}
+
+async fn next_push_wake(
+    watch: &mut (dyn thegn_media::MediaWatch + Send),
+    active: bool,
+    expiry: Option<std::time::Duration>,
+    safety: &mut tokio::time::Interval,
+    probe: &mut tokio::time::Interval,
+) -> bool {
+    if active && let Some(delay) = expiry {
+        tokio::select! {
+            changed = watch.changed() => changed,
+            _ = tokio::time::sleep(delay) => true,
+            _ = probe.tick() => true,
+        }
+    } else if active {
+        tokio::select! {
+            changed = watch.changed() => changed,
+            _ = probe.tick() => true,
+        }
+    } else {
+        tokio::select! {
+            changed = watch.changed() => changed,
+            _ = safety.tick() => true,
+        }
     }
 }
 
@@ -370,10 +427,11 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                         }
                     }
                 }
+                let retry_after = jittered(backoff, jitter_sample());
                 let retry_after = state
                     .freshness
                     .until_expiry(tokio::time::Instant::now(), state.grace)
-                    .map_or(backoff, |remaining| backoff.min(remaining));
+                    .map_or(retry_after, |remaining| retry_after.min(remaining));
                 tokio::time::sleep(retry_after).await;
                 backoff = (backoff * 2).min(max_backoff);
                 continue;
@@ -389,31 +447,19 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
         match client.watch().await {
             Ok(Some(mut watch)) => {
                 let connected_at = tokio::time::Instant::now();
-                // Native push path. Re-snapshot on each D-Bus signal; additionally,
-                // *while no track is displayed*, run a slow safety poll so a failed
-                // initial read self-heals. Once a badge shows, drop back to
-                // signal-only (no idle polling during playback).
+                // Native push path. Re-snapshot on each D-Bus signal; run a slow
+                // safety poll while hidden and a slower liveness probe while a
+                // badge shows, so a silent open stream cannot leave it stale.
                 let mut safety = interval(period);
                 safety.tick().await; // consume the immediate first tick
+                let mut probe = interval(STREAM_STABILITY);
+                probe.tick().await; // consume the immediate first tick
                 let stream_ended = loop {
-                    let changed = if active {
-                        if let Some(delay) = state
-                            .freshness
-                            .until_expiry(tokio::time::Instant::now(), state.grace)
-                        {
-                            tokio::select! {
-                                changed = watch.changed() => changed,
-                                _ = tokio::time::sleep(delay) => true,
-                            }
-                        } else {
-                            watch.changed().await
-                        }
-                    } else {
-                        tokio::select! {
-                            c = watch.changed() => c,
-                            _ = safety.tick() => true,
-                        }
-                    };
+                    let expiry = state
+                        .freshness
+                        .until_expiry(tokio::time::Instant::now(), state.grace);
+                    let changed =
+                        next_push_wake(&mut *watch, active, expiry, &mut safety, &mut probe).await;
                     if !changed {
                         break true; // signal stream ended → reconnect
                     }
@@ -429,7 +475,7 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
                 if stream_ended {
                     tracing::debug!(target: "thegn::media", "MPRIS signal stream ended; reconnecting");
                     backoff = backoff_after_stream(backoff, connected_at.elapsed());
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(jittered(backoff, jitter_sample())).await;
                     backoff = (backoff * 2).min(max_backoff);
                     continue;
                 }
@@ -556,8 +602,8 @@ mod tests {
 
     use super::{
         FlapAction, Freshness, MediaSnapshotDelivery, STREAM_STABILITY, abort_and_join,
-        backoff_after_stream, drain_snapshots, flap_action, interval, offer, should_confirm_flap,
-        should_deliver, stale_grace,
+        backoff_after_stream, drain_snapshots, flap_action, interval, jittered, join_within,
+        next_push_wake, offer, should_confirm_flap, should_deliver, stale_grace,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
@@ -827,5 +873,99 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    struct SilentWatch;
+
+    impl thegn_media::MediaWatch for SilentWatch {
+        fn changed(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct EndedWatch;
+
+    impl thegn_media::MediaWatch for EndedWatch {
+        fn changed(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(async { false })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_silent_stream_wakes_on_the_probe_while_active() {
+        let mut watch = SilentWatch;
+        let mut safety = interval(std::time::Duration::from_secs(3));
+        safety.tick().await;
+        let mut probe = interval(STREAM_STABILITY);
+        probe.tick().await;
+        let wake = next_push_wake(&mut watch, true, None, &mut safety, &mut probe);
+        tokio::pin!(wake);
+        tokio::select! {
+            result = &mut wake => panic!("silent stream woke before the probe: {result}"),
+            _ = tokio::time::sleep(STREAM_STABILITY - std::time::Duration::from_millis(1)) => {},
+        }
+        tokio::select! {
+            result = &mut wake => panic!("silent stream woke before the probe: {result}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {},
+        }
+        assert!(wake.await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_inactive_wait_keeps_the_safety_period() {
+        let period = std::time::Duration::from_secs(3);
+        let mut watch = SilentWatch;
+        let mut safety = interval(period);
+        safety.tick().await;
+        let mut probe = interval(STREAM_STABILITY);
+        probe.tick().await;
+        let started = tokio::time::Instant::now();
+        assert!(next_push_wake(&mut watch, false, None, &mut safety, &mut probe).await);
+        assert_eq!(tokio::time::Instant::now() - started, period);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_ended_stream_returns_false() {
+        let mut watch = EndedWatch;
+        let mut safety = interval(std::time::Duration::from_secs(3));
+        safety.tick().await;
+        let mut probe = interval(STREAM_STABILITY);
+        probe.tick().await;
+        assert!(!next_push_wake(&mut watch, true, None, &mut safety, &mut probe).await);
+    }
+
+    #[test]
+    fn liveness_jitter_stays_within_half_to_full_backoff() {
+        for backoff in [
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(8),
+            std::time::Duration::from_secs(30),
+        ] {
+            for sample in [0, 1, u32::MAX / 2, u32::MAX] {
+                let value = jittered(backoff, sample);
+                assert!(
+                    value >= backoff / 2 && value <= backoff,
+                    "{value:?} for {backoff:?}"
+                );
+            }
+            assert_eq!(jittered(backoff, 0), backoff / 2);
+            assert_eq!(jittered(backoff, u32::MAX), backoff);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_join_within_times_out_on_a_never_finishing_future() {
+        assert!(
+            !join_within(
+                std::future::pending::<()>(),
+                crate::media_ctl::MEDIA_OP_BUDGET
+            )
+            .await
+        );
+        assert!(join_within(std::future::ready(()), crate::media_ctl::MEDIA_OP_BUDGET).await);
     }
 }
