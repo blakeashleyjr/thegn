@@ -102,6 +102,35 @@ pub struct CiRunList {
 pub struct CiRunDetail {
     pub run: CiRun,
     pub discarded_jobs: usize,
+    /// None when the provider returned every job; Some when a budget stopped
+    /// the listing early, so `run.jobs` is a prefix and must not be treated as
+    /// the whole run.
+    pub incomplete: Option<CiDetailIncomplete>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiDetailIncomplete {
+    PageBudget { pages: usize },
+    RowBudget { rows: usize },
+}
+
+impl CiDetailIncomplete {
+    pub fn reason(&self) -> String {
+        match self {
+            Self::PageBudget { pages } => {
+                format!("job list stopped after {pages} pages (page budget)")
+            }
+            Self::RowBudget { rows } => {
+                format!("job list stopped after {rows} rows (row budget)")
+            }
+        }
+    }
+}
+
+impl CiRunDetail {
+    pub fn is_complete(&self) -> bool {
+        self.incomplete.is_none()
+    }
 }
 
 // === provider selection ====================================================
@@ -1263,6 +1292,7 @@ impl CiProvider for GithubCi {
         Ok(CiRunDetail {
             run,
             discarded_jobs,
+            incomplete: None,
         })
     }
 
@@ -1697,6 +1727,7 @@ impl CiProvider for GitlabCi {
         let mut discarded_jobs = 0usize;
         let mut bytes = 0usize;
         let mut complete = false;
+        let mut incomplete = None;
         for page in 1..=GITLAB_JOBS_MAX_PAGES {
             let endpoint = format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
             let remaining = GITLAB_JOBS_MAX_BYTES.saturating_sub(bytes);
@@ -1711,38 +1742,44 @@ impl CiProvider for GitlabCi {
                     .map_err(CiError::Other)?;
             let page_length = page_rows.len();
             let (parsed, discarded) = parse_provider_row(&page_rows, gitlab_job_from_value);
-            for job in parsed {
+            for job in &parsed {
                 if !ids.insert(job.id.clone()) {
                     return Err(CiError::Other(format!(
                         "duplicate GitLab job id {:?}",
                         job.id
                     )));
                 }
-                jobs.push(job);
             }
-            discarded_jobs += discarded;
-            if jobs.len() + discarded_jobs > GITLAB_JOBS_MAX_ROWS {
-                return Err(CiError::Other(
-                    "GitLab jobs pagination row budget exhausted".into(),
-                ));
+            jobs.extend(parsed);
+            discarded_jobs = discarded_jobs.saturating_add(discarded);
+            if jobs.len().saturating_add(discarded_jobs) > GITLAB_JOBS_MAX_ROWS {
+                jobs.truncate(GITLAB_JOBS_MAX_ROWS.saturating_sub(discarded_jobs));
+                incomplete = Some(CiDetailIncomplete::RowBudget {
+                    rows: GITLAB_JOBS_MAX_ROWS,
+                });
+                break;
             }
             if page_length < GITLAB_JOBS_PAGE_SIZE {
                 complete = true;
                 break;
             }
         }
-        if !complete {
-            return Err(CiError::Other(
-                "GitLab jobs pagination page budget exhausted".into(),
-            ));
+        if !complete && incomplete.is_none() {
+            incomplete = Some(CiDetailIncomplete::PageBudget {
+                pages: GITLAB_JOBS_MAX_PAGES,
+            });
         }
         if discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitLab job rows");
         }
         run.jobs = jobs;
+        if let Some(reason) = incomplete.map(|detail| detail.reason()) {
+            tracing::warn!(target: "thegn::ci", %reason, "GitLab job list incomplete");
+        }
         Ok(CiRunDetail {
             run,
             discarded_jobs,
+            incomplete,
         })
     }
 
@@ -2747,15 +2784,16 @@ mod tests {
 endpoint=
 for arg in "$@"; do endpoint=$arg; done
 case "$endpoint" in
-  *"/pipelines/123/jobs?"*|*"/pipelines/124/jobs?"*|*"/pipelines/125/jobs?"*|*"/pipelines/126/jobs?"*)
-    case "$endpoint" in *pipelines/123/jobs?*) run=123 ;; *pipelines/124/jobs?*) run=124 ;; *pipelines/125/jobs?*) run=125 ;; *) run=126 ;; esac
+  *"/pipelines/123/jobs?"*|*"/pipelines/124/jobs?"*|*"/pipelines/125/jobs?"*|*"/pipelines/126/jobs?"*|*"/pipelines/127/jobs?"*)
+    case "$endpoint" in *pipelines/123/jobs?*) run=123 ;; *pipelines/124/jobs?*) run=124 ;; *pipelines/125/jobs?*) run=125 ;; *pipelines/126/jobs?*) run=126 ;; *) run=127 ;; esac
     page=${endpoint##*page=}
     if [ "$run" = 126 ]; then printf '{}\n'; exit 0; fi
     if [ "$page" = 1 ] || [ "$run" = 125 ]; then
       printf '['
       i=1
       base=$(( (page - 1) * 100 ))
-      while [ "$i" -le 100 ]; do
+      if [ "$run" = 127 ]; then page_rows=5001; else page_rows=100; fi
+      while [ "$i" -le "$page_rows" ]; do
         [ "$i" -gt 1 ] && printf ','
         id=$((base + i))
         printf '{"id":%s,"name":"job-%s","status":"success"}' "$id" "$id"
@@ -2808,6 +2846,7 @@ esac
         let detail = client.run_detail(&loc, "123").unwrap();
         assert_eq!(detail.run.jobs.len(), 101);
         assert_eq!(detail.run.jobs[100].state, CiState::Fail);
+        assert!(detail.is_complete());
         assert!(
             client
                 .run_detail(&loc, "124")
@@ -2815,12 +2854,21 @@ esac
                 .to_string()
                 .contains("duplicate GitLab job id")
         );
-        assert!(
-            client
-                .run_detail(&loc, "125")
-                .unwrap_err()
-                .to_string()
-                .contains("page budget exhausted")
+        let partial = client.run_detail(&loc, "125").unwrap();
+        assert_eq!(partial.run.jobs.len(), 5_000);
+        assert_eq!(
+            partial.incomplete,
+            Some(CiDetailIncomplete::PageBudget { pages: 50 })
+        );
+        assert!(!partial.is_complete());
+        let row_limited = client.run_detail(&loc, "127").unwrap();
+        assert_eq!(
+            row_limited.run.jobs.len() + row_limited.discarded_jobs,
+            5_000
+        );
+        assert_eq!(
+            row_limited.incomplete,
+            Some(CiDetailIncomplete::RowBudget { rows: 5_000 })
         );
         assert!(
             client
@@ -2828,6 +2876,20 @@ esac
                 .unwrap_err()
                 .to_string()
                 .contains("invalid GitLab jobs response")
+        );
+    }
+
+    #[test]
+    fn gitlab_detail_incomplete_reason_names_the_budget() {
+        assert!(
+            CiDetailIncomplete::PageBudget { pages: 50 }
+                .reason()
+                .contains("50 pages (page budget)")
+        );
+        assert!(
+            CiDetailIncomplete::RowBudget { rows: 5_000 }
+                .reason()
+                .contains("5000 rows (row budget)")
         );
     }
 
