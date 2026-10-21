@@ -358,7 +358,7 @@ fn adopt_registered_worktrees(
     db: &Db,
     cfg: &thegn_core::config::Config,
     session: &str,
-    slug: &str,
+    slug: Option<&str>,
     registry_rows: Option<&[thegn_core::models::WorktreeRow]>,
     worktrees: &mut Vec<WorktreeGroup>,
 ) -> std::collections::HashMap<String, i64> {
@@ -408,7 +408,8 @@ fn adopt_registered_worktrees(
             // worktrees, which is exactly how they disappeared from the
             // sidebar on a workspace switch (THE-73).
             let adopt = (wt.session_name == session && !known(worktrees))
-                || (wt.tab_name.starts_with(&format!("{slug}/")) && !known(worktrees));
+                || (slug.is_some_and(|slug| wt.tab_name.starts_with(&format!("{slug}/")))
+                    && !known(worktrees));
             if adopt {
                 worktrees.push(WorktreeGroup::new(
                     wt.tab_name.clone(),
@@ -487,10 +488,22 @@ impl Session {
         // path-keyed sessions have one. For non-path session names fall back
         // to the name itself for registry matching (legacy behavior).
         let session_path = std::path::Path::new(session);
-        let canonical = session_path
-            .is_absolute()
-            .then(|| thegn_core::repo::repo_slug_with(db, session_path));
-        let slug = canonical.clone().unwrap_or_else(|| session.to_string());
+        let canonical = if session_path.is_absolute() {
+            match thegn_core::repo::repo_slug_with_checked(db, session_path) {
+                Ok(slug) => Some(slug),
+                Err(error) => {
+                    tracing::warn!(target: "thegn::session", %error, session, "workspace slug unresolved; skipping slug-keyed adoption, renames and pruning");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let adoption_slug = if session_path.is_absolute() {
+            canonical.as_deref()
+        } else {
+            Some(session)
+        };
 
         let registry_rows = match db.worktrees() {
             Ok(rows) => Some(rows),
@@ -506,7 +519,7 @@ impl Session {
             db,
             cfg,
             session,
-            &slug,
+            adoption_slug,
             registry_rows.as_deref(),
             &mut worktrees,
         );
@@ -884,7 +897,13 @@ impl Session {
         if !path.is_absolute() {
             return Vec::new();
         }
-        let slug = thegn_core::repo::repo_slug_with(db, path);
+        let slug = match thegn_core::repo::repo_slug_with_checked(db, path) {
+            Ok(slug) => Some(slug),
+            Err(error) => {
+                tracing::warn!(target: "thegn::session", %error, session = %session_id, "workspace slug unresolved; skipping slug-keyed warm adoption");
+                None
+            }
+        };
         let registry_rows = match db.worktrees() {
             Ok(rows) => Some(rows),
             Err(error) => {
@@ -896,7 +915,7 @@ impl Session {
             db,
             cfg,
             session_id,
-            &slug,
+            slug.as_deref(),
             registry_rows.as_deref(),
             &mut worktrees,
         );
@@ -995,7 +1014,8 @@ impl Session {
             // (sidebar grouping, ui_state, worktree registry); naming the home
             // group by the raw basename here would desync it from the DB slug
             // and duplicate the workspace in the sidebar tree.
-            let slug = thegn_core::repo::repo_slug_with(db, std::path::Path::new(repo_path));
+            let slug =
+                thegn_core::repo::repo_slug_with_checked(db, std::path::Path::new(repo_path))?;
             worktrees.push(WorktreeGroup::new(
                 thegn_core::repo::home_tab(&slug),
                 GroupKind::Home,
@@ -2271,6 +2291,107 @@ mod tests {
             live.worktrees
                 .iter()
                 .any(|group| group.name == format!("{slug}/registered"))
+        );
+    }
+
+    #[test]
+    fn slug_unresolved_adoption_skips_foreign_prefix() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("db.sqlite");
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.slug_for_repo("/elsewhere/same-name", "same-name")
+                .unwrap(),
+            "same-name"
+        );
+        let foreign = scratch.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        let foreign = foreign.to_string_lossy().into_owned();
+        db.put_worktree(
+            "same-name/feat",
+            "/elsewhere/same-name",
+            &foreign,
+            "feat",
+            None,
+            None,
+        )
+        .unwrap();
+        let ro = Db::open_read_only_wal_at(&path)
+            .unwrap()
+            .expect("db file exists");
+
+        let adopted = Session::prepare_registered_adoption(
+            "/home/me/code/same-name",
+            &[],
+            &ro,
+            &thegn_core::config::Config::default(),
+        );
+        assert!(!adopted.iter().any(|group| group.name == "same-name/feat"));
+    }
+
+    #[test]
+    fn slug_unresolved_resurrect_keeps_every_group() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("db.sqlite");
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.slug_for_repo("/elsewhere/same-name", "same-name")
+                .unwrap(),
+            "same-name"
+        );
+        let repo = "/home/me/code/same-name";
+        let topic = scratch.path().join("topic");
+        std::fs::create_dir(&topic).unwrap();
+        let persisted = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new("same-name-2/home", GroupKind::Home, repo),
+                WorktreeGroup::new(
+                    "same-name-2/topic",
+                    GroupKind::Branch,
+                    topic.to_string_lossy().into_owned(),
+                ),
+            ],
+            active: 0,
+        };
+        persisted.persist(&db, repo, 0).unwrap();
+        let ro = Db::open_read_only_wal_at(&path)
+            .unwrap()
+            .expect("db file exists");
+
+        let resurrected =
+            Session::resurrect_with_cfg(&ro, repo, &thegn_core::config::Config::default()).unwrap();
+        assert_eq!(
+            resurrected
+                .worktrees
+                .iter()
+                .map(|group| group.name.as_str())
+                .collect::<Vec<_>>(),
+            ["same-name-2/home", "same-name-2/topic"]
+        );
+    }
+
+    #[test]
+    fn slug_unresolved_workspace_switch_errors() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("db.sqlite");
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            db.slug_for_repo("/elsewhere/same-name", "same-name")
+                .unwrap(),
+            "same-name"
+        );
+        let ro = Db::open_read_only_wal_at(&path)
+            .unwrap()
+            .expect("db file exists");
+
+        assert!(
+            Session::prepare_workspace_switch(
+                "/home/me/code/same-name",
+                &ro,
+                &thegn_core::config::Config::default(),
+            )
+            .is_err()
         );
     }
 }

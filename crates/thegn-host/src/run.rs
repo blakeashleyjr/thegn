@@ -160,9 +160,15 @@ fn workspace_context(
         return (None, None);
     }
     let root = std::path::PathBuf::from(&session.id);
-    let slug = thegn_core::repo::repo_slug(&root);
+    let slug = match thegn_core::repo::repo_slug_checked(&root) {
+        Ok(slug) => Some(slug),
+        Err(error) => {
+            tracing::debug!(target: "thegn::session", %error, "workspace slug unresolved; no per-workspace keymap layer");
+            None
+        }
+    };
     let root = root.is_dir().then_some(root);
-    (root, Some(slug))
+    (root, slug)
 }
 
 /// Rebuild the host keymap for the session's focused workspace (profile +
@@ -26588,13 +26594,25 @@ async fn event_loop<T: Terminal>(
                                 // Derive the slug from the active group's own name
                                 // so it matches the `{slug}/…` prefix that
                                 // `remove_workspace_with_db` filters live groups on.
-                                let slug = session
+                                let slug = match session
                                     .active_group()
                                     .and_then(|g| crate::sidebar::split_tab(&g.name))
                                     .map(|(repo, _)| repo)
-                                    .unwrap_or_else(|| {
-                                        thegn_core::repo::repo_slug(Path::new(&repo_path))
-                                    });
+                                {
+                                    Some(slug) => slug,
+                                    None => match thegn_core::repo::repo_slug_checked(Path::new(
+                                        &repo_path,
+                                    )) {
+                                        Ok(slug) => slug,
+                                        Err(error) => {
+                                            model.status = format!(
+                                                "Cannot delete project: its identity is unavailable ({error})"
+                                            );
+                                            dirty = true;
+                                            continue;
+                                        }
+                                    },
+                                };
                                 if current_config.ui.confirm_delete_workspace {
                                     // Default (pre-selected) choice is "delete from
                                     // disk"; resolved in the menu Pick handler.
