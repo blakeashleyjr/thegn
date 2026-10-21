@@ -2737,7 +2737,7 @@ pub(crate) fn spawn_hunk_fetch(
     waker: &TerminalWaker,
     generation: u64,
 ) {
-    if panel_ui.hunks.contains_key(path) {
+    if panel_ui.hunks_banked(path) {
         return;
     }
     let Some(token) = hunk_inflight.begin(path) else {
@@ -2750,16 +2750,20 @@ pub(crate) fn spawn_hunk_fetch(
     tokio::task::spawn_blocking(move || {
         use thegn_svc::git::GitBackend;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let hunks = thegn_svc::git::CliGit
-            .diff_hunks(&loc, "HEAD", &path, 16)
-            .unwrap_or_default();
+        let hunks = match thegn_svc::git::CliGit.diff_hunks(&loc, "HEAD", &path, 16) {
+            Ok(hunks) => Ok(hunks),
+            Err(error) => {
+                tracing::debug!(target: "thegn::panel", path = %path, %error, "hunk preview diff failed");
+                Err(())
+            }
+        };
         if tx.send((generation, token, path, hunks)).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
 
-pub(crate) type HunkMsg = (u64, u64, String, Vec<thegn_svc::git::Hunk>);
+pub(crate) type HunkMsg = (u64, u64, String, Result<Vec<thegn_svc::git::Hunk>, ()>);
 
 type SubmoduleScanMsg = (
     u64,
@@ -9406,7 +9410,7 @@ async fn event_loop<T: Terminal>(
             // The old worktree's hunk previews are meaningless here: drop them and
             // raise the acceptance cutoff so in-flight fetches die on arrival.
             hydration_gen += 1;
-            panel_ui.hunks.clear();
+            panel_ui.clear_hunks();
             hunk_inflight.clear();
             submodule_preview_inflight.clear();
             submodule_scans.reset();
@@ -11276,7 +11280,7 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let owns_path = hunk_inflight.finish(&path, token);
             if owns_path && generation >= panel_ui.hunks_gen {
-                panel_ui.hunks.insert(path, hunks);
+                panel_ui.bank_hunks(path, hunks);
                 dirty = true;
             }
         }
@@ -11992,7 +11996,7 @@ async fn event_loop<T: Terminal>(
             // clear); the selected row's preview is refetched immediately so
             // an open preview never sticks on stale content.
             if next_model.panel != model.panel {
-                panel_ui.hunks.clear();
+                panel_ui.clear_hunks();
                 hunk_inflight.clear();
                 if let Some(path) = panel_ui.git.staging.as_ref().map(|s| s.path.clone())
                     && let Some(untracked) = gitui::staging_refetch(
