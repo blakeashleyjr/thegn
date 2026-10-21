@@ -396,7 +396,7 @@ reminder_default_mins = [10]
 #                           Google, Outlook, Fastmail, Nextcloud and Proton all
 #                           publish these, which is why there is no OAuth here.
 #   provider = "caldav"   — a CalDAV collection. Needs `url`.
-#   provider = "command"  — any program that prints newline-delimited JSON; see
+#   provider = "command"  — a trusted program (runs as you) that prints newline-delimited JSON; see
 #                           docs/help/calendar.md for the plugin contract.
 #
 # Sources are read-only: thegn never writes back to a provider.
