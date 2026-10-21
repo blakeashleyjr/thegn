@@ -83,6 +83,8 @@ pub enum MediaError {
     Unsupported(String),
     /// The player rejected the request or returned something unparseable.
     Backend(String),
+    /// The selected player changed between the read and the mutation; nothing was written.
+    Stale(String),
 }
 
 impl std::fmt::Display for MediaError {
@@ -92,6 +94,7 @@ impl std::fmt::Display for MediaError {
             MediaError::Unavailable(m) => write!(f, "media backend unavailable: {m}"),
             MediaError::Unsupported(m) => write!(f, "media operation unsupported: {m}"),
             MediaError::Backend(m) => write!(f, "media backend error: {m}"),
+            MediaError::Stale(m) => write!(f, "media player changed: {m}"),
         }
     }
 }
