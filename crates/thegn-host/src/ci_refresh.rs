@@ -359,6 +359,20 @@ pub(crate) fn ci_cache_is_fresh(fetched_at: Option<i64>, now: i64, ttl_secs: u64
     thegn_core::time_policy::is_fresh(now, fetched_at, ttl_secs)
 }
 
+/// Whether the daemon may serve a cached CI run row. The row must be fresh
+/// under `[ci] ttl_secs` and belong to a known current branch; legacy rows with
+/// an empty cached branch and unknown current branches are never matches.
+pub(crate) fn daemon_ci_cache_usable(
+    cached_branch: &str,
+    current_branch: Option<&str>,
+    fetched_at: i64,
+    now: i64,
+    ttl_secs: u64,
+) -> bool {
+    ci_cache_is_fresh(Some(fetched_at), now, ttl_secs)
+        && current_branch.is_some_and(|branch| !branch.is_empty() && cached_branch == branch)
+}
+
 // --- fetch health: the panel note + failure backoff ------------------------
 
 /// Per-worktree CI fetch health. Process-global (same pattern as hydrate's
@@ -1481,6 +1495,21 @@ mod tests {
         // A clock that went backwards must not wedge the guard forever
         // (saturating_sub keeps the age ≥ 0, so it reads as "just fetched").
         assert!(ci_cache_is_fresh(Some(200), 120, 30));
+    }
+
+    #[test]
+    fn daemon_ci_cache_usable_requires_fresh_row_for_current_branch() {
+        assert!(daemon_ci_cache_usable("main", Some("main"), 100, 120, 30));
+        assert!(!daemon_ci_cache_usable("main", Some("main"), 89, 120, 30));
+        assert!(!daemon_ci_cache_usable("main", Some("main"), 120, 120, 0));
+        assert!(!daemon_ci_cache_usable("other", Some("main"), 100, 120, 30));
+    }
+
+    #[test]
+    fn daemon_ci_cache_usable_rejects_unknown_identity() {
+        assert!(!daemon_ci_cache_usable("", Some("main"), 100, 120, 30));
+        assert!(!daemon_ci_cache_usable("main", None, 100, 120, 30));
+        assert!(!daemon_ci_cache_usable("", Some(""), 100, 120, 30));
     }
 
     #[test]
