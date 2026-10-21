@@ -675,7 +675,12 @@ fn staging_region(
                         PanelRow::blank(),
                         PanelRow::plain(Line::segs(vec![seg(g2(), "selected file diff")])),
                     ];
-                    if let Some(hunks) = ui.hunks.get(&c.path) {
+                    if ui.hunks_unavailable.contains(&c.path) {
+                        rows.push(PanelRow::plain(Line::segs(vec![seg(
+                            g2(),
+                            "diff unavailable (git failed)",
+                        )])));
+                    } else if let Some(hunks) = ui.hunks.get(&c.path) {
                         for hunk in hunks {
                             rows.push(PanelRow::plain(Line::segs(vec![seg(
                                 hue(Hue::Blue),
