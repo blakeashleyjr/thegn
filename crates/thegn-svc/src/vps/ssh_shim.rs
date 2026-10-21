@@ -608,6 +608,12 @@ mod tests {
     fn control_dir_is_private_and_template_is_stable() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("sock");
+        std::fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let key = std::path::Path::new("/state/ssh/key");
         let first = control_template(std::path::Path::new("/r/tg-ssh"), key).unwrap();
         let second = control_template(std::path::Path::new("/r/tg-ssh"), key).unwrap();
@@ -624,7 +630,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
                 0o700
             );
         }
