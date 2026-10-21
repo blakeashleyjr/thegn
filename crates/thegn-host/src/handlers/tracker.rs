@@ -32,6 +32,25 @@ pub(crate) fn panel_issue_router(
     router
 }
 
+async fn self_assign_issue(
+    router: &thegn_svc::issue::IssueRouter,
+    issue: &thegn_core::issue::Issue,
+) -> Result<thegn_core::issue::Issue, thegn_svc::issue::IssueError> {
+    let patch = thegn_core::issue::IssuePatch {
+        assignee_me: Some(true),
+        ..Default::default()
+    };
+    if let Some(issue_ref) = thegn_core::issue::IssueRef::of(issue) {
+        router.update_issue_ref(&issue_ref, &patch).await
+    } else if issue.account.is_none() {
+        router.update_issue(&issue.id, &patch).await
+    } else {
+        Err(thegn_svc::issue::IssueError::Policy(
+            "issue row has an invalid account reference",
+        ))
+    }
+}
+
 /// The loop locals the tracker keys need, borrowed for one keypress.
 pub(crate) struct TrackerCtx<'a> {
     pub model: &'a mut FrameModel,
@@ -248,32 +267,29 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                 let waker2 = ctx.waker.clone();
                 let refresh_tx2 = ctx.refresh_tx.clone();
                 let cwd2 = active_tab_path(ctx.session);
+                let number = issue.number.clone();
                 tokio::task::spawn_blocking(move || {
-                    use thegn_core::issue::IssuePatch;
                     let repo_root =
                         thegn_core::repo::main_worktree(&cwd2).unwrap_or_else(|| cwd2.clone());
                     let router = panel_issue_router(&full_cfg, &repo_root, &cwd2);
                     if !router.is_configured() {
                         return;
                     }
-                    let patch = IssuePatch {
-                        assignee_me: Some(true),
-                        ..Default::default()
-                    };
                     // Don't swallow a provider failure on this user action: the
                     // optimistic "Assigning…" status was already set on the loop,
                     // so surface the error (matches dispatch_agent's off-thread
                     // reporting) instead of silently claiming success.
-                    if let Ok(Err(e)) =
-                        thegn_svc::issue::block_on_tracker(router.update_issue(&issue.id, &patch))
-                    {
-                        crate::hydrate_tracker::send_tracker_toast(
-                            &refresh_tx2,
-                            &waker2,
-                            format!("Issue assignment failed: {e}"),
-                            thegn_core::notification::Priority::Alert,
-                        );
-                        return;
+                    match thegn_svc::issue::block_on_tracker(self_assign_issue(&router, &issue)) {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) | Err(error) => {
+                            crate::hydrate_tracker::send_tracker_toast(
+                                &refresh_tx2,
+                                &waker2,
+                                format!("Issue assignment failed: {error}"),
+                                thegn_core::notification::Priority::Alert,
+                            );
+                            return;
+                        }
                     }
                     let wake_on_busy = waker2.clone();
                     let report = crate::hydrate_tracker::RefreshReportTarget {
@@ -295,7 +311,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                         );
                     }
                 });
-                ctx.model.status = format!("Assigning {} to you…", issue.number);
+                ctx.model.status = format!("Assigning {} to you…", number);
             }
             true
         }
