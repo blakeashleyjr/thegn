@@ -606,7 +606,9 @@ mod tests {
 
     #[test]
     fn control_dir_is_private_and_template_is_stable() {
-        let temp = tempfile::tempdir().unwrap();
+        // A short base: sockets are capped near 100 bytes, and a nested TMPDIR
+        // (nix-shell, nextest) can push the template past that cap.
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
         let dir = temp.path().join("sock");
         std::fs::create_dir(&dir).unwrap();
         #[cfg(unix)]
