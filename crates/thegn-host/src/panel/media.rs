@@ -47,6 +47,7 @@ pub(crate) struct MediaPanelState {
     pub(crate) queue_truncated: usize,
     pub(crate) queue_error: Option<String>,
     pub(crate) art: Option<ArtMosaic>,
+    pub(crate) health: crate::media_watch::MediaHealth,
     caps: Option<MediaCaps>,
     generation: u64,
     watcher_generation: u64,
