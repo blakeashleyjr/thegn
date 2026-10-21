@@ -1,6 +1,230 @@
 use super::*;
 use thegn_core::config::{Config, IssueProviderKind, IssuesConfig};
 
+struct RecordingBackend {
+    account: &'static str,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl thegn_svc::issue::IssueBackend for RecordingBackend {
+    fn provider_id(&self) -> &str {
+        "plugin:demo"
+    }
+
+    fn caps(&self) -> thegn_svc::issue::IssueCaps {
+        thegn_svc::issue::IssueCaps {
+            patch_assignee_me: true,
+            ..Default::default()
+        }
+    }
+
+    fn list_issues<'a>(
+        &'a self,
+        _filter: &'a thegn_core::issue::IssueFilter,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn get_issue<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<thegn_core::issue::IssueDetail, thegn_svc::issue::IssueError>,
+    > {
+        Box::pin(async { Err(thegn_svc::issue::IssueError::Api("unused".into())) })
+    }
+
+    fn create_issue<'a>(
+        &'a self,
+        _draft: &'a thegn_core::issue::IssueDraft,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<thegn_core::issue::Issue, thegn_svc::issue::IssueError>,
+    > {
+        Box::pin(async { Err(thegn_svc::issue::IssueError::Api("unused".into())) })
+    }
+
+    fn update_issue<'a>(
+        &'a self,
+        id: &'a str,
+        _patch: &'a thegn_core::issue::IssuePatch,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<thegn_core::issue::Issue, thegn_svc::issue::IssueError>,
+    > {
+        let account = self.account;
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(account);
+            Ok(thegn_core::issue::Issue {
+                id: id.to_owned(),
+                provider: "plugin:demo".into(),
+                number: "1".into(),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+fn recording_router(
+    accounts: &[&'static str],
+    calls: &std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+) -> thegn_svc::issue::IssueRouter {
+    let mut router = thegn_svc::issue::IssueRouter::from_config(&IssuesConfig::default());
+    for account in accounts {
+        router
+            .push_backend(
+                (*account).into(),
+                Box::new(RecordingBackend {
+                    account: *account,
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+    }
+    router
+}
+
+fn run_self_assign(
+    router: &thegn_svc::issue::IssueRouter,
+    issue: &thegn_core::issue::Issue,
+) -> Result<thegn_core::issue::Issue, thegn_svc::issue::IssueError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(self_assign_issue(router, issue))
+}
+
+#[test]
+fn self_assign_uses_the_rows_account() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work", "home"], &calls);
+    let issue = thegn_core::issue::Issue {
+        id: "plugin:demo:1".into(),
+        provider: "plugin:demo".into(),
+        account: Some("home".into()),
+        ..Default::default()
+    };
+
+    assert!(run_self_assign(&router, &issue).is_ok());
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &["home"]
+    );
+}
+
+#[test]
+fn self_assign_refuses_an_unconfigured_account_without_falling_back() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work", "home"], &calls);
+    let issue = thegn_core::issue::Issue {
+        id: "plugin:demo:1".into(),
+        provider: "plugin:demo".into(),
+        account: Some("gone".into()),
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        run_self_assign(&router, &issue),
+        Err(thegn_svc::issue::IssueError::UnknownAccount { .. })
+    ));
+    assert!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+}
+
+#[test]
+fn self_assign_refuses_invalid_account_reference_without_falling_back() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work", "home"], &calls);
+    let issue = thegn_core::issue::Issue {
+        id: "plugin:demo:1".into(),
+        provider: "plugin:demo\ninvalid".into(),
+        account: Some("home".into()),
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        run_self_assign(&router, &issue),
+        Err(thegn_svc::issue::IssueError::Policy(
+            "issue row has an invalid account reference"
+        ))
+    ));
+    assert!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+}
+
+#[test]
+fn self_assign_legacy_row_without_account_uses_the_sole_backend() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work"], &calls);
+    let issue = thegn_core::issue::Issue {
+        id: "plugin:demo:1".into(),
+        provider: "plugin:demo".into(),
+        ..Default::default()
+    };
+
+    assert!(run_self_assign(&router, &issue).is_ok());
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &["work"]
+    );
+}
+
+#[test]
+fn self_assign_legacy_row_without_account_stays_ambiguous() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work", "home"], &calls);
+    let issue = thegn_core::issue::Issue {
+        id: "plugin:demo:1".into(),
+        provider: "plugin:demo".into(),
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        run_self_assign(&router, &issue),
+        Err(thegn_svc::issue::IssueError::AmbiguousAccount { .. })
+    ));
+    assert!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+}
+
 #[test]
 fn issue_dispatch_prompt_bounds_hostile_tracker_fields_and_keeps_framing() {
     let prompt = issue_dispatch_prompt(
