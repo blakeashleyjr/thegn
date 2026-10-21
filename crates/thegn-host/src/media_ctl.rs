@@ -8,10 +8,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use termwiz::terminal::TerminalWaker;
 
-use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
+use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery, QueueItemLease};
 
 const MAX_PENDING_MEDIA_OPS: usize = 8;
-pub(crate) const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const MEDIA_OP_BUDGET: Duration = thegn_media::MEDIA_OP_BUDGET;
 
 pub(crate) static MEDIA_DELIVERY_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -78,6 +78,7 @@ impl MediaOpOutcome {
             Self::Stale => "Media operation skipped because the player changed",
             Self::Refused("shuffle") => "Media operation needs known shuffle state",
             Self::Refused("loop") => "Media operation needs known loop state",
+            Self::Refused("queue") => "Media queue item needs the current player's state",
             Self::Refused(_) => "Media operation was refused",
             Self::Unsupported => "This player does not support that control",
             Self::Failed => "Media operation failed",
@@ -359,8 +360,8 @@ pub(crate) enum MediaOp {
     /// (audio vs video) and `[media] seek_step*`.
     SeekForward,
     SeekBack,
-    /// Jump to a queue entry by its opaque id.
-    PlayQueueItem(String),
+    /// Jump to a queue entry tied to the player that listed it.
+    PlayQueueItem(QueueItemLease),
     ChapterNext,
     ChapterPrev,
     FullscreenToggle,
@@ -383,6 +384,19 @@ fn op_supported(
         MediaOp::FullscreenToggle => caps.fullscreen,
         MediaOp::PlayPause | MediaOp::Next | MediaOp::Previous => true,
     }
+}
+
+fn queue_lease_check(
+    lease: &QueueItemLease,
+    current: Option<&thegn_core::media::MediaSnapshot>,
+) -> Result<(), MediaOpOutcome> {
+    let Some(snapshot) = current else {
+        return Err(MediaOpOutcome::Refused("queue"));
+    };
+    if snapshot.state.player != lease.player {
+        return Err(MediaOpOutcome::Stale);
+    }
+    Ok(())
 }
 
 /// An async result that opens a secondary media picker palette.
@@ -598,7 +612,18 @@ pub(crate) fn spawn_media_op(
                     let step = cfg.seek_step(kind);
                     Some(client.seek(step, matches!(op, MediaOp::SeekForward)).await)
                 }
-                MediaOp::PlayQueueItem(ref id) => Some(client.play_queue_item(id).await),
+                MediaOp::PlayQueueItem(ref lease) => match queue_lease_check(lease, cur.as_ref()) {
+                    Ok(()) => Some(client.play_queue_item(&lease.id).await),
+                    Err(outcome) => {
+                        tracing::debug!(
+                            target: "thegn::media",
+                            outcome = ?outcome,
+                            "media queue item lease refused"
+                        );
+                        publish_outcome(outcome, &outcome_waker);
+                        None
+                    }
+                },
                 MediaOp::ChapterNext => Some(client.chapter_next().await),
                 MediaOp::ChapterPrev => Some(client.chapter_prev().await),
                 MediaOp::FullscreenToggle => Some(client.toggle_fullscreen().await),
@@ -813,9 +838,10 @@ mod tests {
     use super::{
         Latest, MediaGeneration, MediaOp, MediaOpChain, MediaOpOutcome, MediaOpTail, MediaPick,
         MediaPreflightError, cancel_op_chain, chain_op, chain_op_with_outcome, delivery_from_read,
-        generation_is_current, loop_target, op_supported, pick_palette, record_refusal,
-        replace_in_flight, shuffle_target, take_outcome, within_media_budget,
+        generation_is_current, loop_target, op_supported, pick_palette, queue_lease_check,
+        record_refusal, replace_in_flight, shuffle_target, take_outcome, within_media_budget,
     };
+    use crate::panel::media::QueueItemLease;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState};
@@ -892,9 +918,13 @@ mod tests {
             (MediaOp::VolumeDown, |caps| caps.volume = true),
             (MediaOp::SeekForward, |caps| caps.seek = true),
             (MediaOp::SeekBack, |caps| caps.seek = true),
-            (MediaOp::PlayQueueItem("queue-id".into()), |caps| {
-                caps.queue = true
-            }),
+            (
+                MediaOp::PlayQueueItem(QueueItemLease {
+                    id: "queue-id".into(),
+                    player: "player".into(),
+                }),
+                |caps| caps.queue = true,
+            ),
             (MediaOp::ChapterNext, |caps| caps.chapters = true),
             (MediaOp::ChapterPrev, |caps| caps.chapters = true),
             (MediaOp::FullscreenToggle, |caps| caps.fullscreen = true),
@@ -1060,6 +1090,61 @@ mod tests {
             take_outcome(&outcome),
             Some(MediaOpOutcome::Refused("shuffle"))
         );
+    }
+
+    #[test]
+    fn queue_lease_check_refuses_a_switched_player_as_stale() {
+        let lease = QueueItemLease {
+            id: "q1".into(),
+            player: "spotify".into(),
+        };
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "mpd".into(),
+                ..MediaState::default()
+            },
+            caps: MediaCaps::default(),
+        };
+
+        assert_eq!(
+            queue_lease_check(&lease, Some(&snapshot)),
+            Err(MediaOpOutcome::Stale)
+        );
+    }
+
+    #[test]
+    fn queue_lease_check_refuses_without_a_readable_snapshot() {
+        let lease = QueueItemLease {
+            id: "q1".into(),
+            player: "spotify".into(),
+        };
+
+        assert_eq!(
+            queue_lease_check(&lease, None),
+            Err(MediaOpOutcome::Refused("queue"))
+        );
+        assert!(
+            MediaOpOutcome::Refused("queue")
+                .status_text()
+                .contains("queue")
+        );
+    }
+
+    #[test]
+    fn queue_lease_check_accepts_the_listing_player() {
+        let lease = QueueItemLease {
+            id: "q1".into(),
+            player: "spotify".into(),
+        };
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "spotify".into(),
+                ..MediaState::default()
+            },
+            caps: MediaCaps::default(),
+        };
+
+        assert_eq!(queue_lease_check(&lease, Some(&snapshot)), Ok(()));
     }
 
     #[tokio::test]
@@ -1309,5 +1394,10 @@ mod tests {
 
         assert!(ran.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn media_op_budget_is_the_backend_budget() {
+        assert_eq!(super::MEDIA_OP_BUDGET, thegn_media::MEDIA_OP_BUDGET);
     }
 }

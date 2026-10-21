@@ -16,6 +16,7 @@ struct FakeProvider {
     calls: Calls,
     ready_fails: bool,
     up_fails: bool,
+    up_drift: bool,
 }
 
 impl VpnProvider for FakeProvider {
@@ -37,6 +38,12 @@ impl VpnProvider for FakeProvider {
 
     fn up(&self, _rt: &OciRuntime, container: &str) -> anyhow::Result<Attachment> {
         self.calls.ups.lock().unwrap().push(container.to_string());
+        if self.up_drift {
+            return Err(anyhow::Error::new(thegn_svc::vpn::VpnSidecarDrift {
+                sidecar: container.into(),
+                found: None,
+            }));
+        }
         if self.up_fails {
             anyhow::bail!("partial bring-up failure")
         }
@@ -116,6 +123,7 @@ fn fake(ready_fails: bool) -> FakeProvider {
         calls: Calls::default(),
         ready_fails,
         up_fails: false,
+        up_drift: false,
     }
 }
 
@@ -252,4 +260,25 @@ fn tunnel_only_refusal_precedes_launch_effects() {
         Some(thegn_core::sandbox::EnterError::Refused(refusal))
             if refusal.class == thegn_core::sandbox::RefusalClass::TunnelUnenforced
     ));
+}
+
+#[test]
+fn drifted_sidecar_is_refused_and_not_rolled_back() {
+    let mut spec = vpn_spec(VpnOnError::Fail);
+    let mut provider = fake(false);
+    provider.up_drift = true;
+    let calls = provider.calls.clone();
+    let sidecar = thegn_core::sandbox::vpn_sidecar_name(&spec.name);
+    let rt = OciRuntime::new(vec!["unused-runtime".into()]);
+
+    let result = attach_vpn_with(&mut spec, &provider, &rt, record_removal(&calls));
+
+    assert!(result.is_err());
+    assert_eq!(*calls.ups.lock().unwrap(), vec![sidecar]);
+    assert!(result.as_ref().err().is_some_and(|error| {
+        let message = error.to_string();
+        message.starts_with("vpn: sidecar ") && message.contains("different tunnel configuration")
+    }));
+    assert!(calls.downs.lock().unwrap().is_empty());
+    assert!(calls.removals.lock().unwrap().is_empty());
 }

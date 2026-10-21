@@ -33,8 +33,18 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Total budget (write + every reply line) for a finite command. `idle` is the
 /// one long poll and is exempt from this, but not from the size caps.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Each set_loop stage gets a quarter of the host budget, so the mutation and
+/// its reconciliation finish within half of it, leaving room for host reads.
+const LOOP_STAGE_BUDGET: Duration = match crate::MEDIA_OP_BUDGET.checked_div(4) {
+    Some(duration) => duration,
+    None => Duration::ZERO,
+};
 /// Maximum characters of peer-supplied text echoed into an error.
 const MAX_DIAG_CHARS: usize = 120;
+
+fn remaining(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
 
 /// Peer text made safe for an error or log: control chars replaced, length capped.
 fn sanitize_diag(s: &str) -> String {
@@ -539,16 +549,30 @@ impl Mpd {
         previous: (u8, &str),
         stage: &str,
         cause: MediaError,
+        deadline: tokio::time::Instant,
     ) -> Result<(), MediaError> {
-        let mut conn = match self.conn().await {
+        let connection = match tokio::time::timeout(remaining(deadline), self.conn()).await {
+            Ok(connection) => connection,
+            Err(_) => Err(MediaError::Unavailable("mpd connect timed out".into())),
+        };
+        let mut conn = match connection {
             Ok(conn) => conn,
             Err(error) => {
                 return self
-                    .restore_loop_after_unreadable(previous, stage, error.to_string(), cause)
+                    .restore_loop_after_unreadable(
+                        previous,
+                        stage,
+                        error.to_string(),
+                        cause,
+                        deadline,
+                    )
                     .await;
             }
         };
-        let observed = match conn.command("status").await {
+        let observed = match conn
+            .command_budget("status", Some(remaining(deadline)))
+            .await
+        {
             Ok(status) => parse_loop_status(&status).map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         };
@@ -566,14 +590,24 @@ impl Mpd {
             }
             Ok((repeat, single)) => {
                 if repeat != previous.0 {
-                    conn.command(&format!("repeat {}", previous.0)).await.map_err(|error| {
+                    conn.command_budget(
+                        &format!("repeat {}", previous.0),
+                        Some(remaining(deadline)),
+                    )
+                    .await
+                    .map_err(|error| {
                         MediaError::Backend(format!(
                             "mpd {stage} update failed; loop mode rollback failed: {cause}; {error}"
                         ))
                     })?;
                 }
                 if single != previous.1 {
-                    conn.command(&format!("single {}", previous.1)).await.map_err(|error| {
+                    conn.command_budget(
+                        &format!("single {}", previous.1),
+                        Some(remaining(deadline)),
+                    )
+                    .await
+                    .map_err(|error| {
                         MediaError::Backend(format!(
                             "mpd {stage} update failed; loop mode rollback failed: {cause}; {error}"
                         ))
@@ -584,7 +618,7 @@ impl Mpd {
                 )))
             }
             Err(error) => {
-                self.restore_loop_after_unreadable(previous, stage, error, cause)
+                self.restore_loop_after_unreadable(previous, stage, error, cause, deadline)
                     .await
             }
         }
@@ -596,11 +630,19 @@ impl Mpd {
         stage: &str,
         status_error: String,
         cause: MediaError,
+        deadline: tokio::time::Instant,
     ) -> Result<(), MediaError> {
-        let restore = match self.conn().await {
-            Ok(mut conn) => match conn.command(&format!("repeat {}", previous.0)).await {
+        let connection = match tokio::time::timeout(remaining(deadline), self.conn()).await {
+            Ok(connection) => connection,
+            Err(_) => Err(MediaError::Unavailable("mpd connect timed out".into())),
+        };
+        let restore = match connection {
+            Ok(mut conn) => match conn
+                .command_budget(&format!("repeat {}", previous.0), Some(remaining(deadline)))
+                .await
+            {
                 Ok(_) => conn
-                    .command(&format!("single {}", previous.1))
+                    .command_budget(&format!("single {}", previous.1), Some(remaining(deadline)))
                     .await
                     .map(|_| ()),
                 Err(error) => Err(error),
@@ -754,18 +796,29 @@ impl MediaBackend for Mpd {
     }
     fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + LOOP_STAGE_BUDGET;
             let (repeat, single) = match mode {
                 LoopMode::None => (0, "0"),
                 LoopMode::Playlist => (1, "0"),
                 LoopMode::Track => (1, "1"),
             };
             let (previous, stage, cause) = {
-                let mut c = self.conn().await?;
-                let status = c.command("status").await?;
+                let mut c = tokio::time::timeout(remaining(deadline), self.conn())
+                    .await
+                    .map_err(|_| MediaError::Unavailable("mpd connect timed out".into()))??;
+                let status = c
+                    .command_budget("status", Some(remaining(deadline)))
+                    .await?;
                 let previous = parse_loop_status(&status)?;
-                if let Err(error) = c.command(&format!("repeat {repeat}")).await {
+                if let Err(error) = c
+                    .command_budget(&format!("repeat {repeat}"), Some(remaining(deadline)))
+                    .await
+                {
                     (previous, "repeat", error)
-                } else if let Err(error) = c.command(&format!("single {single}")).await {
+                } else if let Err(error) = c
+                    .command_budget(&format!("single {single}"), Some(remaining(deadline)))
+                    .await
+                {
                     (previous, "single", error)
                 } else {
                     return Ok(());
@@ -776,6 +829,7 @@ impl MediaBackend for Mpd {
                 (previous.0, previous.1.as_str()),
                 stage,
                 cause,
+                tokio::time::Instant::now() + LOOP_STAGE_BUDGET,
             )
             .await
         })
@@ -1540,8 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_loop_rolls_back_on_a_fresh_connection_after_single_timeout() {
-        // COMMAND_TIMEOUT is fixed at ten seconds, so exercising the timeout
-        // path costs ten seconds rather than shortening the production budget.
+        // The stage deadline bounds this timeout path to LOOP_STAGE_BUDGET.
         let (ep, seen) = single_timeout_server().await;
         let m = Mpd {
             ep,
@@ -1752,5 +1805,68 @@ mod tests {
             seen.lock().unwrap().clone(),
             vec!["seekcur +1.500".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn set_loop_single_timeout_rolls_back_inside_the_op_budget() {
+        let (ep, seen) = single_timeout_server().await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let result =
+            tokio::time::timeout(crate::MEDIA_OP_BUDGET, m.set_loop(LoopMode::Track)).await;
+        assert!(
+            result.is_ok(),
+            "set_loop must finish inside MEDIA_OP_BUDGET"
+        );
+        let error = result.unwrap().unwrap_err().to_string();
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(!error.contains("rollback failed"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "single 1".to_string(),
+                "status".to_string(),
+                "repeat 0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_loop_repeat_timeout_rolls_back_inside_the_op_budget() {
+        let (ep, seen) = repeat_timeout_server().await;
+        let m = Mpd {
+            ep,
+            caps: MediaCaps::default(),
+            commands: vec![],
+        };
+        let result =
+            tokio::time::timeout(crate::MEDIA_OP_BUDGET, m.set_loop(LoopMode::Track)).await;
+        assert!(
+            result.is_ok(),
+            "set_loop must finish inside MEDIA_OP_BUDGET"
+        );
+        let error = result.unwrap().unwrap_err().to_string();
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(!error.contains("rollback failed"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "status".to_string(),
+                "repeat 1".to_string(),
+                "status".to_string(),
+                "repeat 0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_stage_budgets_fit_inside_the_op_budget() {
+        assert!(LOOP_STAGE_BUDGET > Duration::ZERO);
+        assert!(LOOP_STAGE_BUDGET * 2 < crate::MEDIA_OP_BUDGET);
     }
 }

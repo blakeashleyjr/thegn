@@ -2737,7 +2737,7 @@ pub(crate) fn spawn_hunk_fetch(
     waker: &TerminalWaker,
     generation: u64,
 ) {
-    if panel_ui.hunks.contains_key(path) {
+    if panel_ui.hunks_banked(path) {
         return;
     }
     let Some(token) = hunk_inflight.begin(path) else {
@@ -2750,16 +2750,20 @@ pub(crate) fn spawn_hunk_fetch(
     tokio::task::spawn_blocking(move || {
         use thegn_svc::git::GitBackend;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let hunks = thegn_svc::git::CliGit
-            .diff_hunks(&loc, "HEAD", &path, 16)
-            .unwrap_or_default();
+        let hunks = match thegn_svc::git::CliGit.diff_hunks(&loc, "HEAD", &path, 16) {
+            Ok(hunks) => Ok(hunks),
+            Err(error) => {
+                tracing::debug!(target: "thegn::panel", path = %path, %error, "hunk preview diff failed");
+                Err(())
+            }
+        };
         if tx.send((generation, token, path, hunks)).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
 
-pub(crate) type HunkMsg = (u64, u64, String, Vec<thegn_svc::git::Hunk>);
+pub(crate) type HunkMsg = (u64, u64, String, Result<Vec<thegn_svc::git::Hunk>, ()>);
 
 type SubmoduleScanMsg = (
     u64,
@@ -6273,7 +6277,7 @@ fn compose_corner(
     let outer = prospective_corner_rect(pin, cols, rows);
     // The corner card sits over the center band, so a focused center pane whose
     // caret lands under it would otherwise blink through the card.
-    crate::caret::cover(outer);
+    crate::caret::cover_corner(outer);
     crate::compositor::compose_pane(scratch, p.emulator(), crate::pins::inset1(outer));
     let border = if focused {
         crate::chrome::col(crate::chrome::S::Focus)
@@ -9194,10 +9198,12 @@ async fn event_loop<T: Terminal>(
         let corner_visible = corner.is_some()
             && corner_kitty
             && !corner_occluded
-            && crate::caret::no_covers()
-            && app_host.active_tile_mut().is_none()
-            && mouse_sel.is_none()
-            && replay.is_none();
+            && !crate::preview_retry::corner_occluded(
+                !crate::caret::no_popup_covers(),
+                app_host.active_tile_mut().is_some(),
+                mouse_sel.is_some(),
+                replay.is_some(),
+            );
         pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
         pending_clipboard_oob.retry(|bytes| writer.try_submit_oob(bytes));
         pending_bell.retry(|bytes| writer.try_submit_oob(bytes));
@@ -9404,7 +9410,7 @@ async fn event_loop<T: Terminal>(
             // The old worktree's hunk previews are meaningless here: drop them and
             // raise the acceptance cutoff so in-flight fetches die on arrival.
             hydration_gen += 1;
-            panel_ui.hunks.clear();
+            panel_ui.clear_hunks();
             hunk_inflight.clear();
             submodule_preview_inflight.clear();
             submodule_scans.reset();
@@ -11274,7 +11280,7 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Hunk);
             let owns_path = hunk_inflight.finish(&path, token);
             if owns_path && generation >= panel_ui.hunks_gen {
-                panel_ui.hunks.insert(path, hunks);
+                panel_ui.bank_hunks(path, hunks);
                 dirty = true;
             }
         }
@@ -11990,7 +11996,7 @@ async fn event_loop<T: Terminal>(
             // clear); the selected row's preview is refetched immediately so
             // an open preview never sticks on stale content.
             if next_model.panel != model.panel {
-                panel_ui.hunks.clear();
+                panel_ui.clear_hunks();
                 hunk_inflight.clear();
                 if let Some(path) = panel_ui.git.staging.as_ref().map(|s| s.path.clone())
                     && let Some(untracked) = gitui::staging_refetch(
@@ -16294,7 +16300,12 @@ async fn event_loop<T: Terminal>(
             // blank the video on occlusion, retaining only the latest complete
             // child update for replay after the overlay clears.
             if corner.is_some() && corner_kitty {
-                let occluded_now = overlays.any();
+                let occluded_now = crate::preview_retry::corner_occluded(
+                    !crate::caret::no_popup_covers(),
+                    app_tile_active,
+                    mouse_sel.is_some(),
+                    replay.is_some(),
+                );
                 if occluded_now && !corner_occluded {
                     pending_corner_oob.require_delete();
                 }
@@ -17635,14 +17646,14 @@ async fn event_loop<T: Terminal>(
                                 // branch/commit/stash than the highlighted one.
                                 panel_ui.sync_section_cursors();
                                 if sec == crate::panel::Section::Media {
-                                    if let Some(item) = panel_ui.media.queue_at(i) {
+                                    if let Some(lease) = panel_ui.media.queue_lease_at(i) {
                                         if current_config.media.enabled {
                                             spawn_media_op(
                                                 media_effective_cfg(
                                                     &current_config.media,
                                                     &media_player_override,
                                                 ),
-                                                MediaOp::PlayQueueItem(item.id.clone()),
+                                                MediaOp::PlayQueueItem(lease),
                                                 &media_generation,
                                                 media_tx.clone(),
                                                 waker.clone(),
@@ -18395,6 +18406,9 @@ async fn event_loop<T: Terminal>(
                     match d.handle_key(&k.key, k.modifiers) {
                         crate::detail::DetailOutcome::Close => bar_detail = None,
                         crate::detail::DetailOutcome::Pending => {}
+                        crate::detail::DetailOutcome::Refused(refusal) => {
+                            model.status = refusal.notice().into();
+                        }
                         // Expanding into the monitor needs the monitor slot and
                         // the saved prefs, which only the loop holds.
                         crate::detail::DetailOutcome::Act(
@@ -22341,15 +22355,15 @@ async fn event_loop<T: Terminal>(
                                                     );
                                                     model.status =
                                                         format!("Media: selected {source}");
-                                                } else if let Some(item) =
-                                                    panel_ui.media.queue_at(panel_ui.cursor)
+                                                } else if let Some(lease) =
+                                                    panel_ui.media.queue_lease_at(panel_ui.cursor)
                                                 {
                                                     spawn_media_op(
                                                         media_effective_cfg(
                                                             &current_config.media,
                                                             &media_player_override,
                                                         ),
-                                                        MediaOp::PlayQueueItem(item.id.clone()),
+                                                        MediaOp::PlayQueueItem(lease),
                                                         &media_generation,
                                                         media_tx.clone(),
                                                         waker.clone(),

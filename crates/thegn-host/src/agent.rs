@@ -1254,6 +1254,11 @@ fn attach_vpn_with<P: VpnProvider>(
     let attach = match provider.up(rt, &sidecar) {
         Ok(attach) => attach,
         Err(e) => {
+            if e.downcast_ref::<thegn_svc::vpn::VpnSidecarDrift>()
+                .is_some()
+            {
+                return apply_vpn_error(spec, on_error, true, e.to_string());
+            }
             rollback_vpn(provider, rt, &sidecar, remove_sidecar);
             return apply_vpn_error(spec, on_error, true, format!("vpn: bring-up failed: {e}"));
         }
@@ -2560,6 +2565,19 @@ pub fn provision_provider_env_named(
         // is dead and nix wastes minutes timing out before falling back to source.
         host_cache_url: (pc.host_cache && crate::bridge_sup::bridge_binary_path().is_some())
             .then(|| format!("http://127.0.0.1:{}", crate::nixcache::SANDBOX_PORT)),
+        host_cache_key: if pc.host_cache && crate::bridge_sup::bridge_binary_path().is_some() {
+            match crate::nix_signing::ensure_install_key() {
+                Ok(key) => Some(key.public),
+                Err(error) => {
+                    thegn_core::msg::warn(&format!(
+                        "host cache: no installation signing key ({error}); the sandbox will not trust the host cache"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        },
         toolchain: cfg.toolchain.clone(),
     };
     let plan = envplan::plan(&req, &opts);
@@ -4461,20 +4479,9 @@ pub(crate) fn credential_overlay_gate(
     }
     if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
         cfg.workspace_overlay_for_tab_slug(db, slug)
+        && thegn_core::workspace_overlay::refusal_carries_credentials(&cfg.workspace, &refusal)
     {
-        let key = match &refusal {
-            thegn_core::workspace_overlay::OverlayRefusal::AliasCollision { key, .. }
-            | thegn_core::workspace_overlay::OverlayRefusal::NonCanonicalKey {
-                canonical: key,
-                ..
-            }
-            | thegn_core::workspace_overlay::OverlayRefusal::AmbiguousRepositories {
-                key, ..
-            } => key,
-        };
-        if thegn_core::workspace_overlay::candidates_carry_credentials(&cfg.workspace, key) {
-            anyhow::bail!("agent launch refused: {refusal}");
-        }
+        anyhow::bail!("agent launch refused: {refusal}");
     }
     Ok(())
 }

@@ -181,6 +181,12 @@ There's deliberately no Google or Outlook integration: both need an OAuth client
 registration and a consent flow, and both hand out a secret `.ics` URL that
 `ics_url` already reads. Fastmail, Nextcloud and Proton do too.
 
+An account `token` is resolved as a secret reference before its request.
+`env:`, `file:` and `keyring:` references are supported; a bare value is used
+literally. An unresolved reference fails that account's sync with an
+authentication error and sends no request. With no token, the request is
+unauthenticated.
+
 Subscribed URLs are re-fetched conditionally, so an unchanged calendar costs one
 `304` and no parsing. CalDAV goes further and asks only for what changed since
 last time, which is how a deletion on the server becomes a deletion here rather
@@ -249,6 +255,14 @@ A `command` account runs any program and reads newline-delimited JSON from its
 stdout. The query arrives in the environment, so a plugin only has to _print_
 JSON — never parse it.
 
+**Trust.** Configure only a program you trust: a `command` account runs it as
+you, with your filesystem, network, and executable authority; thegn does not
+sandbox it. Its environment is limited to a fixed plugin allowlist (PATH, HOME,
+user and locale variables, TZ, TERM, TMPDIR), the account's `env` table, and the
+`THEGN_CAL_*` query variables; host tokens and agent sockets are not passed
+unless you put them in `env`. Git repository variables are removed, and the
+child's process group is killed if it exceeds `timeout_secs`.
+
 ```sh
 #!/bin/sh
 khal list --json "$THEGN_CAL_FROM" "$THEGN_CAL_TO" \
@@ -278,8 +292,9 @@ Each output line is `{"method": "...", "params": {...}}`:
   produced: `snapshot` (the whole window; a `sync_token` may still come back),
   `delta` (changes since the token you were sent), `unchanged`, or `reset`
   (replace the cache even if empty). Omit it and thegn infers the old way.
-- **`manifest`** — declare an id, the API version you speak, and the
-  capabilities you want. Optional, at most once, and before any `events`.
+- **`manifest`** — declare an id, the API version you speak, and capabilities
+  checked against the account's `capabilities` list; a mismatch fails the run.
+  Optional, at most once, and before any `events`.
 - **`log`** — `{level, message}`, routed to thegn's log. Diagnostics go here or
   on stderr; a stray `echo` on stdout is reported as junk rather than silently
   swallowed.
@@ -320,10 +335,11 @@ Everything else is optional: `description`, `location`, `url`, `calendar`,
 ignored, so a plugin written against a newer thegn still works against an older
 one.
 
-Capabilities are `"kind:target"` strings — `"run:khal"`, `"network:example.com"`.
-A plugin that asks for a capability the account didn't grant fails the run.
-A plugin that runs past `timeout_secs` has its whole process group killed, and
-its stderr is kept and surfaced.
+Capabilities are declared metadata as `"kind:target"` strings — `"run:khal"`,
+`"network:example.com"` — compared with the account's list when a manifest
+arrives. They describe intent and do not limit what the process can do. A plugin
+that runs past `timeout_secs` has its whole process group killed, and its stderr
+is kept and surfaced.
 
 ## Related
 

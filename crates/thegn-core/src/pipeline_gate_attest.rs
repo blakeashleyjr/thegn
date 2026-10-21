@@ -4,6 +4,7 @@
 //! boundary. A worker-authored gate: line is only a claim, never an
 //! attestation. This module evaluates supplied values without I/O or clock reads.
 
+use serde::Serialize;
 use std::fmt;
 
 /// Identity of the process that produced gate evidence.
@@ -24,6 +25,46 @@ impl GateRunner {
             Self::HostFoldGate => "host_fold_gate",
             Self::LeadRunner => "lead_runner",
             Self::Worker => "worker",
+        }
+    }
+
+    /// Parse a stable runner identifier.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "host_fold_gate" => Some(Self::HostFoldGate),
+            "lead_runner" => Some(Self::LeadRunner),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+}
+
+/// Result of one trusted gate execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateOutcome {
+    Passed,
+    Failed,
+    Error,
+}
+
+impl GateOutcome {
+    /// Stable database and JSON representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Error => "error",
+        }
+    }
+
+    /// Parse a stable outcome identifier.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "passed" => Some(Self::Passed),
+            "failed" => Some(Self::Failed),
+            "error" => Some(Self::Error),
+            _ => None,
         }
     }
 }
@@ -211,9 +252,29 @@ fn valid_oid(oid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttestationContext, AttestationRefusal, AttestationVerdict, GateAttestation, GateRunner,
-        attestation_satisfies,
+        AttestationContext, AttestationRefusal, AttestationVerdict, GateAttestation, GateOutcome,
+        GateRunner, attestation_satisfies,
     };
+
+    #[test]
+    fn gate_runner_round_trips() {
+        for runner in [
+            GateRunner::HostFoldGate,
+            GateRunner::LeadRunner,
+            GateRunner::Worker,
+        ] {
+            assert_eq!(GateRunner::parse(runner.as_str()), Some(runner));
+        }
+        assert_eq!(GateRunner::parse("unknown"), None);
+    }
+
+    #[test]
+    fn gate_outcome_round_trips() {
+        for outcome in [GateOutcome::Passed, GateOutcome::Failed, GateOutcome::Error] {
+            assert_eq!(GateOutcome::parse(outcome.as_str()), Some(outcome));
+        }
+        assert_eq!(GateOutcome::parse("unknown"), None);
+    }
 
     fn good() -> (GateAttestation, AttestationContext) {
         let att = GateAttestation {

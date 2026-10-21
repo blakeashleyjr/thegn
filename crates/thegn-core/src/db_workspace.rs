@@ -560,10 +560,27 @@ impl WorkspaceStore for Db {
         // A recognized cleanup hold is independent retained branch history,
         // not a live-worktree cache. Generic hydration/reaping must not erase
         // it; explicit queue dismissal still uses remove_merge_entry.
-        self.conn().execute(
-            "DELETE FROM merge_queue WHERE worktree=?1 AND NOT(status='landed' AND error_detail IS ?2)",
+        let deleted = self.conn().execute(
+            "DELETE FROM merge_queue WHERE worktree=?1 AND claim_owner IS NULL \
+             AND NOT(status='landed' AND error_detail IS ?2)",
             params![wt, crate::merge_sweep::CleanupHold::BranchRetained.marker()],
         )?;
+        let claimed = if deleted == 0 {
+            self.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM merge_queue WHERE worktree=?1 AND claim_owner IS NOT NULL)",
+                [wt],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        if claimed {
+            tracing::warn!(
+                target: "thegn::db",
+                worktree = %wt,
+                "kept the merge-queue row of a removed worktree: claimed by an active drain"
+            );
+        }
         Ok(())
     }
 

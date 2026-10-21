@@ -937,6 +937,67 @@ mod tests {
         assert!(crate::pipeline_report::gate_evidence(&report).is_some());
     }
 
+    #[test]
+    fn pipeline_skill_drives_the_lead_lease_and_states_native_concurrency() {
+        let pipeline = EMBEDDED_MANIFEST
+            .iter()
+            .find(|entry| entry.name == "pipeline")
+            .expect("pipeline skill is embedded")
+            .document;
+        let collapsed = pipeline.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for command in [
+            "dispatch lease acquire",
+            "dispatch lease renew",
+            "dispatch lease release",
+        ] {
+            assert!(collapsed.contains(command), "missing {command}");
+        }
+        assert!(collapsed.contains(
+            "dispatch lease renew --name \"$lease_name\" --owner \"$lease_owner\" --ttl 300"
+        ));
+        assert!(collapsed.contains("<repo>:<issue-id>"));
+        assert!(collapsed.contains("--ttl 300"));
+        assert!(collapsed.contains("every 100 seconds"));
+        assert!(collapsed.contains("record the literal name and owner printed above"));
+        assert!(!collapsed.contains("--name lead"));
+        assert!(!collapsed.contains("Nothing in thegn checks this"));
+        assert!(!collapsed.contains("is yours to enforce"));
+        assert!(!collapsed.contains("enforces `concurrency`"));
+
+        let section_one_a = pipeline
+            .find("## 1a. Hold the Lead lease")
+            .expect("lease section exists");
+        let section_one = pipeline
+            .find("## 1. Resume before you dispatch")
+            .expect("resume section exists");
+        assert!(
+            section_one_a < section_one,
+            "lease instructions precede resume"
+        );
+        let resume_section = pipeline[section_one..]
+            .split("## 2.")
+            .next()
+            .expect("resume section is bounded by section 2");
+        assert!(resume_section.contains("thegn dispatch list --active --json"));
+
+        let monitor_section = pipeline
+            .split("## 4. The monitor owns the watch loop")
+            .nth(1)
+            .and_then(|section| section.split("## 5.").next())
+            .expect("monitor section exists");
+        let monitor = monitor_section
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(monitor.contains("--timeout 100000 --json"));
+        assert!(monitor.contains("wait_ms"));
+        assert!(monitor.contains(
+            "dispatch lease renew --name \"$lease_name\" --owner \"$lease_owner\" --ttl 300"
+        ));
+        assert!(!monitor.contains("--timeout 600000"));
+    }
+
     fn source(name: &str) -> SkillSource {
         SkillSource::user(format!("fixture/{name}/SKILL.md"))
     }

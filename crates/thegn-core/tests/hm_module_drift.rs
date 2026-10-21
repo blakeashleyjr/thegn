@@ -150,7 +150,10 @@ const OMITTED: &[(&str, &str)] = &[
         "log.stderr_cap_mb",
         "captured stderr retention is not exposed",
     ),
-    ("sandbox", "blocked on THE-419 safe defaults"),
+    (
+        "sandbox",
+        "only part of [sandbox] is exposed; unset options fall through to core defaults",
+    ),
 ];
 
 fn module_src() -> String {
@@ -158,6 +161,148 @@ fn module_src() -> String {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../nix/hm-module.nix"),
     )
     .expect("nix/hm-module.nix")
+}
+
+fn declared_default(line: &str) -> Option<&str> {
+    line.strip_prefix("default = ")
+        .map(|value| value.strip_suffix(';').unwrap_or(value).trim())
+}
+
+fn strip_null_or(expr: &str) -> &str {
+    let Some(inner) = expr.strip_prefix("lib.types.nullOr ") else {
+        return expr;
+    };
+    let inner = inner.trim();
+    if !inner.starts_with('(') || !inner.ends_with(')') {
+        return inner;
+    }
+    let mut depth = 0usize;
+    for (index, character) in inner.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && index + character.len_utf8() != inner.len() {
+                    return inner;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 {
+        &inner[1..inner.len() - 1]
+    } else {
+        inner
+    }
+}
+
+#[test]
+fn every_value_option_defaults_to_null() {
+    let src = module_src();
+    let item_ranges = [
+        (
+            src.find("  agentSubmodule =")
+                .expect("agentSubmodule declaration"),
+            src.find("  remoteSubmodule =")
+                .expect("remoteSubmodule declaration"),
+        ),
+        (
+            src.find("  actionSubmodule =")
+                .expect("actionSubmodule declaration"),
+            src.find("  tomlFormat =").expect("tomlFormat declaration"),
+        ),
+    ];
+    let mut offenders = Vec::new();
+    let lines: Vec<&str> = src.lines().collect();
+    let mut offset = 0usize;
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim();
+        let Some(name) = trimmed.strip_suffix("= lib.mkOption {") else {
+            offset += line.len() + 1;
+            index += 1;
+            continue;
+        };
+        let name = name.trim();
+        let declaration_offset = offset;
+        let indentation = line.len() - line.trim_start().len();
+        offset += line.len() + 1;
+        index += 1;
+        let mut default = None;
+        while index < lines.len() {
+            let option_line = lines[index];
+            let option_trimmed = option_line.trim();
+            if option_line.len() - option_line.trim_start().len() == indentation
+                && option_trimmed == "};"
+            {
+                offset += option_line.len() + 1;
+                index += 1;
+                break;
+            }
+            if let Some(value) = declared_default(option_trimmed) {
+                default = Some(value);
+            }
+            offset += option_line.len() + 1;
+            index += 1;
+        }
+        let Some(value) = default else {
+            continue;
+        };
+        if value == "null" {
+            continue;
+        }
+        let is_list_item_field = item_ranges
+            .iter()
+            .any(|(start, end)| *start <= declaration_offset && declaration_offset < *end);
+        let is_submodule_container = matches!(name, "package" | "log" | "sandbox")
+            || (name == "remote"
+                && src[..declaration_offset].rfind("sandboxSubmodule =")
+                    > src[..declaration_offset].rfind("remoteSubmodule ="));
+        if !is_list_item_field && !is_submodule_container {
+            offenders.push(format!("{name}: {value}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "value options must default to null (allowed submodule containers and list-item fields excluded): {offenders:?}"
+    );
+}
+
+#[test]
+fn multiline_default_opening_line_is_recorded() {
+    assert_eq!(declared_default("default = ["), Some("["));
+    assert_eq!(declared_default("default = null;"), Some("null"));
+}
+
+#[test]
+fn generate_block_prunes_nulls() {
+    let src = module_src();
+    assert!(
+        src.contains("tomlFormat.generate \"thegn-config.toml\" (pruneEmpty (pruneNulls {"),
+        "generated config must recursively prune null values and empty tables"
+    );
+    assert!(
+        src.contains("pruneNulls = lib.filterAttrsRecursive (_: v: v != null);"),
+        "the recursive prune predicate must remove null values"
+    );
+}
+
+#[test]
+fn generate_block_prunes_empty_tables_for_all_null_defaults() {
+    let src = module_src();
+    assert!(
+        src.contains("pruneEmpty = value:")
+            && src.contains("lib.mapAttrs (_: pruneEmpty) value")
+            && src.contains("lib.filterAttrs (_: v: v != {}) pruned"),
+        "empty attrsets must be recursively pruned after null values"
+    );
+    assert!(
+        src.contains("(pruneEmpty (pruneNulls {")
+            && src.contains("theme.accent = cfg.themeAccent;")
+            && src.contains("remote = {"),
+        "the all-null render must pass its nested config tables through pruneEmpty"
+    );
 }
 
 /// TOML key paths rendered by the `configFile = tomlFormat.generate … { … }`
@@ -184,10 +329,31 @@ fn rendered_paths(src: &str) -> BTreeSet<String> {
     let block = &src[open + 1..end];
     let mut out = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
-    for raw in block.lines() {
-        let line = raw.trim();
+    let lines: Vec<&str> = block.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let mut line = lines[index].trim().to_string();
+        index += 1;
         if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+        // A Nix assignment may put its `if/then/else` expression on the next
+        // lines. Collect through the terminating semicolon before inspecting
+        // map/inherit expressions. These continuation keywords are never
+        // assignments even if their text contains `=` (e.g. `if x == null`).
+        if line.starts_with("if ") || line.starts_with("then ") || line.starts_with("else ") {
+            continue;
+        }
+        if line.ends_with('=') {
+            while index < lines.len() {
+                let continuation = lines[index].trim();
+                line.push(' ');
+                line.push_str(continuation);
+                index += 1;
+                if continuation.ends_with(';') {
+                    break;
+                }
+            }
         }
         let prefix = |k: &str| {
             let mut p = stack.clone();
@@ -215,8 +381,9 @@ fn rendered_paths(src: &str) -> BTreeSet<String> {
             } else {
                 // `a.b = …;` is a nested key; `map (a: { … }) cfg.x` renders
                 // an array of tables whose inner `inherit` names are keys
-                // under `lhs`.
-                if let Some(inner) = rhs.strip_prefix("map (") {
+                // under `lhs`. Guarded maps use `if ... then null else map ...`.
+                if let Some(map_start) = rhs.find("map (") {
+                    let inner = &rhs[map_start + "map (".len()..];
                     if let Some(i) = inner.find("inherit (") {
                         let names = inner[i + "inherit (".len()..]
                             .split_once(')')
@@ -238,6 +405,10 @@ fn rendered_paths(src: &str) -> BTreeSet<String> {
         }
     }
     assert!(out.len() > 20, "generate-block parse broke: {out:?}");
+    assert!(
+        out.contains("agents.name") && out.contains("actions.hint") && out.contains("projects_dir"),
+        "conditional assignments and list item keys must remain visible: {out:?}"
+    );
     out
 }
 
@@ -246,7 +417,14 @@ fn enum_lists(src: &str) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     let lines: Vec<&str> = src.lines().collect();
     for (i, l) in lines.iter().enumerate() {
-        if let Some(rest) = l.trim().strip_prefix("type = lib.types.enum [") {
+        let Some(expr) = l
+            .trim()
+            .strip_prefix("type = ")
+            .map(|expr| expr.trim_end_matches(';'))
+        else {
+            continue;
+        };
+        if let Some(rest) = strip_null_or(expr).strip_prefix("lib.types.enum [") {
             let vals: Vec<String> = rest
                 .split(']')
                 .next()
@@ -284,6 +462,7 @@ fn numeric_options(src: &str) -> Vec<(String, String)> {
         else {
             continue;
         };
+        let expr = strip_null_or(expr);
         if !(expr.starts_with("lib.types.int") || expr == "lib.types.port") {
             continue;
         }

@@ -396,8 +396,8 @@ reminder_default_mins = [10]
 #                           Google, Outlook, Fastmail, Nextcloud and Proton all
 #                           publish these, which is why there is no OAuth here.
 #   provider = "caldav"   — a CalDAV collection. Needs `url`.
-#   provider = "command"  — any program that prints newline-delimited JSON; see
-#                           docs/help/calendar.md for the plugin contract.
+#   provider = "command"  — a trusted program (runs as you) printing
+#                           newline-delimited JSON; see docs/help/calendar.md.
 #
 # Sources are read-only: thegn never writes back to a provider.
 # [[calendar.accounts]]
@@ -407,7 +407,7 @@ reminder_default_mins = [10]
 # enabled = true
 # color = "teal"            # semantic hue name, resolved by the theme (never RGB)
 # refresh_interval_secs = 0 # 0 inherits [calendar]; always floored at 60
-# token = ""                # "env:VAR" / "file:PATH" — note the URL is a secret too
+# token = ""                # "keyring:NAME" / "env:VAR" / "file:PATH" — note the URL is a secret too
 # username = ""             # caldav: Basic-auth user
 # allow_private_network = false # trusted LAN opt-in; ambient proxies are never used
 # read_only = true
@@ -426,8 +426,8 @@ reminder_default_mins = [10]
 # command = ["thegn-cal-khal"]   # argv, not a shell string — no quoting rules
 # cwd = ""
 # timeout_secs = 20              # then the child's process group is killed
-# # What the plugin is allowed to do, as "kind:target". Anything it asks for
-# # beyond this is denied and written to the plugin audit log.
+# # Capabilities the plugin's manifest may declare, as "kind:target". A manifest
+# # declaring one not listed fails the run; this is not a sandbox (runs as you).
 # capabilities = ["run:khal"]
 # [calendar.accounts.env]
 # KHAL_CONFIG = "~/.config/khal/config"
@@ -1482,6 +1482,10 @@ command = "git diff"
 # sandbox_mounts = ["~/datasets:ro", "/opt/toolchain"]
 # Default env bundle for this workspace (see [bundle.*] below):
 # env_bundle = "work"
+# Bind this block to ONE checkout when two repos share a directory name (each
+# gets its own block; a bound block never applies to another checkout, and two
+# blocks may not bind the same path):
+# repo_path = "~/work/my-work-repo"
 
 # ── Environment bundles (AU) ────────────────────────────────────────────────
 # Soft "work vs personal" identities WITHIN one running process — the middle
@@ -3731,11 +3735,11 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #                                 #   (substituter) reachable from the sprite over the
 # #                                 #   reverse tunnel, so in-sprite `nix develop`/`direnv`
 # #                                 #   SUBSTITUTE prebuilt store paths from your host
-# #                                 #   instead of building from source. A general cache
-# #                                 #   over the WHOLE host store. It is unsigned and
-# #                                 #   loopback-tunnel-only; the sandbox keeps Nix signature
-# #                                 #   checks enabled, so this cache is inert until it has a
-# #                                 #   signing key. The host serves it from the thegn process;
+# #                                 #   instead of building from source. It serves only host
+# #                                 #   store paths signed by this installation's key (today
+# #                                 #   the host-parity home closure). The sandbox trusts that
+# #                                 #   key and keeps Nix signature checks enabled. The host
+# #                                 #   serves it from the thegn process;
 # #                                 #   needs a resident-bridge provider (sprites).
 # # push_devshell = false           # Deprecated and ignored: host-side devShell
 # #                                 #   evaluation and closure transfer are disabled.

@@ -675,7 +675,12 @@ fn staging_region(
                         PanelRow::blank(),
                         PanelRow::plain(Line::segs(vec![seg(g2(), "selected file diff")])),
                     ];
-                    if let Some(hunks) = ui.hunks.get(&c.path) {
+                    if ui.hunks_unavailable.contains(&c.path) {
+                        rows.push(PanelRow::plain(Line::segs(vec![seg(
+                            g2(),
+                            "diff unavailable (git failed)",
+                        )])));
+                    } else if let Some(hunks) = ui.hunks.get(&c.path) {
                         for hunk in hunks {
                             rows.push(PanelRow::plain(Line::segs(vec![seg(
                                 hue(Hue::Blue),
@@ -1870,6 +1875,27 @@ mod tests {
             !main_file_row.contains("+5") && !main_file_row.contains("−1"),
             "binary row has no numeric count: {main_file_row}"
         );
+    }
+
+    #[test]
+    fn files_main_region_renders_unavailable_diff_without_spinner() {
+        let m = model();
+        let mut ui = ui(GitView::Files);
+        ui.hunks_unavailable.insert("src/a.rs".into());
+
+        let rows = staging_region(&m.panel, &ui, true, 120, 40);
+        let rendered = rows
+            .iter()
+            .map(|row| text_of(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("diff unavailable (git failed)"),
+            "{rendered}"
+        );
+        // Only the "selected file diff" heading: no "file diff" loading spinner.
+        assert_eq!(rendered.matches("file diff").count(), 1, "{rendered}");
     }
 
     #[test]
