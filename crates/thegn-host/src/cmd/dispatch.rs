@@ -1571,10 +1571,7 @@ fn set_status(
     let result = if db.get_dispatch(id)?.is_none() {
         Err(anyhow::Error::new(thegn_core::db::MissingDispatch { id }))
     } else {
-        match proof {
-            LeadProof::Unbound => set_status_on(&db, id, parsed, force, why, json),
-            _ => set_status_on_led(&db, id, parsed, force, why, proof, json),
-        }
+        set_status_on_led(&db, id, parsed, force, why, proof, json)
     };
     if json
         && let Err(error) = &result
@@ -1680,7 +1677,7 @@ fn set_status_on_led(
                 .reason,
         )
     } else if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
-        db.set_dispatch_status_checked(
+        db.set_dispatch_status_led(
             id,
             row.status,
             parsed,

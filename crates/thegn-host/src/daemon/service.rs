@@ -540,6 +540,12 @@ fn map_dispatch_status_error(error: anyhow::Error) -> ControlError {
             }
         };
     }
+    if error
+        .downcast_ref::<thegn_core::db::LeadLeaseConflict>()
+        .is_some()
+    {
+        return ControlError::FailedPrecondition(error.to_string());
+    }
     if let Some(conflict) = error.downcast_ref::<thegn_core::db::DispatchTransitionConflict>() {
         return match conflict {
             thegn_core::db::DispatchTransitionConflict::Illegal { .. } => {
@@ -5037,6 +5043,37 @@ mod tests {
         assert!(matches!(
             svc.dispatch_set_status(9999, St::Done).await,
             Err(ControlError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_status_bound_row_maps_lease_refusal_to_failed_precondition() {
+        use thegn_core::db::LeadProof;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+
+        let (svc, _rx) = service(0);
+        let row_id = svc
+            .with_db(|db| {
+                db.acquire_pipeline_lease("repo:linear:A-1", "lead-a", 300)?;
+                db.claim_dispatch_admitted_led(
+                    NewDispatch::new("linear:A-1", "/wt/a", "coder"),
+                    20,
+                    None,
+                    None,
+                    None,
+                    LeadProof::Lease {
+                        name: "repo:linear:A-1",
+                        owner: "lead-a",
+                    },
+                )?
+                .map_err(|decision| anyhow::anyhow!("unexpected admission refusal: {decision:?}"))
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            svc.dispatch_set_status(row_id, St::Running).await,
+            Err(ControlError::FailedPrecondition(_))
         ));
     }
 
