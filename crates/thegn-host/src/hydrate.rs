@@ -2128,7 +2128,15 @@ fn collect_sidebar_status(
 
     // Attention scores + hysteresis-stable ranks (pure DB/snapshot reads; the
     // branching lives in core). After the git pass so `dirty` is fresh.
-    crate::attention_status::collect_attention(session, db, &mut status);
+    crate::attention_status::collect_attention_with_ci(
+        session,
+        db,
+        &mut status,
+        &crate::attention_status::CiReader {
+            cfg: &app_cfg.ci,
+            locations: &locations,
+        },
+    );
 
     tracing::debug!(
         target: "thegn::hydrate",
