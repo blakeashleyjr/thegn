@@ -1536,7 +1536,7 @@ fn user_bus_hardened_systemd_pane_hides_the_user_bus() {
     for property in [
         "UnsetEnvironment=DBUS_SESSION_BUS_ADDRESS",
         "InaccessiblePaths=-/run/user/42/bus",
-        "InaccessiblePaths=-/run/user/42/systemd",
+        "InaccessiblePaths=-/run/user/42/systemd/private",
         "InaccessiblePaths=-/run/user/42/thegn",
     ] {
         assert!(

@@ -368,7 +368,9 @@ impl Fixture {
         command
             .envs(state_env_all(self.state.root()))
             .env("XDG_RUNTIME_DIR", self.runtime.path())
-            // Never pass the developer's real bus to a security probe.
+            // Never pass the developer's real bus to a security probe. The
+            // sentinel also reaches fixture daemon and CLI children; a daemon
+            // session-spawn test must account for it because it is unreachable.
             .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL)
             .env_remove("THEGN_LOG")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
