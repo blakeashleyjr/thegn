@@ -273,8 +273,8 @@ fn record_exists_in(root: &thegn_core::fsperm::PrivateDir, name: &str) -> Result
         .map_err(Into::into)
 }
 
-/// Capacity is per provider account. Unknown-account records (legacy or unreadable) count against every account,
-/// and an unstamped reservation counts everything.
+/// Capacity is per provider account. Unknown-account records (legacy or unreadable)
+/// count against every account, and an unstamped reservation counts everything.
 fn occupied_at(
     root: &thegn_core::fsperm::PrivateDir,
     scope: ReserveScope,
