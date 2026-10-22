@@ -702,7 +702,7 @@ def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
             if len(raw) > MAX_TRUSTED_DIGESTS_BYTES:
                 raise ReleaseError(f"release manifest {path} exceeds {MAX_TRUSTED_DIGESTS_BYTES} bytes")
             value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ReleaseError(f"cannot read release manifest {path}: {error}") from error
     finally:
         if descriptor is not None:

@@ -1094,10 +1094,19 @@ class ReleaseAssetManifestTests(unittest.TestCase):
             release.load_release_manifest(path, self.tag)
 
     def test_load_release_manifest_rejects_duplicate_json_key(self) -> None:
-        path = self.temp / "duplicate.json"
-        path.write_text('{"schema_version":1,"schema_version":1}', encoding="utf-8")
-        with self.assertRaisesRegex(release.ReleaseError, str(path)):
+        path = self.write_manifest([self.valid_asset()])
+        content = path.read_text(encoding="utf-8")
+        tag_pair = f'  "tag": "{self.tag}",\n'
+        self.assertIn(tag_pair, content)
+        path.write_text(content.replace(tag_pair, tag_pair + tag_pair, 1), encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "duplicate JSON key"):
             release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_converts_json_recursion_error_to_release_error(self) -> None:
+        path = self.write_manifest([self.valid_asset()])
+        with mock.patch.object(release.json, "loads", side_effect=RecursionError("maximum recursion depth exceeded")):
+            with self.assertRaisesRegex(release.ReleaseError, "cannot read release manifest"):
+                release.load_release_manifest(path, self.tag)
 
     def test_load_release_manifest_rejects_uppercase_or_short_sha256(self) -> None:
         for digest in ("A" * 64, "a" * 63):
@@ -1191,7 +1200,7 @@ class ReleaseAssetManifestTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout):
             release.main(["verify-assets", "--tag", self.tag, "--release-manifest", str(manifest), "--asset", str(asset)])
         self.assertIn(f"{self.asset}: matches the release manifest", stdout.getvalue())
-        asset.write_bytes(b"different bytes")
+        asset.write_bytes(b"package byteX")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
             release.main(["verify-assets", "--tag", self.tag, "--release-manifest", str(manifest), "--asset", str(asset)])

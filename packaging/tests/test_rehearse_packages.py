@@ -136,6 +136,41 @@ class RehearsePackagesTests(unittest.TestCase):
         self.assertIn("does not match the release manifest", stderr.getvalue())
         runner.assert_not_called()
 
+    def test_verified_package_digest_must_match_the_evidence_digest(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse.release, "verify_release_asset_files", return_value={self.deb.name: "0" * 64}):
+            with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+                with contextlib.redirect_stderr(stderr):
+                    result = rehearse.main([
+                        "--deb", str(self.deb), "--release-manifest", str(manifest),
+                        "--runtime", "podman", "--deb-image", "debian:test",
+                        "--evidence-dir", str(self.root / "evidence"),
+                    ])
+        self.assertEqual(2, result)
+        self.assertIn("changed after package validation", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_manifest_changed_during_loading_is_refused(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        original_loader = rehearse.release.load_release_manifest
+
+        def replace_after_loading(path: Path, tag: str):
+            entries = original_loader(path, tag)
+            path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            return entries
+
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse.release, "load_release_manifest", side_effect=replace_after_loading):
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main([
+                    "--deb", str(self.deb), "--release-manifest", str(manifest),
+                    "--runtime", "podman", "--deb-image", "debian:test",
+                    "--evidence-dir", str(self.root / "evidence"),
+                ])
+        self.assertEqual(2, result)
+        self.assertIn("release manifest changed while being verified", stderr.getvalue())
+
     def test_package_size_mismatch_against_the_release_manifest_refuses_before_any_runtime_call(self) -> None:
         manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
         value = json.loads(manifest.read_text(encoding="utf-8"))
@@ -204,11 +239,53 @@ class RehearsePackagesTests(unittest.TestCase):
         manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
         expected = hashlib.sha256(manifest.read_bytes()).hexdigest()
         with mock.patch.object(rehearse, "_run", side_effect=self.successful_runner()):
-            result = rehearse.main(["--deb", str(self.deb), "--release-manifest", str(manifest), "--evidence-dir", str(self.root / "evidence")])
+            result = rehearse.main([
+                "--deb", str(self.deb), "--release-manifest", str(manifest),
+                "--runtime", "podman", "--deb-image", "debian:test",
+                "--evidence-dir", str(self.root / "evidence"),
+            ])
         self.assertEqual(0, result)
         evidence = next((self.root / "evidence").glob("*.json"))
         payload = json.loads(evidence.read_text(encoding="utf-8"))
         self.assertEqual(expected, payload["release_manifest_sha256"])
+
+    def test_previous_package_mismatch_against_the_previous_release_manifest_is_refused(self) -> None:
+        current_manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        previous_manifest = self.write_manifest("0.1.0-alpha.21", [self.previous_deb])
+        value = json.loads(previous_manifest.read_text(encoding="utf-8"))
+        value["assets"][0]["sha256"] = "0" * 64
+        previous_manifest.write_text(json.dumps(value), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main([
+                    "--deb", str(self.deb), "--previous-deb", str(self.previous_deb),
+                    "--release-manifest", str(current_manifest),
+                    "--previous-release-manifest", str(previous_manifest),
+                    "--runtime", "podman", "--deb-image", "debian:test",
+                    "--evidence-dir", str(self.root / "evidence"),
+                ])
+        self.assertEqual(2, result)
+        self.assertIn("does not match the release manifest", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_previous_deb_and_rpm_must_have_the_same_version(self) -> None:
+        current_rpm = self.root / "thegn-0.1.0-alpha.22-1.x86_64.rpm"
+        previous_rpm = self.root / "thegn-0.1.0-alpha.20-1.x86_64.rpm"
+        previous_rpm.write_bytes(b"previous rpm")
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb, current_rpm])
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main([
+                    "--deb", str(self.deb), "--rpm", str(current_rpm),
+                    "--previous-deb", str(self.previous_deb), "--previous-rpm", str(previous_rpm),
+                    "--release-manifest", str(manifest), "--runtime", "podman",
+                    "--deb-image", "debian:test", "--evidence-dir", str(self.root / "evidence"),
+                ])
+        self.assertEqual(2, result)
+        self.assertIn("previous deb and rpm packages must have the same version", stderr.getvalue())
+        runner.assert_not_called()
 
     def test_rejects_a_misnamed_package_before_any_runtime_call(self) -> None:
         bad = self.root / "package.deb"
