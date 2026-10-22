@@ -747,4 +747,276 @@ mod tests {
         assert!(state.take_bell());
         assert!(!state.take_bell());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn reminder_delivery_default_route_records_one_row_and_rings_once() {
+        use std::collections::BTreeMap;
+        use termwiz::terminal::Terminal;
+        use thegn_core::calendar::DueReminder;
+        use thegn_core::store::NotificationStore;
+
+        let mut cfg = NotificationsConfig::default();
+        cfg.sound.min_priority = "info".into();
+        cfg.sound.per_kind = BTreeMap::from([("calendar_reminder".into(), "bell".into())]);
+        let (state, _master, terminal) = test_state(cfg);
+        let waker = terminal.waker();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let r = DueReminder {
+            event_id: "ics:work/e1".into(),
+            title: "standup".into(),
+            location: String::new(),
+            url: String::new(),
+            occurrence_start_ms: 1_800_000_000_000,
+            trigger_mins: 10,
+            starts_in_mins: 10,
+        };
+        let mut delivered = None;
+        let first_claim =
+            crate::handlers::calendar::raise_reminder_on(&db, &r, 5_000, |db, s, m| {
+                delivered = Some(crate::handlers::calendar::deliver_reminder(
+                    db,
+                    Some(&state),
+                    &waker,
+                    s,
+                    m,
+                ));
+            });
+        let rows = db.get_all_notifications(10).unwrap();
+        let first_bell = state.take_bell();
+        assert_eq!(
+            first_claim,
+            crate::handlers::calendar::ReminderClaim::Won,
+            "claim={first_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            matches!(
+                delivered,
+                Some(crate::handlers::calendar::ReminderDelivery::Recorded { .. })
+            ),
+            "claim={first_claim:?}, delivery={delivered:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind.as_str() == "calendar_reminder")
+                .count(),
+            1,
+            "claim={first_claim:?}, delivery={delivered:?}, rows={rows:?}"
+        );
+        assert!(first_bell, "claim={first_claim:?}, delivery={delivered:?}");
+
+        delivered = None;
+        let second_claim =
+            crate::handlers::calendar::raise_reminder_on(&db, &r, 5_001, |db, s, m| {
+                delivered = Some(crate::handlers::calendar::deliver_reminder(
+                    db,
+                    Some(&state),
+                    &waker,
+                    s,
+                    m,
+                ));
+            });
+        let rows = db.get_all_notifications(10).unwrap();
+        let second_bell = state.take_bell();
+        assert_eq!(
+            second_claim,
+            crate::handlers::calendar::ReminderClaim::AlreadyClaimed,
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            delivered.is_none(),
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind.as_str() == "calendar_reminder")
+                .count(),
+            1,
+            "claim={second_claim:?}, delivery={delivered:?}, rows={rows:?}"
+        );
+        assert!(
+            !second_bell,
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reminder_delivery_route_without_inbox_rings_once_and_writes_no_row() {
+        use std::collections::BTreeMap;
+        use termwiz::terminal::Terminal;
+        use thegn_core::calendar::DueReminder;
+        use thegn_core::config::NotificationRule;
+        use thegn_core::store::NotificationStore;
+
+        let mut cfg = NotificationsConfig::default();
+        cfg.sound.min_priority = "info".into();
+        cfg.sound.per_kind = BTreeMap::from([("calendar_reminder".into(), "bell".into())]);
+        cfg.rules.push(NotificationRule {
+            kind: Some("calendar_reminder".into()),
+            route: Some(vec!["sound".into()]),
+            ..Default::default()
+        });
+        let (state, _master, terminal) = test_state(cfg);
+        let waker = terminal.waker();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let r = DueReminder {
+            event_id: "ics:work/e1".into(),
+            title: "standup".into(),
+            location: String::new(),
+            url: String::new(),
+            occurrence_start_ms: 1_800_000_000_000,
+            trigger_mins: 10,
+            starts_in_mins: 10,
+        };
+        let mut delivered = None;
+        let first_claim =
+            crate::handlers::calendar::raise_reminder_on(&db, &r, 5_000, |db, s, m| {
+                delivered = Some(crate::handlers::calendar::deliver_reminder(
+                    db,
+                    Some(&state),
+                    &waker,
+                    s,
+                    m,
+                ));
+            });
+        let rows = db.get_all_notifications(10).unwrap();
+        let first_bell = state.take_bell();
+        assert_eq!(
+            first_claim,
+            crate::handlers::calendar::ReminderClaim::Won,
+            "claim={first_claim:?}, delivery={delivered:?}"
+        );
+        assert_eq!(
+            delivered,
+            Some(crate::handlers::calendar::ReminderDelivery::RoutedWithoutInbox),
+            "claim={first_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            rows.is_empty(),
+            "claim={first_claim:?}, delivery={delivered:?}, rows={rows:?}"
+        );
+        assert!(first_bell, "claim={first_claim:?}, delivery={delivered:?}");
+
+        delivered = None;
+        let second_claim =
+            crate::handlers::calendar::raise_reminder_on(&db, &r, 5_001, |db, s, m| {
+                delivered = Some(crate::handlers::calendar::deliver_reminder(
+                    db,
+                    Some(&state),
+                    &waker,
+                    s,
+                    m,
+                ));
+            });
+        let rows = db.get_all_notifications(10).unwrap();
+        let second_bell = state.take_bell();
+        assert_eq!(
+            second_claim,
+            crate::handlers::calendar::ReminderClaim::AlreadyClaimed,
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            delivered.is_none(),
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            rows.is_empty(),
+            "claim={second_claim:?}, delivery={delivered:?}, rows={rows:?}"
+        );
+        assert!(
+            !second_bell,
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reminder_delivery_drop_rule_consumes_the_claim_and_delivers_nothing() {
+        use std::collections::BTreeMap;
+        use termwiz::terminal::Terminal;
+        use thegn_core::calendar::DueReminder;
+        use thegn_core::config::NotificationRule;
+        use thegn_core::store::NotificationStore;
+
+        let mut cfg = NotificationsConfig::default();
+        cfg.sound.min_priority = "info".into();
+        cfg.sound.per_kind = BTreeMap::from([("calendar_reminder".into(), "bell".into())]);
+        cfg.rules.push(NotificationRule {
+            kind: Some("calendar_reminder".into()),
+            drop: true,
+            ..Default::default()
+        });
+        let (state, _master, terminal) = test_state(cfg);
+        let waker = terminal.waker();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let r = DueReminder {
+            event_id: "ics:work/e1".into(),
+            title: "standup".into(),
+            location: String::new(),
+            url: String::new(),
+            occurrence_start_ms: 1_800_000_000_000,
+            trigger_mins: 10,
+            starts_in_mins: 10,
+        };
+        let mut delivered = None;
+        let first_claim =
+            crate::handlers::calendar::raise_reminder_on(&db, &r, 5_000, |db, s, m| {
+                delivered = Some(crate::handlers::calendar::deliver_reminder(
+                    db,
+                    Some(&state),
+                    &waker,
+                    s,
+                    m,
+                ));
+            });
+        let rows = db.get_all_notifications(10).unwrap();
+        let first_bell = state.take_bell();
+        assert_eq!(
+            first_claim,
+            crate::handlers::calendar::ReminderClaim::Won,
+            "claim={first_claim:?}, delivery={delivered:?}"
+        );
+        assert_eq!(
+            delivered,
+            Some(crate::handlers::calendar::ReminderDelivery::Dropped),
+            "claim={first_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            rows.is_empty(),
+            "claim={first_claim:?}, delivery={delivered:?}, rows={rows:?}"
+        );
+        assert!(!first_bell, "claim={first_claim:?}, delivery={delivered:?}");
+
+        delivered = None;
+        let second_claim =
+            crate::handlers::calendar::raise_reminder_on(&db, &r, 5_001, |db, s, m| {
+                delivered = Some(crate::handlers::calendar::deliver_reminder(
+                    db,
+                    Some(&state),
+                    &waker,
+                    s,
+                    m,
+                ));
+            });
+        let rows = db.get_all_notifications(10).unwrap();
+        let second_bell = state.take_bell();
+        assert_eq!(
+            second_claim,
+            crate::handlers::calendar::ReminderClaim::AlreadyClaimed,
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            delivered.is_none(),
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+        assert!(
+            rows.is_empty(),
+            "claim={second_claim:?}, delivery={delivered:?}, rows={rows:?}"
+        );
+        assert!(
+            !second_bell,
+            "claim={second_claim:?}, delivery={delivered:?}"
+        );
+    }
 }
