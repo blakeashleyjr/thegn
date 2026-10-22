@@ -227,15 +227,16 @@ the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
 Release archives are available on the [releases page][releases] for
 **x86_64 Linux** (GNU or musl) and best-effort **Apple silicon**
 (`aarch64-apple-darwin`). On Linux x86_64, install the GNU or musl archive for
-your system. For example, with GitHub CLI installed, this downloads the GNU
-archive and its checksum for the newest published release:
+your system. For example, with GitHub CLI installed and authenticated
+(`gh auth login`), this downloads the GNU archive and its checksum for the
+newest published release:
 
 ```sh
-TAG="$(gh release list --limit 100 --json tagName --jq '.[0].tagName')"
+TAG="$(gh release list --repo blakeashleyjr/thegn --exclude-drafts --limit 100 --json tagName --jq '.[0].tagName')"
 TARGET=x86_64-unknown-linux-gnu
 ARCHIVE="thegn-${TAG}-${TARGET}.tar.gz"
 CHECKSUM="thegn-${TAG}-${TARGET}.sha256"
-gh release download "$TAG" --pattern "$ARCHIVE" --pattern "$CHECKSUM"
+gh release download "$TAG" --repo blakeashleyjr/thegn --pattern "$ARCHIVE" --pattern "$CHECKSUM"
 sha256sum -c "$CHECKSUM"
 gh attestation verify "$ARCHIVE" --repo blakeashleyjr/thegn
 tar -xzf "$ARCHIVE" thegn
@@ -243,11 +244,16 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 thegn "$HOME/.local/bin/thegn"
 ```
 
-The musl build is statically linked; the GNU build needs the GNU C library.
-The archive contains `thegn` at its root. Put `$HOME/.local/bin` on `PATH` if
-it is not already there. The `.sha256` sidecar checks the archive digest, and
+The musl build is statically linked. The GNU build needs glibc at least as new
+as the `ubuntu-latest` runner used to build it; users on older distributions
+should use the musl archive. The archive contains only `thegn` at its root, so
+run `thegn` (the flake package and `./install.sh` also provide the `tg` alias).
+Put `$HOME/.local/bin` on `PATH` if it is not already there. The `.sha256`
+sidecar checks the archive digest, and
 `gh attestation verify` checks its build provenance. You can also download the
 archive and sidecar in a browser and run the verification commands locally.
+Tarball users must also put `fzf`, `gum`, `yazi`, `delta`, and `gdu` on `PATH`
+for the panes that use them; the flake wraps these tools.
 
 `git` is required at runtime. `gh` and `ssh` are used as needed for GitHub and
 SSH integration where native support has gaps. Diff highlighting is built in;
@@ -443,9 +449,9 @@ subsystems is compiled in but **clamped off** outside the dev channel:
 - voice mode.
 
 Enable them with `THEGN_CHANNEL=dev`, or install the dev build
-(`nix run .#dev` / `nix profile install .#dev`, which lands as `thegn-dev`
-alongside a stable install). `thegn doctor` prints which channel you are on and
-what is clamped.
+(`nix run github:blakeashleyjr/thegn#dev` / `nix profile install
+github:blakeashleyjr/thegn#dev`, which lands as `thegn-dev` alongside a stable
+install). `thegn doctor` prints which channel you are on and what is clamped.
 
 ## Development
 
