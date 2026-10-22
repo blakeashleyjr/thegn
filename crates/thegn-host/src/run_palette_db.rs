@@ -35,7 +35,7 @@ pub(crate) enum PaletteRows {
         items: Vec<PaletteItem>,
         repo_path: String,
     },
-    PickerSeed(Vec<String>, std::collections::HashSet<String>),
+    PickerSeed(Vec<String>, crate::workspace_picker::PickerExclusions),
     LayoutNames(Vec<String>),
 }
 
