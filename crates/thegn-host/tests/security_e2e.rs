@@ -228,13 +228,16 @@ fn required_prerequisites() -> bool {
 
 struct Fixture {
     state: IsolatedState,
+    /// Keep the daemon runtime outside isolated HOME: hardened panes bind HOME
+    /// read-only, and Unix socket connects still work through that bind. In
+    /// production the runtime is under `/run/user/<uid>`, which bwrap does not mount.
     runtime: tempfile::TempDir,
     worktree: tempfile::TempDir,
     captures: tempfile::TempDir,
     _marker_dir: tempfile::TempDir,
     marker: PathBuf,
     socket: PathBuf,
-    _daemon: RunningDaemon,
+    daemon: RunningDaemon,
 }
 
 /// The test launches panes with a private XDG_RUNTIME_DIR that has no user
@@ -282,23 +285,19 @@ fn security_e2e_pane_argv_strips_only_the_cpu_cap() {
         pane_argv_for_isolated_runtime(soft_capped.clone()),
         soft_capped
     );
-    assert_eq!(
-        thegn_core::sandbox_truth::observed(&pane_argv_for_isolated_runtime(soft_capped)),
-        Backend::Bwrap
-    );
 
     let bare = ["bwrap", "--", "sh"].map(str::to_owned).to_vec();
     assert_eq!(pane_argv_for_isolated_runtime(bare.clone()), bare);
-    assert_eq!(
-        thegn_core::sandbox_truth::observed(&pane_argv_for_isolated_runtime(bare)),
-        Backend::Bwrap
-    );
+    // Soft-cap observation is pinned in thegn-core `sandbox_truth_tests`.
 }
 
 impl Fixture {
     fn new() -> Self {
         let state = IsolatedState::new();
-        let runtime = tempfile::tempdir_in(state.root()).expect("private runtime directory");
+        let runtime = tempfile::Builder::new()
+            .prefix("tg-sec-")
+            .tempdir_in("/tmp")
+            .expect("private runtime directory outside isolated HOME");
         let worktree = tempfile::tempdir_in(state.root()).expect("private worktree directory");
         let captures = tempfile::tempdir_in(state.root()).expect("private capture directory");
         let marker_dir = tempfile::tempdir().expect("private host-only marker directory");
@@ -330,6 +329,11 @@ impl Fixture {
         let child = spawn_quiet(&mut daemon_cmd);
         let mut daemon = RunningDaemon { child };
         let socket = wait_for_socket(runtime.path(), &mut daemon);
+        assert!(
+            !socket.starts_with(state.root()),
+            "daemon socket {} must stay outside isolated HOME because hardened panes bind HOME read-only and Unix socket connects still work through that bind",
+            socket.display()
+        );
 
         Self {
             state,
@@ -339,8 +343,24 @@ impl Fixture {
             _marker_dir: marker_dir,
             marker,
             socket,
-            _daemon: daemon,
+            daemon,
         }
+    }
+
+    fn assert_daemon_alive(&mut self, context: &str) {
+        assert!(
+            self.daemon
+                .child
+                .try_wait()
+                .expect("poll isolated daemon")
+                .is_none(),
+            "isolated daemon exited {context}"
+        );
+        assert!(
+            self.socket.exists(),
+            "isolated daemon socket disappeared {context}: {}",
+            self.socket.display()
+        );
     }
 
     fn child_env(&self, command: &mut Command) {
@@ -478,17 +498,10 @@ fn security_e2e_hardened_pane_cannot_stop_daemon() {
     if !required_prerequisites() {
         return;
     }
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let (config_home, _) = fixture.probe_config();
-    let home = shell_quote(
-        fixture
-            .worktree
-            .path()
-            .to_str()
-            .expect("worktree path is UTF-8"),
-    );
     let config_home_env = shell_quote(config_home.to_str().expect("config home path is UTF-8"));
-    let inner = format!("env HOME={home} XDG_CONFIG_HOME={config_home_env} ./thegn daemon stop");
+    let inner = format!("env XDG_CONFIG_HOME={config_home_env} ./thegn daemon stop");
     let host = fixture.host_sessions_with_config("host-stop-control", &config_home);
     fixture.assert_no_sessions(&host);
     let version = fixture.run_pane("version-control", "./thegn --version");
@@ -512,9 +525,17 @@ fn security_e2e_hardened_pane_cannot_stop_daemon() {
         String::from_utf8_lossy(&probe.stderr)
     );
     assert!(
-        probe_output.contains("no thegn pane daemon is running"),
-        "probe failed for an unrelated reason: {probe_output}"
+        !probe_output.contains("stopped ")
+            && !probe_output.contains("shutdown refused for ")
+            && !probe_output.contains("still running after "),
+        "hardened pane reached a daemon listener; these messages are emitted only after a listener is reached: {probe_output}"
     );
+    assert!(
+        probe_output.contains("no thegn pane daemon is running")
+            || probe_output.contains("listener registry could not be read"),
+        "expected the hardened pane's fail-closed daemon refusal (accepted: `no thegn pane daemon is running` when no daemon is reachable, or `listener registry could not be read` when protected state prevents registry access): {probe_output}"
+    );
+    fixture.assert_daemon_alive("after the stop probe");
     let host = fixture.host_sessions_with_config("sessions-after-stop", &config_home);
     fixture.assert_no_sessions(&host);
 }
@@ -524,7 +545,7 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
     if !required_prerequisites() {
         return;
     }
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let (config_home, config_path) = fixture.probe_config();
     let socket = fixture.socket.to_string_lossy();
     let command = format!(
@@ -548,16 +569,9 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
         String::from_utf8_lossy(&version.stdout),
         String::from_utf8_lossy(&version.stderr)
     );
-    let home = shell_quote(
-        fixture
-            .worktree
-            .path()
-            .to_str()
-            .expect("worktree path is UTF-8"),
-    );
     let config_home_env = shell_quote(config_home.to_str().expect("config home path is UTF-8"));
     let inner = format!(
-        "env HOME={home} XDG_CONFIG_HOME={config_home_env} ./thegn session open --agent probe --worktree . --prompt x"
+        "env XDG_CONFIG_HOME={config_home_env} ./thegn session open --agent probe --worktree . --prompt x"
     );
     let probe = fixture.run_pane("open-probe", &inner);
     assert!(
@@ -582,6 +596,7 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
     assert!(!fixture.marker.exists(), "host-only marker was created");
     let host = fixture.host_sessions_with_config("sessions-after-open", &config_home);
     fixture.assert_no_sessions(&host);
+    fixture.assert_daemon_alive("after the open probe");
 }
 
 fn shell_quote(value: &str) -> String {
