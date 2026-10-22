@@ -653,6 +653,8 @@ fn short(sha: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test fixtures seed dispatch rows through the store trait.
+    use thegn_core::store::NotificationStore as _;
     use thegn_core::config_pipeline::Requirement;
     use thegn_core::issue::AgentDispatchStatus;
     use thegn_core::pipeline_approval::Approval;
