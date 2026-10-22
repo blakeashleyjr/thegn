@@ -225,6 +225,7 @@ pub struct FlyProvider {
     spec: FlySpec,
     client: reqwest::Client,
     owner: Option<String>,
+    credential_ref: Option<String>,
     ips: Mutex<HashMap<String, String>>,
 }
 
@@ -234,6 +235,7 @@ impl FlyProvider {
             spec,
             client: crate::provider::provider_http_client(),
             owner: None,
+            credential_ref: None,
             ips: Mutex::new(HashMap::new()),
         }
     }
@@ -249,6 +251,23 @@ impl FlyProvider {
 
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
+    }
+
+    pub fn with_credential_ref(mut self, credential_ref: &str) -> Self {
+        self.credential_ref = Some(credential_ref.to_owned());
+        self
+    }
+
+    pub fn account(&self) -> Result<String> {
+        let Some(credential_ref) = self.credential_ref.as_deref() else {
+            return Ok(String::new());
+        };
+        let authority = crate::provider::authority_key(&self.spec.api_base()?)?;
+        Ok(registry::account_fingerprint(
+            LEDGER_PROVIDER,
+            &authority,
+            credential_ref,
+        ))
     }
 
     async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
@@ -671,6 +690,7 @@ impl RemoteProvider for FlyProvider {
             metadata.insert(crate::vps::CONTROLLER_KEY.into(), controller);
             let admitted = self.spec.admit_static(&metadata)?;
             let name = self.spec.name.clone();
+            let account = self.account()?;
             let body = machines::create_machine_body(
                 &name,
                 &admitted.region,
@@ -691,6 +711,7 @@ impl RemoteProvider for FlyProvider {
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
                 owner: self.owner.clone().unwrap_or_default(),
+                account: account.clone(),
             };
             let cap = self.spec.max_instances();
             let reservation_name = name.clone();
@@ -713,6 +734,9 @@ impl RemoteProvider for FlyProvider {
                     ));
                 }
                 Err(error @ registry::ReserveError::OwnedByOther { .. }) => {
+                    return Err(anyhow!(error));
+                }
+                Err(error @ registry::ReserveError::OtherAccount { .. }) => {
                     return Err(anyhow!(error));
                 }
                 Err(registry::ReserveError::Store(error)) => {
@@ -782,6 +806,7 @@ impl RemoteProvider for FlyProvider {
                 ip: ip.clone(),
                 created_at: thegn_core::util::now(),
                 owner: self.owner.clone().unwrap_or_default(),
+                account,
             })?;
             self.ips.lock().unwrap().insert(name.clone(), ip.clone());
             thegn_core::managed_ssh::record_authorized(
@@ -901,6 +926,7 @@ mod tests {
             ip: "198.51.100.2".into(),
             created_at: 1,
             owner: String::new(),
+            account: String::new(),
         })
         .unwrap();
 
@@ -921,6 +947,7 @@ mod tests {
             ip: "203.0.113.9".into(),
             created_at: 1,
             owner: String::new(),
+            account: String::new(),
         })
         .unwrap();
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1457,6 +1484,7 @@ mod tests {
             ip: "192.0.2.1".into(),
             created_at: 1,
             owner: registry::worktree_owner(b"/worktree/owner-a"),
+            account: String::new(),
         })
         .unwrap();
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
