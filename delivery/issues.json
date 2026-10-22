@@ -364,13 +364,6 @@
       ]
     },
     {
-      "issue": "THE-589",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "confirm-fold-before-land"
-      ]
-    },
-    {
       "issue": "THE-593",
       "project": "Runtime Security & Host Architecture",
       "changes": [
