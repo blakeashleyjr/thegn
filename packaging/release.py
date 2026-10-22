@@ -29,11 +29,13 @@ PACKAGING_DIR = Path(__file__).resolve().parent
 REPOSITORY_ROOT = PACKAGING_DIR.parent
 MANIFEST_PATH = PACKAGING_DIR / "release.json"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+TRUSTED_NAME_RE = re.compile(r"thegn[A-Za-z0-9._+-]*")
 TARGET_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,}")
 PLACEHOLDER_RE = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
 FORBIDDEN_OUTPUT = ("REPLACE_WITH_", "thegn-dev", ".SRCINFO")
 WINDOWS_ERROR = "Windows release lane is not enabled"
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_TRUSTED_DIGESTS_BYTES = 64 * 1024
 RELEASE_MANIFEST_NAME = "thegn-{tag}-manifest.json"
 MAX_MEMBERS = 64
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
@@ -300,6 +302,107 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_trusted_digests(paths: Sequence[Path]) -> dict[str, str]:
+    trusted: dict[str, str] = {}
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, digest in pairs:
+            if name in value:
+                raise ReleaseError(f"trusted digest for {name} given twice")
+            value[name] = digest
+        return value
+
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise ReleaseError(f"cannot inspect trusted digests {path}: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"trusted digests are not a regular file: {path}")
+        if metadata.st_size > MAX_TRUSTED_DIGESTS_BYTES:
+            raise ReleaseError(
+                f"trusted digests {path} exceed {MAX_TRUSTED_DIGESTS_BYTES} bytes"
+            )
+        try:
+            value = json.loads(
+                path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReleaseError(f"cannot read trusted digests {path}: {error}") from error
+        value = _object(value, f"trusted digests in {path}")
+        for name, digest in value.items():
+            if (
+                not isinstance(name, str)
+                or name in {".", ".."}
+                or TRUSTED_NAME_RE.fullmatch(name) is None
+            ):
+                raise ReleaseError(f"invalid trusted digest asset name: {name!r}")
+            if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+                raise ReleaseError(
+                    f"trusted digest for {name} must be lowercase 64-hex SHA-256"
+                )
+            if name in trusted:
+                raise ReleaseError(f"trusted digest for {name} given twice")
+            trusted[name] = digest
+    if not trusted:
+        raise ReleaseError("trusted digests must not be empty")
+    return trusted
+
+
+def require_trusted_digests(
+    assets_dir: Path, names: Iterable[str], trusted: Mapping[str, str]
+) -> None:
+    for name in names:
+        if name not in trusted:
+            raise ReleaseError(f"no trusted digest for {name}")
+        actual = _sha256(assets_dir / name)
+        expected = trusted[name]
+        if actual != expected:
+            raise ReleaseError(
+                f"{name} does not match the producer job's digest: "
+                f"expected {expected}, got {actual}"
+            )
+
+
+def verify_downloaded_assets(
+    manifest: Mapping[str, Any],
+    tag: str,
+    assets_dir: Path,
+    trusted: Mapping[str, str],
+) -> list[str]:
+    required: list[str] = []
+    for target, config in manifest["targets"].items():
+        if config["enabled"]:
+            required.extend(_asset_names(manifest, tag, target))
+    completions_name = f"thegn-{tag}-completions.tar.gz"
+    required.extend((completions_name, f"{completions_name}.sha256"))
+    required = sorted(required)
+
+    found: set[str] = set()
+    try:
+        entries = list(os.scandir(assets_dir))
+    except OSError as error:
+        raise ReleaseError(f"cannot list downloaded assets {assets_dir}: {error}") from error
+    for entry in entries:
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ReleaseError(f"cannot inspect downloaded asset {entry.name}: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"downloaded asset is not a regular file: {entry.name}")
+        found.add(entry.name)
+    missing = sorted(set(required) - found)
+    unexpected = sorted(found - set(required))
+    if missing or unexpected:
+        raise ReleaseError(
+            f"release asset set mismatch; missing: {', '.join(missing) or '(none)'}; "
+            f"unexpected: {', '.join(unexpected) or '(none)'}"
+        )
+    require_trusted_digests(assets_dir, required, trusted)
+    return required
+
+
 def _safe_archive_names(names: Iterable[str], path: Path) -> set[str]:
     normalized: set[str] = set()
     for name in names:
@@ -505,6 +608,7 @@ def build_release_manifest(
     commit: str,
     assets_dir: Path,
     record_path: Path,
+    trusted: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     record_name = f"thegn-{tag}-release.json"
     if record_path.name != record_name or record_path.parent.resolve() != assets_dir.resolve():
@@ -539,6 +643,16 @@ def build_release_manifest(
             f"release asset set mismatch; missing: {', '.join(missing) or '(none)'}; "
             f"unexpected: {', '.join(unexpected) or '(none)'}"
         )
+    if trusted is not None:
+        trusted_missing = sorted(set(expected) - set(trusted))
+        trusted_unexpected = sorted(set(trusted) - set(expected))
+        if trusted_missing or trusted_unexpected:
+            raise ReleaseError(
+                "trusted producer digests do not cover exactly the release asset set; "
+                f"missing: {', '.join(trusted_missing) or '(none)'}; "
+                f"unexpected: {', '.join(trusted_unexpected) or '(none)'}"
+            )
+        require_trusted_digests(assets_dir, expected, trusted)
 
     archive_names: list[str] = []
     for target, config in manifest["targets"].items():
@@ -787,9 +901,24 @@ def _run(args: argparse.Namespace) -> None:
     manifest = load_manifest(manifest_path)
     version = workspace_version(root)
     require_matching_tag(args.tag, version)
+    if args.command == "verify-digests":
+        trusted = load_trusted_digests(args.trusted_digests)
+        names = verify_downloaded_assets(manifest, args.tag, args.assets_dir, trusted)
+        for name in names:
+            print(f"{name}: {_sha256(args.assets_dir / name)}")
+        return
     if args.command == "manifest":
         value = build_release_manifest(
-            manifest, args.tag, args.commit, args.assets_dir, args.record
+            manifest,
+            args.tag,
+            args.commit,
+            args.assets_dir,
+            args.record,
+            trusted=(
+                load_trusted_digests(args.trusted_digests)
+                if args.trusted_digests is not None
+                else None
+            ),
         )
         write_release_manifest(args.output, args.assets_dir, value)
         print(args.output.as_posix())
@@ -830,6 +959,13 @@ def build_parser() -> argparse.ArgumentParser:
     manifest_parser.add_argument("--output", required=True, type=Path)
     manifest_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     manifest_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
+    manifest_parser.add_argument("--trusted-digests", type=Path, action="append")
+    verify_parser = subparsers.add_parser("verify-digests")
+    verify_parser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
+    verify_parser.add_argument("--assets-dir", required=True, type=Path)
+    verify_parser.add_argument("--trusted-digests", required=True, type=Path, action="append")
+    verify_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    verify_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
     return parser
 
 
