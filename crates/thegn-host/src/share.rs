@@ -293,7 +293,7 @@ impl ShareInstance {
             let generation = self.generation;
             let provider = self.provider;
             let spawn = std::thread::Builder::new()
-                .name("tgshare-down".into())
+                .name("thegn-share-dn".into())
                 .spawn(move || {
                     crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                     let event = match thegn_svc::share::serve_down(&td.sidecar, &td.serve) {
@@ -506,7 +506,7 @@ impl ShareSupervisor {
         let t_waker = waker.clone();
         let wt = worktree.to_string();
         std::thread::Builder::new()
-            .name("tgshare".into())
+            .name("thegn-share".into())
             .spawn(move || {
                 // Utility: the user started this share and is watching for its URL.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);

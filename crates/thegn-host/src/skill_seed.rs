@@ -1020,7 +1020,7 @@ pub fn seed_persisted_worktrees(cfg: &Config) {
     }
     let cfg = cfg.clone();
     let _ = std::thread::Builder::new()
-        .name("thegn-skill-seed".into())
+        .name("thegn-skillseed".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             if let Ok(db) = thegn_core::db::Db::open() {

@@ -525,7 +525,7 @@ fn queue_reaper(owner: ReapOwner) -> bool {
     let sender = REAPER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<ReapOwner>();
         std::thread::Builder::new()
-            .name("thegn-gate-reaper".into())
+            .name("thegn-gate-reap".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 while let Ok((mut child, group)) = rx.recv() {

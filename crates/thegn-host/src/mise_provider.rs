@@ -1067,7 +1067,7 @@ fn prewarm_remote(
         .map(|db| approvals_for(Some(db), repo_root.as_path()))
         .unwrap_or_default();
     if std::thread::Builder::new()
-        .name("thegn-toolchain-remote".into())
+        .name("thegn-tc-remote".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             resolve_remote_cache(&cfg, &worktree, &loc, approved);
