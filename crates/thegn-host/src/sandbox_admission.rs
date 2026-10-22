@@ -116,8 +116,6 @@ fn admission_for_decision(
 pub(crate) enum RouteStatus {
     /// The launch carries the opaque admission handle.
     Handle,
-    /// The route passes `sandbox_admission::admit`, but the handle is not carried to the spawn.
-    AdmittedNoHandle,
     /// Some spawns on the route carry the handle, and others do not.
     Partial,
     /// The route has a separate floor or sealed gate outside the handle.
@@ -133,7 +131,6 @@ impl RouteStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Handle => "handle",
-            Self::AdmittedNoHandle => "admitted-no-handle",
             Self::Partial => "partial",
             Self::OwnGate => "own-gate",
             Self::HostCapped => "host-capped",
@@ -165,8 +162,8 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
     LaunchRoute {
         id: "terminal-tabs",
         route: "Standalone terminal tabs",
-        status: RouteStatus::AdmittedNoHandle,
-        path: "panes::terminal_launch_spec admits wrapped, degraded and fallback shells; the handle is not carried",
+        status: RouteStatus::Handle,
+        path: "panes::terminal_launch_spec builds every requested local sandbox, degraded or fallback shell from the admission; explicit host and ssh/mosh terminals are declared host-trust",
         anchor: Some((
             "panes.rs",
             "crate::sandbox_admission::admit(sb, actual, \"terminal\", false, warnings)",
@@ -503,6 +500,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_tabs_route_carries_the_handle() {
+        let route = LAUNCH_ROUTES
+            .iter()
+            .find(|route| route.id == "terminal-tabs")
+            .expect("terminal-tabs route is present");
+        assert_eq!(route.status, RouteStatus::Handle);
+        assert!(route.path.contains("explicit host"));
+        assert!(route.path.contains("ssh/mosh"));
+    }
+
     fn source(file: &str) -> &'static str {
         match file {
             "agent.rs" => include_str!("agent.rs"),
@@ -542,7 +550,7 @@ mod tests {
                             route.id
                         );
                     }
-                    RouteStatus::Handle | RouteStatus::AdmittedNoHandle => assert!(
+                    RouteStatus::Handle => assert!(
                         source(file).contains("sandbox_admission::"),
                         "route {} should call sandbox_admission",
                         route.id
