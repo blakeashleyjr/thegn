@@ -1146,6 +1146,20 @@ pub fn reconcile_rename_intent(root: &Path) -> Result<Option<RenameRecovery>, St
     reconcile_rename_intent_locked(root)
 }
 
+/// Check whether a rename intent journal is present using only a filesystem
+/// stat. This does not run git or acquire the repository mutation lock.
+pub fn rename_intent_pending(root: &Path) -> Result<bool, String> {
+    let path = rename_intent_path(root);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "could not inspect rename intent at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 pub(crate) fn reconcile_rename_intent_locked(
     root: &Path,
 ) -> Result<Option<RenameRecovery>, String> {
@@ -2641,6 +2655,25 @@ mod tests {
         let error = rename(&repo, &repo.join("not-a-worktree"), "main", "x", &cfg).unwrap_err();
         assert!(error.contains("registered"), "{error}");
         assert!(branch_exists(&repo, "main"));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rename_intent_pending_is_a_stat_only_probe() {
+        let repo = temp_repo("rename-intent-pending");
+        assert!(!rename_intent_pending(&repo).unwrap());
+
+        let intent = RenameIntent {
+            version: 1,
+            old_branch: "old".into(),
+            new_branch: "new".into(),
+            old_path: repo.join("wt-old").to_string_lossy().into_owned(),
+            new_path: repo.join("wt-new").to_string_lossy().into_owned(),
+        };
+        write_rename_intent(&repo, &intent).unwrap();
+        assert!(rename_intent_pending(&repo).unwrap());
+
+        assert!(!rename_intent_pending(&repo.join("missing")).unwrap());
         std::fs::remove_dir_all(&repo).unwrap();
     }
 }
