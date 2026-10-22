@@ -1457,6 +1457,126 @@ fn empty_xdg_runtime_dir_uses_run_user_for_systemd_hardening() {
 }
 
 #[test]
+fn user_bus_hardened_bwrap_pane_unsets_the_session_bus_address() {
+    let _env = crate::testenv::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"]);
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.read_only_root = true;
+    sandbox
+        .env
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), "unix:path=/x".into()));
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let unset = argv
+        .windows(2)
+        .position(|pair| pair == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"])
+        .expect("hardened bwrap explicitly unsets the inherited session bus");
+    let end = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("bwrap argv has a command separator");
+    assert!(
+        unset < end,
+        "bus address is unset before the pane command: {argv:?}"
+    );
+    assert!(
+        !argv[unset + 2..end].iter().any(|arg| arg == "--setenv"),
+        "unset follows every explicit setenv: {argv:?}"
+    );
+    assert!(
+        argv.windows(3)
+            .any(|triple| { triple == ["--setenv", "DBUS_SESSION_BUS_ADDRESS", "unix:path=/x"] }),
+        "fixture proves an explicit bus passthrough precedes the unset: {argv:?}"
+    );
+}
+
+#[test]
+fn user_bus_open_bwrap_pane_keeps_the_session_bus_address() {
+    // Positive control: absence of an unset is already true at the frozen base.
+    let sandbox = spec(Backend::Bwrap);
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]),
+        "open bwrap panes keep the session bus address: {argv:?}"
+    );
+}
+
+#[test]
+fn user_bus_hardened_systemd_pane_hides_the_user_bus() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for property in [
+        "UnsetEnvironment=DBUS_SESSION_BUS_ADDRESS",
+        "InaccessiblePaths=-/run/user/42/bus",
+        "InaccessiblePaths=-/run/user/42/systemd",
+        "InaccessiblePaths=-/run/user/42/thegn",
+    ] {
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "-p" && pair[1] == property),
+            "hardened systemd pane includes -p {property}: {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn user_bus_systemd_run_user_fallback_adds_no_bus_paths() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2).any(|pair| {
+            pair[0] == "-p" && pair[1] == "UnsetEnvironment=DBUS_SESSION_BUS_ADDRESS"
+        }),
+        "fallback systemd panes still unset the inherited bus address: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| {
+            arg == "InaccessiblePaths=-/run/user/bus"
+                || arg == "InaccessiblePaths=-/run/user/systemd"
+        }),
+        "fallback runtime is already inaccessible as a whole: {argv:?}"
+    );
+}
+
+#[test]
 fn canonical_mount_sources_preserve_visible_destinations_for_every_backend_family() {
     #[cfg(unix)]
     {
