@@ -1944,7 +1944,9 @@ pub(crate) fn verify_v93_schema(conn: &Connection) -> Result<()> {
         .query_map([], |row| row.get::<_, String>(2))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if columns.iter().map(String::as_str).collect::<Vec<_>>() != ["dispatched_at_ms", "id"] {
-        bail!("schema v93 index idx_agent_dispatches_dispatched has unexpected columns");
+        bail!(
+            "schema v93 index idx_agent_dispatches_dispatched has columns {columns:?}, expected [\"dispatched_at_ms\", \"id\"]; drop or rename the colliding index"
+        );
     }
     Ok(())
 }
@@ -2990,7 +2992,11 @@ mod tests {
              CREATE INDEX idx_agent_dispatches_dispatched ON agent_dispatches(id);",
         )
         .unwrap();
-        assert!(super::verify_v93_schema(&conn).is_err());
+        let error = super::verify_v93_schema(&conn).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "schema v93 index idx_agent_dispatches_dispatched has columns [\"id\"], expected [\"dispatched_at_ms\", \"id\"]; drop or rename the colliding index"
+        );
     }
 
     #[test]
