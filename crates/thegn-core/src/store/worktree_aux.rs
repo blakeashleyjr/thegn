@@ -492,6 +492,12 @@ pub trait WorktreeAuxStore {
         own_head: &str,
     ) -> Result<bool>;
 
+    /// Clear a PR-agent claim whose lease expired, fenced on the observed
+    /// generation. An `agent_running` row becomes `watching` with `detail`; any
+    /// other status is kept. Returns false when the claim is live, already
+    /// cleared, or belongs to another generation.
+    fn reap_expired_pr_agent(&self, key: &str, generation: i64, detail: &str) -> Result<bool>;
+
     /// Atomically reserve the one automatic CI rerun for `head`. The
     /// `expected_head` fence prevents a stale driver from reverting a newer
     /// observed head. Returns true only for the worker that reserved it.
