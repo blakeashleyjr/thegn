@@ -2178,13 +2178,16 @@ fn share_provider_seam_is_sealed_and_claims_no_plugins() {
 #[test]
 fn bore_extra_args_secret_flags_are_refused() {
     let cases = [
-        vec!["--secret".to_owned(), "canary-325x".to_owned()],
-        vec!["--secret=canary-325x".to_owned()],
-        vec!["-s".to_owned(), "canary-325x".to_owned()],
-        vec!["-scanary-325x".to_owned()],
+        (
+            vec!["--secret".to_owned(), "canary-325x".to_owned()],
+            "--secret",
+        ),
+        (vec!["--secret=canary-325x".to_owned()], "--secret"),
+        (vec!["-s".to_owned(), "canary-325x".to_owned()], "-s"),
+        (vec!["-scanary-325x".to_owned()], "-s"),
     ];
 
-    for extra_args in cases {
+    for (extra_args, flag) in cases {
         let spec = spec_with(
             BoreConfig {
                 extra_args,
@@ -2197,7 +2200,7 @@ fn bore_extra_args_secret_flags_are_refused() {
             Ok(_) => panic!("bore secret flags in extra_args must be refused"),
         };
         let message = format!("{error:#}");
-        assert!(message.contains("secret"), "refusal identifies secret flag");
+        assert!(message.contains(flag), "refusal identifies {flag} flag");
         assert!(
             !message.contains("canary-325x"),
             "refusal never exposes the secret value"

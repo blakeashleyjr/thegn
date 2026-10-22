@@ -57,8 +57,9 @@ Each share provider has a different credential channel and limit:
 - iroh has no shared secret: its printed ticket is the capability, and anyone
   holding it can connect.
 
-Clients start with a minimal environment that omits HOME, D-Bus, and unrelated
-provider credentials. Literal `secret` or `token` values in `config.toml` are
+Clients start with a minimal environment that omits HOME, D-Bus, `IROH_SECRET`
+and provider credentials (other than the client's own channel above). Literal
+`secret` or `token` values in `config.toml` are
 stored in plain text; move them to `"env:NAME"` or `"file:PATH"`. Move any bore
 secret passed through `extra_args` to `[share.bore] secret` instead.
 
