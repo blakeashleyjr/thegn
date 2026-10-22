@@ -4802,7 +4802,7 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
             let (provenance, provenance_reason) = match &res {
                 Resolution::Managed { .. } => {
                     let status = crate::managed_tool::installed_provenance(&tool);
-                    (status.as_str(), status.reason())
+                    (status.as_str(), status.reason().map(str::to_owned))
                 }
                 _ => ("external", None),
             };
