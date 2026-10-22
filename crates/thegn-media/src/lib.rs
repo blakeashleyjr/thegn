@@ -53,6 +53,9 @@ mod applescript_parse;
 mod mediaremote_parse;
 #[cfg(any(windows, test))]
 mod smtc_decode;
+// The SMTC operation worker is pure so it is unit-tested on Linux.
+#[cfg(any(windows, test))]
+mod smtc_worker;
 
 use std::future::Future;
 use std::pin::Pin;
