@@ -980,17 +980,11 @@ jobs:
             echo "::error::release manifest attestation did not verify"
             exit 1
           fi
-          if [ "$(jq -r '.tag' "$manifest")" != "$TAG" ]; then
-            echo "::error::release manifest tag does not match"
-            exit 1
-          fi
           formula="thegn-$TAG-homebrew.rb"
-          manifest_sha="$(jq -r --arg n "$formula" \
-            '[.assets[] | select(.name == $n) | .sha256] | if length == 1 then .[0] else "" end' \
-            "$manifest")"
-          if [[ ! "$manifest_sha" =~ ^[a-f0-9]{64}$ ]] \
-            || [ "$(sha256sum "$publish_root/metadata/$formula" | cut -d ' ' -f 1)" != "$manifest_sha" ]; then
-            echo "::error::$formula does not match the release manifest"
+          if ! python3 packaging/release.py verify-assets --tag "$TAG" \
+            --release-manifest "$manifest" --asset "$publish_root/metadata/$formula"; then
+            echo "::error::$formula does not match the release manifest" \
+              "(release.py verify-assets refused; see its message above)"
             exit 1
           fi
       - name: Materialize Homebrew deploy key
@@ -1209,17 +1203,11 @@ jobs:
             echo "::error::release manifest attestation did not verify"
             exit 1
           fi
-          if [ "$(jq -r '.tag' "$manifest")" != "$TAG" ]; then
-            echo "::error::release manifest tag does not match"
-            exit 1
-          fi
           pkgbuild="thegn-$TAG-PKGBUILD"
-          manifest_sha="$(jq -r --arg n "$pkgbuild" \
-            '[.assets[] | select(.name == $n) | .sha256] | if length == 1 then .[0] else "" end' \
-            "$manifest")"
-          if [[ ! "$manifest_sha" =~ ^[a-f0-9]{64}$ ]] \
-            || [ "$(sha256sum "$publish_root/metadata/$pkgbuild" | cut -d ' ' -f 1)" != "$manifest_sha" ]; then
-            echo "::error::$pkgbuild does not match the release manifest"
+          if ! python3 packaging/release.py verify-assets --tag "$TAG" \
+            --release-manifest "$manifest" --asset "$publish_root/metadata/$pkgbuild"; then
+            echo "::error::$pkgbuild does not match the release manifest" \
+              "(release.py verify-assets refused; see its message above)"
             exit 1
           fi
           artifact_sha="$(sha256sum "$RUNNER_TEMP/aur-metadata/PKGBUILD" | cut -d ' ' -f 1)"
