@@ -414,7 +414,6 @@
           "type": "boolean"
         },
         "warnings": {
-          "default": [],
           "description": "Provider-fill problems with the run detail (unavailable, incomplete job list, unlisted job); empty on cache hits.",
           "items": {
             "type": "string"
