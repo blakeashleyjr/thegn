@@ -179,6 +179,9 @@ else. A week is how long you have to notice.
   Sweep results appear in the status line; an empty startup sweep is silent.
   **Sweep merged** from the palette reports `merge queue: nothing to sweep`
   when there is nothing to do.
+  After an in-app drain or panel land, worktree cleanup results appear as
+  toasts. `thegn merge drain` prints them in its warnings, including in the
+  `--json` `warnings` array.
 
 Set `merged_ttl_secs = 0` to keep merged worktrees indefinitely (the same
 as `on_landed = "move"`), or `on_landed = "remove"` to delete immediately

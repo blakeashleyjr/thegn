@@ -376,6 +376,10 @@ thegn keys hints --zone sidebar   # what that zone's hint strip renders
 For GitLab CI, the `thegn doctor` probe reports whether a configured
 `[ci.gitlab]` token resolved, without printing the token value.
 
+`thegn config show`, `get` and `explain` mask secret-named values and calendar
+account URLs, usernames, environment values and command arguments after the
+program as `***redacted***`. The MCP config view uses the same redaction.
+
 Some provider `kind` values are **reserved**: the name is accepted so a
 config stays forward-compatible (for example `[ci] provider = "drone"`,
 `[[forges]] kind = "forgejo"`, `[media] backend = "jellyfin"`), but this build
