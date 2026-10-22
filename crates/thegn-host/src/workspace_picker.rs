@@ -447,7 +447,7 @@ impl WorkspacePicker {
         let generation = DISCOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        self.result_tx = tx.clone();
+        self.result_tx = tx;
         self.result_rx = rx;
         self.generation = generation;
         self.cancel = Some(cancel.clone());
@@ -461,7 +461,7 @@ impl WorkspacePicker {
             Some(waker.clone()),
         ) {
             self.deferred_discovery = None;
-            self.start_scan(cfg, waker, slot);
+            self.start_scan(cfg, waker, slot, cancel);
         } else {
             self.deferred_discovery = Some((cfg, waker));
         }
@@ -472,13 +472,9 @@ impl WorkspacePicker {
         cfg: thegn_core::config::Config,
         waker: TerminalWaker,
         slot: DiscoverySlot,
+        cancel: Arc<AtomicBool>,
     ) {
         let generation = self.generation;
-        let cancel = self
-            .cancel
-            .as_ref()
-            .expect("scan generation has cancellation flag")
-            .clone();
         let tx = self.result_tx.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
@@ -532,11 +528,12 @@ impl WorkspacePicker {
             .as_ref()
             .map(|(_, waker)| waker.clone());
         let started = if let Some(waker) = deferred_waker
+            && let Some(cancel) = self.cancel.clone()
             && let Some(slot) =
                 try_acquire_slot(&self.live_workers, MAX_LIVE_DISCOVERY_WORKERS, Some(waker))
             && let Some((cfg, waker)) = self.deferred_discovery.take()
         {
-            self.start_scan(cfg, waker, slot);
+            self.start_scan(cfg, waker, slot, cancel);
             true
         } else {
             false
@@ -1834,5 +1831,36 @@ mod tests {
 
         assert!(p.deferred_discovery.is_none());
         assert!(!p.scanning);
+    }
+
+    #[test]
+    fn deferred_scan_waits_when_its_cancel_flag_is_missing() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let mut p = picker(&["/r/a"]);
+        p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
+        let cfg = thegn_core::config::Config {
+            repo_roots: Vec::new(),
+            ..thegn_core::config::Config::default()
+        };
+        p.spawn_discovery(cfg, waker);
+        p.cancel = None;
+        p.live_workers
+            .store(MAX_LIVE_DISCOVERY_WORKERS - 1, Ordering::SeqCst);
+
+        let drained =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.drain_discovery()));
+        assert!(
+            matches!(drained, Ok(false)),
+            "a deferred scan without a cancel flag must remain idle"
+        );
+        assert!(p.deferred_discovery.is_some());
+        assert_eq!(
+            p.live_workers.load(Ordering::SeqCst),
+            MAX_LIVE_DISCOVERY_WORKERS - 1
+        );
     }
 }
