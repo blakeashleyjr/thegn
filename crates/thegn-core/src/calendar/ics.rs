@@ -63,6 +63,8 @@ pub enum IcsDiagnostic {
     NestedEvent,
     EventWithoutStart,
     InvalidEvent,
+    /// An event the shared admission validator refused; value-free: the defect category only.
+    RejectedEvent(super::validate::EventDefect),
     DuplicateProperty(&'static str),
     Truncated,
     MissingEnvelope,
@@ -1593,7 +1595,8 @@ impl Builder {
             report.record(IcsDiagnostic::InvalidRecurrenceValue(error));
             return None;
         }
-        if validate_event(&e).is_err() {
+        if let Err(defect) = validate_event(&e) {
+            report.record(IcsDiagnostic::RejectedEvent(defect));
             return None;
         }
         Some(e)
