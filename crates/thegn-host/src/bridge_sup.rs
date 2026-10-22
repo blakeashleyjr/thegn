@@ -290,9 +290,14 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
 }
 
 fn ssh_self_bridge(control_prefix: &[String]) -> bool {
-    control_prefix.len() == 4
+    let thegn_self_bridge = control_prefix.len() == 4
         && matches!(control_prefix[1].as_str(), "vps-ssh" | "machine0-ssh")
-        && control_prefix[3] == "--"
+        && control_prefix[3] == "--";
+    let ssh_program_prefix = control_prefix.len() >= 2
+        && std::path::Path::new(&control_prefix[0]).file_name()
+            == Some(std::ffi::OsStr::new("ssh"));
+
+    thegn_self_bridge || ssh_program_prefix
 }
 
 fn provider_bridge_argv(control_prefix: &[String], bridge: &ResidentBridge) -> Option<Vec<String>> {
@@ -311,9 +316,10 @@ fn provider_bridge_argv(control_prefix: &[String], bridge: &ResidentBridge) -> O
 
 /// Build the transport command that runs `thegn bridge` *inside* the env for a
 /// placement, or `None` when no bridge applies (local / k8s-for-now). Provider
-/// launches re-hash the resident bridge before exec; ssh self-bridges receive
-/// that wrapper as one shell-quoted word. The agent reads framed requests on
-/// stdin and writes responses/notifications on stdout.
+/// launches re-hash the resident bridge before exec; ssh transports (thegn's
+/// self-bridges and a configured `ssh` `exec_command`) receive that wrapper as
+/// one shell-quoted word. The agent reads framed requests on stdin and writes
+/// responses/notifications on stdout.
 pub fn bridge_command(placement: &Placement, bridge: Option<&ResidentBridge>) -> Option<Command> {
     match placement {
         Placement::Ssh(t) => {
@@ -793,6 +799,91 @@ mod tests {
             assert_eq!(argv.len(), 5);
             assert_eq!(&argv[..4], prefix.as_slice());
             assert_eq!(argv.last(), Some(&thegn_core::util::sh_join(&verified)));
+        }
+    }
+
+    #[test]
+    fn provider_bridge_ssh_exec_command_gets_one_quoted_word() {
+        let bridge = resident_bridge_for(b"provider bridge");
+        let verified = verified_exec_argv(&bridge, &["bridge".to_string()]);
+        let prefixes: [Vec<String>; 3] = [
+            vec!["ssh".into(), "box".into(), "--".into()],
+            vec![
+                "/usr/bin/ssh".into(),
+                "-p".into(),
+                "2222".into(),
+                "u@h".into(),
+                "--".into(),
+            ],
+            vec![
+                "ssh".into(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "box".into(),
+            ],
+        ];
+
+        for prefix in prefixes {
+            let argv = provider_bridge_argv(&prefix, &bridge).expect("ssh provider argv");
+
+            assert_eq!(argv.len(), prefix.len() + 1);
+            assert_eq!(&argv[..prefix.len()], prefix.as_slice());
+            assert_eq!(argv.last(), Some(&thegn_core::util::sh_join(&verified)));
+        }
+    }
+
+    #[test]
+    fn provider_bridge_ssh_exec_command_builds_an_ssh_command() {
+        let bridge = resident_bridge_for(b"provider bridge");
+        let verified = verified_exec_argv(&bridge, &["bridge".to_string()]);
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "custom".into(),
+            id: "box".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec!["ssh".into(), "box".into(), "--".into()],
+            up_command: vec![],
+            down_command: vec![],
+        });
+
+        let command = bridge_command(&provider, Some(&bridge)).expect("provider command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("ssh"));
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "box");
+        assert_eq!(args[1], "--");
+        assert_eq!(args[2], thegn_core::util::sh_join(&verified));
+    }
+
+    #[test]
+    // positive control: only a program exactly named ssh is shell-joined.
+    fn provider_bridge_ssh_exec_lookalikes_keep_separate_args() {
+        let bridge = resident_bridge_for(b"provider bridge");
+        let verified = verified_exec_argv(&bridge, &["bridge".to_string()]);
+        let prefixes: [Vec<String>; 7] = [
+            vec!["daytona".into(), "ssh".into(), "box".into(), "--".into()],
+            vec!["autossh".into(), "box".into(), "--".into()],
+            vec!["ssh-wrapper".into(), "box".into(), "--".into()],
+            vec!["sshpass".into(), "box".into(), "--".into()],
+            vec!["/opt/sshd".into(), "box".into()],
+            vec![
+                "sprite".into(),
+                "exec".into(),
+                "-s".into(),
+                "s1".into(),
+                "--".into(),
+            ],
+            vec!["ssh".into()],
+        ];
+
+        for prefix in prefixes {
+            let mut expected = prefix.clone();
+            expected.extend(verified.clone());
+
+            assert_eq!(provider_bridge_argv(&prefix, &bridge), Some(expected));
         }
     }
 
