@@ -459,6 +459,35 @@ pub(crate) fn context_row_current(cached_context: &str, current_context: Option<
     }
 }
 
+/// Resolve CI context for cache readers without running git on remote/provider
+/// worktrees. Local origins are served by the memoised origin reader.
+pub(crate) fn reader_cache_context(
+    loc: &thegn_core::remote::GitLoc,
+    cfg: &thegn_core::config::CiConfig,
+) -> Option<String> {
+    if loc.is_remote() {
+        None
+    } else {
+        thegn_svc::ci::cache_context(loc, cfg)
+    }
+}
+
+/// Decode cached runs and withhold them when a known current provider context
+/// differs from the one that produced the cache row.
+pub(crate) fn cached_runs_for_reader(
+    json: &str,
+    current_context: Option<&str>,
+) -> Result<Option<thegn_core::ci::CiRunCache>, String> {
+    let Some(cache) = thegn_core::ci::decode_run_cache(json) else {
+        return Ok(None);
+    };
+    if let Some(note) = thegn_core::ci::foreign_context_note(&cache.context, current_context) {
+        Err(note)
+    } else {
+        Ok(Some(cache))
+    }
+}
+
 pub(crate) fn logs_need_purge(old: Option<&str>, new: Option<&str>) -> bool {
     matches!((old, new), (Some(old), Some(new)) if old != new)
 }
@@ -537,8 +566,8 @@ fn cached_ci_row_is_current(
     };
     cached.is_some_and(|(json, branch, fetched_at)| {
         let age_is_fresh = ci_cache_is_fresh(Some(*fetched_at), now, cfg.ttl_secs);
-        let current_context = if age_is_fresh && !loc.is_remote() {
-            thegn_svc::ci::cache_context(loc, cfg)
+        let current_context = if age_is_fresh {
+            reader_cache_context(loc, cfg)
         } else {
             None
         };
@@ -1909,6 +1938,66 @@ mod tests {
             cached.as_ref(),
             thegn_core::util::now()
         ));
+    }
+
+    #[test]
+    fn reader_runs_from_another_provider_context_are_withheld() {
+        let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
+            context: "github:github.com/o/a".into(),
+            runs: vec![thegn_core::ci::CiRun::default()],
+            ..Default::default()
+        })
+        .expect("encode cached run");
+
+        let foreign = cached_runs_for_reader(&json, Some("github:github.com/o/b"));
+        assert!(matches!(
+            foreign,
+            Err(ref note) if note.contains("github:github.com/o/a")
+        ));
+        let equal = cached_runs_for_reader(&json, Some("github:github.com/o/a"));
+        assert!(matches!(equal, Ok(Some(cache)) if cache.runs.len() == 1));
+        let unknown = cached_runs_for_reader(&json, None);
+        assert!(matches!(unknown, Ok(Some(cache)) if cache.runs.len() == 1));
+        assert!(matches!(cached_runs_for_reader("not json", None), Ok(None)));
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: initialize an isolated Git repository"
+    )]
+    #[test]
+    fn reader_cache_context_reads_the_local_origin_only() {
+        let temp = private_tempdir();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir(&worktree).expect("create fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["init", "-q", "-b", "topic"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("initialize fixture repo");
+        assert!(status.success(), "git init failed for fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["remote", "add", "origin", "https://github.com/o/b.git"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("add fixture origin");
+        assert!(status.success(), "adding fixture origin failed");
+
+        let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
+        assert_eq!(
+            reader_cache_context(&loc, &thegn_core::config::CiConfig::default()).as_deref(),
+            Some("github:github.com/o/b")
+        );
+        assert_eq!(
+            reader_cache_context(
+                &loc,
+                &thegn_core::config::CiConfig {
+                    provider: thegn_core::config_ci::CiProviderKind::None,
+                    ..Default::default()
+                }
+            ),
+            None
+        );
     }
 
     #[test]
