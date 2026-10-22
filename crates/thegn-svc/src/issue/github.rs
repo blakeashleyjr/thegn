@@ -464,6 +464,8 @@ impl IssueBackend for GitHubIssuesBackend {
             Ok(IssueDetail {
                 issue: gh_issue_to_domain_with_host(detail.issue, expected_host.as_deref())?,
                 comments,
+                // gh preloads every comment page when the comments field is requested.
+                comments_complete: true,
             })
         })
     }

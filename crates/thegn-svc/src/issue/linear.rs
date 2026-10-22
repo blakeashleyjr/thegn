@@ -793,6 +793,8 @@ impl IssueBackend for LinearBackend {
             Ok(IssueDetail {
                 issue: linear_issue_to_domain(li.issue)?,
                 comments,
+                // Incomplete comment paging returns an error before reaching this result.
+                comments_complete: true,
             })
         })
     }

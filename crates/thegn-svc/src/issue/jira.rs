@@ -633,6 +633,8 @@ impl IssueBackend for JiraBackend {
             Ok(IssueDetail {
                 issue: jira_issue_to_domain(ji, &self.base_url),
                 comments,
+                // Incomplete comment paging returns an error before reaching this result.
+                comments_complete: true,
             })
         })
     }
