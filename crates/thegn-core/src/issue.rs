@@ -751,6 +751,62 @@ impl AgentDispatchStatus {
     }
 }
 
+/// Incomplete-list metadata for one tracker account's cached issue rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueCachePartial {
+    pub account: String,
+    pub reason: String,
+    pub checked_at_ms: i64,
+    /// Whether the cached rows came from a complete list; `None` means an older cache did not record it.
+    #[serde(default)]
+    pub showing_last_good: Option<bool>,
+}
+
+/// Cached rows plus their refresh completeness state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IssueCacheEntry {
+    pub issues: Vec<Issue>,
+    pub partial: Option<IssueCachePartial>,
+}
+
+pub const ISSUE_CACHE_ENTRY_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct IssueCacheEntryWire {
+    v: u8,
+    issues: Vec<Issue>,
+    partial: Option<IssueCachePartial>,
+}
+
+impl IssueCacheEntry {
+    /// Read a legacy complete array or a supported versioned cache wrapper.
+    pub fn parse(json: &str) -> Option<Self> {
+        if let Ok(issues) = serde_json::from_str::<Vec<Issue>>(json) {
+            return Some(Self {
+                issues,
+                partial: None,
+            });
+        }
+        let wire = serde_json::from_str::<IssueCacheEntryWire>(json).ok()?;
+        (wire.v == ISSUE_CACHE_ENTRY_VERSION).then_some(Self {
+            issues: wire.issues,
+            partial: wire.partial,
+        })
+    }
+
+    /// Preserve the legacy bare-array encoding for complete cache entries.
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        match &self.partial {
+            None => serde_json::to_string(&self.issues),
+            Some(partial) => serde_json::to_string(&IssueCacheEntryWire {
+                v: ISSUE_CACHE_ENTRY_VERSION,
+                issues: self.issues.clone(),
+                partial: Some(partial.clone()),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod spec {
     use super::*;
@@ -1396,6 +1452,64 @@ mod spec {
                 "{s:?} ASCII glyph is not 7-bit: {ascii:?}"
             );
         }
+    }
+
+    #[test]
+    fn cache_entry_bare_array_is_complete_and_writes_a_bare_array() {
+        let issue = Issue {
+            id: "linear:ABC-1".into(),
+            number: "ABC-1".into(),
+            provider: "linear".into(),
+            title: "Example".into(),
+            url: "https://example.invalid/ABC-1".into(),
+            ..Default::default()
+        };
+        let issues = vec![issue];
+        let json = serde_json::to_string(&issues).unwrap();
+        assert_eq!(
+            IssueCacheEntry::parse("[]"),
+            Some(IssueCacheEntry::default())
+        );
+        assert_eq!(
+            IssueCacheEntry::parse(&json),
+            Some(IssueCacheEntry {
+                issues: issues.clone(),
+                partial: None,
+            })
+        );
+        assert_eq!(
+            IssueCacheEntry {
+                issues: issues.clone(),
+                partial: None,
+            }
+            .to_json()
+            .unwrap(),
+            json
+        );
+    }
+
+    #[test]
+    fn cache_entry_partial_wrapper_round_trips_and_unknown_version_is_refused() {
+        let entry = IssueCacheEntry {
+            issues: vec![Issue::default()],
+            partial: Some(IssueCachePartial {
+                account: "work".into(),
+                reason: "page cap".into(),
+                checked_at_ms: 7,
+                showing_last_good: Some(true),
+            }),
+        };
+        let json = entry.to_json().unwrap();
+        assert_eq!(IssueCacheEntry::parse(&json), Some(entry));
+        let unknown_version = json.replace("\"v\":1", "\"v\":2");
+        assert_eq!(IssueCacheEntry::parse(&unknown_version), None);
+        let legacy_partial = IssueCacheEntry::parse(
+            r#"{"v":1,"issues":[],"partial":{"account":"work","reason":"cap","checked_at_ms":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_partial.partial.unwrap().showing_last_good, None);
+        assert_eq!(IssueCacheEntry::parse("{}"), None);
+        assert_eq!(IssueCacheEntry::parse("not json"), None);
     }
 
     #[test]
