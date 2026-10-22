@@ -17,6 +17,7 @@ use std::path::Path;
 use thegn_core::config::{Config, OnLanded};
 use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_sweep::{self, MergedEntry};
+use thegn_core::notification::Priority;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
 
@@ -60,6 +61,153 @@ pub struct SweepReport {
     pub kept: Vec<(String, String)>,
     /// Enumeration and sweep-level bookkeeping failures, never "collected".
     pub bookkeeping_errors: Vec<String>,
+}
+
+pub(crate) struct SweepNotify {
+    pub(crate) refresh_tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    pub(crate) waker: termwiz::terminal::TerminalWaker,
+    pub(crate) report_empty: bool,
+}
+
+pub(crate) const NOTHING_TO_SWEEP: &str = "merge queue: nothing to sweep";
+
+pub(crate) fn report_lines(report: &SweepReport) -> Vec<(Priority, String)> {
+    let mut lines = Vec::new();
+    if !report.collected.is_empty() {
+        lines.push((
+            Priority::Info,
+            format!(
+                "merge queue: swept {} merged worktree(s): {}",
+                report.collected.len(),
+                report
+                    .collected
+                    .iter()
+                    .map(|branch| safe_display(branch))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    for (branch, errors) in &report.collected_partial {
+        lines.push((
+            Priority::Alert,
+            format!(
+                "merge queue: swept {} with incomplete bookkeeping: {}",
+                safe_display(branch),
+                errors
+                    .iter()
+                    .map(|error| safe_display(error))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ));
+    }
+    for branch in &report.held_branches {
+        lines.push((
+            Priority::Info,
+            format!(
+                "merge queue: worktree previously collected; branch {} and queue evidence retained for explicit cleanup (THE-596)",
+                safe_display(branch)
+            ),
+        ));
+    }
+    for (branch, reason) in &report.informational {
+        lines.push((
+            Priority::Info,
+            format!(
+                "merge queue: left {} untouched — {}",
+                safe_display(branch),
+                safe_display(reason)
+            ),
+        ));
+    }
+    for branch in &report.kept_dirty {
+        lines.push((
+            Priority::Alert,
+            format!(
+                "merge queue: kept {} — edited since landing",
+                safe_display(branch)
+            ),
+        ));
+    }
+    for branch in &report.kept_changed {
+        lines.push((
+            Priority::Alert,
+            format!(
+                "merge queue: kept {} — changed during cleanup",
+                safe_display(branch)
+            ),
+        ));
+    }
+    for branch in &report.discarded_build_state {
+        lines.push((
+            Priority::Info,
+            format!(
+                "merge queue: swept {} (discarded build state)",
+                safe_display(branch)
+            ),
+        ));
+    }
+    for branch in &report.discarded_tool_state {
+        lines.push((
+            Priority::Info,
+            format!(
+                "merge queue: swept {} (discarded seeded tool state)",
+                safe_display(branch)
+            ),
+        ));
+    }
+    for (branch, reason) in &report.kept {
+        lines.push((
+            Priority::Alert,
+            format!(
+                "merge cleanup: kept {} — {}",
+                safe_display(branch),
+                safe_display(reason)
+            ),
+        ));
+    }
+    for error in &report.bookkeeping_errors {
+        lines.push((Priority::Alert, safe_display(error)));
+    }
+    lines
+}
+
+pub(crate) fn deliver_toast_lines(
+    lines: Vec<(Priority, String)>,
+    empty_note: Option<&str>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+) -> bool {
+    let (message, priority) = if lines.is_empty() {
+        let Some(empty_note) = empty_note else {
+            return false;
+        };
+        (empty_note.to_string(), Priority::Info)
+    } else {
+        let priority = if lines
+            .iter()
+            .any(|(priority, _)| *priority == Priority::Alert)
+        {
+            Priority::Alert
+        } else {
+            Priority::Info
+        };
+        (
+            lines
+                .into_iter()
+                .map(|(_, line)| line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            priority,
+        )
+    };
+    match tx.send(crate::hydrate::RefreshKind::Toast { message, priority }) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(target: "thegn::merge_sweep", %error, "merge sweep toast delivery failed");
+            false
+        }
+    }
 }
 
 impl SweepReport {
@@ -439,80 +587,24 @@ pub(crate) fn sweep_root(dir: &Path) -> Option<std::path::PathBuf> {
 /// and shells out to git. `dir` may be any path inside the repo (the launch dir
 /// at startup, an arbitrary worktree path after a fold); a non-repo path is a
 /// no-op.
-pub fn spawn(cfg: Config, dir: std::path::PathBuf) {
+pub fn spawn(cfg: Config, dir: std::path::PathBuf, notify: SweepNotify) {
     tokio::task::spawn_blocking(move || {
-        let Some(report) = sweep_from(&cfg, &dir, false) else {
-            return;
-        };
-        if !report.collected.is_empty() {
-            thegn_core::msg::info(&format!(
-                "merge queue: swept {} merged worktree(s): {}",
-                report.collected.len(),
-                report
-                    .collected
-                    .iter()
-                    .map(|b| safe_display(b))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+        let report = sweep_from(&cfg, &dir, false).unwrap_or_else(SweepReport::default);
+        let lines = report_lines(&report);
+        for (priority, line) in &lines {
+            match priority {
+                Priority::Alert => thegn_core::msg::warn(line),
+                _ => thegn_core::msg::info(line),
+            }
         }
-        for (branch, errors) in &report.collected_partial {
-            thegn_core::msg::warn(&format!(
-                "merge queue: swept {} with incomplete bookkeeping: {}",
-                safe_display(branch),
-                errors
-                    .iter()
-                    .map(|error| safe_display(error))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ));
-        }
-        for branch in &report.held_branches {
-            thegn_core::msg::info(&format!(
-                "merge queue: worktree previously collected; branch {} and queue evidence retained for explicit cleanup (THE-596)",
-                safe_display(branch)
-            ));
-        }
-        for (branch, reason) in &report.informational {
-            thegn_core::msg::info(&format!(
-                "merge queue: left {} untouched — {}",
-                safe_display(branch),
-                safe_display(reason)
-            ));
-        }
-        for b in &report.kept_dirty {
-            thegn_core::msg::warn(&format!(
-                "merge queue: kept {} — edited since landing",
-                safe_display(b)
-            ));
-        }
-        for b in &report.kept_changed {
-            thegn_core::msg::warn(&format!(
-                "merge queue: kept {} — changed during cleanup",
-                safe_display(b)
-            ));
-        }
-        for b in &report.discarded_build_state {
-            thegn_core::msg::info(&format!(
-                "merge queue: swept {} (discarded build state)",
-                safe_display(b)
-            ));
-        }
-        for b in &report.discarded_tool_state {
-            thegn_core::msg::info(&format!(
-                "merge queue: swept {} (discarded seeded tool state)",
-                safe_display(b)
-            ));
-        }
-        for (branch, reason) in &report.kept {
-            thegn_core::msg::warn(&format!(
-                "merge cleanup: kept {} — {}",
-                safe_display(branch),
-                safe_display(reason)
-            ));
-        }
-        for error in &report.bookkeeping_errors {
-            thegn_core::msg::warn(&safe_display(error));
+        if deliver_toast_lines(
+            lines,
+            notify.report_empty.then_some(NOTHING_TO_SWEEP),
+            &notify.refresh_tx,
+        ) {
+            if let Err(error) = notify.waker.wake() {
+                tracing::debug!(target: "thegn::merge_sweep", %error, "merge sweep terminal wake failed");
+            }
         }
     });
 }
@@ -2132,5 +2224,145 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod status_route_tests {
+    use super::*;
+    use crate::hydrate::RefreshKind;
+    use thegn_core::notification::Priority;
+
+    #[test]
+    fn report_lines_keep_every_existing_message_text() {
+        let report = SweepReport {
+            collected: vec!["one".into(), "two".into()],
+            collected_partial: vec![("partial".into(), vec!["bookkeeping".into()])],
+            held_branches: vec!["held".into()],
+            informational: vec![("untouched".into(), "reason".into())],
+            kept_dirty: vec!["dirty".into()],
+            kept_changed: vec!["changed".into()],
+            discarded_build_state: vec!["build".into()],
+            discarded_tool_state: vec!["tool".into()],
+            kept: vec![("kept".into(), "refused".into())],
+            bookkeeping_errors: vec!["bookkeeping error".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            report_lines(&report),
+            vec![
+                (
+                    Priority::Info,
+                    "merge queue: swept 2 merged worktree(s): one, two".into()
+                ),
+                (
+                    Priority::Alert,
+                    "merge queue: swept partial with incomplete bookkeeping: bookkeeping".into()
+                ),
+                (
+                    Priority::Info,
+                    "merge queue: worktree previously collected; branch held and queue evidence retained for explicit cleanup (THE-596)".into()
+                ),
+                (
+                    Priority::Info,
+                    "merge queue: left untouched untouched — reason".into()
+                ),
+                (
+                    Priority::Alert,
+                    "merge queue: kept dirty — edited since landing".into()
+                ),
+                (
+                    Priority::Alert,
+                    "merge queue: kept changed — changed during cleanup".into()
+                ),
+                (
+                    Priority::Info,
+                    "merge queue: swept build (discarded build state)".into()
+                ),
+                (
+                    Priority::Info,
+                    "merge queue: swept tool (discarded seeded tool state)".into()
+                ),
+                (
+                    Priority::Alert,
+                    "merge cleanup: kept kept — refused".into()
+                ),
+                (Priority::Alert, "bookkeeping error".into()),
+            ]
+        );
+
+        let cleared_only = SweepReport {
+            cleared_rows: vec!["row".into()],
+            ..Default::default()
+        };
+        assert!(report_lines(&cleared_only).is_empty());
+    }
+
+    fn receive_toast(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<RefreshKind>,
+    ) -> (String, Priority) {
+        let msg = rx.try_recv().expect("expected a toast");
+        let RefreshKind::Toast { message, priority } = msg else {
+            panic!("expected a toast refresh");
+        };
+        (message, priority)
+    }
+
+    #[test]
+    fn deliver_sends_one_alert_toast_when_any_line_warns() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RefreshKind>();
+        assert!(deliver_toast_lines(
+            vec![
+                (Priority::Info, "completed".into()),
+                (Priority::Alert, "kept dirty".into()),
+            ],
+            None,
+            &tx,
+        ));
+        assert_eq!(
+            receive_toast(&mut rx),
+            ("completed\nkept dirty".into(), Priority::Alert)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn deliver_sends_an_info_toast_for_info_only_lines() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RefreshKind>();
+        assert!(deliver_toast_lines(
+            vec![(Priority::Info, "completed".into())],
+            None,
+            &tx,
+        ));
+        assert_eq!(receive_toast(&mut rx), ("completed".into(), Priority::Info));
+    }
+
+    #[test]
+    fn deliver_empty_startup_sweep_sends_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RefreshKind>();
+        assert!(!deliver_toast_lines(Vec::new(), None, &tx));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn deliver_empty_interactive_sweep_says_nothing_to_sweep() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RefreshKind>();
+        assert!(deliver_toast_lines(Vec::new(), Some(NOTHING_TO_SWEEP), &tx));
+        assert_eq!(
+            receive_toast(&mut rx),
+            (NOTHING_TO_SWEEP.to_string(), Priority::Info)
+        );
+    }
+
+    #[test]
+    fn deliver_tolerates_a_dropped_receiver() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RefreshKind>();
+        drop(rx);
+        assert!(!deliver_toast_lines(
+            vec![(Priority::Info, "completed".into())],
+            None,
+            &tx,
+        ));
     }
 }
