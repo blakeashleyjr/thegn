@@ -57,12 +57,33 @@ pub(crate) enum WriterStatus {
     Fatal(String),
 }
 
+/// A clipboard delivery that did not commit to the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardOutcome {
+    /// The write failed and was dropped; some bytes may have reached the terminal.
+    Uncertain,
+    /// The set was abandoned before any write attempt.
+    NotWritten,
+}
+
+/// Fixed, payload-free status text for a clipboard delivery outcome.
+pub(crate) fn clipboard_outcome_status(outcome: ClipboardOutcome) -> &'static str {
+    match outcome {
+        ClipboardOutcome::Uncertain => {
+            "Copy may not have reached the terminal clipboard (terminal write failed)"
+        }
+        ClipboardOutcome::NotWritten => {
+            "Copy was not sent to the terminal clipboard (terminal writer stopped)"
+        }
+    }
+}
+
 enum Msg {
     /// A composed frame (wire bytes + trailing graphics/bell).
     Frame(Vec<u8>, Option<FrameStamp>, u64),
     /// Order-preserving passthrough (kitty deletes, muse marker…).
     Oob(Vec<u8>),
-    Clipboard(Vec<u8>),
+    Clipboard(Vec<u8>, u64),
 }
 
 struct Q {
@@ -73,6 +94,8 @@ struct Q {
     frames_queued: usize,
     clipboard_queued: usize,
     clipboard_bytes: usize,
+    clipboard_outcome: Option<(u64, ClipboardOutcome)>,
+    clipboard_committed: u64,
     /// Includes queued and currently-writing OOB messages.
     oob_in_flight: usize,
     oob_bytes: usize,
@@ -158,6 +181,8 @@ impl FrameWriter {
                 frames_queued: 0,
                 clipboard_queued: 0,
                 clipboard_bytes: 0,
+                clipboard_outcome: None,
+                clipboard_committed: 0,
                 oob_in_flight: 0,
                 oob_bytes: 0,
                 oob_retry_need: None,
@@ -333,7 +358,7 @@ impl FrameWriter {
         q.clipboard_bytes += bytes.len();
         q.submitted_seq = q.submitted_seq.saturating_add(1);
         let target = q.submitted_seq;
-        q.msgs.push_back(Msg::Clipboard(bytes));
+        q.msgs.push_back(Msg::Clipboard(bytes, target));
         drop(q);
         self.inner.cv.notify_one();
         if self.sync {
@@ -352,6 +377,17 @@ impl FrameWriter {
             }
             other => other,
         }
+    }
+
+    /// Take the newest unresolved clipboard delivery outcome once.
+    pub(crate) fn take_clipboard_outcome(&self) -> Option<ClipboardOutcome> {
+        self.inner
+            .q
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clipboard_outcome
+            .take()
+            .map(|(_, outcome)| outcome)
     }
 
     fn wait_for_sync_write(&self, target: u64) {
@@ -456,6 +492,28 @@ fn abandon_queued_messages(q: &mut Q) {
     if !matches!(q.status, WriterStatus::Fatal(_)) {
         q.status = WriterStatus::Fatal("terminal writer shutdown deadline".into());
     }
+    let queued_clipboard_ids: Vec<u64> = q
+        .msgs
+        .iter()
+        .filter_map(|msg| match msg {
+            Msg::Clipboard(_, id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for id in queued_clipboard_ids {
+        note_clipboard(q, id, Some(ClipboardOutcome::NotWritten));
+    }
+    let deferred_clipboard_ids: Vec<u64> = q
+        .deferred
+        .iter()
+        .filter_map(|deferred| match &deferred.msg {
+            Msg::Clipboard(_, id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for id in deferred_clipboard_ids {
+        note_clipboard(q, id, Some(ClipboardOutcome::Uncertain));
+    }
     let queued_oob_count = q
         .msgs
         .iter()
@@ -463,7 +521,7 @@ fn abandon_queued_messages(q: &mut Q) {
         .count();
     let queued_oob_bytes = q.msgs.iter().fold(0usize, |total, msg| match msg {
         Msg::Oob(bytes) => total.saturating_add(bytes.len()),
-        Msg::Frame(..) | Msg::Clipboard(_) => total,
+        Msg::Frame(..) | Msg::Clipboard(..) => total,
     });
     let deferred_oob_count = q
         .deferred
@@ -475,7 +533,7 @@ fn abandon_queued_messages(q: &mut Q) {
             .iter()
             .fold(0usize, |total, deferred| match &deferred.msg {
                 Msg::Oob(bytes) => total.saturating_add(bytes.len()),
-                Msg::Frame(..) | Msg::Clipboard(_) => total,
+                Msg::Frame(..) | Msg::Clipboard(..) => total,
             });
     q.msgs.clear();
     q.deferred.clear();
@@ -493,6 +551,17 @@ fn abandon_queued_messages(q: &mut Q) {
 }
 
 fn abandon_deferred_writes(q: &mut Q) {
+    let clipboard_ids: Vec<u64> = q
+        .deferred
+        .iter()
+        .filter_map(|deferred| match &deferred.msg {
+            Msg::Clipboard(_, id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for id in clipboard_ids {
+        note_clipboard(q, id, Some(ClipboardOutcome::Uncertain));
+    }
     let (oob_count, oob_bytes, clipboard_count, clipboard_bytes) = q.deferred.iter().fold(
         (0usize, 0usize, 0usize, 0usize),
         |(oob_count, oob_bytes, clipboard_count, clipboard_bytes), deferred| match &deferred.msg {
@@ -502,7 +571,7 @@ fn abandon_deferred_writes(q: &mut Q) {
                 clipboard_count,
                 clipboard_bytes,
             ),
-            Msg::Clipboard(bytes) => (
+            Msg::Clipboard(bytes, _) => (
                 oob_count,
                 oob_bytes,
                 clipboard_count + 1,
@@ -524,6 +593,31 @@ fn pop_message(q: &mut Q) -> Option<Msg> {
         q.frames_queued = q.frames_queued.saturating_sub(1);
     }
     Some(message)
+}
+
+fn note_clipboard(q: &mut Q, id: u64, outcome: Option<ClipboardOutcome>) {
+    match outcome {
+        None => {
+            q.clipboard_committed = q.clipboard_committed.max(id);
+            if q.clipboard_outcome
+                .is_some_and(|(pending_id, _)| pending_id <= id)
+            {
+                q.clipboard_outcome = None;
+            }
+        }
+        Some(outcome) if id > q.clipboard_committed => {
+            let replace = match q.clipboard_outcome {
+                Some((pending_id, _)) if pending_id > id => false,
+                Some((pending_id, ClipboardOutcome::Uncertain)) if pending_id == id => false,
+                Some((pending_id, _)) if pending_id == id => true,
+                _ => true,
+            };
+            if replace {
+                q.clipboard_outcome = Some((id, outcome));
+            }
+        }
+        Some(_) => {}
+    }
 }
 
 fn writer_main(
@@ -591,7 +685,7 @@ fn write_message(
     mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
 ) -> (bool, bool, bool) {
     let bytes = match &msg {
-        Msg::Frame(b, ..) | Msg::Oob(b) | Msg::Clipboard(b) => b,
+        Msg::Frame(b, ..) | Msg::Oob(b) | Msg::Clipboard(b, _) => b,
     };
     // After a Fatal, drop writes (the loop is tearing down); keep draining
     // so shutdown never deadlocks.
@@ -599,6 +693,9 @@ fn write_message(
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
         let fatal = matches!(q.status, WriterStatus::Fatal(_));
         let released = if fatal {
+            if let Msg::Clipboard(_, id) = &msg {
+                note_clipboard(&mut q, *id, Some(ClipboardOutcome::NotWritten));
+            }
             release_message_capacity(&mut q, &msg);
             matches!(&msg, Msg::Oob(_))
         } else {
@@ -611,11 +708,11 @@ fn write_message(
         q.completed_seq = q.completed_seq.saturating_add(1);
         drop(q);
         inner.done_cv.notify_all();
-        return (false, fatal.1, matches!(&msg, Msg::Clipboard(_)));
+        return (false, fatal.1, matches!(&msg, Msg::Clipboard(..)));
     }
     let stamp = match &msg {
         Msg::Frame(_, stamp, _) => *stamp,
-        Msg::Oob(_) | Msg::Clipboard(_) => None,
+        Msg::Oob(_) | Msg::Clipboard(..) => None,
     };
     let started = stamp.map(|_| Instant::now());
     let reset_pending = inner
@@ -648,13 +745,19 @@ fn write_message(
     };
     {
         let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        if result.is_err() && inner.worker_frames && matches!(&msg, Msg::Oob(_) | Msg::Clipboard(_))
+        if result.is_err()
+            && inner.worker_frames
+            && matches!(&msg, Msg::Oob(_) | Msg::Clipboard(..))
         {
             let defer_after = q.submitted_seq;
             q.deferred.push_back(DeferredWrite { msg, defer_after });
         } else {
             released_oob = matches!(&msg, Msg::Oob(_));
-            released_clipboard = matches!(&msg, Msg::Clipboard(_));
+            released_clipboard = matches!(&msg, Msg::Clipboard(..));
+            if let Msg::Clipboard(_, id) = &msg {
+                let outcome = result.is_err().then_some(ClipboardOutcome::Uncertain);
+                note_clipboard(&mut q, *id, outcome);
+            }
             release_message_capacity(&mut q, &msg);
         }
         if let (Some(stamp), Some(started), Some(finished)) = (stamp, started, finished) {
@@ -693,11 +796,17 @@ fn write_message(
             let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(q.status, WriterStatus::Fatal(_)) {
                 let mut abandoned_oob = matches!(&replay_msg, Msg::Oob(_));
-                let mut abandoned_clipboard = matches!(&replay_msg, Msg::Clipboard(_));
+                let mut abandoned_clipboard = matches!(&replay_msg, Msg::Clipboard(..));
+                if let Msg::Clipboard(_, id) = &replay_msg {
+                    note_clipboard(&mut q, *id, Some(ClipboardOutcome::Uncertain));
+                }
                 release_message_capacity(&mut q, &replay_msg);
                 while let Some(remaining) = replay.pop_front() {
                     abandoned_oob |= matches!(&remaining, Msg::Oob(_));
-                    abandoned_clipboard |= matches!(&remaining, Msg::Clipboard(_));
+                    abandoned_clipboard |= matches!(&remaining, Msg::Clipboard(..));
+                    if let Msg::Clipboard(_, id) = &remaining {
+                        note_clipboard(&mut q, *id, Some(ClipboardOutcome::Uncertain));
+                    }
                     release_message_capacity(&mut q, &remaining);
                 }
                 (true, abandoned_oob, abandoned_clipboard)
@@ -714,7 +823,7 @@ fn write_message(
             break;
         }
         let replay_bytes = match &replay_msg {
-            Msg::Oob(bytes) | Msg::Clipboard(bytes) => bytes,
+            Msg::Oob(bytes) | Msg::Clipboard(bytes, _) => bytes,
             Msg::Frame(..) => unreachable!("only OOB and clipboard messages are deferred"),
         };
         let replay_result = write(replay_bytes);
@@ -734,7 +843,10 @@ fn write_message(
             replay_errored = true;
         } else {
             released_oob |= matches!(&replay_msg, Msg::Oob(_));
-            released_clipboard |= matches!(&replay_msg, Msg::Clipboard(_));
+            released_clipboard |= matches!(&replay_msg, Msg::Clipboard(..));
+            if let Msg::Clipboard(_, id) = &replay_msg {
+                note_clipboard(&mut q, *id, None);
+            }
             release_message_capacity(&mut q, &replay_msg);
         }
         apply_write_result(&mut q, replay_result);
@@ -761,7 +873,7 @@ fn release_oob_capacity(q: &mut Q, msg: &Msg) {
 
 fn release_message_capacity(q: &mut Q, msg: &Msg) {
     release_oob_capacity(q, msg);
-    if let Msg::Clipboard(bytes) = msg {
+    if let Msg::Clipboard(bytes, _) = msg {
         q.clipboard_queued = q.clipboard_queued.saturating_sub(1);
         q.clipboard_bytes = q.clipboard_bytes.saturating_sub(bytes.len());
     }
@@ -815,6 +927,8 @@ mod tests {
             frames_queued: 0,
             clipboard_queued: 0,
             clipboard_bytes: 0,
+            clipboard_outcome: None,
+            clipboard_committed: 0,
             oob_in_flight: 0,
             oob_bytes: 0,
             oob_retry_need: None,
@@ -976,14 +1090,21 @@ mod tests {
         assert_eq!(q.clipboard_bytes, 4);
         assert!(matches!(pop_message(&mut q), Some(Msg::Oob(ref b)) if b == &[0]));
         for byte in 1..=4 {
-            assert!(matches!(pop_message(&mut q), Some(Msg::Clipboard(ref b)) if b == &[byte]));
+            assert!(matches!(pop_message(&mut q), Some(Msg::Clipboard(ref b, _) ) if b == &[byte]));
         }
         assert_eq!(q.clipboard_queued, 4);
         assert_eq!(q.clipboard_bytes, 4);
         drop(q);
         assert!(writer.try_submit_clipboard(vec![5], || panic!()).is_err());
         for byte in 1..=4 {
-            assert!(!write_message(&writer.inner, Msg::Clipboard(vec![byte]), |_| Ok(())).0);
+            assert!(
+                !write_message(
+                    &writer.inner,
+                    Msg::Clipboard(vec![byte], u64::from(byte)),
+                    |_| Ok(())
+                )
+                .0
+            );
         }
         assert!(writer.try_submit_clipboard(vec![5], || panic!()).is_ok());
         assert!(writer.inner.clipboard_retry.load(Ordering::SeqCst));
@@ -995,6 +1116,181 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn dropped_failed_clipboard_write_reports_uncertain_once() {
+        let writer = test_writer_with_worker_frames(false);
+        writer
+            .try_submit_clipboard(vec![b'C'], || panic!())
+            .unwrap();
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, clipboard, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::Uncertain)
+        );
+        assert_eq!(writer.take_clipboard_outcome(), None);
+    }
+
+    #[test]
+    fn queued_clipboard_abandoned_before_write_reports_not_written() {
+        let writer = test_writer();
+        writer
+            .try_submit_clipboard(vec![b'C'], || panic!())
+            .unwrap();
+        abandon_queued_messages(&mut writer.inner.q.lock().unwrap());
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::NotWritten)
+        );
+    }
+
+    #[test]
+    fn refused_clipboard_admission_has_no_outcome() {
+        let writer = test_writer();
+        for byte in 0..4 {
+            assert!(writer.try_submit_clipboard(vec![byte], || panic!()).is_ok());
+        }
+        assert_eq!(
+            writer.try_submit_clipboard(vec![5], || panic!()),
+            Err(vec![5])
+        );
+        assert_eq!(writer.take_clipboard_outcome(), None);
+    }
+
+    #[test]
+    fn fatal_clipboard_drop_before_write_reports_not_written() {
+        let writer = test_writer();
+        writer
+            .try_submit_clipboard(vec![b'C'], || panic!())
+            .unwrap();
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        writer.inner.q.lock().unwrap().status =
+            WriterStatus::Fatal("test terminal failure".to_string());
+        assert!(!write_message(&writer.inner, clipboard, |_| panic!()).0);
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::NotWritten)
+        );
+    }
+
+    #[test]
+    fn failed_then_replayed_clipboard_commits_without_an_outcome() {
+        let writer = test_writer();
+        writer
+            .try_submit_clipboard(vec![b'C'], || panic!())
+            .unwrap();
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, clipboard, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        assert_eq!(writer.take_clipboard_outcome(), None);
+        assert!(writer.submit_frame(vec![b'F'], None));
+        let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(!write_message(&writer.inner, frame, |_| Ok(())).0);
+        assert_eq!(writer.take_clipboard_outcome(), None);
+    }
+
+    #[test]
+    fn deferred_clipboard_abandoned_on_worker_exit_reports_uncertain() {
+        let writer = test_writer();
+        writer
+            .try_submit_clipboard(vec![b'C'], || panic!())
+            .unwrap();
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, clipboard, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        abandon_deferred_writes(&mut writer.inner.q.lock().unwrap());
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::Uncertain)
+        );
+    }
+
+    #[test]
+    fn frame_oob_and_bell_failures_never_produce_a_clipboard_outcome() {
+        let writer = test_writer_with_worker_frames(false);
+        assert!(writer.submit_frame(b"frame bell".to_vec(), None));
+        let frame = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, frame, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        assert_eq!(writer.take_clipboard_outcome(), None);
+
+        assert!(writer.try_submit_oob(b"graphics".to_vec()).is_ok());
+        let oob = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, oob, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        assert_eq!(writer.take_clipboard_outcome(), None);
+    }
+
+    #[test]
+    fn newer_committed_clipboard_supersedes_an_older_outcome() {
+        let writer = test_writer_with_worker_frames(false);
+        writer
+            .try_submit_clipboard(vec![b'A'], || panic!())
+            .unwrap();
+        let first = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let first_id = match &first {
+            Msg::Clipboard(_, id) => *id,
+            _ => panic!("expected clipboard message"),
+        };
+        assert!(
+            write_message(&writer.inner, first, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        assert!(writer.try_submit_clipboard(vec![b'B'], || panic!()).is_ok());
+        let second = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(!write_message(&writer.inner, second, |_| Ok(())).0);
+        assert_eq!(writer.take_clipboard_outcome(), None);
+        note_clipboard(
+            &mut writer.inner.q.lock().unwrap(),
+            first_id,
+            Some(ClipboardOutcome::Uncertain),
+        );
+        assert_eq!(writer.take_clipboard_outcome(), None);
+    }
+
+    #[test]
+    fn clipboard_outcome_status_is_payload_free() {
+        let writer = test_writer_with_worker_frames(false);
+        writer
+            .try_submit_clipboard(b"SECRET-PAYLOAD".to_vec(), || panic!())
+            .unwrap();
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, clipboard, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        let outcome = writer.take_clipboard_outcome().unwrap();
+        let status = clipboard_outcome_status(outcome);
+        assert!(!status.is_empty());
+        assert!(status.contains("clipboard"));
+        assert!(!status.contains("SECRET-PAYLOAD"));
     }
 
     #[test]
