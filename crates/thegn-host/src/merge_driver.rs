@@ -523,6 +523,7 @@ fn verify_fixer_checkout(
     }
     let top_level = local_git_text(path, &["rev-parse", "--show-toplevel"])
         .map_err(|error| format!("path is not a Git worktree: {error}"))?;
+    // GitPolicy::read permits empty stdout, so this explicit empty check is load-bearing.
     if top_level.is_empty() {
         return Err("path is not a Git worktree".into());
     }
@@ -2882,7 +2883,10 @@ mod tests {
 
 #[cfg(test)]
 mod typed_read_tests {
-    use super::{classify_oid, local_git_text, unreadable_detail};
+    use super::{
+        CandidateUnreadable, Config, DriveActions, Failure, MergeQueueConfig, QueueItem,
+        classify_oid, drive_queue_with, local_git_text, unreadable_detail,
+    };
     use thegn_core::git_run::{GitOutcome, GitTextError};
 
     #[test]
@@ -2927,6 +2931,8 @@ mod typed_read_tests {
 
     #[test]
     fn queued_tip_read_in_a_non_repository_is_a_failure_not_absence() {
+        // This fixture relies on /tmp being outside the checked-out repository so
+        // Git's upward repository discovery cannot find the outer worktree.
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let result = classify_oid(local_git_text(
             dir.path(),
@@ -2956,6 +2962,8 @@ mod typed_read_tests {
 
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "t@e"]);
+        git(dir.path(), &["config", "user.name", "t"]);
         git(
             dir.path(),
             &[
@@ -2981,6 +2989,76 @@ mod typed_read_tests {
             )),
             Ok(None)
         ));
+    }
+
+    #[test]
+    fn unreadable_queued_tip_holds_row_without_attempt_or_fixer() {
+        use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+
+        #[expect(clippy::disallowed_methods, reason = "create an isolated Git fixture")]
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let status = thegn_core::util::git_cmd(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed with {status}");
+        }
+
+        let repo = tempfile::tempdir_in("/tmp").unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        db.put_worktree("feat", &repo_path, &repo_path, "feat", None, None)
+            .unwrap();
+        db.enqueue_merge(&repo_path, "feat", "main").unwrap();
+        let queued = QueueItem {
+            worktree: repo_path.clone(),
+            branch: "feat".into(),
+            location: String::new(),
+        };
+
+        let outcome = drive_queue_with(
+            &MergeQueueConfig {
+                organize_folders: false,
+                ..MergeQueueConfig::default()
+            },
+            &Config::default(),
+            repo.path(),
+            &db,
+            vec![queued],
+            |_| {},
+            DriveActions {
+                attempt: |_: &str,
+                          _: &thegn_core::remote::GitLoc,
+                          _: bool|
+                 -> anyhow::Result<super::AttemptOutcome> {
+                    Err(anyhow::Error::new(CandidateUnreadable {
+                        reason: "queued branch tip refs/heads/feat: Git command timed out".into(),
+                    }))
+                },
+                floor: |_: &str| panic!("unreadable candidate must not dispatch a fixer"),
+                runner: |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| {
+                    panic!("unreadable candidate must not run a fixer")
+                },
+            },
+        );
+
+        assert_eq!(outcome.agent_blocked, ["feat"]);
+        assert!(outcome.landed.is_empty());
+        assert!(outcome.needs_human.is_empty());
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.status, "agent_blocked");
+        assert_eq!(row.agent_attempts, 0);
+        let detail = row.error_detail.unwrap();
+        assert!(detail.contains("candidate unreadable"));
+        assert!(!detail.contains("identity drift"));
+        assert!(!detail.contains("re-enqueue"));
     }
 
     #[test]
