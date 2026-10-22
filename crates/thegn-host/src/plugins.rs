@@ -746,6 +746,15 @@ fn spawn_session(
     )
 }
 
+/// One one-shot run to start on a poll worker: an initial run or a due scheduled poll.
+struct PollJob {
+    plugin: String,
+    command: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: Option<PathBuf>,
+    timeout: Duration,
+}
+
 /// One `Interval` contribution the scheduler services.
 struct SchedEntry {
     plugin: String,
@@ -858,6 +867,63 @@ fn run_due(
                     );
                 }
             },
+        }
+    }
+}
+
+fn admit_initial_runs(
+    pending: &mut Vec<PollJob>,
+    disabled: &Disabled,
+    gate: &OneShotGate,
+    start: &mut dyn FnMut(OneShotTicket, PollJob),
+) {
+    let mut kept = Vec::new();
+    for job in std::mem::take(pending) {
+        if lock(disabled).contains(&job.plugin) {
+            tracing::debug!(target: "thegn::plugin", plugin = %job.plugin, "initial one-shot run dropped because plugin is disabled");
+            continue;
+        }
+        match gate.try_begin(&job.plugin) {
+            Ok(ticket) => start(ticket, job),
+            Err(refusal @ (GateRefusal::Busy | GateRefusal::Overloaded)) => {
+                tracing::debug!(target: "thegn::plugin", plugin = %job.plugin, ?refusal, "initial one-shot run deferred by admission gate");
+                kept.push(job);
+            }
+        }
+    }
+    *pending = kept;
+}
+
+fn start_poll_worker(
+    ticket: OneShotTicket,
+    job: PollJob,
+    tx: &PluginTx,
+    waker: Option<&TerminalWaker>,
+    failed_poll_starts: &mut BTreeSet<String>,
+) {
+    let plugin = job.plugin.clone();
+    let command = job.command;
+    let env = job.env;
+    let cwd = job.cwd;
+    let timeout = job.timeout;
+    let worker_tx = tx.clone();
+    let worker_waker = waker.cloned();
+    match thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let run = thegn_svc::plugin::spawn_ndjson(&command, &env, cwd.as_deref(), timeout);
+        drop(ticket);
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = worker_tx.send(PluginMsg::OneShot { plugin, run });
+        if let Some(waker) = &worker_waker {
+            let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
+        }
+    }) {
+        Ok(_handle) => {
+            failed_poll_starts.remove(&job.plugin);
+        }
+        Err(error) => {
+            tracing::warn!(target: "thegn::plugin", plugin = %job.plugin, error = %error, "scheduled one-shot thread failed to start");
+            report_poll_start_failure(failed_poll_starts, &job.plugin, &error, tx, waker);
         }
     }
 }
@@ -1003,22 +1069,15 @@ fn setup_and_schedule_with_waker(
         }
     }
 
-    // One-shot plugins with no interval contribution still get exactly one
-    // run, so their register/update messages produce an initial view.
-    struct InitialRun {
-        plugin: String,
-        command: Vec<String>,
-        env: BTreeMap<String, String>,
-        cwd: Option<PathBuf>,
-        timeout: Duration,
-    }
-    let mut initial_runs: Vec<InitialRun> = Vec::new();
+    // One-shot plugins with no interval contribution still get exactly one run; it is admitted
+    // through the gate on a poll worker like a scheduled poll, retried each tick while refused.
+    let mut pending: Vec<PollJob> = Vec::new();
     let initial_run_ids = initial_run_ids(&loaded, &sched);
     for st in &loaded {
         let id = st.plugin.spec.manifest.id.as_str();
         if initial_run_ids.contains(id) {
             if let Some(env) = resolved_envs.get(id) {
-                initial_runs.push(InitialRun {
+                pending.push(PollJob {
                     plugin: id.to_string(),
                     command: st.plugin.spec.command.clone(),
                     env: env.clone(),
@@ -1057,37 +1116,30 @@ fn setup_and_schedule_with_waker(
         }
     }
 
-    for r in initial_runs {
-        if stop.is_stopped() {
-            return;
-        }
-        let run = thegn_svc::plugin::spawn_ndjson(&r.command, &r.env, r.cwd.as_deref(), r.timeout);
-        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = tx.send(PluginMsg::OneShot {
-            plugin: r.plugin,
-            run,
-        });
-        if let Some(waker) = &waker {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
-    }
-
-    if sched.is_empty() {
+    if sched.is_empty() && pending.is_empty() {
         return;
     }
+    const SCHED_MIN_WAIT: Duration = Duration::from_secs(1);
     // Sleep granularity: the smallest interval, floored at 1s so a plugin
     // asking for a 50ms cadence cannot spin this thread.
-    let granularity = sched
-        .iter()
-        .map(|e| e.interval)
-        .min()
-        .unwrap_or(Duration::from_secs(1))
-        .max(Duration::from_secs(1));
+    let granularity = if sched.is_empty() {
+        SCHED_MIN_WAIT
+    } else {
+        sched
+            .iter()
+            .map(|e| e.interval)
+            .min()
+            .unwrap_or(SCHED_MIN_WAIT)
+            .max(SCHED_MIN_WAIT)
+    };
     let mut failed_poll_starts = BTreeSet::new();
     loop {
         if stop.is_stopped() {
             return;
         }
+        admit_initial_runs(&mut pending, &disabled, &gate, &mut |ticket, job| {
+            start_poll_worker(ticket, job, &tx, waker.as_ref(), &mut failed_poll_starts);
+        });
         run_due(
             &mut sched,
             Instant::now(),
@@ -1095,41 +1147,30 @@ fn setup_and_schedule_with_waker(
             &sessions,
             &gate,
             &mut |ticket, entry| {
-                let plugin = entry.plugin.clone();
-                let command = entry.command.clone();
-                let env = entry.env.clone();
-                let cwd = entry.cwd.clone();
-                let timeout = entry.timeout;
-                let worker_tx = tx.clone();
-                let worker_waker = waker.clone();
-                match thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
-                    crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                    let run =
-                        thegn_svc::plugin::spawn_ndjson(&command, &env, cwd.as_deref(), timeout);
-                    drop(ticket);
-                    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                    let _ = worker_tx.send(PluginMsg::OneShot { plugin, run });
-                    if let Some(waker) = &worker_waker {
-                        let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
-                    }
-                }) {
-                    Ok(_handle) => {
-                        failed_poll_starts.remove(&entry.plugin);
-                    }
-                    Err(error) => {
-                        tracing::warn!(target: "thegn::plugin", plugin = %entry.plugin, error = %error, "scheduled one-shot thread failed to start");
-                        report_poll_start_failure(
-                            &mut failed_poll_starts,
-                            &entry.plugin,
-                            &error,
-                            &tx,
-                            waker.as_ref(),
-                        );
-                    }
-                }
+                start_poll_worker(
+                    ticket,
+                    PollJob {
+                        plugin: entry.plugin.clone(),
+                        command: entry.command.clone(),
+                        env: entry.env.clone(),
+                        cwd: entry.cwd.clone(),
+                        timeout: entry.timeout,
+                    },
+                    &tx,
+                    waker.as_ref(),
+                    &mut failed_poll_starts,
+                );
             },
         );
-        if stop.wait_timeout(granularity) {
+        if sched.is_empty() && pending.is_empty() {
+            return;
+        }
+        let wait = if pending.is_empty() {
+            granularity
+        } else {
+            granularity.min(SCHED_MIN_WAIT)
+        };
+        if stop.wait_timeout(wait) {
             return;
         }
     }
@@ -1154,6 +1195,128 @@ mod tests {
     use thegn_core::plugin_api::{
         ApiVersion, ContributionId, MAX_PLUGIN_TIMEOUT_SECS, PluginId, PluginSpec,
     };
+
+    fn recv_within(rx: &mut PluginRx, limit: Duration) -> Option<PluginMsg> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match rx.try_recv() {
+                Ok(message) => return Some(message),
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn poll_job(plugin: &str) -> PollJob {
+        PollJob {
+            plugin: plugin.to_string(),
+            command: vec!["true".into()],
+            env: BTreeMap::new(),
+            cwd: None,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn initial_runs_are_admitted_through_the_gate() {
+        let disabled: Disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let gate = OneShotGate::default();
+        let mut pending = vec![poll_job("a"), poll_job("b")];
+        let mut started = Vec::new();
+        let mut tickets = Vec::new();
+
+        admit_initial_runs(&mut pending, &disabled, &gate, &mut |ticket, job| {
+            started.push(job.plugin);
+            tickets.push(ticket);
+        });
+
+        assert_eq!(started, vec!["a".to_string(), "b".to_string()]);
+        assert!(pending.is_empty());
+        assert!(matches!(gate.try_begin("a"), Err(GateRefusal::Busy)));
+        drop(tickets);
+    }
+
+    #[test]
+    fn initial_run_refused_busy_stays_pending() {
+        let disabled: Disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let gate = OneShotGate::default();
+        let held = gate.try_begin("a").unwrap();
+        let mut pending = vec![poll_job("a")];
+        let mut started = Vec::new();
+
+        admit_initial_runs(&mut pending, &disabled, &gate, &mut |_, job| {
+            started.push(job.plugin);
+        });
+        assert!(started.is_empty());
+        assert_eq!(
+            pending
+                .iter()
+                .map(|job| job.plugin.as_str())
+                .collect::<Vec<_>>(),
+            ["a"]
+        );
+
+        drop(held);
+        admit_initial_runs(&mut pending, &disabled, &gate, &mut |_, job| {
+            started.push(job.plugin);
+        });
+        assert_eq!(started, vec!["a".to_string()]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn initial_run_refused_overloaded_stays_pending() {
+        let disabled: Disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let gate = OneShotGate::default();
+        let mut held = (0..MAX_INFLIGHT_ONE_SHOTS)
+            .map(|index| gate.try_begin(&format!("holder-{index}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut pending = vec![poll_job("a")];
+        let mut started = Vec::new();
+
+        admit_initial_runs(&mut pending, &disabled, &gate, &mut |_, job| {
+            started.push(job.plugin);
+        });
+        assert!(started.is_empty());
+        assert_eq!(
+            pending
+                .iter()
+                .map(|job| job.plugin.as_str())
+                .collect::<Vec<_>>(),
+            ["a"]
+        );
+
+        drop(held.pop());
+        admit_initial_runs(&mut pending, &disabled, &gate, &mut |_, job| {
+            started.push(job.plugin);
+        });
+        assert_eq!(started, vec!["a".to_string()]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn initial_run_of_a_disabled_plugin_is_dropped() {
+        let disabled: Disabled = Arc::new(Mutex::new(BTreeSet::from(["a".to_string()])));
+        let gate = OneShotGate::default();
+        let mut pending = vec![poll_job("a"), poll_job("b")];
+        let mut started = Vec::new();
+        let mut tickets = Vec::new();
+
+        admit_initial_runs(&mut pending, &disabled, &gate, &mut |ticket, job| {
+            started.push(job.plugin);
+            tickets.push(ticket);
+        });
+
+        assert_eq!(started, vec!["b".to_string()]);
+        assert!(pending.is_empty());
+        let ticket = gate.try_begin("a").unwrap();
+        drop(ticket);
+        drop(tickets);
+    }
 
     #[test]
     fn plugin_send_error_keeps_result_variant_small() {
@@ -2436,6 +2599,104 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    // The release file is created only after the b-fast assertion. The gate cap of four admits
+    // both runs, and bounded channel receives (not elapsed-time ordering) decide every outcome.
+    #[test]
+    fn startup_slow_initial_run_does_not_block_setup_or_other_plugins() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release-slow");
+        let marker = tmp.path().join("fast-finished");
+        let mut slow = example_spec();
+        slow.manifest.id = PluginId::new("a-slow");
+        slow.mode = PluginMode::OneShot;
+        slow.manifest.contributions.clear();
+        slow.timeout_secs = 30;
+        slow.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "while [ ! -e \"$1\" ]; do sleep 0.05; done".into(),
+            "plugin".into(),
+            release.display().to_string(),
+        ];
+        let mut fast = example_spec();
+        fast.manifest.id = PluginId::new("b-fast");
+        fast.mode = PluginMode::OneShot;
+        fast.manifest.contributions.clear();
+        fast.timeout_secs = 30;
+        fast.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "touch \"$1\"".into(),
+            "plugin".into(),
+            marker.display().to_string(),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let disabled: Disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let stop = Arc::new(StopSignal::default());
+        let (tx, mut rx) = plugin_channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let config_dir = tmp.path().to_path_buf();
+        let state_anchor = tmp.path().join("state");
+        let setup = std::thread::spawn(move || {
+            setup_and_schedule_with_waker(
+                supervisor,
+                vec![slow, fast],
+                config_dir,
+                sessions,
+                disabled,
+                stop,
+                tx,
+                None,
+                OneShotGate::default(),
+                state_anchor,
+            );
+            returned_tx.send(()).unwrap();
+        });
+
+        let setup_returned = returned_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let loaded = matches!(
+            recv_within(&mut rx, Duration::from_secs(10)),
+            Some(PluginMsg::Loaded(_))
+        );
+        let fast_completed = matches!(
+            recv_within(&mut rx, Duration::from_secs(10)),
+            Some(PluginMsg::OneShot { plugin, run: Ok(_) }) if plugin == "b-fast"
+        );
+        let fast_marker_exists = marker.exists();
+        let slow_was_blocked = !release.exists();
+        std::fs::write(&release, "go").unwrap();
+        let slow_completed = matches!(
+            recv_within(&mut rx, Duration::from_secs(10)),
+            Some(PluginMsg::OneShot { plugin, run: Ok(_) }) if plugin == "a-slow"
+        );
+        setup.join().unwrap();
+
+        assert!(setup_returned, "setup waited for an initial plugin run");
+        assert!(loaded, "Loaded was not published before initial runs");
+        assert!(
+            fast_completed,
+            "b-fast did not finish while a-slow was held"
+        );
+        assert!(
+            fast_marker_exists,
+            "b-fast did not create its completion marker"
+        );
+        assert!(
+            slow_was_blocked,
+            "the slow plugin was released before b-fast completed"
+        );
+        assert!(slow_completed, "a-slow did not finish after release");
+    }
+
     #[test]
     fn startup_resolves_plugin_env_before_running_one_shot() {
         let _env = thegn_core::testenv::EnvGuard::set(&[("THEGN_B42_PLUGIN_SECRET", "s3cr3t")]);
@@ -2478,7 +2739,7 @@ mod tests {
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
         assert!(matches!(
-            rx.try_recv().unwrap(),
+            recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
             PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
         ));
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "s3cr3t");
@@ -2528,7 +2789,7 @@ mod tests {
 
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
         assert!(matches!(
-            rx.try_recv().unwrap(),
+            recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
             PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
         ));
         assert_eq!(
@@ -2620,7 +2881,7 @@ mod tests {
                 })
         ));
         assert!(matches!(
-            rx.try_recv().unwrap(),
+            recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
             PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "survivor"
         ));
         assert!(!refused_marker.exists());
