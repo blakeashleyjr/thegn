@@ -33,6 +33,7 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 TRUSTED_NAME_RE = re.compile(r"thegn[A-Za-z0-9._+-]*")
 TARGET_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,}")
 PLACEHOLDER_RE = re.compile(r"@@([A-Z][A-Z0-9_]*)@@")
+RELEASE_TAG_RE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?")
 FORBIDDEN_OUTPUT = ("REPLACE_WITH_", "thegn-dev", ".SRCINFO")
 WINDOWS_ERROR = "Windows release lane is not enabled"
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
@@ -1315,6 +1316,14 @@ def atomic_write_output(output_dir: Path, files: Mapping[Path, str]) -> None:
 
 
 def _run(args: argparse.Namespace) -> None:
+    if args.command == "verify-assets":
+        if RELEASE_TAG_RE.fullmatch(args.tag) is None:
+            raise ReleaseError(f"invalid release tag {args.tag!r}")
+        entries = load_release_manifest(args.release_manifest, args.tag)
+        verified = verify_release_asset_files(entries, args.asset)
+        for name in verified:
+            print(f"{name}: matches the release manifest")
+        return
     manifest_path = args.manifest.resolve()
     root = args.repo_root.resolve()
     manifest = load_manifest(manifest_path)
@@ -1374,12 +1383,6 @@ def _run(args: argparse.Namespace) -> None:
         staged = load_staged_digests(args.staged_digests)
         verify_package_payload(staged, args.payload_root, args.label)
         print(f"{args.label} payload matches staged bytes")
-        return
-    if args.command == "verify-assets":
-        entries = load_release_manifest(args.release_manifest, args.tag)
-        verified = verify_release_asset_files(entries, args.asset)
-        for name in verified:
-            print(f"{name}: matches the release manifest")
         return
     if args.command == "manifest":
         value = build_release_manifest(
