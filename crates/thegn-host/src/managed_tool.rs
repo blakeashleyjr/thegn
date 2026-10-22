@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{NamedTempFile, TempDir};
 use thegn_core::managed_tool::{Arch, ManagedTool, Os, Source};
 use thegn_core::{msg, util};
@@ -214,6 +214,21 @@ fn installer_containment(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallerContainment {
+    Bwrap,
+    HostUnsafe,
+}
+
+impl InstallerContainment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bwrap => "bwrap",
+            Self::HostUnsafe => "host-unsafe",
+        }
+    }
+}
+
 fn installer_command(
     installer: &str,
     inner: &[OsString],
@@ -222,7 +237,7 @@ fn installer_command(
     host_install: HostInstall,
     what: &str,
     tool_bin: Option<&Path>,
-) -> Result<Command> {
+) -> Result<(Command, InstallerContainment)> {
     let host_vars = std::env::vars_os().collect::<Vec<_>>();
     let host_home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -243,6 +258,11 @@ fn installer_command(
         .unwrap_or("installer")
         .to_owned();
     let bwrap = installer_containment(usable_bwrap(), host_install, installer_kind, what)?;
+    let containment = if bwrap.is_some() {
+        InstallerContainment::Bwrap
+    } else {
+        InstallerContainment::HostUnsafe
+    };
     let mut cmd = if let Some(bwrap) = bwrap {
         let argv = installer_bwrap_argv(
             staging,
@@ -261,7 +281,7 @@ fn installer_command(
         cmd
     };
     cmd.env_clear().envs(installer_env(host_vars, home));
-    Ok(cmd)
+    Ok((cmd, containment))
 }
 
 /// Output retained per stream for diagnostics: the first and last bytes only.
@@ -810,6 +830,110 @@ fn installer_workspace(managed: &Path, name: &str) -> Result<(TempDir, TempDir)>
     Ok((home, staging))
 }
 
+struct StagedBinary {
+    target_rel: PathBuf,
+    sha256: String,
+}
+
+fn sha256_file(mut file: std::fs::File) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 32 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_staged_binary(staging: &Path, bin_rel: &Path) -> Result<StagedBinary> {
+    let expected = staging.join(bin_rel);
+    let staging_canon = std::fs::canonicalize(staging)
+        .with_context(|| format!("canonicalize staging directory {}", staging.display()))?;
+    let resolved = std::fs::canonicalize(&expected).with_context(|| {
+        format!(
+            "installer did not produce expected binary {}",
+            expected.display()
+        )
+    })?;
+    anyhow::ensure!(
+        resolved.starts_with(&staging_canon),
+        "installer binary {} resolves outside its staging directory: {}",
+        bin_rel.display(),
+        resolved.display()
+    );
+    let file = thegn_core::fsperm::open_regular_file_nofollow(&resolved)
+        .with_context(|| format!("open staged binary {}", resolved.display()))?;
+    let target_rel = resolved
+        .strip_prefix(&staging_canon)
+        .context("resolved installer binary is outside its canonical staging directory")?
+        .to_path_buf();
+    Ok(StagedBinary {
+        target_rel,
+        sha256: sha256_file(file)?,
+    })
+}
+
+fn provenance_record(
+    staging: &Path,
+    tool: &ManagedTool,
+    source: &'static str,
+    package: &str,
+    bin_rel: &Path,
+    staged: &StagedBinary,
+    containment: InstallerContainment,
+) -> Result<serde_json::Value> {
+    let lockfile_names: &[&str] = match source {
+        "npm" => &["package-lock.json"],
+        "cargo" => &[".crates.toml", ".crates2.json"],
+        _ => anyhow::bail!("unknown managed installer source {source}"),
+    };
+    let mut lockfiles = Vec::new();
+    for name in lockfile_names {
+        let path = staging.join(name);
+        let file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("open installer lock manifest {}", path.display())));
+            }
+        };
+        lockfiles.push(serde_json::json!({
+            "path": name,
+            "sha256": sha256_file(file)?,
+        }));
+    }
+    let installed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_millis();
+    let installed_at_ms =
+        u64::try_from(installed_at_ms).context("installer timestamp exceeds u64 milliseconds")?;
+    Ok(serde_json::json!({
+        "schema": 1,
+        "tool": &tool.name,
+        "source": source,
+        "package": package,
+        "version": &tool.version,
+        "binary": bin_rel.to_string_lossy(),
+        "binary_target": staged.target_rel.to_string_lossy(),
+        "binary_sha256": &staged.sha256,
+        "lockfiles": lockfiles,
+        "containment": containment.as_str(),
+        "installed_at_ms": installed_at_ms,
+    }))
+}
+
+fn write_provenance(staging: &Path, record: &serde_json::Value) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(record).context("serialize installer provenance")?;
+    thegn_core::fsperm::write_owner_only_atomic(&staging.join(".thegn-provenance.json"), &bytes)
+        .context("write managed-tool installer provenance")?;
+    Ok(())
+}
+
 fn promote_staging(staging: &Path, managed: &Path, bin_rel: &Path) -> Result<()> {
     promote_staging_with_rename(staging, managed, bin_rel, |from, to| {
         std::fs::rename(from, to)
@@ -929,7 +1053,7 @@ pub fn acquire(tool: &ManagedTool, host_install: HostInstall) -> Result<()> {
                 staging.path().as_os_str().to_owned(),
                 OsString::from(format!("{package}@{}", tool.version)),
             ];
-            let cmd = installer_command(
+            let (cmd, containment) = installer_command(
                 &installer,
                 &inner,
                 staging.path(),
@@ -943,6 +1067,17 @@ pub fn acquire(tool: &ManagedTool, host_install: HostInstall) -> Result<()> {
                 &format!("npm install {package}@{}", tool.version),
                 &format!("npm install {package}@{} failed", tool.version),
             )?;
+            let staged = verify_staged_binary(staging.path(), &bin_rel)?;
+            let record = provenance_record(
+                staging.path(),
+                tool,
+                "npm",
+                package,
+                &bin_rel,
+                &staged,
+                containment,
+            )?;
+            write_provenance(staging.path(), &record)?;
             promote_staging(staging.path(), &managed, &bin_rel)?;
             let _staging_path = staging.keep();
             drop(home);
@@ -990,7 +1125,7 @@ pub fn acquire(tool: &ManagedTool, host_install: HostInstall) -> Result<()> {
                 staging.path().as_os_str().to_owned(),
                 OsString::from("--locked"),
             ];
-            let cmd = installer_command(
+            let (cmd, containment) = installer_command(
                 &installer,
                 &inner,
                 staging.path(),
@@ -1004,6 +1139,17 @@ pub fn acquire(tool: &ManagedTool, host_install: HostInstall) -> Result<()> {
                 &format!("cargo install {crate_name} --version {}", tool.version),
                 &format!("cargo install {crate_name} {} failed", tool.version),
             )?;
+            let staged = verify_staged_binary(staging.path(), &bin_rel)?;
+            let record = provenance_record(
+                staging.path(),
+                tool,
+                "cargo",
+                crate_name,
+                &bin_rel,
+                &staged,
+                containment,
+            )?;
+            write_provenance(staging.path(), &record)?;
             promote_staging(staging.path(), &managed, &bin_rel)?;
             let _staging_path = staging.keep();
             drop(home);
@@ -2257,5 +2403,161 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
         }
         assert!(ok, "reader threads leaked");
+    }
+
+    #[test]
+    fn installer_verify_refuses_bin_symlink_escaping_staging() {
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        let staging = base.path().join("staging");
+        std::fs::create_dir_all(staging.join("node_modules/.bin")).unwrap();
+        let outside = base.path().join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        match thegn_core::fsperm::create_symlink(
+            &outside,
+            &staging.join("node_modules/.bin/x"),
+            false,
+        ) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create escaping symlink: {error}"),
+        }
+        let result = verify_staged_binary(&staging, Path::new("node_modules/.bin/x"));
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("outside its staging directory"))
+        );
+    }
+
+    #[test]
+    fn installer_verify_follows_in_staging_bin_symlink() {
+        let staging = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::create_dir_all(staging.path().join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(staging.path().join("node_modules/.bin")).unwrap();
+        std::fs::write(staging.path().join("node_modules/pkg/cli.js"), b"#!cli").unwrap();
+        let link = staging.path().join("node_modules/.bin/x");
+        match thegn_core::fsperm::create_symlink(Path::new("../pkg/cli.js"), &link, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create in-staging symlink: {error}"),
+        }
+        let staged =
+            verify_staged_binary(staging.path(), Path::new("node_modules/.bin/x")).unwrap();
+        assert_eq!(staged.target_rel, Path::new("node_modules/pkg/cli.js"));
+        assert_eq!(staged.sha256, format!("{:x}", Sha256::digest(b"#!cli")));
+    }
+
+    #[test]
+    fn installer_verify_refuses_dangling_and_directory_targets() {
+        let staging = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::create_dir_all(staging.path().join("bin")).unwrap();
+        let dangling = staging.path().join("bin/dangling");
+        match thegn_core::fsperm::create_symlink(Path::new("missing"), &dangling, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create dangling symlink: {error}"),
+        }
+        assert!(verify_staged_binary(staging.path(), Path::new("bin/dangling")).is_err());
+        std::fs::create_dir(staging.path().join("bin/directory")).unwrap();
+        assert!(verify_staged_binary(staging.path(), Path::new("bin/directory")).is_err());
+    }
+
+    #[test]
+    fn installer_provenance_is_owner_only_and_promoted_with_the_install() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let managed = root.path().join("tool");
+        let staging = tempfile::Builder::new()
+            .prefix(".tool.staging-")
+            .tempdir_in(root.path())
+            .unwrap();
+        std::fs::create_dir_all(staging.path().join("bin")).unwrap();
+        std::fs::write(staging.path().join("bin/x"), b"new").unwrap();
+        std::fs::write(staging.path().join(".crates2.json"), b"{}").unwrap();
+        let tool = ManagedTool::npm("x", "pkg", "x", "1.2.3");
+        let bin_rel = Path::new("bin/x");
+        let staged = verify_staged_binary(staging.path(), bin_rel).unwrap();
+        let record = provenance_record(
+            staging.path(),
+            &tool,
+            "cargo",
+            "pkg",
+            bin_rel,
+            &staged,
+            InstallerContainment::Bwrap,
+        )
+        .unwrap();
+        write_provenance(staging.path(), &record).unwrap();
+        promote_staging(staging.path(), &managed, bin_rel).unwrap();
+        let record_text = std::fs::read_to_string(managed.join(".thegn-provenance.json")).unwrap();
+        let promoted: serde_json::Value = serde_json::from_str(&record_text).unwrap();
+        assert_eq!(promoted["schema"], 1);
+        assert_eq!(promoted["tool"], "x");
+        assert_eq!(promoted["source"], "cargo");
+        assert_eq!(promoted["package"], "pkg");
+        assert_eq!(promoted["version"], "1.2.3");
+        assert_eq!(
+            promoted["binary_sha256"],
+            format!("{:x}", Sha256::digest(b"new"))
+        );
+        assert_eq!(promoted["binary"], "bin/x");
+        assert_eq!(promoted["binary_target"], "bin/x");
+        assert_eq!(promoted["lockfiles"][0]["path"], ".crates2.json");
+        assert_eq!(
+            promoted["lockfiles"][0]["sha256"],
+            format!("{:x}", Sha256::digest(b"{}"))
+        );
+        assert_eq!(promoted["containment"], "bwrap");
+        assert!(promoted["installed_at_ms"].as_u64().is_some());
+        if let Some(mode) =
+            thegn_core::fsperm::mode_bits(&managed.join(".thegn-provenance.json")).unwrap()
+        {
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn installer_command_reports_containment() {
+        let path = std::env::var("PATH").unwrap();
+        let state = crate::testenv::IsolatedState::with_env(&[("PATH", &path)]);
+        let staging = state.root().join("staging");
+        let home = state.root().join("home");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let inner = [OsString::from("/bin/echo"), OsString::from("installer")];
+        let expected = if usable_bwrap().is_some() {
+            InstallerContainment::Bwrap
+        } else {
+            InstallerContainment::HostUnsafe
+        };
+        let (_command, containment) = installer_command(
+            "/bin/echo",
+            &inner,
+            &staging,
+            &home,
+            HostInstall::AllowUnsafe,
+            "test-tool",
+            None,
+        )
+        .unwrap();
+        assert_eq!(containment, expected);
     }
 }
