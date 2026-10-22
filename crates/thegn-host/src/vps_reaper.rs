@@ -276,7 +276,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
     cleanup_ledger(&records, &live_anywhere);
 }
 
-fn record_account_matches(record: &registry::VpsRecord, ours: &str) -> bool {
+pub(crate) fn record_account_matches(record: &registry::VpsRecord, ours: &str) -> bool {
     record.account.is_empty() || record.account == ours
 }
 
