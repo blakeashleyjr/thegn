@@ -109,7 +109,7 @@ fn installer_toolchain_dirs(
     path_var: Option<&OsStr>,
     host_home: Option<&Path>,
     rustup_home: Option<&Path>,
-    tool_bin: &Path,
+    tool_bin: Option<&Path>,
 ) -> Vec<PathBuf> {
     let Some(host_home) = host_home else {
         return Vec::new();
@@ -129,11 +129,12 @@ fn installer_toolchain_dirs(
     {
         dirs.push(rustup_home.to_path_buf());
     }
-    if let Ok(canonical) = tool_bin.canonicalize()
+    if let Some(tool_bin) = tool_bin
+        && let Ok(canonical) = tool_bin.canonicalize()
         && let Some(prefix) = canonical.parent().and_then(Path::parent)
         && prefix.starts_with(host_home)
         && prefix != host_home
-        && prefix.file_name().is_none_or(|name| name != ".cargo")
+        && (prefix.join("bin/node").exists() || prefix.join("lib/node_modules").is_dir())
     {
         dirs.push(prefix.to_path_buf());
     }
@@ -150,23 +151,60 @@ fn usable_bwrap() -> Option<PathBuf> {
     let path = PathBuf::from(util::which_path("bwrap")?);
     let mut cmd = Command::new(&path);
     cmd.args(["--unshare-user", "--ro-bind", "/", "/", "true"]);
-    run_bounded(&mut cmd, Limits::setup(), false)
-        .is_ok()
-        .then_some(path)
+    run_bounded(
+        &mut cmd,
+        Limits {
+            timeout: Duration::from_secs(10),
+            term_grace: Duration::from_secs(1),
+            read_grace: Duration::from_secs(1),
+        },
+        false,
+    )
+    .is_ok()
+    .then_some(path)
 }
+
+#[derive(Debug)]
+struct InstallerUncontained {
+    what: String,
+    name: String,
+}
+
+impl std::fmt::Display for InstallerUncontained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if std::env::consts::OS == "linux" {
+            write!(
+                f,
+                "refusing to run the {} installer for `{}` uncontained: bubblewrap (bwrap) with user namespaces is not usable here, and npm install scripts / cargo build.rs would run with your host files; install bwrap, or rerun interactively with `thegn mcp install {} --unsafe-host-install`",
+                self.what, self.name, self.name
+            )
+        } else {
+            write!(
+                f,
+                "refusing to run the {} installer for `{}` uncontained: containment is unavailable on this platform, and npm install scripts / cargo build.rs would run with your host files; rerun interactively with `thegn mcp install {} --unsafe-host-install`",
+                self.what, self.name, self.name
+            )
+        }
+    }
+}
+
+impl std::error::Error for InstallerUncontained {}
 
 fn installer_containment(
     bwrap: Option<PathBuf>,
     host_install: HostInstall,
-    what: &str,
+    what: String,
+    name: &str,
 ) -> Result<Option<PathBuf>> {
-    if bwrap.is_some() {
-        return Ok(bwrap);
+    if let Some(bwrap) = bwrap {
+        return Ok(Some(bwrap));
     }
     match host_install {
-        HostInstall::Refuse => anyhow::bail!(
-            "refusing to run the {what} installer uncontained: bubblewrap (bwrap) with user namespaces is not usable here, and npm install scripts / cargo build.rs would run with your host files; install bwrap, or rerun interactively with `thegn mcp install <name> --unsafe-host-install`"
-        ),
+        HostInstall::Refuse => Err(InstallerUncontained {
+            what,
+            name: name.to_owned(),
+        }
+        .into()),
         HostInstall::AllowUnsafe => {
             msg::warn(&format!(
                 "running the {what} installer WITHOUT containment (--unsafe-host-install)"
@@ -174,6 +212,56 @@ fn installer_containment(
             Ok(None)
         }
     }
+}
+
+fn installer_command(
+    installer: &str,
+    inner: &[OsString],
+    staging: &Path,
+    home: &Path,
+    host_install: HostInstall,
+    what: &str,
+    tool_bin: Option<&Path>,
+) -> Result<Command> {
+    let host_vars = std::env::vars_os().collect::<Vec<_>>();
+    let host_home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path != Path::new("/"));
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| host_home.as_ref().map(|path| path.join(".rustup")));
+    let toolchain = installer_toolchain_dirs(
+        std::env::var_os("PATH").as_deref(),
+        host_home.as_deref(),
+        rustup_home.as_deref(),
+        tool_bin,
+    );
+    let installer_kind = Path::new(installer)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("installer")
+        .to_owned();
+    let bwrap = installer_containment(usable_bwrap(), host_install, installer_kind, what)?;
+    let mut cmd = if let Some(bwrap) = bwrap {
+        let argv = installer_bwrap_argv(
+            staging,
+            home,
+            host_home.as_deref(),
+            &installer_hidden_dirs(),
+            &toolchain,
+            inner,
+        );
+        let mut cmd = Command::new(bwrap);
+        cmd.args(argv);
+        cmd
+    } else {
+        let mut cmd = Command::new(installer);
+        cmd.args(&inner[1..]);
+        cmd
+    };
+    cmd.env_clear().envs(installer_env(host_vars, home));
+    Ok(cmd)
 }
 
 /// Output retained per stream for diagnostics: the first and last bytes only.
@@ -834,46 +922,22 @@ pub fn acquire(tool: &ManagedTool, host_install: HostInstall) -> Result<()> {
                 "npm not found — needed to install {package}@{}. Install Node/npm, or put the tool on PATH.",
                 tool.version
             ))?;
-            let host_vars = std::env::vars_os().collect::<Vec<_>>();
-            let host_home = std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .filter(|path| path != Path::new("/"));
-            let rustup_home = std::env::var_os("RUSTUP_HOME")
-                .map(PathBuf::from)
-                .or_else(|| host_home.as_ref().map(|path| path.join(".rustup")));
-            let toolchain = installer_toolchain_dirs(
-                std::env::var_os("PATH").as_deref(),
-                host_home.as_deref(),
-                rustup_home.as_deref(),
-                Path::new(&installer),
-            );
-            let bwrap = installer_containment(usable_bwrap(), host_install, "npm")?;
             let inner = [
-                OsString::from(installer),
+                OsString::from(installer.clone()),
                 OsString::from("install"),
                 OsString::from("--prefix"),
                 staging.path().as_os_str().to_owned(),
                 OsString::from(format!("{package}@{}", tool.version)),
             ];
-            let mut cmd = if let Some(bwrap) = bwrap {
-                let argv = installer_bwrap_argv(
-                    staging.path(),
-                    home.path(),
-                    host_home.as_deref(),
-                    &installer_hidden_dirs(),
-                    &toolchain,
-                    &inner,
-                );
-                let mut cmd = Command::new(bwrap);
-                cmd.args(argv);
-                cmd
-            } else {
-                let mut cmd = Command::new(&inner[0]);
-                cmd.args(&inner[1..]);
-                cmd
-            };
-            cmd.env_clear().envs(installer_env(host_vars, home.path()));
+            let cmd = installer_command(
+                &installer,
+                &inner,
+                staging.path(),
+                home.path(),
+                host_install,
+                &tool.name,
+                Some(Path::new(&installer)),
+            )?;
             run_setup_cmd(
                 cmd,
                 &format!("npm install {package}@{}", tool.version),
@@ -916,23 +980,8 @@ pub fn acquire(tool: &ManagedTool, host_install: HostInstall) -> Result<()> {
                 "cargo not found — needed to install {crate_name} {}. Install the Rust toolchain, or put the tool on PATH.",
                 tool.version
             ))?;
-            let host_vars = std::env::vars_os().collect::<Vec<_>>();
-            let host_home = std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .filter(|path| path != Path::new("/"));
-            let rustup_home = std::env::var_os("RUSTUP_HOME")
-                .map(PathBuf::from)
-                .or_else(|| host_home.as_ref().map(|path| path.join(".rustup")));
-            let toolchain = installer_toolchain_dirs(
-                std::env::var_os("PATH").as_deref(),
-                host_home.as_deref(),
-                rustup_home.as_deref(),
-                Path::new(&installer),
-            );
-            let bwrap = installer_containment(usable_bwrap(), host_install, "cargo")?;
             let inner = [
-                OsString::from(installer),
+                OsString::from(installer.clone()),
                 OsString::from("install"),
                 OsString::from(crate_name),
                 OsString::from("--version"),
@@ -941,24 +990,15 @@ pub fn acquire(tool: &ManagedTool, host_install: HostInstall) -> Result<()> {
                 staging.path().as_os_str().to_owned(),
                 OsString::from("--locked"),
             ];
-            let mut cmd = if let Some(bwrap) = bwrap {
-                let argv = installer_bwrap_argv(
-                    staging.path(),
-                    home.path(),
-                    host_home.as_deref(),
-                    &installer_hidden_dirs(),
-                    &toolchain,
-                    &inner,
-                );
-                let mut cmd = Command::new(bwrap);
-                cmd.args(argv);
-                cmd
-            } else {
-                let mut cmd = Command::new(&inner[0]);
-                cmd.args(&inner[1..]);
-                cmd
-            };
-            cmd.env_clear().envs(installer_env(host_vars, home.path()));
+            let cmd = installer_command(
+                &installer,
+                &inner,
+                staging.path(),
+                home.path(),
+                host_install,
+                &tool.name,
+                None,
+            )?;
             run_setup_cmd(
                 cmd,
                 &format!("cargo install {crate_name} --version {}", tool.version),
@@ -1721,6 +1761,7 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--tmpfs" && pair[1] == "/home")
         );
+        assert_eq!(argv.iter().filter(|arg| *arg == "--tmpfs").count(), 1);
     }
 
     #[test]
@@ -1740,7 +1781,7 @@ mod tests {
             Some(&path),
             Some(home),
             Some(&rustup),
-            Path::new("/usr/bin/npm"),
+            Some(Path::new("/usr/bin/npm")),
         );
         assert!(dirs.contains(&cargo_bin));
         assert!(dirs.contains(&bin));
@@ -1751,23 +1792,84 @@ mod tests {
     }
 
     #[test]
+    fn installer_toolchain_dirs_do_not_bind_nondefault_cargo_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let cargo_bin = home.join(".local/share/cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let cargo = cargo_bin.join("cargo");
+        std::fs::write(&cargo, "cargo").unwrap();
+        let cargo_dirs = installer_toolchain_dirs(None, Some(home), None, Some(&cargo));
+        assert!(
+            !cargo_dirs.contains(&home.join(".local/share/cargo")),
+            "non-default CARGO_HOME and its credentials must not be bound"
+        );
+    }
+
+    #[test]
+    fn installer_toolchain_dirs_bind_grandparent_only_for_node_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let npm_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&npm_bin).unwrap();
+        let npm = npm_bin.join("npm");
+        std::fs::write(&npm, "npm").unwrap();
+        let npm_dirs = installer_toolchain_dirs(None, Some(home), None, Some(&npm));
+        assert!(!npm_dirs.contains(&home.join(".local")));
+
+        std::fs::write(npm_bin.join("node"), "node").unwrap();
+        let node_dirs = installer_toolchain_dirs(None, Some(home), None, Some(&npm));
+        assert!(node_dirs.contains(&home.join(".local")));
+    }
+
+    #[test]
     fn installer_containment_refuses_without_bwrap() {
-        let refused = installer_containment(None, HostInstall::Refuse, "npm");
+        let refused =
+            installer_containment(None, HostInstall::Refuse, "npm".to_owned(), "my-server");
         assert!(matches!(
-            refused,
-            Err(error) if error.to_string().contains("--unsafe-host-install") && error.to_string().contains("bwrap")
+            &refused,
+            Err(error)
+                if error.downcast_ref::<InstallerUncontained>().is_some()
+                    && error.to_string().contains("--unsafe-host-install")
+                    && error.to_string().contains("my-server")
+                    && !error.to_string().contains("<name>")
         ));
+        let message = refused.unwrap_err().to_string();
+        if std::env::consts::OS == "linux" {
+            assert!(message.contains("install bwrap"));
+        } else {
+            assert!(message.contains("containment is unavailable on this platform"));
+            assert!(!message.contains("install bwrap"));
+        }
         assert_eq!(
-            installer_containment(None, HostInstall::AllowUnsafe, "npm").unwrap(),
+            installer_containment(
+                None,
+                HostInstall::AllowUnsafe,
+                "npm".to_owned(),
+                "my-server",
+            )
+            .unwrap(),
             None
         );
         let path = PathBuf::from("/usr/bin/bwrap");
         assert_eq!(
-            installer_containment(Some(path.clone()), HostInstall::Refuse, "npm").unwrap(),
+            installer_containment(
+                Some(path.clone()),
+                HostInstall::Refuse,
+                "npm".to_owned(),
+                "my-server",
+            )
+            .unwrap(),
             Some(path.clone())
         );
         assert_eq!(
-            installer_containment(Some(path.clone()), HostInstall::AllowUnsafe, "npm").unwrap(),
+            installer_containment(
+                Some(path.clone()),
+                HostInstall::AllowUnsafe,
+                "npm".to_owned(),
+                "my-server",
+            )
+            .unwrap(),
             Some(path)
         );
     }
@@ -1824,7 +1926,7 @@ mod tests {
             staging.path(),
             home.path(),
             Some(&fake_home),
-            &installer_hidden_dirs(),
+            &[],
             &[],
             &inner,
         );
