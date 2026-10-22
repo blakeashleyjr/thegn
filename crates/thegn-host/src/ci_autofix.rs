@@ -484,45 +484,66 @@ fn consider_candidate_with_forge(
             item.number
         ));
     }
+    let fresh = provider
+        .pr_status(&loc, PrRef::Number(item.number))
+        .ok()
+        .filter(|pr| {
+            thegn_core::pr_queue::attest_pr_identity(
+                item.pr_url.as_deref(),
+                item.number,
+                &pr.url,
+                pr.number,
+            )
+            .is_ok()
+        });
     let own = crate::pr_agent_lease::observe_own_head(&loc, &entry.head_sha, || {
-        provider
-            .pr_status(&loc, PrRef::Number(item.number))
-            .ok()
-            .filter(|pr| {
-                thegn_core::pr_queue::attest_pr_identity(
-                    item.pr_url.as_deref(),
-                    item.number,
-                    &pr.url,
-                    pr.number,
-                )
-                .is_ok()
-            })
-            .map(|pr| pr.head_ref_oid)
+        fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
     });
-    if let Some(own) = own {
-        match guard.record_own_head(db, &entry.head_sha, &own) {
+    let validation = crate::pr_authorship::revalidate_after_agent(
+        authorship.as_ref(),
+        db,
+        provider,
+        &loc,
+        fresh.as_ref(),
+        own.as_deref(),
+    );
+    if let Err(reason) = validation {
+        match guard.finish(db, Some((PrqStatus::NeedsHuman.as_str(), reason))) {
             Ok(true) => {}
             Ok(false) => {
-                tracing::warn!(target: "thegn::ci_autofix", pr = item.number, "agent push could not be recorded under its lease; next refresh treats it as foreign")
+                tracing::warn!(target: "thegn::ci_autofix", pr = item.number, "CI autofix PR-agent lease was lost before release")
             }
             Err(error) => {
-                tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "agent push could not be recorded under its lease; next refresh treats it as foreign")
+                tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "could not release CI autofix PR-agent lease")
             }
         }
-    }
-    let outcome = if exited_zero {
-        "exit ok"
+        notify(format!("CI autofix for PR #{} held: {reason}", item.number));
     } else {
-        "exit failed"
-    };
-    let finished = format!("CI autofix finished ({outcome}); awaiting the next PR refresh");
-    match guard.finish(db, Some((PrqStatus::BlockedCi.as_str(), &finished))) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(target: "thegn::ci_autofix", pr = item.number, "CI autofix PR-agent lease was lost before release")
+        if let Some(own) = own {
+            match guard.record_own_head(db, &entry.head_sha, &own) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(target: "thegn::ci_autofix", pr = item.number, "agent push could not be recorded under its lease; next refresh treats it as foreign")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "agent push could not be recorded under its lease; next refresh treats it as foreign")
+                }
+            }
         }
-        Err(error) => {
-            tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "could not release CI autofix PR-agent lease")
+        let outcome = if exited_zero {
+            "exit ok"
+        } else {
+            "exit failed"
+        };
+        let finished = format!("CI autofix finished ({outcome}); awaiting the next PR refresh");
+        match guard.finish(db, Some((PrqStatus::BlockedCi.as_str(), &finished))) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(target: "thegn::ci_autofix", pr = item.number, "CI autofix PR-agent lease was lost before release")
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "could not release CI autofix PR-agent lease")
+            }
         }
     }
 }
@@ -748,6 +769,65 @@ mod tests {
             assert!(!handoff.sentinel.exists(), "duplicate ran for {mode:?}");
             assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 1);
         }
+    }
+
+    #[test]
+    fn after_agent_identity_change_skips_the_own_head_record_and_holds_the_row() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        handoff.config.pr_queue.own_prs_only = true;
+        let mut foreign = fixture.proof.clone();
+        foreign.viewer.id = "U_someone_else".into();
+        handoff.forge = fixture.forge(vec![fixture.proof.clone(), fixture.proof.clone(), foreign]);
+        handoff.forge.pr.status_check_rollup = vec![
+            serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                .unwrap(),
+        ];
+
+        consider(&handoff, false);
+
+        assert!(
+            handoff.sentinel.exists(),
+            "the agent should run before post-agent recheck"
+        );
+        assert_eq!(
+            handoff.forge.proof_calls.load(Ordering::SeqCst),
+            3,
+            "expected acquire, pre-dispatch revalidate, and post-agent proof calls"
+        );
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.agent_attempts, 1);
+        assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("held after the agent ran"))
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| notification.message.contains("held after the agent ran"))
+        );
+    }
+
+    #[test]
+    fn after_agent_unchanged_identity_keeps_the_existing_finish() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        handoff.config.pr_queue.own_prs_only = true;
+
+        consider(&handoff, false);
+
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.status, PrqStatus::BlockedCi.as_str());
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("CI autofix finished"))
+        );
     }
 
     #[test]
