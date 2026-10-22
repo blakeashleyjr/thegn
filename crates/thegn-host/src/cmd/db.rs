@@ -45,13 +45,13 @@ pub fn run(action: Action) -> Result<()> {
             let startup_pruned = if dry_run {
                 0
             } else {
-                match Db::open_read_only()? {
+                match Db::open_read_only_current()? {
                     Some(db) => db.expired_read_notification_count(thegn_core::util::now())?,
                     None => 0,
                 }
             };
             let db = if dry_run {
-                Db::open_read_only()?
+                Db::open_read_only_current()?
                     .ok_or_else(|| anyhow::anyhow!("state database does not exist yet"))?
             } else {
                 Db::open()?
@@ -239,6 +239,40 @@ mod tests {
         let dir = tempfile::Builder::new().tempdir().unwrap();
         let db = Db::open_at(&dir.path().join("state.db")).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn dry_run_report_counts_pages_held_in_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Db::open_at(&path).unwrap());
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 CREATE TABLE wal_pages(payload BLOB NOT NULL);
+                 WITH RECURSIVE rows(n) AS (
+                     SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 200
+                 )
+                 INSERT INTO wal_pages(payload) SELECT randomblob(1024) FROM rows;",
+            )
+            .unwrap();
+
+        let current = Db::open_read_only_current_at(&path).unwrap().unwrap();
+        let current_report = vacuum_report(&current, true).unwrap();
+        let immutable = Db::open_read_only_at(&path).unwrap().unwrap();
+        let immutable_report = vacuum_report(&immutable, true).unwrap();
+
+        assert!(
+            current_report.before.page_count > immutable_report.before.page_count,
+            "WAL-aware dry-run page count {} must exceed immutable page count {}",
+            current_report.before.page_count,
+            immutable_report.before.page_count
+        );
+        drop(immutable);
+        drop(current);
+        drop(writer);
     }
 
     #[test]
