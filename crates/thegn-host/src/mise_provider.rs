@@ -1213,7 +1213,18 @@ pub(crate) fn status(
     repo_root: &Path,
     db: Option<&thegn_core::db::Db>,
 ) -> ToolchainStatus {
-    let loc = GitLoc::for_worktree(worktree);
+    // Resolve the location from the caller's handle: doctor passes a read-only DB (or None when no DB exists)
+    // and must never create one, which `GitLoc::for_worktree`'s creating open would do.
+    let path = worktree.to_string_lossy();
+    let loc = GitLoc::from_db(
+        &path,
+        db.and_then(|db| {
+            thegn_core::store::WorkspaceStore::location_for(db, &path)
+                .ok()
+                .flatten()
+        })
+        .as_deref(),
+    );
     if loc.is_remote() {
         let Some(cached) = read_remote_cache(&worktree.to_string_lossy(), &loc) else {
             return ToolchainStatus {
