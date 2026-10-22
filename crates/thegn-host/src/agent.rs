@@ -3214,11 +3214,11 @@ pub fn ensure_remote_bridge(
                 &crate::bridge_sup::resident_bridge_dir(&bridge),
             )
             .await?;
-        provider.ensure_executable(&id, &bridge.path, &data).await
+        provider.ensure_executable(&id, bridge.path(), &data).await
     }) {
         Ok(true) => thegn_core::msg::info(&format!(
             "pushed resident bridge → {id}:{} ({} bytes)",
-            bridge.path,
+            bridge.path(),
             data.len()
         )),
         Ok(false) => {} // already current — digest-verified install remains valid
