@@ -3185,18 +3185,14 @@ fn tail_lines(out: &str, n: usize) -> String {
 pub use crate::env_halt::env_halt_reason;
 
 /// Idempotently install and verify the resident bridge binary in a provider env
-/// before connecting to it. Work runs off-loop via `block_on_provider`; `false`
-/// means the caller must skip bridge setup because no unverified binary may be
-/// launched. No-op success for envs without a file-capable provider.
+/// before connecting to it. Work runs off-loop via `block_on_provider`; `None`
+/// means the caller must skip bridge setup and use the per-operation fallback.
 pub fn ensure_remote_bridge(
     cfg: &Config,
     env_name: &str,
     binary: &Path,
-    remote_path: &str,
-) -> bool {
-    let Some((provider, id, _)) = provider_sync_target(cfg, env_name) else {
-        return true;
-    };
+) -> Option<crate::bridge_sup::ResidentBridge> {
+    let (provider, id, _) = provider_sync_target(cfg, env_name)?;
     let data = match std::fs::read(binary) {
         Ok(d) => d,
         Err(e) => {
@@ -3204,24 +3200,35 @@ pub fn ensure_remote_bridge(
                 "bridge binary unreadable ({}): {e}",
                 binary.display()
             ));
-            return false;
+            return None;
         }
     };
-    match block_on_provider(|| async { provider.ensure_executable(&id, remote_path, &data).await })
-    {
+    let bridge = crate::bridge_sup::resident_bridge_for(&data);
+    match block_on_provider(|| async {
+        provider
+            .ensure_private_exec_dir(
+                &id,
+                crate::bridge_sup::BRIDGE_ROOT,
+                &crate::bridge_sup::resident_bridge_dir(&bridge),
+            )
+            .await?;
+        provider.ensure_executable(&id, bridge.path(), &data).await
+    }) {
         Ok(true) => thegn_core::msg::info(&format!(
-            "pushed resident bridge → {id}:{remote_path} ({} bytes)",
+            "pushed resident bridge → {id}:{} ({} bytes)",
+            bridge.path(),
             data.len()
         )),
-        Ok(false) => {} // already current — no re-push
+        Ok(false) => {} // already current — digest-verified install remains valid
         Err(e) => {
             thegn_core::msg::warn(&format!(
                 "bridge binary install failed; not connecting the resident bridge: {e:#}"
             ));
-            return false;
+            return None;
         }
     }
-    true
+    // The legacy /workspace/.tg/thegn path is no longer launched.
+    Some(bridge)
 }
 
 /// Whether a worktree's persisted remote `location` should be healed back to
