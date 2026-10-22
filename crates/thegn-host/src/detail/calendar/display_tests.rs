@@ -366,7 +366,7 @@ fn agenda_note_of(st: &CalState) -> String {
 
 #[test]
 fn calendar_expansion_failure_is_visible_as_unavailable() {
-    use crate::calendar_docs::CalendarViewError;
+    use crate::calendar_docs::{CacheSkips, CalendarViewError};
     use thegn_core::calendar::{ExpansionError, ExpansionLimit};
     let failed =
         CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::BucketEntries));
@@ -401,7 +401,7 @@ fn calendar_expansion_failure_is_visible_as_unavailable() {
     let note = agenda_note_of(&status_state(
         kept,
         true,
-        Some(CalendarViewError::MalformedCache),
+        Some(CalendarViewError::MalformedCache(CacheSkips::default())),
     ));
     assert!(note.ends_with(" incomplete"), "{note}");
 }
@@ -411,7 +411,7 @@ fn a_failed_month_is_visible_without_the_agenda() {
     // `show_agenda = false` never builds the agenda note, so the grid header
     // has to carry the state — or a first-load failure paints as an ordinary
     // empty month and a stale one paints as current.
-    use crate::calendar_docs::CalendarViewError;
+    use crate::calendar_docs::{CacheSkips, CalendarViewError};
     use thegn_core::calendar::{ExpansionError, ExpansionLimit};
     let failed =
         CalendarViewError::Expansion(ExpansionError::Budget(ExpansionLimit::RetainedBytes));
@@ -456,7 +456,7 @@ fn a_failed_month_is_visible_without_the_agenda() {
         month_status_of(&hide_agenda(status_state(
             events,
             true,
-            Some(CalendarViewError::MalformedCache)
+            Some(CalendarViewError::MalformedCache(CacheSkips::default()))
         )))
         .as_deref(),
         Some("incomplete")

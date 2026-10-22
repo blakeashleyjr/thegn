@@ -13,6 +13,23 @@ use chrono_tz::Tz;
 use thegn_core::calendar::{CalEvent, ClockFormat, ExpansionError, ResolvedClock};
 use thegn_core::config_calendar::CalendarConfig;
 
+/// Value-free counts explaining which cached calendar rows were omitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheSkips {
+    pub undecodable: usize,
+    pub rejected: thegn_svc::calendar::RejectedEvents,
+    pub expansion: usize,
+}
+
+impl CacheSkips {
+    pub fn total(&self) -> usize {
+        self.rejected.counts().into_iter().fold(
+            self.undecodable.saturating_add(self.expansion),
+            |total, (_, count)| total.saturating_add(count),
+        )
+    }
+}
+
 /// Display settings the popup reads, already resolved out of `auto`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalUiCfg {
@@ -38,8 +55,8 @@ pub enum CalendarViewError {
     CacheUnavailable,
     /// The requested local-date range cannot be represented in the home zone.
     InvalidWindow,
-    /// Some cached rows could not be decoded; the rest are shown.
-    MalformedCache,
+    /// Some cached rows could not be decoded, admitted, or expanded; the rest are shown.
+    MalformedCache(CacheSkips),
     /// Expansion refused (budget, invalid span/window, arithmetic).
     Expansion(ExpansionError),
 }
@@ -48,7 +65,7 @@ impl CalendarViewError {
     /// Whether the view still carries the readable data (incomplete) rather
     /// than having none at all (unavailable).
     pub fn is_partial(&self) -> bool {
-        matches!(self, Self::MalformedCache)
+        matches!(self, Self::MalformedCache(_))
     }
 }
 
@@ -57,7 +74,30 @@ impl std::fmt::Display for CalendarViewError {
         match self {
             Self::CacheUnavailable => f.write_str("calendar cache unavailable"),
             Self::InvalidWindow => f.write_str("invalid calendar window"),
-            Self::MalformedCache => f.write_str("calendar cache contains unreadable rows"),
+            Self::MalformedCache(skips) => {
+                f.write_str("calendar cache contains unreadable rows")?;
+                let mut parts = Vec::new();
+                if skips.undecodable > 0 {
+                    parts.push(format!("{} undecodable", skips.undecodable));
+                }
+                let rejected = skips
+                    .rejected
+                    .counts()
+                    .into_iter()
+                    .filter(|(_, count)| *count > 0)
+                    .map(|(defect, count)| format!("{defect} ({count})"))
+                    .collect::<Vec<_>>();
+                if !rejected.is_empty() {
+                    parts.push(format!("rejected: {}", rejected.join(", ")));
+                }
+                if skips.expansion > 0 {
+                    parts.push(format!("{} not expandable", skips.expansion));
+                }
+                if !parts.is_empty() {
+                    write!(f, " ({})", parts.join("; "))?;
+                }
+                Ok(())
+            }
             Self::Expansion(error) => error.fmt(f),
         }
     }
@@ -237,6 +277,29 @@ mod tests {
     use chrono::NaiveDate;
     use thegn_core::calendar::{EventTime, ExpansionLimit};
 
+    #[test]
+    fn cache_skip_text_names_each_value_free_category() {
+        let skips = CacheSkips {
+            undecodable: 2,
+            rejected: thegn_svc::calendar::RejectedEvents {
+                reversed: 1,
+                unknown_zone: 1,
+                ..Default::default()
+            },
+            expansion: 1,
+        };
+        let error = CalendarViewError::MalformedCache(skips);
+        assert_eq!(
+            error.to_string(),
+            "calendar cache contains unreadable rows (2 undecodable; rejected: end precedes start (1), unknown time zone (1); 1 not expandable)"
+        );
+        assert!(error.is_partial());
+
+        let empty = CalendarViewError::MalformedCache(CacheSkips::default());
+        assert_eq!(empty.to_string(), "calendar cache contains unreadable rows");
+        assert!(empty.is_partial());
+    }
+
     fn event() -> Arc<CalEvent> {
         Arc::new(CalEvent::new(
             "one",
@@ -340,7 +403,7 @@ mod tests {
         let mut docs = CalendarDocs::default();
         docs.events.insert(retained, vec![event()]);
 
-        let incomplete = CalendarViewError::MalformedCache;
+        let incomplete = CalendarViewError::MalformedCache(CacheSkips::default());
         docs.merge(&payload(Some(Vec::new()), Some(incomplete)));
 
         assert!(docs.events.contains_key(&retained));
@@ -354,14 +417,14 @@ mod tests {
         let mut docs = CalendarDocs::default();
         docs.merge(&payload(
             Some(vec![(date, vec![event()])]),
-            Some(CalendarViewError::MalformedCache),
+            Some(CalendarViewError::MalformedCache(CacheSkips::default())),
         ));
         assert!(docs.loaded.contains(&month));
         assert_eq!(docs.events[&date].len(), 1);
         assert!(docs.errors[&month].is_partial());
         assert!(!CalendarViewError::CacheUnavailable.is_partial());
         assert_eq!(
-            CalendarViewError::MalformedCache.to_string(),
+            CalendarViewError::MalformedCache(CacheSkips::default()).to_string(),
             "calendar cache contains unreadable rows"
         );
     }

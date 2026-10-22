@@ -701,7 +701,13 @@ fn an_undeserializable_row_is_skipped_not_fatal() {
     // than presented as the whole calendar.
     assert_eq!(cached.skipped, 1);
     let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
-    assert_eq!(view.error, Some(CalendarViewError::MalformedCache));
+    assert_eq!(
+        view.error,
+        Some(CalendarViewError::MalformedCache(CacheSkips {
+            undecodable: 1,
+            ..Default::default()
+        }))
+    );
     let events = view.events.expect("the readable rows still show");
     assert_eq!(events.len(), 1);
 }
@@ -954,7 +960,16 @@ fn one_malformed_row_costs_itself_not_the_month_or_every_reminder() {
 
     // The month shows the readable events, marked incomplete — not blanked.
     let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
-    assert_eq!(view.error, Some(CalendarViewError::MalformedCache));
+    assert_eq!(
+        view.error,
+        Some(CalendarViewError::MalformedCache(CacheSkips {
+            rejected: thegn_svc::calendar::RejectedEvents {
+                reversed: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+    );
     let events = view.events.expect("the readable rows still show");
     assert!(
         events
@@ -966,6 +981,57 @@ fn one_malformed_row_costs_itself_not_the_month_or_every_reminder() {
             .iter()
             .any(|(_, evs)| evs.iter().any(|e| e.uid == "inverted"))
     );
+}
+
+#[test]
+fn cache_skip_categories_reach_the_month_and_reminder_errors() {
+    let t = TmpDb::new("cache-skip-categories");
+    let (from, to) = window();
+    let mut reversed = event("SENTINEL-uid");
+    std::mem::swap(&mut reversed.start, &mut reversed.end);
+    apply_page(
+        &t.db,
+        "work",
+        "ics",
+        &page(vec![reversed], vec![], ""),
+        from,
+        to,
+    );
+    let row_window =
+        CalendarWindow::new(d(2026, 8, 21), d(2026, 8, 21), chrono_tz::Tz::UTC).unwrap();
+    t.db.put_calendar_events(
+        "work",
+        &[CalendarRow {
+            uid: "bad".into(),
+            calendar: String::new(),
+            start_ms: row_window.start_ms,
+            end_ms: row_window.start_ms + 3_600_000,
+            recurring: false,
+            json: "{ not json at all".into(),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+
+    let view = expand_month(&t.db, from, to, chrono_tz::Tz::UTC);
+    let error = view.error.expect("the month reports skipped rows");
+    let CalendarViewError::MalformedCache(skips) = error else {
+        panic!("expected categorized cache error: {error:?}");
+    };
+    let error_text = CalendarViewError::MalformedCache(skips).to_string();
+    assert_eq!(skips.undecodable, 1, "{error_text}");
+    assert_eq!(skips.rejected.reversed, 1, "{error_text}");
+    assert!(error_text.contains("1 undecodable"), "{error_text}");
+    assert!(
+        error_text.contains("end precedes start (1)"),
+        "{error_text}"
+    );
+    assert!(!error_text.contains("SENTINEL"), "{error_text}");
+
+    let reminder = reminder_window(1, utc_ms(2026, 8, 21, 8, 49), utc_ms(2026, 8, 21, 8, 51));
+    let due = due_reminders(&t.db, &reminder_cfg(), reminder).unwrap();
+    assert_eq!(due.skips, skips, "{error_text}");
+    assert_eq!(due.skipped, 2, "{error_text}");
 }
 
 #[test]
@@ -1000,7 +1066,7 @@ fn the_reminder_cursor_advances_only_on_a_current_success() {
     let w = c.begin(5_000).unwrap();
     assert!(c.finish(
         w,
-        ReminderOutcome::Incomplete(CalendarViewError::MalformedCache)
+        ReminderOutcome::Incomplete(CalendarViewError::MalformedCache(CacheSkips::default()))
     ));
     assert_eq!(c.last_checked_ms(), 5_000);
 
