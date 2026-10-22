@@ -2992,6 +2992,14 @@ mod tests {
         captured: Arc<Mutex<Vec<u8>>>,
     }
 
+    type StallWriterFixture = (
+        thegn_core::asciicast::CastWriter<StallSink>,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        Arc<Mutex<Vec<u8>>>,
+    );
+
     impl std::io::Write for StallSink {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             use std::sync::atomic::Ordering;
@@ -3039,15 +3047,7 @@ mod tests {
         actor.recorder = Some(rec);
     }
 
-    fn stall_writer(
-        fail: bool,
-    ) -> (
-        thegn_core::asciicast::CastWriter<StallSink>,
-        Arc<std::sync::atomic::AtomicBool>,
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-        Arc<Mutex<Vec<u8>>>,
-    ) {
+    fn stall_writer(fail: bool) -> StallWriterFixture {
         let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let captured = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
