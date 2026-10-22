@@ -39,6 +39,127 @@ const DOWNLOAD_LIMIT: u64 = 128 * 1024 * 1024;
 const EXTRACTED_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVENANCE_RECORD_LIMIT: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProvenanceCheck {
+    Verified,
+    Missing,
+    Mismatch(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstalledStep {
+    Use,
+    Reinstall,
+    Refuse(String),
+}
+
+fn record_mode_ok(mode: Option<u32>) -> bool {
+    mode.is_none_or(|mode| mode & 0o077 == 0)
+}
+
+fn installed_step(check: ProvenanceCheck) -> InstalledStep {
+    match check {
+        ProvenanceCheck::Verified => InstalledStep::Use,
+        ProvenanceCheck::Missing => InstalledStep::Reinstall,
+        ProvenanceCheck::Mismatch(reason) => InstalledStep::Refuse(reason),
+    }
+}
+
+fn check_installed_provenance(
+    managed: &Path,
+    tool: &ManagedTool,
+    source: &str,
+    package: &str,
+    bin_rel: &Path,
+) -> ProvenanceCheck {
+    let record_path = managed.join(".thegn-provenance.json");
+    let mut file = match thegn_core::fsperm::open_regular_file_nofollow(&record_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProvenanceCheck::Missing;
+        }
+        Err(error) => {
+            return ProvenanceCheck::Mismatch(format!(
+                "install record is not a regular file: {error}"
+            ));
+        }
+    };
+    let mode = match thegn_core::fsperm::mode_bits(&record_path) {
+        Ok(mode) => mode,
+        Err(error) => {
+            return ProvenanceCheck::Mismatch(format!(
+                "inspect install record permissions: {error}"
+            ));
+        }
+    };
+    if !record_mode_ok(mode) {
+        return ProvenanceCheck::Mismatch("install record is readable by other users".to_owned());
+    }
+
+    let mut bytes = Vec::new();
+    if let Err(error) = file
+        .by_ref()
+        .take(PROVENANCE_RECORD_LIMIT)
+        .read_to_end(&mut bytes)
+    {
+        return ProvenanceCheck::Mismatch(format!("read install record: {error}"));
+    }
+    if bytes.len() as u64 >= PROVENANCE_RECORD_LIMIT {
+        return ProvenanceCheck::Mismatch("install record exceeds the 64 KiB limit".to_owned());
+    }
+    let record: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            return ProvenanceCheck::Mismatch(format!("install record is not valid JSON: {error}"));
+        }
+    };
+    let expected_fields = [
+        ("schema", serde_json::json!(1)),
+        ("tool", serde_json::json!(tool.name.as_str())),
+        ("source", serde_json::json!(source)),
+        ("package", serde_json::json!(package)),
+        ("version", serde_json::json!(tool.version.as_str())),
+        (
+            "binary",
+            serde_json::json!(bin_rel.to_string_lossy().to_string()),
+        ),
+    ];
+    for (field, expected) in expected_fields {
+        let found = record
+            .get(field)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if found != expected {
+            return ProvenanceCheck::Mismatch(format!(
+                "install record {field} is {found:?}, expected {expected:?}"
+            ));
+        }
+    }
+
+    let staged = match verify_staged_binary(managed, bin_rel) {
+        Ok(staged) => staged,
+        Err(error) => return ProvenanceCheck::Mismatch(format!("{error:#}")),
+    };
+    let expected_target = record
+        .get("binary_target")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let expected_sha256 = record
+        .get("binary_sha256")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if expected_target != serde_json::json!(staged.target_rel.to_string_lossy().to_string())
+        || expected_sha256 != serde_json::json!(staged.sha256.as_str())
+    {
+        return ProvenanceCheck::Mismatch(
+            "installed binary does not match its install record (sha256 or target changed)"
+                .to_owned(),
+        );
+    }
+    ProvenanceCheck::Verified
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostInstall {
@@ -1235,7 +1356,43 @@ pub(crate) fn install_with(
     host_install: HostInstall,
 ) -> Result<()> {
     if !tool.needs_install(force) {
-        return Ok(());
+        let provenance = match &tool.source {
+            Source::GithubRelease { .. } => return Ok(()),
+            Source::Npm { package } => {
+                let managed = tool.managed_dir();
+                let bin_rel = tool
+                    .bin_path()
+                    .strip_prefix(&managed)
+                    .context("managed binary is outside its install directory")?
+                    .to_path_buf();
+                check_installed_provenance(&managed, tool, "npm", package, &bin_rel)
+            }
+            Source::Cargo { crate_name } => {
+                let managed = tool.managed_dir();
+                let bin_rel = tool
+                    .bin_path()
+                    .strip_prefix(&managed)
+                    .context("managed binary is outside its install directory")?
+                    .to_path_buf();
+                check_installed_provenance(&managed, tool, "cargo", crate_name, &bin_rel)
+            }
+        };
+        match installed_step(provenance) {
+            InstalledStep::Use => return Ok(()),
+            InstalledStep::Reinstall => {
+                msg::info(&format!(
+                    "{}: no install provenance record; reinstalling",
+                    tool.name
+                ));
+            }
+            InstalledStep::Refuse(reason) => {
+                anyhow::bail!(
+                    "managed tool `{}` failed its install provenance check: {reason}; refusing to use it (remove {} and reinstall)",
+                    tool.name,
+                    tool.managed_dir().display()
+                );
+            }
+        }
     }
     acquire(tool, host_install)?;
     mark_installed(tool);
@@ -2551,6 +2708,137 @@ mod tests {
         {
             assert_eq!(mode, 0o600);
         }
+    }
+
+    fn promoted_provenance_fixture() -> (TempDir, PathBuf, ManagedTool, PathBuf) {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let managed = root.path().join("tool");
+        let staging = tempfile::Builder::new()
+            .prefix(".tool.staging-")
+            .tempdir_in(root.path())
+            .unwrap();
+        std::fs::create_dir_all(staging.path().join("bin")).unwrap();
+        std::fs::write(staging.path().join("bin/x"), b"verified binary").unwrap();
+        let tool = ManagedTool::cargo("x", "pkg", "x", "1.2.3");
+        let bin_rel = PathBuf::from("bin/x");
+        let staged = verify_staged_binary(staging.path(), &bin_rel).unwrap();
+        let record = provenance_record(
+            staging.path(),
+            &tool,
+            "cargo",
+            "pkg",
+            &bin_rel,
+            &staged,
+            InstallerContainment::Bwrap,
+        )
+        .unwrap();
+        write_provenance(staging.path(), &record).unwrap();
+        promote_staging(staging.path(), &managed, &bin_rel).unwrap();
+        (root, managed, tool, bin_rel)
+    }
+
+    #[test]
+    fn provenance_check_verifies_a_promoted_install() {
+        let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
+        assert_eq!(
+            check_installed_provenance(&managed, &tool, "cargo", "pkg", &bin_rel),
+            ProvenanceCheck::Verified
+        );
+    }
+
+    #[test]
+    fn provenance_check_flags_a_swapped_binary() {
+        let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
+        std::fs::write(managed.join(&bin_rel), b"replacement binary").unwrap();
+        assert!(matches!(
+            check_installed_provenance(&managed, &tool, "cargo", "pkg", &bin_rel),
+            ProvenanceCheck::Mismatch(reason)
+                if reason.contains("does not match its install record")
+        ));
+    }
+
+    #[test]
+    fn provenance_check_reports_a_missing_record() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let managed = root.path().join("tool");
+        std::fs::create_dir_all(managed.join("bin")).unwrap();
+        std::fs::write(managed.join("bin/x"), b"legacy binary").unwrap();
+        let tool = ManagedTool::cargo("x", "pkg", "x", "1.2.3");
+        assert_eq!(
+            check_installed_provenance(&managed, &tool, "cargo", "pkg", Path::new("bin/x")),
+            ProvenanceCheck::Missing
+        );
+    }
+
+    #[test]
+    fn provenance_check_refuses_another_version() {
+        let (_root, managed, _tool, bin_rel) = promoted_provenance_fixture();
+        let other_version = ManagedTool::cargo("x", "pkg", "x", "1.2.4");
+        assert!(matches!(
+            check_installed_provenance(&managed, &other_version, "cargo", "pkg", &bin_rel),
+            ProvenanceCheck::Mismatch(reason) if reason.contains("version")
+        ));
+    }
+
+    #[test]
+    fn provenance_check_refuses_another_package() {
+        let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
+        assert!(matches!(
+            check_installed_provenance(&managed, &tool, "cargo", "other-pkg", &bin_rel),
+            ProvenanceCheck::Mismatch(reason) if reason.contains("package")
+        ));
+    }
+
+    #[test]
+    fn provenance_check_refuses_an_unparsable_record() {
+        let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
+        thegn_core::fsperm::write_owner_only_atomic(
+            &managed.join(".thegn-provenance.json"),
+            b"not json",
+        )
+        .unwrap();
+        assert!(matches!(
+            check_installed_provenance(&managed, &tool, "cargo", "pkg", &bin_rel),
+            ProvenanceCheck::Mismatch(reason) if reason.contains("valid JSON")
+        ));
+    }
+
+    #[test]
+    fn provenance_check_refuses_a_group_readable_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
+        let record = managed.join(".thegn-provenance.json");
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            check_installed_provenance(&managed, &tool, "cargo", "pkg", &bin_rel),
+            ProvenanceCheck::Mismatch(reason) if reason.contains("readable by other users")
+        ));
+    }
+
+    #[test]
+    fn provenance_record_mode_ok_requires_owner_only() {
+        assert!(record_mode_ok(Some(0o600)));
+        assert!(record_mode_ok(Some(0o400)));
+        assert!(record_mode_ok(None));
+        assert!(!record_mode_ok(Some(0o640)));
+        assert!(!record_mode_ok(Some(0o644)));
+    }
+
+    #[test]
+    fn installed_step_maps_each_check() {
+        assert_eq!(
+            installed_step(ProvenanceCheck::Verified),
+            InstalledStep::Use
+        );
+        assert_eq!(
+            installed_step(ProvenanceCheck::Missing),
+            InstalledStep::Reinstall
+        );
+        assert_eq!(
+            installed_step(ProvenanceCheck::Mismatch("x".to_owned())),
+            InstalledStep::Refuse("x".to_owned())
+        );
     }
 
     #[test]
