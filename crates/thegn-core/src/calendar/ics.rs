@@ -1237,10 +1237,13 @@ impl Builder {
         let end = self.end.as_ref().map(day_of).unwrap_or_else(|| {
             let extra = self.duration.map_or(0, |d| d.num_days()).max(0) + 1;
             start
-                .checked_add_signed(chrono::Duration::days(extra))
+                .checked_add_signed(
+                    chrono::Duration::try_days(extra).unwrap_or(chrono::Duration::MAX),
+                )
                 .unwrap_or(NaiveDate::MAX)
         });
-        let span = chrono::Duration::days((end - start).num_days().max(0));
+        let span = chrono::Duration::try_days((end - start).num_days().max(0))
+            .unwrap_or(chrono::Duration::MAX);
         let reaches =
             |d: NaiveDate| d <= hi && d.checked_add_signed(span).unwrap_or(NaiveDate::MAX) >= lo;
         if self.rdates.iter().any(|t| reaches(day_of(t))) || reaches(start) {
