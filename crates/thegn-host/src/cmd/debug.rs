@@ -84,8 +84,8 @@ fn path(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `bs`, installing the managed copy if that's the selected tier and it
-/// isn't current. Returns the binary path to exec.
+/// Resolve `bs`, installing or verifying the managed copy when that's the
+/// selected tier. Returns the binary path to exec only after that check.
 fn ensure_bin(cfg: &Config) -> Result<String> {
     require_supported()?;
     let tool = bs_tool();
@@ -98,8 +98,8 @@ fn ensure_bin(cfg: &Config) -> Result<String> {
         Resolution::Managed { path, current } => {
             if !current {
                 msg::info(&format!("installing BugStalker {} via cargo", tool.version));
-                crate::managed_tool::install(&tool, false)?;
             }
+            crate::managed_tool::install(&tool, false)?;
             Ok(path)
         }
     }
