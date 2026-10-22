@@ -806,6 +806,110 @@ fn wal_aware_read_only_open_sees_uncheckpointed_rows() {
 }
 
 #[test]
+fn read_only_current_sees_rows_held_only_in_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.db");
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE marker(value TEXT NOT NULL);
+             PRAGMA wal_checkpoint(TRUNCATE);
+             INSERT INTO marker(value) VALUES ('in-wal');",
+        )
+        .unwrap();
+    let before_bytes = std::fs::read(&path).unwrap();
+    let before_entries = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let reader = Db::open_read_only_current_at(&path).unwrap().unwrap();
+    let value: String = reader
+        .conn
+        .query_row("SELECT value FROM marker", [], |row| row.get(0))
+        .unwrap();
+    let after_entries = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(value, "in-wal");
+    assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+    assert_eq!(after_entries, before_entries);
+    drop(reader);
+    drop(writer);
+}
+
+#[test]
+fn read_only_current_refuses_a_wal_without_its_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.db");
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE marker(value TEXT);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(writer);
+    let shm = shm_sidecar(&path);
+    if shm.exists() {
+        std::fs::remove_file(&shm).unwrap();
+    }
+    std::fs::write(wal_sidecar(&path), b"not empty").unwrap();
+
+    let result = Db::open_read_only_current_at(&path);
+    assert!(matches!(
+        result,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<ReadOnlyOpenError>(),
+                Some(ReadOnlyOpenError::WalWithoutIndex { path: refused }) if refused == &path
+            ) && error.to_string().contains("write-ahead log")
+    ));
+}
+
+#[test]
+fn read_only_current_keeps_the_immutable_view_without_a_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpointed.db");
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE marker(value TEXT);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(writer);
+    let wal = wal_sidecar(&path);
+    let shm = shm_sidecar(&path);
+    let journal = PathBuf::from(format!("{}-journal", path.display()));
+    for sidecar in [&wal, &shm, &journal] {
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar).unwrap();
+        }
+    }
+
+    assert!(Db::open_read_only_current_at(&path).unwrap().is_some());
+    assert!(!wal.exists());
+    assert!(!shm.exists());
+    assert!(!journal.exists());
+}
+
+#[test]
+fn read_only_current_missing_file_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.db");
+
+    assert!(Db::open_read_only_current_at(&path).unwrap().is_none());
+    assert!(!path.exists());
+}
+
+#[test]
 fn explicit_db_open_restricts_created_state_to_owner() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("profile/state/thegn");
