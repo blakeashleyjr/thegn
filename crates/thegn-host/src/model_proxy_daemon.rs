@@ -601,7 +601,7 @@ pub fn spawn_supervisor(cfg: &Config) {
     }
     let mp = cfg.model_proxy.clone();
     std::thread::Builder::new()
-        .name("model-proxy-sup".into())
+        .name("thegn-proxy-sup".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let mut failures: u32 = 0;

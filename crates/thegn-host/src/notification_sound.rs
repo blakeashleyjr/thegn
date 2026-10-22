@@ -125,7 +125,7 @@ impl SoundRuntime {
         let runtime = Arc::downgrade(self);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
-            .name("notify-sound-config".into())
+            .name("thegn-sound-cfg".into())
             .spawn(move || {
                 let _done = SignalDone(done_tx);
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
@@ -253,7 +253,7 @@ impl SoundRuntime {
         let runtime = Arc::downgrade(self);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
-            .name("notify-sound".into())
+            .name("thegn-sound".into())
             .spawn(move || {
                 let _done = SignalDone(done_tx);
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);

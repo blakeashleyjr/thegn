@@ -289,7 +289,7 @@ pub fn spawn_detector(
     // sandboxed); a successful probe resets it to `poll`.
     let idle_backoff = poll.saturating_mul(8).max(Duration::from_secs(10));
     std::thread::Builder::new()
-        .name("tgforward".into())
+        .name("thegn-forward".into())
         .spawn(move || {
             // Background: a fixed-cadence sampler (poll + backoff) — the result lands
             // at the poll cadence regardless of scheduling, like the proc/metrics samplers.

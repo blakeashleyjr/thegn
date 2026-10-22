@@ -108,7 +108,7 @@ pub(crate) fn spawn(
         crate::platform::qos::Qos::Background
     };
     let join = std::thread::Builder::new()
-        .name("desktop-notify".into())
+        .name("thegn-desk-ntfy".into())
         .spawn(move || {
             crate::platform::qos::set_self(qos);
             let healthy = run_dispatcher(rx, enabled, min_urgency, worker_stop);

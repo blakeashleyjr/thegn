@@ -557,7 +557,7 @@ fn clone_workspace_repo_with_deadline(
         let mut reader = if let Some(stderr) = child.stderr.take() {
             let reader_last_output_ms = last_output_ms.clone();
             match std::thread::Builder::new()
-                .name("workspace-clone-progress".into())
+                .name("thegn-clone-prg".into())
                 .spawn(move || {
                     crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                     stream_progress_lines_with_activity(
