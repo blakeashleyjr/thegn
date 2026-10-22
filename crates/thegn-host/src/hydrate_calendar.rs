@@ -530,6 +530,17 @@ fn diagnostics_notice(
             now.unresolved_zones
         ));
     }
+    let rejected = now
+        .rejected
+        .counts()
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(defect, count)| format!("{defect} ({count})"))
+        .collect::<Vec<_>>();
+    if !rejected.is_empty() {
+        text.push_str("; rejected: ");
+        text.push_str(&rejected.join(", "));
+    }
     Some(text)
 }
 

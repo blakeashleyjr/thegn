@@ -268,6 +268,8 @@ pub struct EventPage {
     lease: AdmissionLease,
 }
 
+use thegn_core::calendar::validate::EventDefect;
+
 /// Value-free counts of parser diagnostics accumulated while building a page.
 /// Counts are diagnostic records, not events: one event may contribute more
 /// than one count.
@@ -281,6 +283,50 @@ pub struct PageDiagnostics {
     pub other: usize,
     /// Diagnostics beyond the parser's bounded report capacity, counted but not retained.
     pub overflow: usize,
+    /// Breakdown of validator rejections by defect; each such event is ALSO counted in
+    /// `quarantined_events`, so this is not added to `total()`.
+    pub rejected: RejectedEvents,
+}
+
+/// Counts of validator-rejected events by value-free defect category.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RejectedEvents {
+    pub empty_uid: usize,
+    pub mixed_shape: usize,
+    pub reversed: usize,
+    pub recurrence_shape: usize,
+    pub unknown_zone: usize,
+}
+
+impl RejectedEvents {
+    fn bump(&mut self, defect: EventDefect) {
+        let count = match defect {
+            EventDefect::EmptyUid => &mut self.empty_uid,
+            EventDefect::MixedShape => &mut self.mixed_shape,
+            EventDefect::Reversed => &mut self.reversed,
+            EventDefect::RecurrenceShape => &mut self.recurrence_shape,
+            EventDefect::UnknownZone => &mut self.unknown_zone,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    fn absorb(&mut self, other: RejectedEvents) {
+        self.empty_uid = self.empty_uid.saturating_add(other.empty_uid);
+        self.mixed_shape = self.mixed_shape.saturating_add(other.mixed_shape);
+        self.reversed = self.reversed.saturating_add(other.reversed);
+        self.recurrence_shape = self.recurrence_shape.saturating_add(other.recurrence_shape);
+        self.unknown_zone = self.unknown_zone.saturating_add(other.unknown_zone);
+    }
+
+    pub fn counts(&self) -> [(EventDefect, usize); 5] {
+        [
+            (EventDefect::EmptyUid, self.empty_uid),
+            (EventDefect::MixedShape, self.mixed_shape),
+            (EventDefect::Reversed, self.reversed),
+            (EventDefect::RecurrenceShape, self.recurrence_shape),
+            (EventDefect::UnknownZone, self.unknown_zone),
+        ]
+    }
 }
 
 impl PageDiagnostics {
@@ -297,6 +343,7 @@ impl PageDiagnostics {
                     diagnostics.quarantined_events =
                         diagnostics.quarantined_events.saturating_add(1);
                 }
+                IcsDiagnostic::RejectedEvent(defect) => diagnostics.rejected.bump(*defect),
                 IcsDiagnostic::UnknownTimeZone | IcsDiagnostic::UnmappedTimeZone => {
                     diagnostics.unresolved_zones = diagnostics.unresolved_zones.saturating_add(1);
                 }
@@ -321,6 +368,7 @@ impl PageDiagnostics {
         self.unresolved_zones = self.unresolved_zones.saturating_add(other.unresolved_zones);
         self.other = self.other.saturating_add(other.other);
         self.overflow = self.overflow.saturating_add(other.overflow);
+        self.rejected.absorb(other.rejected);
     }
 
     pub fn total(&self) -> usize {
