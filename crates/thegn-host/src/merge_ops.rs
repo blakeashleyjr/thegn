@@ -565,6 +565,28 @@ pub fn clear_repo(cfg: &Config, db: &Db, root: &Path) -> Result<usize> {
     })
 }
 
+/// Read token-free claim views for the listed rows. A failed observation is
+/// retained for the panel to display, while remaining rows are still checked.
+pub(crate) fn collect_claims(
+    db: &impl WorktreeAuxStore,
+    rows: &[MergeQueueRow],
+) -> (Vec<MergeClaimView>, Option<String>) {
+    let mut claims = Vec::new();
+    let mut first_error = None;
+    for row in rows {
+        match db.observe_merge_claim(&row.worktree) {
+            Ok(Some(view)) if view.phase != "unclaimed" => claims.push(view),
+            Ok(_) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+    (claims, first_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1194,6 +1216,46 @@ mod tests {
             land_row("ready", Some("oid"), "local", "second"),
         ];
         assert_eq!(clear_rows(&rows, |_| Ok(())).unwrap(), 2);
+    }
+
+    #[test]
+    fn collect_claims_reads_an_admitted_claim_and_omits_unclaimed_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let claimed_repo = temp.path().join("claimed");
+        let unclaimed_repo = temp.path().join("unclaimed");
+        init_repo(&claimed_repo);
+        init_repo(&unclaimed_repo);
+        let claimed_worktree = claimed_repo.to_string_lossy().into_owned();
+        let unclaimed_worktree = unclaimed_repo.to_string_lossy().into_owned();
+        let db = Db::open_memory().unwrap();
+
+        for worktree in [&claimed_worktree, &unclaimed_worktree] {
+            db.put_worktree("main", worktree, worktree, "main", None, None)
+                .unwrap();
+            db.enqueue_merge(worktree, "main", "main").unwrap();
+            db.update_merge_status(worktree, "ready", Some("fold-oid"), None, None)
+                .unwrap();
+        }
+        db.admit_merge_claim(&MergeClaimRequest {
+            worktree: claimed_worktree.clone(),
+            branch: "main".to_owned(),
+            repo_root: claimed_worktree.clone(),
+            target_branch: "main".to_owned(),
+            location: String::new(),
+            expected_status: "ready".to_owned(),
+            lease_until_ms: util::now_ms() + 60_000,
+            owner_hint: Some("test-drain".to_owned()),
+        })
+        .unwrap()
+        .unwrap();
+
+        let rows = db.list_merge_queue().unwrap();
+        let (claims, error) = collect_claims(&db, &rows);
+        assert_eq!(error, None);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].worktree, claimed_worktree);
+        assert_eq!(claims[0].owner_hint.as_deref(), Some("test-drain"));
+        assert!(!claims[0].phase.is_empty());
     }
 }
 

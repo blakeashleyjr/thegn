@@ -45,6 +45,9 @@ is not shown in rail mode. The bottom-bar summary is opt-in: set
 - `thegn merge list` shows the drain holding each row (its owner, claim
   phase and lease), and `--json` adds a `claim` object (`null` when
   unclaimed); the claim token is never shown.
+- The Merge queue panel shows the same claim: a held row is marked `claimed`,
+  and Full view names the owner, claim phase and lease (or says an expired
+  claim is recoverable).
 - `thegn integrate` does the same from any shell. It prints the branches
   it is about to fold and asks before folding any of them; `--dry-run`
   prints that plan and stops, and `--yes` skips the prompt (required to
