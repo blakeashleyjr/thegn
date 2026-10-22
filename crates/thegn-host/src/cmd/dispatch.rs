@@ -53,6 +53,12 @@ pub enum Action {
         /// waiting_human / pr_open) — what a supervisor resumes from.
         #[arg(long)]
         active: bool,
+        /// Rows per history page (newest first; default 2048, at most 4096).
+        #[arg(long, conflicts_with = "active", value_parser = clap::value_parser!(u64).range(1..=4096))]
+        limit: Option<u64>,
+        /// Show rows older than this row id (the cursor a truncated page prints).
+        #[arg(long, conflicts_with = "active")]
+        before: Option<i64>,
         /// Emit JSON instead of the human table.
         #[arg(long)]
         json: bool,
@@ -340,6 +346,12 @@ pub enum Action {
         /// Include every row (terminals too), not just active ones.
         #[arg(long)]
         all: bool,
+        /// Rows per history page (newest first; default 2048, at most 4096).
+        #[arg(long, requires = "all", conflicts_with = "row", value_parser = clap::value_parser!(u64).range(1..=4096))]
+        limit: Option<u64>,
+        /// Show rows older than this row id (the cursor a truncated page prints).
+        #[arg(long, requires = "all", conflicts_with = "row")]
+        before: Option<i64>,
         /// Emit as JSON (one digest array; row mode adds a `notes` array).
         #[arg(long)]
         json: bool,
@@ -467,7 +479,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         WorkerRoute::Local => {}
     }
     match action {
-        Action::List { active, json } => list(active, json),
+        Action::List {
+            active,
+            limit,
+            before,
+            json,
+        } => list(active, HistoryPage::from_args(limit, before)?, json),
         Action::Reap { apply, json } => reap(cfg, apply, json),
         Action::Claim {
             issue_id,
@@ -662,8 +679,16 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             row,
             since,
             all,
+            limit,
+            before,
             json,
-        } => status(row, since, all, json),
+        } => status(
+            row,
+            since,
+            all,
+            HistoryPage::from_args(limit, before)?,
+            json,
+        ),
     }
 }
 
@@ -1390,16 +1415,48 @@ fn bounded_rows(
     Ok((rows, truncated))
 }
 
-fn list_rows(db: &Db, active: bool) -> Result<(Vec<AgentDispatch>, bool)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryPage {
+    limit: usize,
+    before: Option<i64>,
+}
+
+impl Default for HistoryPage {
+    fn default() -> Self {
+        Self {
+            limit: Db::ROSTER_HISTORY_LIMIT,
+            before: None,
+        }
+    }
+}
+
+impl HistoryPage {
+    #[allow(
+        clippy::unnecessary_fallible_conversions,
+        clippy::useless_conversion,
+        reason = "the u64 CLI value must convert safely on 32-bit targets"
+    )]
+    fn from_args(limit: Option<u64>, before: Option<i64>) -> Result<Self> {
+        Ok(Self {
+            limit: limit
+                .map(usize::try_from)
+                .transpose()?
+                .unwrap_or(Db::ROSTER_HISTORY_LIMIT),
+            before,
+        })
+    }
+}
+
+fn list_rows(db: &Db, active: bool, page: HistoryPage) -> Result<(Vec<AgentDispatch>, bool)> {
     if !active {
-        return Ok((db.list_dispatches()?, false));
+        return db.dispatch_history_page(page.before, page.limit);
     }
     bounded_rows(db, &ACTIVE_STATUSES, "dispatch list --active shows")
 }
 
-fn list(active: bool, json: bool) -> Result<()> {
+fn list(active: bool, page: HistoryPage, json: bool) -> Result<()> {
     let db = Db::open()?;
-    let (rows, _) = list_rows(&db, active)?;
+    let (rows, truncated) = list_rows(&db, active, page)?;
     let overrides = db.dispatch_overrides()?;
     if json {
         // One value per row: stored fields, the admitted ownership snapshot,
@@ -1451,7 +1508,15 @@ fn list(active: bool, json: bool) -> Result<()> {
             };
             vals.push(v);
         }
-        return super::emit_json(&vals);
+        super::emit_json(&vals)?;
+        if truncated {
+            let last_id = rows.last().expect("truncated page has a row").id;
+            thegn_core::msg::warn(&format!(
+                "dispatch list shows the newest {} rows of this page; older rows: `thegn dispatch list --before {last_id}`",
+                rows.len()
+            ));
+        }
+        return Ok(());
     }
     if rows.is_empty() {
         outln!("no dispatches");
@@ -1527,6 +1592,13 @@ fn list(active: bool, json: bool) -> Result<()> {
              bookkeeping lost the row rather than the work being bad; read the report with \
              `thegn dispatch status <id>` before re-running anything."
         );
+    }
+    if truncated {
+        let last_id = rows.last().expect("truncated page has a row").id;
+        thegn_core::msg::warn(&format!(
+            "dispatch list shows the newest {} rows of this page; older rows: `thegn dispatch list --before {last_id}`",
+            rows.len()
+        ));
     }
     Ok(())
 }
@@ -2607,9 +2679,15 @@ fn newest_status_notes(notes: &[DispatchNote]) -> &[DispatchNote] {
 /// digest array (row mode: one digest + `notes` array). Human: one line
 /// per row `id status stage issue notes=N last=<truncated latest>` and, in
 /// row mode, the report body printed verbatim under a `report:` line.
-fn status(row: Option<i64>, since_ms: Option<i64>, all: bool, json: bool) -> Result<()> {
+fn status(
+    row: Option<i64>,
+    since_ms: Option<i64>,
+    all: bool,
+    page: HistoryPage,
+    json: bool,
+) -> Result<()> {
     let db = Db::open()?;
-    read_status(&db, row, since_ms, all, json)
+    read_status(&db, row, since_ms, all, page, json)
 }
 
 /// THE-88 — the DB-bound half of `dispatch status`. Tests exercise the
@@ -2619,19 +2697,26 @@ pub(crate) fn read_status(
     row: Option<i64>,
     since_ms: Option<i64>,
     all: bool,
+    page: HistoryPage,
     json: bool,
 ) -> Result<()> {
-    let rows = if let Some(id) = row {
-        match db.get_dispatch(id)? {
-            Some(row) => vec![row],
-            None => {
-                anyhow::bail!("no dispatch with id {id}");
-            }
-        }
+    let (rows, truncated) = if let Some(id) = row {
+        (
+            match db.get_dispatch(id)? {
+                Some(row) => vec![row],
+                None => {
+                    anyhow::bail!("no dispatch with id {id}");
+                }
+            },
+            false,
+        )
     } else if all {
-        db.list_dispatches()?
+        db.dispatch_history_page(page.before, page.limit)?
     } else {
-        bounded_rows(db, &ACTIVE_STATUSES, "dispatch status shows")?.0
+        (
+            bounded_rows(db, &ACTIVE_STATUSES, "dispatch status shows")?.0,
+            false,
+        )
     };
 
     let row_mode = row.is_some();
@@ -2719,6 +2804,13 @@ pub(crate) fn read_status(
                 }
             }
         }
+    }
+    if truncated {
+        let last_id = rows.last().expect("truncated page has a row").id;
+        thegn_core::msg::warn(&format!(
+            "dispatch status --all shows the newest {} rows; older rows: `thegn dispatch status --all --before {last_id}`",
+            rows.len()
+        ));
     }
     Ok(())
 }
@@ -4599,14 +4691,23 @@ mod tests {
         write_note(&db, active.id, "first", false).unwrap();
 
         // List mode: only the active row (no `all`, no `row`).
-        read_status(&db, None, None, false, false).unwrap();
+        read_status(&db, None, None, false, HistoryPage::default(), false).unwrap();
         // Row mode: that one active row, report under `report:`.
-        read_status(&db, Some(active.id), None, false, false).unwrap();
+        read_status(
+            &db,
+            Some(active.id),
+            None,
+            false,
+            HistoryPage::default(),
+            false,
+        )
+        .unwrap();
         // `--all` would include the done row, but we don't capture stdout
         // here; the contract is asserted in the digest composition below.
 
         // Unknown row mode is refused with the id named.
-        let err = read_status(&db, Some(99), None, false, false).unwrap_err();
+        let err =
+            read_status(&db, Some(99), None, false, HistoryPage::default(), false).unwrap_err();
         assert!(err.to_string().contains("99"), "{err}");
 
         // The notes read is since-filtered and bounded to the newest 20;
@@ -4796,7 +4897,8 @@ mod tests {
     #[test]
     fn status_missing_row_keeps_the_exact_id_error() {
         let (_dir, db) = db("status-missing-row-error");
-        let err = read_status(&db, Some(9876), None, false, false).unwrap_err();
+        let err =
+            read_status(&db, Some(9876), None, false, HistoryPage::default(), false).unwrap_err();
         assert_eq!(err.to_string(), "no dispatch with id 9876");
     }
 
@@ -5083,6 +5185,8 @@ mod tests {
             (
                 Action::List {
                     active: false,
+                    limit: None,
+                    before: None,
                     json: false,
                 },
                 WorkerRoute::Local,
@@ -5106,6 +5210,8 @@ mod tests {
                     row: None,
                     since: None,
                     all: false,
+                    limit: None,
+                    before: None,
                     json: false,
                 },
                 WorkerRoute::Local,
@@ -5405,7 +5511,7 @@ mod tests {
         poison_terminal_report(&db.file_path().unwrap(), terminal.id);
 
         assert_eq!(active.status, AgentDispatchStatus::Queued);
-        assert!(read_status(&db, None, None, false, true).is_ok());
+        assert!(read_status(&db, None, None, false, HistoryPage::default(), true).is_ok());
     }
 
     #[test]
@@ -5441,7 +5547,7 @@ mod tests {
         drop(conn);
         poison_terminal_report(&path, terminal.id);
 
-        let (rows, truncated) = list_rows(&db, true).unwrap();
+        let (rows, truncated) = list_rows(&db, true, HistoryPage::default()).unwrap();
         assert_eq!(
             rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             [older.id, newer.id]
@@ -5534,7 +5640,7 @@ mod tests {
         .unwrap();
         poison_terminal_report(&db.file_path().unwrap(), terminal.id);
 
-        assert!(list_rows(&db, false).is_err());
+        assert!(list_rows(&db, false, HistoryPage::default()).is_err());
     }
 
     #[test]
@@ -5693,5 +5799,85 @@ mod tests {
             subdirectory_error.contains(&subdirectory.display().to_string()),
             "{subdirectory_error}"
         );
+    }
+
+    #[test]
+    fn history_page_list_reads_only_the_newest_page() {
+        let (_dir, db) = db("history-page-list");
+        for index in 0..3 {
+            put(
+                &db,
+                NewDispatch::new(
+                    &format!("linear:PAGE-{index}"),
+                    "/wt/history-page-list",
+                    "codex",
+                ),
+            )
+            .unwrap();
+        }
+        let expected = db
+            .list_dispatches()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        let (newest, truncated) = list_rows(
+            &db,
+            false,
+            HistoryPage {
+                limit: 2,
+                before: None,
+            },
+        )
+        .unwrap();
+        assert!(truncated);
+        assert_eq!(
+            newest.iter().map(|row| row.id).collect::<Vec<_>>(),
+            expected[..2]
+        );
+        let (older, truncated) = list_rows(
+            &db,
+            false,
+            HistoryPage {
+                limit: 2,
+                before: newest.last().map(|row| row.id),
+            },
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            older.iter().map(|row| row.id).collect::<Vec<_>>(),
+            expected[2..]
+        );
+    }
+
+    #[test]
+    fn history_page_flags_parse_only_for_history_modes() {
+        use clap::Parser as _;
+
+        for args in [
+            vec![
+                "thegn", "dispatch", "list", "--limit", "10", "--before", "3",
+            ],
+            vec!["thegn", "dispatch", "status", "--all", "--limit", "5"],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["thegn", "dispatch", "list", "--active", "--limit", "2"],
+            vec!["thegn", "dispatch", "status", "--limit", "2"],
+            vec!["thegn", "dispatch", "status", "4", "--all", "--before", "1"],
+            vec!["thegn", "dispatch", "list", "--limit", "0"],
+            vec!["thegn", "dispatch", "list", "--limit", "4097"],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn history_page_limits_match_the_roster_constants() {
+        assert_eq!(Db::ROSTER_HISTORY_LIMIT, 2048);
+        assert_eq!(Db::ROSTER_ACTIVE_LIMIT, 4096);
+        assert_eq!(HistoryPage::default().limit, Db::ROSTER_HISTORY_LIMIT);
     }
 }
