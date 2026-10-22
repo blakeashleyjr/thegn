@@ -4622,8 +4622,9 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                     }
                     if let Ok(cached) = db.get_all_issue_cache(path) {
                         for (_provider, cache_json) in cached {
-                            let Ok(issues) =
-                                serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&cache_json)
+                            let Some(issues) =
+                                thegn_core::issue::IssueCacheEntry::parse(&cache_json)
+                                    .map(|entry| entry.issues)
                             else {
                                 continue;
                             };
