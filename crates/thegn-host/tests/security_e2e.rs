@@ -15,6 +15,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 
 struct Captured {
+    program: String,
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -119,7 +120,13 @@ fn stop_child_bounded(child: &mut Child, timeout: Duration) {
     }
 }
 
-fn wait_bounded(mut child: Child, stdout: &Path, stderr: &Path, timeout: Duration) -> Captured {
+fn wait_bounded(
+    mut child: Child,
+    program: String,
+    stdout: &Path,
+    stderr: &Path,
+    timeout: Duration,
+) -> Captured {
     let deadline = Instant::now() + timeout;
     loop {
         enforce_capture_cap(stdout);
@@ -127,6 +134,7 @@ fn wait_bounded(mut child: Child, stdout: &Path, stderr: &Path, timeout: Duratio
         match child.try_wait().expect("poll bounded child process") {
             Some(status) => {
                 return Captured {
+                    program,
                     status,
                     stdout: read_capped(stdout),
                     stderr: read_capped(stderr),
@@ -149,8 +157,9 @@ fn run_bounded(
 ) -> Captured {
     let stdout = capture_dir.join(format!("{label}.stdout"));
     let stderr = capture_dir.join(format!("{label}.stderr"));
+    let program = command.get_program().to_string_lossy().into_owned();
     let child = spawn_captured(command, &stdout, &stderr);
-    wait_bounded(child, &stdout, &stderr, timeout)
+    wait_bounded(child, program, &stdout, &stderr, timeout)
 }
 
 fn print_skip() {
@@ -202,6 +211,64 @@ struct Fixture {
     marker: PathBuf,
     socket: PathBuf,
     _daemon: RunningDaemon,
+}
+
+/// The test launches panes with a private XDG_RUNTIME_DIR that has no user
+/// bus, so the host CPU-cap scope wrapper cannot run there. That cap is a
+/// resource ceiling, not containment; bwrap remains the boundary under test.
+/// A nice/ionice soft-cap prefix needs no bus and is left intact.
+fn pane_argv_for_isolated_runtime(argv: Vec<String>) -> Vec<String> {
+    thegn_core::sandbox_cpucap::strip_pane_cap(&argv).to_vec()
+}
+
+#[test]
+fn security_e2e_pane_argv_strips_only_the_cpu_cap() {
+    let capped = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--slice=thegn.slice",
+        "-p",
+        "CPUQuota=800%",
+        "--",
+        "bwrap",
+        "--unshare-user",
+        "--",
+        "sh",
+        "-lc",
+        "true",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let peeled = pane_argv_for_isolated_runtime(capped);
+    assert_eq!(
+        peeled,
+        ["bwrap", "--unshare-user", "--", "sh", "-lc", "true"]
+            .map(str::to_owned)
+            .to_vec()
+    );
+    assert_eq!(thegn_core::sandbox_truth::observed(&peeled), Backend::Bwrap);
+
+    let soft_capped = ["nice", "-n", "10", "bwrap", "--", "sh"]
+        .map(str::to_owned)
+        .to_vec();
+    assert_eq!(
+        pane_argv_for_isolated_runtime(soft_capped.clone()),
+        soft_capped
+    );
+    assert_eq!(
+        thegn_core::sandbox_truth::observed(&pane_argv_for_isolated_runtime(soft_capped)),
+        Backend::Bwrap
+    );
+
+    let bare = ["bwrap", "--", "sh"].map(str::to_owned).to_vec();
+    assert_eq!(pane_argv_for_isolated_runtime(bare.clone()), bare);
+    assert_eq!(
+        thegn_core::sandbox_truth::observed(&pane_argv_for_isolated_runtime(bare)),
+        Backend::Bwrap
+    );
 }
 
 impl Fixture {
@@ -294,7 +361,15 @@ impl Fixture {
         )
         .expect("production resolver builds bwrap hardened pane spec");
         assert_eq!(spec.backend, Backend::Bwrap);
-        sandbox::enter_argv(&spec, inner).expect("production enter_argv builds hardened pane")
+        let argv = pane_argv_for_isolated_runtime(
+            sandbox::enter_argv(&spec, inner).expect("production enter_argv builds hardened pane"),
+        );
+        assert_eq!(
+            thegn_core::sandbox_truth::observed(&argv),
+            Backend::Bwrap,
+            "hardened pane argv must enter bwrap: {argv:?}"
+        );
+        argv
     }
 
     fn copy_binary(&self) {
@@ -390,7 +465,8 @@ fn security_e2e_hardened_pane_cannot_stop_daemon() {
     let version = fixture.run_pane("version-control", "./thegn --version");
     assert!(
         version.status.success(),
-        "in-pane thegn --version failed: stdout: {} stderr: {}",
+        "in-pane thegn --version failed (program {}): stdout: {} stderr: {}",
+        version.program,
         String::from_utf8_lossy(&version.stdout),
         String::from_utf8_lossy(&version.stderr)
     );
@@ -438,7 +514,8 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
     let version = fixture.run_pane("open-version-control", "./thegn --version");
     assert!(
         version.status.success(),
-        "in-pane thegn --version failed: stdout: {} stderr: {}",
+        "in-pane thegn --version failed (program {}): stdout: {} stderr: {}",
+        version.program,
         String::from_utf8_lossy(&version.stdout),
         String::from_utf8_lossy(&version.stderr)
     );
