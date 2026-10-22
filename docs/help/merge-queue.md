@@ -199,6 +199,9 @@ expiry-swept — only branches landed through the queue (a `landed` row) are
 collected. Remove such a worktree yourself once you're done with it. (Under
 `on_landed = "off"` a `thegn land` instead clears any stale _Merging_ /
 _Needs attention_ membership, so a fold-actor land never strands it.)
+The main checkout, including a path alias to it, is never registered or filed
+in a lifecycle folder. If worktree identity cannot be read, the queue reports
+the error and files nothing; `thegn land` reports the same error.
 
 `thegn land` declares the exact state-DB capabilities needed for the remote
 target guard and this folder bookkeeping. It may therefore operate on the
