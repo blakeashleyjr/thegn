@@ -24,16 +24,23 @@ fn partial_cache_entry(
     reason: &str,
     now_ms: i64,
 ) -> IssueCacheEntry {
-    let issues = last_good
-        .filter(|entry| !entry.issues.is_empty())
-        .map(|entry| entry.issues)
-        .unwrap_or(partial_rows);
+    let (issues, showing_last_good) = match last_good.filter(|entry| !entry.issues.is_empty()) {
+        Some(entry) => {
+            let showing_last_good = match entry.partial.as_ref() {
+                Some(partial) => partial.showing_last_good,
+                None => Some(true),
+            };
+            (entry.issues, showing_last_good)
+        }
+        None => (partial_rows, Some(false)),
+    };
     IssueCacheEntry {
         issues,
         partial: Some(IssueCachePartial {
             account: account.to_owned(),
             reason: reason.to_owned(),
             checked_at_ms: now_ms,
+            showing_last_good,
         }),
     }
 }
@@ -735,6 +742,7 @@ mod tests {
                 account: "work".into(),
                 reason: "page cap".into(),
                 checked_at_ms: 7,
+                showing_last_good: Some(true),
             })
         );
     }
@@ -747,6 +755,32 @@ mod tests {
             assert_eq!(entry.issues, partial_rows);
             assert!(entry.partial.is_some());
         }
+    }
+
+    #[test]
+    fn repeated_partial_refresh_keeps_the_first_partial_snapshot() {
+        let first_partial = vec![thegn_core::issue::Issue {
+            id: "first".into(),
+            ..Default::default()
+        }];
+        let cached = partial_cache_entry(None, first_partial.clone(), "work", "cap", 9);
+        let refreshed = partial_cache_entry(
+            Some(cached),
+            vec![thegn_core::issue::Issue {
+                id: "newer".into(),
+                ..Default::default()
+            }],
+            "work",
+            "cap",
+            10,
+        );
+        assert_eq!(refreshed.issues, first_partial);
+        assert!(
+            refreshed
+                .partial
+                .as_ref()
+                .is_some_and(|partial| partial.showing_last_good == Some(false))
+        );
     }
 
     #[test]
@@ -768,6 +802,7 @@ mod tests {
                 account: "work".into(),
                 reason: "page cap".into(),
                 checked_at_ms: 7,
+                showing_last_good: Some(false),
             }),
         };
         db.put_issue_cache("fixture-repo", "linear", "work", &entry.to_json().unwrap())

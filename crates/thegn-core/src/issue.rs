@@ -736,6 +736,9 @@ pub struct IssueCachePartial {
     pub account: String,
     pub reason: String,
     pub checked_at_ms: i64,
+    /// Whether the cached rows came from a complete list; `None` means an older cache did not record it.
+    #[serde(default)]
+    pub showing_last_good: Option<bool>,
 }
 
 /// Cached rows plus their refresh completeness state.
@@ -1472,12 +1475,18 @@ mod spec {
                 account: "work".into(),
                 reason: "page cap".into(),
                 checked_at_ms: 7,
+                showing_last_good: Some(true),
             }),
         };
         let json = entry.to_json().unwrap();
         assert_eq!(IssueCacheEntry::parse(&json), Some(entry));
         let unknown_version = json.replace("\"v\":1", "\"v\":2");
         assert_eq!(IssueCacheEntry::parse(&unknown_version), None);
+        let legacy_partial = IssueCacheEntry::parse(
+            r#"{"v":1,"issues":[],"partial":{"account":"work","reason":"cap","checked_at_ms":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_partial.partial.unwrap().showing_last_good, None);
         assert_eq!(IssueCacheEntry::parse("{}"), None);
         assert_eq!(IssueCacheEntry::parse("not json"), None);
     }
