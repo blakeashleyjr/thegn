@@ -9,7 +9,7 @@
 use anyhow::Result;
 use thegn_core::db::Db;
 use thegn_core::forge::model::{CreateOpts, MergeMethod, PanelState, PrPanel, ReviewState};
-use thegn_core::forge::{Forge, PrDepth, PrRef};
+use thegn_core::forge::{Forge, ForgeError, PrDepth, PrRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::CacheStore;
 use thegn_core::{msg, outln};
