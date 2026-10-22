@@ -59,8 +59,8 @@ local player, without leaving the compositor. Hidden unless
   controls from before the change.
 - When reading the player fails, the last track stays visible with a dim
   `stale` marker for up to three poll periods or ten seconds, whichever is
-  longer; after that the section shows “provider unavailable” instead of “no
-  player”.
+  longer; the status-bar badge turns amber and says `stale` for the same period.
+  After that the section shows “provider unavailable” instead of “no player”.
 
 Spotify remains a reserved backend kind: the supported desktop route is the
 existing MPRIS integration (or SMTC/AppleScript on their platforms), with no
