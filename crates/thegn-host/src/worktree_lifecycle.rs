@@ -1239,9 +1239,9 @@ pub fn create_failure_after_add(
     if add.destination_preexisted {
         return format!("{primary}; the existing destination was left untouched");
     }
-    if add.lock_unavailable {
-        // Nothing was mutated, and a concurrent create may hold the path: a
-        // rollback here would destroy the other create's checkout/branch.
+    if add.lock_unavailable || add.rename_journal_pending {
+        // Nothing was mutated, and a concurrent create or unreconciled rename
+        // may own repository state: rollback could destroy another checkout.
         return format!("{primary}; nothing was created, so nothing was rolled back");
     }
     create_failure_with_add_state(
@@ -2566,6 +2566,32 @@ mod tests {
         ));
         assert!(session.worktrees.is_empty());
         assert!(model.sidebar_workspaces.is_empty());
+    }
+
+    #[test]
+    fn add_failure_journal_refusal_runs_no_rollback() {
+        let worktree = tempfile::tempdir().unwrap();
+        let sentinel = worktree.path().join("sentinel");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+        let add = thegn_core::worktree::AddError {
+            message: "rename journal pending".into(),
+            branch_created: false,
+            destination_preexisted: false,
+            lock_unavailable: false,
+            rename_journal_pending: true,
+        };
+
+        let result = create_failure_after_add(
+            "create failed",
+            &Config::default(),
+            Path::new("/not-a-git-repository"),
+            worktree.path(),
+            "feat",
+            &add,
+        );
+
+        assert!(result.ends_with("nothing was created, so nothing was rolled back"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
     }
 }
 
