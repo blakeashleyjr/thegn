@@ -9834,6 +9834,7 @@ async fn event_loop<T: Terminal>(
                 last_pool_reconcile = Some(std::time::Instant::now());
                 let cfg = current_config.clone();
                 let wk = waker.clone();
+                let tx = refresh_tx.clone();
                 task::spawn_blocking(move || {
                     let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
                     let chip = if loc.is_remote()
@@ -9856,9 +9857,27 @@ async fn event_loop<T: Terminal>(
                             .filter(|s| s.state == "ready")
                             .count();
                         let wk2 = wk.clone();
-                        crate::lifecycle::reconcile_pool(&cfg, &repo_root, &env_name, move || {
-                            let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                        });
+                        let outcome = crate::lifecycle::reconcile_pool(
+                            &cfg,
+                            &repo_root,
+                            &env_name,
+                            move || {
+                                let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                            },
+                        );
+                        if let Some(message) =
+                            crate::lifecycle::halt_toast(&repo, &env_name, &outcome)
+                            && let Err(error) = tx.send(RefreshKind::Toast {
+                                message,
+                                priority: thegn_core::notification::Priority::Alert,
+                            })
+                        {
+                            tracing::debug!(
+                                target: "thegn::lifecycle",
+                                %error,
+                                "pool halt toast receiver is gone"
+                            );
+                        }
                         (target > 0).then_some((ready, target))
                     } else {
                         None
