@@ -13,7 +13,9 @@
 //! next natural wake, which is the whole point of an idle loop that never polls.
 
 use crate::merge_lifecycle::CleanupOutcome;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use thegn_core::config::{Config, OnLanded};
 use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_sweep::{self, MergedEntry};
@@ -55,7 +57,7 @@ pub struct SweepReport {
     pub collected_partial: Vec<(String, Vec<String>)>,
     /// Branches retained for explicit cleanup after worktree removal.
     pub held_branches: Vec<String>,
-    /// Rows left untouched because they cannot be attributed to this repository.
+    /// Informational notes for held branches, foreign rows, and deferred cleanup retries.
     pub informational: Vec<(String, String)>,
     /// Refused or failed physical cleanup, with an actionable reason.
     pub kept: Vec<(String, String)>,
@@ -70,6 +72,16 @@ pub(crate) struct SweepNotify {
 }
 
 pub(crate) const NOTHING_TO_SWEEP: &str = "merge queue: nothing to sweep";
+
+fn first_retry_deferral_report(worktree: &str, attempts: u32, next_at: i64, now: i64) -> bool {
+    static REPORTED: OnceLock<Mutex<HashSet<(String, u32, i64)>>> = OnceLock::new();
+    let reported = REPORTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut reported = reported
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reported.retain(|(_, _, deadline)| *deadline > now);
+    reported.insert((worktree.to_string(), attempts, next_at))
+}
 
 pub(crate) fn report_lines(report: &SweepReport) -> Vec<(Priority, String)> {
     let mut lines = Vec::new();
@@ -466,6 +478,9 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             && let Some(retry) = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
             && !retry.is_due(now)
         {
+            if !first_retry_deferral_report(&row.worktree, retry.attempts, retry.next_at, now) {
+                continue;
+            }
             let remaining = u64::try_from(retry.next_at.saturating_sub(now)).unwrap_or(u64::MAX);
             report.informational.push((
                 row.branch.clone(),
@@ -2513,6 +2528,12 @@ mod retry_tests {
             fixture.worktree.exists(),
             "deferred sweep must not run cleanup"
         );
+
+        let repeated = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert!(
+            repeated.informational.is_empty(),
+            "one retry-window deferral is reported once per worktree and deadline"
+        );
     }
 
     #[test]
@@ -2605,8 +2626,31 @@ mod retry_tests {
             "deferral leaves retry marker unchanged"
         );
 
+        let repeated = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert!(repeated.informational.is_empty());
+        assert!(!repeated.is_incomplete());
+
         let forced = sweep_with_db(&fixture.cfg, &fixture.root, true, &fixture.db);
         assert_eq!(forced.collected, ["feature"]);
         assert!(!fixture.worktree.exists());
+    }
+
+    #[test]
+    fn cleanup_retry_already_merged_row_is_deferred() {
+        let fixture = refused_fixture("retry-already-merged");
+        rusqlite::Connection::open(&fixture.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET error_detail='already merged' WHERE worktree=?1",
+                [fixture.worktree.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        let row = fixture.db.list_merge_queue().unwrap().remove(0);
+        let retry = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
+            .expect("ordinary landed detail is replaced by retry metadata");
+        assert_eq!(retry.attempts, 1);
+        assert!(report.bookkeeping_errors.is_empty());
     }
 }
