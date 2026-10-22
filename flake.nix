@@ -724,6 +724,31 @@
               test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-MIT
               test -f ${thegnMusl}/share/licenses/thegn-musl/LICENSE-APACHE
             ''}
+            for package_names in "${thegn}:thegn:tg" "${thegnDev}:thegn-dev:tg-dev"; do
+              IFS=: read -r package primary_name alias_name <<< "$package_names"
+              for name in "$primary_name" "$alias_name"; do
+                bash_completion="$package/share/bash-completion/completions/$name"
+                zsh_completion="$package/share/zsh/site-functions/_$name"
+                fish_completion="$package/share/fish/vendor_completions.d/$name.fish"
+                test -s "$bash_completion"
+                grep -q -- "$name" "$bash_completion"
+                test -s "$zsh_completion"
+                grep -q -- "$name" "$zsh_completion"
+                grep -q "^#compdef $name" "$zsh_completion"
+                test -s "$fish_completion"
+                grep -q -- "$name" "$fish_completion"
+              done
+            done
+            for name in thegn tg; do
+              test ! -e "${thegnDev}/share/bash-completion/completions/$name"
+              test ! -e "${thegnDev}/share/zsh/site-functions/_$name"
+              test ! -e "${thegnDev}/share/fish/vendor_completions.d/$name.fish"
+            done
+            for name in thegn-dev tg-dev; do
+              test ! -e "${thegn}/share/bash-completion/completions/$name"
+              test ! -e "${thegn}/share/zsh/site-functions/_$name"
+              test ! -e "${thegn}/share/fish/vendor_completions.d/$name.fish"
+            done
             touch $out
           '';
         dev-docker-shim =
@@ -753,6 +778,10 @@
           doCheck = false;
           dontFixup = true;
         });
+        hm-module-eval = import ./nix/hm-module-eval.nix {
+          inherit pkgs self thegn;
+          lib = pkgs.lib;
+        };
       };
 
       # Lean shell for sandboxes/sprites: ONLY what's needed to build + run
