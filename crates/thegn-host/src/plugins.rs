@@ -1945,7 +1945,17 @@ mod tests {
             tmp.path().join("state"),
         );
 
-        assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(loaded) if loaded.len() == 1));
+        // Startup may publish other messages first; drain (bounded) to Loaded.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let loaded = loop {
+            assert!(Instant::now() < deadline, "startup did not publish Loaded");
+            match rx.try_recv() {
+                Ok(PluginMsg::Loaded(loaded)) => break loaded,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        assert_eq!(loaded.len(), 1);
         assert!(probe.wait_for_release("hello").is_ok());
         assert!(lock(&sessions).is_empty());
         wait_for_pidfile_and_exit(&pidfile);
