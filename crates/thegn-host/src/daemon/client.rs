@@ -25,6 +25,11 @@ use crate::pane_source::ExecSource;
 const SCOPE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// One scope-probe budget shared by every startup candidate.
 const CONNECT_DAEMON_TOTAL_DEADLINE: Duration = SCOPE_PROBE_TIMEOUT;
+/// The spawn wait is bounded by the 3 s already promised by its timeout error
+/// (the old 60 x 50 ms loop).
+const SPAWN_WAIT_DEADLINE: Duration = Duration::from_secs(3);
+/// Interval between checks while waiting for the spawned daemon to start.
+const SPAWN_WAIT_POLL: Duration = Duration::from_millis(50);
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -284,6 +289,70 @@ fn scope_mismatch_error(socket: &str, actual: &str) -> anyhow::Error {
     )
 }
 
+enum SpawnWait {
+    Up,
+    Foreign(String),
+    TimedOut,
+}
+
+async fn wait_for_spawned_daemon(
+    deadline: Duration,
+    poll: Duration,
+    probe: impl Fn() -> BoxFuture<'static, StopProbe>,
+) -> SpawnWait {
+    let deadline_at = tokio::time::Instant::now() + deadline;
+    loop {
+        let now = tokio::time::Instant::now();
+        let Some(remaining) = deadline_at.checked_duration_since(now) else {
+            return SpawnWait::TimedOut;
+        };
+        if remaining.is_zero() {
+            return SpawnWait::TimedOut;
+        }
+        tokio::time::sleep(poll.min(remaining)).await;
+        match tokio::time::timeout_at(deadline_at, probe()).await {
+            Ok(StopProbe::Ours) => return SpawnWait::Up,
+            Ok(StopProbe::Foreign(actual)) => return SpawnWait::Foreign(actual),
+            Ok(StopProbe::NotRunning) => {}
+            Err(_) => return SpawnWait::TimedOut,
+        }
+    }
+}
+
+fn own_spawned_daemon(child: std::process::Child) {
+    if let Err(error) = thegn_core::thread_name::try_spawn_named("thegn-dmn-wait", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        reap_spawned_daemon(child);
+    }) {
+        // The failed thread spawn drops its closure (and the Child handle), but
+        // does not kill the daemon; there is no safe synchronous fallback here.
+        tracing::warn!(
+            target: "thegn::daemon",
+            %error,
+            "could not start the daemon child waiter; the daemon will not be reaped"
+        );
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "blocking wait on a dedicated waiter thread, never the UI loop"
+)]
+fn reap_spawned_daemon(mut child: std::process::Child) {
+    match child.wait() {
+        Ok(status) => tracing::debug!(
+            target: "thegn::daemon",
+            %status,
+            "spawned pane daemon exited"
+        ),
+        Err(error) => tracing::debug!(
+            target: "thegn::daemon",
+            %error,
+            "could not wait for the spawned pane daemon"
+        ),
+    }
+}
+
 fn no_daemon_error() -> anyhow::Error {
     anyhow!(
         "no thegn pane daemon is running — start one with `thegn serve`, \
@@ -387,26 +456,29 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
         .context("resolving this executable's path for daemon spawn")?;
     let mut cmd = thegn_core::util::detached(&exe.to_string_lossy());
     cmd.arg("daemon").arg("--socket").arg(&sock);
-    cmd.spawn().context("spawn pane daemon")?;
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if client.health().await.is_ok() {
-            match check_daemon_scope(&client, &scopes).await {
-                ScopeCheck::Match | ScopeCheck::Unknown => {
-                    start_error_state_bridge(&client);
-                    return Ok(client);
-                }
-                ScopeCheck::Mismatch(actual) => {
-                    return Err(scope_mismatch_error(&sock.display().to_string(), &actual));
-                }
-                ScopeCheck::NotOurs => {}
-            }
+    let child = cmd.spawn().context("spawn pane daemon")?;
+    own_spawned_daemon(child);
+    let probe_client = client.clone();
+    let probe = move || {
+        let client = probe_client.clone();
+        let scopes = scopes.clone();
+        Box::pin(async move { probe_stop_target(&client, &scopes).await })
+            as BoxFuture<'static, StopProbe>
+    };
+    match wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, probe).await {
+        SpawnWait::Up => {
+            start_error_state_bridge(&client);
+            Ok(client)
         }
+        SpawnWait::Foreign(actual) => {
+            Err(scope_mismatch_error(&sock.display().to_string(), &actual))
+        }
+        SpawnWait::TimedOut => Err(anyhow!(
+            "pane daemon did not come up on {} within {}s",
+            sock.display(),
+            SPAWN_WAIT_DEADLINE.as_secs()
+        )),
     }
-    Err(anyhow!(
-        "pane daemon did not come up on {} within 3s",
-        sock.display()
-    ))
 }
 
 /// Keep the compositor's attention cache synchronized with the daemon's
@@ -1050,6 +1122,93 @@ mod tests {
                 end,
             },
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_wait_bounds_a_probe_that_never_answers() {
+        let started = tokio::time::Instant::now();
+        let result = wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, || {
+            Box::pin(std::future::pending::<StopProbe>())
+        })
+        .await;
+        let elapsed = tokio::time::Instant::now().duration_since(started);
+
+        assert!(matches!(result, SpawnWait::TimedOut));
+        assert!(elapsed <= SPAWN_WAIT_DEADLINE + SPAWN_WAIT_POLL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_wait_retries_not_running_until_up() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let result = wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, move || {
+            let calls = probe_calls.clone();
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    StopProbe::NotRunning
+                } else {
+                    StopProbe::Ours
+                }
+            })
+        })
+        .await;
+
+        assert!(matches!(result, SpawnWait::Up));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_wait_reports_a_foreign_scope() {
+        let result = wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, || {
+            Box::pin(async { StopProbe::Foreign("other".into()) })
+        })
+        .await;
+
+        assert!(matches!(result, SpawnWait::Foreign(actual) if actual == "other"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_wait_times_out_when_the_daemon_never_comes_up() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let result = wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, move || {
+            let calls = probe_calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                StopProbe::NotRunning
+            })
+        })
+        .await;
+
+        assert!(matches!(result, SpawnWait::TimedOut));
+        assert!(calls.load(Ordering::SeqCst) <= 61);
+    }
+
+    #[test]
+    fn spawn_daemon_child_is_reaped_after_it_exits() {
+        if !crate::platform::sound_process::test_support::UNIX
+            || !std::path::Path::new("/proc/self/stat").exists()
+        {
+            return;
+        }
+
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        own_spawned_daemon(child);
+
+        let proc_entry = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let stat_path = proc_entry.join("stat");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while proc_entry.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if proc_entry.exists() {
+            let stat = std::fs::read_to_string(stat_path).unwrap_or_else(|error| error.to_string());
+            panic!("spawned child pid {pid} was not reaped; /proc/{pid}/stat: {stat}");
+        }
     }
 
     #[test]
