@@ -413,9 +413,16 @@ pub(crate) fn stop_worktree_share(
     // resurrected on the next launch).
     let stopped = share_supervisor.stop(&wt, None);
     let stopped_count = stopped.removed.len() + stopped.pending.len();
-    queue_stopped_share_deletes(wt, stopped.removed);
+    queue_stopped_share_deletes(wt.clone(), stopped.removed);
+    queue_stopped_share_failures(wt, stopped.failed.clone());
     model.shares = crate::run::current_share_views(share_supervisor, session);
-    model.status = if stopped_count == 0 {
+    model.status = if let Some(failure) = stopped.failed.first() {
+        format!(
+            "Could not stop {} share(s): {}; stop again to retry",
+            stopped.failed.len(),
+            failure.error
+        )
+    } else if stopped_count == 0 {
         "No active shares on this worktree".into()
     } else {
         format!("Stopped {stopped_count} share(s)")
@@ -438,6 +445,23 @@ pub(crate) fn queue_stopped_share_deletes(worktree: String, stopped: Vec<(u16, u
                     tracing::warn!(target: "thegn::db", %error, "stopped share cache delete failed")
                 }
             }
+        }
+    });
+}
+
+pub(crate) fn queue_stopped_share_failures(
+    worktree: String,
+    failed: Vec<crate::share::StopFailure>,
+) {
+    if failed.is_empty() {
+        return;
+    }
+    crate::db_task::persist_critical(move |db| {
+        for failure in failed {
+            crate::share::apply_share_persist(
+                db,
+                crate::share::stop_failure_persist(&worktree, &failure),
+            );
         }
     });
 }
