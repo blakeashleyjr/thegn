@@ -103,6 +103,26 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
     let state_dir = thegn_core::util::xdg_state_home().join("thegn");
     let uid = effective_uid();
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    #[cfg(unix)]
+    if dcfg.socket.is_empty() && runtime_dir.as_deref().is_none_or(str::is_empty) {
+        let state_key = thegn_core::config_daemon::state_endpoint_key(&state_dir);
+        let predictable = private_tmp_socket_path_with_key(uid, &state_key);
+        let natural = match short_runtime_dir() {
+            Some(private) => private.join(format!("thegn-{state_key}.sock")),
+            None => predictable.clone(),
+        };
+        let max = thegn_core::config_daemon::max_socket_path_len(cfg!(target_os = "linux"));
+        let socket = thegn_core::config_daemon::resolve_socket_path(
+            natural,
+            short_runtime_dir().as_deref(),
+            max,
+            cfg!(windows),
+        );
+        if is_implicit_private_tmp_fallback(dcfg, &socket, &predictable) {
+            return private_tmp_socket_resolved(&state_dir, uid, &state_key, &predictable);
+        }
+        return socket;
+    }
     let socket = socket_path_for(
         dcfg,
         runtime_dir.as_deref(),
@@ -110,12 +130,6 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
         uid,
         short_runtime_dir(),
     );
-    #[cfg(unix)]
-    let predictable = private_tmp_socket_path(&state_dir, uid);
-    #[cfg(unix)]
-    if socket == predictable {
-        return private_tmp_socket_resolved(&state_dir, uid, &predictable);
-    }
     socket
 }
 
@@ -151,10 +165,13 @@ pub(crate) fn daemon_socket_usable(dcfg: &thegn_core::config::DaemonConfig) -> b
     let usable = {
         #[cfg(unix)]
         {
-            let state_dir = thegn_core::util::xdg_state_home().join("thegn");
-            let uid = effective_uid();
-            let predictable = private_tmp_socket_path(&state_dir, uid);
-            let private_tmp = private_tmp_socket_resolved(&state_dir, uid, &predictable);
+            let private_tmp = if dcfg.socket.is_empty()
+                && std::env::var("XDG_RUNTIME_DIR").map_or(true, |dir| dir.is_empty())
+            {
+                socket.clone()
+            } else {
+                PathBuf::new()
+            };
             socket_usable_decision(
                 legacy_socket_state(),
                 &socket,
@@ -266,12 +283,25 @@ fn effective_uid() -> u32 {
 }
 
 fn private_tmp_socket_path(state_dir: &std::path::Path, euid: u32) -> PathBuf {
+    private_tmp_socket_path_with_key(
+        euid,
+        &thegn_core::config_daemon::state_endpoint_key(state_dir),
+    )
+}
+
+fn private_tmp_socket_path_with_key(euid: u32, state_key: &str) -> PathBuf {
     std::path::Path::new("/tmp")
-        .join(format!(
-            "thegn-{euid}-{}",
-            thegn_core::config_daemon::state_endpoint_key(state_dir)
-        ))
+        .join(format!("thegn-{euid}-{state_key}"))
         .join("daemon.sock")
+}
+
+#[cfg(unix)]
+fn is_implicit_private_tmp_fallback(
+    dcfg: &thegn_core::config::DaemonConfig,
+    socket: &std::path::Path,
+    predictable: &std::path::Path,
+) -> bool {
+    dcfg.socket.is_empty() && socket == predictable
 }
 
 #[cfg(unix)]
@@ -361,17 +391,36 @@ fn live_dir_meta(path: &std::path::Path) -> Option<DirMeta> {
 fn private_tmp_socket_resolved(
     state_dir: &std::path::Path,
     euid: u32,
+    state_key: &str,
     predictable: &std::path::Path,
 ) -> PathBuf {
-    let state_key = thegn_core::config_daemon::state_endpoint_key(state_dir);
-    let locator = read_tmp_fallback_locator_at(&state_dir.join("run").join("tmp-fallback-dir"));
-    relocated_private_tmp(
-        predictable,
+    private_tmp_socket_resolved_with(
         euid,
-        &state_key,
-        locator.as_deref(),
+        state_key,
+        predictable,
+        || read_tmp_fallback_locator_at(&state_dir.join("run").join("tmp-fallback-dir")),
         &live_dir_meta,
     )
+}
+
+#[cfg(unix)]
+fn private_tmp_socket_resolved_with(
+    euid: u32,
+    state_key: &str,
+    predictable: &std::path::Path,
+    read_locator: impl FnOnce() -> Option<String>,
+    probe: &dyn Fn(&std::path::Path) -> Option<DirMeta>,
+) -> PathBuf {
+    let Some(parent) = predictable.parent() else {
+        return predictable.to_path_buf();
+    };
+    if probe(parent).is_none_or(|meta| {
+        meta.is_dir && !meta.is_symlink && meta.owned && meta.mode & 0o777 == 0o700
+    }) {
+        return predictable.to_path_buf();
+    }
+    let locator = read_locator();
+    relocated_private_tmp(predictable, euid, state_key, locator.as_deref(), probe)
 }
 
 #[cfg(unix)]
@@ -528,7 +577,7 @@ fn allocate_private_tmp_fallback_in(
         let mut file = thegn_core::fsperm::create_owner_only_exclusive(&temp_locator)?;
         std::io::Write::write_all(&mut file, format!("{name}\n").as_bytes())?;
         file.sync_all()?;
-        std::fs::hard_link(&temp_locator, &locator)
+        std::fs::rename(&temp_locator, &locator)
     })();
     match publication {
         Ok(()) => {
@@ -538,10 +587,10 @@ fn allocate_private_tmp_fallback_in(
             Ok(dir.join("daemon.sock"))
         }
         Err(error) => {
-            if let Err(cleanup) = std::fs::remove_file(&temp_locator) {
-                if cleanup.kind() != std::io::ErrorKind::NotFound {
-                    tracing::debug!(target: "thegn::daemon", path = %temp_locator.display(), %cleanup, "failed to remove temporary private control-runtime locator");
-                }
+            if let Err(cleanup) = std::fs::remove_file(&temp_locator)
+                && cleanup.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::debug!(target: "thegn::daemon", path = %temp_locator.display(), %cleanup, "failed to remove temporary private control-runtime locator");
             }
             if let Err(cleanup) = std::fs::remove_dir(&dir) {
                 tracing::debug!(target: "thegn::daemon", path = %dir.display(), %cleanup, "failed to remove unpublished private control-runtime directory");
@@ -2087,6 +2136,60 @@ mod tests {
             relocated_private_tmp(predictable, 1000, "key", None, &private),
             predictable
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_resolver_does_not_read_locator_for_a_private_parent() {
+        let predictable = std::path::Path::new("/tmp/thegn-1000-key/daemon.sock");
+        let private_parent = |path: &std::path::Path| {
+            (path == predictable.parent().unwrap()).then_some(DirMeta {
+                is_dir: true,
+                is_symlink: false,
+                owned: true,
+                mode: 0o700,
+            })
+        };
+        let read = std::cell::Cell::new(false);
+
+        let socket = private_tmp_socket_resolved_with(
+            1000,
+            "key",
+            predictable,
+            || {
+                read.set(true);
+                None
+            },
+            &private_parent,
+        );
+
+        assert_eq!(socket, predictable);
+        assert!(
+            !read.get(),
+            "a private predictable parent skips locator I/O"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_resolver_preserves_explicit_predictable_socket() {
+        let predictable = std::path::Path::new("/tmp/thegn-1000-key/daemon.sock");
+        let implicit = thegn_core::config::DaemonConfig::default();
+        let explicit = thegn_core::config::DaemonConfig {
+            socket: predictable.display().to_string(),
+            ..Default::default()
+        };
+
+        assert!(is_implicit_private_tmp_fallback(
+            &implicit,
+            predictable,
+            predictable
+        ));
+        assert!(!is_implicit_private_tmp_fallback(
+            &explicit,
+            predictable,
+            predictable
+        ));
     }
 
     #[cfg(unix)]

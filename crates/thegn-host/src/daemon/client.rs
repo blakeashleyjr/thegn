@@ -458,26 +458,37 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     let child = cmd.spawn().context("spawn pane daemon")?;
     own_spawned_daemon(child);
     let probe_dcfg = dcfg.clone();
+    let last_probe_socket = std::sync::Arc::new(std::sync::Mutex::new(sock.clone()));
+    let probe_socket = std::sync::Arc::clone(&last_probe_socket);
     let probe = move || {
         let socket = super::socket_path(&probe_dcfg);
+        *probe_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = socket.clone();
         let client = ControlClient::new(ControlAddr::Unix(socket));
         let scopes = scopes.clone();
         Box::pin(async move { probe_stop_target(&client, &scopes).await })
             as BoxFuture<'static, StopProbe>
     };
+    let probed_socket = || {
+        last_probe_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
     match wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, probe).await {
         SpawnWait::Up => {
-            let sock = super::socket_path(dcfg);
+            let sock = probed_socket();
             let client = ControlClient::new(ControlAddr::Unix(sock));
             start_error_state_bridge(&client);
             Ok(client)
         }
         SpawnWait::Foreign(actual) => {
-            let sock = super::socket_path(dcfg);
+            let sock = probed_socket();
             Err(scope_mismatch_error(&sock.display().to_string(), &actual))
         }
         SpawnWait::TimedOut => {
-            let sock = super::socket_path(dcfg);
+            let sock = probed_socket();
             Err(anyhow!(
                 "pane daemon did not come up on {} within {}s",
                 sock.display(),
