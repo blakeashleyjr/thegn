@@ -11,8 +11,8 @@
 //! matcher are unit-tested here (`tests`); the subprocess execution
 //! ([`start`]) is the I/O seam, exercised by `test/smoke.sh`.
 //!
-//! `bore` (<https://github.com/ekzhang/bore>) is the first and only backend; the
-//! [`ShareProvider`] seam keeps room for rathole/zrok/ngrok/iroh later.
+//! The built-in backends are bore, frp, tailscale, and iroh, all dispatched by
+//! [`BuiltinProvider`].
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -605,9 +605,15 @@ pub struct ServePlan {
     pub port: u16,
 }
 
-/// The share provider seam. One built-in impl ([`BuiltinProvider`]) dispatches
-/// on the resolved provider; external providers could plug in here later.
-pub trait ShareProvider {
+mod sealed {
+    /// Only this crate implements [`super::ShareProvider`].
+    pub trait Sealed {}
+}
+
+/// The internal share dispatcher. It is sealed: only the built-in backends
+/// (bore, frp, tailscale, iroh) implement it, and share providers cannot be
+/// added by plugins. Adding one is core/service work with its own issue.
+pub trait ShareProvider: sealed::Sealed {
     /// Stable id for logging/bookkeeping.
     fn kind(&self) -> &'static str;
     /// Build the (secrets-resolved) launch. Errors if a required secret/setting
@@ -624,6 +630,8 @@ pub fn for_provider(spec: &ShareSpec) -> BuiltinProvider<'_> {
 pub struct BuiltinProvider<'a> {
     spec: &'a ShareSpec,
 }
+
+impl sealed::Sealed for BuiltinProvider<'_> {}
 
 impl ShareProvider for BuiltinProvider<'_> {
     fn kind(&self) -> &'static str {
