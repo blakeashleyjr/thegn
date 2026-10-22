@@ -20,6 +20,7 @@
 //! `test/smoke.sh`).
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -91,6 +92,21 @@ impl OciRuntime {
         v.extend(args.iter().map(|s| s.to_string()));
         v
     }
+}
+
+/// Runtime and immutable container identity for a VPN sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedSidecar {
+    pub runtime: OciRuntime,
+    pub id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SidecarRecord {
+    version: u8,
+    container: String,
+    prefix: Vec<String>,
+    id: String,
 }
 
 /// What the provider produced — consumed by `thegn_core::sandbox` to splice
@@ -322,6 +338,9 @@ impl VpnProvider for BuiltinProvider<'_> {
     fn up(&self, rt: &OciRuntime, container: &str) -> Result<Attachment> {
         let plan = self.sidecar_plan(container)?;
         run_sidecar(rt, &plan)?;
+        // Fail closed if identity cannot be recorded. The host launch path
+        // rolls back failed up calls.
+        record_sidecar(rt, container).context("vpn: record the sidecar runtime")?;
         Ok(Attachment {
             join_netns: matches!(self.spec.mode, VpnMode::Sidecar | VpnMode::Proxy)
                 .then(|| container.to_string()),
@@ -340,11 +359,143 @@ impl VpnProvider for BuiltinProvider<'_> {
         if let Some(argv) = deregister_argv(self.spec) {
             let _ = exec_in(rt, container, &argv); // best-effort: dereg during teardown; container is about to be removed
         }
+        remove_sidecar_record(rt, container);
         // Secret material must not outlive the tunnel it was minted for.
         cleanup_staged(container);
         Ok(())
     }
 }
+
+/// Inspect and persist the exact runtime and immutable id for a started sidecar.
+fn record_sidecar(rt: &OciRuntime, container: &str) -> Result<RecordedSidecar> {
+    validate_container_name(container)?;
+    if rt.prefix.is_empty() {
+        bail!("vpn: sidecar {container} has no runtime prefix to record");
+    }
+    let id = sidecar_container_id(rt, container)?;
+    let record = SidecarRecord {
+        version: 1,
+        container: container.to_string(),
+        prefix: rt.prefix.clone(),
+        id: id.clone(),
+    };
+    let bytes = serde_json::to_vec(&record).context("vpn: encode sidecar runtime record")?;
+    if bytes.len() > SIDECAR_RECORD_MAX_BYTES {
+        bail!("vpn: sidecar runtime record for {container} exceeds the size limit");
+    }
+    sidecar_record_dir()?
+        .write_owner_only_atomic(&sidecar_record_name(container), &bytes)
+        .context("vpn: write sidecar runtime record")?;
+    Ok(RecordedSidecar {
+        runtime: rt.clone(),
+        id,
+    })
+}
+
+/// Read a bounded, no-follow sidecar runtime record and validate every field.
+pub fn recorded_sidecar(container: &str) -> Result<RecordedSidecar> {
+    validate_container_name(container)?;
+    let name = sidecar_record_name(container);
+    let dir = match sidecar_record_dir_existing()? {
+        Some(dir) => dir,
+        None => bail!(
+            "vpn: no recorded runtime for VPN sidecar {container}; restart this worktree's sandbox so thegn records which runtime started it"
+        ),
+    };
+    let file = match dir.open_regular_nofollow(&name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "vpn: no recorded runtime for VPN sidecar {container}; restart this worktree's sandbox so thegn records which runtime started it"
+            )
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("vpn: read runtime record for sidecar {container}"));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(SIDECAR_RECORD_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("vpn: read runtime record for sidecar {container}"))?;
+    if bytes.len() > SIDECAR_RECORD_MAX_BYTES {
+        bail!("vpn: malformed runtime record for sidecar {container}");
+    }
+    let parsed: SidecarRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("vpn: malformed runtime record for sidecar {container}"))?;
+    if parsed.version != 1
+        || parsed.container != container
+        || parsed.prefix.is_empty()
+        || !valid_container_id(&parsed.id)
+    {
+        bail!("vpn: malformed runtime record for sidecar {container}");
+    }
+    Ok(RecordedSidecar {
+        runtime: OciRuntime::new(parsed.prefix),
+        id: parsed.id,
+    })
+}
+
+fn sidecar_container_id(rt: &OciRuntime, container: &str) -> Result<String> {
+    let argv = rt.argv(&["inspect", "-f", "{{.Id}}", container]);
+    let id = match run_bounded(&argv, INSPECT_TIMEOUT, 128, STDERR_CAPTURE_CAP) {
+        Ok(out) if out.success => out.stdout.trim().to_string(),
+        _ => String::new(),
+    };
+    if !valid_container_id(&id) {
+        bail!("vpn: sidecar {container} has no readable container id");
+    }
+    Ok(id)
+}
+
+fn valid_container_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn remove_sidecar_record(rt: &OciRuntime, container: &str) {
+    let result = (|| -> Result<()> {
+        validate_container_name(container)?;
+        let Some(dir) = sidecar_record_dir_existing()? else {
+            return Ok(());
+        };
+        let name = sidecar_record_name(container);
+        if let Ok(recorded) = recorded_sidecar(container)
+            && recorded.runtime.prefix != rt.prefix
+        {
+            return Ok(());
+        }
+        dir.remove_file(&name)
+            .with_context(|| format!("vpn: remove runtime record for sidecar {container}"))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::debug!(target: "thegn::vpn", %error, "could not remove VPN sidecar runtime record");
+    }
+}
+
+fn sidecar_record_dir() -> Result<thegn_core::fsperm::PrivateDir> {
+    let root = state_root()?;
+    thegn_core::fsperm::ensure_private_dir_beneath(&root, Path::new("vpn-runtime"))
+        .context("vpn: open private sidecar runtime directory")
+}
+
+fn sidecar_record_dir_existing() -> Result<Option<thegn_core::fsperm::PrivateDir>> {
+    let path = state_root_path()?.join("vpn-runtime");
+    match thegn_core::fsperm::open_private_dir(&path) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("vpn: open private sidecar runtime directory"),
+    }
+}
+
+fn sidecar_record_name(container: &str) -> String {
+    format!("{container}.json")
+}
+
+const SIDECAR_RECORD_MAX_BYTES: usize = 4 * 1024;
 
 // ── pure builders (unit-tested) ──────────────────────────────────────────────
 
@@ -1043,6 +1194,13 @@ pub fn cleanup_staged(container: &str) {
 }
 
 fn state_root() -> Result<PathBuf> {
+    let root = state_root_path()?;
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("vpn: create state root {}", root.display()))?;
+    Ok(root)
+}
+
+fn state_root_path() -> Result<PathBuf> {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1054,10 +1212,7 @@ fn state_root() -> Result<PathBuf> {
                 .map(|home| PathBuf::from(home).join(".local/state"))
         })
         .ok_or_else(|| anyhow!("vpn: XDG_STATE_HOME and HOME are unset"))?;
-    let root = base.join("thegn");
-    std::fs::create_dir_all(&root)
-        .with_context(|| format!("vpn: create state root {}", root.display()))?;
-    Ok(root)
+    Ok(base.join("thegn"))
 }
 
 #[derive(Debug, PartialEq, Eq)]
