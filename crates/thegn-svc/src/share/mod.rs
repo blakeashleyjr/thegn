@@ -645,7 +645,7 @@ impl ShareProvider for BuiltinProvider<'_> {
 
     fn launch(&self) -> Result<ShareLaunch> {
         match &self.spec.params {
-            ShareParams::Bore(b) => Ok(ShareLaunch::Process(plan_bore(self.spec, b))),
+            ShareParams::Bore(b) => Ok(ShareLaunch::Process(plan_bore(self.spec, b)?)),
             ShareParams::Frp(f) => Ok(ShareLaunch::Process(plan_frp(self.spec, f)?)),
             ShareParams::Tailscale(t) => {
                 Ok(ShareLaunch::SidecarServe(plan_tailscale(self.spec, t)))
@@ -660,13 +660,19 @@ impl ShareProvider for BuiltinProvider<'_> {
 /// The relay used when `[share.bore] to` is left empty.
 const BORE_PUBLIC: &str = "bore.pub";
 
-fn plan_bore(spec: &ShareSpec, b: &BoreConfig) -> SharePlan {
+fn plan_bore(spec: &ShareSpec, b: &BoreConfig) -> Result<SharePlan> {
+    if let Some(flag) = bore_secret_flag(&b.extra_args) {
+        bail!(
+            "bore: extra_args must not carry the secret ({flag}); set [share.bore] secret = \"env:BORE_SECRET\" or \"file:PATH\" instead"
+        );
+    }
+
     let secret = expand_env_ref(&b.secret);
     let mut env = vec![("RUST_LOG".into(), "info".into())];
     if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
         env.push(("BORE_SECRET".into(), SecretString::new(secret)));
     }
-    SharePlan {
+    Ok(SharePlan {
         program: "bore".into(),
         args: bore_args(spec.local_port, b),
         // bore logs the "listening at" line via `tracing` at info on stderr;
@@ -677,7 +683,19 @@ fn plan_bore(spec: &ShareSpec, b: &BoreConfig) -> SharePlan {
             marker: "listening at ".into(),
             scheme: "http".into(),
         },
-    }
+    })
+}
+
+fn bore_secret_flag(extra_args: &[String]) -> Option<&'static str> {
+    extra_args.iter().find_map(|arg| {
+        if arg == "--secret" || arg.starts_with("--secret=") {
+            Some("--secret")
+        } else if arg == "-s" || (arg.starts_with("-s") && !arg.starts_with("--")) {
+            Some("-s")
+        } else {
+            None
+        }
+    })
 }
 
 /// `bore local <port> --to <relay> [--port N] [--local-host H] …`.

@@ -3367,7 +3367,7 @@ ready_timeout_secs = 20
 # secret = "env:BORE_SECRET"    # shared HMAC (secrets-ref); must match the server
 # remote_port = 0               # port to bind on the relay; 0 = relay chooses
 # local_host = "127.0.0.1"      # interface the dev server listens on
-# extra_args = []               # extra `bore local` flags
+# extra_args = []               # extra `bore local` flags (never --secret/-s: use `secret`)
 
 # [share.frp]    # provider = "frp" — https://github.com/fatedier/frp (self-host)
 # server_addr = "frps.example.com"   # your frps host (required)
