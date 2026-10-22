@@ -159,7 +159,7 @@ pub fn detect_cpu_cap() -> CpuCap {
 /// Whether systemd's user manager can be reached with the current environment.
 /// `systemd-run --user` looks first for `$XDG_RUNTIME_DIR/systemd/private`,
 /// then for the user bus at `DBUS_SESSION_BUS_ADDRESS` or
-/// `$XDG_RUNTIME_DIR/bus`.
+/// `$XDG_RUNTIME_DIR/bus`. A non-empty bus address is trusted, not probed.
 pub fn user_manager_reachable(
     runtime_dir: Option<&std::ffi::OsStr>,
     bus_address: Option<&std::ffi::OsStr>,
@@ -181,10 +181,13 @@ pub fn scope_skipped_note(
     systemd_run: bool,
     cgroup_cpu_delegated: bool,
     user_manager: bool,
+    nice: bool,
 ) -> Option<&'static str> {
-    (systemd_run && cgroup_cpu_delegated && !user_manager).then_some(
-        "hard cap skipped: no systemd user manager is reachable from this environment (no $XDG_RUNTIME_DIR/systemd/private, $XDG_RUNTIME_DIR/bus or DBUS_SESSION_BUS_ADDRESS); using the soft nice cap",
-    )
+    (systemd_run && cgroup_cpu_delegated && !user_manager).then_some(if nice {
+        "hard cap skipped: no systemd user manager is reachable from this environment (no $XDG_RUNTIME_DIR/systemd/private, $XDG_RUNTIME_DIR/bus or DBUS_SESSION_BUS_ADDRESS); using the soft nice cap"
+    } else {
+        "hard cap skipped: no systemd user manager is reachable from this environment (no $XDG_RUNTIME_DIR/systemd/private, $XDG_RUNTIME_DIR/bus or DBUS_SESSION_BUS_ADDRESS); no cap is applied"
+    })
 }
 
 /// Probe whether a hard scope cap was skipped because the user manager is
@@ -198,6 +201,7 @@ pub fn detected_scope_skipped_note() -> Option<&'static str> {
             std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
             &|path| path.exists(),
         ),
+        util::have("nice"),
     )
 }
 
@@ -1194,10 +1198,17 @@ mod tests {
 
     #[test]
     fn scope_skipped_note_only_when_the_user_manager_is_the_missing_piece() {
-        assert!(scope_skipped_note(true, true, false).is_some());
-        assert_eq!(scope_skipped_note(true, true, true), None);
-        assert_eq!(scope_skipped_note(false, true, false), None);
-        assert_eq!(scope_skipped_note(true, false, false), None);
+        assert!(
+            scope_skipped_note(true, true, false, true)
+                .is_some_and(|note| note.ends_with("using the soft nice cap"))
+        );
+        assert!(
+            scope_skipped_note(true, true, false, false)
+                .is_some_and(|note| note.ends_with("no cap is applied"))
+        );
+        assert_eq!(scope_skipped_note(true, true, true, true), None);
+        assert_eq!(scope_skipped_note(false, true, false, true), None);
+        assert_eq!(scope_skipped_note(true, false, false, true), None);
     }
 
     #[test]
