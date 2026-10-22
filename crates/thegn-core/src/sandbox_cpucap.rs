@@ -49,7 +49,7 @@ impl CpuCap {
     pub fn label(self) -> &'static str {
         match self {
             CpuCap::ScopeHard => "hard — systemd user scope",
-            CpuCap::NiceSoft => "SOFT — nice (no cgroup cpu delegation)",
+            CpuCap::NiceSoft => "SOFT — nice",
             CpuCap::None => "none",
         }
     }
@@ -114,6 +114,57 @@ pub fn choose_cpu_cap(
     }
 }
 
+/// The host facts used to select and explain the CPU cap. Cached together so
+/// doctor reports the same probe that selected the active mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapFacts {
+    pub systemd_run: bool,
+    pub cgroup_cpu_delegated: bool,
+    pub user_manager: bool,
+    pub nice: bool,
+}
+
+impl CapFacts {
+    /// The selected mechanism, using the existing cap-selection ladder.
+    pub fn cap(self) -> CpuCap {
+        choose_cpu_cap(
+            self.systemd_run,
+            self.cgroup_cpu_delegated,
+            self.user_manager,
+            self.nice,
+        )
+    }
+
+    /// Hard-cap prerequisites that are missing, in decision-ladder order.
+    pub fn hard_cap_gaps(self) -> Vec<&'static str> {
+        let mut gaps = Vec::new();
+        if !self.systemd_run {
+            gaps.push("systemd-run not found");
+        }
+        if !self.cgroup_cpu_delegated {
+            gaps.push("no cgroup v2 cpu delegation");
+        }
+        if !self.user_manager {
+            gaps.push("no reachable systemd user manager");
+        }
+        gaps
+    }
+
+    /// Why the selected soft cap could not be a hard systemd scope.
+    pub fn soft_reason(self) -> Option<String> {
+        (self.cap() == CpuCap::NiceSoft).then(|| self.hard_cap_gaps().join(", "))
+    }
+
+    /// Mechanism label with the actual missing hard-cap prerequisites.
+    pub fn label_on(self, os: HostOs) -> String {
+        let label = self.cap().label_on(os);
+        match self.soft_reason() {
+            Some(reason) => format!("{label} ({reason})"),
+            None => label,
+        }
+    }
+}
+
 /// True when this process runs under cgroup v2 with the `cpu` controller
 /// available in its own cgroup — the precondition for a `systemd-run --scope`
 /// `CPUQuota` to actually bite (otherwise the scope is created but the quota is
@@ -140,20 +191,23 @@ fn cgroup_cpu_delegated() -> bool {
 /// Probe (once) how this host can cap an interactive pane's CPU. Reads PATH and
 /// cgroup v2 controller delegation; memoized because neither changes within a
 /// run. Free when unused — nothing calls it unless a cap is configured.
-pub fn detect_cpu_cap() -> CpuCap {
-    static CAP: OnceLock<CpuCap> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        choose_cpu_cap(
-            util::have("systemd-run"),
-            cgroup_cpu_delegated(),
-            user_manager_reachable(
-                std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-                std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
-                &|path| path.exists(),
-            ),
-            util::have("nice"),
-        )
+pub fn detect_cap_facts() -> CapFacts {
+    static FACTS: OnceLock<CapFacts> = OnceLock::new();
+    *FACTS.get_or_init(|| CapFacts {
+        systemd_run: util::have("systemd-run"),
+        cgroup_cpu_delegated: cgroup_cpu_delegated(),
+        user_manager: user_manager_reachable(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+            &|path| path.exists(),
+        ),
+        nice: util::have("nice"),
     })
+}
+
+/// The selected mechanism from the cached host facts.
+pub fn detect_cpu_cap() -> CpuCap {
+    detect_cap_facts().cap()
 }
 
 /// Whether systemd's user manager can be reached with the current environment.
@@ -193,15 +247,12 @@ pub fn scope_skipped_note(
 /// Probe whether a hard scope cap was skipped because the user manager is
 /// unreachable. Used by doctor to report the same host facts as the cap ladder.
 pub fn detected_scope_skipped_note() -> Option<&'static str> {
+    let facts = detect_cap_facts();
     scope_skipped_note(
-        util::have("systemd-run"),
-        cgroup_cpu_delegated(),
-        user_manager_reachable(
-            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-            std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
-            &|path| path.exists(),
-        ),
-        util::have("nice"),
+        facts.systemd_run,
+        facts.cgroup_cpu_delegated,
+        facts.user_manager,
+        facts.nice,
     )
 }
 
@@ -1175,6 +1226,95 @@ mod tests {
         // A missing user manager also falls back to nice, or no cap if nice is absent.
         assert_eq!(choose_cpu_cap(true, true, false, true), NiceSoft);
         assert_eq!(choose_cpu_cap(true, true, false, false), None);
+    }
+
+    #[test]
+    fn cap_facts_soft_reason_names_every_missing_prerequisite() {
+        let cases = [
+            (true, true, true, true, None),
+            (true, true, true, false, None),
+            (
+                true,
+                true,
+                false,
+                true,
+                Some("no reachable systemd user manager"),
+            ),
+            (true, true, false, false, None),
+            (true, false, true, true, Some("no cgroup v2 cpu delegation")),
+            (true, false, true, false, None),
+            (
+                true,
+                false,
+                false,
+                true,
+                Some("no cgroup v2 cpu delegation, no reachable systemd user manager"),
+            ),
+            (true, false, false, false, None),
+            (false, true, true, true, Some("systemd-run not found")),
+            (false, true, true, false, None),
+            (
+                false,
+                true,
+                false,
+                true,
+                Some("systemd-run not found, no reachable systemd user manager"),
+            ),
+            (false, true, false, false, None),
+            (
+                false,
+                false,
+                true,
+                true,
+                Some("systemd-run not found, no cgroup v2 cpu delegation"),
+            ),
+            (false, false, true, false, None),
+            (
+                false,
+                false,
+                false,
+                true,
+                Some(
+                    "systemd-run not found, no cgroup v2 cpu delegation, no reachable systemd user manager",
+                ),
+            ),
+            (false, false, false, false, None),
+        ];
+
+        for (systemd_run, cgroup_cpu_delegated, user_manager, nice, reason) in cases {
+            let facts = CapFacts {
+                systemd_run,
+                cgroup_cpu_delegated,
+                user_manager,
+                nice,
+            };
+            let selected = choose_cpu_cap(systemd_run, cgroup_cpu_delegated, user_manager, nice);
+            assert_eq!(facts.cap(), selected, "{facts:?}");
+            assert_eq!(facts.soft_reason().as_deref(), reason, "{facts:?}");
+        }
+    }
+
+    #[test]
+    fn cap_facts_label_on_carries_the_reason() {
+        let soft = CapFacts {
+            systemd_run: true,
+            cgroup_cpu_delegated: true,
+            user_manager: false,
+            nice: true,
+        };
+        assert!(
+            soft.label_on(HostOs::Linux)
+                .contains("no reachable systemd user manager")
+        );
+
+        let hard = CapFacts {
+            user_manager: true,
+            ..soft
+        };
+        assert_eq!(
+            hard.label_on(HostOs::Linux),
+            CpuCap::ScopeHard.label().to_string()
+        );
     }
 
     #[test]
