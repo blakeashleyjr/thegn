@@ -218,22 +218,20 @@ pub(crate) fn terminal_launch_spec(
                      (install/start it, or choose `host` for this terminal)"
                 )];
                 thegn_core::msg::warn(&warnings[0]);
-                admit_terminal(
+                let admission = admit_terminal(
                     &cfg.sandbox,
                     backend,
                     TerminalOutcome::HostFallback,
                     &mut warnings,
                 )
                 .map_err(|error| error.context("sandbox entry refused"))?;
-                return Ok(crate::agent::LaunchSpec {
-                    argv: cap_local_shell(connection, argv),
-                    cwd: None,
-                    env: vec![],
-                    backend: "host".to_string(),
+                return Ok(admitted_terminal_spec(
+                    admission,
+                    cap_local_shell(connection, argv),
+                    "host".to_string(),
                     warnings,
-                    degraded: true,
-                    remote: false,
-                });
+                    true,
+                ));
             }
         };
         // The label comes from the argv we are about to exec, NEVER from the
@@ -244,7 +242,7 @@ pub(crate) fn terminal_launch_spec(
         let truth = thegn_core::sandbox_truth::reconcile(backend, &wrapped.argv);
         if !truth.degraded {
             let mut warnings = Vec::new();
-            admit_terminal(
+            let admission = admit_terminal(
                 &cfg.sandbox,
                 backend,
                 TerminalOutcome::Wrapped(wrapped.isolation),
@@ -255,15 +253,13 @@ pub(crate) fn terminal_launch_spec(
                 thegn_core::msg::warn(note);
             }
             let degraded = finish_wrapped_terminal(&wrapped, &mut warnings);
-            return Ok(crate::agent::LaunchSpec {
-                argv: wrapped.argv,
-                cwd: None,
-                env: vec![],
-                backend: truth.label,
-                degraded,
+            return Ok(admitted_terminal_spec(
+                admission,
+                wrapped.argv,
+                truth.label,
                 warnings,
-                remote: false,
-            });
+                degraded,
+            ));
         }
         // THE-215: a sealed terminal that came back uncontained is refused, not
         // downgraded to a labelled host shell.
@@ -278,7 +274,7 @@ pub(crate) fn terminal_launch_spec(
             thegn_core::msg::warn(w);
         }
         let mut warnings = truth.warning.into_iter().collect::<Vec<_>>();
-        admit_terminal(
+        let admission = admit_terminal(
             &cfg.sandbox,
             backend,
             TerminalOutcome::DegradedToHost,
@@ -287,16 +283,14 @@ pub(crate) fn terminal_launch_spec(
         .map_err(|error| error.context("sandbox entry refused"))?;
         // Containment was asked for and not delivered: fall through to the plain
         // host shell, labelled `host`, carrying the reason so the pane can say so.
-        return Ok(crate::agent::LaunchSpec {
+        return Ok(admitted_terminal_spec(
+            admission,
             // Uncontained, but still capped — see `cap_local_shell`.
-            argv: cap_local_shell(connection, argv),
-            cwd: None,
-            env: vec![],
-            backend: "host".to_string(),
+            cap_local_shell(connection, argv),
+            "host".to_string(),
             warnings,
-            degraded: true,
-            remote: false,
-        });
+            true,
+        ));
     }
     Ok(crate::agent::LaunchSpec {
         argv: cap_local_shell(connection, argv),
@@ -318,6 +312,30 @@ fn finish_wrapped_terminal(wrapped: &WrappedShell, warnings: &mut Vec<String>) -
     degraded
 }
 
+fn admitted_terminal_spec(
+    admission: crate::sandbox_admission::Admission,
+    argv: Vec<String>,
+    backend: String,
+    warnings: Vec<String>,
+    degraded: bool,
+) -> crate::agent::LaunchSpec {
+    tracing::debug!(
+        target: "thegn::sandbox",
+        class = admission.class().as_str(),
+        enforcement = admission.enforcement().as_str(),
+        "terminal sandbox admission"
+    );
+    crate::agent::LaunchSpec {
+        argv,
+        cwd: None,
+        env: vec![],
+        backend,
+        warnings,
+        degraded,
+        remote: false,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TerminalOutcome {
     HostFallback,
@@ -330,7 +348,7 @@ fn admit_terminal(
     requested: &str,
     outcome: TerminalOutcome,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::sandbox_admission::Admission> {
     let actual = match outcome {
         TerminalOutcome::HostFallback | TerminalOutcome::DegradedToHost => {
             thegn_core::capabilities::IsolationClass::HostProcess
@@ -338,7 +356,6 @@ fn admit_terminal(
         TerminalOutcome::Wrapped(class) => class,
     };
     crate::sandbox_admission::admit(sb, actual, "terminal", false, warnings)
-        .map(|_admission| ())
         .map_err(|error| error.context(format!("requested terminal sandbox `{requested}`")))
 }
 
@@ -2254,6 +2271,65 @@ mod tests {
         assert_eq!(remote.backend, "host");
         assert!(!remote.degraded);
         assert!(remote.warnings.is_empty());
+    }
+
+    #[test]
+    fn admit_terminal_returns_the_admitted_class() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox.isolation_floor = Some(thegn_core::config::IsolationFloor::Off);
+
+        let mut warnings = Vec::new();
+        let wrapped = admit_terminal(
+            &cfg.sandbox,
+            "bwrap",
+            TerminalOutcome::Wrapped(thegn_core::capabilities::IsolationClass::SharedKernel),
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(
+            wrapped.class(),
+            thegn_core::capabilities::IsolationClass::SharedKernel
+        );
+
+        let mut warnings = Vec::new();
+        let fallback = admit_terminal(
+            &cfg.sandbox,
+            "bwrap",
+            TerminalOutcome::HostFallback,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(
+            fallback.class(),
+            thegn_core::capabilities::IsolationClass::HostProcess
+        );
+
+        let mut warnings = Vec::new();
+        let degraded = admit_terminal(
+            &cfg.sandbox,
+            "bwrap",
+            TerminalOutcome::DegradedToHost,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(
+            degraded.class(),
+            thegn_core::capabilities::IsolationClass::HostProcess
+        );
+    }
+
+    #[test]
+    fn terminal_local_sandbox_specs_are_built_only_from_an_admission() {
+        let source = include_str!("panes.rs");
+        let terminal = source
+            .split_once("pub(crate) fn terminal_launch_spec(")
+            .expect("terminal launch function is present")
+            .1
+            .split_once("\nfn finish_wrapped_terminal(")
+            .expect("terminal launch function has a following helper")
+            .0;
+        assert_eq!(terminal.matches("crate::agent::LaunchSpec {").count(), 1);
+        assert_eq!(terminal.matches("admitted_terminal_spec(").count(), 3);
     }
 
     #[test]

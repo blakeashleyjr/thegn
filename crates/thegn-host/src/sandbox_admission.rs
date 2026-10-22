@@ -165,8 +165,8 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
     LaunchRoute {
         id: "terminal-tabs",
         route: "Standalone terminal tabs",
-        status: RouteStatus::AdmittedNoHandle,
-        path: "panes::terminal_launch_spec admits wrapped, degraded and fallback shells; the handle is not carried",
+        status: RouteStatus::Handle,
+        path: "panes::terminal_launch_spec builds every requested local sandbox, degraded or fallback shell from the admission; explicit host and ssh/mosh terminals are declared host-trust",
         anchor: Some((
             "panes.rs",
             "crate::sandbox_admission::admit(sb, actual, \"terminal\", false, warnings)",
@@ -501,6 +501,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             AUDIT_ROWS
         );
+    }
+
+    #[test]
+    fn terminal_tabs_route_carries_the_handle() {
+        let route = LAUNCH_ROUTES
+            .iter()
+            .find(|route| route.id == "terminal-tabs")
+            .expect("terminal-tabs route is present");
+        assert_eq!(route.status, RouteStatus::Handle);
+        assert!(route.path.contains("explicit host"));
+        assert!(route.path.contains("ssh/mosh"));
     }
 
     fn source(file: &str) -> &'static str {
