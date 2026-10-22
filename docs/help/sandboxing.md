@@ -367,6 +367,16 @@ what is _measured_ on this host — a machine without cgroup cpu delegation show
 soft ceiling for the host-toolchain backends, not a hard one. Backends thegn's
 verbs were never checked against a real install are flagged `(unverified)`.
 
+`thegn doctor` also lists sandbox execution routes such as worktree panes,
+queue agents, tests and gates, hooks, language services, and host extensions,
+with each route's admission status. `handle` means the launch carries sandbox
+admission; `admitted-no-handle` means admission passes without carrying the
+handle, and `partial` means only some spawns carry it. `own-gate` means a
+separate floor or sealed gate; `host-capped` means host execution under the
+shared resource ceiling; and `host-trust` means host execution on user trust.
+`thegn doctor --json` includes the table as `sandbox.admission_routes`, with
+`id`, `route`, `status`, and `path` fields.
+
 The honest **isolation class**, weakest to strongest:
 
 | Class              | Escape needs…                               | Backends                                             |
@@ -567,6 +577,9 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 The bridge helper is uploaded to a staged file and checked by SHA-256 before
 it is moved into place. If the install cannot be verified, the bridge
 connection is skipped.
+The helper lives at `/var/tmp/thegn-bridge/<sha256>/thegn`, outside the
+worktree. Its digest is re-checked before thegn starts it through a provider's
+native exec API or for a reverse tunnel.
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
 
@@ -578,6 +591,10 @@ shows that floor.
 A thegn-derived VPS or Fly sandbox name is bound to the worktree that created
 it. Another worktree resolving to the same name is refused before a provider
 call.
+VPS and Fly ledger records carry a credential-free fingerprint of the provider
+kind, API authority, and configured (or default) token variable name, never the
+token itself. A name recorded under another account is refused; the VPS reaper
+quarantines that record and does not delete it.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or

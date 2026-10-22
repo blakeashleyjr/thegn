@@ -30,6 +30,12 @@ is reported as unknown and makes the command exit non-zero naming it. It prints
 "no thegn pane daemon is running" only when every listener was checked and none
 is running.
 
+When starting a pane daemon, thegn checks a configured socket first, then
+checks registered daemon endpoints, skipping any duplicate address. Registered
+endpoints share a 5-second check budget; if an endpoint is still unchecked when
+that budget expires, thegn does not start another daemon and names the
+unchecked endpoints, suggesting a retry or `thegn daemon stop`.
+
 When the UI exits, in-flight custom git commands, CI refreshes, and CI rerun or
 cancel actions are cancelled. Thegn waits up to two seconds for them before
 exiting; work still running after that is logged. A CI action requested while
