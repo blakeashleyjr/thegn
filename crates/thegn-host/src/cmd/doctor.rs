@@ -194,6 +194,7 @@ fn sandbox_json_with(cfg: &Config, backend: Backend, actual: IsolationClass) -> 
         "enforcement_matrix": enforcement_matrix_json(),
         "home": home_json(cfg),
         "network_rules": network_rules_line(&cfg.sandbox, backend),
+        "admission_routes": crate::sandbox_admission::routes_json(),
         "isolation": isolation_json(&thegn_core::sandbox_floor::isolation_report(
             &cfg.sandbox,
             backend,
@@ -4474,6 +4475,9 @@ fn floor_report(cfg: &Config) {
         "{}",
         containment_line(containment_summary(cfg.sandbox.enabled, actual))
     );
+    for line in crate::sandbox_admission::route_lines() {
+        outln!("{line}");
+    }
 }
 
 /// Format requested, resolved, and enforced isolation as three stable report lines.
@@ -5944,6 +5948,38 @@ args = ["--verbose"]
             report["headless_agent_handoff"]["supported"]
                 .as_bool()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn admission_routes_json_lists_every_audit_route() {
+        let value = sandbox_json_with(
+            &Config::default(),
+            Backend::None,
+            IsolationClass::HostProcess,
+        );
+        let routes = value["admission_routes"]
+            .as_array()
+            .expect("admission_routes is an array");
+        assert_eq!(routes.len(), 11);
+        for route in routes {
+            assert!(route["id"].as_str().is_some());
+            assert!(route["route"].as_str().is_some());
+            assert!(route["status"].as_str().is_some());
+            assert!(route["path"].as_str().is_some());
+        }
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (
+                    route["id"].as_str().expect("route id is a string"),
+                    route["status"].as_str().expect("route status is a string"),
+                ))
+                .collect::<Vec<_>>(),
+            crate::sandbox_admission::LAUNCH_ROUTES
+                .iter()
+                .map(|route| (route.id, route.status.as_str()))
+                .collect::<Vec<_>>()
         );
     }
 }
