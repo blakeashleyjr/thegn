@@ -110,6 +110,9 @@ fn observe_attention_edges(rows: &[thegn_core::osc_attention::SessionAttention])
 pub(crate) struct CiReader<'a> {
     pub cfg: &'a thegn_core::config::CiConfig,
     pub locations: &'a thegn_core::remote::WorktreeLocations,
+    /// Spawn-free current-branch observations, keyed by worktree path.
+    pub branches:
+        &'a std::collections::HashMap<String, crate::worktree_snapshot::BranchObservation>,
 }
 
 /// Compute `status.attention` / `attention_ranks` / `workspace_attention` for
@@ -353,20 +356,34 @@ fn collect_attention_inner(
         // Latest cached CI run (newest first in the cache), last-known-good.
         let (mut ci_failing, mut ci_running) = (false, false);
         let (mut ci_episode, mut ci_since) = (0u64, None);
-        let cache = db
-            .get_ci_cache(path)
-            .ok()
-            .flatten()
-            .and_then(|(json, _)| match ci {
-                Some(ci) => {
-                    let loc = ci.locations.loc(std::path::Path::new(path));
-                    let current = crate::ci_refresh::reader_cache_context(&loc, ci.cfg);
-                    crate::ci_refresh::cached_runs_for_reader(&json, current.as_deref())
-                        .ok()
-                        .flatten()
-                }
-                None => thegn_core::ci::decode_run_cache(&json),
-            });
+        let cache =
+            match ci {
+                Some(ci) => db.get_ci_cache_entry(path).ok().flatten().and_then(
+                    |(json, cached_branch, _)| {
+                        if ci
+                            .branches
+                            .get(path)
+                            .and_then(|branch| branch.branch())
+                            .is_some_and(|current| {
+                                thegn_core::ci::foreign_cache_note(&cached_branch, current)
+                                    .is_some()
+                            })
+                        {
+                            return None;
+                        }
+                        let loc = ci.locations.loc(std::path::Path::new(path));
+                        let current = crate::ci_refresh::reader_cache_context(&loc, ci.cfg);
+                        crate::ci_refresh::cached_runs_for_reader(&json, current.as_deref())
+                            .ok()
+                            .flatten()
+                    },
+                ),
+                None => db
+                    .get_ci_cache(path)
+                    .ok()
+                    .flatten()
+                    .and_then(|(json, _)| thegn_core::ci::decode_run_cache(&json)),
+            };
         if let Some(cache) = cache
             && let Some(latest) = cache
                 .runs
@@ -592,6 +609,7 @@ mod tests {
         let ci = CiReader {
             cfg: &cfg,
             locations: &locations,
+            branches: &std::collections::HashMap::new(),
         };
         let session = session_with(&[("app/c", path)]);
         let mut status = crate::sidebar::SidebarStatus::default();
@@ -620,6 +638,7 @@ mod tests {
         let ci = CiReader {
             cfg: &cfg,
             locations: &locations,
+            branches: &std::collections::HashMap::new(),
         };
         let session = session_with(&[("app/c", path)]);
         let mut status = crate::sidebar::SidebarStatus::default();
@@ -633,19 +652,115 @@ mod tests {
     }
 
     #[test]
-    fn unknown_context_keeps_cached_ci_attention() {
+    fn unknown_current_branch_keeps_cached_ci_attention() {
         order_memo().lock().unwrap().clear();
         let path = "/wt/none";
         let db = thegn_core::db::Db::open_memory().unwrap();
         db.put_worktree("app/c", "/repo", path, "topic", None, None)
             .unwrap();
-        db.put_ci_cache(path, "topic", &failing_cache("github:github.com/o/a"))
+        db.put_ci_cache(path, "old-topic", &failing_cache("github:github.com/o/a"))
             .unwrap();
         let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
         let cfg = thegn_core::config::CiConfig::default();
+        let branches = std::collections::HashMap::from([(
+            path.to_string(),
+            crate::worktree_snapshot::BranchObservation::Detached,
+        )]);
         let ci = CiReader {
             cfg: &cfg,
             locations: &locations,
+            branches: &branches,
+        };
+        let session = session_with(&[("app/c", path)]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+
+        collect_attention_with_ci(&session, &db, &mut status, &ci);
+
+        assert_eq!(
+            status.attention[path].reason,
+            thegn_core::attention::AttentionReason::CiFailed
+        );
+    }
+
+    #[test]
+    fn foreign_branch_ci_failure_raises_no_attention() {
+        order_memo().lock().unwrap().clear();
+        let path = "/wt/none";
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", path, "topic", None, None)
+            .unwrap();
+        db.put_ci_cache(path, "old-topic", &failing_cache(""))
+            .unwrap();
+        let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
+        let cfg = thegn_core::config::CiConfig::default();
+        let branches = std::collections::HashMap::from([(
+            path.to_string(),
+            crate::worktree_snapshot::BranchObservation::Branch("topic".into()),
+        )]);
+        let ci = CiReader {
+            cfg: &cfg,
+            locations: &locations,
+            branches: &branches,
+        };
+        let session = session_with(&[("app/c", path)]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+
+        collect_attention_with_ci(&session, &db, &mut status, &ci);
+
+        assert_ne!(
+            status.attention[path].reason,
+            thegn_core::attention::AttentionReason::CiFailed
+        );
+    }
+
+    #[test]
+    fn empty_cached_branch_ci_failure_raises_no_attention() {
+        order_memo().lock().unwrap().clear();
+        let path = "/wt/none";
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", path, "topic", None, None)
+            .unwrap();
+        db.put_ci_cache(path, "", &failing_cache("")).unwrap();
+        let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
+        let cfg = thegn_core::config::CiConfig::default();
+        let branches = std::collections::HashMap::from([(
+            path.to_string(),
+            crate::worktree_snapshot::BranchObservation::Branch("topic".into()),
+        )]);
+        let ci = CiReader {
+            cfg: &cfg,
+            locations: &locations,
+            branches: &branches,
+        };
+        let session = session_with(&[("app/c", path)]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+
+        collect_attention_with_ci(&session, &db, &mut status, &ci);
+
+        assert_ne!(
+            status.attention[path].reason,
+            thegn_core::attention::AttentionReason::CiFailed
+        );
+    }
+
+    #[test]
+    fn matching_branch_ci_failure_still_raises_attention() {
+        order_memo().lock().unwrap().clear();
+        let path = "/wt/none";
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", path, "topic", None, None)
+            .unwrap();
+        db.put_ci_cache(path, "topic", &failing_cache("")).unwrap();
+        let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
+        let cfg = thegn_core::config::CiConfig::default();
+        let branches = std::collections::HashMap::from([(
+            path.to_string(),
+            crate::worktree_snapshot::BranchObservation::Branch("topic".into()),
+        )]);
+        let ci = CiReader {
+            cfg: &cfg,
+            locations: &locations,
+            branches: &branches,
         };
         let session = session_with(&[("app/c", path)]);
         let mut status = crate::sidebar::SidebarStatus::default();
