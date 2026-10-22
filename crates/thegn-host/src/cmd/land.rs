@@ -22,11 +22,11 @@ use std::path::Path;
 use thegn_core::config::Config;
 use thegn_core::db::{CompatibleDb, Db, SchemaOperation};
 use thegn_core::merge_lifecycle::{LifecycleAction, LifecycleEvent, decide};
+use thegn_core::outln;
 use thegn_core::store::{
     MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
     WorktreeAuxStore,
 };
-use thegn_core::{outln, util};
 
 use crate::integrate::{self, AttemptOutcome};
 
@@ -54,10 +54,11 @@ pub(crate) fn land_branch(
     worktree: &Path,
 ) -> Result<(String, String, AttemptOutcome)> {
     let root = integrate::main_checkout(worktree).context("not inside a git repository")?;
-    let branch = util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .with_context(|| format!("{}: not on a branch (detached HEAD?)", worktree.display()))?;
+    let branch = match crate::merge_ops::branch_of(worktree) {
+        Ok(Some(branch)) => branch,
+        Ok(None) => anyhow::bail!("{}: not on a branch (detached HEAD?)", worktree.display()),
+        Err(reason) => anyhow::bail!("{}: branch could not be read: {reason}", worktree.display()),
+    };
     // THE-515: a refused (ambiguous) trusted overlay must not degrade to the
     // global gate on the one path that forces auto_land on below.
     if let Some(refusal) = cfg.workspace_overlay_refusal(&root) {

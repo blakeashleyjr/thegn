@@ -52,10 +52,26 @@ pub(crate) fn drain_add_result(result: Result<()>) -> Result<Option<String>> {
 }
 
 /// The branch a worktree is currently on (`None` when detached).
-pub fn branch_of(worktree: &Path) -> Option<String> {
-    util::git_out(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+pub fn branch_of(worktree: &Path) -> std::result::Result<Option<String>, String> {
+    let loc = GitLoc::Local(worktree.to_path_buf());
+    match loc.git_text(&["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Ok(branch) if branch.is_empty() => Err("git returned an empty branch name".into()),
+        Ok(branch) => Ok(Some(branch)),
+        Err(error) if is_absent(&error) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn is_absent(error: &thegn_core::git_run::GitTextError) -> bool {
+    matches!(
+        error,
+        thegn_core::git_run::GitTextError::Failed(
+            thegn_core::git_run::GitOutcome::Exit {
+                code: Some(1),
+                stderr_tail
+            }
+        ) if stderr_tail.is_empty()
+    )
 }
 
 /// Capture the current local branch tip before writing a deliberate enqueue.
@@ -183,6 +199,7 @@ pub fn canonical_worktree(worktree: &Path) -> PathBuf {
 pub(crate) enum LandRefusal {
     NotQueued,
     NotOnBranch,
+    BranchUnreadable { reason: String },
     NotReady { status: String },
     NoResult,
     BranchMismatch { queued: String, checked_out: String },
@@ -195,6 +212,9 @@ impl std::fmt::Display for LandRefusal {
         let reason = match self {
             Self::NotQueued => "worktree has no merge-queue row".to_owned(),
             Self::NotOnBranch => "worktree is not on a branch".to_owned(),
+            Self::BranchUnreadable { reason } => {
+                format!("worktree branch could not be read: {reason}")
+            }
             Self::NotReady { status } => format!("merge-queue row is {status}, not ready"),
             Self::NoResult => "ready merge-queue row has no result OID".to_owned(),
             Self::BranchMismatch {
@@ -261,11 +281,10 @@ pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<()> {
         .into_iter()
         .find(|row| row.worktree == canonical_s);
     let claim = db.observe_merge_claim(&canonical_s)?;
-    let Some(branch) = util::git_out(&canonical, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|branch| branch.trim().to_owned())
-        .filter(|branch| !branch.is_empty())
-    else {
-        return Err(anyhow::Error::new(LandRefusal::NotOnBranch));
+    let branch = match branch_of(&canonical) {
+        Ok(Some(branch)) => branch,
+        Ok(None) => return Err(anyhow::Error::new(LandRefusal::NotOnBranch)),
+        Err(reason) => return Err(anyhow::Error::new(LandRefusal::BranchUnreadable { reason })),
     };
     ready_land_check(row.as_ref(), claim.as_ref(), &branch).map_err(anyhow::Error::from)
 }
@@ -305,6 +324,9 @@ pub fn enqueue_worktree_with(
     let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
     let branch = branch_of(worktree)
+        .map_err(|reason| {
+            anyhow::anyhow!("{}: branch could not be read: {reason}", worktree.display())
+        })?
         .with_context(|| format!("{}: not on a branch (detached HEAD?)", worktree.display()))?;
     let wt_s = worktree.to_string_lossy().to_string();
     if branch == target {
@@ -1265,5 +1287,77 @@ mod operand_tests {
     fn push_target_refuses_dash_branch_before_spawn() {
         let e = super::push_target(std::path::Path::new("/nonexistent"), "--mirror").unwrap_err();
         assert!(e.to_string().contains("begins with '-'"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod typed_branch_tests {
+    use super::{LandRefusal, branch_of};
+    use std::path::Path;
+
+    #[test]
+    fn branch_of_non_repository_is_an_error() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let result = branch_of(dir.path());
+        assert!(
+            matches!(&result, Err(reason) if reason.contains("not a git repository")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn branch_of_reads_the_checked_out_branch() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        init_repo(dir.path());
+        assert_eq!(branch_of(dir.path()).unwrap().as_deref(), Some("feat"));
+    }
+
+    #[test]
+    fn branch_of_detached_head_is_none() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        init_repo(dir.path());
+        git(dir.path(), &["checkout", "-q", "--detach", "HEAD"]);
+        assert_eq!(branch_of(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn branch_unreadable_refusal_names_the_reason() {
+        let refusal = LandRefusal::BranchUnreadable {
+            reason: "boom".into(),
+        };
+        assert!(refusal.to_string().contains("could not be read: boom"));
+    }
+
+    fn init_repo(path: &Path) {
+        git(path, &["init", "-q", "-b", "feat"]);
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        );
+    }
+
+    #[allow(clippy::disallowed_methods, reason = "test fixture git")]
+    fn git(path: &Path, args: &[&str]) {
+        let status = thegn_core::util::git_cmd(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "git {args:?} failed in {}",
+            path.display()
+        );
     }
 }
