@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -38,6 +40,8 @@ class RehearsePackagesTests(unittest.TestCase):
             "rpm": None,
             "previous_deb": None,
             "previous_rpm": None,
+            "release_manifest": None,
+            "previous_release_manifest": None,
             "runtime": "podman",
             "deb_images": ["debian:test", "ubuntu:test"],
             "rpm_images": ["fedora:test"],
@@ -47,6 +51,28 @@ class RehearsePackagesTests(unittest.TestCase):
         }
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    def write_manifest(self, version: str, packages: list[Path]) -> Path:
+        assets = [
+            {
+                "name": package.name,
+                "sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
+                "size": package.stat().st_size,
+            }
+            for package in packages
+        ]
+        value = {
+            "schema_version": 1,
+            "tag": f"v{version}",
+            "commit": "fixture-commit",
+            "tag_object": "fixture-tag-object",
+            "workflow_sha": "fixture-workflow-sha",
+            "run_id": "fixture-run-id",
+            "assets": assets,
+        }
+        path = self.root / f"manifest-{version}.json"
+        path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
 
     def successful_runner(self, calls: list[list[str]] | None = None):
         def run(argv: list[str], timeout: float) -> rehearse.StepResult:
@@ -87,6 +113,102 @@ class RehearsePackagesTests(unittest.TestCase):
                 result = rehearse.main(["--deb", str(self.deb), "--dry-run"])
         self.assertEqual(0, result)
         self.assertTrue(any("podman pull docker.io/library/debian:stable-slim" in str(call) for call in stdout.write.call_args_list))
+
+    def test_real_run_requires_a_release_manifest(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main(["--deb", str(self.deb), "--evidence-dir", str(self.root / "evidence")])
+        self.assertEqual(2, result)
+        self.assertIn("--release-manifest", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_package_digest_mismatch_against_the_release_manifest_refuses_before_any_runtime_call(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value["assets"][0]["sha256"] = "0" * 64
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main(["--deb", str(self.deb), "--release-manifest", str(manifest), "--evidence-dir", str(self.root / "evidence")])
+        self.assertEqual(2, result)
+        self.assertIn("does not match the release manifest", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_package_size_mismatch_against_the_release_manifest_refuses_before_any_runtime_call(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value["assets"][0]["size"] += 1
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main(["--deb", str(self.deb), "--release-manifest", str(manifest), "--evidence-dir", str(self.root / "evidence")])
+        self.assertEqual(2, result)
+        self.assertIn("size does not match", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_package_missing_from_the_release_manifest_refuses_before_any_runtime_call(self) -> None:
+        other = self.root / "thegn_0.1.0-alpha.22_other.deb"
+        other.write_bytes(b"other package")
+        manifest = self.write_manifest("0.1.0-alpha.22", [other])
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main(["--deb", str(self.deb), "--release-manifest", str(manifest), "--evidence-dir", str(self.root / "evidence")])
+        self.assertEqual(2, result)
+        self.assertIn("not in the release manifest", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_release_manifest_for_another_tag_is_refused(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.21", [self.deb])
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main(["--deb", str(self.deb), "--release-manifest", str(manifest), "--evidence-dir", str(self.root / "evidence")])
+        self.assertEqual(2, result)
+        self.assertIn("does not match requested tag", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_upgrade_leg_requires_a_previous_release_manifest(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        stderr = io.StringIO()
+        with mock.patch.object(rehearse, "_run", side_effect=AssertionError("runtime called")) as runner:
+            with contextlib.redirect_stderr(stderr):
+                result = rehearse.main(["--deb", str(self.deb), "--previous-deb", str(self.previous_deb), "--release-manifest", str(manifest), "--evidence-dir", str(self.root / "evidence")])
+        self.assertEqual(2, result)
+        self.assertIn("--previous-release-manifest is required", stderr.getvalue())
+        runner.assert_not_called()
+
+    def test_previous_release_manifest_without_previous_packages_is_refused(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.21", [self.previous_deb])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = rehearse.main(["--deb", str(self.deb), "--previous-release-manifest", str(manifest), "--dry-run"])
+        self.assertEqual(2, result)
+        self.assertIn("requires previous packages", stderr.getvalue())
+
+    def test_dry_run_still_verifies_a_given_manifest(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value["assets"][0]["size"] += 1
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = rehearse.main(["--deb", str(self.deb), "--release-manifest", str(manifest), "--dry-run"])
+        self.assertEqual(2, result)
+        self.assertIn("size does not match", stderr.getvalue())
+
+    def test_matching_manifest_runs_and_records_its_digest_in_the_evidence(self) -> None:
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
+        expected = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        with mock.patch.object(rehearse, "_run", side_effect=self.successful_runner()):
+            result = rehearse.main(["--deb", str(self.deb), "--release-manifest", str(manifest), "--evidence-dir", str(self.root / "evidence")])
+        self.assertEqual(0, result)
+        evidence = next((self.root / "evidence").glob("*.json"))
+        payload = json.loads(evidence.read_text(encoding="utf-8"))
+        self.assertEqual(expected, payload["release_manifest_sha256"])
 
     def test_rejects_a_misnamed_package_before_any_runtime_call(self) -> None:
         bad = self.root / "package.deb"
@@ -224,6 +346,7 @@ class RehearsePackagesTests(unittest.TestCase):
             return rehearse.StepResult(0, "ok", "", 1)
 
         evidence_dir = self.root / "interrupted-evidence"
+        manifest = self.write_manifest("0.1.0-alpha.22", [self.deb])
         with mock.patch.object(rehearse, "_run", side_effect=interrupting):
             result = rehearse.main(
                 [
@@ -235,6 +358,8 @@ class RehearsePackagesTests(unittest.TestCase):
                     "debian:test",
                     "--evidence-dir",
                     str(evidence_dir),
+                    "--release-manifest",
+                    str(manifest),
                 ]
             )
         self.assertEqual(1, result)

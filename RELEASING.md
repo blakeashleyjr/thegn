@@ -31,14 +31,18 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    built for _this_ machine's target, so it rehearses the
    darwin leg on a Mac and the linux-gnu leg on Linux — not the musl one.
 
-   After downloading a draft release's `.deb`/`.rpm` assets with
-   `gh release download <tag> --pattern 'thegn_*_amd64.deb' --pattern 'thegn-*-1.x86_64.rpm'`, run
-   `just rehearse-packages deb=... rpm=...` (and optionally pass the previous release's packages as
-   `previous_deb=... previous_rpm=...` for the upgrade leg). Attach the generated JSON evidence to
-   THE-52. The standalone `.deb` / `.rpm` channel row changes only after a passing evidence record exists.
+   After downloading a draft release's `.deb`/`.rpm` assets and manifest with
+   `gh release download <tag> --pattern 'thegn_*_amd64.deb' --pattern 'thegn-*-1.x86_64.rpm' --pattern 'thegn-<tag>-manifest.json'`,
+   verify the manifest attestation first with
+   `gh attestation verify thegn-<tag>-manifest.json --repo blakeashleyjr/thegn`, then run
+   `just rehearse-packages deb=... rpm=... manifest=thegn-<tag>-manifest.json`. For the upgrade leg, also pass
+   `previous_deb=... previous_rpm=... previous_manifest=thegn-<previous-tag>-manifest.json` after downloading and
+   verifying that manifest's attestation. The rehearsal refuses any package not recorded byte-for-byte in its release
+   manifest. Attach the generated JSON evidence to THE-52. The standalone `.deb` / `.rpm` channel row changes only after a
+   passing evidence record exists.
 
    ```sh
-   just rehearse-packages deb=thegn_<version>_amd64.deb rpm=thegn-<version>-1.x86_64.rpm
+   just rehearse-packages deb=thegn_<version>_amd64.deb rpm=thegn-<version>-1.x86_64.rpm manifest=thegn-<tag>-manifest.json
    ```
 
 6. **Tag + push.**
