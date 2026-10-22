@@ -3835,6 +3835,65 @@ mod tests {
         assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
     }
 
+    #[tokio::test]
+    async fn ci_logs_cache_hit_does_not_widen_past_configured_line_policy() {
+        let worktree = tempfile::tempdir().unwrap();
+        let config = thegn_core::config::Config {
+            ci: thegn_core::config_ci::CiConfig {
+                log_tail_lines: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (service, _) = service_with_config(0, config);
+        let repo_path = worktree.path().display().to_string();
+        let worktree_path = repo_path.clone();
+        service
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                db.put_workspace(&repo_path, "repo", "repo")?;
+                db.put_worktree(
+                    "repo/feature",
+                    &repo_path,
+                    &worktree_path,
+                    "feature",
+                    None,
+                    None,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(worktree.path());
+        let text = (0..8)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let mut entry =
+            thegn_core::ci_log::CiLogEntry::new(cache_key, "1", "2", "job", &text, 8, 4096, 10);
+        entry.head_sha = "known-head".into();
+        service
+            .with_db(move |db| {
+                use thegn_core::store::CacheStore;
+                db.put_ci_log(&entry)
+            })
+            .await
+            .unwrap();
+
+        let reply = service
+            .ci_logs(worktree.path().to_str().unwrap(), "1", "2", Some(20))
+            .await
+            .unwrap();
+        assert_eq!(reply.source, "cache");
+        assert_eq!(reply.logs.len(), 1);
+        let served = reply.logs[0]["text"].as_str().unwrap();
+
+        assert!(
+            served.lines().count() <= 3,
+            "a cache hit must honor log_tail_lines even when tail_lines requests more"
+        );
+    }
+
     /// Build a service with an in-memory DB and no live sessions — enough to
     /// exercise the lease bookkeeping glue (`on_session_idle` / `on_session_busy`)
     /// in isolation from the PTY actors, which is exactly the untested seam.
