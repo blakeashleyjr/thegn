@@ -1967,6 +1967,9 @@ size = 13\n\
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("kitty.conf");
         std::fs::write(&config, b"old").unwrap();
+        let mut permissions = std::fs::metadata(&config).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&config, permissions.clone()).unwrap();
         let permissions = std::fs::metadata(&config).unwrap().permissions();
         let mut suffix = || Ok("cccc".to_string());
 
@@ -1974,9 +1977,9 @@ size = 13\n\
 
         assert_eq!(
             std::fs::metadata(&staged).unwrap().permissions(),
-            permissions
+            permissions,
+            "the staged file must inherit the explicitly read-only destination permissions"
         );
         assert_eq!(std::fs::read(&staged).unwrap(), b"x");
-        std::fs::remove_file(staged).unwrap();
     }
 }
