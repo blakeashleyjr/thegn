@@ -2,7 +2,7 @@
 //! `<config_dir>/plugins/<dir>/plugin.toml` directories, each checked against
 //! the host contract before anything runs.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -146,17 +146,10 @@ impl AdmittedPluginSet {
 /// the same manifest bytes read during discovery.
 pub fn admit(cfg: &Config, config_dir: &Path) -> AdmittedPluginSet {
     let (loaded, broken, source_digests) = discover_with_digests(cfg, config_dir);
-    let mut seen = HashSet::new();
     let mut set_problems = broken;
-    for plugin in &loaded {
-        let id = plugin.spec.manifest.id.as_str().to_string();
-        if !seen.insert(id.clone()) {
-            set_problems.push(SpecProblem {
-                plugin: id,
-                problem: "duplicate plugin id".into(),
-            });
-        }
-    }
+    set_problems.extend(duplicate_id_problems(
+        loaded.iter().map(|plugin| plugin.spec.manifest.id.as_str()),
+    ));
     set_problems
         .sort_by(|left, right| (&left.plugin, &left.problem).cmp(&(&right.plugin, &right.problem)));
 
@@ -437,6 +430,52 @@ fn valid_routing_id(id: &str) -> bool {
             .any(|character| character.is_control() || character == ':')
 }
 
+fn valid_env_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=MAX_PLUGIN_ROUTING_ID_BYTES).contains(&bytes.len())
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn launch_field_bytes(spec: &PluginSpec) -> usize {
+    let command_bytes = spec.command.iter().fold(0_usize, |total, argument| {
+        total.saturating_add(argument.len()).saturating_add(1)
+    });
+    let env_bytes = spec.env.iter().fold(0_usize, |total, (key, value)| {
+        total
+            .saturating_add(key.len())
+            .saturating_add(value.len())
+            .saturating_add(2)
+    });
+    command_bytes
+        .saturating_add(spec.cwd.len())
+        .saturating_add(1)
+        .saturating_add(env_bytes)
+}
+
+fn duplicate_id_problems<'a>(ids: impl Iterator<Item = &'a str>) -> Vec<SpecProblem> {
+    let mut seen = HashMap::<String, String>::new();
+    let mut problems = Vec::new();
+    for id in ids {
+        let canonical = id.to_ascii_lowercase();
+        if let Some(first) = seen.get(&canonical) {
+            problems.push(SpecProblem {
+                plugin: id.to_string(),
+                problem: if first.as_str() == id {
+                    "duplicate plugin id".into()
+                } else {
+                    format!("duplicate plugin id (differs only by case from {first:?})")
+                },
+            });
+        } else {
+            seen.insert(canonical, id.to_string());
+        }
+    }
+    problems
+}
+
 /// Negotiate one spec against the host contract.
 pub fn negotiate(spec: &PluginSpec) -> Result<NegotiatedManifest, String> {
     host_contract()
@@ -545,6 +584,30 @@ fn check_spec_fields(p: &LoadedPlugin) -> Vec<SpecProblem> {
             }
         }
     }
+    for (index, argument) in p.spec.command.iter().enumerate() {
+        if argument.contains('\0') {
+            push(format!("command argument {index} contains a NUL byte"));
+        }
+    }
+    if p.spec.cwd.contains('\0') {
+        push("cwd contains a NUL byte".into());
+    }
+    for (key, value) in &p.spec.env {
+        if !valid_env_key(key) {
+            push(format!(
+                "env key {key:?} must be 1..={MAX_PLUGIN_ROUTING_ID_BYTES} bytes of [A-Za-z0-9_], not starting with a digit"
+            ));
+        }
+        if value.contains('\0') {
+            push(format!("env {key} value contains a NUL byte"));
+        }
+    }
+    let launch_bytes = launch_field_bytes(&p.spec);
+    if launch_bytes > MAX_MANIFEST_BYTES {
+        push(format!(
+            "launch fields (command, cwd, env) are {launch_bytes} bytes; the limit is {MAX_MANIFEST_BYTES}"
+        ));
+    }
     out
 }
 
@@ -559,16 +622,9 @@ pub fn check_specs(cfg: &Config, config_dir: &Path) -> Vec<SpecProblem> {
 /// Validate one discovered snapshot (including parse failures from discovery).
 pub fn check_loaded(loaded: &[LoadedPlugin], broken: Vec<SpecProblem>) -> Vec<SpecProblem> {
     let mut out = broken;
-    let mut seen: HashSet<String> = HashSet::new();
-    for p in loaded {
-        let id = p.spec.manifest.id.as_str().to_string();
-        if !seen.insert(id.clone()) {
-            out.push(SpecProblem {
-                plugin: id,
-                problem: "duplicate plugin id".into(),
-            });
-        }
-    }
+    out.extend(duplicate_id_problems(
+        loaded.iter().map(|plugin| plugin.spec.manifest.id.as_str()),
+    ));
     for p in loaded.iter().filter(|p| p.spec.enabled) {
         out.extend(check_spec(p));
     }
@@ -1172,6 +1228,7 @@ mod tests {
         assert_ne!(first.digest, changed.digest);
     }
 
+    // Positive control: exact duplicate ids retain the established diagnostic.
     #[test]
     fn admit_set_problems_include_duplicate_ids_and_discovery_errors() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1244,5 +1301,190 @@ mod tests {
             decision => panic!("expected invalid plugin decision, got {decision:?}"),
         }
         assert!(admitted.startable().is_err());
+    }
+
+    #[test]
+    fn launch_fields_with_nul_bytes_are_refused() {
+        let cases = [
+            (
+                spec("argv-nul", vec!["true".into(), "a\0b".into()]),
+                "command argument 1 contains a NUL byte",
+            ),
+            (
+                {
+                    let mut plugin = spec("cwd-nul", vec!["true".into()]);
+                    plugin.cwd = "x\0y".into();
+                    plugin
+                },
+                "cwd contains a NUL byte",
+            ),
+            (
+                {
+                    let mut plugin = spec("env-nul", vec!["true".into()]);
+                    plugin.env.insert("KEY".into(), "v\0".into());
+                    plugin
+                },
+                "env KEY value contains a NUL byte",
+            ),
+            (
+                {
+                    let mut plugin = spec("env-key-nul", vec!["true".into()]);
+                    plugin.env.insert("KE\0Y".into(), "value".into());
+                    plugin
+                },
+                "env key \"KE\\0Y\" must be 1..=128 bytes of [A-Za-z0-9_], not starting with a digit",
+            ),
+        ];
+
+        for (plugin, expected_problem) in cases {
+            let loaded = LoadedPlugin {
+                spec: plugin,
+                dir: None,
+                trusted_native_ignored: false,
+            };
+            let problems = check_spec(&loaded);
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert_eq!(problems[0].problem, expected_problem);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env_nul = spec("env-nul", vec!["true".into()]);
+        env_nul.env.insert("KEY".into(), "v\0".into());
+        let admitted = admit(
+            &Config {
+                plugins: vec![env_nul],
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        assert!(matches!(
+            &admitted.plugins[0].decision,
+            PluginDecision::Invalid(problems)
+                if problems.iter().any(|problem| problem.problem == "env KEY value contains a NUL byte")
+        ));
+    }
+
+    #[test]
+    fn env_key_grammar_is_enforced() {
+        let invalid = [
+            "".to_string(),
+            "1A".to_string(),
+            "A=B".to_string(),
+            "A B".to_string(),
+            "é".to_string(),
+            "A\u{7}".to_string(),
+            "K".repeat(MAX_PLUGIN_ROUTING_ID_BYTES + 1),
+        ];
+        for key in invalid {
+            let mut plugin = spec("env-key", vec!["true".into()]);
+            plugin.env.insert(key.clone(), "value".into());
+            let loaded = LoadedPlugin {
+                spec: plugin,
+                dir: None,
+                trusted_native_ignored: false,
+            };
+            assert!(
+                check_spec(&loaded)
+                    .iter()
+                    .any(|problem| problem.problem.starts_with("env key ")),
+                "key {key:?} should fail the env key grammar"
+            );
+        }
+
+        for key in [
+            "A".to_string(),
+            "_X1".to_string(),
+            "PATH".to_string(),
+            "lower_case".to_string(),
+            "K".repeat(MAX_PLUGIN_ROUTING_ID_BYTES),
+        ] {
+            let mut plugin = spec("env-key", vec!["true".into()]);
+            plugin.env.insert(key.clone(), "value".into());
+            let loaded = LoadedPlugin {
+                spec: plugin,
+                dir: None,
+                trusted_native_ignored: false,
+            };
+            assert!(
+                !check_spec(&loaded)
+                    .iter()
+                    .any(|problem| problem.problem.starts_with("env key ")),
+                "key {key:?} should pass the env key grammar"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_field_budget_boundaries() {
+        let base = spec("budget", vec!["true".into()]);
+        let base_bytes = launch_field_bytes(&base);
+        let exact_padding_len = MAX_MANIFEST_BYTES - base_bytes - 1;
+
+        for (padding_len, expected_bytes, refused) in [
+            (exact_padding_len - 1, MAX_MANIFEST_BYTES - 1, false),
+            (exact_padding_len, MAX_MANIFEST_BYTES, false),
+            (exact_padding_len + 1, MAX_MANIFEST_BYTES + 1, true),
+        ] {
+            let mut plugin = base.clone();
+            plugin.command.push("x".repeat(padding_len));
+            let actual_bytes = launch_field_bytes(&plugin);
+            assert_eq!(
+                actual_bytes, expected_bytes,
+                "computed launch bytes: {actual_bytes}"
+            );
+            let loaded = LoadedPlugin {
+                spec: plugin,
+                dir: None,
+                trusted_native_ignored: false,
+            };
+            let problems = check_spec(&loaded);
+            let budget_problem = problems.iter().find(|problem| {
+                problem
+                    .problem
+                    .starts_with("launch fields (command, cwd, env)")
+            });
+            assert_eq!(
+                budget_problem.is_some(),
+                refused,
+                "computed launch bytes: {actual_bytes}; problems: {problems:?}"
+            );
+            if refused {
+                let expected_problem = format!(
+                    "launch fields (command, cwd, env) are {} bytes; the limit is {MAX_MANIFEST_BYTES}",
+                    MAX_MANIFEST_BYTES + 1
+                );
+                assert_eq!(
+                    budget_problem.map(|problem| problem.problem.as_str()),
+                    Some(expected_problem.as_str()),
+                    "computed launch bytes: {actual_bytes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn case_only_duplicate_ids_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            plugins: vec![
+                spec("Hello", vec!["true".into()]),
+                spec("hello", vec!["true".into()]),
+            ],
+            ..Default::default()
+        };
+        let expected = "duplicate plugin id (differs only by case from \"Hello\")";
+
+        for problems in [
+            check_specs(&cfg, tmp.path()),
+            admit(&cfg, tmp.path()).set_problems,
+        ] {
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| { problem.plugin == "hello" && problem.problem == expected }),
+                "case-only duplicate diagnostic missing: {problems:?}"
+            );
+        }
+        assert!(admit(&cfg, tmp.path()).startable().is_err());
     }
 }
