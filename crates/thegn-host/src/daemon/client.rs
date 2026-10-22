@@ -439,7 +439,6 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
         ));
     }
     let sock = super::socket_path(dcfg);
-    let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
     if let Some(error) = startup_refusal(&scan, &sock.display().to_string()) {
         return Err(error);
     }
