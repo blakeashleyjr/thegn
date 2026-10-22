@@ -42,8 +42,8 @@ pub trait NotificationStore {
     ///
     /// `put_notification` is a plain insert, so a producer that can be re-run
     /// (a restart, a re-sync) needs this to stay idempotent. Calendar reminders
-    /// encode `(event, occurrence, lead time)` into `issue_id` for exactly this
-    /// — no extra table required.
+    /// use the independent `calendar_reminder_claims` ledger as their firing
+    /// guard; inbox rows remain dismissible presentation data.
     fn has_notification(&self, kind: &str, issue_id: &str) -> Result<bool>;
 
     /// All unread notifications, newest first.

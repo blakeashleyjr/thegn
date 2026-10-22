@@ -413,9 +413,37 @@ fn delete_calendar_tombstones(
     Ok(())
 }
 
+/// How long a reminder claim is kept: longer than the 28-day maximum lead
+/// (`calendar::reminders::MAX_LEAD_MINS`) plus the one-hour catch-up window,
+/// so a claim is never pruned while its trigger can still be re-evaluated.
+pub const REMINDER_CLAIM_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+impl Db {
+    /// Atomically claim one reminder firing. `Ok(true)`: this caller won and
+    /// must deliver; `Ok(false)`: someone already claimed it (deliver nothing).
+    /// An `Err` is NOT "unclaimed": the caller delivers nothing.
+    pub fn claim_calendar_reminder(&self, source_ref: &str, now_ms: i64) -> Result<bool> {
+        if source_ref.is_empty() {
+            anyhow::bail!("calendar reminder claim source_ref must not be empty");
+        }
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM calendar_reminder_claims WHERE claimed_ms < ?1",
+            [now_ms.saturating_sub(REMINDER_CLAIM_RETENTION_MS)],
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO calendar_reminder_claims(source_ref, claimed_ms) VALUES (?1, ?2)",
+            params![source_ref, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(inserted == 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::NotificationStore;
 
     fn row(uid: &str) -> CalendarRow {
         CalendarRow {
@@ -861,5 +889,106 @@ mod tests {
         );
         let observed = events(&db, "acct");
         assert!(observed.is_empty(), "rows: {observed:?}");
+    }
+
+    #[test]
+    fn reminder_claim_has_one_winner_across_two_connections() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.sqlite");
+        let setup = Db::open_at(&path).unwrap();
+        drop(setup);
+        let barrier = Arc::new(Barrier::new(2));
+        let threads = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let db = Db::open_at(&path).unwrap();
+                    barrier.wait();
+                    db.claim_calendar_reminder("cal:acct/series@1000+10", 5_000)
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let winners = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        let db = Db::open_at(&path).unwrap();
+        let claims: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM calendar_reminder_claims WHERE source_ref = ?1",
+                ["cal:acct/series@1000+10"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 1);
+    }
+
+    #[test]
+    fn reminder_claim_survives_inbox_dismissal() {
+        let db = Db::open_memory().unwrap();
+        let source_ref = "cal:acct/series@1000+10";
+        assert!(db.claim_calendar_reminder(source_ref, 5_000).unwrap());
+        let id = db
+            .put_notification("calendar_reminder", source_ref, "msg", "")
+            .unwrap();
+        db.delete_notification(id).unwrap();
+        assert!(!db.claim_calendar_reminder(source_ref, 5_001).unwrap());
+    }
+
+    #[test]
+    fn reminder_claim_keeps_two_lead_times_and_two_occurrences_apart() {
+        let db = Db::open_memory().unwrap();
+        for (uid, occurrence_start_ms) in [("series-a", 1_000), ("series-b", 2_000)] {
+            for trigger_mins in [5, 10] {
+                let reminder = crate::calendar::DueReminder {
+                    event_id: format!("acct/{uid}"),
+                    title: "event".to_owned(),
+                    location: String::new(),
+                    url: String::new(),
+                    occurrence_start_ms,
+                    trigger_mins,
+                    starts_in_mins: 0,
+                };
+                assert!(
+                    db.claim_calendar_reminder(&reminder.source_ref(), 5_000)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reminder_claim_prunes_only_claims_past_retention() {
+        let db = Db::open_memory().unwrap();
+        let source_ref = "cal:acct/series@1000+10";
+        assert!(db.claim_calendar_reminder(source_ref, 1_000).unwrap());
+        assert!(
+            !db.claim_calendar_reminder(source_ref, 1_000 + REMINDER_CLAIM_RETENTION_MS - 1,)
+                .unwrap()
+        );
+        assert!(
+            db.claim_calendar_reminder(source_ref, 1_000 + REMINDER_CLAIM_RETENTION_MS + 1,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reminder_claim_error_is_an_error_not_a_win() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.claim_calendar_reminder("", 5_000).is_err());
+        db.conn()
+            .execute_batch("DROP TABLE calendar_reminder_claims")
+            .unwrap();
+        assert!(
+            db.claim_calendar_reminder("cal:acct/series@1000+10", 5_000)
+                .is_err()
+        );
     }
 }
