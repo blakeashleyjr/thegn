@@ -251,9 +251,9 @@ autofix does not start from them. `thegn ci trigger -i KEY=VALUE` inputs are
 validated before any provider request; malformed or duplicate keys, control
 characters, and oversized keys or values are refused.
 
-Ctrl-C or SIGTERM during `thegn ci rerun`, `ci trigger` or `ci cancel` stops
-the provider command and exits non-zero; the action may or may not have reached
-the provider. Check with `thegn ci runs`.
+On Unix, Ctrl-C or SIGTERM during `thegn ci rerun`, `ci trigger` or `ci cancel`
+stops the provider command and exits non-zero; the action may or may not have
+reached the provider. Check with `thegn ci runs`.
 
 `thegn ci runs --json` emits a JSON array on success. If provider fetching fails,
 or the provider returns a partial list containing malformed rows, it emits an
@@ -301,9 +301,10 @@ refused unless `--unsafe-host-install` is given at an interactive terminal;
 that runs the installer uncontained and prints a warning.
 
 Before replacing an install, the staged binary must resolve to a regular file
-inside staging or installation is refused and the previous install is kept.
-The owner-only `.thegn-provenance.json` records the package and version, binary
-and available lock-file SHA-256s, and the containment used.
+inside staging or installation is refused and the previous install is kept. An
+owner-only `.thegn-provenance.json`, installed beside the tool, records the
+package and version, binary and available lock-file SHA-256s, and the
+containment used.
 
 `thegn supervise plan --all` and `thegn supervise status --all` read one
 newest-first roster page. `--limit` defaults to 2048 and is capped at 4096;
