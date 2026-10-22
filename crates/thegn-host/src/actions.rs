@@ -589,7 +589,11 @@ pub(crate) fn spawn_ci_detail(
                 })
                 .flatten();
             let entry = if cached.as_ref().is_some_and(|e| {
-                e.head_sha.is_empty() || detail.sha.is_empty() || e.head_sha == detail.sha
+                thegn_core::ci_log::cached_log_is_evidence_for(
+                    e,
+                    &detail.sha,
+                    job.finished_at.as_deref(),
+                )
             }) {
                 cached
             } else {
@@ -610,6 +614,7 @@ pub(crate) fn spawn_ci_detail(
                     entry.truncated |= log.truncated;
                     entry.head_sha = detail.sha.clone();
                     if cfg.log_cache_runs > 0
+                        && thegn_core::ci_log::cacheable_log_entry(&entry)
                         && let Some(db) = db.as_ref()
                     {
                         use thegn_core::store::CacheStore;

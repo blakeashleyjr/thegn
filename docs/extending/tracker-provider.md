@@ -164,6 +164,8 @@ process becomes a provider error rather than hanging the UI.
 Each reply must carry exactly one of `result` or `error`; `add_comment`,
 `attach_label`, and `detach_label` must return a non-null success result such as
 `true` (`null` or a missing result is an error).
+A `get_issue` result may set `"comments_complete": false` when it contains only
+part of the comments; omitting the field means the comments are complete.
 
 Check the manifest and negotiated extension point with:
 

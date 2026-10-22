@@ -11,9 +11,12 @@
 //! Rebinds are generation-fenced outside the bind lock, and a failed rebind ends
 //! the watch so the host reconnects instead of trusting stale signal capability.
 //!
-//! All WinRT calls run inside `spawn_blocking` and return plain owned data
-//! (`String`/`bool`/`MediaState`), so no COM object crosses an `.await`. The
-//! pure enum/tick decoding lives in [`crate::smtc_decode`] (Linux-testable).
+//! WinRT calls run on the single `thegn-smtc` worker with a bounded queue and a
+//! per-op deadline (`MEDIA_OP_BUDGET`), and return plain owned data
+//! (`String`/`bool`/`MediaState`), so no COM object crosses an `.await`. A timed
+//! out call keeps the worker busy until the OS returns, so later calls are
+//! refused rather than stacking threads. The pure enum/tick decoding lives in
+//! [`crate::smtc_decode`] (Linux-testable).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +40,41 @@ use crate::smtc_decode::{
 };
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
+/// Mirrors the host's MAX_PENDING_MEDIA_OPS (crates/thegn-host/src/media_ctl.rs); the primary may retune.
+const SMTC_QUEUE_CAPACITY: usize = 8;
+const SMTC_OP_DEADLINE: std::time::Duration = crate::MEDIA_OP_BUDGET;
+// Failed thread creation is transient, so only a successfully-created worker
+// is cached. Serialize initialization to ensure concurrent first operations
+// never create more than one worker thread.
+static WORKER: std::sync::OnceLock<crate::smtc_worker::OpWorker> = std::sync::OnceLock::new();
+static WORKER_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn worker() -> Result<&'static crate::smtc_worker::OpWorker, MediaError> {
+    if let Some(worker) = WORKER.get() {
+        return Ok(worker);
+    }
+
+    let _initializing = WORKER_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(worker) = WORKER.get() {
+        return Ok(worker);
+    }
+
+    let worker = crate::smtc_worker::spawn("thegn-smtc", SMTC_QUEUE_CAPACITY)?;
+    match WORKER.set(worker) {
+        Ok(()) => WORKER
+            .get()
+            .ok_or_else(|| MediaError::Backend("thegn-smtc worker initialization failed".into())),
+        Err(worker) => {
+            drop(worker);
+            WORKER.get().ok_or_else(|| {
+                MediaError::Backend("thegn-smtc worker initialization failed".into())
+            })
+        }
+    }
+}
+
 /// Stateless SMTC controller — the session manager is opened fresh per call
 /// (cheap, and avoids holding a COM object across `.await`).
 pub struct Smtc;
@@ -44,7 +82,7 @@ pub struct Smtc;
 impl Smtc {
     /// Probe that the session manager is obtainable; `None` ⇒ media inert.
     pub async fn connect() -> Option<Self> {
-        let ok = tokio::task::spawn_blocking(|| manager().is_ok())
+        let ok = run_blocking(|| Ok(manager().is_ok()))
             .await
             .unwrap_or(false);
         ok.then_some(Smtc)
@@ -542,16 +580,13 @@ fn snapshot_with_caps_blocking() -> Result<Option<MediaSnapshot>, MediaError> {
     }))
 }
 
-/// Run blocking COM work off the async runtime, flattening the join error.
+/// Run COM work on the single owned SMTC worker.
 async fn run_blocking<T, F>(f: F) -> Result<T, MediaError>
 where
     F: FnOnce() -> Result<T, MediaError> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(e) => Err(MediaError::Backend(format!("smtc task: {e}"))),
-    }
+    worker()?.run(SMTC_OP_DEADLINE, f).await
 }
 
 #[cfg(test)]

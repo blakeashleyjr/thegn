@@ -69,6 +69,83 @@ use crate::plugin::proc::{self, NdjsonSink, PluginError};
 /// Non-JSON stdout lines kept for the warning log.
 const MAX_JUNK_KEPT: usize = 3;
 
+/// Secret values that a command plugin may echo into output or diagnostics.
+#[derive(Debug, Clone, Default)]
+struct SecretScrub {
+    values: Vec<String>,
+}
+
+impl SecretScrub {
+    fn for_account(argv: &[String], env: &BTreeMap<String, String>) -> Self {
+        let mut values = Vec::new();
+        for value in env.values().chain(argv.iter().skip(1)) {
+            if !value.trim().is_empty() && !values.contains(value) {
+                values.push(value.clone());
+            }
+        }
+        values.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        Self { values }
+    }
+
+    fn scrub(&self, text: &str) -> String {
+        let mut scrubbed = String::with_capacity(text.len());
+        let mut offset = 0;
+        while offset < text.len() {
+            let remaining = &text[offset..];
+            if let Some(value) = self
+                .values
+                .iter()
+                .filter(|value| remaining.starts_with(value.as_str()))
+                .max_by_key(|value| value.len())
+            {
+                scrubbed.push_str("<redacted>");
+                offset += value.len();
+            } else {
+                let character = remaining.chars().next().expect("offset is before end");
+                scrubbed.push(character);
+                offset += character.len_utf8();
+            }
+        }
+        scrubbed
+    }
+
+    fn scrub_capped_stderr(&self, text: &str) -> String {
+        let scrubbed = self.scrub(text);
+        if text.len() < proc::MAX_STDERR - 4 {
+            return scrubbed;
+        }
+
+        let checked = scrubbed.strip_suffix('\u{fffd}').unwrap_or(&scrubbed);
+        for value in &self.values {
+            let value_bytes = value.as_bytes();
+            let checked_bytes = checked.as_bytes();
+            let max_prefix = value_bytes.len().min(checked_bytes.len());
+            for prefix_len in (1..=max_prefix).rev() {
+                if prefix_len < value_bytes.len()
+                    && value.is_char_boundary(prefix_len)
+                    && checked_bytes.ends_with(&value_bytes[..prefix_len])
+                    && let Some(prefix) = checked.get(..checked.len() - prefix_len)
+                {
+                    return format!("{prefix}<redacted>");
+                }
+            }
+        }
+        scrubbed
+    }
+
+    fn scrub_error(&self, error: CalendarError) -> CalendarError {
+        match error {
+            CalendarError::Network(text) => CalendarError::Network(self.scrub(&text)),
+            CalendarError::Auth(text) => CalendarError::Auth(self.scrub(&text)),
+            CalendarError::Api(text) => CalendarError::Api(self.scrub(&text)),
+            CalendarError::Subprocess(text) => CalendarError::Subprocess(self.scrub(&text)),
+            CalendarError::Parse(text) => CalendarError::Parse(self.scrub(&text)),
+            CalendarError::Io(text) => CalendarError::Io(self.scrub(&text)),
+            other => other,
+        }
+    }
+}
+
 /// What one plugin run admitted so far.
 struct Admitted {
     meter: AdmissionMeter,
@@ -105,6 +182,7 @@ impl Admitted {
 struct AdmittingSink {
     admitted: Admitted,
     granted: Vec<Capability>,
+    scrub: SecretScrub,
     junk: Vec<String>,
     error: Option<CalendarError>,
     saw_events: bool,
@@ -364,8 +442,8 @@ impl AdmittingSink {
                     .unwrap_or_default();
                 tracing::debug!(
                     target: "thegn::calendar::plugin",
-                    level = p.level.as_deref().unwrap_or("info"),
-                    message = p.message.as_deref().unwrap_or_default(),
+                    level = self.scrub.scrub(p.level.as_deref().unwrap_or("info")),
+                    message = self.scrub.scrub(p.message.as_deref().unwrap_or_default()),
                     "plugin log"
                 );
                 Ok(())
@@ -382,14 +460,15 @@ impl NdjsonSink for AdmittingSink {
     fn line(&mut self, text: &str) -> bool {
         let Ok(head) = serde_json::from_str::<Head>(text) else {
             if self.junk.len() < MAX_JUNK_KEPT {
-                self.junk.push(text.chars().take(200).collect());
+                self.junk
+                    .push(self.scrub.scrub(text).chars().take(200).collect());
             }
             return true;
         };
         match self.message(&head.method, text) {
             Ok(()) => true,
             Err(e) => {
-                self.error = Some(e);
+                self.error = Some(self.scrub.scrub_error(e));
                 false
             }
         }
@@ -550,6 +629,7 @@ impl CommandBackend {
             ));
         }
         let argv = self.argv.clone();
+        let scrub = SecretScrub::for_account(&self.argv, &self.env);
         let env = self.query_env(from, to, sync_token);
         let cwd = self.cwd.clone();
         let sink = AdmittingSink {
@@ -564,6 +644,7 @@ impl CommandBackend {
                 cursor_conflict: false,
             },
             granted: self.granted.clone(),
+            scrub: scrub.clone(),
             junk: Vec::new(),
             error: None,
             saw_events: false,
@@ -582,6 +663,16 @@ impl CommandBackend {
             PluginError::Timeout(_) => {
                 CalendarError::Timeout("calendar command exceeded its deadline")
             }
+            PluginError::Exit { code, stderr } => CalendarError::Subprocess(
+                PluginError::Exit {
+                    code,
+                    stderr: scrub.scrub_capped_stderr(&stderr),
+                }
+                .to_string(),
+            ),
+            PluginError::Protocol(text) => {
+                CalendarError::Subprocess(PluginError::Protocol(scrub.scrub(&text)).to_string())
+            }
             other => CalendarError::Subprocess(other.to_string()),
         })?;
 
@@ -594,7 +685,7 @@ impl CommandBackend {
             );
         }
         if let Some(e) = sink.error {
-            return Err(e);
+            return Err(scrub.scrub_error(e));
         }
         // More messages than one run may send: the output is incomplete, so
         // it is refused rather than published as a whole calendar.

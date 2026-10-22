@@ -16,6 +16,22 @@ use thegn_core::util;
 static GATE_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 use thegn_core::{GateAttestationRefusal, StoredGateAttestation};
 
+/// Include pre-batch-64 pipeline rows saved under another spelling of this
+/// worktree, such as a symlink alias or redundant path components.
+fn pipeline_spellings(db: &Db, worktree: &str, canonical: &str) -> Result<Vec<String>> {
+    let canonical_path = PathBuf::from(canonical);
+    let mut spellings = vec![worktree.to_string(), canonical.to_string()];
+    for path in db.pipeline_worktree_paths()? {
+        if path != worktree
+            && path != canonical
+            && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved == canonical_path)
+        {
+            spellings.push(path);
+        }
+    }
+    Ok(spellings)
+}
+
 pub(super) fn trusted_gate_for(
     row: &thegn_core::issue::AgentDispatch,
     latest: Option<&StoredGateAttestation>,
@@ -53,7 +69,9 @@ pub(crate) fn pipeline_merge_admission(
         .unwrap_or_else(|_| std::path::PathBuf::from(worktree))
         .to_string_lossy()
         .to_string();
-    let rows = db.pipeline_rows_for_worktree(worktree, &canonical)?;
+    let spellings = pipeline_spellings(db, worktree, &canonical)?;
+    let spellings = spellings.iter().map(String::as_str).collect::<Vec<_>>();
+    let rows = db.pipeline_rows_for_worktree_paths(&spellings)?;
     let (row, gate_state, reason) = match gating_row(&rows) {
         GatingRow::None => return Ok(()),
         GatingRow::Unfinished(row) => (
@@ -492,16 +510,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repo");
         std::fs::create_dir(&path).unwrap();
-        git(&path, &["init", "--quiet"]);
-        git(&path, &["config", "user.name", "Test User"]);
-        git(&path, &["config", "user.email", "test@example.invalid"]);
+        init_repo(&path);
+        (dir, path)
+    }
+
+    fn init_repo(path: &Path) {
+        git(path, &["init", "--quiet"]);
+        git(path, &["config", "user.name", "Test User"]);
+        git(path, &["config", "user.email", "test@example.invalid"]);
         std::fs::write(path.join("file.txt"), "committed\n").unwrap();
-        git(&path, &["add", "file.txt"]);
+        git(path, &["add", "file.txt"]);
         git(
-            &path,
+            path,
             &["-c", "commit.gpgsign=false", "commit", "-m", "fixture"],
         );
-        (dir, path)
     }
 
     fn setup(
@@ -852,6 +874,75 @@ mod tests {
             Err(error) if error.downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
                 .is_some_and(|refusal| refusal.reason.contains("dispatch gate"))
         ));
+    }
+
+    #[test]
+    fn merge_admission_refuses_a_finished_row_stored_under_a_symlink_alias() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            // This platform cannot create an unprivileged directory symlink.
+            return;
+        }
+        init_repo(temp.real_path());
+        let (db, id, _cfg, _log_dir, _logs) = pipeline_setup(temp.path());
+        finish_pipeline_row(&db, id);
+        let candidate = git(temp.real_path(), &["rev-parse", "HEAD"]);
+        let result = pipeline_merge_admission(
+            &db,
+            &temp.real_path().display().to_string(),
+            &candidate,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(error) if error.downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
+                .is_some_and(|refusal| refusal.reason.contains("dispatch gate"))
+        ));
+    }
+
+    #[test]
+    fn merge_admission_refuses_a_finished_row_stored_under_a_redundant_spelling() {
+        let (_repo_dir, repo_path) = repo();
+        let redundant_path = repo_path.join(".");
+        let (db, id, _cfg, _log_dir, _logs) = pipeline_setup(&redundant_path);
+        finish_pipeline_row(&db, id);
+        let candidate = git(&repo_path, &["rev-parse", "HEAD"]);
+        let result =
+            pipeline_merge_admission(&db, &repo_path.display().to_string(), &candidate, None);
+        assert!(matches!(
+            result,
+            Err(error) if error.downcast_ref::<thegn_core::pipeline_merge_admission::PipelineMergeRefused>()
+                .is_some_and(|refusal| refusal.reason.contains("dispatch gate"))
+        ));
+    }
+
+    #[test]
+    fn merge_admission_admits_a_gated_row_stored_under_an_alias() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            // This platform cannot create an unprivileged directory symlink.
+            return;
+        }
+        init_repo(temp.real_path());
+        let (db, id, cfg, _log_dir, logs) = pipeline_setup(temp.path());
+        gate_row(
+            &db,
+            &cfg,
+            id,
+            &logs,
+            &|_, _, _| Ok(GateVerdict::Passed),
+            &|| 100,
+        )
+        .unwrap();
+        finish_pipeline_row(&db, id);
+        let candidate = git(temp.real_path(), &["rev-parse", "HEAD"]);
+        pipeline_merge_admission(
+            &db,
+            &temp.real_path().display().to_string(),
+            &candidate,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -1927,11 +1927,8 @@ impl ControlApi for DaemonService {
         limit: usize,
     ) -> BoxFuture<'a, ControlResult<thegn_svc::control::CiRunsReply>> {
         Box::pin(async move {
-            let requested = if limit == 0 {
-                self.config.ci.max_runs
-            } else {
-                limit
-            };
+            let requested = crate::ci_refresh::daemon_ci_runs_limit(limit, self.config.ci.max_runs)
+                .map_err(ControlError::InvalidArgument)?;
             let path = if worktree.is_empty() {
                 std::env::current_dir().map_err(|e| ControlError::Internal(e.into()))?
             } else {
@@ -1941,10 +1938,14 @@ impl ControlApi for DaemonService {
             self.confine_worktree(&path_string).await?;
             let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
             let branch_path = path.clone();
-            let branch = tokio::task::spawn_blocking(move || {
+            let branch_cfg = self.config.ci.clone();
+            let (branch, context) = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&branch_path);
-                loc.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-                    .filter(|branch| !branch.is_empty())
+                let branch = loc
+                    .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                    .filter(|branch| !branch.is_empty());
+                let context = thegn_svc::ci::cache_context(&loc, &branch_cfg);
+                (branch, context)
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?;
@@ -1960,6 +1961,7 @@ impl ControlApi for DaemonService {
                 .ok()
                 .flatten();
             if let Some((json, cached_branch, fetched_at)) = cached
+                && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
                 && crate::ci_refresh::daemon_ci_cache_usable(
                     &cached_branch,
                     branch.as_deref(),
@@ -1967,7 +1969,7 @@ impl ControlApi for DaemonService {
                     thegn_core::util::now(),
                     self.config.ci.ttl_secs,
                 )
-                && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
+                && thegn_core::ci::cache_context_matches(&cache.context, context.as_deref())
             {
                 let before = cache.runs.len();
                 cache
@@ -1989,32 +1991,37 @@ impl ControlApi for DaemonService {
             let provider_branch = branch.clone();
             let fetched = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
-                let client = thegn_svc::ci::provider_for(&loc, &cfg)
+                let (client, context) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
                     .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
-                client
+                let fetched = client
                     .runs(&loc, provider_branch.as_deref(), requested)
-                    .map_err(|error| anyhow::anyhow!("CI provider: {error}"))
+                    .map_err(|error| anyhow::anyhow!("CI provider: {error}"))?;
+                Ok::<_, anyhow::Error>((fetched, context))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?
             .map_err(ControlError::Internal)?;
+            let (fetched, context) = fetched;
             let fetched_at = thegn_core::util::now();
             if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
                 runs: fetched.runs.clone(),
                 discarded_rows: fetched.discarded_rows,
+                context: context.clone().unwrap_or_default(),
             }) {
                 let key_for_write = key.clone();
                 let branch_for_write = branch.clone();
+                let context_for_write = context.clone();
                 let _ = self
                     .with_db(move |db| {
-                        use thegn_core::store::CacheStore;
-                        db.put_ci_cache(
+                        crate::ci_refresh::put_ci_cache_with_context(
+                            db,
                             &key_for_write,
                             branch_for_write
                                 .as_deref()
                                 .filter(|branch| !branch.is_empty() && *branch != "HEAD")
                                 .unwrap_or(""),
                             &json,
+                            context_for_write.as_deref(),
                         )
                     })
                     .await;
@@ -2076,6 +2083,7 @@ impl ControlApi for DaemonService {
                     && entry.job_id == job_id_owned
                     && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
                     && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
+                    && thegn_core::ci_log::cacheable_log_entry(entry)
             });
             if let Some(mut entry) = cached {
                 let redacted = thegn_core::ci_log::redact(&entry.text);
@@ -2154,7 +2162,8 @@ impl ControlApi for DaemonService {
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
             .map_err(ControlError::Internal)?;
 
-            if self.config.ci.log_cache_runs > 0 {
+            if self.config.ci.log_cache_runs > 0 && thegn_core::ci_log::cacheable_log_entry(&entry)
+            {
                 let entry_for_write = entry.clone();
                 let _ = self
                     .with_db(move |db| {

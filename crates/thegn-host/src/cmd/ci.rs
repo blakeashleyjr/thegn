@@ -183,7 +183,7 @@ fn runs(
     // Host-path cache key — matches the panel's reader (never `loc.path()`).
     let cache_key = GitLoc::worktree_cache_key(&wt);
     let loc = GitLoc::for_worktree(&wt);
-    let Some(client) = provider_for(&loc, &cfg.ci) else {
+    let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg.ci) else {
         if json_out {
             return super::emit_json(&Vec::<CiRun>::new());
         }
@@ -221,9 +221,18 @@ fn runs(
                     let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
                         runs: runs.clone(),
                         discarded_rows: result.discarded_rows,
+                        context: context.clone().unwrap_or_default(),
                     })
                     .unwrap_or_default();
-                    let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    if let Err(error) = crate::ci_refresh::put_ci_cache_with_context(
+                        &db,
+                        &cache_key,
+                        cache_branch,
+                        &json,
+                        context.as_deref(),
+                    ) {
+                        tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
+                    }
                 }
                 return super::emit_json(&runs);
             }
@@ -239,9 +248,18 @@ fn runs(
                 let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
                     runs: runs.clone(),
                     discarded_rows: result.discarded_rows,
+                    context: context.clone().unwrap_or_default(),
                 })
                 .unwrap_or_default();
-                let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if let Err(error) = crate::ci_refresh::put_ci_cache_with_context(
+                    &db,
+                    &cache_key,
+                    cache_branch,
+                    &json,
+                    context.as_deref(),
+                ) {
+                    tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
+                }
             }
             for r in &runs {
                 outln!(
@@ -372,6 +390,7 @@ fn log(
                 && entry.job_id == job_id
                 && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
                 && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
+                && thegn_core::ci_log::cacheable_log_entry(entry)
         });
     let entry = if let Some(mut entry) = cached {
         // Cache rows have already been redacted and bounded. Re-apply the
@@ -461,6 +480,7 @@ fn log(
             entry.truncated |= raw.truncated;
             entry.head_sha = head_sha;
             if cfg.ci.log_cache_runs > 0
+                && thegn_core::ci_log::cacheable_log_entry(&entry)
                 && let Ok(db) = Db::open()
             {
                 let _ = db.put_ci_log(&entry);

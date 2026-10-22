@@ -31,7 +31,8 @@
 - [x] 4.1 Help page: the Zoom section in `terminal-and-panes.md`.
 - [x] 4.2 Unit tests for the stack geometry, the Grow cycle, the effective
       zoom, the nav layout, the bar rendering, and the activation round-trip.
-- [ ] 4.3 Pre-push gate (`just test`, clippy, smoke).
+- [x] 4.3 Pre-push gate (`just test`, clippy, smoke).
+      Superseded, not performed as a separate step: THE-559, THE-560, THE-566, THE-567 and THE-568 closed Done on 2026-09-11 after the integrated candidate 47aa962ed passed source ratchets and 3088/3088 host tests, independent Muse visual/input checks (12 zoom/keyboard combinations, covered-overlay negative, 1-col/2-col hit parity) and the full native merge gate, landing on local main 71d8a61f0 (recorded on THE-560); the change is archived in batch 65.
 
 ## 5. Queue-review repairs (THE-559 / THE-560)
 
@@ -44,9 +45,10 @@
       preserving active/verification-gated status and these unchecked gates.
 - [x] 5.4 THE-560: run delivery validation, negative fixtures and source ratchets
       without weakening the guards.
-- [ ] 5.5 THE-559 / THE-560: review and verify the candidate integrated with
+- [x] 5.5 THE-559 / THE-560: review and verify the candidate integrated with
       current main; run the remaining full gates and required visual/e2e
       evidence before queue approval or issue closure.
+      Superseded, not performed as a separate step: THE-559, THE-560, THE-566, THE-567 and THE-568 closed Done on 2026-09-11 after the integrated candidate 47aa962ed passed source ratchets and 3088/3088 host tests, independent Muse visual/input checks (12 zoom/keyboard combinations, covered-overlay negative, 1-col/2-col hit parity) and the full native merge gate, landing on local main 71d8a61f0 (recorded on THE-560); the change is archived in batch 65.
 
 ## 6. Full-feature review repairs (THE-566 / THE-567 / THE-568)
 
@@ -57,7 +59,9 @@
 - [x] 6.3 THE-568: compute paired frame/bar geometry in one visitor pass for
       rendering and hit-testing; single-output callers allocate only their
       requested output.
-- [ ] 6.4 Run the keyboard restore, narrow-bar dispatch and paired-geometry
+- [x] 6.4 Run the keyboard restore, narrow-bar dispatch and paired-geometry
       regressions along with the prior focused suite, without weakening gates.
-- [ ] 6.5 Review actual-source visual evidence and the fully integrated gates;
+      Superseded, not performed as a separate step: THE-559, THE-560, THE-566, THE-567 and THE-568 closed Done on 2026-09-11 after the integrated candidate 47aa962ed passed source ratchets and 3088/3088 host tests, independent Muse visual/input checks (12 zoom/keyboard combinations, covered-overlay negative, 1-col/2-col hit parity) and the full native merge gate, landing on local main 71d8a61f0 (recorded on THE-560); the change is archived in batch 65.
+- [x] 6.5 Review actual-source visual evidence and the fully integrated gates;
       no merge approval or tracker closure before these pass.
+      Superseded, not performed as a separate step: THE-559, THE-560, THE-566, THE-567 and THE-568 closed Done on 2026-09-11 after the integrated candidate 47aa962ed passed source ratchets and 3088/3088 host tests, independent Muse visual/input checks (12 zoom/keyboard combinations, covered-overlay negative, 1-col/2-col hit parity) and the full native merge gate, landing on local main 71d8a61f0 (recorded on THE-560); the change is archived in batch 65.

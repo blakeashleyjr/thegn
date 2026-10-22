@@ -203,6 +203,10 @@ supervisor state: it is not persisted across a daemon or compositor restart.
 After such a restart, the offline `plugin list` command cannot reconcile live
 state and reports an enabled plugin as `unknown` with
 `live_health = unavailable` until a future attached-snapshot surface exists.
+If the plugin host, restart worker, or a scheduled run cannot start, the status
+line reports the failure. A restart that cannot be scheduled counts as a failed
+restart, so the plugin is disabled after the usual attempts. A scheduled run
+start failure is reported once until a run starts successfully.
 Resident-plugin stderr is drained and, when debug logging is enabled, written
 to the debug log at most 20 lines per second; a line is capped at 512 bytes,
 and excess lines are suppressed. thegn keeps the last 8 KiB and line counts

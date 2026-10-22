@@ -1,6 +1,6 @@
 use super::{FIXTURES, Verdict, ics_document};
 use crate::calendar::admission::{AdmissionBudget, AdmissionMeter};
-use crate::calendar::ics::{IcsReport, parse_ics_window_reported};
+use crate::calendar::ics::{IcsDiagnostic, IcsReport, parse_ics_window_reported};
 use crate::calendar::{CalEvent, validate::validate_event};
 use std::collections::HashSet;
 
@@ -71,4 +71,54 @@ fn conformance_fixture_names_are_unique() {
         table.iter().all(|(_, _, _, unique)| *unique),
         "duplicate calendar fixture name: {table:#?}"
     );
+}
+
+#[test]
+fn a_duration_at_the_timedelta_limit_does_not_panic_the_window_filter() {
+    let mut out = Vec::new();
+    let mut report = IcsReport::default();
+    let result = parse_ics_window_reported(
+        &ics_document(
+            "UID:t\r\nDTSTART:20260814T090000Z\r\nDURATION:PT9223372036854775S\r\nSUMMARY:t",
+        ),
+        "UTC",
+        Some((
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+        )),
+        &mut AdmissionMeter::isolated(AdmissionBudget::default()),
+        &mut out,
+        || Ok(()),
+        &mut report,
+    );
+
+    assert!(result.is_ok());
+    assert!(out.is_empty());
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+}
+
+#[test]
+fn extreme_durations_are_quarantined_not_admitted() {
+    for duration in ["P15000000W", "PT9223372036854775807S"] {
+        let mut out = Vec::new();
+        let mut report = IcsReport::default();
+        let result = parse_ics_window_reported(
+            &ics_document(&format!(
+                "UID:t\r\nDTSTART:20260814T090000Z\r\nDURATION:{duration}\r\nSUMMARY:t"
+            )),
+            "UTC",
+            None,
+            &mut AdmissionMeter::isolated(AdmissionBudget::default()),
+            &mut out,
+            || Ok(()),
+            &mut report,
+        );
+
+        assert!(result.is_ok(), "duration {duration}");
+        assert!(out.is_empty(), "duration {duration}");
+        assert!(
+            report.diagnostics().contains(&IcsDiagnostic::InvalidEvent),
+            "duration {duration}"
+        );
+    }
 }

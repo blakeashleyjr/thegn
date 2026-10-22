@@ -1144,6 +1144,52 @@ fn serve_down_ok_when_down_fails_but_status_lacks_the_port() {
 }
 
 #[test]
+fn serve_up_uses_only_the_recorded_runtime_and_id() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let recorded = crate::vpn::RecordedSidecar {
+        runtime: OciRuntime::docker(),
+        id: "a".repeat(64),
+    };
+    let mut calls = Vec::new();
+    let endpoint = serve_up_with(&recorded, &plan, |runtime, target, argv| {
+        calls.push((runtime.clone(), target.to_string(), argv.to_vec()));
+        if argv == plan.up_argv.as_slice() {
+            Ok((true, String::new()))
+        } else {
+            Ok((
+                true,
+                r#"{"Self":{"DNSName":"node.example.ts.net."}}"#.into(),
+            ))
+        }
+    })
+    .unwrap();
+
+    assert_eq!(endpoint.as_url(), Some("https://node.example.ts.net"));
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(runtime, target, _)| {
+        runtime == &OciRuntime::docker() && target == &recorded.id && target != "c-tgvpn"
+    }));
+}
+
+#[test]
+fn serve_up_refuses_without_a_record() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+
+    let result = serve_up("c-missing", &plan);
+    assert!(matches!(result, Err(ref error) if error.to_string().contains("no recorded runtime")));
+}
+
+#[test]
+fn serve_down_without_a_record_is_unverified() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+
+    let result = serve_down("c-missing", &plan);
+    assert!(matches!(result, Err(ref error) if error.to_string().contains("teardown unverified")));
+}
+
+#[test]
 fn serve_status_parser_cases() {
     for (json, expected) in [
         ("", false),
