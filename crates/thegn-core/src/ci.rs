@@ -174,6 +174,22 @@ pub fn foreign_cache_note(cached_branch: &str, current_branch: &str) -> Option<S
     })
 }
 
+/// A panel note when cached CI rows belong to a different known provider
+/// context. Unknown current contexts remain unverifiable and keep today's
+/// display behavior.
+pub fn foreign_context_note(cached_context: &str, current_context: Option<&str>) -> Option<String> {
+    if current_context.is_none_or(str::is_empty)
+        || cache_context_matches(cached_context, current_context)
+    {
+        return None;
+    }
+    Some(if cached_context.is_empty() {
+        "CI cache provider is unknown; refresh pending (g)".into()
+    } else {
+        format!("CI cache is for {cached_context}; refresh pending (g)")
+    })
+}
+
 impl CiRun {
     /// Seconds the run took (finished) or has been running (started only),
     /// measured against `now` epoch seconds. Mirrors [`crate::forge::model::CheckRun::duration_secs`].
@@ -728,6 +744,24 @@ mod tests {
         assert_eq!(foreign_cache_note("a", "a"), None);
         assert_eq!(foreign_cache_note("b", ""), None);
         assert_eq!(foreign_cache_note("b", "HEAD"), None);
+    }
+
+    #[test]
+    fn foreign_context_note_names_the_other_provider_context() {
+        assert_eq!(
+            foreign_context_note("github:github.com/o/a", Some("github:github.com/o/b")).as_deref(),
+            Some("CI cache is for github:github.com/o/a; refresh pending (g)")
+        );
+        assert_eq!(
+            foreign_context_note("", Some("github:github.com/o/b")).as_deref(),
+            Some("CI cache provider is unknown; refresh pending (g)")
+        );
+        assert_eq!(
+            foreign_context_note("github:github.com/o/a", Some("github:github.com/o/a")),
+            None
+        );
+        assert_eq!(foreign_context_note("anything", None), None);
+        assert_eq!(foreign_context_note("anything", Some("")), None);
     }
 
     #[test]
