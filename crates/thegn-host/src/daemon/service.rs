@@ -2083,6 +2083,7 @@ impl ControlApi for DaemonService {
                     && entry.job_id == job_id_owned
                     && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
                     && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
+                    && thegn_core::ci_log::cacheable_log_entry(entry)
             });
             if let Some(mut entry) = cached {
                 let redacted = thegn_core::ci_log::redact(&entry.text);
@@ -2161,7 +2162,8 @@ impl ControlApi for DaemonService {
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
             .map_err(ControlError::Internal)?;
 
-            if self.config.ci.log_cache_runs > 0 {
+            if self.config.ci.log_cache_runs > 0 && thegn_core::ci_log::cacheable_log_entry(&entry)
+            {
                 let entry_for_write = entry.clone();
                 let _ = self
                     .with_db(move |db| {
