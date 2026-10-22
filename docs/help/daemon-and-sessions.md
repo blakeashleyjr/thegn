@@ -39,6 +39,10 @@ unchecked endpoints, suggesting a retry or `thegn daemon stop`.
 After starting a pane daemon, thegn waits up to 3 seconds for it to answer and
 reports an error if it does not. A daemon that cannot acquire its control-socket
 lock gives up after 5 seconds instead of waiting indefinitely.
+On Unix, while holding the lock, a starting daemon probes an existing control
+socket for up to 5 seconds. A responding socket or full backlog means a daemon
+is running; only a refused connection is removed as stale. A timeout or other
+probe error stops startup with an error naming the socket.
 
 When the UI exits, in-flight custom git commands, CI refreshes, and CI rerun or
 cancel actions are cancelled. Thegn waits up to two seconds for them before

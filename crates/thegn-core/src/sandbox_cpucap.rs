@@ -98,9 +98,14 @@ impl CpuCap {
 }
 
 /// Pure decision: pick the enforcement mechanism from the probed facts. Split
-/// from the probe so the 3-way ladder is exhaustively unit-testable.
-pub fn choose_cpu_cap(systemd_run: bool, cgroup_cpu_delegated: bool, nice: bool) -> CpuCap {
-    if systemd_run && cgroup_cpu_delegated {
+/// from the probe so the 4-way ladder is exhaustively unit-testable.
+pub fn choose_cpu_cap(
+    systemd_run: bool,
+    cgroup_cpu_delegated: bool,
+    user_manager: bool,
+    nice: bool,
+) -> CpuCap {
+    if systemd_run && cgroup_cpu_delegated && user_manager {
         CpuCap::ScopeHard
     } else if nice {
         CpuCap::NiceSoft
@@ -141,9 +146,63 @@ pub fn detect_cpu_cap() -> CpuCap {
         choose_cpu_cap(
             util::have("systemd-run"),
             cgroup_cpu_delegated(),
+            user_manager_reachable(
+                std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+                &|path| path.exists(),
+            ),
             util::have("nice"),
         )
     })
+}
+
+/// Whether systemd's user manager can be reached with the current environment.
+/// `systemd-run --user` looks first for `$XDG_RUNTIME_DIR/systemd/private`,
+/// then for the user bus at `DBUS_SESSION_BUS_ADDRESS` or
+/// `$XDG_RUNTIME_DIR/bus`. A non-empty bus address is trusted, not probed.
+pub fn user_manager_reachable(
+    runtime_dir: Option<&std::ffi::OsStr>,
+    bus_address: Option<&std::ffi::OsStr>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> bool {
+    if bus_address.is_some_and(|address| !address.is_empty()) {
+        return true;
+    }
+    let Some(runtime_dir) = runtime_dir.filter(|dir| !dir.is_empty()) else {
+        return false;
+    };
+    let runtime_dir = std::path::Path::new(runtime_dir);
+    exists(&runtime_dir.join("systemd/private")) || exists(&runtime_dir.join("bus"))
+}
+
+/// Explain why a hard scope cap could not be used, when the user manager is
+/// the only missing prerequisite.
+pub fn scope_skipped_note(
+    systemd_run: bool,
+    cgroup_cpu_delegated: bool,
+    user_manager: bool,
+    nice: bool,
+) -> Option<&'static str> {
+    (systemd_run && cgroup_cpu_delegated && !user_manager).then_some(if nice {
+        "hard cap skipped: no systemd user manager is reachable from this environment (no $XDG_RUNTIME_DIR/systemd/private, $XDG_RUNTIME_DIR/bus or DBUS_SESSION_BUS_ADDRESS); using the soft nice cap"
+    } else {
+        "hard cap skipped: no systemd user manager is reachable from this environment (no $XDG_RUNTIME_DIR/systemd/private, $XDG_RUNTIME_DIR/bus or DBUS_SESSION_BUS_ADDRESS); no cap is applied"
+    })
+}
+
+/// Probe whether a hard scope cap was skipped because the user manager is
+/// unreachable. Used by doctor to report the same host facts as the cap ladder.
+pub fn detected_scope_skipped_note() -> Option<&'static str> {
+    scope_skipped_note(
+        util::have("systemd-run"),
+        cgroup_cpu_delegated(),
+        user_manager_reachable(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+            &|path| path.exists(),
+        ),
+        util::have("nice"),
+    )
 }
 
 /// How many CPUs the **machine** has, independent of any cgroup quota this
@@ -538,6 +597,43 @@ pub fn strip_pane_cap(argv: &[String]) -> &[String] {
     // Defensive: a prefix with nothing after it is not something we produced,
     // and returning an empty argv would read as "no containment".
     if inner.is_empty() { argv } else { inner }
+}
+
+/// Peel the [`CpuCap::NiceSoft`] prefix back off a capped argv, yielding the
+/// argv that actually enters the sandbox. Returns `argv` unchanged when there
+/// is no cap prefix.
+///
+/// A priority ceiling is not containment, so observation must see through the
+/// prefix to the command it wraps. The match is exact because a user's own
+/// `nice -n 5 …` (or any other nice level) is not a prefix thegn produced.
+pub fn strip_soft_cap(argv: &[String]) -> &[String] {
+    let nice_start = if argv.first().map(String::as_str) == Some("ionice")
+        && argv.get(1).map(String::as_str) == Some("-c3")
+    {
+        2
+    } else {
+        0
+    };
+    let nice_level = CPU_NICE.to_string();
+    if argv.get(nice_start).map(String::as_str) != Some("nice")
+        || argv.get(nice_start + 1).map(String::as_str) != Some("-n")
+        || argv.get(nice_start + 2).map(String::as_str) != Some(nice_level.as_str())
+        || nice_start + 3 >= argv.len()
+    {
+        return argv;
+    }
+    &argv[nice_start + 3..]
+}
+
+/// Peel whichever exclusive CPU-cap prefix the pane wrapper emitted.
+///
+/// When it adds a cap, `cap_prefix` emits either the hard `systemd-run` prefix
+/// or the soft `nice` prefix (optionally preceded by `ionice`), never both, and
+/// does not add a prefix to an argv that already starts with `systemd-run`.
+/// Since `nice` and `ionice` exec their argument, peeling a soft prefix only
+/// reveals the real program and cannot erase a sandbox boundary.
+pub fn strip_cap(argv: &[String]) -> &[String] {
+    strip_soft_cap(strip_pane_cap(argv))
 }
 
 /// How many parallel build jobs a pane should ask for, from its own CPU ceiling.
@@ -1064,17 +1160,92 @@ mod tests {
     #[test]
     fn choose_cpu_cap_ladder() {
         use CpuCap::*;
-        // Hard cap requires BOTH systemd-run and cgroup cpu delegation.
-        assert_eq!(choose_cpu_cap(true, true, true), ScopeHard);
-        assert_eq!(choose_cpu_cap(true, true, false), ScopeHard);
+        // Existing rows retain their expectations with a reachable manager.
+        // Hard cap requires systemd-run, cgroup cpu delegation and a user manager.
+        assert_eq!(choose_cpu_cap(true, true, true, true), ScopeHard);
+        assert_eq!(choose_cpu_cap(true, true, true, false), ScopeHard);
         // systemd present but no delegation ⇒ soft nice (if available).
-        assert_eq!(choose_cpu_cap(true, false, true), NiceSoft);
-        assert_eq!(choose_cpu_cap(false, true, true), NiceSoft);
-        assert_eq!(choose_cpu_cap(false, false, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(true, false, true, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(false, true, true, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(false, false, true, true), NiceSoft);
         // Nothing available ⇒ no cap.
-        assert_eq!(choose_cpu_cap(true, false, false), None);
-        assert_eq!(choose_cpu_cap(false, true, false), None);
-        assert_eq!(choose_cpu_cap(false, false, false), None);
+        assert_eq!(choose_cpu_cap(true, false, true, false), None);
+        assert_eq!(choose_cpu_cap(false, true, true, false), None);
+        assert_eq!(choose_cpu_cap(false, false, true, false), None);
+        // A missing user manager also falls back to nice, or no cap if nice is absent.
+        assert_eq!(choose_cpu_cap(true, true, false, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(true, true, false, false), None);
+    }
+
+    #[test]
+    fn user_manager_reachable_follows_the_systemd_lookup() {
+        use std::collections::HashSet;
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+
+        let runtime = PathBuf::from("/runtime/test");
+        let cases = [
+            (
+                "private socket only",
+                Some("/runtime/test"),
+                None,
+                HashSet::from([runtime.join("systemd/private")]),
+                true,
+            ),
+            (
+                "bus socket only",
+                Some("/runtime/test"),
+                None,
+                HashSet::from([runtime.join("bus")]),
+                true,
+            ),
+            (
+                "bus address only",
+                None,
+                Some("unix:path=/bus"),
+                HashSet::new(),
+                true,
+            ),
+            (
+                "runtime without sockets",
+                Some("/runtime/test"),
+                None,
+                HashSet::new(),
+                false,
+            ),
+            (
+                "empty runtime and address",
+                Some(""),
+                Some(""),
+                HashSet::new(),
+                false,
+            ),
+            ("both unset", None, None, HashSet::new(), false),
+        ];
+
+        for (name, runtime_dir, bus_address, present, expected) in cases {
+            let reachable = user_manager_reachable(
+                runtime_dir.map(OsStr::new),
+                bus_address.map(OsStr::new),
+                &|path| present.iter().any(|candidate| candidate.as_path() == path),
+            );
+            assert_eq!(reachable, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn scope_skipped_note_only_when_the_user_manager_is_the_missing_piece() {
+        assert!(
+            scope_skipped_note(true, true, false, true)
+                .is_some_and(|note| note.ends_with("using the soft nice cap"))
+        );
+        assert!(
+            scope_skipped_note(true, true, false, false)
+                .is_some_and(|note| note.ends_with("no cap is applied"))
+        );
+        assert_eq!(scope_skipped_note(true, true, true, true), None);
+        assert_eq!(scope_skipped_note(false, true, false, true), None);
+        assert_eq!(scope_skipped_note(true, false, false, true), None);
     }
 
     #[test]
@@ -1433,5 +1604,65 @@ mod tests {
         ] {
             assert_eq!(strip_pane_cap(&argv), argv.as_slice(), "argv: {argv:?}");
         }
+    }
+
+    #[test]
+    fn strip_soft_cap_peels_exactly_what_the_soft_cap_prepended() {
+        let limits = SandboxLimits {
+            cpu: Some("8".into()),
+            ..SandboxLimits::default()
+        };
+        let inner = sv(&["bwrap", "--bind", "/wt", "/wt", "--", "zsh"]);
+        let capped = wrap_provider_pane_argv(inner.clone(), &limits, CpuCap::NiceSoft);
+        assert!(capped.len() > inner.len(), "the soft cap must wrap");
+        assert_eq!(strip_soft_cap(&capped), inner.as_slice());
+
+        let nice_level = CPU_NICE.to_string();
+        let with_ionice = [
+            vec![
+                "ionice".into(),
+                "-c3".into(),
+                "nice".into(),
+                "-n".into(),
+                nice_level.clone(),
+            ],
+            sv(&["bwrap", "--", "zsh"]),
+        ]
+        .concat();
+        let without_ionice = [
+            vec!["nice".into(), "-n".into(), nice_level],
+            sv(&["bwrap", "--", "zsh"]),
+        ]
+        .concat();
+        assert_eq!(strip_soft_cap(&with_ionice), sv(&["bwrap", "--", "zsh"]));
+        assert_eq!(strip_soft_cap(&without_ionice), sv(&["bwrap", "--", "zsh"]));
+    }
+
+    #[test]
+    fn strip_soft_cap_ignores_argv_it_did_not_produce() {
+        let nice_level = CPU_NICE.to_string();
+        for argv in [
+            sv(&["nice", "-n", "5", "bwrap"]),
+            sv(&["nice", "bwrap"]),
+            sv(&["ionice", "-c3", "bwrap"]),
+            [
+                sv(&["ionice", "-c2", "nice", "-n"]),
+                vec![nice_level.clone(), "bwrap".into()],
+            ]
+            .concat(),
+            [sv(&["nice", "-n"]), vec![nice_level]].concat(),
+            Vec::new(),
+        ] {
+            assert_eq!(strip_soft_cap(&argv), argv.as_slice(), "argv: {argv:?}");
+        }
+
+        let limits = SandboxLimits {
+            cpu: Some("8".into()),
+            memory: Some("24G".into()),
+            ..SandboxLimits::default()
+        };
+        let hard_capped =
+            wrap_provider_pane_argv(sv(&["bwrap", "--", "zsh"]), &limits, CpuCap::ScopeHard);
+        assert_eq!(strip_cap(&hard_capped), strip_pane_cap(&hard_capped));
     }
 }

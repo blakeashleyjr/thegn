@@ -868,7 +868,10 @@ pub(crate) fn adjust_pool_target(
         return "warm pool: only for provider (remote) workspaces".into();
     }
     let (_, repo, env) = crate::lifecycle::pool_context(db, cfg, wt, &loc);
-    let cur = crate::lifecycle::effective_pool_target(db, cfg, &repo, &env);
+    let cur = match crate::lifecycle::effective_pool_target(db, cfg, &repo, &env) {
+        Ok(cur) => cur,
+        Err(error) => return format!("warm pool: cannot read the current target: {error:#}"),
+    };
     let new = (cur as i64 + delta).clamp(0, crate::lifecycle::POOL_TARGET_CEILING as i64);
     if let Err(error) = db.set_pool_target(&repo, &env, new) {
         return format!("warm pool: persist failed: {error}");
@@ -1656,6 +1659,50 @@ mod tests {
             "warm pool target: 1 spare(s)"
         );
         assert_eq!(db.pool_target("/repo", "selected-env").unwrap(), Some(1));
+        assert_eq!(db.pool_target("/repo", "default").unwrap(), None);
+    }
+
+    #[test]
+    fn adjust_pool_target_refuses_a_target_read_error_without_persisting() {
+        use thegn_core::store::{PoolStore as _, WorkspaceStore as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool-target.sqlite");
+        let db = thegn_core::db::Db::open_at(&path).unwrap();
+        db.put_worktree(
+            "repo/main",
+            "/repo",
+            "/remote/wt",
+            "main",
+            Some(r#"{"control_prefix":["provider"],"path":"/remote/wt"}"#),
+            None,
+        )
+        .unwrap();
+        db.set_pool_target("/repo", "default", 2).unwrap();
+
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE pool_targets")
+            .unwrap();
+
+        let refusal =
+            adjust_pool_target(&db, &thegn_core::config::Config::default(), "/remote/wt", 1);
+        assert!(
+            refusal.starts_with("warm pool: cannot read the current target:"),
+            "failed target reads must be reported as a refusal, got: {refusal}"
+        );
+
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE pool_targets (
+                   repo_path TEXT NOT NULL,
+                   env_name TEXT NOT NULL,
+                   target INTEGER NOT NULL,
+                   PRIMARY KEY (repo_path, env_name)
+                 )",
+            )
+            .unwrap();
         assert_eq!(db.pool_target("/repo", "default").unwrap(), None);
     }
 

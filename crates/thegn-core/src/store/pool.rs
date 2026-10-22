@@ -81,7 +81,8 @@ pub trait PoolStore {
     fn worktree_provider_sandbox(&self, worktree: &str) -> Result<Option<String>>;
 
     /// The runtime pool-target override for `(repo, env)`, or `None` to fall back
-    /// to the configured `[lifecycle.pool] size`.
+    /// to the configured `[lifecycle.pool] size`; a read error is returned as
+    /// `Err` and must not fall back to the configured size.
     fn pool_target(&self, repo: &str, env: &str) -> Result<Option<i64>>;
 
     /// Set the runtime pool-target override for `(repo, env)`.

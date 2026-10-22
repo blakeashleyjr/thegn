@@ -149,6 +149,67 @@ fn every_backend_round_trips_through_the_cpu_cap() {
 }
 
 #[test]
+fn every_backend_round_trips_through_the_soft_cap() {
+    for b in all_backends().into_iter().filter(|b| argv_visible(*b)) {
+        let argv = enter_argv(&spec(b), "zsh").expect("valid volume names");
+        let limits = SandboxLimits {
+            cpu: Some("8".into()),
+            ..SandboxLimits::default()
+        };
+        let capped = crate::sandbox_cpucap::wrap_provider_pane_argv(
+            argv,
+            &limits,
+            crate::sandbox_cpucap::CpuCap::NiceSoft,
+        );
+        assert_eq!(
+            observed(&capped),
+            b,
+            "backend {} reads as {:?} once the soft CPU cap wraps it: {capped:?}",
+            b.label(),
+            observed(&capped)
+        );
+    }
+}
+
+#[test]
+fn reconcile_keeps_a_soft_capped_bwrap_pane() {
+    let argv = enter_argv(&spec(Backend::Bwrap), "zsh").expect("valid volume names");
+    let limits = SandboxLimits {
+        cpu: Some("8".into()),
+        ..SandboxLimits::default()
+    };
+    let capped = crate::sandbox_cpucap::wrap_provider_pane_argv(
+        argv,
+        &limits,
+        crate::sandbox_cpucap::CpuCap::NiceSoft,
+    );
+    let truth = reconcile("bwrap", &capped);
+    assert!(!truth.degraded, "soft cap must preserve bwrap: {truth:?}");
+    assert_eq!(truth.warning, None);
+    assert_eq!(truth.label, Backend::Bwrap.label());
+}
+
+#[test]
+fn a_soft_capped_host_shell_is_not_contained() {
+    // Positive control: this already reads as uncontained on the frozen base.
+    let shell = vec![
+        "bash".to_string(),
+        "-lc".into(),
+        "cd /wt && exec bash".into(),
+    ];
+    let limits = SandboxLimits {
+        cpu: Some("8".into()),
+        ..SandboxLimits::default()
+    };
+    let capped = crate::sandbox_cpucap::wrap_provider_pane_argv(
+        shell,
+        &limits,
+        crate::sandbox_cpucap::CpuCap::NiceSoft,
+    );
+    assert_eq!(observed(&capped), Backend::None);
+}
+
+#[test]
 fn a_merely_capped_host_shell_is_not_a_systemd_sandbox() {
     // The inverse lie, and the one this module exists to prevent: capping an
     // UNCONTAINED pane prepends the same `systemd-run --scope` and used to make

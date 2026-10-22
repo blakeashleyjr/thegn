@@ -629,35 +629,33 @@ impl PluginsHost {
         let tx = self.tx.clone();
         let waker = self.waker.clone();
         let state_anchor = self.state_anchor.clone();
-        let spawn = std::thread::Builder::new()
-            .name("thegn-plugin-once".into())
-            .spawn(move || {
-                // Utility: the user just invoked this one-shot and is waiting on its result.
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let id = plugin.spec.manifest.id.as_str().to_string();
-                let run = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
-                    Ok(env) => thegn_svc::plugin::spawn_ndjson(
-                        &plugin.spec.command,
-                        &env,
-                        plugin.effective_cwd().as_deref(),
-                        plugin.spec.run_timeout(),
-                    ),
-                    Err(problem) => {
-                        drop(ticket);
-                        if let Err(error) = tx.send(PluginMsg::Refused(vec![problem])) {
-                            tracing::debug!(target: "thegn::plugin", %error, "refusal message consumer is gone");
-                        }
-                        if let Err(error) = waker.wake() {
-                            tracing::debug!(target: "thegn::plugin", %error, "refusal message waker pulse failed");
-                        }
-                        return;
+        let spawn = thegn_core::thread_name::try_spawn_named("thegn-plug-once", move || {
+            // Utility: the user just invoked this one-shot and is waiting on its result.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            let id = plugin.spec.manifest.id.as_str().to_string();
+            let run = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
+                Ok(env) => thegn_svc::plugin::spawn_ndjson(
+                    &plugin.spec.command,
+                    &env,
+                    plugin.effective_cwd().as_deref(),
+                    plugin.spec.run_timeout(),
+                ),
+                Err(problem) => {
+                    drop(ticket);
+                    if let Err(error) = tx.send(PluginMsg::Refused(vec![problem])) {
+                        tracing::debug!(target: "thegn::plugin", %error, "refusal message consumer is gone");
                     }
-                };
-                drop(ticket);
-                // best-effort: the loop may be shutting down.
-                let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
-                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-            });
+                    if let Err(error) = waker.wake() {
+                        tracing::debug!(target: "thegn::plugin", %error, "refusal message waker pulse failed");
+                    }
+                    return;
+                }
+            };
+            drop(ticket);
+            // best-effort: the loop may be shutting down.
+            let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        });
         match spawn {
             Ok(_) => OneShotStart::Started,
             Err(e) => {

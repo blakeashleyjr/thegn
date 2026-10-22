@@ -42,6 +42,7 @@ RELEASE_MANIFEST_NAME = "thegn-{tag}-manifest.json"
 MAX_MEMBERS = 64
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_EXPANDED_BYTES = 512 * 1024 * 1024
+MAX_PATH_CHARS = 255
 # Expanded bytes may be at most this multiple of the archive's on-disk size.
 # Release archives compress about 3-4x; gzip's ceiling is about 1032x, so 100
 # refuses decompression bombs with wide headroom.
@@ -858,7 +859,7 @@ def _validate_archive_layout(
                         raise ReleaseError(
                             f"archive {path} exceeds {MAX_MEMBERS} members"
                         )
-                    if len(member.name) > 255:
+                    if len(member.name) > MAX_PATH_CHARS:
                         raise ReleaseError(f"archive {path} has an overlong path")
                     clean_names = _safe_archive_names((member.name,), path)
                     duplicates = names & clean_names
@@ -870,6 +871,12 @@ def _validate_archive_layout(
                     if member.size > MAX_MEMBER_BYTES:
                         raise ReleaseError(
                             f"archive {path} member exceeds {MAX_MEMBER_BYTES} bytes"
+                        )
+                    if member.issparse() or any(
+                        key.startswith("GNU.sparse.") for key in member.pax_headers
+                    ):
+                        raise ReleaseError(
+                            f"archive {path} member {member.name!r} is a sparse file"
                         )
                     if member.isdir() and member.name.rstrip("/") in ("", "."):
                         continue
@@ -906,7 +913,7 @@ def _validate_archive_layout(
                         raise ReleaseError(
                             f"archive {path} exceeds {MAX_MEMBERS} members"
                         )
-                    if len(member.filename) > 255:
+                    if len(member.filename) > MAX_PATH_CHARS:
                         raise ReleaseError(f"archive {path} has an overlong path")
                     clean_names = _safe_archive_names((member.filename,), path)
                     duplicates = names & clean_names
@@ -942,7 +949,7 @@ def _validate_archive_layout(
                                 f"archive {path} exceeds compression ratio {MAX_COMPRESSION_RATIO}"
                             )
                         regular.add(member.filename.rstrip("/"))
-    except (OSError, tarfile.TarError, zipfile.BadZipFile) as error:
+    except (OSError, EOFError, zlib.error, tarfile.TarError, zipfile.BadZipFile) as error:
         raise ReleaseError(f"cannot inspect release archive {path}: {error}") from error
     if unsafe:
         raise ReleaseError(

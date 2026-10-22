@@ -216,7 +216,8 @@ mod db_open_memo;
 /// v90: agent_dispatches.lead_lease, the Lead lease a pipeline row was claimed under (THE-208).
 /// v91: pr_queue.agent_claim_*, the PR-agent lease (THE-546).
 /// v92: calendar_reminder_claims, the durable at-most-once reminder firing ledger (THE-461).
-pub const SCHEMA_VERSION: i64 = 92;
+/// v93: the roster order index (THE-259): every roster reader orders by dispatched_at_ms DESC, id DESC.
+pub const SCHEMA_VERSION: i64 = 93;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -933,6 +934,37 @@ fn enter_background_worker() {
     }
 }
 
+static SEMANTIC_SWEEP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SEMANTIC_SWEEP_PATH: OnceLock<PathBuf> = OnceLock::new();
+static SEMANTIC_SWEEP_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// Opt in long-lived compositor and daemon processes to the semantic-index growth bound.
+/// Short CLI processes must not leave a second SQLite connection open when they exit.
+pub fn enable_semantic_sweep() {
+    SEMANTIC_SWEEP_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    maybe_start_semantic_sweep();
+}
+
+fn semantic_sweep_should_start(enabled: bool, path: Option<&Path>) -> bool {
+    enabled && path.is_some()
+}
+
+fn maybe_start_semantic_sweep() {
+    let enabled = SEMANTIC_SWEEP_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(path) = SEMANTIC_SWEEP_PATH.get()
+        && semantic_sweep_should_start(enabled, Some(path.as_path()))
+    {
+        SEMANTIC_SWEEP_STARTED.call_once(|| {
+            // The bounded, idempotent sweep is intentionally detached.
+            if let Err(error) = spawn_semantic_sweep(path.clone()) {
+                tracing::debug!(%error, "could not start semantic entity prune worker");
+            }
+        });
+    }
+}
+
 /// A no-migration handle for one cataloged operation on an already-existing
 /// schema. The held shared lease prevents an authorized controller from
 /// migrating the file while this operation is using the older shape.
@@ -1288,20 +1320,20 @@ impl Db {
         let _ = crate::fsperm::restrict_to_owner(&path); // best-effort: hardening: a failed chmod must never block DB open
         // The common fast-path init (user_version already current) skips the
         // startup prunes so a plain open takes NO write lock. Run them once
-        // per process here so a long-lived install still gets its growth
-        // bound. (A full init also prunes inline; the overlap on the first
-        // open after a migration is an idempotent no-op.)
+        // per process here. The semantic sweep starts only in processes that
+        // opted in (the compositor and daemon), so a short CLI never leaves a
+        // second SQLite connection open at exit. (A full init also prunes
+        // inline; the overlap on the first open after a migration is an
+        // idempotent no-op.)
         static PRUNE_ONCE: std::sync::Once = std::sync::Once::new();
         if db.schema_mismatch.is_none() {
             PRUNE_ONCE.call_once(|| {
                 db.startup_prune();
-                // Semantic-file checks perform filesystem metadata I/O. Run
-                // the bounded-delete sweep on its own worker so opening the
-                // DB from the event loop never waits for that walk.
-                let sweep_path = path.clone();
-                if let Err(error) = spawn_semantic_sweep(sweep_path) {
-                    tracing::debug!(%error, "could not start semantic entity prune worker");
+                if SEMANTIC_SWEEP_PATH.set(path.clone()).is_err() {
+                    tracing::debug!("semantic sweep database path was already recorded");
                 }
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                maybe_start_semantic_sweep();
             });
         }
         Ok(db)
@@ -1457,9 +1489,67 @@ impl Db {
         }))
     }
 
+    /// Open the current contents of an existing state DB without writing it.
+    ///
+    /// Immutable mode ignores the WAL. A non-empty WAL is therefore read
+    /// through [`Self::open_read_only_wal_at`] when its shared-memory index
+    /// exists; a non-empty WAL without that index is refused. Neither path
+    /// creates a file or writes the main database.
+    pub fn open_read_only_current_at(path: &std::path::Path) -> Result<Option<Db>> {
+        use anyhow::Context as _;
+
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let wal = wal_sidecar(path);
+        match std::fs::metadata(&wal) {
+            Ok(metadata) if metadata.len() > 0 => {
+                let shm = shm_sidecar(path);
+                match std::fs::metadata(&shm) {
+                    Ok(_) => Self::open_read_only_wal_at(path).with_context(|| {
+                        format!(
+                            "open state database read-only with its write-ahead log at {}",
+                            path.display()
+                        )
+                    }),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Err(ReadOnlyOpenError::WalWithoutIndex {
+                            path: path.to_path_buf(),
+                        }
+                        .into())
+                    }
+                    Err(error) => Err(error).with_context(|| {
+                        format!(
+                            "inspect state database shared-memory index at {}",
+                            shm.display()
+                        )
+                    }),
+                }
+            }
+            Ok(_) => Self::open_read_only_at(path)
+                .with_context(|| format!("open state database read-only at {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::open_read_only_at(path)
+                    .with_context(|| format!("open state database read-only at {}", path.display()))
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "inspect state database write-ahead log at {}",
+                    wal.display()
+                )
+            }),
+        }
+    }
+
     /// Read-only counterpart to [`Db::open`] for dry-run command paths.
     pub fn open_read_only() -> Result<Option<Db>> {
         Self::open_read_only_at(&db_path())
+    }
+
+    /// Read the current state DB without creating, migrating, pruning, or
+    /// changing its journal mode.
+    pub fn open_read_only_current() -> Result<Option<Db>> {
+        Self::open_read_only_current_at(&db_path())
     }
 
     /// Open a state DB read-only when it was written by a newer build. The
@@ -1618,6 +1708,7 @@ impl Db {
                     crate::db_migrate::verify_v90_schema(&conn)?;
                     crate::db_migrate::verify_v91_schema(&conn)?;
                     crate::db_migrate::verify_v92_schema(&conn)?;
+                    crate::db_migrate::verify_v93_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2294,6 +2385,7 @@ impl Db {
         crate::db_migrate::migrate_v90(&conn)?;
         crate::db_migrate::migrate_v91(&conn)?;
         crate::db_migrate::migrate_v92(&conn)?;
+        crate::db_migrate::migrate_v93(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2324,6 +2416,7 @@ impl Db {
             crate::db_migrate::verify_v90_schema(&conn)?;
             crate::db_migrate::verify_v91_schema(&conn)?;
             crate::db_migrate::verify_v92_schema(&conn)?;
+            crate::db_migrate::verify_v93_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
@@ -2566,6 +2659,39 @@ impl Db {
         tx.commit()?;
         Ok(out)
     }
+}
+
+/// A current-state read could not safely use the immutable view or join the WAL.
+#[derive(Debug)]
+pub enum ReadOnlyOpenError {
+    /// A non-empty WAL exists without the SHM index needed to read it safely.
+    WalWithoutIndex { path: PathBuf },
+}
+
+impl std::fmt::Display for ReadOnlyOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WalWithoutIndex { path } => write!(
+                f,
+                "state database at {} has an un-checkpointed write-ahead log but no shared-memory index; open thegn on it once to recover it",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadOnlyOpenError {}
+
+fn wal_sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+fn shm_sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-shm");
+    PathBuf::from(name)
 }
 
 /// Run the bounded semantic-file prune until it reaches the terminal slice.

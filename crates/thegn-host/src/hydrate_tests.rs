@@ -3054,3 +3054,73 @@ fn idle_glyph_unchanged_flag_never_affects_background_rows() {
         assert!(reused.is_empty());
     }
 }
+
+#[test]
+fn across_skips_ci_cached_for_another_branch() {
+    use thegn_core::store::{CacheStore, WorkspaceStore};
+
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_worktree("app/c", "/repo", "/wt/none", "topic", None, None)
+        .unwrap();
+    let cache = serde_json::to_string(&thegn_core::ci::CiRunCache {
+        runs: vec![thegn_core::ci::CiRun {
+            id: "101".into(),
+            state: thegn_core::ci::CiState::Fail,
+            ..Default::default()
+        }],
+        context: String::new(),
+        ..Default::default()
+    })
+    .unwrap();
+    db.put_ci_cache("/wt/none", "old-topic", &cache).unwrap();
+    let rows = db.worktrees().unwrap();
+    let observed = std::collections::HashMap::from([(
+        "/wt/none".to_string(),
+        crate::worktree_snapshot::BranchObservation::Branch("topic".into()),
+    )]);
+
+    let across = across_from_rows(
+        &db,
+        &rows,
+        None,
+        &thegn_core::config::CiConfig::default(),
+        &observed,
+    );
+
+    assert!(across.is_empty());
+}
+
+#[test]
+fn across_keeps_ci_cached_for_the_current_branch() {
+    use thegn_core::store::{CacheStore, WorkspaceStore};
+
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    db.put_worktree("app/c", "/repo", "/wt/none", "topic", None, None)
+        .unwrap();
+    let cache = serde_json::to_string(&thegn_core::ci::CiRunCache {
+        runs: vec![thegn_core::ci::CiRun {
+            id: "101".into(),
+            state: thegn_core::ci::CiState::Fail,
+            ..Default::default()
+        }],
+        context: String::new(),
+        ..Default::default()
+    })
+    .unwrap();
+    db.put_ci_cache("/wt/none", "topic", &cache).unwrap();
+    let rows = db.worktrees().unwrap();
+    let observed = std::collections::HashMap::from([(
+        "/wt/none".to_string(),
+        crate::worktree_snapshot::BranchObservation::Branch("topic".into()),
+    )]);
+
+    let across = across_from_rows(
+        &db,
+        &rows,
+        None,
+        &thegn_core::config::CiConfig::default(),
+        &observed,
+    );
+
+    assert!(!across.is_empty());
+}
