@@ -374,6 +374,12 @@ fn run_mount_bounded(
     if argv.is_empty() {
         bail!("empty projection argv");
     }
+    if !crate::plugin::proc::bounded_group_termination_supported() {
+        bail!(
+            "{} failed: this platform cannot bound the mount's process tree; refusing to start it",
+            argv[0]
+        );
+    }
 
     let stderr_file = tempfile::tempfile().map_err(|error| {
         anyhow::anyhow!("{} failed: could not capture stderr: {error}", argv[0])
@@ -382,11 +388,14 @@ fn run_mount_bounded(
         anyhow::anyhow!("{} failed: could not capture stderr: {error}", argv[0])
     })?;
     let started = std::time::Instant::now();
-    let mut child = std::process::Command::new(&argv[0])
+    let mut command = std::process::Command::new(&argv[0]);
+    command
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(stderr_file))
+        .stderr(std::process::Stdio::from(stderr_file));
+    crate::plugin::proc::set_process_group(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| anyhow::anyhow!("{} failed: could not run: {error}", argv[0]))?;
     let deadline = started + timeout;
@@ -401,6 +410,7 @@ fn run_mount_bounded(
             }
             Ok(None) => {}
             Err(error) => {
+                crate::plugin::proc::kill_group(child.id());
                 let kill_error = match child.kill() {
                     Ok(()) => None,
                     Err(kill_error) if kill_error.kind() == std::io::ErrorKind::InvalidInput => {
@@ -430,6 +440,7 @@ fn run_mount_bounded(
         interval = thegn_proc::next_backoff(interval, remaining);
     }
 
+    crate::plugin::proc::kill_group(child.id());
     let kill_error = match child.kill() {
         Ok(()) => None,
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => None,
@@ -1422,5 +1433,107 @@ mod tests {
 
         assert!(result.unwrap_err().to_string().contains("could not run"));
         assert!(!rolled.get());
+    }
+
+    // The shell runs its background child in the mount leader's process group
+    // (sh -c has no job control), and the leader stays alive blocked in `wait`.
+    // This test owns an isolated tempdir and has no shared lease/state; two
+    // seconds is well above the time needed to fork and record the pid.
+    #[test]
+    fn sshfs_mount_runner_timeout_kills_the_whole_process_group() {
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create private descendant fixture directory");
+        thegn_core::fsperm::restrict_dir_to_owner(dir.path())
+            .expect("restrict descendant fixture directory");
+        let pid_file = dir.path().join("descendant.pid");
+        let result = run_mount_bounded(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "sleep 30 & echo $! > \"$1\"; wait".into(),
+                "sh".into(),
+                pid_file.display().to_string(),
+            ],
+            std::time::Duration::from_secs(2),
+            || Ok(()),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let descendant_pid = std::fs::read_to_string(&pid_file)
+            .expect("the leader records its descendant before the 2 s deadline")
+            .trim()
+            .parse::<u32>()
+            .expect("the recorded descendant pid is numeric");
+        let descendant_stat = std::path::PathBuf::from(format!("/proc/{descendant_pid}/stat"));
+        let mut gone = false;
+        for _ in 0..100 {
+            match std::fs::read_to_string(&descendant_stat) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    gone = true;
+                    break;
+                }
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit_once(')')
+                        .and_then(|(_, fields)| fields.split_whitespace().next());
+                    if state == Some("Z") {
+                        gone = true;
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            gone,
+            "a timed-out mount must not leave its descendants running"
+        );
+    }
+
+    // The shell exits successfully after starting the child, so try_wait reaps
+    // the leader before the 5 s timeout; its group must remain untouched. This
+    // test owns a separate tempdir and has no shared lease/state.
+    #[test]
+    fn sshfs_mount_runner_success_does_not_signal_the_daemonized_descendant() {
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create private descendant fixture directory");
+        thegn_core::fsperm::restrict_dir_to_owner(dir.path())
+            .expect("restrict descendant fixture directory");
+        let pid_file = dir.path().join("descendant.pid");
+        let result = run_mount_bounded(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "sleep 30 & echo $! > \"$1\"; exit 0".into(),
+                "sh".into(),
+                pid_file.display().to_string(),
+            ],
+            std::time::Duration::from_secs(5),
+            || Ok(()),
+        );
+
+        assert!(result.is_ok());
+        let descendant_pid = std::fs::read_to_string(&pid_file)
+            .expect("the leader records its daemonized descendant before exiting")
+            .trim()
+            .parse::<u32>()
+            .expect("the recorded descendant pid is numeric");
+        let descendant_stat = std::path::PathBuf::from(format!("/proc/{descendant_pid}/stat"));
+        let stat = std::fs::read_to_string(descendant_stat)
+            .expect("the successful mount daemon must keep running");
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().next());
+        assert!(
+            state.is_some_and(|state| state != "Z"),
+            "a successful mount daemon must keep running"
+        );
     }
 }
