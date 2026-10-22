@@ -77,6 +77,9 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   it against the current tip.
 - If a fixing agent does not start, the row is held `agent_blocked` with no
   attempt spent; `thegn merge retry` re-arms it.
+- If Git cannot read the queued branch or fixer's checkout during a drain, the
+  row is held `agent_blocked` with a `candidate unreadable:` reason and Git's
+  error, without spending an attempt. Retry it once Git is readable.
 - `thegn merge clear` removes unclaimed rows. Rows held by an active drain
   stay queued, are named in the error, and require another clear after the
   drain finishes.
