@@ -767,19 +767,12 @@ impl Db {
         };
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut rows = if let (Some(id), Some(stamp)) = (before, cursor_stamp) {
-            let mut statement = tx.prepare(&format!(
-                "SELECT {DISPATCH_COLS} FROM agent_dispatches \
-                 WHERE dispatched_at_ms < ?1 OR (dispatched_at_ms = ?1 AND id < ?2) \
-                 ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?3"
-            ))?;
+            let mut statement = tx.prepare(&Self::dispatch_history_sql(true))?;
             statement
                 .query_map(params![stamp, id, fetch_limit], map_dispatch)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            let mut statement = tx.prepare(&format!(
-                "SELECT {DISPATCH_COLS} FROM agent_dispatches \
-                 ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?1"
-            ))?;
+            let mut statement = tx.prepare(&Self::dispatch_history_sql(false))?;
             statement
                 .query_map(params![fetch_limit], map_dispatch)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -788,6 +781,18 @@ impl Db {
         let truncated = rows.len() > limit;
         rows.truncate(limit);
         Ok((rows, truncated))
+    }
+
+    fn dispatch_history_sql(after_cursor: bool) -> String {
+        let cursor = if after_cursor {
+            "WHERE (dispatched_at_ms, id) < (?1, ?2) "
+        } else {
+            ""
+        };
+        let limit = if after_cursor { "?3" } else { "?1" };
+        format!(
+            "SELECT {DISPATCH_COLS} FROM agent_dispatches {cursor}ORDER BY dispatched_at_ms DESC, id DESC LIMIT {limit}"
+        )
     }
 
     /// Return child stage names for the whole roster. This narrow query is
@@ -1484,5 +1489,45 @@ mod tests {
         let error = db.dispatch_history_page(Some(999), 2).unwrap_err();
 
         assert!(error.to_string().contains("999"));
+    }
+
+    #[test]
+    fn dispatch_history_page_queries_use_the_order_index() {
+        let db = Db::open_memory().unwrap();
+        let head_sql = format!("EXPLAIN QUERY PLAN {}", Db::dispatch_history_sql(false));
+        let mut head_statement = db.conn().prepare(&head_sql).unwrap();
+        let head_plan = head_statement
+            .query_map(params![10_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let head_details = head_plan.join("\n");
+        assert!(
+            head_details.contains("idx_agent_dispatches_dispatched"),
+            "head query must use the roster order index; plan:\n{head_details}"
+        );
+        assert!(
+            !head_details.contains("TEMP B-TREE"),
+            "head query must avoid a temporary sort; plan:\n{head_details}"
+        );
+
+        let cursor_sql = format!("EXPLAIN QUERY PLAN {}", Db::dispatch_history_sql(true));
+        let mut cursor_statement = db.conn().prepare(&cursor_sql).unwrap();
+        let cursor_plan = cursor_statement
+            .query_map(params![100_i64, 1_i64, 10_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let cursor_details = cursor_plan.join("\n");
+        assert!(
+            cursor_details.contains("idx_agent_dispatches_dispatched"),
+            "cursor query must use the roster order index; plan:\n{cursor_details}"
+        );
+        assert!(
+            !cursor_details.contains("TEMP B-TREE"),
+            "cursor query must avoid a temporary sort; plan:\n{cursor_details}"
+        );
     }
 }
