@@ -5,6 +5,7 @@
 //!
 //! This is the native view + matcher the host drives, populated from host state.
 
+use std::collections::HashSet;
 use termwiz::surface::Surface;
 
 use crate::chrome::S;
@@ -575,6 +576,27 @@ pub(crate) fn build_workspace_switch_palette(
     crate::palette::order_by_frecency(items, &usage)
 }
 
+fn issue_palette_label(issue: &thegn_core::issue::Issue, shared: &HashSet<&str>) -> String {
+    let account_tag = if shared.contains(issue.id.as_str()) {
+        format!(
+            " ({})",
+            issue
+                .account
+                .as_deref()
+                .map(|account| thegn_core::pipeline_report::display_clip(account, 16))
+                .unwrap_or_else(|| "?".to_string())
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {}{account_tag} {}",
+        issue.status.glyph(),
+        issue.number,
+        issue.title
+    )
+}
+
 /// Build the palette's item list: the command actions + a nav row per open tab
 /// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
 /// of the old engine's command + nav + frecency sources).
@@ -678,24 +700,7 @@ pub(crate) fn build_palette(
             .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
     );
     for issue in issues {
-        let status_glyph = issue.status.glyph();
-        let account_tag = shared
-            .contains(issue.id.as_str())
-            .then(|| {
-                format!(
-                    " ({})",
-                    issue
-                        .account
-                        .as_deref()
-                        .map(|account| thegn_core::pipeline_report::display_clip(account, 16))
-                        .unwrap_or_else(|| "?".to_string())
-                )
-            })
-            .unwrap_or_default();
-        let label = format!(
-            "{status_glyph} {}{account_tag} {}",
-            issue.number, issue.title
-        );
+        let label = issue_palette_label(issue, &shared);
         items.push(PaletteItem::new(format!("issue:{}", issue.id), label));
     }
 
@@ -761,27 +766,9 @@ pub(crate) fn build_palette_seed(
             .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
     );
     for issue in issues {
-        let account_tag = shared
-            .contains(issue.id.as_str())
-            .then(|| {
-                format!(
-                    " ({})",
-                    issue
-                        .account
-                        .as_deref()
-                        .map(|account| thegn_core::pipeline_report::display_clip(account, 16))
-                        .unwrap_or_else(|| "?".to_string())
-                )
-            })
-            .unwrap_or_default();
         items.push(PaletteItem::new(
             format!("issue:{}", issue.id),
-            format!(
-                "{} {}{account_tag} {}",
-                issue.status.glyph(),
-                issue.number,
-                issue.title
-            ),
+            issue_palette_label(issue, &shared),
         ));
     }
     items

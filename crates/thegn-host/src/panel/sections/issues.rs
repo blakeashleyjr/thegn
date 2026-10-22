@@ -17,6 +17,19 @@ use super::{
     PanelHit, PanelRow, Section, SectionCtx, d, f, g, g2, g3, hint_row, hue, list_detail, rule, t,
 };
 
+pub(super) fn account_tag(shared: bool, account: Option<&str>) -> String {
+    if shared {
+        format!(
+            " ({})",
+            account
+                .map(|account| display_clip(account, 16))
+                .unwrap_or_else(|| "?".to_string())
+        )
+    } else {
+        String::new()
+    }
+}
+
 // ---- status colour mapping --------------------------------------------------
 
 fn status_hue(s: IssueStatus) -> crate::seg::Tok {
@@ -160,27 +173,15 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         // Budget: 1 glyph + 1 space + number + 1 space + title
         let number_part = display_cell(&issue.number);
         let number_width = UnicodeWidthStr::width(number_part.as_str());
-        let account_tag = shared.contains(issue.id.as_str()).then(|| {
-            format!(
-                " ({})",
-                issue
-                    .account
-                    .as_deref()
-                    .map(|account| display_clip(account, 16))
-                    .unwrap_or_else(|| "?".to_string())
-            )
-        });
-        let account_width = account_tag
-            .as_deref()
-            .map(UnicodeWidthStr::width)
-            .unwrap_or(0);
+        let account_tag = account_tag(shared.contains(issue.id.as_str()), issue.account.as_deref());
+        let account_width = UnicodeWidthStr::width(account_tag.as_str());
         let budget = cols
             .saturating_sub(1) // glyph
             .saturating_sub(1) // space
             .saturating_sub(number_width)
             .saturating_sub(account_width)
             .saturating_sub(1) // space
-            .saturating_sub(UnicodeWidthStr::width(link_mark));
+            .saturating_sub(link_mark.len());
         let title = display_clip(&issue.title, budget);
 
         let row = PanelRow::plain(Line::segs(vec![
@@ -195,7 +196,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(g(), " "),
             seg(g2(), link_mark.to_string()),
             seg(d(), number_part.clone()),
-            seg(g2(), account_tag.unwrap_or_default()),
+            seg(g2(), account_tag),
             seg(g(), " "),
             seg(t(), title),
         ]))
@@ -246,20 +247,8 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
         // Line 1: status glyph (⊘ if blocked) + number + title
         let blocked = !issue.blocked_by.is_empty();
-        let account_tag = shared.contains(issue.id.as_str()).then(|| {
-            format!(
-                " ({})",
-                issue
-                    .account
-                    .as_deref()
-                    .map(|account| display_clip(account, 16))
-                    .unwrap_or_else(|| "?".to_string())
-            )
-        });
-        let account_width = account_tag
-            .as_deref()
-            .map(UnicodeWidthStr::width)
-            .unwrap_or(0);
+        let account_tag = account_tag(shared.contains(issue.id.as_str()), issue.account.as_deref());
+        let account_width = UnicodeWidthStr::width(account_tag.as_str());
         let linked_str = if linked { " ◈" } else { "" };
         let number = display_clip(&issue.number, cols.saturating_sub(account_width + 3));
         let title_budget = cols.saturating_sub(
@@ -285,7 +274,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             ),
             seg(g(), " "),
             seg(d(), number),
-            seg(g2(), account_tag.unwrap_or_default()),
+            seg(g2(), account_tag),
             seg(g2(), linked_str.to_string()),
             seg(g(), " "),
             seg(t(), title),
@@ -351,12 +340,6 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let cols = ctx.cols;
     let mut rows = Vec::new();
     let issues = sorted_issues(ctx);
-    let shared = thegn_core::issue::ids_shared_across_accounts(
-        data.tracker_issues
-            .iter()
-            .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
-    );
-
     // Header bar
     let provider_label = if !data.issues_configured {
         "no issue tracker configured".to_string()
@@ -410,6 +393,11 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let cursor = ctx.ui.cursor;
     let list_w = (cols / 3).max(30);
     let detail_w = cols.saturating_sub(list_w + 2);
+    let shared = thegn_core::issue::ids_shared_across_accounts(
+        data.tracker_issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
+    );
 
     // Build left column (issue list).
     let list_rows: Vec<(Vec<Seg>, Option<usize>)> = issues
@@ -420,29 +408,18 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let sel_mark = if i == cursor { "▶ " } else { "  " };
             let link_mark = if linked { "◈" } else { " " };
             let number = display_clip(&issue.number, 10);
-            let account_tag = shared.contains(issue.id.as_str()).then(|| {
-                format!(
-                    " ({})",
-                    issue
-                        .account
-                        .as_deref()
-                        .map(|account| display_clip(account, 16))
-                        .unwrap_or_else(|| "?".to_string())
-                )
-            });
-            let account_width = account_tag
-                .as_deref()
-                .map(UnicodeWidthStr::width)
-                .unwrap_or(0);
+            let account_tag =
+                account_tag(shared.contains(issue.id.as_str()), issue.account.as_deref());
+            let account_width = UnicodeWidthStr::width(account_tag.as_str());
             let num_w = UnicodeWidthStr::width(number.as_str()) + account_width + 1;
-            let title_w = list_w.saturating_sub(2 + 1 + num_w + 1 + 2);
+            let title_w = list_w.saturating_sub(2 + num_w + 1 + 1);
             (
                 vec![
                     seg(if i == cursor { t() } else { g() }, sel_mark.to_string()),
                     seg(status_hue(issue.status), issue.status.glyph().to_string()),
                     seg(g(), " "),
                     seg(d(), number),
-                    seg(g2(), account_tag.unwrap_or_default()),
+                    seg(g2(), account_tag),
                     seg(g(), " "),
                     seg(
                         if i == cursor { t() } else { g2() },
@@ -948,7 +925,24 @@ mod tests {
             for line in &lines {
                 assert!(UnicodeWidthStr::width(line.as_str()) <= cols, "{line:?}");
             }
+            if width == crate::layout::PanelWidth::Full {
+                let list_w = (cols / 3).max(30);
+                for row in &rendered {
+                    let left = match &row.line {
+                        Line::Split { l, .. } | Line::SplitMinLeft { l, .. } => Some(l),
+                        _ => None,
+                    };
+                    if let Some(left) = left {
+                        let line = left.iter().map(|seg| seg.text.as_str()).collect::<String>();
+                        assert!(
+                            UnicodeWidthStr::width(line.as_str()) <= list_w,
+                            "list cluster exceeds {list_w} columns: {line:?}"
+                        );
+                    }
+                }
+            }
             let solo_line = lines.iter().find(|line| line.contains("ENG-2"));
+            assert!(solo_line.is_some(), "ENG-2 row was not rendered: {text}");
             assert!(
                 !solo_line.is_some_and(|line| line.contains("(work)")),
                 "{text}"
@@ -975,7 +969,20 @@ mod tests {
             cols: 150,
             rows: 24,
         });
-        let text = format!("{rendered:?}");
+        let text = rendered
+            .iter()
+            .flat_map(|row| match &row.line {
+                Line::Segs(segs) => {
+                    vec![segs.iter().map(|seg| seg.text.as_str()).collect::<String>()]
+                }
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => vec![
+                    l.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                    r.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                ],
+                Line::Blank | Line::Fill { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("account"), "{text}");
         assert!(text.contains("work"), "{text}");
     }
