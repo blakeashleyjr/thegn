@@ -2163,3 +2163,14 @@ fn start_cancelled_before_spawn_starts_nothing_and_removes_credentials() {
         "cancelled start must not leave credentials"
     );
 }
+
+#[test]
+fn share_provider_seam_is_sealed_and_claims_no_plugins() {
+    let src = include_str!("mod.rs");
+    assert!(!src.contains("plug in here later"));
+    assert!(!src.contains("keeps room for"));
+    assert!(src.contains("pub trait ShareProvider: sealed::Sealed"));
+
+    let spec = spec_with(BoreConfig::default(), 3000);
+    assert_eq!(for_provider(&spec).kind(), "bore");
+}

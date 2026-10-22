@@ -3970,8 +3970,8 @@ pub use crate::config_vpn::{
 
 config_enum! {
     /// `[share] provider` — which tunnel backend gives a worktree port a URL.
-    /// `none` (default) disables sharing. Future backends (rathole / zrok /
-    /// ngrok / iroh) plug in behind the same `ShareProvider` seam.
+    /// `none` (default) disables sharing. The other values are the built-in
+    /// backends; there are no plugin backends.
     pub enum ShareProviderKind: "share provider" {
         None = "none" | "off",
         Bore = "bore",
