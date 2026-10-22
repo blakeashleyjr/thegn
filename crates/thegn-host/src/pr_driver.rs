@@ -928,7 +928,7 @@ pub(crate) fn drive_queue(
                     guard.cancel_flag(),
                 );
 
-                let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
+                let fresh = authorship.as_ref().and_then(|_| {
                     forge
                         .pr_status(&loc, PrRef::Number(item.number))
                         .ok()
@@ -941,21 +941,62 @@ pub(crate) fn drive_queue(
                             )
                             .is_ok()
                         })
-                        .map(|pr| pr.head_ref_oid)
                 });
-                if let Some(own) = own
-                    && let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
-                        item.number,
-                        guard.record_own_head(db, &head, &own),
-                    )
-                {
-                    out.warnings.push(warning);
-                }
-
-                match guard.finish(db, None) {
-                    Ok(true) => {}
-                    Ok(false) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row", item.number)),
-                    Err(error) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row ({error})", item.number)),
+                let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
+                    if authorship.is_some() {
+                        fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
+                    } else {
+                        forge
+                            .pr_status(&loc, PrRef::Number(item.number))
+                            .ok()
+                            .filter(|pr| {
+                                pr_queue::attest_pr_identity(
+                                    item.pr_url.as_deref(),
+                                    item.number,
+                                    &pr.url,
+                                    pr.number,
+                                )
+                                .is_ok()
+                            })
+                            .map(|pr| pr.head_ref_oid)
+                    }
+                });
+                match crate::pr_authorship::revalidate_after_agent(
+                    authorship.as_ref(),
+                    db,
+                    forge,
+                    &loc,
+                    fresh.as_ref(),
+                    own.as_deref(),
+                ) {
+                    Ok(()) => {
+                        if let Some(own) = own
+                            && let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
+                                item.number,
+                                guard.record_own_head(db, &head, &own),
+                            )
+                        {
+                            out.warnings.push(warning);
+                        }
+                        match guard.finish(db, None) {
+                            Ok(true) => {}
+                            Ok(false) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row", item.number)),
+                            Err(error) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row ({error})", item.number)),
+                        }
+                    }
+                    Err(reason) => {
+                        match guard.finish(
+                            db,
+                            Some((PrqStatus::NeedsHuman.as_str(), reason)),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row", item.number)),
+                            Err(error) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row ({error})", item.number)),
+                        }
+                        step(PrqStatus::NeedsHuman.as_str(), reason, &mut progress);
+                        out.warnings.push(format!("PR #{}: {reason}", item.number));
+                        out.needs_human.push(item.number);
+                    }
                 }
 
                 // The exit code decides nothing — the next refresh does, exactly
@@ -2268,6 +2309,84 @@ mod tests {
             assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
             assert!(!sentinel.exists());
         }
+    }
+
+    #[test]
+    fn after_agent_identity_change_holds_the_row_needs_human() {
+        use crate::pr_authorship::tests::Fixture;
+        use std::sync::atomic::Ordering;
+
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = &fixture.db;
+        db.enqueue_bound_pr(
+            path,
+            7,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url,
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::BlockedCi.as_str(),
+            None,
+            None,
+            Some(&fixture.pr.head_ref_oid),
+        )
+        .unwrap();
+        db.set_pr_agent_attempts(&row.key, 1).unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let sentinel = fixture.dir.path().join("agent-ran");
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.agent_command = format!("touch {}", sentinel.display());
+        let mut foreign = fixture.proof.clone();
+        foreign.viewer.id = "U_someone_else".into();
+        let mut forge = fixture.forge(vec![fixture.proof.clone(), fixture.proof.clone(), foreign]);
+        forge.pr.status_check_rollup = vec![
+            serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                .unwrap(),
+        ];
+
+        // A failed-CI row with an existing attempt bypasses the zero-attempt CI rerun branch at
+        // drive_queue's `if kind == PrCiFailure && attempts == 0` check and reaches DispatchAgent.
+        let full = uncontained_config();
+        let out = drive_queue(
+            &config,
+            &full,
+            &forge,
+            fixture.dir.path(),
+            db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+
+        let held = db.list_pr_queue().unwrap().remove(0);
+        assert!(
+            sentinel.exists(),
+            "the agent should run before post-agent recheck"
+        );
+        assert_eq!(
+            forge.proof_calls.load(Ordering::SeqCst),
+            3,
+            "expected acquire, pre-dispatch revalidate, and post-agent proof calls"
+        );
+        assert_eq!(out.needs_human, vec![7]);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| { warning.contains("held after the agent ran") })
+        );
+        assert_eq!(held.status, PrqStatus::NeedsHuman.as_str());
+        assert!(
+            held.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("held after the agent ran"))
+        );
     }
 
     #[test]
