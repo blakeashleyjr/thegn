@@ -214,16 +214,14 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             let deliveries = Arc::clone(&deliveries);
             workers.push(
-                // Unnamed: a short-lived test thread, not a long-lived named thread (qos ratchet).
-                std::thread::Builder::new()
-                    .spawn(move || {
-                        let db = Db::open_at(&path).unwrap();
-                        barrier.wait();
-                        raise_reminder_on(&db, &rem("standup", 10, "", ""), 5_000, |_, _, _| {
-                            deliveries.fetch_add(1, Ordering::SeqCst);
-                        })
+                // A short-lived unnamed test thread (the qos ratchet flags any `thread::Builder`).
+                std::thread::spawn(move || {
+                    let db = Db::open_at(&path).unwrap();
+                    barrier.wait();
+                    raise_reminder_on(&db, &rem("standup", 10, "", ""), 5_000, |_, _, _| {
+                        deliveries.fetch_add(1, Ordering::SeqCst);
                     })
-                    .unwrap(),
+                }),
             );
         }
         let claims: Vec<_> = workers
