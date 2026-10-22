@@ -598,12 +598,11 @@ fn rerun(
         Err(message) => msg::die(message),
     };
     let guard = crate::platform::InterruptGuard::install();
-    let loc2 = loc.clone();
     let run_id = run_id.to_string();
     let (result, interrupted) = run_interruptible(
         &cancel_flag,
         || guard.fired(),
-        move || client.rerun(&loc2, &run_id, scope),
+        move || client.rerun(&loc, &run_id, scope),
     );
     drop(guard);
     if interrupted {
@@ -639,12 +638,11 @@ fn trigger(
         msg::die("this provider can't trigger workflows");
     }
     let guard = crate::platform::InterruptGuard::install();
-    let loc2 = loc.clone();
-    let workflow = workflow.to_string();
+    let workflow_owned = workflow.to_string();
     let (result, interrupted) = run_interruptible(
         &cancel_flag,
         || guard.fired(),
-        move || client.trigger(&loc2, &workflow, &inputs),
+        move || client.trigger(&loc, &workflow_owned, &inputs),
     );
     drop(guard);
     if interrupted {
@@ -668,12 +666,11 @@ fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
         msg::die("this provider can't cancel runs");
     }
     let guard = crate::platform::InterruptGuard::install();
-    let loc2 = loc.clone();
     let run_id = run_id.to_string();
     let (result, interrupted) = run_interruptible(
         &cancel_flag,
         || guard.fired(),
-        move || client.cancel(&loc2, &run_id),
+        move || client.cancel(&loc, &run_id),
     );
     drop(guard);
     if interrupted {
