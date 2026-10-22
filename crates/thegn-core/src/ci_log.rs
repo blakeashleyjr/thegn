@@ -320,9 +320,9 @@ pub fn failure_excerpt(text: &str, max_bytes: usize) -> String {
     }
 
     let chunks: Vec<&str> = text.split_inclusive('\n').collect();
-    let anchor = chunks.iter().position(|chunk| {
-        crate::ci::line_is_failure(chunk.trim_end_matches(|ch| ch == '\r' || ch == '\n'))
-    });
+    let anchor = chunks
+        .iter()
+        .position(|chunk| crate::ci::line_is_failure(chunk.trim_end_matches(['\r', '\n'])));
 
     let Some(anchor) = anchor else {
         let marker = if EARLIER_OMITTED.len() <= max_bytes {
