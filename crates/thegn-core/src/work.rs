@@ -84,6 +84,10 @@ pub struct WorkRow {
     /// Local workspace root used to branch this row in the correct repo.
     #[serde(default)]
     pub repo_root: Option<String>,
+    /// The tracker account that produced this issue row (from `Issue.account`);
+    /// `None` for PRs, notifications and older caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 impl WorkRow {
@@ -164,6 +168,7 @@ pub fn sort_rows(rows: &mut [WorkRow]) {
             .cmp(&b.group.order())
             .then(b.urgency.cmp(&a.urgency))
             .then(a.number.cmp(&b.number))
+            .then(a.account.cmp(&b.account))
     });
 }
 
@@ -231,10 +236,49 @@ mod spec {
             branch_hint: None,
             worktree_path: Some("/tmp/wt".into()),
             repo_root: Some("/tmp/repo".into()),
+            account: None,
         };
         let json = serde_json::to_string(&row).unwrap();
         let back: WorkRow = serde_json::from_str(&json).unwrap();
         assert_eq!(row, back);
+    }
+
+    #[test]
+    fn account_field_is_optional_and_omitted_when_none() {
+        let row = WorkRow::default();
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("account").is_none());
+
+        let row = WorkRow {
+            account: Some("work".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        let back: WorkRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.account.as_deref(), Some("work"));
+
+        let legacy = r#"{"group":"assigned","kind":"issue","provider":"linear",
+            "number":"ABC-1","title":"t","url":"u"}"#;
+        let back: WorkRow = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.account, None);
+    }
+
+    #[test]
+    fn account_breaks_sort_ties_deterministically() {
+        let mut rows = vec![
+            WorkRow {
+                number: "ENG-1".into(),
+                account: Some("work".into()),
+                ..Default::default()
+            },
+            WorkRow {
+                number: "ENG-1".into(),
+                account: Some("home".into()),
+                ..Default::default()
+            },
+        ];
+        sort_rows(&mut rows);
+        assert_eq!(rows[0].account.as_deref(), Some("home"));
     }
 
     #[test]
