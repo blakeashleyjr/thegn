@@ -2174,3 +2174,49 @@ fn share_provider_seam_is_sealed_and_claims_no_plugins() {
     let spec = spec_with(BoreConfig::default(), 3000);
     assert_eq!(for_provider(&spec).kind(), "bore");
 }
+
+#[test]
+fn bore_extra_args_secret_flags_are_refused() {
+    let cases = [
+        vec!["--secret".to_owned(), "canary-325x".to_owned()],
+        vec!["--secret=canary-325x".to_owned()],
+        vec!["-s".to_owned(), "canary-325x".to_owned()],
+        vec!["-scanary-325x".to_owned()],
+    ];
+
+    for extra_args in cases {
+        let spec = spec_with(
+            BoreConfig {
+                extra_args,
+                ..BoreConfig::default()
+            },
+            3000,
+        );
+        let error = match for_provider(&spec).launch() {
+            Err(error) => error,
+            Ok(_) => panic!("bore secret flags in extra_args must be refused"),
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("secret"), "refusal identifies secret flag");
+        assert!(
+            !message.contains("canary-325x"),
+            "refusal never exposes the secret value"
+        );
+    }
+}
+
+#[test]
+fn bore_extra_args_without_secret_flags_still_launch() {
+    // Positive control: these non-secret arguments launch before and after the refusal guard.
+    let spec = spec_with(
+        BoreConfig {
+            extra_args: vec!["--max-conn".into(), "10".into()],
+            ..BoreConfig::default()
+        },
+        3000,
+    );
+    let plan = process_plan(&spec);
+
+    let expected = ["--max-conn".to_owned(), "10".to_owned()];
+    assert!(plan.args.ends_with(&expected));
+}
