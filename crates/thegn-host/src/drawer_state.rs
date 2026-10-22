@@ -10,7 +10,8 @@
 //!    restarts. The global drawer slot is process-local because its PTY is
 //!    local to this process and cannot be restored after restart. The loop only
 //!    ever reads the in-process cache ([`desired_occupant`]); worktree writes
-//!    are write-through ([`set_desired_occupant`]: cache now, file off-loop).
+//!    are write-through ([`set_desired_occupant`]: cache now, file off-loop),
+//!    and the latest request for a scope key wins.
 //!    Before this cache every tab/worktree switch paid a synchronous
 //!    `read_to_string` on the loop.
 //! 2. **Cold spawns resolve off-loop.** Materializing a drawer pane means
@@ -106,6 +107,52 @@ fn flags() -> &'static Mutex<FlagCache> {
     FLAGS.get_or_init(|| Mutex::new(FlagCache::load_from(&store_dir())))
 }
 
+#[derive(Default)]
+struct PersistOrder {
+    /// Latest requested sequence per scope key. The event loop only bumps this
+    /// map; no I/O happens while its mutex is held.
+    latest: Mutex<HashMap<String, u64>>,
+    /// Serializes off-loop writes. This mutex is never taken on the event loop.
+    write: Mutex<()>,
+}
+
+impl PersistOrder {
+    fn request(&self, key: &str) -> u64 {
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sequence = latest.entry(key.to_string()).or_insert(0);
+        *sequence += 1;
+        *sequence
+    }
+
+    /// Run a write only while its request is current, serialized with other
+    /// writes. Returns false when a newer request superseded this one.
+    fn write_if_latest(&self, key: &str, seq: u64, write: impl FnOnce()) -> bool {
+        let _write_guard = self
+            .write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|latest| *latest == seq);
+        if is_latest {
+            write();
+        }
+        is_latest
+    }
+}
+
+static PERSIST_ORDER: OnceLock<PersistOrder> = OnceLock::new();
+
+fn persist_order() -> &'static PersistOrder {
+    PERSIST_ORDER.get_or_init(PersistOrder::default)
+}
+
 /// Warm the flag cache from disk. Called once at startup (sanctioned pre-loop
 /// I/O); after this the loop never touches the filesystem to answer "is this
 /// worktree's drawer open?".
@@ -137,9 +184,17 @@ fn set_desired_key(key: &str, occupant: Option<&str>) {
     if key == GLOBAL_SCOPE_KEY {
         return;
     }
+    let seq = persist_order().request(key);
+    let key_owned = key.to_string();
     let path = store_dir().join(key);
     let value = occupant.unwrap_or("false").to_string();
-    let write = move || crate::platform::write_state_file(&path, &value);
+    let write = move || {
+        if !persist_order().write_if_latest(&key_owned, seq, || {
+            crate::platform::write_state_file(&path, &value);
+        }) {
+            tracing::trace!(key = %key_owned, seq, "skipped stale drawer state write");
+        }
+    };
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::spawn_blocking(write);
     } else {
@@ -1316,5 +1371,72 @@ mod tests {
             "drawer_state.rs must not name the `{vendor}` vendor — move the \
              specific behind the file_manager seam"
         );
+    }
+
+    #[test]
+    fn persist_order_skips_a_stale_write_that_runs_last() {
+        let order = PersistOrder::default();
+        let first = order.request("k");
+        let second = order.request("k");
+        let log = std::cell::RefCell::new(Vec::new());
+
+        assert!(order.write_if_latest("k", second, || log.borrow_mut().push("open")));
+        assert!(!order.write_if_latest("k", first, || log.borrow_mut().push("closed")));
+        assert_eq!(*log.borrow(), ["open"]);
+    }
+
+    #[test]
+    fn persist_order_keys_are_independent() {
+        let order = PersistOrder::default();
+        let a1 = order.request("a");
+        let b1 = order.request("b");
+        let a2 = order.request("a");
+        let b2 = order.request("b");
+        let log = std::cell::RefCell::new(Vec::new());
+
+        assert!(order.write_if_latest("a", a2, || log.borrow_mut().push("a2")));
+        assert!(!order.write_if_latest("a", a1, || log.borrow_mut().push("a1")));
+        assert!(order.write_if_latest("b", b2, || log.borrow_mut().push("b2")));
+        assert!(!order.write_if_latest("b", b1, || log.borrow_mut().push("b1")));
+        assert_eq!(*log.borrow(), ["a2", "b2"]);
+    }
+
+    #[test]
+    fn persist_order_writes_the_latest_even_after_an_earlier_write_ran() {
+        let order = PersistOrder::default();
+        let first = order.request("k");
+        let log = std::cell::RefCell::new(Vec::new());
+
+        assert!(order.write_if_latest("k", first, || log.borrow_mut().push("open")));
+        let second = order.request("k");
+        assert!(order.write_if_latest("k", second, || log.borrow_mut().push("closed")));
+        assert_eq!(*log.borrow(), ["open", "closed"]);
+    }
+
+    #[test]
+    fn persist_order_concurrent_writers_end_at_the_latest_value() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let file = dir.path().join("drawer-state");
+        let order = PersistOrder::default();
+        let sequences: Vec<u64> = (0..16).map(|_| order.request("k")).collect();
+
+        std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for index in (1..=16).rev() {
+                let seq = sequences[index - 1];
+                let order = &order;
+                let file = &file;
+                writers.push(scope.spawn(move || {
+                    order.write_if_latest("k", seq, || {
+                        crate::platform::write_state_file(file, &format!("v{index}"));
+                    });
+                }));
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+        });
+
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "v16");
     }
 }
