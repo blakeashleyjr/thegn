@@ -280,6 +280,14 @@ The daemon serves a cached CI run list only while it is younger than
 asks the provider. Cached job logs written under an older redaction policy are
 redacted and bounded into a window again when read.
 
+Cached run lists are shown when their recorded provider context matches the
+worktree's current context. A different or unknown cached context shows
+"refresh pending (g)" until refresh; when local origin context is unavailable,
+including for remote worktrees, the cached display is kept. CI autofix gives
+the PR-queue agent a redacted log excerpt starting 20 lines before the first
+recognised failure, or the newest lines if none is found; omitted lines are
+marked.
+
 ### merge — the local merge queue
 
 The fold-actor's per-branch land/defer status. Scoped to the active
@@ -310,6 +318,12 @@ handoff for a selected queued PR.
 Issues from the configured `[issues]` providers for this repo. Before the
 first load, the list says "loading…"; a failed read names the error instead
 of appearing empty. A Busy tracker refresh is retried.
+
+When issue numbers are shared across tracker accounts, each row shows its
+account in parentheses, including in My Work and the palette. If a tracker
+listing stops early, an amber `partial results: <accounts> — ...` line names
+the accounts and says whether the last complete list, partial list or cached
+rows are shown.
 
 {{keys:issues}}
 
