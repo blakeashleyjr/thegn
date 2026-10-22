@@ -276,6 +276,28 @@ pub fn same_candidate(a: &CiLogCandidate, b: &CiLogCandidate) -> bool {
     a == b
 }
 
+/// A cached log is evidence only for a known equal run head, and only when
+/// the job did not finish after the log was captured.
+pub fn cached_log_is_evidence_for(
+    entry: &CiLogEntry,
+    run_sha: &str,
+    job_finished_at: Option<&str>,
+) -> bool {
+    if entry.head_sha.is_empty() || run_sha.is_empty() || entry.head_sha != run_sha {
+        return false;
+    }
+    match job_finished_at.and_then(crate::ci::epoch_secs) {
+        Some(finished_at) if finished_at > entry.fetched_at => false,
+        _ => true,
+    }
+}
+
+/// Unknown-head log entries may be shown from a provider fetch, but never
+/// persisted as cache evidence.
+pub fn cacheable_log_entry(entry: &CiLogEntry) -> bool {
+    !entry.head_sha.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +516,61 @@ mod tests {
         let mut b = a.clone();
         b.head_sha = "b".into();
         assert!(!same_candidate(&a, &b));
+    }
+
+    #[test]
+    fn cached_log_evidence_requires_a_known_equal_head() {
+        let entry = CiLogEntry {
+            head_sha: "sha".into(),
+            ..Default::default()
+        };
+        assert!(cached_log_is_evidence_for(&entry, "sha", None));
+        assert!(!cached_log_is_evidence_for(&entry, "", None));
+        assert!(!cached_log_is_evidence_for(
+            &CiLogEntry::default(),
+            "sha",
+            None
+        ));
+        assert!(!cached_log_is_evidence_for(
+            &CiLogEntry::default(),
+            "",
+            None
+        ));
+        assert!(!cached_log_is_evidence_for(&entry, "other", None));
+    }
+
+    #[test]
+    fn job_finished_after_capture_is_not_evidence() {
+        let entry = CiLogEntry {
+            fetched_at: 100,
+            head_sha: "sha".into(),
+            ..Default::default()
+        };
+        assert!(cached_log_is_evidence_for(
+            &entry,
+            "sha",
+            Some("1970-01-01T00:01:00Z")
+        ));
+        assert!(!cached_log_is_evidence_for(
+            &entry,
+            "sha",
+            Some("1970-01-01T00:03:00Z")
+        ));
+        assert!(cached_log_is_evidence_for(&entry, "sha", Some("junk")));
+        assert!(cached_log_is_evidence_for(&entry, "sha", None));
+    }
+
+    #[test]
+    fn unknown_head_entries_are_not_cacheable() {
+        assert!(!cacheable_log_entry(&CiLogEntry::default()));
+        assert!(!cacheable_log_entry(&CiLogEntry {
+            head_sha: "  \t".into(),
+            ..Default::default()
+        }));
+        assert!(cacheable_log_entry(&CiLogEntry {
+            head_sha: "sha".into(),
+            ..Default::default()
+        }));
     }
 
     #[test]

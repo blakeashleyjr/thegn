@@ -372,6 +372,7 @@ fn log(
                 && entry.job_id == job_id
                 && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
                 && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
+                && thegn_core::ci_log::cacheable_log_entry(entry)
         });
     let entry = if let Some(mut entry) = cached {
         // Cache rows have already been redacted and bounded. Re-apply the
@@ -461,6 +462,7 @@ fn log(
             entry.truncated |= raw.truncated;
             entry.head_sha = head_sha;
             if cfg.ci.log_cache_runs > 0
+                && thegn_core::ci_log::cacheable_log_entry(&entry)
                 && let Ok(db) = Db::open()
             {
                 let _ = db.put_ci_log(&entry);
