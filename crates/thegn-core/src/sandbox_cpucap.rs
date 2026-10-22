@@ -540,6 +540,37 @@ pub fn strip_pane_cap(argv: &[String]) -> &[String] {
     if inner.is_empty() { argv } else { inner }
 }
 
+/// Peel the [`CpuCap::NiceSoft`] prefix back off a capped argv, yielding the
+/// argv that actually enters the sandbox. Returns `argv` unchanged when there
+/// is no cap prefix.
+///
+/// A priority ceiling is not containment, so observation must see through the
+/// prefix to the command it wraps. The match is exact because a user's own
+/// `nice -n 5 …` (or any other nice level) is not a prefix thegn produced.
+pub fn strip_soft_cap(argv: &[String]) -> &[String] {
+    let nice_start = if argv.first().map(String::as_str) == Some("ionice")
+        && argv.get(1).map(String::as_str) == Some("-c3")
+    {
+        2
+    } else {
+        0
+    };
+    let nice_level = CPU_NICE.to_string();
+    if argv.get(nice_start).map(String::as_str) != Some("nice")
+        || argv.get(nice_start + 1).map(String::as_str) != Some("-n")
+        || argv.get(nice_start + 2).map(String::as_str) != Some(nice_level.as_str())
+        || nice_start + 3 >= argv.len()
+    {
+        return argv;
+    }
+    &argv[nice_start + 3..]
+}
+
+/// Peel whichever exclusive CPU-cap prefix the pane wrapper emitted.
+pub fn strip_cap(argv: &[String]) -> &[String] {
+    strip_soft_cap(strip_pane_cap(argv))
+}
+
 /// How many parallel build jobs a pane should ask for, from its own CPU ceiling.
 ///
 /// `CARGO_BUILD_JOBS` is per-INVOCATION, so N worktrees each claim the whole
@@ -1433,5 +1464,65 @@ mod tests {
         ] {
             assert_eq!(strip_pane_cap(&argv), argv.as_slice(), "argv: {argv:?}");
         }
+    }
+
+    #[test]
+    fn strip_soft_cap_peels_exactly_what_the_soft_cap_prepended() {
+        let limits = SandboxLimits {
+            cpu: Some("8".into()),
+            ..SandboxLimits::default()
+        };
+        let inner = sv(&["bwrap", "--bind", "/wt", "/wt", "--", "zsh"]);
+        let capped = wrap_provider_pane_argv(inner.clone(), &limits, CpuCap::NiceSoft);
+        assert!(capped.len() > inner.len(), "the soft cap must wrap");
+        assert_eq!(strip_soft_cap(&capped), inner.as_slice());
+
+        let nice_level = CPU_NICE.to_string();
+        let with_ionice = [
+            vec![
+                "ionice".into(),
+                "-c3".into(),
+                "nice".into(),
+                "-n".into(),
+                nice_level.clone(),
+            ],
+            sv(&["bwrap", "--", "zsh"]),
+        ]
+        .concat();
+        let without_ionice = [
+            vec!["nice".into(), "-n".into(), nice_level],
+            sv(&["bwrap", "--", "zsh"]),
+        ]
+        .concat();
+        assert_eq!(strip_soft_cap(&with_ionice), sv(&["bwrap", "--", "zsh"]));
+        assert_eq!(strip_soft_cap(&without_ionice), sv(&["bwrap", "--", "zsh"]));
+    }
+
+    #[test]
+    fn strip_soft_cap_ignores_argv_it_did_not_produce() {
+        let nice_level = CPU_NICE.to_string();
+        for argv in [
+            sv(&["nice", "-n", "5", "bwrap"]),
+            sv(&["nice", "bwrap"]),
+            sv(&["ionice", "-c3", "bwrap"]),
+            [
+                sv(&["ionice", "-c2", "nice", "-n"]),
+                vec![nice_level.clone(), "bwrap".into()],
+            ]
+            .concat(),
+            [sv(&["nice", "-n"]), vec![nice_level]].concat(),
+            Vec::new(),
+        ] {
+            assert_eq!(strip_soft_cap(&argv), argv.as_slice(), "argv: {argv:?}");
+        }
+
+        let limits = SandboxLimits {
+            cpu: Some("8".into()),
+            memory: Some("24G".into()),
+            ..SandboxLimits::default()
+        };
+        let hard_capped =
+            wrap_provider_pane_argv(sv(&["bwrap", "--", "zsh"]), &limits, CpuCap::ScopeHard);
+        assert_eq!(strip_cap(&hard_capped), strip_pane_cap(&hard_capped));
     }
 }
