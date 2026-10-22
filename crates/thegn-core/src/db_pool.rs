@@ -288,17 +288,13 @@ impl PoolStore for Db {
             params![repo, env],
             |r| r.get::<_, i64>(0),
         );
-        // best-effort read: no rows is the None case; a real DB error is
-        // surfaced but still degrades to the default target.
-        let r = match res {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => {
-                tracing::warn!(target: "thegn::db", error = %e, "pool_target read failed; treating as a miss");
-                None
-            }
-        };
-        Ok(r)
+        match res {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(anyhow::Error::new(error).context(format!(
+                "warm pool: cannot read the pool-target override for {repo} ({env})"
+            ))),
+        }
     }
 
     fn set_pool_target(&self, repo: &str, env: &str, target: i64) -> Result<()> {
@@ -375,6 +371,15 @@ mod tests {
 
         db.conn().execute("DROP TABLE worktrees", []).unwrap();
         assert!(db.worktree_provider_sandbox("/wt/none").is_err());
+    }
+
+    #[test]
+    fn pool_target_db_error_is_an_error_and_missing_is_none() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.pool_target("/repo", "sprites").unwrap(), None);
+
+        db.conn().execute("DROP TABLE pool_targets", []).unwrap();
+        assert!(db.pool_target("/repo", "sprites").is_err());
     }
 
     #[test]
