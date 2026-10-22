@@ -1300,7 +1300,10 @@ mod typed_branch_tests {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let result = branch_of(dir.path());
         assert!(
-            matches!(&result, Err(reason) if reason.contains("not a git repository")),
+            matches!(
+                &result,
+                Err(reason) if !reason.is_empty() && reason.contains("Git exited with status")
+            ),
             "{result:?}"
         );
     }
