@@ -24,12 +24,10 @@ runs:
     # ── Self-hosted (ageless) note ──────────────────────────────────────────
     # Every step below is gated on `runner.environment == 'github-hosted'`, so
     # on our self-hosted ageless runners this action does NOTHING: nix is
-    # installed on the host (persistent /nix/store), and the warm caches
-    # (sccache, CARGO_HOME) + PATH are injected per-job via the runner's
-    # .env/.path files (see scripts/ci/ageless-runner-setup.sh). Installing nix
-    # or round-tripping the store to the GitHub cache there would be pure
-    # overhead — the whole point of self-hosting is that the store already
-    # persists. The macOS job is still GitHub-hosted, so these steps run for it.
+    # installed at the host level. No warm caches or PATH entries are injected;
+    # each job starts with a wiped per-job HOME and _work directory. Installing
+    # nix or using GitHub cache actions there would be unnecessary. The macOS
+    # job is still GitHub-hosted, so these steps run for it.
     #
     # Reclaim runner disk before building. The default ubuntu runner ships ~14G
     # free on /, and a full rust+nix build (debug link of thegn, nix store,
