@@ -348,29 +348,34 @@ pub fn failure_excerpt(text: &str, max_bytes: usize) -> String {
     };
 
     let mut start = anchor.saturating_sub(FAILURE_CONTEXT_LINES);
-    let mut keep_earlier = start > 0;
     let has_later = anchor + 1 < chunks.len();
-    let mut keep_later = false;
-    let mut marker_bytes = 0;
-    if keep_earlier && EARLIER_OMITTED.len() <= max_bytes {
-        marker_bytes += EARLIER_OMITTED.len();
-        keep_later = has_later && LATER_OMITTED.len() <= max_bytes - marker_bytes;
-        if keep_later {
-            marker_bytes += LATER_OMITTED.len();
-        }
+    let mut context_bytes: usize = chunks[start..anchor].iter().map(|line| line.len()).sum();
+    let projected_markers = if EARLIER_OMITTED.len() <= max_bytes {
+        EARLIER_OMITTED.len()
+            + if has_later && LATER_OMITTED.len() <= max_bytes - EARLIER_OMITTED.len() {
+                LATER_OMITTED.len()
+            } else {
+                0
+            }
     } else {
-        keep_earlier = false;
-        keep_later = has_later && LATER_OMITTED.len() <= max_bytes;
-        if keep_later {
-            marker_bytes += LATER_OMITTED.len();
-        }
+        0
+    };
+    let needs_earlier =
+        start > 0 || (projected_markers > 0 && context_bytes > (max_bytes - projected_markers) / 4);
+    let mut keep_earlier = needs_earlier && EARLIER_OMITTED.len() <= max_bytes;
+    let mut marker_bytes = 0;
+    if keep_earlier {
+        marker_bytes += EARLIER_OMITTED.len();
+    }
+    let keep_later = has_later && LATER_OMITTED.len() <= max_bytes - marker_bytes;
+    if keep_later {
+        marker_bytes += LATER_OMITTED.len();
     }
     let content_budget = max_bytes - marker_bytes;
 
     // Context gets at most one quarter of the content budget. If necessary,
     // discard its oldest lines first and mark the resulting gap when possible.
     let context_budget = content_budget / 4;
-    let mut context_bytes = chunks[start..anchor].iter().map(|line| line.len()).sum();
     while context_bytes > context_budget && start < anchor {
         context_bytes -= chunks[start].len();
         start += 1;
@@ -552,6 +557,20 @@ mod tests {
 
         assert_eq!(failure_excerpt("short log\n", 64), "short log\n");
         assert_eq!(failure_excerpt("anything\n", 0), "");
+
+        let mut early_anchor_log = (0..4)
+            .map(|line| format!("context {line:02} {}\n", "x".repeat(16)))
+            .collect::<String>();
+        early_anchor_log.push_str("error: early failure\n");
+        early_anchor_log.push_str(
+            &(5..20)
+                .map(|line| format!("later line {line}\n"))
+                .collect::<String>(),
+        );
+        let early_anchor = failure_excerpt(&early_anchor_log, 128);
+        assert!(early_anchor.starts_with(EARLIER_OMITTED));
+        assert!(early_anchor.contains("error: early failure\n"));
+        assert!(early_anchor.len() <= 128);
     }
 
     #[test]
