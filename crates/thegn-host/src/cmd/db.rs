@@ -45,9 +45,24 @@ pub fn run(action: Action) -> Result<()> {
             let startup_pruned = if dry_run {
                 0
             } else {
-                match Db::open_read_only_current()? {
-                    Some(db) => db.expired_read_notification_count(thegn_core::util::now())?,
-                    None => 0,
+                match Db::open_read_only_current() {
+                    Ok(Some(db)) => db.expired_read_notification_count(thegn_core::util::now())?,
+                    Ok(None) => 0,
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<thegn_core::db::ReadOnlyOpenError>(),
+                            Some(thegn_core::db::ReadOnlyOpenError::WalWithoutIndex { .. })
+                        ) =>
+                    {
+                        tracing::debug!(%error, "falling back to immutable notification pre-count");
+                        match Db::open_read_only()? {
+                            Some(db) => {
+                                db.expired_read_notification_count(thegn_core::util::now())?
+                            }
+                            None => 0,
+                        }
+                    }
+                    Err(error) => return Err(error),
                 }
             };
             let db = if dry_run {

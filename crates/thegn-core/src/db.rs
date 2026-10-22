@@ -1464,6 +1464,8 @@ impl Db {
     /// exists; a non-empty WAL without that index is refused. Neither path
     /// creates a file or writes the main database.
     pub fn open_read_only_current_at(path: &std::path::Path) -> Result<Option<Db>> {
+        use anyhow::Context as _;
+
         if !path.is_file() {
             return Ok(None);
         }
