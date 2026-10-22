@@ -349,10 +349,7 @@ impl FrameWriter {
                 return Err(bytes);
             }
         };
-        let target = match admit_clipboard(&mut q, bytes, 4 * crate::queries::clipboard::MAX_WIRE) {
-            Ok(target) => target,
-            Err(bytes) => return Err(bytes),
-        };
+        let target = admit_clipboard(&mut q, bytes, 4 * crate::queries::clipboard::MAX_WIRE)?;
         drop(q);
         self.inner.cv.notify_one();
         if self.sync {
@@ -375,10 +372,7 @@ impl FrameWriter {
         }
         self.inner.clipboard_retry.store(true, Ordering::SeqCst);
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
-        let target = match admit_clipboard(&mut q, bytes, OOB_QUEUE_BYTES) {
-            Ok(target) => target,
-            Err(bytes) => return Err(bytes),
-        };
+        let target = admit_clipboard(&mut q, bytes, OOB_QUEUE_BYTES)?;
         drop(q);
         self.inner.cv.notify_one();
         if self.sync {
