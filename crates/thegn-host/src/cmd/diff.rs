@@ -127,7 +127,10 @@ fn resolve_target(loc: &GitLoc, base: &str) -> Result<String> {
 fn git_exit_is_one(error: &GitTextError) -> bool {
     matches!(
         error,
-        GitTextError::Failed(GitOutcome::Exit { code: Some(1), .. })
+        GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
     )
 }
 
@@ -191,12 +194,12 @@ mod tests {
         git(dir, &["commit", "-q", "-m", "initial"]);
     }
 
-    fn failing_provider(wrapper_dir: &Path, path: &Path, needle: &str) -> GitLoc {
+    fn failing_provider(wrapper_dir: &Path, path: &Path, needle: &str, exit_code: u8) -> GitLoc {
         let wrapper = wrapper_dir.join("git-wrapper.sh");
         std::fs::write(
             &wrapper,
             format!(
-                "case \"$3\" in *'{needle}'*) echo 'ssh: connect to host fixture: Connection refused' >&2; exit 255;; esac\nexec \"$@\"\n"
+                "case \"$3\" in *'{needle}'*) echo 'ssh: connect to host fixture: Connection refused' >&2; exit {exit_code};; esac\nexec \"$@\"\n"
             ),
         )
         .expect("write provider wrapper");
@@ -218,6 +221,7 @@ mod tests {
             wrapper_dir.path(),
             repo.path(),
             "rev-parse --verify --quiet",
+            255,
         );
 
         let result = resolve_target(&location, "main");
@@ -234,7 +238,7 @@ mod tests {
         let repo = tempfile::tempdir().expect("provider repo");
         committed_repo(repo.path());
         let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
-        let location = failing_provider(wrapper_dir.path(), repo.path(), "merge-base");
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "merge-base", 255);
 
         let result = resolve_target(&location, "main");
         assert!(matches!(result, Err(error)
@@ -254,6 +258,43 @@ mod tests {
         let result = resolve_target(&GitLoc::Local(repo.path().to_path_buf()), "main")
             .expect("unrelated valid base uses HEAD");
         assert_eq!(result, "HEAD");
+    }
+
+    #[test]
+    fn base_probe_exit_one_with_stderr_is_not_unknown_base() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path());
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let location = failing_provider(
+            wrapper_dir.path(),
+            repo.path(),
+            "rev-parse --verify --quiet",
+            1,
+        );
+
+        let result = resolve_target(&location, "main");
+        assert!(matches!(result, Err(error)
+            if !error.to_string().starts_with("unknown base ref")
+                && error.to_string().contains("Connection refused")));
+    }
+
+    #[test]
+    fn merge_base_exit_one_with_stderr_is_not_head() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path());
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "merge-base", 1);
+
+        let result = resolve_target(&location, "main");
+        assert!(matches!(result, Err(error)
+            if error.to_string().contains("merge-base")
+                && error.to_string().contains("Connection refused")));
     }
 
     #[test]

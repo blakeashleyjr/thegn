@@ -40,7 +40,10 @@ fn authority_blob(loc: &GitLoc) -> Result<Option<String>, String> {
 fn probe_absent(error: &GitTextError) -> bool {
     matches!(
         error,
-        GitTextError::Failed(GitOutcome::Exit { code: Some(1), .. })
+        GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
     )
 }
 
@@ -276,12 +279,12 @@ mod tests {
         }
     }
 
-    fn failing_provider(wrapper_dir: &Path, path: &Path, needle: &str) -> GitLoc {
+    fn failing_provider(wrapper_dir: &Path, path: &Path, needle: &str, exit_code: u8) -> GitLoc {
         let wrapper = wrapper_dir.join("git-wrapper.sh");
         std::fs::write(
             &wrapper,
             format!(
-                "case \"$3\" in *'{needle}'*) echo 'ssh: connect to host fixture: Connection refused' >&2; exit 255;; esac\nexec \"$@\"\n"
+                "case \"$3\" in *'{needle}'*) echo 'ssh: connect to host fixture: Connection refused' >&2; exit {exit_code};; esac\nexec \"$@\"\n"
             ),
         )
         .expect("write provider wrapper");
@@ -403,7 +406,7 @@ mod tests {
         let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
         let repo = tempfile::tempdir().expect("provider repo");
         committed_repo(repo.path(), Some(MODULES_A));
-        let location = failing_provider(wrapper_dir.path(), repo.path(), "HEAD:.gitmodules");
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "HEAD:.gitmodules", 255);
 
         let result = authority_metadata(repo.path(), Some(&location));
         assert!(matches!(result, Err(message)
@@ -422,7 +425,7 @@ mod tests {
             .expect("metadata probe succeeds")
             .expect("fixture has metadata");
         let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
-        let location = failing_provider(wrapper_dir.path(), repo.path(), "hash-object");
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "hash-object", 255);
 
         let result = authority_check(&location, &Some(approved));
         assert!(matches!(result, Err(message) if message.contains("Connection refused")));
@@ -436,6 +439,22 @@ mod tests {
         let result = authority_metadata(repo.path(), Some(&provider(repo.path())))
             .expect("exit 1 means absent metadata");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn submodule_authority_exit_one_with_stderr_is_not_absent() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path(), Some(MODULES_A));
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "HEAD:.gitmodules", 1);
+
+        let result = authority_metadata(repo.path(), Some(&location));
+        assert!(matches!(result, Err(message)
+            if message.contains("execution authority")
+                && message.contains("Connection refused")));
     }
 
     #[test]
