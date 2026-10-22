@@ -256,4 +256,11 @@ fn cleanup_retry_defer_refuses_changed_held_or_unlanded_rows() {
         .unwrap();
     selected.error_detail = Some("operator detail".into());
     assert!(!db.defer_merge_cleanup(&selected, retry).unwrap());
+
+    let (db, mut selected) = retry_fixture();
+    db.conn()
+        .execute("UPDATE merge_queue SET error_detail=''", [])
+        .unwrap();
+    selected.error_detail = Some(String::new());
+    assert!(db.defer_merge_cleanup(&selected, retry).unwrap());
 }

@@ -68,10 +68,11 @@ impl CleanupRetry {
     pub fn after_refusal(previous: Option<Self>, now: i64) -> Self {
         let attempts = previous.map_or(1, |retry| retry.attempts.saturating_add(1));
         let shift = attempts.saturating_sub(1);
-        let delay = CLEANUP_RETRY_BASE_SECS
-            .checked_shl(shift)
-            .unwrap_or(CLEANUP_RETRY_MAX_SECS)
-            .min(CLEANUP_RETRY_MAX_SECS);
+        let delay = if shift >= 9 {
+            CLEANUP_RETRY_MAX_SECS
+        } else {
+            (CLEANUP_RETRY_BASE_SECS << shift).min(CLEANUP_RETRY_MAX_SECS)
+        };
         Self {
             attempts,
             next_at: now.saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)),
@@ -311,6 +312,20 @@ mod tests {
             saturated.next_at,
             i64::try_from(CLEANUP_RETRY_MAX_SECS).unwrap()
         );
+        for attempts in 57..=66 {
+            let retry = CleanupRetry::after_refusal(
+                Some(CleanupRetry {
+                    attempts: attempts - 1,
+                    next_at: 0,
+                }),
+                10_000,
+            );
+            assert_eq!(retry.attempts, attempts);
+            assert_eq!(
+                retry.next_at,
+                10_000 + i64::try_from(CLEANUP_RETRY_MAX_SECS).unwrap()
+            );
+        }
     }
 
     #[test]
