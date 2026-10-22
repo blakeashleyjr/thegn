@@ -836,6 +836,7 @@ mod tests {
             .collect();
 
         assert_eq!(program, "sprite");
+        assert!(args.iter().any(|arg| arg == "/bin/sh"));
         assert!(args.iter().any(|arg| arg == "-c"));
         assert!(args.iter().any(|arg| arg == bridge.sha256()));
         assert_eq!(args.last().map(String::as_str), Some("bridge"));
