@@ -905,7 +905,7 @@ mod tests {
 
         assert!(matches!(result, Err(message)
             if message.contains("could not read HEAD for undo mark")
-                && message.contains("not a git repository")));
+                && message.contains("status Some(128)")));
     }
 
     #[test]
