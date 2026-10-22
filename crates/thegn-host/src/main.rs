@@ -1387,9 +1387,17 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
-    if let Some(dir) = crate::daemon::socket_path(&cfg.daemon)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
+    let daemon_uses_socket_override = matches!(
+        &command,
+        Command::Daemon {
+            socket: Some(_),
+            action: None
+        }
+    );
+    if !daemon_uses_socket_override
+        && let Some(dir) = crate::daemon::socket_path(&cfg.daemon)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
     {
         thegn_core::sandbox_control_guard::publish_control_socket_dir(dir.to_path_buf());
     }

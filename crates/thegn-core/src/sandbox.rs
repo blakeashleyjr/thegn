@@ -698,7 +698,7 @@ impl RefusalClass {
                 "a mount source changed during launch (check for a symlink swap), then relaunch"
             }
             Self::ControlSocketReachable => {
-                "move [daemon] socket and $XDG_RUNTIME_DIR out of $HOME, the worktree and every sandbox mount (the default /run/user/<uid> is never mounted), or use the bwrap backend, which masks it"
+                "move [daemon] socket and $XDG_RUNTIME_DIR out of $HOME, the worktree and every sandbox mount (the default /run/user/<uid> is never mounted)"
             }
             Self::StrictUnsupported => {
                 "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile"
@@ -886,15 +886,29 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
         && spec.backend.is_oci()
         && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
     {
-        let visible_roots: Vec<&std::path::Path> = spec
+        let host_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = spec
             .mounts
             .iter()
-            .map(|mount| std::path::Path::new(&mount.dest))
+            .map(|mount| {
+                (
+                    std::path::PathBuf::from(&mount.host),
+                    std::path::PathBuf::from(&mount.dest),
+                )
+            })
             .collect();
-        if let Some(exposure) = crate::sandbox_control_guard::exposure(
+        let mount_refs: Vec<(&std::path::Path, &std::path::Path)> = host_mounts
+            .iter()
+            .map(|(host, dest)| (host.as_path(), dest.as_path()))
+            .collect();
+        let (control_dirs, unresolved_exposure) = crate::sandbox_control_guard::in_sandbox_paths(
             &crate::sandbox_control_guard::control_dirs(),
-            &visible_roots,
-        ) {
+            &mount_refs,
+        );
+        let visible_roots: Vec<&std::path::Path> =
+            host_mounts.iter().map(|(_, dest)| dest.as_path()).collect();
+        if let Some(exposure) = unresolved_exposure
+            .or_else(|| crate::sandbox_control_guard::exposure(&control_dirs, &visible_roots))
+        {
             return Err(refusal(
                 spec,
                 RefusalClass::ControlSocketReachable,
@@ -3440,7 +3454,7 @@ fn backend_enter_argv_guarded_with_env(
                 // bind, so let the normal covered-mount skip handle them.
                 hardcoded_parents.push(dir);
             }
-            let mut emitted_mount_dests = Vec::new();
+            let mut emitted_mounts = Vec::new();
             for m in &spec.mounts {
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
@@ -3465,23 +3479,73 @@ fn backend_enter_argv_guarded_with_env(
                 }
                 let flag = if m.ro { "--ro-bind" } else { "--bind" };
                 v.extend([flag.into(), m.host.clone(), m.dest.clone()]);
-                emitted_mount_dests.push(std::path::Path::new(&m.dest));
+                emitted_mounts.push((m.host.as_str(), m.dest.as_str()));
             }
             if spec.placement.is_local()
                 && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
             {
-                let mut visible_roots: Vec<&std::path::Path> = hardcoded_parents
-                    .iter()
-                    .map(|path| std::path::Path::new(path))
-                    .collect();
-                visible_roots.extend(emitted_mount_dests.iter().copied());
-                let mut bind_dests = emitted_mount_dests;
+                let visible_roots: Vec<&std::path::Path> =
+                    hardcoded_parents.iter().map(std::path::Path::new).collect();
+                let mut visible_roots = visible_roots;
+                visible_roots.extend(
+                    emitted_mounts
+                        .iter()
+                        .map(|(_, dest)| std::path::Path::new(dest)),
+                );
+                let mut bind_dests: Vec<&std::path::Path> =
+                    hardcoded_parents.iter().map(std::path::Path::new).collect();
+                bind_dests.extend(
+                    emitted_mounts
+                        .iter()
+                        .map(|(_, dest)| std::path::Path::new(dest)),
+                );
                 bind_dests.push(&spec.worktree);
+                let mut host_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+                    hardcoded_parents
+                        .iter()
+                        .map(|path| {
+                            (
+                                std::path::PathBuf::from(path),
+                                std::path::PathBuf::from(path),
+                            )
+                        })
+                        .collect();
+                host_mounts.extend(emitted_mounts.iter().map(|(host, dest)| {
+                    (
+                        std::path::PathBuf::from(host),
+                        std::path::PathBuf::from(dest),
+                    )
+                }));
+                let mount_refs: Vec<(&std::path::Path, &std::path::Path)> = host_mounts
+                    .iter()
+                    .map(|(host, dest)| (host.as_path(), dest.as_path()))
+                    .collect();
+                let (mapped_control_dirs, unresolved_exposure) =
+                    crate::sandbox_control_guard::in_sandbox_paths(&env.control_dirs, &mount_refs);
+                if let Some(exposure) = unresolved_exposure {
+                    return Err(refusal(
+                        spec,
+                        RefusalClass::ControlSocketReachable,
+                        Some(exposure.control_dir.display().to_string()),
+                        format!(
+                            "daemon control directory {} may be visible through sandbox bind {}; its host path could not be canonicalized, so move the socket directory or change the bind layout",
+                            exposure.control_dir.display(),
+                            exposure.visible_through.display()
+                        ),
+                    ));
+                }
                 match crate::sandbox_control_guard::plan(
-                    &env.control_dirs,
+                    &mapped_control_dirs,
                     &visible_roots,
                     &bind_dests,
-                    &|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()),
+                    &|path| {
+                        mount_refs.iter().any(|(host, dest)| {
+                            path.strip_prefix(dest).is_ok_and(|relative| {
+                                std::fs::metadata(host.join(relative))
+                                    .is_ok_and(|metadata| metadata.is_dir())
+                            })
+                        })
+                    },
                 ) {
                     crate::sandbox_control_guard::MaskPlan::Clear => {}
                     crate::sandbox_control_guard::MaskPlan::Mask(dirs) => {
@@ -3495,7 +3559,7 @@ fn backend_enter_argv_guarded_with_env(
                             RefusalClass::ControlSocketReachable,
                             Some(exposure.control_dir.display().to_string()),
                             format!(
-                                "daemon control directory {} is visible through sandbox bind {}; bwrap could not mask it without hiding a bind",
+                                "daemon control directory {} is visible through sandbox bind {}; bwrap could not mask it without hiding a bind, so move the socket directory or change the bind layout",
                                 exposure.control_dir.display(),
                                 exposure.visible_through.display()
                             ),
@@ -3581,25 +3645,39 @@ fn backend_enter_argv_guarded_with_env(
                 // allowlist, worktree and caches are bound back in below.
                 let protect_home = if sealed_home { "tmpfs" } else { "read-only" };
                 v.extend(["-p".into(), format!("ProtectHome={protect_home}")]);
-                let mut runtime_control_dir = None;
                 if let Some(runtime_dir) = env.runtime_dir.as_deref() {
                     let control_dir = if runtime_dir == std::path::Path::new("/run/user") {
                         runtime_dir.to_path_buf()
                     } else {
                         runtime_dir.join("thegn")
                     };
-                    runtime_control_dir = Some(control_dir.clone());
-                    v.extend([
-                        "-p".into(),
-                        format!("InaccessiblePaths=-{}", control_dir.display()),
-                    ]);
+                    if !control_dir.starts_with(std::path::Path::new("/tmp")) {
+                        v.extend([
+                            "-p".into(),
+                            format!("InaccessiblePaths=-{}", control_dir.display()),
+                        ]);
+                    }
                 }
                 for control_dir in &env.control_dirs {
-                    if runtime_control_dir
-                        .as_ref()
-                        .is_some_and(|runtime| control_dir.starts_with(runtime))
-                    {
+                    if control_dir.starts_with(std::path::Path::new("/tmp")) {
                         continue;
+                    }
+                    let hides_worktree = control_dir.starts_with(&spec.worktree)
+                        || spec.worktree.starts_with(control_dir);
+                    let hides_mount = spec.mounts.iter().any(|mount| {
+                        let dest = std::path::Path::new(&mount.dest);
+                        control_dir.starts_with(dest) || dest.starts_with(control_dir)
+                    });
+                    if hides_worktree || hides_mount {
+                        return Err(refusal(
+                            spec,
+                            RefusalClass::ControlSocketReachable,
+                            Some(control_dir.display().to_string()),
+                            format!(
+                                "daemon control directory {} would hide the worktree or a carved-back sandbox mount",
+                                control_dir.display()
+                            ),
+                        ));
                     }
                     v.extend([
                         "-p".into(),

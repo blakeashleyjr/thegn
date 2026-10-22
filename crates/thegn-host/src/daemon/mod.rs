@@ -761,10 +761,7 @@ async fn run(
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
-    if let Some(dir) = socket_path(&cfg.daemon)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
+    if let Some(dir) = sock.parent().filter(|p| !p.as_os_str().is_empty()) {
         thegn_core::sandbox_control_guard::publish_control_socket_dir(dir.to_path_buf());
     }
     // Warm the scope probe off the runtime's worker threads: it spawns a real

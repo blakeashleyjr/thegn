@@ -186,7 +186,8 @@ variable unset, it uses a vetted private runtime directory, then a private
 panes run in-process. It does not place a new control socket under sandbox state.
 If a control socket directory is visible through a sandbox bind (for example,
 an explicit `[daemon] socket` or an `XDG_RUNTIME_DIR` under `$HOME` or the
-worktree), bwrap hides it with a tmpfs and systemd makes it inaccessible.
+worktree), bwrap hides it with a tmpfs and systemd makes it inaccessible unless
+that would hide the worktree or a carved-back mount, in which case it refuses.
 Container backends refuse the launch (`control-socket-reachable`) because
 their mounts are fixed when the container is created. On bwrap,
 `file_access = "all"` or `"host"` exposes the host filesystem by design,
