@@ -2328,8 +2328,16 @@ mod tests {
             .split_once("\nfn finish_wrapped_terminal(")
             .expect("terminal launch function has a following helper")
             .0;
-        assert_eq!(terminal.matches("crate::agent::LaunchSpec {").count(), 1);
-        assert_eq!(terminal.matches("admitted_terminal_spec(").count(), 3);
+        assert_eq!(
+            terminal.matches("crate::agent::LaunchSpec {").count(),
+            1,
+            "{terminal}"
+        );
+        assert_eq!(
+            terminal.matches("admitted_terminal_spec(").count(),
+            3,
+            "{terminal}"
+        );
     }
 
     #[test]

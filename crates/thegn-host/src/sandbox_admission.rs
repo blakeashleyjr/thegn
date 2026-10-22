@@ -116,8 +116,6 @@ fn admission_for_decision(
 pub(crate) enum RouteStatus {
     /// The launch carries the opaque admission handle.
     Handle,
-    /// The route passes `sandbox_admission::admit`, but the handle is not carried to the spawn.
-    AdmittedNoHandle,
     /// Some spawns on the route carry the handle, and others do not.
     Partial,
     /// The route has a separate floor or sealed gate outside the handle.
@@ -133,7 +131,6 @@ impl RouteStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Handle => "handle",
-            Self::AdmittedNoHandle => "admitted-no-handle",
             Self::Partial => "partial",
             Self::OwnGate => "own-gate",
             Self::HostCapped => "host-capped",
@@ -553,7 +550,7 @@ mod tests {
                             route.id
                         );
                     }
-                    RouteStatus::Handle | RouteStatus::AdmittedNoHandle => assert!(
+                    RouteStatus::Handle => assert!(
                         source(file).contains("sandbox_admission::"),
                         "route {} should call sandbox_admission",
                         route.id
