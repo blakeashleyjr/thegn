@@ -402,19 +402,20 @@ fn queue_lease_check(
 
 /// An async result that opens a secondary media picker palette.
 pub(crate) enum MediaPick {
-    Playlists(Result<Vec<thegn_core::media::Playlist>, String>),
+    Playlists(Result<thegn_core::media::PlaylistPage, String>),
     Players(Result<Vec<String>, String>),
 }
 
 pub(crate) fn pick_palette(pick: MediaPick) -> Result<Vec<crate::palette::PaletteItem>, String> {
     match pick {
-        MediaPick::Playlists(Ok(playlists)) if playlists.is_empty() => {
+        MediaPick::Playlists(Ok(page)) if page.items.is_empty() => {
             Err("Media: nothing to pick".into())
         }
         MediaPick::Players(Ok(players)) if players.is_empty() => {
             Err("Media: nothing to pick".into())
         }
-        MediaPick::Playlists(Ok(playlists)) => Ok(playlists
+        MediaPick::Playlists(Ok(page)) => Ok(page
+            .items
             .into_iter()
             .map(|playlist| {
                 crate::palette::PaletteItem::new(
@@ -436,6 +437,17 @@ pub(crate) fn pick_palette(pick: MediaPick) -> Result<Vec<crate::palette::Palett
             Err(format!("Media: could not list playlists: {error}"))
         }
         MediaPick::Players(Err(error)) => Err(format!("Media: could not list players: {error}")),
+    }
+}
+
+pub(crate) fn pick_note(pick: &MediaPick) -> Option<String> {
+    match pick {
+        MediaPick::Playlists(Ok(page)) if page.hidden() > 0 && !page.items.is_empty() => {
+            let hidden = page.hidden();
+            let noun = if hidden == 1 { "playlist" } else { "playlists" };
+            Some(format!("Media: {hidden} more {noun} not shown"))
+        }
+        _ => None,
     }
 }
 
@@ -753,8 +765,8 @@ pub(crate) fn spawn_media_pick(
                 Ok(client) if players => MediaPick::Players(
                     client.players().await.map_err(|error| error.to_string()),
                 ),
-                Ok(client) => match client.playlists().await {
-                    Ok(playlists) => MediaPick::Playlists(Ok(playlists)),
+                Ok(client) => match client.playlist_page().await {
+                    Ok(page) => MediaPick::Playlists(Ok(page)),
                     Err(error) => {
                         tracing::debug!(target: "thegn::media", error = %error, "media playlist fetch failed");
                         MediaPick::Playlists(Err(error.to_string()))
@@ -840,8 +852,9 @@ mod tests {
     use super::{
         Latest, MediaGeneration, MediaOp, MediaOpChain, MediaOpOutcome, MediaOpTail, MediaPick,
         MediaPreflightError, cancel_op_chain, chain_op, chain_op_with_outcome, delivery_from_read,
-        generation_is_current, loop_target, op_supported, pick_palette, queue_lease_check,
-        record_refusal, replace_in_flight, shuffle_target, take_outcome, within_media_budget,
+        generation_is_current, loop_target, op_supported, pick_note, pick_palette,
+        queue_lease_check, record_refusal, replace_in_flight, shuffle_target, take_outcome,
+        within_media_budget,
     };
     use crate::panel::media::QueueItemLease;
     use std::sync::atomic::AtomicUsize;
@@ -873,7 +886,7 @@ mod tests {
             Err(text) if text.contains("could not list playlists") && text.contains("boom")
         ));
         assert!(matches!(
-            pick_palette(MediaPick::Playlists(Ok(Vec::new()))),
+            pick_palette(MediaPick::Playlists(Ok(thegn_core::media::PlaylistPage::default()))),
             Err(text) if text == "Media: nothing to pick"
         ));
         assert!(matches!(
@@ -885,12 +898,12 @@ mod tests {
             Err(text) if text == "Media: nothing to pick"
         ));
 
-        let playlists = pick_palette(MediaPick::Playlists(Ok(vec![
-            thegn_core::media::Playlist {
+        let playlists = pick_palette(MediaPick::Playlists(Ok(
+            thegn_core::media::PlaylistPage::from_rows(vec![thegn_core::media::Playlist {
                 id: "playlist-id".into(),
                 name: "Favorites".into(),
-            },
-        ])))
+            }]),
+        )))
         .unwrap();
         assert_eq!(playlists.len(), 1);
         assert_eq!(playlists[0].key, "media-playlist:playlist-id");
@@ -898,6 +911,46 @@ mod tests {
         let items = pick_palette(MediaPick::Players(Ok(vec!["mpv".into()]))).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].key, "media-player:mpv");
+    }
+
+    #[test]
+    fn pick_note_reports_hidden_playlists() {
+        let page = thegn_core::media::PlaylistPage {
+            items: (0..thegn_core::media::MAX_PLAYLISTS)
+                .map(|index| thegn_core::media::Playlist {
+                    id: format!("playlist-{index}"),
+                    name: format!("Playlist {index}"),
+                })
+                .collect(),
+            total: thegn_core::media::MAX_PLAYLISTS + 5,
+        };
+        assert!(matches!(
+            pick_note(&MediaPick::Playlists(Ok(page))),
+            Some(text) if text.contains("5 more playlists not shown")
+        ));
+
+        let page = thegn_core::media::PlaylistPage {
+            items: vec![thegn_core::media::Playlist {
+                id: "playlist-id".into(),
+                name: "Favorites".into(),
+            }],
+            total: 1,
+        };
+        assert_eq!(pick_note(&MediaPick::Playlists(Ok(page))), None);
+        assert_eq!(pick_note(&MediaPick::Players(Ok(Vec::new()))), None);
+        assert_eq!(pick_note(&MediaPick::Playlists(Err("failed".into()))), None);
+
+        let page = thegn_core::media::PlaylistPage {
+            items: vec![thegn_core::media::Playlist {
+                id: "playlist-id".into(),
+                name: "Favorites".into(),
+            }],
+            total: 2,
+        };
+        assert_eq!(
+            pick_note(&MediaPick::Playlists(Ok(page))).as_deref(),
+            Some("Media: 1 more playlist not shown")
+        );
     }
 
     #[test]
