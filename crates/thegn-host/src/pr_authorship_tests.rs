@@ -205,6 +205,251 @@ fn fresh_organization_authorship_is_admitted_and_disabled_policy_needs_no_proof(
 }
 
 #[test]
+fn after_agent_viewer_change_holds() {
+    let fixture = Fixture::new();
+    let mut foreign = fixture.proof.clone();
+    foreign.viewer.id = "U_someone_else".into();
+    let forge = fixture.forge(vec![fixture.proof.clone(), foreign]);
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            Some(&fixture.pr),
+            None,
+        ),
+        Err(AFTER_AGENT_HELD)
+    );
+}
+
+#[test]
+fn after_agent_author_change_holds() {
+    let fixture = Fixture::new();
+    let mut foreign = fixture.proof.clone();
+    foreign.author.id = "U_other".into();
+    foreign.viewer.id = "U_other".into();
+    let forge = fixture.forge(vec![fixture.proof.clone(), foreign]);
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+    let mut fresh = fixture.pr.clone();
+    let mut changed_author = fixture.proof.author.clone();
+    changed_author.id = "U_other".into();
+    fresh.author = Some(changed_author);
+
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            Some(&fresh),
+            None,
+        ),
+        Err(AFTER_AGENT_HELD)
+    );
+}
+
+#[test]
+fn after_agent_foreign_head_holds_before_forge_call() {
+    let fixture = Fixture::new();
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+    let mut fresh = fixture.pr.clone();
+    fresh.head_ref_oid = "f".repeat(40);
+    let calls_before = forge.proof_calls.load(Ordering::SeqCst);
+
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            Some(&fresh),
+            None,
+        ),
+        Err(AFTER_AGENT_HELD)
+    );
+    assert_eq!(forge.proof_calls.load(Ordering::SeqCst), calls_before);
+}
+
+#[test]
+fn after_agent_unavailable_evidence_holds() {
+    let fixture = Fixture::new();
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            None,
+            None,
+        ),
+        Err(AFTER_AGENT_HELD)
+    );
+
+    let unavailable = fixture.forge(vec![]);
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &unavailable,
+            &fixture.loc,
+            Some(&fixture.pr),
+            None,
+        ),
+        Err(AFTER_AGENT_HELD)
+    );
+}
+
+// Positive controls: unchanged evidence, disabled policy, and an attributed agent push retain the
+// existing behavior.
+#[test]
+fn after_agent_unchanged_evidence_passes() {
+    let fixture = Fixture::new();
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            Some(&fixture.pr),
+            None,
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn after_agent_disabled_policy_needs_no_proof() {
+    let fixture = Fixture::new();
+    let forge = fixture.forge(vec![]);
+
+    assert_eq!(
+        revalidate_after_agent(None, &fixture.db, &forge, &fixture.loc, None, None,),
+        Ok(())
+    );
+    assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "private synchronous fixture commit, off the compositor"
+)]
+fn after_agent_own_pushed_head_passes_only_when_attributed() {
+    let fixture = Fixture::new();
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+    let commit = fixture
+        .loc
+        .git_command(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "agent push",
+        ])
+        .output()
+        .unwrap();
+    assert!(commit.status.success());
+    let new_head = fixture.loc.git_out(&["rev-parse", "HEAD"]).unwrap();
+    let mut fresh = fixture.pr.clone();
+    fresh.head_ref_oid.clone_from(&new_head);
+    let mut after = fixture.proof.clone();
+    after.head.clone_from(&new_head);
+    forge.proofs.lock().unwrap()[0] = after;
+
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            Some(&fresh),
+            Some(&new_head),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        revalidate_after_agent(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            Some(&fresh),
+            None,
+        ),
+        Err(AFTER_AGENT_HELD)
+    );
+}
+
+#[test]
 fn account_change_and_origin_change_after_preparation_hold() {
     let fixture = Fixture::new();
     let mut foreign = fixture.proof.clone();
