@@ -364,6 +364,14 @@ pub trait WorktreeAuxStore {
     /// raw nullable location/attempt aliases; false means revoked/already held.
     fn hold_merge_cleanup(&self, expected: &MergeQueueRow) -> Result<bool>;
 
+    /// Record the next retry after a refused landed cleanup if the complete
+    /// observed row still matches. This changes only reserved `error_detail`.
+    fn defer_merge_cleanup(
+        &self,
+        expected: &MergeQueueRow,
+        retry: crate::merge_sweep::CleanupRetry,
+    ) -> Result<bool>;
+
     /// The whole queue, oldest-queued first (the fold order + UI feed).
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>>;
 
