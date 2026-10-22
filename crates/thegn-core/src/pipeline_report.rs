@@ -93,6 +93,43 @@ pub fn display_cell(s: &str) -> String {
         .collect()
 }
 
+/// Escape control and Unicode format characters in a compact JSON document
+/// produced by serde_json. The returned document parses to the same value;
+/// terminal-sensitive characters are represented with lowercase `\u` escapes
+/// so they are never sent raw to a terminal.
+pub fn json_terminal_safe(json: &str) -> std::borrow::Cow<'_, str> {
+    let mut output = None::<String>;
+    let mut copied_until = 0;
+
+    for (byte_index, c) in json.char_indices() {
+        if c.is_control() || is_format_control(c) {
+            let escaped =
+                output.get_or_insert_with(|| String::with_capacity(json.len().saturating_add(16)));
+            escaped.push_str(&json[copied_until..byte_index]);
+            let mut units = [0_u16; 2];
+            for unit in c.encode_utf16(&mut units).iter().copied() {
+                escaped.push_str("\\u");
+                for shift in [12, 8, 4, 0] {
+                    let nibble = ((unit >> shift) & 0x0f) as u8;
+                    escaped.push(char::from(match nibble {
+                        0..=9 => b'0' + nibble,
+                        _ => b'a' + nibble - 10,
+                    }));
+                }
+            }
+            copied_until = byte_index + c.len_utf8();
+        }
+    }
+
+    match output {
+        Some(mut escaped) => {
+            escaped.push_str(&json[copied_until..]);
+            std::borrow::Cow::Owned(escaped)
+        }
+        None => std::borrow::Cow::Borrowed(json),
+    }
+}
+
 /// Render untrusted text into a terminal cell with a fixed display width.
 /// Controls and format characters are replaced, leading zero-width characters
 /// are dropped, and truncation reserves one column for an ellipsis.
@@ -556,6 +593,44 @@ pub fn digest(
 mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn json_terminal_safe_escapes_controls_and_format_characters_and_round_trips() {
+        let value = serde_json::json!({"s": "a\u{9b}b\u{7f}c\u{202e}d\u{2028}e\u{200b}f\u{e0041}g é 界 😀"});
+        let raw = serde_json::to_string(&value).unwrap();
+        let safe = json_terminal_safe(&raw);
+
+        assert!(
+            safe.chars()
+                .all(|c| !c.is_control() && !is_format_control(c))
+        );
+        for escape in [
+            "\\u009b",
+            "\\u007f",
+            "\\u202e",
+            "\\u2028",
+            "\\u200b",
+            "\\udb40\\udc41",
+        ] {
+            assert!(safe.contains(escape), "missing {escape} in {safe}");
+        }
+        assert!(
+            safe.contains("é 界 😀"),
+            "ordinary Unicode stays readable: {safe}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&safe).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn json_terminal_safe_leaves_clean_documents_borrowed() {
+        let json = r#"{"s":"ASCII 日本語 😀"}"#;
+        let safe = json_terminal_safe(json);
+        assert!(matches!(safe, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(safe, json);
+    }
 
     fn row(
         id: i64,
