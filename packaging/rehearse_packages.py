@@ -155,17 +155,30 @@ def _verify_against_manifests(args: argparse.Namespace, packages: list[Package],
     try:
         manifest_digest = None
         if release_manifest is not None:
+            digest_before = release._hash_payload_file(release_manifest)
             entries = release.load_release_manifest(release_manifest, f"v{version}")
-            current_packages = [package for package in packages if package.version == version]
-            release.verify_release_asset_files(entries, [package.path for package in current_packages])
             manifest_digest = release._hash_payload_file(release_manifest)
+            if manifest_digest != digest_before:
+                raise RehearsalError(f"release manifest changed while being verified: {release_manifest}")
+            current_packages = [package for package in packages if package.version == version]
+            verified = release.verify_release_asset_files(entries, [package.path for package in current_packages])
+            for package in current_packages:
+                if verified[package.basename] != package.sha256:
+                    raise RehearsalError(f"{package.basename} changed after package validation")
         if previous_packages:
             if previous_manifest is None and not args.dry_run:
                 raise RehearsalError("--previous-release-manifest is required when rehearsing an upgrade leg")
             if previous_manifest is not None:
                 previous_version = next(iter(previous_versions))
+                digest_before = release._hash_payload_file(previous_manifest)
                 entries = release.load_release_manifest(previous_manifest, f"v{previous_version}")
-                release.verify_release_asset_files(entries, [package.path for package in previous_packages])
+                digest_after = release._hash_payload_file(previous_manifest)
+                if digest_after != digest_before:
+                    raise RehearsalError(f"previous release manifest changed while being verified: {previous_manifest}")
+                verified = release.verify_release_asset_files(entries, [package.path for package in previous_packages])
+                for package in previous_packages:
+                    if verified[package.basename] != package.sha256:
+                        raise RehearsalError(f"{package.basename} changed after package validation")
         return manifest_digest
     except release.ReleaseError as error:
         raise RehearsalError(str(error)) from error
