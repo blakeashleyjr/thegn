@@ -1201,4 +1201,48 @@ mod tests {
         );
         assert_eq!(admitted.problems(), admitted.startable().unwrap_err());
     }
+
+    #[test]
+    fn admit_refuses_a_plugin_whose_contributions_share_a_surface() {
+        use thegn_core::plugin_api::{ContributionId, PluginMode, SurfaceId};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut duplicate_surface = spec("dupsurf", vec!["true".into()]);
+        duplicate_surface.mode = PluginMode::Resident;
+        duplicate_surface.manifest.capabilities = vec![Capability::new("surface", "statusbar")];
+        for id in ["dupsurf.a", "dupsurf.b"] {
+            duplicate_surface.manifest.contributions.push(Contribution {
+                id: ContributionId::new(id),
+                extension_point: ExtensionPoint::StatusBarSegment,
+                label: id.into(),
+                surface: Some(SurfaceId::new("dupsurf.seg")),
+                cadence: CadenceHint::OnDemand,
+                metadata: Default::default(),
+                caps: serde_json::Value::Null,
+                chord: None,
+            });
+        }
+
+        let admitted = admit(
+            &Config {
+                plugins: vec![duplicate_surface],
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        let plugin = admitted
+            .plugins
+            .iter()
+            .find(|plugin| plugin.plugin.spec.manifest.id.as_str() == "dupsurf")
+            .unwrap();
+        match &plugin.decision {
+            PluginDecision::Invalid(problems) => assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.problem.contains("duplicate surface dupsurf.seg"))
+            ),
+            decision => panic!("expected invalid plugin decision, got {decision:?}"),
+        }
+        assert!(admitted.startable().is_err());
+    }
 }
