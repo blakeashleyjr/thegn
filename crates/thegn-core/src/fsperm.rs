@@ -1290,16 +1290,20 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 /// — can assert the restriction took without growing a `#[cfg]` of its own, so
 /// per-OS knowledge stays inside this seam.
 pub fn mode_bits(path: &Path) -> std::io::Result<Option<u32>> {
+    Ok(mode_bits_from_metadata(&std::fs::metadata(path)?))
+}
+
+/// The permission bits from already-open file metadata, or `None` on
+/// platforms with no mode bits.
+pub fn mode_bits_from_metadata(_metadata: &std::fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        Ok(Some(std::fs::metadata(path)?.permissions().mode() & 0o777))
+        Some(_metadata.permissions().mode() & 0o777)
     }
     #[cfg(not(unix))]
     {
-        // Existence still has to hold, so a missing path is an error either way.
-        std::fs::metadata(path)?;
-        Ok(None)
+        None
     }
 }
 
