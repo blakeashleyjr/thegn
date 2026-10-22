@@ -623,7 +623,7 @@ fn drain_with_responder(
             }
             PluginMsg::RetryRespawn { plugin } => {
                 if let Some(host) = host {
-                    host.respawn(plugin, Duration::ZERO);
+                    host.respawn(plugin, std::time::Duration::ZERO);
                 }
             }
         }
