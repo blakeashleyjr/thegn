@@ -22,8 +22,10 @@ actions: [pr-open, pr-create]
    is available; PR review shows the PR head diff, inline threads, outdated
    feedback, and top-level comments. Stale, loading, unsupported, and absent
    snapshots are labeled rather than attached to local lines.
-4. Act from the panel's _pr_ section: `A` approves and `o` opens the PR in
-   your browser. `M` opens a merge-method menu (squash is the default) and
+4. Act from the panel's _pr_ section: `A` approves the PR head the panel shows;
+   if the PR moved since, nothing is submitted and the status line says so —
+   refresh and review again. `o` opens the PR in your browser. `M` opens a
+   merge-method menu (squash is the default) and
    lists blockers; `c` comments when a PR exists and asks
    before creating one otherwise. `r` needs a PR. Enter on an OPEN PRS row
    opens that PR read-only; Enter on the branch PR opens its PR view;
