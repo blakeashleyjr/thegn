@@ -142,19 +142,16 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     // the existing singleton; it never deletes source state.
     let _source_guard = source_migration_guard(&source, &worktree, dry_run)?;
     let source_db = if dry_run {
-        Db::open_read_only()
-            .context("open source profile database read-only")?
-            .ok_or_else(|| anyhow!("source profile database does not exist"))?
+        dry_run_open_at(
+            &thegn_core::util::xdg_state_home().join("thegn/thegn.db"),
+            "source",
+        )?
+        .ok_or_else(|| anyhow!("source profile database does not exist"))?
     } else {
         Db::open().context("open source profile database")?
     };
     let target_db = if dry_run {
-        Db::open_read_only_at(&target_db_path).with_context(|| {
-            format!(
-                "open target profile database read-only at {}",
-                target_db_path.display()
-            )
-        })?
+        dry_run_open_at(&target_db_path, "target")?
     } else {
         Db::open_read_only_wal_at(&target_db_path).with_context(|| {
             format!(
@@ -720,6 +717,70 @@ fn profile_db_path(paths: &ProfilePaths, default_state_home: &Path) -> PathBuf {
     } else {
         paths.root.join("state/thegn/thegn.db")
     }
+}
+
+/// Opens a profile database without writing it, while accounting for committed
+/// changes that a short CLI may leave in its WAL. SQLite's immutable mode
+/// ignores WAL frames, so a non-empty WAL is read through the read-only WAL
+/// opener when its shared-memory index is present. Neither read-only opener
+/// creates files, and the WAL-aware connection does not checkpoint the main
+/// database.
+fn dry_run_open_at(path: &Path, role: &str) -> Result<Option<Db>> {
+    let wal = wal_sidecar(path);
+    match std::fs::metadata(&wal) {
+        Ok(metadata) if metadata.len() > 0 => {
+            let shm = shm_sidecar(path);
+            match std::fs::metadata(&shm) {
+                Ok(_) => Db::open_read_only_wal_at(path).with_context(|| {
+                    format!(
+                        "open {role} profile database read-only (with its write-ahead log) at {}",
+                        path.display()
+                    )
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                    "{role} profile database at {} has an un-checkpointed write-ahead log but no shared-memory index; open thegn for that profile once, or run the move without --dry-run",
+                    path.display()
+                ),
+                Err(error) => Err(error).with_context(|| {
+                    format!(
+                        "inspect {role} profile database shared-memory index at {}",
+                        shm.display()
+                    )
+                }),
+            }
+        }
+        Ok(_) => Db::open_read_only_at(path).with_context(|| {
+            format!(
+                "open {role} profile database read-only at {}",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Db::open_read_only_at(path)
+            .with_context(|| {
+                format!(
+                    "open {role} profile database read-only at {}",
+                    path.display()
+                )
+            }),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "inspect {role} profile database write-ahead log at {}",
+                wal.display()
+            )
+        }),
+    }
+}
+
+fn wal_sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+fn shm_sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-shm");
+    PathBuf::from(name)
 }
 
 fn now_ms() -> i64 {
@@ -1402,5 +1463,123 @@ mod tests {
             Err(error) if error.contains("bad-group") && error.contains("tab 4")
                 && error.contains("not valid JSON") && !error.contains("{")
         ));
+    }
+
+    fn wal_fixture() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/thegn/thegn.db");
+        drop(Db::open_at(&path).unwrap());
+
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 INSERT INTO worktrees (worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,env_name)
+                 VALUES ('/wal-only','default','g','/wal-only','b','a',1,'local','default');",
+            )
+            .unwrap();
+        (dir, path, writer)
+    }
+
+    fn directory_entries(path: &Path) -> BTreeSet<PathBuf> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    #[test]
+    fn dry_run_open_reads_rows_held_only_in_the_wal() {
+        let (_dir, path, writer) = wal_fixture();
+        let state_dir = path.parent().unwrap();
+        let before_bytes = std::fs::read(&path).unwrap();
+        let before_entries = directory_entries(state_dir);
+
+        let target = dry_run_open_at(&path, "target")
+            .unwrap()
+            .unwrap()
+            .migration_target_snapshot("default", "/wal-only")
+            .unwrap();
+
+        assert!(target.worktree.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+        assert_eq!(directory_entries(state_dir), before_entries);
+        drop(writer);
+    }
+
+    #[test]
+    fn dry_run_open_immutable_view_misses_wal_rows() {
+        let (_dir, path, writer) = wal_fixture();
+        let result = Db::open_read_only_at(&path)
+            .unwrap()
+            .unwrap()
+            .migration_target_snapshot("default", "/wal-only");
+        assert!(matches!(
+            result,
+            Err(_) | Ok(MigrationTarget { worktree: None, .. })
+        ));
+        drop(writer);
+    }
+
+    #[test]
+    fn dry_run_open_refuses_a_wal_without_its_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thegn.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE marker(value TEXT);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        drop(writer);
+
+        let shm = shm_sidecar(&path);
+        if shm.exists() {
+            std::fs::remove_file(&shm).unwrap();
+        }
+        std::fs::write(wal_sidecar(&path), b"not empty").unwrap();
+
+        let result = dry_run_open_at(&path, "target");
+        assert!(matches!(result, Err(error)
+            if format!("{error:#}").contains("write-ahead log")
+                && format!("{error:#}").contains(path.to_str().unwrap())));
+    }
+
+    #[test]
+    fn dry_run_open_uses_the_immutable_view_without_a_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thegn.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("CREATE TABLE marker(value TEXT);")
+            .unwrap();
+        drop(writer);
+        let wal = wal_sidecar(&path);
+        let shm = shm_sidecar(&path);
+        let journal = PathBuf::from(format!("{}-journal", path.display()));
+        for sidecar in [&wal, &shm, &journal] {
+            if sidecar.exists() {
+                std::fs::remove_file(sidecar).unwrap();
+            }
+        }
+
+        assert!(dry_run_open_at(&path, "target").unwrap().is_some());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn dry_run_open_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            dry_run_open_at(&dir.path().join("missing.db"), "target")
+                .unwrap()
+                .is_none()
+        );
     }
 }
