@@ -128,6 +128,11 @@ pub struct CiRunCache {
     pub runs: Vec<CiRun>,
     #[serde(default)]
     pub discarded_rows: usize,
+    /// Provider context that produced the rows (`<system>:<host>/<project>`);
+    /// empty for rows written before batch 65 or when the context was unknown.
+    /// An empty context never matches.
+    #[serde(default)]
+    pub context: String,
 }
 
 /// Decode a current cache envelope or a legacy bare run array.
@@ -137,9 +142,15 @@ pub fn decode_run_cache(json: &str) -> Option<CiRunCache> {
         return Some(CiRunCache {
             runs: serde_json::from_value(value).ok()?,
             discarded_rows: 0,
+            context: String::new(),
         });
     }
     serde_json::from_value(value).ok()
+}
+
+/// Whether cached rows belong to a known, equal provider context.
+pub fn cache_context_matches(cached: &str, current: Option<&str>) -> bool {
+    current.is_some_and(|context| !context.is_empty() && cached == context)
 }
 
 /// Whether a cached CI run row belongs to the current, known branch.
@@ -659,6 +670,38 @@ mod tests {
         let legacy = decode_run_cache("[]").unwrap();
         assert!(legacy.runs.is_empty());
         assert_eq!(legacy.discarded_rows, 0);
+    }
+
+    #[test]
+    fn run_cache_context_round_trips_and_legacy_rows_have_none() {
+        let cache = CiRunCache {
+            context: "github:github.com/o/r".into(),
+            ..CiRunCache::default()
+        };
+        let json = serde_json::to_string(&cache).unwrap();
+        assert_eq!(decode_run_cache(&json).unwrap().context, cache.context);
+        assert_eq!(decode_run_cache("[]").unwrap().context, "");
+        assert_eq!(
+            decode_run_cache(r#"{"runs":[],"discarded_rows":0}"#)
+                .unwrap()
+                .context,
+            ""
+        );
+    }
+
+    #[test]
+    fn cache_context_matches_requires_a_known_equal_context() {
+        assert!(cache_context_matches(
+            "github:github.com/o/r",
+            Some("github:github.com/o/r")
+        ));
+        assert!(!cache_context_matches(
+            "github:github.com/o/a",
+            Some("github:github.com/o/b")
+        ));
+        assert!(!cache_context_matches("", Some("github:github.com/o/r")));
+        assert!(!cache_context_matches("github:github.com/o/r", None));
+        assert!(!cache_context_matches("github:github.com/o/r", Some("")));
     }
 
     #[test]
