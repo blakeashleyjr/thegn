@@ -172,6 +172,49 @@ pub(crate) fn restart_delay(restarts: u32) -> Option<Duration> {
     }
 }
 
+fn report_host_start_failure(tx: &PluginTx, waker: &TerminalWaker, error: &std::io::Error) {
+    if let Err(error) = tx.send(PluginMsg::Loaded(Vec::new())) {
+        tracing::debug!(target: "thegn::plugin", %error, "plugin load message consumer is gone");
+    }
+    if let Err(error) = tx.send(PluginMsg::Refused(vec![
+        thegn_svc::plugin::loader::SpecProblem {
+            plugin: "plugins".into(),
+            problem: format!("plugin host thread failed to start: {error}; no plugin is running"),
+        },
+    ])) {
+        tracing::debug!(target: "thegn::plugin", %error, "plugin start failure consumer is gone");
+    }
+    if let Err(error) = waker.wake() {
+        tracing::debug!(target: "thegn::plugin", %error, "plugin start failure waker pulse failed");
+    }
+}
+
+fn report_poll_start_failure(
+    failed: &mut BTreeSet<String>,
+    plugin: &str,
+    error: &std::io::Error,
+    tx: &PluginTx,
+    waker: Option<&TerminalWaker>,
+) -> bool {
+    if !failed.insert(plugin.to_string()) {
+        return false;
+    }
+    if let Err(error) = tx.send(PluginMsg::Refused(vec![
+        thegn_svc::plugin::loader::SpecProblem {
+            plugin: plugin.into(),
+            problem: format!("scheduled run failed to start: {error}"),
+        },
+    ])) {
+        tracing::debug!(target: "thegn::plugin", %error, "scheduled run failure consumer is gone");
+    }
+    if let Some(waker) = waker
+        && let Err(error) = waker.wake()
+    {
+        tracing::debug!(target: "thegn::plugin", %error, "scheduled run failure waker pulse failed");
+    }
+    true
+}
+
 type Sessions = Arc<Mutex<BTreeMap<String, ResidentSession>>>;
 type Disabled = Arc<Mutex<std::collections::BTreeSet<String>>>;
 
@@ -451,11 +494,39 @@ pub(crate) fn spawn_plugins_host(
         });
     if let Err(e) = spawn {
         tracing::warn!(target: "thegn::plugin", error = %e, "plugin host thread failed to start");
+        report_host_start_failure(&host.tx, &host.waker, &e);
+        host.stop.stop();
     }
     host
 }
 
 impl PluginsHost {
+    fn respawn_worker_failed(&self, id: &str, error: &std::io::Error) {
+        {
+            let mut state = lock(&self.respawns.state);
+            state.queue.cancel(id);
+            state.worker = false;
+            self.respawns.cv.notify_all();
+        }
+        if let Err(error) = self.tx.send(PluginMsg::Refused(vec![
+            thegn_svc::plugin::loader::SpecProblem {
+                plugin: id.into(),
+                problem: format!("restart worker failed to start: {error}"),
+            },
+        ])) {
+            tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "restart failure consumer is gone");
+        }
+        if let Err(error) = self.tx.send(PluginMsg::Respawned {
+            plugin: id.into(),
+            writer: None,
+        }) {
+            tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "restart failure consumer is gone");
+        }
+        if let Err(error) = self.waker.wake() {
+            tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "restart failure waker pulse failed");
+        }
+    }
+
     /// Schedule a resident plugin respawn after `delay` on the shared timer
     /// worker (never on the loop). The outcome lands as [`PluginMsg::Respawned`].
     pub(crate) fn respawn(&self, plugin: LoadedPlugin, delay: Duration) {
@@ -498,10 +569,7 @@ impl PluginsHost {
             });
         }) {
             tracing::warn!(target: "thegn::plugin", error = %error, "respawn worker failed to start");
-            let mut state = lock(&self.respawns.state);
-            state.queue.cancel(&id);
-            state.worker = false;
-            self.respawns.cv.notify_all();
+            self.respawn_worker_failed(&id, &error);
         }
     }
 
@@ -961,6 +1029,7 @@ fn setup_and_schedule_with_waker(
         .min()
         .unwrap_or(Duration::from_secs(1))
         .max(Duration::from_secs(1));
+    let mut failed_poll_starts = BTreeSet::new();
     loop {
         if stop.is_stopped() {
             return;
@@ -977,26 +1046,32 @@ fn setup_and_schedule_with_waker(
                 let env = entry.env.clone();
                 let cwd = entry.cwd.clone();
                 let timeout = entry.timeout;
-                let tx = tx.clone();
-                let waker = waker.clone();
-                if let Err(error) =
-                    thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
-                        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                        let run = thegn_svc::plugin::spawn_ndjson(
-                            &command,
-                            &env,
-                            cwd.as_deref(),
-                            timeout,
+                let worker_tx = tx.clone();
+                let worker_waker = waker.clone();
+                match thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                    let run =
+                        thegn_svc::plugin::spawn_ndjson(&command, &env, cwd.as_deref(), timeout);
+                    drop(ticket);
+                    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    let _ = worker_tx.send(PluginMsg::OneShot { plugin, run });
+                    if let Some(waker) = &worker_waker {
+                        let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
+                    }
+                }) {
+                    Ok(()) => {
+                        failed_poll_starts.remove(&entry.plugin);
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "thegn::plugin", plugin = %entry.plugin, error = %error, "scheduled one-shot thread failed to start");
+                        report_poll_start_failure(
+                            &mut failed_poll_starts,
+                            &entry.plugin,
+                            &error,
+                            &tx,
+                            waker.as_ref(),
                         );
-                        drop(ticket);
-                        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                        let _ = tx.send(PluginMsg::OneShot { plugin, run });
-                        if let Some(waker) = &waker {
-                            let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
-                        }
-                    })
-                {
-                    tracing::warn!(target: "thegn::plugin", plugin = %entry.plugin, error = %error, "scheduled one-shot thread failed to start");
+                    }
                 }
             },
         );
@@ -1034,6 +1109,147 @@ mod tests {
         let error = tx.send(PluginMsg::Loaded(Vec::new())).unwrap_err();
 
         assert!(std::mem::size_of_val(&error) < 128);
+    }
+
+    #[test]
+    fn start_failure_host_thread_publishes_empty_load_then_refusal() {
+        let (tx, mut rx) = plugin_channel();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+
+        report_host_start_failure(&tx, &waker, &std::io::Error::other("boom"));
+
+        assert!(matches!(rx.try_recv(), Ok(PluginMsg::Loaded(loaded)) if loaded.is_empty()));
+        match rx.try_recv() {
+            Ok(PluginMsg::Refused(problems)) => {
+                assert_eq!(problems.len(), 1);
+                assert_eq!(problems[0].plugin, "plugins");
+                assert!(
+                    problems[0]
+                        .problem
+                        .contains("plugin host thread failed to start")
+                );
+                assert!(problems[0].problem.contains("boom"));
+                assert_eq!(
+                    problems[0].problem,
+                    "plugin host thread failed to start: boom; no plugin is running"
+                );
+            }
+            _ => panic!("expected host start refusal"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn start_failure_respawn_worker_reports_a_failed_restart() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, mut rx) = plugin_channel();
+        let host = PluginsHost {
+            stop: Arc::new(StopSignal::default()),
+            supervisor: ResidentSupervisor::new(runtime.handle().clone()),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            disabled: Arc::new(Mutex::new(Default::default())),
+            tx,
+            waker,
+            one_shot_gate: OneShotGate::default(),
+            state_anchor: PathBuf::new(),
+            respawns: Arc::new(RespawnTimers::default()),
+        };
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("p");
+        let plugin = LoadedPlugin {
+            spec,
+            dir: None,
+            trusted_native_ignored: false,
+        };
+        {
+            let mut state = lock(&host.respawns.state);
+            state
+                .queue
+                .schedule("p".into(), Instant::now() + Duration::from_secs(60), plugin);
+            state.worker = true;
+        }
+
+        host.respawn_worker_failed("p", &std::io::Error::other("boom"));
+
+        {
+            let state = lock(&host.respawns.state);
+            assert!(state.queue.is_empty());
+            assert!(!state.worker);
+        }
+        let mut saw_refusal = false;
+        let mut saw_respawn = false;
+        let mut message_order = Vec::new();
+        for _ in 0..8 {
+            match rx.try_recv() {
+                Ok(PluginMsg::Refused(problems)) => {
+                    assert_eq!(problems.len(), 1);
+                    assert_eq!(problems[0].plugin, "p");
+                    assert_eq!(problems[0].problem, "restart worker failed to start: boom");
+                    saw_refusal = true;
+                    message_order.push("refused");
+                }
+                Ok(PluginMsg::Respawned { plugin, writer }) => {
+                    assert_eq!(plugin, "p");
+                    assert!(writer.is_none());
+                    saw_respawn = true;
+                    message_order.push("respawned");
+                }
+                Err(_) => break,
+                Ok(_) => panic!("unexpected plugin message"),
+            }
+        }
+        assert!(saw_refusal);
+        assert!(saw_respawn);
+        assert_eq!(message_order, ["refused", "respawned"]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn start_failure_scheduled_poll_reports_once_until_it_starts() {
+        let (tx, mut rx) = plugin_channel();
+        let mut failed = BTreeSet::new();
+        let error = std::io::Error::other("boom");
+
+        assert!(report_poll_start_failure(
+            &mut failed,
+            "p",
+            &error,
+            &tx,
+            None
+        ));
+        assert!(!report_poll_start_failure(
+            &mut failed,
+            "p",
+            &error,
+            &tx,
+            None
+        ));
+        match rx.try_recv() {
+            Ok(PluginMsg::Refused(problems)) => {
+                assert_eq!(problems.len(), 1);
+                assert_eq!(problems[0].plugin, "p");
+                assert_eq!(problems[0].problem, "scheduled run failed to start: boom");
+            }
+            _ => panic!("expected scheduled run refusal"),
+        }
+        assert!(rx.try_recv().is_err());
+
+        failed.remove("p");
+        assert!(report_poll_start_failure(
+            &mut failed,
+            "p",
+            &error,
+            &tx,
+            None
+        ));
+        assert!(matches!(rx.try_recv(), Ok(PluginMsg::Refused(problems)) if problems.len() == 1));
+        assert!(rx.try_recv().is_err());
     }
 
     fn example_spec() -> PluginSpec {
