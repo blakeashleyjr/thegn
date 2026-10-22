@@ -3530,7 +3530,7 @@ fn backend_enter_argv_guarded_with_env(
                         "-p".into(),
                         format!(
                             "InaccessiblePaths=-{}",
-                            runtime_dir.join("systemd").display()
+                            runtime_dir.join("systemd/private").display()
                         ),
                     ]);
                 }
