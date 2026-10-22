@@ -46,6 +46,8 @@ globally. The launcher creates
 absent, then preserves that user-owned copy. `THEGN_ALACRITTY_CONFIG` points the
 font picker at the same file. The picker leaves the config untouched if another
 user owns it or it has extra hard links, and explains why.
+For the Alacritty config, the picker writes through a staging file beside it
+and leaves the config unchanged if staging fails.
 
 Run `thegn doctor` in that window to verify the terminal and resolved
 capabilities. The derivation is build-tested on x86_64 Linux; clean-host

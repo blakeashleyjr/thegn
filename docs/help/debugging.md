@@ -50,6 +50,8 @@ The report's `db space` line shows the database size, reclaimable space, and
 vacuum mode. It suggests `thegn db vacuum` when the database is not yet in
 incremental mode or is too large to convert automatically (more than 64 MiB
 of live data).
+The line reads the database read-only, including changes still in its
+write-ahead log.
 
 For a support archive, run:
 
