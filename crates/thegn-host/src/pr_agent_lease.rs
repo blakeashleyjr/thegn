@@ -13,6 +13,13 @@ use thegn_core::store::WorktreeAuxStore;
 const LEASE_MS: i64 = PR_AGENT_MAX_LEASE_MS - 10_000;
 const RENEW_EVERY: Duration = Duration::from_secs(60);
 
+fn heartbeat_failure_is_terminal(error: &anyhow::Error, lease_until_ms: i64, now_ms: i64) -> bool {
+    error
+        .to_string()
+        .contains(thegn_core::pr_queue::PR_AGENT_LEASE_LOST)
+        || now_ms >= lease_until_ms
+}
+
 pub(crate) fn lease_until_ms() -> i64 {
     thegn_core::util::now_ms() + LEASE_MS
 }
@@ -52,25 +59,27 @@ impl PrAgentGuard {
             let thread_lost = Arc::clone(&lost);
             let handle = thegn_core::thread_name::spawn_named("thegn-prlease", move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let db = match Db::open_at(&path) {
-                    Ok(db) => db,
-                    Err(error) => {
-                        tracing::debug!(target: "thegn::prq", %error, "PR-agent lease heartbeat could not open its database");
-                        thread_lost.store(true, Ordering::Release);
-                        return;
-                    }
-                };
                 loop {
                     match stop_rx.recv_timeout(renew_every) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let mut current = thread_lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            match db.renew_pr_agent(&current, lease_until_ms()) {
+                            let result = Db::open_at(&path)
+                                .and_then(|db| db.renew_pr_agent(&current, lease_until_ms()));
+                            match result {
                                 Ok(renewed) => *current = renewed,
                                 Err(error) => {
-                                    tracing::debug!(target: "thegn::prq", %error, "PR-agent lease heartbeat lost ownership");
-                                    thread_lost.store(true, Ordering::Release);
-                                    break;
+                                    let terminal = heartbeat_failure_is_terminal(
+                                        &error,
+                                        current.lease_until_ms,
+                                        thegn_core::util::now_ms(),
+                                    );
+                                    if terminal {
+                                        tracing::debug!(target: "thegn::prq", %error, "PR-agent lease heartbeat confirmed lease loss or reached its expiry");
+                                        thread_lost.store(true, Ordering::Release);
+                                        break;
+                                    }
+                                    tracing::debug!(target: "thegn::prq", %error, lease_until_ms = current.lease_until_ms, "PR-agent lease heartbeat could not confirm ownership; retrying before lease expiry");
                                 }
                             }
                         }
@@ -371,6 +380,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert!(!guard.cancel_flag().load(Ordering::Acquire));
         assert!(guard.finish(&db, None).unwrap());
+    }
+
+    #[test]
+    fn heartbeat_retries_transient_errors_until_the_lease_expires() {
+        let transient = anyhow::anyhow!("database is busy");
+        assert!(!heartbeat_failure_is_terminal(&transient, 200, 199));
+        assert!(heartbeat_failure_is_terminal(&transient, 200, 200));
+
+        let lost = anyhow::anyhow!("{}", thegn_core::pr_queue::PR_AGENT_LEASE_LOST);
+        assert!(heartbeat_failure_is_terminal(&lost, 500, 100));
     }
 
     #[expect(

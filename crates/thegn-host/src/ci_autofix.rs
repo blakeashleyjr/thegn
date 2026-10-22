@@ -480,7 +480,7 @@ fn consider_candidate_with_forge(
     .exited_zero();
     if guard.lease_lost() {
         notify(format!(
-            "CI autofix for PR #{} stopped: its PR-agent lease was lost; the next refresh re-evaluates the row",
+            "CI autofix for PR #{} stopped: its PR-agent lease could not be confirmed; the next refresh re-evaluates the row",
             item.number
         ));
     }
