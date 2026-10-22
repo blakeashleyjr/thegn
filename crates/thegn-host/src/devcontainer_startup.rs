@@ -366,7 +366,7 @@ fn spawn_owner(
         return Err(std::io::Error::other("owned fixture owner launch failure"));
     }
     std::thread::Builder::new()
-        .name("devcontainer-startup".into())
+        .name("thegn-dc-start".into())
         .spawn(move || {
             if gate.recv().is_err() {
                 operation.not_started(StartReason::Abandoned);
@@ -624,7 +624,7 @@ fn spawn_reader(
         return Err(std::io::Error::other("owned fixture reader launch failure"));
     }
     std::thread::Builder::new()
-        .name("devcontainer-stderr".into())
+        .name("thegn-dc-stderr".into())
         .spawn(move || read_stderr(operation, pipe, bytes, session))
 }
 

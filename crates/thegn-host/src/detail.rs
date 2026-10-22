@@ -435,17 +435,17 @@ pub struct DetailOverlay {
     sel: usize,
     /// A dim key-hint footer line for actionable lists (drawn on the last row).
     hint: Option<String>,
-    /// While a CI-run drill's async fetch is in flight, the run id being fetched;
-    /// [`apply_ci_detail`] only fills a result whose id still matches (the user
-    /// may have navigated away). `None` outside a CI drill.
-    pending_ci: Option<String>,
+    /// While a CI-run drill's async fetch is in flight, the run id and bound
+    /// worktree; [`apply_ci_detail`] requires both to match. `None` outside a
+    /// CI drill.
+    pending_ci: Option<ci_drill::CiPending>,
     /// The monitor tab this popup expands into, when it has one. `↵`/`M` then
     /// hand off to the full modal instead of merely closing.
     monitor_tab: Option<crate::monitor::MonitorTab>,
-    /// A drilled run that was still in flight at its last fill — the loop
-    /// re-polls it on the CI tick ([`DetailOverlay::live_ci_repoll`]) so the
-    /// drill updates in place. `None` outside a CI drill / once terminal.
-    live_ci: Option<thegn_core::ci::CiRun>,
+    /// A drilled run and its worktree that were still in flight at the last
+    /// fill — the loop re-polls that origin on the CI tick. `None` outside a CI
+    /// drill / once terminal.
+    live_ci: Option<ci_drill::LiveCi>,
     /// A human-authorized CI autofix action, populated only after a bounded
     /// redacted log entry has landed in the in-place CI drill.
     ci_autofix: Option<CiAutofixAvailability>,
@@ -2145,12 +2145,15 @@ fn badge_detail(
         BarBadge::Media => {
             let m = model.panel.media.as_ref()?;
             let text = m.badge()?;
-            Some(keyval(
-                "Now playing",
-                vec![("track".into(), text, Tok::Hue(Hue::Green))],
-                50,
-                near,
-            ))
+            let mut rows = vec![("track".into(), text, Tok::Hue(Hue::Green))];
+            if model.media_stale {
+                rows.push((
+                    "state".into(),
+                    "stale (provider not answering)".into(),
+                    Tok::Hue(Hue::Amber),
+                ));
+            }
+            Some(keyval("Now playing", rows, 50, near))
         }
         // The usage chip drills into the same per-account overlay `open-usage`
         // opens — one view, reached two ways, rather than a second summary that

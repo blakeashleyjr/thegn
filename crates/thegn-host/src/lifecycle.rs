@@ -347,24 +347,102 @@ pub fn refill_pool_after_claim(cfg: &Config, worktree: &str) {
             return;
         };
         let (repo_root, _repo, env_name) = pool_context(&db, &cfg, &worktree, &loc);
-        reconcile_pool(&cfg, &repo_root, &env_name, || {});
+        if let PoolReconcile::Halted(halt) = reconcile_pool(&cfg, &repo_root, &env_name, || {}) {
+            tracing::debug!(
+                target: "thegn::lifecycle",
+                message = %halt.message,
+                "warm pool refill halted; the next maintainer tick reports it"
+            );
+        }
     });
+}
+
+/// Why warm-pool reconciliation stopped without changing the pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolHalt {
+    pub message: String,
+}
+
+/// The outcome of one `reconcile_pool` pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum PoolReconcile {
+    Ran,
+    Busy,
+    Halted(PoolHalt),
 }
 
 fn spares_or_halt(
     read: anyhow::Result<Vec<PoolSpare>>,
     repo: &str,
     env_name: &str,
-) -> Option<Vec<PoolSpare>> {
+) -> Result<Vec<PoolSpare>, PoolHalt> {
     match read {
-        Ok(spares) => Some(spares),
+        Ok(spares) => Ok(spares),
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            let message = format!(
                 "warm pool: cannot read the spare ledger for {repo} ({env_name}): {error:#}; no pool changes made"
-            ));
-            None
+            );
+            thegn_core::msg::warn(&message);
+            Err(PoolHalt { message })
         }
     }
+}
+
+/// The halt message to show for `(repo, env)`, or None: a halt toasts only when
+/// it is new or its text changed; `Ran` clears the latch; `Busy` leaves it
+/// unchanged.
+pub(crate) fn halt_toast(repo: &str, env_name: &str, outcome: &PoolReconcile) -> Option<String> {
+    static HALTS: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
+    let mut latched = HALTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    latch_halt(&mut latched, repo, env_name, outcome)
+}
+
+fn latch_halt(
+    latched: &mut HashMap<(String, String), String>,
+    repo: &str,
+    env_name: &str,
+    outcome: &PoolReconcile,
+) -> Option<String> {
+    let key = (repo.to_string(), env_name.to_string());
+    match outcome {
+        PoolReconcile::Halted(halt) => {
+            if latched.get(&key) == Some(&halt.message) {
+                None
+            } else {
+                latched.insert(key, halt.message.clone());
+                Some(halt.message.clone())
+            }
+        }
+        PoolReconcile::Ran => {
+            latched.remove(&key);
+            None
+        }
+        PoolReconcile::Busy => None,
+    }
+}
+
+/// Report a DB lookup failure from the maintainer tick before it has a repo/env
+/// pair to reconcile. The worktree is the stable fallback key until the DB is
+/// available again.
+pub(crate) fn pool_ledger_open_failed(worktree: &str) -> Option<String> {
+    let message = "warm pool: cannot open ledger for reconciliation; no pool changes made";
+    halt_toast(
+        worktree,
+        "",
+        &PoolReconcile::Halted(PoolHalt {
+            message: message.to_string(),
+        }),
+    )
+}
+
+/// Clear the fallback DB-failure latch once the maintainer can resolve the
+/// worktree's normal repo/env key again.
+pub(crate) fn clear_pool_ledger_open_failure(worktree: &str) {
+    halt_toast(worktree, "", &PoolReconcile::Ran);
 }
 
 /// Reconcile the warm-spare POOL for one `(repo, env)`: create spares toward the
@@ -373,7 +451,7 @@ fn spares_or_halt(
 /// spawned concurrently (each marks itself `provisioning` in the DB immediately,
 /// so a re-entrant tick won't double-provision). `notify` pulses the UI when the
 /// pool changes. No-op unless the pool is enabled for this (repo, env).
-pub fn reconcile_pool<N>(cfg: &Config, repo_root: &Path, env_name: &str, notify: N)
+pub fn reconcile_pool<N>(cfg: &Config, repo_root: &Path, env_name: &str, notify: N) -> PoolReconcile
 where
     N: Fn() + Clone + Send + 'static,
 {
@@ -382,38 +460,41 @@ where
         Ok(lease) => lease,
         Err(crate::pool_lease::LeaseError::Busy) => {
             tracing::debug!(target: "thegn::lifecycle", %repo, %env_name, "warm pool reconcile skipped: lease busy");
-            return;
+            return PoolReconcile::Busy;
         }
         Err(crate::pool_lease::LeaseError::Io(error)) => {
-            thegn_core::msg::warn(&format!(
+            let message = format!(
                 "warm pool: cannot establish reconcile lease for {repo} ({env_name}): {error}"
-            ));
-            return;
+            );
+            thegn_core::msg::warn(&message);
+            return PoolReconcile::Halted(PoolHalt { message });
         }
     };
     let Ok(db) = thegn_core::db::Db::open() else {
-        thegn_core::msg::warn(
-            "warm pool: cannot open ledger for reconciliation; no pool changes made",
-        );
-        return;
+        let message =
+            "warm pool: cannot open ledger for reconciliation; no pool changes made".to_string();
+        thegn_core::msg::warn(&message);
+        return PoolReconcile::Halted(PoolHalt { message });
     };
     let target = match effective_pool_target(&db, cfg, &repo, env_name) {
         Ok(target) => target,
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            let message = format!(
                 "warm pool: cannot read the pool target for {repo} ({env_name}): {error:#}; no pool changes made"
-            ));
-            return;
+            );
+            thegn_core::msg::warn(&message);
+            return PoolReconcile::Halted(PoolHalt { message });
         }
     };
     let max_idle = cfg.lifecycle.pool.max_idle_secs;
 
-    let Some(spares) = spares_or_halt(db.pool_spares_for(&repo, env_name), &repo, env_name) else {
-        return;
+    let spares = match spares_or_halt(db.pool_spares_for(&repo, env_name), &repo, env_name) {
+        Ok(spares) => spares,
+        Err(halt) => return PoolReconcile::Halted(halt),
     };
     // Nothing configured and nothing to clean up ⇒ cheap no-op.
     if target == 0 && spares.is_empty() {
-        return;
+        return PoolReconcile::Ran;
     }
     // Idle policy by provider billing model: a scale-to-zero provider (sprites)
     // parks idle spares for free — aging them out just discards provisioning for
@@ -597,6 +678,7 @@ where
         });
     }
     notify();
+    PoolReconcile::Ran
 }
 
 /// Ceiling for one in-place restore (a Sprites checkpoint restore is ~seconds;
@@ -714,20 +796,43 @@ fn claimed_recycle_checkpoint(
     .then(|| spare.checkpoint_id.clone().unwrap_or_default())
 }
 
-/// Worktree-delete path: when the deleted worktree's sandbox is a CLAIMED pool
-/// spare with a fresh provisioned-base checkpoint, restore it in place and
-/// return it to the pool (`ready`) instead of destroying it — the next worktree
-/// claims it instantly. Returns whether it was recycled (the caller skips the
-/// destroy). The deleted worktree's row/binding is dropped by the delete flow
-/// itself (`forget_worktree_group`), so no explicit unbind is needed here. On a
-/// non-recyclable row or a failed restore the phantom `claimed` row is dropped
-/// so it can't linger after the caller destroys the sandbox.
-pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> bool {
+/// What the worktree-delete path does with a provider sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteRecycle {
+    /// A claimed spare was restored in place and returned to the pool.
+    Recycled,
+    /// Destroy the sandbox; `pool_spare` says whether its ledger row should be
+    /// dropped after the provider confirms the destroy.
+    Destroy { pool_spare: bool },
+}
+
+/// Worktree-delete path: restore a recyclable claimed spare in place, or defer
+/// a spare's ledger deletion until its provider sandbox has been destroyed.
+pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> DeleteRecycle {
     let Ok(db) = thegn_core::db::Db::open() else {
-        return false;
+        return DeleteRecycle::Destroy { pool_spare: false };
     };
-    let Ok(Some(spare)) = db.pool_spare_by_name(name) else {
-        return false; // not a pool spare: a derived per-worktree sandbox
+    delete_disposition(&db, cfg, env_name, name)
+}
+
+fn delete_disposition(
+    db: &thegn_core::db::Db,
+    cfg: &Config,
+    env_name: &str,
+    name: &str,
+) -> DeleteRecycle {
+    let spare = match db.pool_spare_by_name(name) {
+        Ok(Some(spare)) => spare,
+        Ok(None) => return DeleteRecycle::Destroy { pool_spare: false },
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::lifecycle",
+                %error,
+                spare = name,
+                "cannot read the pool ledger on delete; destroying without a ledger update"
+            );
+            return DeleteRecycle::Destroy { pool_spare: false };
+        }
     };
     // The row's own repo_path (recorded at mint time) keys the lock hash — the
     // worktree's rows/files are already being torn down concurrently.
@@ -735,12 +840,22 @@ pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> bo
     if claimed_recycle_checkpoint(&spare, env_name, &current_lock).is_some()
         && recycle_spare(cfg, env_name, &spare, &current_lock)
     {
-        return true;
+        return DeleteRecycle::Recycled;
     }
-    // best-effort: drop the stale claimed row so it never lingers as a phantom
-    // spare; the caller proceeds to destroy the sandbox itself.
-    let _ = db.delete_pool_spare(name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    false
+    DeleteRecycle::Destroy { pool_spare: true }
+}
+
+/// Forget a pool spare after its provider sandbox was successfully destroyed.
+pub fn forget_destroyed_spare(name: &str) {
+    let result = thegn_core::db::Db::open().and_then(|db| db.delete_pool_spare(name));
+    if let Err(error) = result {
+        tracing::warn!(
+            target: "thegn::lifecycle",
+            %error,
+            spare = name,
+            "destroyed spare's ledger row could not be dropped"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1111,6 +1226,33 @@ mod tests {
     }
 
     #[test]
+    fn pool_delete_unrecyclable_claimed_spare_keeps_its_row() {
+        let db = Db::open_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        db.insert_pool_spare("tg-spare-a", &repo_path, "sprites")
+            .unwrap();
+        db.set_pool_spare_ready("tg-spare-a", None, "").unwrap();
+        db.claim_pool_spare(&repo_path, "sprites", "/wt/x").unwrap();
+
+        let disposition = delete_disposition(&db, &Config::default(), "sprites", "tg-spare-a");
+
+        assert_eq!(disposition, DeleteRecycle::Destroy { pool_spare: true });
+        let spare = db.pool_spare_by_name("tg-spare-a").unwrap().unwrap();
+        assert_eq!(spare.state, "claimed");
+    }
+
+    #[test]
+    fn pool_delete_non_spare_is_plain_destroy() {
+        let db = Db::open_memory().unwrap();
+
+        assert_eq!(
+            delete_disposition(&db, &Config::default(), "sprites", "derived-sandbox"),
+            DeleteRecycle::Destroy { pool_spare: false }
+        );
+    }
+
+    #[test]
     fn pool_ledger_read_error_halts_reconcile() {
         assert!(
             spares_or_halt(
@@ -1118,14 +1260,123 @@ mod tests {
                 "/repo",
                 "sprites"
             )
-            .is_none()
+            .is_err()
         );
     }
 
     #[test]
     fn pool_ledger_rows_pass_through() {
         assert!(
-            spares_or_halt(Ok(vec![]), "/repo", "sprites").is_some_and(|spares| spares.is_empty())
+            spares_or_halt(Ok(vec![]), "/repo", "sprites").is_ok_and(|spares| spares.is_empty())
+        );
+    }
+
+    #[test]
+    fn pool_halt_new_halt_toasts_once() {
+        let mut latched = HashMap::new();
+        let outcome = PoolReconcile::Halted(PoolHalt {
+            message: "warm pool: x".into(),
+        });
+
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &outcome),
+            Some("warm pool: x".to_string())
+        );
+        assert_eq!(latch_halt(&mut latched, "/repo", "sprites", &outcome), None);
+    }
+
+    #[test]
+    fn pool_halt_changed_text_toasts_again() {
+        let mut latched = HashMap::new();
+        let first = PoolReconcile::Halted(PoolHalt {
+            message: "a".into(),
+        });
+        let changed = PoolReconcile::Halted(PoolHalt {
+            message: "b".into(),
+        });
+
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &first),
+            Some("a".into())
+        );
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &changed),
+            Some("b".into())
+        );
+    }
+
+    #[test]
+    fn pool_halt_ran_clears_and_busy_keeps() {
+        let mut latched = HashMap::new();
+        let halted = PoolReconcile::Halted(PoolHalt {
+            message: "a".into(),
+        });
+
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &halted),
+            Some("a".into())
+        );
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &PoolReconcile::Busy),
+            None
+        );
+        assert_eq!(latch_halt(&mut latched, "/repo", "sprites", &halted), None);
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &PoolReconcile::Ran),
+            None
+        );
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &halted),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn pool_halt_keys_are_per_repo_and_env() {
+        let mut latched = HashMap::new();
+        let halted = PoolReconcile::Halted(PoolHalt {
+            message: "a".into(),
+        });
+
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "sprites", &halted),
+            Some("a".into())
+        );
+        assert_eq!(
+            latch_halt(&mut latched, "/repo", "vps", &halted),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn pool_halt_spares_read_error_carries_the_warn_text() {
+        let result = spares_or_halt(
+            Err(anyhow::anyhow!("database is locked")),
+            "/repo",
+            "sprites",
+        );
+
+        assert!(matches!(result, Err(halt)
+            if halt.message.contains("cannot read the spare ledger for /repo (sprites)")
+                && halt.message.contains("database is locked")
+                && halt.message.contains("no pool changes made")));
+    }
+
+    #[test]
+    fn pool_halt_ledger_open_failure_toasts_once_and_clears_on_recovery() {
+        let worktree = "/worktree/pool-ledger-open-test";
+
+        assert_eq!(
+            pool_ledger_open_failed(worktree),
+            Some("warm pool: cannot open ledger for reconciliation; no pool changes made".into())
+        );
+        assert_eq!(pool_ledger_open_failed(worktree), None);
+
+        clear_pool_ledger_open_failure(worktree);
+
+        assert_eq!(
+            pool_ledger_open_failed(worktree),
+            Some("warm pool: cannot open ledger for reconciliation; no pool changes made".into())
         );
     }
 }
@@ -1358,8 +1609,9 @@ mod live_recycle {
         assert_eq!(spare_row(&name).state, "claimed");
 
         // Delete-path recycle: back to ready, same sprite, re-claimable.
-        assert!(
+        assert_eq!(
             recycle_claimed_on_delete(&cfg, "tglive", &name),
+            DeleteRecycle::Recycled,
             "claimed spare with fresh checkpoint recycles on delete"
         );
         let row = spare_row(&name);

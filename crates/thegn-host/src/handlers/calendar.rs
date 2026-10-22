@@ -12,10 +12,22 @@ use thegn_core::db::Db;
 use thegn_core::notification::NotificationKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReminderClaim {
+pub(crate) enum ReminderClaim {
     Won,
     AlreadyClaimed,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReminderDelivery {
+    /// The reminder was recorded as inbox row `row`.
+    Recorded { row: i64 },
+    /// The route sent the reminder to a transient channel without an inbox row.
+    RoutedWithoutInbox,
+    /// A notification rule dropped the reminder without delivery.
+    Dropped,
+    /// The reminder could not be recorded.
+    NotRecorded,
 }
 
 fn claim_reminder(db: &Db, source_ref: &str, now_ms: i64) -> ReminderClaim {
@@ -48,21 +60,68 @@ pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
     raise_reminder_on(&db, r, now_ms, |db, source_ref, message| {
-        let kind = NotificationKind::CalendarReminder.as_str();
-        if let Some(state) = crate::notify::global() {
-            let _ = crate::notify::record(db, &state, kind, source_ref, message, "");
-            let _ = waker.wake(); // best-effort: waker pulse: a routed reminder must repaint the inbox
-            return;
-        }
-        // best-effort: the inbox is a cache, and a reminder that fails to record
-        // must not take down the compositor.
-        if crate::automation_events::emit(db, kind, source_ref, message, "").is_ok() {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
+        deliver_reminder(
+            db,
+            crate::notify::global().as_deref(),
+            waker,
+            source_ref,
+            message,
+        );
     });
 }
 
-fn raise_reminder_on(
+/// Route and record a claimed reminder.
+///
+/// Transient channels fire according to the routing decision. The automation
+/// event identity is the inbox row (`notification:{row}`), so a recorded
+/// reminder submits exactly one normalized event and routing it out of the
+/// inbox submits none.
+pub(crate) fn deliver_reminder(
+    db: &Db,
+    state: Option<&crate::notify::NotifyState>,
+    waker: &TerminalWaker,
+    source_ref: &str,
+    message: &str,
+) -> ReminderDelivery {
+    let kind = NotificationKind::CalendarReminder.as_str();
+    if let Some(state) = state {
+        let (decision, row) = crate::notify::record(db, state, kind, source_ref, message, "");
+        let _ = waker.wake(); // best-effort: waker pulse: a routed reminder must repaint the inbox
+        let delivery = match row {
+            Some(row) => ReminderDelivery::Recorded { row },
+            None if decision.record => ReminderDelivery::NotRecorded,
+            None if decision.desktop
+                || decision.toast
+                || decision.sound.is_some()
+                || !decision.push_sinks.is_empty() =>
+            {
+                ReminderDelivery::RoutedWithoutInbox
+            }
+            None => ReminderDelivery::Dropped,
+        };
+        if !matches!(delivery, ReminderDelivery::Recorded { .. }) {
+            tracing::debug!(
+                target: "thegn::calendar",
+                outcome = ?delivery,
+                "calendar reminder delivered without an inbox row"
+            );
+        }
+        delivery
+    } else {
+        match crate::automation_events::emit(db, kind, source_ref, message, "") {
+            Ok(row) => {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                ReminderDelivery::Recorded { row }
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::calendar", %error, "calendar reminder not recorded");
+                ReminderDelivery::NotRecorded
+            }
+        }
+    }
+}
+
+pub(crate) fn raise_reminder_on(
     db: &Db,
     r: &DueReminder,
     now_ms: i64,

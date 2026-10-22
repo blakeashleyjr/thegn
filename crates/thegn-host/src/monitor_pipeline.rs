@@ -472,7 +472,8 @@ fn grouped_worktrees(
     grouped
 }
 
-fn resolved_worktree(path: &str) -> Option<String> {
+/// Resolve an absolute worktree path to its canonical spelling; `None` for relative, vanished or unreadable paths. Filesystem I/O: call off the UI loop.
+pub(crate) fn resolved_worktree(path: &str) -> Option<String> {
     let path = std::path::Path::new(path);
     if !path.is_absolute() {
         return None;

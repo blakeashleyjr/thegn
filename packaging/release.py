@@ -1322,6 +1322,173 @@ def atomic_write_output(output_dir: Path, files: Mapping[Path, str]) -> None:
             os.replace(backup, output_dir)
 
 
+def _attestation_value(value: Any, key: str) -> Any:
+    if not isinstance(value, dict) or key not in value:
+        raise ReleaseError(f"malformed attestation verification: missing {key}")
+    return value[key]
+
+
+def _attestation_string(value: Any, key: str) -> str:
+    result = _attestation_value(value, key)
+    if not isinstance(result, str):
+        raise ReleaseError(f"malformed attestation verification: missing {key}")
+    return result
+
+
+def _attestation_excerpt(value: str) -> str:
+    return repr(value[:200])
+
+
+def check_attestation_verification(
+    verification: Any,
+    *,
+    archive_sha256: str,
+    repository: str,
+    server_url: str,
+    source_digest: str,
+    run_id: str,
+) -> int:
+    arguments = {
+        "archive_sha256": (archive_sha256, SHA256_RE),
+        "source_digest": (source_digest, re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")),
+    }
+    for name, (value, pattern) in arguments.items():
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            shown = repr(value)[:200]
+            raise ReleaseError(f"invalid attestation check argument {name}: {shown}")
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9]+", run_id) is None:
+        raise ReleaseError(f"invalid attestation check argument run_id: {repr(run_id)[:200]}")
+    if (
+        not isinstance(repository, str)
+        or repository.count("/") != 1
+        or any(not part for part in repository.split("/"))
+    ):
+        raise ReleaseError(
+            f"invalid attestation check argument repository: {repr(repository)[:200]}"
+        )
+    if (
+        not isinstance(server_url, str)
+        or not server_url.startswith("https://")
+        or server_url.endswith("/")
+    ):
+        raise ReleaseError(
+            f"invalid attestation check argument server_url: {repr(server_url)[:200]}"
+        )
+    if not isinstance(verification, list) or not verification:
+        raise ReleaseError("malformed attestation verification: expected a non-empty array")
+
+    expected_repository = f"{server_url}/{repository}"
+    expected_workflow = f"{expected_repository}/.github/workflows/release.yml@"
+    expected_run = f"{expected_repository}/actions/runs/{run_id}/"
+    for element in verification:
+        if not isinstance(element, dict):
+            raise ReleaseError("malformed attestation verification: expected an object")
+        result = _attestation_value(element, "verificationResult")
+        if not isinstance(result, dict):
+            raise ReleaseError("malformed attestation verification: missing verificationResult")
+        signature = _attestation_value(result, "signature")
+        if not isinstance(signature, dict):
+            raise ReleaseError("malformed attestation verification: missing signature")
+        certificate = _attestation_value(signature, "certificate")
+        if not isinstance(certificate, dict):
+            raise ReleaseError("malformed attestation verification: missing certificate")
+        statement = _attestation_value(result, "statement")
+        if not isinstance(statement, dict):
+            raise ReleaseError("malformed attestation verification: missing statement")
+
+        source_repository = _attestation_string(certificate, "sourceRepositoryURI")
+        if source_repository != expected_repository:
+            raise ReleaseError(
+                "attestation names the wrong repository: "
+                f"{_attestation_excerpt(source_repository)}"
+            )
+        signer = _attestation_string(certificate, "buildSignerURI")
+        if not signer.startswith(expected_workflow):
+            raise ReleaseError(
+                "attestation names the wrong signer workflow: "
+                f"{_attestation_excerpt(signer)}"
+            )
+        source_commit = _attestation_string(certificate, "sourceRepositoryDigest")
+        if source_commit != source_digest:
+            raise ReleaseError(
+                "attestation names the wrong source commit: "
+                f"{_attestation_excerpt(source_commit)}"
+            )
+        runner = _attestation_string(certificate, "runnerEnvironment")
+        if runner != "github-hosted":
+            raise ReleaseError(
+                f"attestation was built by an untrusted runner: {_attestation_excerpt(runner)}"
+            )
+        invocation = _attestation_string(certificate, "runInvocationURI")
+        if not invocation.startswith(expected_run):
+            raise ReleaseError(
+                "attestation is not bound to this workflow run: "
+                f"{_attestation_excerpt(invocation)}"
+            )
+
+        subjects = _attestation_value(statement, "subject")
+        if not isinstance(subjects, list) or not subjects:
+            raise ReleaseError("malformed attestation verification: missing subject")
+        matching_subject = False
+        for subject in subjects:
+            if not isinstance(subject, dict):
+                raise ReleaseError("malformed attestation verification: expected subject object")
+            subject_digest = _attestation_value(subject, "digest")
+            if not isinstance(subject_digest, dict):
+                raise ReleaseError("malformed attestation verification: missing subject digest")
+            digest = _attestation_string(subject_digest, "sha256")
+            if digest == archive_sha256:
+                matching_subject = True
+        if not matching_subject:
+            raise ReleaseError("attestation subject digest does not match the archive")
+    return len(verification)
+
+
+def load_attestation_verification(path: Path) -> Any:
+    descriptor: int | None = None
+    try:
+        path_metadata = path.lstat()
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise ReleaseError(f"attestation verification is not a regular file: {path}")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ReleaseError(f"cannot inspect attestation verification {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ReleaseError(f"attestation verification is not a regular file: {path}")
+    if metadata.st_size > MAX_ARCHIVE_BYTES:
+        os.close(descriptor)
+        raise ReleaseError(f"attestation verification {path} exceeds {MAX_ARCHIVE_BYTES} bytes")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ReleaseError(
+                    f"attestation verification {path} has duplicate JSON key {name}"
+                )
+            value[name] = item
+        return value
+
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_ARCHIVE_BYTES + 1)
+            if len(raw) > MAX_ARCHIVE_BYTES:
+                raise ReleaseError(
+                    f"attestation verification {path} exceeds {MAX_ARCHIVE_BYTES} bytes"
+                )
+            return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ReleaseError(f"cannot read attestation verification {path}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _run(args: argparse.Namespace) -> None:
     if args.command == "verify-assets":
         if RELEASE_TAG_RE.fullmatch(args.tag) is None:
@@ -1330,6 +1497,17 @@ def _run(args: argparse.Namespace) -> None:
         verified = verify_release_asset_files(entries, args.asset)
         for name in verified:
             print(f"{name}: matches the release manifest")
+        return
+    if args.command == "verify-attestation":
+        count = check_attestation_verification(
+            load_attestation_verification(args.verification),
+            archive_sha256=_sha256(args.archive),
+            repository=args.repository,
+            server_url=args.server_url,
+            source_digest=args.source_digest,
+            run_id=args.run_id,
+        )
+        print(f"{args.archive.name}: {count} attestation(s) bound to this run")
         return
     manifest_path = args.manifest.resolve()
     root = args.repo_root.resolve()
@@ -1476,6 +1654,13 @@ def build_parser() -> argparse.ArgumentParser:
     verify_assets_parser.add_argument("--asset", required=True, type=Path, action="append")
     verify_assets_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     verify_assets_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
+    verify_attestation_parser = subparsers.add_parser("verify-attestation")
+    verify_attestation_parser.add_argument("--archive", required=True, type=Path)
+    verify_attestation_parser.add_argument("--verification", required=True, type=Path)
+    verify_attestation_parser.add_argument("--repository", required=True)
+    verify_attestation_parser.add_argument("--server-url", required=True)
+    verify_attestation_parser.add_argument("--source-digest", required=True)
+    verify_attestation_parser.add_argument("--run-id", required=True)
     return parser
 
 

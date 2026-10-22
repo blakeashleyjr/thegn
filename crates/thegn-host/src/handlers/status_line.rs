@@ -142,7 +142,7 @@ impl StatusScheduler {
         #[cfg(test)]
         let started_for_worker = _started.clone();
         let worker = std::thread::Builder::new()
-            .name("status-timer".into())
+            .name("thegn-status-tm".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 #[cfg(test)]

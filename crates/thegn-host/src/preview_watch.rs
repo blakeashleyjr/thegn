@@ -22,7 +22,7 @@ pub(crate) fn spawn_probe(
     tx: UnboundedSender<crate::preview::ProbeResult>,
     waker: TerminalWaker,
 ) {
-    let spawn = std::thread::Builder::new().name("preview-probe".into()).spawn(move || {
+    let spawn = std::thread::Builder::new().name("thegn-prev-prb".into()).spawn(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let backoff = [0, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
         let mut pending: Vec<(crate::preview::ProbeRequest, Vec<SocketAddr>)> = requests
@@ -119,7 +119,7 @@ pub(crate) fn spawn_scan(
     waker: TerminalWaker,
 ) {
     let _ = std::thread::Builder::new()
-        .name("preview-scan".into())
+        .name("thegn-prev-scan".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let configured = configured_ports

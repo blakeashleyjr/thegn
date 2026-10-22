@@ -114,12 +114,15 @@ impl std::error::Error for Retryable {
     }
 }
 
-/// Emit one machine-readable JSON document (compact, single line, no ANSI) on
-/// stdout. The `--json` convention for list-shaped read commands: exactly one
-/// document per invocation, shape treated as a stable API. (`notify list
-/// --json` predates this and stays NDJSON; `doctor --json` keeps its object.)
+/// Emit one machine-readable JSON document on stdout (compact, single line, no
+/// ANSI). Control and Unicode format characters use `\u` escapes, so the
+/// terminal never receives them raw (THE-507); the parsed value is unchanged.
+/// The `--json` convention for list-shaped read commands: exactly one document
+/// per invocation, shape treated as a stable API. (`notify list --json`
+/// predates this and stays NDJSON; `doctor --json` keeps its object.)
 pub fn emit_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
-    thegn_core::outln!("{}", serde_json::to_string(value)?);
+    let json = serde_json::to_string(value)?;
+    thegn_core::outln!("{}", thegn_core::pipeline_report::json_terminal_safe(&json));
     Ok(())
 }
 

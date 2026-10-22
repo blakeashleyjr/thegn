@@ -179,6 +179,66 @@ pub struct Output {
     pub stderr: String,
     pub elapsed_ms: u128,
 }
+
+pub struct Running {
+    child: Owned,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    started: Instant,
+    sequence: usize,
+}
+impl Running {
+    pub fn pid(&self) -> u32 {
+        self.child.child.as_ref().unwrap().id()
+    }
+
+    pub fn sequence(&self) -> usize {
+        self.sequence
+    }
+
+    pub fn finish(mut self) -> Output {
+        let deadline = self.started + COMMAND_DEADLINE;
+        loop {
+            for path in [&self.stdout, &self.stderr] {
+                assert!(
+                    fs::metadata(path).unwrap().len() <= OUTPUT_LIMIT,
+                    "private output exceeded monitored limit"
+                );
+            }
+            if self.child.exited().expect("observe private command") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "private command deadline (30 seconds)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.collect()
+    }
+
+    pub fn kill(mut self) -> Output {
+        self.collect()
+    }
+
+    fn collect(&mut self) -> Output {
+        let status = self
+            .child
+            .settle()
+            .expect("private child/group settlement failed; custody retained");
+        assert!(
+            !self.child.cleanup_failed,
+            "private group cleanup returned an error"
+        );
+        Output {
+            status,
+            stdout: text(&self.stdout),
+            stderr: text(&self.stderr),
+            elapsed_ms: self.started.elapsed().as_millis(),
+        }
+    }
+}
+
 fn text(path: &Path) -> String {
     let mut bytes = Vec::new();
     File::open(path)
@@ -190,7 +250,7 @@ fn text(path: &Path) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-pub fn run(mut command: Command, root: Arc<tempfile::TempDir>, sequence: usize) -> Output {
+pub fn start(mut command: Command, root: Arc<tempfile::TempDir>, sequence: usize) -> Running {
     let stdout = root.path().join(format!("receipts/{sequence}.stdout"));
     let stderr = root.path().join(format!("receipts/{sequence}.stderr"));
     command
@@ -198,36 +258,17 @@ pub fn run(mut command: Command, root: Arc<tempfile::TempDir>, sequence: usize) 
         .stdout(File::create(&stdout).unwrap())
         .stderr(File::create(&stderr).unwrap());
     let started = Instant::now();
-    let deadline = started + COMMAND_DEADLINE;
-    let mut child = Owned::spawn(&mut command, root, sequence);
+    let child = Owned::spawn(&mut command, root, sequence);
     drop(command);
-    loop {
-        for path in [&stdout, &stderr] {
-            assert!(
-                fs::metadata(path).unwrap().len() <= OUTPUT_LIMIT,
-                "private output exceeded monitored limit"
-            );
-        }
-        if child.exited().expect("observe private command") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "private command deadline (30 seconds)"
-        );
-        std::thread::sleep(Duration::from_millis(5));
+    Running {
+        child,
+        stdout,
+        stderr,
+        started,
+        sequence,
     }
-    let status = child
-        .settle()
-        .expect("private child/group settlement failed; custody retained");
-    assert!(
-        !child.cleanup_failed,
-        "private group cleanup returned an error"
-    );
-    Output {
-        status,
-        stdout: text(&stdout),
-        stderr: text(&stderr),
-        elapsed_ms: started.elapsed().as_millis(),
-    }
+}
+
+pub fn run(command: Command, root: Arc<tempfile::TempDir>, sequence: usize) -> Output {
+    start(command, root, sequence).finish()
 }

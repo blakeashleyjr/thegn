@@ -329,7 +329,7 @@ fn capture(
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let capped = Arc::clone(&capped);
         let spawned = std::thread::Builder::new()
-            .name("thegn-preview-io".into())
+            .name("thegn-prev-io".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let mut buf = Vec::new();

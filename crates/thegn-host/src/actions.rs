@@ -518,7 +518,7 @@ pub(crate) fn spawn_ci_action(
 /// run; this fills the drill. On any fetch error we fall back to the cached run
 /// so the modal still shows the header rather than crashing or spawning a pane.
 pub(crate) fn spawn_ci_detail(
-    session: &Session,
+    worktree: std::path::PathBuf,
     cfg: &thegn_core::config::CiConfig,
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
@@ -526,7 +526,7 @@ pub(crate) fn spawn_ci_detail(
     generation: Option<crate::hydrate_schedule::ScheduleFence>,
 ) {
     use thegn_core::ci::CiState;
-    let wt = active_tab_path(session);
+    let wt = worktree;
     let cfg = cfg.clone();
     let tx = refresh_tx.clone();
     let waker = waker.clone();
@@ -553,6 +553,7 @@ pub(crate) fn spawn_ci_detail(
         if cfg.log_cache_runs == 0 {
             let payload = crate::detail::CiDetailPayload {
                 run: detail,
+                origin: wt.clone(),
                 discarded_jobs,
                 incomplete,
                 log_tail: Vec::new(),
@@ -626,13 +627,11 @@ pub(crate) fn spawn_ci_detail(
                 })
             };
             if let Some(mut entry) = entry {
-                let redacted = thegn_core::ci_log::redact(&entry.text);
-                let (text, truncated) = thegn_core::ci_log::bounded_window(
-                    &redacted,
-                    cfg.log_tail_lines
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                    cfg.log_max_bytes
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                let (text, truncated) = thegn_core::ci_log::served_window(
+                    &entry.text,
+                    None,
+                    cfg.log_tail_lines,
+                    cfg.log_max_bytes,
                 );
                 entry.text = text;
                 entry.truncated |= truncated;
@@ -647,6 +646,7 @@ pub(crate) fn spawn_ci_detail(
         }
         let payload = crate::detail::CiDetailPayload {
             run: detail,
+            origin: wt.clone(),
             discarded_jobs,
             incomplete,
             log_tail,
@@ -1908,16 +1908,17 @@ impl CiActionCtx<'_> {
     /// swapped to the run's header in place). The result lands back in the modal
     /// via `RefreshKind::CiDetail` — no pane is spawned (that one-shot pane was
     /// the "crashed quickly" bug: it printed and exited instantly).
-    fn drill_ci_detail(&mut self, run: thegn_core::ci::CiRun) {
+    fn drill_ci_detail(
+        &mut self,
+        run: thegn_core::ci::CiRun,
+        overlay: Option<&mut crate::detail::DetailOverlay>,
+    ) {
         self.model.status = "Fetching CI run detail\u{2026}".into();
-        spawn_ci_detail(
-            self.session,
-            &self.cfg.ci,
-            self.refresh_tx,
-            self.waker,
-            run,
-            None,
-        );
+        let wt = active_tab_path(self.session);
+        if let Some(ov) = overlay {
+            ov.bind_ci_origin(&run.id, &wt);
+        }
+        spawn_ci_detail(wt, &self.cfg.ci, self.refresh_tx, self.waker, run, None);
     }
 
     /// Force a CI run-history refetch (the `g` key): bypasses the `[ci]
@@ -2007,7 +2008,7 @@ impl CiActionCtx<'_> {
             // Intercepted by the loop's Act arm, which owns the monitor slot
             // and the saved prefs this needs. Unreachable here.
             DetailAction::OpenMonitor { .. } => {}
-            DetailAction::DrillCiRun { run } => self.drill_ci_detail(*run),
+            DetailAction::DrillCiRun { run } => self.drill_ci_detail(*run, overlay.as_mut()),
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)
             }
@@ -2184,7 +2185,7 @@ impl CiActionCtx<'_> {
             .map(|run| (*run).clone())
         {
             *overlay = Some(crate::detail::overlay_for_run(&run));
-            self.drill_ci_detail(run.clone());
+            self.drill_ci_detail(run.clone(), overlay.as_mut());
         }
     }
 

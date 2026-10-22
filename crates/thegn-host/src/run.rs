@@ -717,6 +717,12 @@ pub async fn main(
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
+    if let Some(dir) = crate::daemon::socket_path(&cfg.daemon)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        thegn_core::sandbox_control_guard::publish_control_socket_dir(dir.to_path_buf());
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // The refresh channel is created HERE rather than at the ticker spawn below
@@ -7703,22 +7709,24 @@ async fn event_loop<T: Terminal>(
     // layout may survive. Tab/worktree switches reuse the same rects and must
     // NOT trigger this: a full repaint flashes the whole center.
     let mut full_repaint = true;
-    // Consecutive transient terminal-write failures (EIO); reset on a clean
-    // flush, torn down only when it persists past `frame_write::RETRY_MAX`.
-    let mut frame_write_errs: u32 = 0;
     let mut clear_on_next_frame = false;
     // Our own Change→escape serializer (undercurl + underline-color capable);
     // `THEGN_RENDERER=termwiz` falls back to the stock renderer.
     let mut wire_renderer = crate::wire::WireRenderer::new();
     wire_renderer.set_depth(crate::caps::color_depth());
     let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
+    let mut termwiz_frames = if use_termwiz_renderer {
+        Some(crate::frame_write::TermwizFrames::from_env()?)
+    } else {
+        None
+    };
     // The terminal writer thread: owns every stdout write inside the loop so
     // a slow outer terminal never blocks it (see `frame_writer`). Sync mode
-    // (termwiz debug renderer, or THEGN_SYNC_WRITER=1) writes inline.
+    // bounds termwiz debug-renderer frames and THEGN_SYNC_WRITER=1 writes.
     let writer = crate::frame_writer::FrameWriter::spawn(
         waker.clone(),
         crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
-        !use_termwiz_renderer,
+        true,
     );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
     // When set, `palette` is the dedicated drawer picker. Its stable
@@ -9834,34 +9842,96 @@ async fn event_loop<T: Terminal>(
                 last_pool_reconcile = Some(std::time::Instant::now());
                 let cfg = current_config.clone();
                 let wk = waker.clone();
+                let tx = refresh_tx.clone();
                 task::spawn_blocking(move || {
-                    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
-                    let chip = if loc.is_remote()
-                        && let Ok(db) = thegn_core::db::Db::open()
-                    {
-                        // (repo_root, repo, env) via the worktree's EFFECTIVE
-                        // env — see `lifecycle::pool_context` for why never
-                        // the default.
-                        let (repo_root, repo, env_name) =
-                            crate::lifecycle::pool_context(&db, &cfg, &wt, &loc);
-                        // Hide the display-only chip on a target read error; reconcile_pool
-                        // below halts and warns on that same error before changing the pool.
-                        let target =
-                            crate::lifecycle::effective_pool_target(&db, &cfg, &repo, &env_name)
-                                .unwrap_or(0);
-                        let ready = db
-                            .pool_spares_for(&repo, &env_name)
-                            .unwrap_or_default()
-                            .iter()
-                            .filter(|s| s.state == "ready")
-                            .count();
-                        let wk2 = wk.clone();
-                        crate::lifecycle::reconcile_pool(&cfg, &repo_root, &env_name, move || {
-                            let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                        });
-                        (target > 0).then_some((ready, target))
-                    } else {
-                        None
+                    let loc =
+                        thegn_core::remote::GitLoc::for_worktree_checked(std::path::Path::new(&wt));
+                    let chip = match loc {
+                        Err(_) => {
+                            if let Some(message) = crate::lifecycle::pool_ledger_open_failed(&wt)
+                                && let Err(error) = tx.send(RefreshKind::Toast {
+                                    message,
+                                    priority: thegn_core::notification::Priority::Alert,
+                                })
+                            {
+                                tracing::debug!(
+                                    target: "thegn::lifecycle",
+                                    %error,
+                                    "pool halt toast receiver is gone"
+                                );
+                            }
+                            None
+                        }
+                        Ok(loc) if loc.is_remote() => {
+                            let db = match thegn_core::db::Db::open() {
+                                Ok(db) => db,
+                                Err(_) => {
+                                    if let Some(message) =
+                                        crate::lifecycle::pool_ledger_open_failed(&wt)
+                                        && let Err(error) = tx.send(RefreshKind::Toast {
+                                            message,
+                                            priority: thegn_core::notification::Priority::Alert,
+                                        })
+                                    {
+                                        tracing::debug!(
+                                            target: "thegn::lifecycle",
+                                            %error,
+                                            "pool halt toast receiver is gone"
+                                        );
+                                    }
+                                    *crate::lifecycle::pool_chip()
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = Some((wt, None));
+                                    let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                                    return;
+                                }
+                            };
+                            crate::lifecycle::clear_pool_ledger_open_failure(&wt);
+                            // (repo_root, repo, env) via the worktree's EFFECTIVE
+                            // env — see `lifecycle::pool_context` for why never
+                            // the default.
+                            let (repo_root, repo, env_name) =
+                                crate::lifecycle::pool_context(&db, &cfg, &wt, &loc);
+                            // Hide the display-only chip on a target read error; reconcile_pool
+                            // below halts and warns on that same error before changing the pool.
+                            let target = crate::lifecycle::effective_pool_target(
+                                &db, &cfg, &repo, &env_name,
+                            )
+                            .unwrap_or(0);
+                            let ready = db
+                                .pool_spares_for(&repo, &env_name)
+                                .unwrap_or_default()
+                                .iter()
+                                .filter(|s| s.state == "ready")
+                                .count();
+                            let wk2 = wk.clone();
+                            let outcome = crate::lifecycle::reconcile_pool(
+                                &cfg,
+                                &repo_root,
+                                &env_name,
+                                move || {
+                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                                },
+                            );
+                            if let Some(message) =
+                                crate::lifecycle::halt_toast(&repo, &env_name, &outcome)
+                                && let Err(error) = tx.send(RefreshKind::Toast {
+                                    message,
+                                    priority: thegn_core::notification::Priority::Alert,
+                                })
+                            {
+                                tracing::debug!(
+                                    target: "thegn::lifecycle",
+                                    %error,
+                                    "pool halt toast receiver is gone"
+                                );
+                            }
+                            (target > 0).then_some((ready, target))
+                        }
+                        Ok(_) => {
+                            crate::lifecycle::clear_pool_ledger_open_failure(&wt);
+                            None
+                        }
                     };
                     *crate::lifecycle::pool_chip()
                         .lock()
@@ -10551,7 +10621,7 @@ async fn event_loop<T: Terminal>(
                                         key.clone(),
                                         run_palette_db::PaletteRows::PickerSeed(
                                             Vec::new(),
-                                            std::collections::HashSet::new(),
+                                            crate::workspace_picker::PickerExclusions::default(),
                                         ),
                                     );
                                     let run_palette_db::PaletteRows::PickerSeed(seed, excluded) =
@@ -12039,6 +12109,8 @@ async fn event_loop<T: Terminal>(
             // on the next media push) and the `Some` vs `None` panel diff defeats
             // both the idle guard and the hunk-preview cache on every tick.
             next_model.panel.media = model.panel.media.take();
+            // Loop-owned watcher health follows its now-playing snapshot.
+            next_model.media_stale = model.media_stale;
             // Same contract for AI-account usage: loop-owned (the usage poller
             // pushes it), so hydration must carry it or the badge blanks on
             // every 2s tick and reappears only on the next poll.
@@ -13577,6 +13649,8 @@ async fn event_loop<T: Terminal>(
             media_position_visible,
             &mut last_media_full,
         );
+        model.media_stale = model.panel.media.is_some()
+            && panel_ui.media.health == crate::media_watch::MediaHealth::Degraded;
         if let Some(outcome) = crate::media_ctl::take_op_outcome() {
             model.status = outcome.status_text().into();
             dirty = true;
@@ -15357,7 +15431,7 @@ async fn event_loop<T: Terminal>(
         // (damage stays armed and coalesces; the slow terminal's drain rate
         // paces the frame rate). Checked BEFORE the wire renderer runs, whose
         // SGR state must only advance for frames that are actually delivered.
-        let writer_busy = !use_termwiz_renderer && !writer.frame_slot_free();
+        let writer_busy = !writer.frame_slot_free();
         let should_render = have_damage
             && !writer_busy
             && match crate::loop_policy::frame_gate(
@@ -16211,6 +16285,9 @@ async fn event_loop<T: Terminal>(
                 front.flush_changes_older_than(seq);
                 wire.push(clear);
                 wire_renderer.invalidate();
+                if let Some(frames) = termwiz_frames.as_mut() {
+                    frames.reset();
+                }
                 preview_gfx.invalidate();
                 // A cleared screen loses the corner image too; replay its last draw
                 // after this frame's cells.
@@ -16223,6 +16300,9 @@ async fn event_loop<T: Terminal>(
                 tracing::debug!(target: "thegn::frame", "resync");
                 front = Surface::new(cols, rows);
                 wire_renderer.invalidate();
+                if let Some(frames) = termwiz_frames.as_mut() {
+                    frames.reset();
+                }
                 last_resync = std::time::Instant::now();
             }
             // Bounded diff: the incremental path recomposed just a few rects
@@ -16331,12 +16411,9 @@ async fn event_loop<T: Terminal>(
             let seq = scratch.current_seqno();
             scratch.flush_changes_older_than(seq);
             wire.extend(pending);
-            // Write the frame. The wire-renderer path goes through the writer
-            // thread (`frame_writer`): the loop never blocks on a slow outer
-            // terminal, and transient/fatal write errors surface via
-            // `writer.take_status()` at the next wake. The termwiz debug
-            // renderer keeps the old synchronous path (it writes via the
-            // BufferedTerminal) with its inline retry handling.
+            // Both renderers submit frames through the writer FIFO. The termwiz
+            // debug renderer runs in sync mode (`want_sync`), so each frame
+            // waits up to SYNC_WRITE_BOUND and a timeout is Fatal.
             let input_close = if crate::perf::enabled() {
                 crate::perf_timing::classify_input(
                     input_at,
@@ -16353,46 +16430,15 @@ async fn event_loop<T: Terminal>(
                 }
             };
             let flush_t0 = std::time::Instant::now();
-            if use_termwiz_renderer {
-                let stamp = crate::perf_timing::FrameStamp::capture(frame_input_at);
-                let frame_write = crate::frame_write::emit_frame(
-                    true,
-                    buf,
-                    &mut wire_renderer,
-                    &mut recorder,
-                    &wire,
-                    false,
-                );
-                if stamp.is_some() {
-                    writer.record_external_frame(
-                        stamp,
-                        flush_t0,
-                        std::time::Instant::now(),
-                        matches!(&frame_write, crate::frame_write::FrameWrite::Ok),
-                    );
-                }
-                match frame_write {
-                    crate::frame_write::FrameWrite::Ok => frame_write_errs = 0,
-                    crate::frame_write::FrameWrite::Transient
-                        if frame_write_errs < crate::frame_write::RETRY_MAX =>
-                    {
-                        frame_write_errs += 1;
-                        tracing::warn!(
-                            target: "thegn::frame",
-                            attempt = frame_write_errs,
-                            "transient terminal write error; forcing full repaint + retry"
-                        );
-                        full_repaint = true;
-                        dirty = true;
-                        continue;
-                    }
-                    crate::frame_write::FrameWrite::Transient => {
-                        return Err(anyhow::anyhow!(
-                            "terminal writes failed {} times running (EIO); tearing down",
-                            frame_write_errs
-                        ));
-                    }
-                    crate::frame_write::FrameWrite::Fatal(e) => return Err(e),
+            if let Some(frames) = termwiz_frames.as_mut() {
+                let bytes = frames.render(&wire, cols, rows)?;
+                if !writer.submit_frame(
+                    bytes,
+                    crate::perf_timing::FrameStamp::capture(frame_input_at),
+                ) {
+                    full_repaint = true;
+                    dirty = true;
+                    continue;
                 }
             } else {
                 // The wire renderer's SGR state advances only for frames that
@@ -26691,7 +26737,7 @@ async fn event_loop<T: Terminal>(
                                     key.clone(),
                                     run_palette_db::PaletteRows::PickerSeed(
                                         Vec::new(),
-                                        std::collections::HashSet::new(),
+                                        crate::workspace_picker::PickerExclusions::default(),
                                     ),
                                 );
                                 let run_palette_db::PaletteRows::PickerSeed(seed, excluded) = rows
@@ -26776,7 +26822,7 @@ async fn event_loop<T: Terminal>(
                                     key.clone(),
                                     run_palette_db::PaletteRows::PickerSeed(
                                         Vec::new(),
-                                        std::collections::HashSet::new(),
+                                        crate::workspace_picker::PickerExclusions::default(),
                                     ),
                                 );
                                 let run_palette_db::PaletteRows::PickerSeed(seed, excluded) = rows

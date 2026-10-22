@@ -3,9 +3,10 @@
 mod custody;
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -20,6 +21,8 @@ use thegn_core::store::WorktreeAuxStore;
 const GATE: &str = "if [ -f red-gate-marker ]; then printf 'private-red-gate\\n'; exit 1; fi; printf 'private-green-gate\\n'";
 // The credential-free queue-agent hold (THE-419): no sandbox, and autonomous agents never fall back to the host.
 const HOLD: &str = "no sandbox could be established for the queued agent in ";
+
+type StartedCommand = (Vec<String>, BTreeMap<String, Option<String>>);
 
 fn lexical_tool(name: &str) -> PathBuf {
     let found = PathBuf::from(
@@ -61,10 +64,27 @@ struct Fixture {
     config: PathBuf,
     serial: usize,
     binary_hash: String,
+    started: BTreeMap<usize, StartedCommand>,
+}
+struct FixtureOpts {
+    gate: String,
+    auto_land: bool,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with(FixtureOpts {
+            gate: GATE.to_owned(),
+            auto_land: false,
+        })
+    }
+
+    fn with(options: FixtureOpts) -> Self {
         let root = Arc::new(tempfile::tempdir().unwrap());
+        let gate_command = if options.gate.is_empty() {
+            race_gate(root.path())
+        } else {
+            options.gate
+        };
         for name in [
             "repo", "bin", "hooks", "state", "config", "cache", "runtime", "tmp", "receipts",
         ] {
@@ -125,7 +145,7 @@ memory_total = "off"
 [merge_queue]
 enabled = true
 target_branch = "main"
-auto_land = false
+auto_land = {auto_land}
 snapshot_dirty = false
 organize_folders = false
 on_landed = "off"
@@ -145,7 +165,8 @@ agent_sandbox = true
 agent_isolation_floor = "guest-kernel"
 agent_on_floor_miss = "fail"
 "#,
-            gate = serde_json::to_string(GATE).unwrap(),
+            gate = serde_json::to_string(&gate_command).unwrap(),
+            auto_land = options.auto_land,
             command = serde_json::to_string(&command).unwrap()
         );
         let errors = thegn_core::config::validate_str(&text);
@@ -165,19 +186,30 @@ agent_on_floor_miss = "fail"
         assert_eq!(cfg.sandbox.limits.memory_total.as_deref(), Some("off"));
         let mq = &cfg.merge_queue;
         assert!(mq.enabled && mq.gate_on && mq.agent_sandbox);
-        assert!(
-            !mq.auto_land
-                && !mq.snapshot_dirty
-                && !mq.organize_folders
-                && !mq.sign_commits
-                && !mq.gate_reuse_worktree
-        );
+        if !options.auto_land && gate_command == GATE {
+            assert!(
+                !mq.auto_land
+                    && !mq.snapshot_dirty
+                    && !mq.organize_folders
+                    && !mq.sign_commits
+                    && !mq.gate_reuse_worktree
+            );
+            assert_eq!(mq.gate_command, GATE);
+        } else {
+            assert!(
+                !mq.snapshot_dirty
+                    && !mq.organize_folders
+                    && !mq.sign_commits
+                    && !mq.gate_reuse_worktree
+            );
+            assert_eq!(mq.auto_land, options.auto_land);
+            assert_eq!(mq.gate_command, gate_command);
+        }
         assert_eq!(mq.on_landed, OnLanded::Off);
         assert_eq!(mq.conflict_handoff, ConflictHandoff::Agent);
         assert_eq!(mq.agent_isolation_floor, IsolationFloor::GuestKernel);
         assert_eq!(mq.agent_on_floor_miss, OnFloorMiss::Fail);
         assert_eq!(mq.agent_max_attempts, 3);
-        assert_eq!(mq.gate_command, GATE);
         assert!(mq.regenerate_paths.is_empty() && mq.gate_target_dir.is_empty());
         assert_eq!(
             thegn_core::agent_task::resolve_agent(&cfg, &mq.agent, &mq.agent_command),
@@ -192,6 +224,7 @@ agent_on_floor_miss = "fail"
             config,
             serial: 0,
             binary_hash: digest(Path::new(env!("CARGO_BIN_EXE_thegn"))),
+            started: BTreeMap::new(),
             root,
         };
         assert!(!fixture.db_path().exists());
@@ -270,6 +303,64 @@ agent_on_floor_miss = "fail"
             out.stderr
         );
         out
+    }
+
+    fn start_cli(&mut self, args: &[&str]) -> custody::Running {
+        self.serial += 1;
+        let mut argv = vec!["--config", self.config.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        let command = self.command(Path::new(env!("CARGO_BIN_EXE_thegn")), &self.repo, &argv);
+        let rendered = std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|entry| entry.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(!environment.contains_key("HOME") && !environment.contains_key("THEGN_PROFILE"));
+        self.started.insert(self.serial, (rendered, environment));
+        custody::start(command, Arc::clone(&self.root), self.serial)
+    }
+
+    fn finish_cli(&mut self, running: custody::Running) -> custody::Output {
+        let sequence = running.sequence();
+        let out = running.finish();
+        self.record_cli_output(sequence, &out);
+        out
+    }
+
+    fn kill_cli(&mut self, running: custody::Running) -> custody::Output {
+        let sequence = running.sequence();
+        let out = running.kill();
+        self.record_cli_output(sequence, &out);
+        out
+    }
+
+    fn record_cli_output(&mut self, sequence: usize, out: &custody::Output) {
+        let (argv, environment) = self.started.remove(&sequence).unwrap();
+        let cleanup: Value = serde_json::from_slice(
+            &fs::read(
+                self.root
+                    .path()
+                    .join(format!("receipts/{sequence}.cleanup.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cleanup["leader_reaped"].as_bool().unwrap());
+        assert!(!cleanup["retained"].as_bool().unwrap());
+        assert!(!cleanup["identity_lost"].as_bool().unwrap());
+        fs::write(
+            self.root.path().join(format!("receipts/{sequence}.json")),
+            serde_json::to_vec_pretty(&json!({"sequence":sequence,"argv":argv,"environment":environment,"thegn_binary_sha256":self.binary_hash,"exit_code":out.status.code(),"elapsed_ms":out.elapsed_ms,"stdout":out.stdout,"stderr":out.stderr,"cleanup":cleanup})).unwrap(),
+        )
+        .unwrap();
     }
     fn git(&mut self, cwd: &Path, args: &[&str]) -> String {
         let command = self.command(&self.root.path().join("bin/git"), cwd, args);
@@ -378,6 +469,202 @@ agent_on_floor_miss = "fail"
         )
         .unwrap();
     }
+}
+
+fn race_gate(root: &Path) -> String {
+    let starts = thegn_core::util::sh_quote(root.join("gate-runs").to_str().unwrap());
+    let hold = thegn_core::util::sh_quote(root.join("gate-hold").to_str().unwrap());
+    let open = thegn_core::util::sh_quote(root.join("gate-open").to_str().unwrap());
+    format!(
+        "printf 'start %s\\n' \"$$\" >> {starts}; if [ -p {hold} ] && [ ! -e {open} ]; then IFS= read -r _ < {hold}; fi; printf 'end %s\\n' \"$$\" >> {starts}; printf 'private-green-gate\\n'"
+    )
+}
+
+fn make_gate_fifo(root: &Path) {
+    let path = std::ffi::CString::new(root.join("gate-hold").to_str().unwrap()).unwrap();
+    // SAFETY: path is a valid NUL-terminated private fixture path; mode limits
+    // the FIFO to the test's owner.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+struct GateReleaseGuard {
+    root: PathBuf,
+    armed: bool,
+}
+
+impl GateReleaseGuard {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GateReleaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let open = self.root.join("gate-open");
+        if let Err(error) = fs::write(&open, "open\n") {
+            tracing::debug!(path = %open.display(), %error, "could not mark race gate open during cleanup");
+        }
+
+        let fifo_path = self.root.join("gate-hold");
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo_path)
+        {
+            Ok(mut fifo) => {
+                if let Err(error) = fifo.write_all(b"continue\n") {
+                    tracing::debug!(path = %fifo_path.display(), %error, "could not release race gate during cleanup");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(path = %fifo_path.display(), %error, "could not open race gate FIFO during cleanup");
+            }
+        }
+    }
+}
+
+fn release_gate(root: &Path) {
+    let path = root.join("gate-hold");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut fifo = loop {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(fifo) => break fifo,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for the blocked gate to open its FIFO reader"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => panic!("could not open gate FIFO for release: {error}"),
+        }
+    };
+    fifo.write_all(b"continue\n").unwrap();
+}
+
+fn gate_log(root: &Path) -> String {
+    match fs::read_to_string(root.join("gate-runs")) {
+        Ok(log) => log,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("could not read gate log: {error}"),
+    }
+}
+
+fn gate_count(root: &Path, event: &str) -> usize {
+    gate_log(root)
+        .lines()
+        .filter(|line| line.starts_with(event))
+        .count()
+}
+
+fn wait_gate_count(root: &Path, event: &str, expected: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let observed = gate_count(root, event);
+        if observed == expected {
+            return;
+        }
+        assert!(
+            observed < expected && std::time::Instant::now() < deadline,
+            "timed out waiting for {expected} `{event}` gate records (observed {observed}); log: {}",
+            gate_log(root)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn one_row_fixture(options: FixtureOpts) -> Fixture {
+    let mut fixture = Fixture::with(options);
+    let repo = fixture.repo.clone();
+    let feature = fixture.held.clone();
+    fixture.git(&repo, &["init", "-q", "-b", "main"]);
+    for (key, value) in [
+        ("user.name", "private-drain"),
+        ("user.email", "private@example.invalid"),
+        ("commit.gpgsign", "false"),
+        ("core.fsmonitor", "false"),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+    ] {
+        fixture.git(&repo, &["config", key, value]);
+    }
+    fixture.git(
+        &repo,
+        &[
+            "config",
+            "core.hooksPath",
+            fixture.root.path().join("hooks").to_str().unwrap(),
+        ],
+    );
+    fs::write(repo.join("base.txt"), "base\n").unwrap();
+    fixture.git(&repo, &["add", "base.txt"]);
+    fixture.git(&repo, &["commit", "-qm", "base"]);
+    fixture.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "feature",
+            feature.to_str().unwrap(),
+        ],
+    );
+    fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+    fixture.git(&feature, &["add", "feature.txt"]);
+    fixture.git(&feature, &["commit", "-qm", "feature"]);
+    fixture.cli(&["merge", "add", feature.to_str().unwrap()]);
+    fixture
+}
+
+struct RowState {
+    status: String,
+    agent_attempts: i64,
+    generation: i64,
+    phase: String,
+    result_oid: Option<String>,
+}
+
+fn row_state(fixture: &Fixture) -> RowState {
+    let connection = Connection::open(fixture.db_path()).unwrap();
+    connection
+        .query_row(
+            "SELECT status,agent_attempts,claim_generation,claim_phase,result_oid FROM merge_queue",
+            [],
+            |row| {
+                Ok(RowState {
+                    status: row.get(0)?,
+                    agent_attempts: row.get(1)?,
+                    generation: row.get(2)?,
+                    phase: row.get(3)?,
+                    result_oid: row.get(4)?,
+                })
+            },
+        )
+        .unwrap()
+}
+
+fn expire_lease(fixture: &Fixture, worktree: &str) {
+    let connection = Connection::open(fixture.db_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE merge_queue SET claim_lease_until_ms=?2 WHERE worktree=?1",
+            rusqlite::params![worktree, thegn_core::util::now_ms() - 1],
+        )
+        .unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -688,4 +975,193 @@ fn real_cli_conflict_hold_continues_then_plain_drain_recovers_same_row() {
 #[test]
 fn real_cli_red_gate_hold_continues_then_plain_drain_recovers_same_row() {
     exercise(Case::RedGate);
+}
+
+// Both CLI processes use custody-owned groups and the same private fixture DB.
+// A holds its gate in the gate runner's separate group after RowClaim admission;
+// no lease time is simulated, so B observes A's live claim and emits the
+// claimed-by-another warning before attempting the gate (merge_driver.rs:761-779).
+// Releasing A lets its gate pass and the drain writes `ready` then releases the
+// claim (merge_driver.rs:1075-1088, 1478-1481). Thus only one gate start occurs,
+// B changes neither attempts nor generation/status, and the target ref remains
+// at its captured value because this fixture disables auto-land.
+#[test]
+fn race_two_cli_drains_have_one_owner() {
+    let mut f = one_row_fixture(FixtureOpts {
+        gate: String::new(),
+        auto_land: false,
+    });
+    let repo = f.repo.clone();
+    let before_ref = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    let root = f.root.path().to_path_buf();
+    make_gate_fifo(&root);
+    let mut gate_release = GateReleaseGuard::new(&root);
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    assert!(owner.pid() > 0);
+    wait_gate_count(&root, "start ", 1);
+    let owner_claimed = row_state(&f);
+    let loser = f.json(&["merge", "drain", "--json"]);
+    assert!(loser["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning.as_str().is_some_and(|warning| {
+            warning.contains("feature") && warning.contains("claimed by another drain")
+        })
+    }));
+    assert_eq!(gate_count(&root, "start "), 1);
+    let after_loser = row_state(&f);
+    assert_eq!(
+        after_loser.agent_attempts, owner_claimed.agent_attempts,
+        "loser must not consume attempts"
+    );
+    assert_eq!(
+        after_loser.generation, owner_claimed.generation,
+        "loser must not claim the row"
+    );
+    assert_eq!(after_loser.status, owner_claimed.status);
+    release_gate(&root);
+    let winner = f.finish_cli(owner);
+    assert!(winner.status.success());
+    let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
+    assert_eq!(winner_json["ready"], json!(["feature"]));
+    assert_eq!(row_state(&f).status, "ready");
+    assert_eq!(row_state(&f).phase, "unclaimed");
+    assert_eq!(gate_count(&root, "start "), 1);
+    assert_eq!(f.git(&repo, &["rev-parse", "refs/heads/main"]), before_ref);
+    gate_release.disarm();
+    f.close();
+}
+
+// The fixture gives each CLI a custody-owned process group, while
+// `integrate_gate::Workspace::spawn` puts the gate in its own group. SIGKILL
+// therefore kills owner A but leaves its FIFO-blocked gate to write `end`.
+// The lease is the only simulated fact (`expire_lease` sets it to now - 1);
+// A's claim wrote `folding`, generation, and attempts in the real DB. Recovery
+// admits with `queued` (merge_driver.rs:797-825), writes `folding` at
+// merge_driver.rs:911, and the Ready arm writes `ready` at merge_driver.rs:1075-1088;
+// claim finish releases it at merge_driver.rs:1478-1481. Finish preserves the
+// attempt count. Thus gate starts/ends are 2/2 and the killed owner's signal
+// status is SIGKILL.
+#[test]
+fn race_killed_owner_row_is_recovered_after_lease_expiry() {
+    let mut f = one_row_fixture(FixtureOpts {
+        gate: String::new(),
+        auto_land: false,
+    });
+    let root = f.root.path().to_path_buf();
+    let worktree = f.held.to_string_lossy().into_owned();
+    make_gate_fifo(&root);
+    let mut gate_release = GateReleaseGuard::new(&root);
+    let before = row_state(&f);
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    wait_gate_count(&root, "start ", 1);
+    let killed = f.kill_cli(owner);
+    assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
+    let crashed = row_state(&f);
+    assert_eq!(crashed.status, "folding");
+    assert_ne!(crashed.phase, "unclaimed");
+    // The gate runs in its own process group and outlives the killed drain.
+    release_gate(&root);
+    wait_gate_count(&root, "end ", 1);
+    // Only the lease clock is simulated; claim generation, status, and owner
+    // state were written by the killed CLI process itself.
+    expire_lease(&f, &worktree);
+    fs::write(root.join("gate-open"), "open\n").unwrap();
+    let recovered = f.json(&["merge", "drain", "--json"]);
+    let after = row_state(&f);
+    assert_eq!(after.status, "ready");
+    assert_eq!(after.phase, "unclaimed");
+    assert!(
+        after.generation > crashed.generation,
+        "recovery must advance the fencing generation"
+    );
+    assert_eq!(
+        after.agent_attempts, before.agent_attempts,
+        "recovery preserves agent attempts"
+    );
+    assert!(
+        recovered["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| {
+                warning
+                    .as_str()
+                    .is_none_or(|warning| !warning.contains("not claimable"))
+            })
+    );
+    assert_eq!(gate_count(&root, "start "), 2);
+    assert_eq!(gate_count(&root, "end "), 2);
+    gate_release.disarm();
+    f.close();
+}
+
+// CLI A owns the first FIFO-blocked gate in its own process group; its lease
+// is expired in SQLite while A is still alive. CLI C recovers with a new claim
+// generation, folds and passes the now-open gate, then CAS-advances
+// `refs/heads/main` and writes `landed` plus the result OID. When A's gate is
+// released, `attempt_land` sees C's target commit as an ancestor and returns
+// `UpToDate` (integrate.rs:2938-2943); the UpToDate arm writes `landed` and
+// `stop_on_write_error!` catches a lost write (merge_driver.rs:1061-1064,
+// 877-889). Claim finish's Err(_) arm deduplicates the warning
+// (merge_driver.rs:1478-1522). Hence A exits 0, cannot change the landed row/ref,
+// and total gate starts/ends are 2/2.
+#[test]
+fn race_late_former_owner_cannot_overwrite_recovered_row() {
+    let mut f = one_row_fixture(FixtureOpts {
+        gate: String::new(),
+        auto_land: true,
+    });
+    let root = f.root.path().to_path_buf();
+    let repo = f.repo.clone();
+    let worktree = f.held.to_string_lossy().into_owned();
+    make_gate_fifo(&root);
+    let mut gate_release = GateReleaseGuard::new(&root);
+    let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    wait_gate_count(&root, "start ", 1);
+    expire_lease(&f, &worktree);
+    fs::write(root.join("gate-open"), "open\n").unwrap();
+    let recovered = f.json(&["merge", "drain", "--json"]);
+    assert_eq!(recovered["landed"], json!(["feature"]));
+    let after_recovery = row_state(&f);
+    assert_eq!(after_recovery.status, "landed");
+    let result_oid = after_recovery
+        .result_oid
+        .clone()
+        .expect("landed row records result oid");
+    assert_ne!(result_oid, "");
+    assert_ne!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before,
+        "recovered drain advances the target once"
+    );
+    let target_after_recovery = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(target_after_recovery, result_oid);
+    release_gate(&root);
+    let former = f.finish_cli(owner);
+    assert_eq!(former.status.code(), Some(0));
+    let former_json: Value = serde_json::from_str(&former.stdout).unwrap();
+    assert!(
+        former_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                warning.as_str()
+                    == Some("feature: merge claim lost; another drain recovered the row")
+            })
+    );
+    let final_row = row_state(&f);
+    assert_eq!(final_row.status, "landed");
+    assert_eq!(final_row.phase, "unclaimed");
+    assert_eq!(final_row.result_oid.as_deref(), Some(result_oid.as_str()));
+    assert_eq!(final_row.generation, after_recovery.generation);
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_after_recovery,
+        "late former owner must not move target after recovery"
+    );
+    assert_eq!(gate_count(&root, "start "), 2);
+    assert_eq!(gate_count(&root, "end "), 2);
+    gate_release.disarm();
+    f.close();
 }

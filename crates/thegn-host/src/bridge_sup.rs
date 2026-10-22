@@ -289,13 +289,22 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
     None
 }
 
+/// The program of an ssh transport prefix: the last `/`- or `\`-separated
+/// component is exactly `ssh`, or `ssh.exe` in any ASCII case (Windows
+/// OpenSSH; Windows file names are case-insensitive).
+fn is_ssh_program(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or("");
+    name == "ssh"
+        || (name.len() == 7
+            && name.as_bytes()[..3].eq_ignore_ascii_case(b"ssh")
+            && name.as_bytes()[3..].eq_ignore_ascii_case(b".exe"))
+}
+
 fn ssh_self_bridge(control_prefix: &[String]) -> bool {
     let thegn_self_bridge = control_prefix.len() == 4
         && matches!(control_prefix[1].as_str(), "vps-ssh" | "machine0-ssh")
         && control_prefix[3] == "--";
-    let ssh_program_prefix = control_prefix.len() >= 2
-        && std::path::Path::new(&control_prefix[0]).file_name()
-            == Some(std::ffi::OsStr::new("ssh"));
+    let ssh_program_prefix = control_prefix.len() >= 2 && is_ssh_program(&control_prefix[0]);
 
     thegn_self_bridge || ssh_program_prefix
 }
@@ -317,9 +326,9 @@ fn provider_bridge_argv(control_prefix: &[String], bridge: &ResidentBridge) -> O
 /// Build the transport command that runs `thegn bridge` *inside* the env for a
 /// placement, or `None` when no bridge applies (local / k8s-for-now). Provider
 /// launches re-hash the resident bridge before exec; ssh transports (thegn's
-/// self-bridges and a configured `ssh` `exec_command`) receive that wrapper as
-/// one shell-quoted word. The agent reads framed requests on stdin and writes
-/// responses/notifications on stdout.
+/// self-bridges and a configured `ssh`/`ssh.exe` `exec_command`) receive that
+/// wrapper as one shell-quoted word. The agent reads framed requests on stdin
+/// and writes responses/notifications on stdout.
 pub fn bridge_command(placement: &Placement, bridge: Option<&ResidentBridge>) -> Option<Command> {
     match placement {
         Placement::Ssh(t) => {
@@ -830,6 +839,85 @@ mod tests {
             assert_eq!(&argv[..prefix.len()], prefix.as_slice());
             assert_eq!(argv.last(), Some(&thegn_core::util::sh_join(&verified)));
         }
+    }
+
+    #[test]
+    fn provider_bridge_ssh_exec_windows_program_gets_one_quoted_word() {
+        let bridge = resident_bridge_for(b"provider bridge");
+        let verified = verified_exec_argv(&bridge, &["bridge".to_string()]);
+        let prefixes: [Vec<String>; 5] = [
+            vec!["ssh.exe".into(), "box".into(), "--".into()],
+            vec!["SSH.EXE".into(), "box".into(), "--".into()],
+            vec![
+                "Ssh.Exe".into(),
+                "-p".into(),
+                "2222".into(),
+                "u@h".into(),
+                "--".into(),
+            ],
+            vec![
+                r"C:\Windows\System32\OpenSSH\ssh.exe".into(),
+                "box".into(),
+                "--".into(),
+            ],
+            vec!["C:/Program Files/OpenSSH/ssh.exe".into(), "box".into()],
+        ];
+
+        for prefix in prefixes {
+            let argv = provider_bridge_argv(&prefix, &bridge).expect("Windows ssh provider argv");
+
+            assert_eq!(argv.len(), prefix.len() + 1, "prefix: {prefix:?}");
+            assert_eq!(
+                &argv[..prefix.len()],
+                prefix.as_slice(),
+                "prefix: {prefix:?}"
+            );
+            assert_eq!(
+                argv.last(),
+                Some(&thegn_core::util::sh_join(&verified)),
+                "prefix: {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_bridge_ssh_exec_windows_program_rule() {
+        let cases = [
+            ("ssh", true),
+            ("/usr/bin/ssh", true),
+            ("ssh.exe", true),
+            ("SSH.EXE", true),
+            ("sSh.ExE", true),
+            (r"C:\x\ssh.exe", true),
+            ("C:/x/ssh.exe", true),
+            (r"relative\ssh", true),
+            ("SSH", false),
+            ("ssh.exe.bak", false),
+            ("sshd.exe", false),
+            ("ssh.cmd", false),
+            ("ssh.bat", false),
+            ("autossh.exe", false),
+            ("plink.exe", false),
+            ("ssh.exe ", false),
+            (r"C:\x\ssh.exe\", false),
+            ("", false),
+            ("ssh-wrapper", false),
+            ("sshé.exe", false),
+        ];
+
+        for (program, expected) in cases {
+            assert_eq!(is_ssh_program(program), expected, "program: {program:?}");
+        }
+    }
+
+    #[test]
+    fn provider_bridge_ssh_exec_windows_lone_program_keeps_separate_args() {
+        let prefix = vec!["ssh.exe".to_string()];
+        let bridge = resident_bridge_for(b"provider bridge");
+        let mut expected = prefix.clone();
+        expected.extend(verified_exec_argv(&bridge, &["bridge".to_string()]));
+
+        assert_eq!(provider_bridge_argv(&prefix, &bridge), Some(expected));
     }
 
     #[test]

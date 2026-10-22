@@ -9,7 +9,7 @@
 //! shared `workspace_create` flows. The discovery channel is owned here (like
 //! `search_everywhere::PaletteSession`) so the loop only adds a one-line drain.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -42,6 +42,7 @@ pub(crate) struct RepoEntry {
     pub(crate) path: String,
     pub(crate) name: String,
     haystack: String,
+    identity: Option<String>,
 }
 
 #[derive(Debug)]
@@ -49,6 +50,7 @@ enum DiscoveryEvent {
     Batch {
         generation: u64,
         paths: Vec<String>,
+        ids: Vec<Option<String>>,
     },
     Finished {
         generation: u64,
@@ -118,24 +120,75 @@ pub(crate) enum PickerOutcome {
     Manual(String),
 }
 
+/// Registered-workspace paths and filesystem identities, plus identities for
+/// seed paths. All identities are computed off the UI loop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PickerExclusions {
+    paths: HashSet<String>,
+    ids: HashSet<String>,
+    seed_ids: HashMap<String, String>,
+}
+
+impl From<HashSet<String>> for PickerExclusions {
+    fn from(paths: HashSet<String>) -> Self {
+        Self {
+            paths,
+            ..Self::default()
+        }
+    }
+}
+
+impl PickerExclusions {
+    pub(crate) fn contains(&self, path: &str) -> bool {
+        self.paths.contains(path)
+    }
+
+    fn excludes_identity(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn seed_identity(&self, path: &str) -> Option<String> {
+        self.seed_ids.get(path).cloned()
+    }
+}
+
 /// The picker's instant seed: most-recent first (frecency for the empty
 /// query), then every other repo the DB knows, deduped in order and
 /// stat-filtered to dirs that still exist — PLUS the set of already-registered
 /// workspace paths. Repos already added as workspaces (they live in the
 /// `workspaces` table and show in the sidebar) are excluded from the seed, and
-/// the returned set is carried into the picker so streamed-in discovery results
-/// are filtered the same way. Plain "recent" repos that were merely opened but
-/// never registered are kept.
-pub(crate) fn picker_seed(db: &thegn_core::db::Db) -> (Vec<String>, HashSet<String>) {
-    let added: HashSet<String> = db
+/// the returned exclusions are carried into the picker so streamed-in discovery
+/// results are filtered the same way. Plain "recent" repos that were merely
+/// opened but never registered are kept.
+pub(crate) fn picker_seed(db: &thegn_core::db::Db) -> (Vec<String>, PickerExclusions) {
+    let paths: HashSet<String> = db
         .workspaces()
         .unwrap_or_default()
         .into_iter()
         .map(|w| w.repo_path)
         .collect();
+    let mut exclusions = PickerExclusions {
+        ids: paths
+            .iter()
+            .filter_map(|path| thegn_core::util::file_identity(std::path::Path::new(path)))
+            .collect(),
+        paths,
+        ..PickerExclusions::default()
+    };
     let mut out: Vec<String> = Vec::new();
+    let mut seed_ids = HashSet::new();
     let mut push = |p: String| {
-        if !added.contains(&p) && !out.contains(&p) && std::path::Path::new(&p).is_dir() {
+        let Some(id) = thegn_core::util::file_identity(std::path::Path::new(&p)) else {
+            return;
+        };
+        if !exclusions.contains(&p)
+            && !exclusions.excludes_identity(&id)
+            && !out.contains(&p)
+            && !seed_ids.contains(&id)
+            && std::path::Path::new(&p).is_dir()
+        {
+            seed_ids.insert(id.clone());
+            exclusions.seed_ids.insert(p.clone(), id);
             out.push(p);
         }
     };
@@ -145,7 +198,14 @@ pub(crate) fn picker_seed(db: &thegn_core::db::Db) -> (Vec<String>, HashSet<Stri
     for p in db.known_repos().unwrap_or_default() {
         push(p);
     }
-    (out, added)
+    (out, exclusions)
+}
+
+fn discovery_identities(paths: &[String]) -> Vec<Option<String>> {
+    paths
+        .iter()
+        .map(|path| thegn_core::util::file_identity(std::path::Path::new(path)))
+        .collect()
 }
 
 /// A tiny single-line editor: a text buffer plus a char-aware cursor. Enough
@@ -264,9 +324,11 @@ pub(crate) struct WorkspacePicker {
     items: Vec<RepoEntry>,
     /// Paths in `items`, so discovery and seed merges dedup in O(1) on the event loop.
     item_paths: HashSet<String>,
+    /// Filesystem identities for current items, computed by off-loop producers.
+    item_ids: HashSet<String>,
     /// Already-registered workspace paths, kept out of both the seed and any
     /// discovery results streamed in later.
-    excluded: HashSet<String>,
+    excluded: PickerExclusions,
     /// Indices into `items`, best match first (seed order when query empty).
     /// Discovery appends are ranked incrementally; query edits and seed reorders
     /// fully recompute this list.
@@ -300,7 +362,7 @@ impl Drop for WorkspacePicker {
     }
 }
 
-fn entry(path: String) -> RepoEntry {
+fn entry(path: String, identity: Option<String>) -> RepoEntry {
     let name = std::path::Path::new(&path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -310,19 +372,32 @@ fn entry(path: String) -> RepoEntry {
         path,
         name,
         haystack,
+        identity,
     }
 }
 
 impl WorkspacePicker {
-    pub(crate) fn new(seed: Vec<String>, excluded: HashSet<String>) -> Self {
+    pub(crate) fn new(seed: Vec<String>, excluded: impl Into<PickerExclusions>) -> Self {
         let (result_tx, result_rx) = tokio::sync::mpsc::channel(4);
-        let items = seed.into_iter().map(entry).collect::<Vec<_>>();
+        let excluded = excluded.into();
+        let items = seed
+            .into_iter()
+            .map(|path| {
+                let identity = excluded.seed_identity(&path);
+                entry(path, identity)
+            })
+            .collect::<Vec<_>>();
+        let item_ids = items
+            .iter()
+            .filter_map(|item| item.identity.clone())
+            .collect();
         let mut p = Self {
             mode: PickerMode::Fuzzy,
             phase: Phase::Browse,
             query: TextField::default(),
             manual: TextField::default(),
             item_paths: items.iter().map(|item| item.path.clone()).collect(),
+            item_ids,
             items,
             excluded,
             matches: Vec::new(),
@@ -368,7 +443,7 @@ impl WorkspacePicker {
         key: &str,
         generation: u64,
         seed: Vec<String>,
-        excluded: HashSet<String>,
+        excluded: impl Into<PickerExclusions>,
     ) -> bool {
         if !self.db_pending
             || self.db_key.as_deref() != Some(key)
@@ -387,16 +462,41 @@ impl WorkspacePicker {
         }
     }
 
-    pub(crate) fn apply_db_seed(&mut self, seed: Vec<String>, excluded: HashSet<String>) {
-        let mut items = seed.into_iter().map(entry).collect::<Vec<_>>();
+    pub(crate) fn apply_db_seed(
+        &mut self,
+        seed: Vec<String>,
+        excluded: impl Into<PickerExclusions>,
+    ) {
+        let excluded = excluded.into();
+        let mut items = seed
+            .into_iter()
+            .map(|path| {
+                let identity = excluded.seed_identity(&path);
+                entry(path, identity)
+            })
+            .collect::<Vec<_>>();
         let mut paths: HashSet<String> = items.iter().map(|item| item.path.clone()).collect();
+        let mut ids: HashSet<String> = items
+            .iter()
+            .filter_map(|item| item.identity.clone())
+            .collect();
         for existing in &self.items {
-            if !excluded.contains(&existing.path) && paths.insert(existing.path.clone()) {
+            if !excluded.contains(&existing.path)
+                && !existing
+                    .identity
+                    .as_ref()
+                    .is_some_and(|id| excluded.excludes_identity(id) || ids.contains(id))
+                && paths.insert(existing.path.clone())
+            {
+                if let Some(id) = &existing.identity {
+                    ids.insert(id.clone());
+                }
                 items.push(existing.clone());
             }
         }
         self.items = items;
         self.item_paths = paths;
+        self.item_ids = ids;
         self.excluded = excluded;
         self.recompute();
     }
@@ -483,8 +583,13 @@ impl WorkspacePicker {
                 thegn_core::repo::DiscoveryBudget::default(),
                 &cancel,
                 |paths| {
+                    let ids = discovery_identities(&paths);
                     if tx
-                        .blocking_send(DiscoveryEvent::Batch { generation, paths })
+                        .blocking_send(DiscoveryEvent::Batch {
+                            generation,
+                            paths,
+                            ids,
+                        })
                         .is_err()
                     {
                         return false;
@@ -542,11 +647,24 @@ impl WorkspacePicker {
         let old_len = self.items.len();
         while let Ok(event) = self.result_rx.try_recv() {
             match event {
-                DiscoveryEvent::Batch { generation, paths } if generation == self.generation => {
+                DiscoveryEvent::Batch {
+                    generation,
+                    paths,
+                    ids,
+                } if generation == self.generation => {
                     changed = true;
-                    for p in paths {
-                        if !self.excluded.contains(&p) && self.item_paths.insert(p.clone()) {
-                            self.items.push(entry(p));
+                    for (index, p) in paths.into_iter().enumerate() {
+                        let id = ids.get(index).cloned().flatten();
+                        if !self.excluded.contains(&p)
+                            && !id.as_ref().is_some_and(|id| {
+                                self.excluded.excludes_identity(id) || self.item_ids.contains(id)
+                            })
+                            && self.item_paths.insert(p.clone())
+                        {
+                            if let Some(id) = &id {
+                                self.item_ids.insert(id.clone());
+                            }
+                            self.items.push(entry(p, id));
                         }
                     }
                 }
@@ -1255,6 +1373,7 @@ mod tests {
             .try_send(DiscoveryEvent::Batch {
                 generation: 7,
                 paths: vec!["/code/seeded".into(), "/code/found".into()],
+                ids: Vec::new(),
             })
             .unwrap();
         assert!(p.drain_discovery());
@@ -1285,6 +1404,7 @@ mod tests {
             .try_send(DiscoveryEvent::Batch {
                 generation: 7,
                 paths: vec!["/b".into(), "/c".into()],
+                ids: Vec::new(),
             })
             .unwrap();
         assert!(p.drain_discovery());
@@ -1324,6 +1444,7 @@ mod tests {
                 .try_send(DiscoveryEvent::Batch {
                     generation: 7,
                     paths: batch,
+                    ids: Vec::new(),
                 })
                 .unwrap();
             assert!(p.drain_discovery());
@@ -1359,6 +1480,7 @@ mod tests {
                 .try_send(DiscoveryEvent::Batch {
                     generation: 7,
                     paths,
+                    ids: Vec::new(),
                 })
                 .unwrap();
             assert!(p.drain_discovery());
@@ -1397,6 +1519,7 @@ mod tests {
                 .try_send(DiscoveryEvent::Batch {
                     generation: 7,
                     paths,
+                    ids: Vec::new(),
                 })
                 .unwrap();
             assert!(p.drain_discovery());
@@ -1452,6 +1575,7 @@ mod tests {
             .try_send(DiscoveryEvent::Batch {
                 generation: 7,
                 paths: vec!["/code/python".into(), "/code/go".into()],
+                ids: Vec::new(),
             })
             .unwrap();
 
@@ -1471,6 +1595,7 @@ mod tests {
                 .try_send(DiscoveryEvent::Batch {
                     generation: 7,
                     paths,
+                    ids: Vec::new(),
                 })
                 .unwrap();
             assert!(p.drain_discovery());
@@ -1502,6 +1627,7 @@ mod tests {
             .try_send(DiscoveryEvent::Batch {
                 generation: 7,
                 paths: vec!["/excluded".into(), "/included".into()],
+                ids: Vec::new(),
             })
             .unwrap();
 
@@ -1512,6 +1638,149 @@ mod tests {
     }
 
     #[test]
+    fn discovered_alias_of_a_registered_workspace_is_not_offered() {
+        let exclusions = PickerExclusions {
+            ids: HashSet::from(["1:2".to_string()]),
+            ..PickerExclusions::default()
+        };
+        let mut p = WorkspacePicker::new(Vec::new(), exclusions);
+        p.scanning = true;
+        p.generation = 7;
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/alias/repo".into()],
+                ids: vec![Some("1:2".into())],
+            })
+            .unwrap();
+
+        assert!(p.drain_discovery());
+        assert!(p.items.is_empty());
+        assert!(p.item_paths.is_empty());
+    }
+
+    #[test]
+    fn discovered_alias_of_a_seed_repo_is_shown_once() {
+        let exclusions = PickerExclusions {
+            seed_ids: HashMap::from([("/real/repo".to_string(), "9:9".to_string())]),
+            ..PickerExclusions::default()
+        };
+        let mut p = WorkspacePicker::new(vec!["/real/repo".into()], exclusions);
+        p.scanning = true;
+        p.generation = 7;
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/link/repo".into()],
+                ids: vec![Some("9:9".into())],
+            })
+            .unwrap();
+
+        assert!(p.drain_discovery());
+        assert_eq!(
+            p.items
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/real/repo"]
+        );
+    }
+
+    #[test]
+    fn apply_db_seed_drops_a_discovered_alias_of_a_newly_registered_workspace() {
+        let mut p = picker(&[]);
+        p.scanning = true;
+        p.generation = 7;
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/link/repo".into()],
+                ids: vec![Some("5:5".into())],
+            })
+            .unwrap();
+        assert!(p.drain_discovery());
+
+        p.apply_db_seed(
+            Vec::new(),
+            PickerExclusions {
+                ids: HashSet::from(["5:5".to_string()]),
+                ..PickerExclusions::default()
+            },
+        );
+
+        assert!(p.items.is_empty());
+        assert!(p.item_paths.is_empty());
+        assert!(p.item_ids.is_empty());
+    }
+
+    #[test]
+    fn discovery_identities_match_for_two_spellings_of_one_directory() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let repo = temp.real_path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let real = repo.display().to_string();
+        let alias = temp.path().join("repo").display().to_string();
+        let identities = discovery_identities(&[
+            real.clone(),
+            alias.clone(),
+            temp.path().join("missing").display().to_string(),
+        ]);
+
+        assert_eq!(identities[0], identities[1]);
+        assert!(identities[0].is_some());
+        assert_eq!(identities[2], None);
+    }
+
+    #[test]
+    fn picker_seed_skips_a_recent_repo_registered_under_another_spelling() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let repo = temp.real_path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let db = thegn_core::db::Db::open_at(&temp.real_path().join("db.sqlite")).unwrap();
+        let linked = temp.path().join("repo").display().to_string();
+        let real = repo.display().to_string();
+        db.put_workspace(&linked, "repo", "repo").unwrap();
+        db.touch_repo(&real, "repo").unwrap();
+
+        let (seed, exclusions) = picker_seed(&db);
+        assert!(
+            !seed.contains(&real),
+            "registered alias leaked into seed: {seed:?}"
+        );
+        assert!(exclusions.contains(&linked));
+    }
+
+    #[test]
+    fn discovered_paths_without_identity_keep_exact_path_dedupe() {
+        // Positive control: exact-path fallback works even when the batch has no identities.
+        let mut p = picker(&["/a"]);
+        p.scanning = true;
+        p.generation = 7;
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/a".into(), "/b".into()],
+                ids: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(p.drain_discovery());
+        assert_eq!(
+            p.items
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/a", "/b"]
+        );
+    }
+
+    #[test]
     fn stale_discovery_generation_is_ignored() {
         let mut p = picker(&[]);
         p.generation = 2;
@@ -1519,6 +1788,7 @@ mod tests {
             .try_send(DiscoveryEvent::Batch {
                 generation: 1,
                 paths: vec!["/code/stale".into()],
+                ids: Vec::new(),
             })
             .unwrap();
         assert!(!p.drain_discovery());

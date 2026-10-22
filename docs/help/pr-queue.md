@@ -118,6 +118,10 @@ Each PR-agent run holds a durable per-PR lease, so the PR queue and CI autofix c
 
 While a PR agent's lease is live, other refresh passes skip that PR entirely: no merge, re-run or status change happens under a running agent.
 
+If thegn cannot confirm a running PR agent's lease before it expires, it stops
+the agent and reports that the next refresh re-evaluates the row.
+CI autofix reports the same lost-lease condition when it stops its PR agent.
+
 ## Review comment tasks
 
 An explicitly queued row whose `watch` includes `"review"` gets one durable
