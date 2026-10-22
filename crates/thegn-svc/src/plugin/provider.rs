@@ -527,6 +527,57 @@ done
     }
 
     #[test]
+    fn plugin_detail_keeps_partial_comments_marker() {
+        let (_fixture, _session, bridge) = live_bridge();
+        let backend = PluginIssueBackend::new(bridge, "demo", IssueCaps::default()).unwrap();
+        let detail = IssueDetail {
+            issue: Issue {
+                id: "plugin:demo:7".into(),
+                number: "7".into(),
+                provider: "plugin:demo".into(),
+                ..Default::default()
+            },
+            comments: vec![],
+            comments_complete: false,
+        };
+
+        let validated = backend.validate_detail(detail).unwrap();
+        assert!(!validated.comments_complete);
+    }
+
+    #[test]
+    fn plugin_detail_get_issue_keeps_partial_comments_marker_from_json() {
+        let script = r#"
+while read -r line; do
+  id=${line#*'"id":'}; id=${id%%,*}
+  printf '{"id":%s,"result":{"id":"plugin:demo:7","number":"7","provider":"plugin:demo","title":"partial issue","status":"todo","priority":"low","url":"","updated_at_ms":0,"comments":[],"comments_complete":false}}\n' "$id"
+done
+"#;
+        let bridge_slot: Arc<Mutex<Option<Arc<ProviderBridge>>>> = Arc::new(Mutex::new(None));
+        let route = bridge_slot.clone();
+        let fixture = FixtureSupervisor::new();
+        let session = fixture
+            .spawn(&sh(script), &BTreeMap::new(), None, move |event| {
+                if let SessionEvent::Response(response) = event
+                    && let Some(bridge) = route.lock().unwrap().as_ref()
+                {
+                    bridge.resolve(response);
+                }
+            })
+            .unwrap();
+        let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(2));
+        *bridge_slot.lock().unwrap() = Some(bridge.clone());
+        let backend = PluginIssueBackend::new(bridge, "demo", IssueCaps::default()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let detail = rt.block_on(backend.get_issue("plugin:demo:7")).unwrap();
+        assert!(!detail.comments_complete);
+    }
+
+    #[test]
     fn mutation_with_null_or_missing_result_is_not_success() {
         let script = r#"
 while read -r line; do
