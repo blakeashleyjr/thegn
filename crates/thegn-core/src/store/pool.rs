@@ -80,6 +80,10 @@ pub trait PoolStore {
     /// or `None` to use the derived `effective_provider_id`.
     fn worktree_provider_sandbox(&self, worktree: &str) -> Result<Option<String>>;
 
+    /// Spares that need an operator: every `quarantined` row and every `claimed` row no worktree row binds
+    /// (`worktrees.provider_sandbox_id`), oldest `updated_at` first (ties by name). An undecodable row is an error.
+    fn unattended_pool_spares(&self) -> Result<Vec<PoolSpare>>;
+
     /// The runtime pool-target override for `(repo, env)`, or `None` to fall back
     /// to the configured `[lifecycle.pool] size`; a read error is returned as
     /// `Err` and must not fall back to the configured size.
