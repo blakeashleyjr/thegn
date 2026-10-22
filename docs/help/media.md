@@ -50,6 +50,9 @@ local player, without leaving the compositor. Hidden unless
   status line; an empty list means there is nothing to pick.
 - A player with more than 100 playlists opens the picker with the first 100,
   and the status line says how many more were not shown.
+- With more than 64 players the player picker lists the first 64, and the
+  status line says more were not shown; the Media section shows
+  "+more sources not shown".
 - A control is skipped with “Media operation skipped because the player
   changed” if the selected player went away or another process took over its
   MPRIS name. Changing media configuration or player selection cancels waiting
