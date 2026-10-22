@@ -90,6 +90,71 @@ pub(crate) fn plan(
     }
 }
 
+/// Translate host control directories into the destination space of emitted binds.
+/// A failed canonicalization that could lexically match a bind is returned as an
+/// exposure so callers fail closed instead of guessing which path the bind shows.
+pub(crate) fn in_sandbox_paths(
+    control_dirs: &[PathBuf],
+    mounts: &[(&Path, &Path)],
+) -> (Vec<PathBuf>, Option<ControlExposure>) {
+    let mut translated = Vec::new();
+    for control_dir in control_dirs {
+        let canonical_control = canonicalize_with_missing_tail(control_dir);
+        for (host, dest) in mounts {
+            let canonical_host = std::fs::canonicalize(host);
+            let Some(control_path) = canonical_control.as_ref() else {
+                if control_dir.starts_with(host) {
+                    return (
+                        translated,
+                        Some(ControlExposure {
+                            control_dir: control_dir.clone(),
+                            visible_through: (*dest).to_path_buf(),
+                        }),
+                    );
+                }
+                continue;
+            };
+            let Ok(host_path) = canonical_host else {
+                if control_dir.starts_with(host) {
+                    return (
+                        translated,
+                        Some(ControlExposure {
+                            control_dir: control_dir.clone(),
+                            visible_through: (*dest).to_path_buf(),
+                        }),
+                    );
+                }
+                continue;
+            };
+            if let Ok(relative) = control_path.strip_prefix(&host_path) {
+                translated.push(dest.join(relative));
+            }
+        }
+    }
+    (normalize(translated), None)
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let mut current = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(current) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = current.file_name()?;
+                missing.push(name.to_os_string());
+                current = current.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 pub(crate) fn exposure(
     control_dirs: &[PathBuf],
     visible_roots: &[&Path],
@@ -97,7 +162,7 @@ pub(crate) fn exposure(
     control_dirs.iter().find_map(|control_dir| {
         visible_roots
             .iter()
-            .find(|root| control_dir.starts_with(**root))
+            .find(|root| control_dir.starts_with(**root) || root.starts_with(control_dir))
             .copied()
             .map(|root| ControlExposure {
                 control_dir: control_dir.clone(),
@@ -239,6 +304,97 @@ mod tests {
                 &[Path::new("/home"), Path::new("/run/user")]
             ),
             None
+        );
+    }
+
+    #[test]
+    fn planner_translates_a_control_dir_through_a_renamed_mount() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let control = root.path().join("run/thegn");
+        std::fs::create_dir_all(&control).unwrap();
+        let (translated, refusal) = in_sandbox_paths(
+            std::slice::from_ref(&control),
+            &[(root.path(), Path::new("/data"))],
+        );
+        assert_eq!(refusal, None);
+        assert_eq!(translated, paths(&["/data/run/thegn"]));
+        let visible = [Path::new("/data")];
+        let dirs = dir_set(&["/data/run/thegn"]);
+        assert_eq!(
+            plan(&translated, &visible, &[], &is_dir(&dirs)),
+            MaskPlan::Mask(paths(&["/data/run/thegn"]))
+        );
+    }
+
+    #[test]
+    fn planner_resolves_a_symlinked_control_path_before_mount_matching() {
+        let temp = crate::testenv::symlinked_tempdir();
+        let control = temp.path().join("run/thegn");
+        std::fs::create_dir_all(&control).unwrap();
+        let (translated, refusal) = in_sandbox_paths(
+            std::slice::from_ref(&control),
+            &[(temp.real_path(), Path::new("/data"))],
+        );
+        assert_eq!(refusal, None);
+        assert_eq!(translated, paths(&["/data/run/thegn"]));
+    }
+
+    #[test]
+    fn planner_keeps_a_missing_control_tail_beneath_a_canonical_mount() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let control = root.path().join("missing/run/thegn");
+        let (translated, refusal) = in_sandbox_paths(
+            std::slice::from_ref(&control),
+            &[(root.path(), Path::new("/data"))],
+        );
+        assert_eq!(refusal, None);
+        assert_eq!(translated, paths(&["/data/missing/run/thegn"]));
+    }
+
+    #[test]
+    fn planner_refuses_an_ambiguous_lexical_match_to_an_uncanonicalized_mount() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let missing_mount = root.path().join("missing");
+        let control = missing_mount.join("run/thegn");
+        let (translated, refusal) = in_sandbox_paths(
+            std::slice::from_ref(&control),
+            &[(missing_mount.as_path(), Path::new("/data"))],
+        );
+        assert!(translated.is_empty());
+        assert_eq!(
+            refusal,
+            Some(ControlExposure {
+                control_dir: control,
+                visible_through: PathBuf::from("/data"),
+            })
+        );
+    }
+
+    #[test]
+    fn planner_leaves_a_canonical_control_outside_all_mount_hosts_unmapped() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let control = root.path().join("run/thegn");
+        std::fs::create_dir_all(&control).unwrap();
+        let other = tempfile::tempdir_in("/tmp").unwrap();
+        let (translated, refusal) = in_sandbox_paths(
+            std::slice::from_ref(&control),
+            &[(other.path(), Path::new("/data"))],
+        );
+        assert!(translated.is_empty());
+        assert_eq!(refusal, None);
+    }
+
+    #[test]
+    fn exposure_reports_a_mount_inside_the_control_directory() {
+        assert_eq!(
+            exposure(
+                &paths(&["/run/user/42/thegn"]),
+                &[Path::new("/run/user/42/thegn/key")]
+            ),
+            Some(ControlExposure {
+                control_dir: PathBuf::from("/run/user/42/thegn"),
+                visible_through: PathBuf::from("/run/user/42/thegn/key"),
+            })
         );
     }
 
