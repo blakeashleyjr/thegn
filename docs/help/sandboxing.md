@@ -193,6 +193,12 @@ their mounts are fixed when the container is created. On bwrap,
 `file_access = "all"` or `"host"` exposes the host filesystem by design,
 including runtime paths; those modes do not hide the control socket.
 
+Standard, hardened, and sealed panes do not inherit `DBUS_SESSION_BUS_ADDRESS`.
+Bwrap unsets it, and systemd panes also cannot reach `$XDG_RUNTIME_DIR/bus` or
+`$XDG_RUNTIME_DIR/systemd`; `profile = "open"` keeps the address. An
+abstract-namespace session bus can still be reached from bwrap panes that share
+the host network, because the address is withheld but the network namespace is shared.
+
 ## Backends
 
 `[sandbox] backend = "auto"` walks the chain until one works:
