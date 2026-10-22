@@ -28,6 +28,7 @@
 //! in that namespace is the same filesystem principal, so token-only
 //! deployments must keep this private parent outside sandbox mounts. Migrate
 //! custom token-only sockets into a private per-user runtime/state directory.
+//! Lock contention fails closed after a bounded wait.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -363,11 +364,20 @@ fn io_error_with_path_context(
 /// probe→unlink→bind critical section for `sock`. The sidecar `<sock>.lock`
 /// is created once and NEVER unlinked (unlinking it would resurrect the very
 /// race it closes); the flock (std's `File::lock`) dies with the process, so
-/// it can't go stale. Contention lasts a probe + a bind (milliseconds), and
-/// the caller is already on a blocking thread. Failure is fatal: probing or
+/// it can't go stale. Acquisition is bounded by [`BIND_LOCK_WAIT`]; a held
+/// lock that exceeds the bound is a startup error, never a wait without end.
+/// The caller is already on a blocking thread. Failure is fatal: probing or
 /// unlinking without this lock can race another daemon endpoint.
 #[cfg(unix)]
 fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
+    bind_lock_with_wait(sock, BIND_LOCK_WAIT)
+}
+
+#[cfg(unix)]
+const BIND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(unix)]
+fn bind_lock_with_wait(sock: &Path, wait: std::time::Duration) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     let mut path = sock.as_os_str().to_owned();
@@ -420,9 +430,39 @@ fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
             ));
         }
     }
-    file.lock()
-        .map_err(|error| io_error_with_path_context(error, "lock control socket", sock))?;
-    Ok(file)
+    let deadline = std::time::Instant::now() + wait;
+    let mut interval = thegn_proc::POLL_INTERVAL;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(io_error_with_path_context(
+                    error,
+                    "lock control socket",
+                    sock,
+                ));
+            }
+        }
+        let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => {
+                return Err(io_error_with_path_context(
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "control socket lock is held by another process (waited {}ms)",
+                            wait.as_millis()
+                        ),
+                    ),
+                    "lock control socket",
+                    sock,
+                ));
+            }
+        };
+        std::thread::sleep(interval.min(remaining));
+        interval = thegn_proc::next_backoff(interval, remaining);
+    }
 }
 
 #[cfg_attr(not(unix), allow(dead_code))] // Unix-only production call site.
@@ -1344,6 +1384,89 @@ mod tests {
         );
 
         drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_fails_closed_while_another_holder_keeps_it() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("held.sock");
+        assert_socket_path_fits(&sock);
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(sock.with_extension("sock.lock"))
+            .unwrap();
+        holder.lock().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = bind_lock_with_wait(&sock, std::time::Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("held by another process"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!sock.exists(), "failed lock acquisition created a socket");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_acquires_once_the_holder_releases() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("held.sock");
+        assert_socket_path_fits(&sock);
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(sock.with_extension("sock.lock"))
+            .unwrap();
+        holder.lock().unwrap();
+        drop(holder);
+
+        assert!(bind_lock_with_wait(&sock, std::time::Duration::from_secs(2)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_lock_waits_out_a_brief_holder() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("held.sock");
+        assert_socket_path_fits(&sock);
+        let lock_path = sock.with_extension("sock.lock");
+        let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+        let holder_thread = std::thread::spawn(move || {
+            let holder = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(lock_path)
+                .unwrap();
+            holder.lock().unwrap();
+            locked_sender.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(holder);
+        });
+        locked_receiver.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(bind_lock_with_wait(&sock, std::time::Duration::from_secs(2)).is_ok());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        holder_thread.join().unwrap();
     }
 
     #[cfg(unix)]
