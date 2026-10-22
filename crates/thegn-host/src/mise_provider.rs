@@ -1218,7 +1218,7 @@ pub(crate) fn status(
     let path = worktree.to_string_lossy();
     let loc = GitLoc::from_db(
         &path,
-        db.and_then(|db| db.location_for(&path).ok().flatten())
+        db.and_then(|db| thegn_core::store::WorkspaceStore::location_for(db, &path).ok().flatten())
             .as_deref(),
     );
     if loc.is_remote() {
