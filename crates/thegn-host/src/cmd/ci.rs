@@ -442,7 +442,7 @@ fn log(
         // Cache rows have already been redacted and bounded. Re-apply the
         // configured policy so a later config change cannot widen a response.
         let redacted = thegn_core::ci_log::redact(&entry.text);
-        let (text, truncated) = thegn_core::ci_log::bounded_tail(
+        let (text, truncated) = thegn_core::ci_log::bounded_window(
             &redacted,
             cfg.ci
                 .log_tail_lines

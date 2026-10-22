@@ -627,7 +627,7 @@ pub(crate) fn spawn_ci_detail(
             };
             if let Some(mut entry) = entry {
                 let redacted = thegn_core::ci_log::redact(&entry.text);
-                let (text, truncated) = thegn_core::ci_log::bounded_tail(
+                let (text, truncated) = thegn_core::ci_log::bounded_window(
                     &redacted,
                     cfg.log_tail_lines
                         .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
