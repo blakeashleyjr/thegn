@@ -351,6 +351,19 @@ fn sidecar_record_missing_is_a_typed_refusal() {
 
     let result = recorded_sidecar("c-tgvpn");
     assert!(matches!(result, Err(ref error) if error.to_string().contains("no recorded runtime")));
+    let state = std::path::PathBuf::from(std::env::var("XDG_STATE_HOME").unwrap());
+    assert!(!state.join("thegn/vpn-runtime").exists());
+}
+
+#[test]
+fn sidecar_record_empty_runtime_prefix_has_specific_error() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+    let runtime = OciRuntime::new(Vec::new());
+
+    let result = record_sidecar(&runtime, "c-tgvpn");
+    assert!(
+        matches!(result, Err(ref error) if error.to_string().contains("has no runtime prefix to record"))
+    );
 }
 
 #[cfg(unix)]
@@ -369,7 +382,8 @@ fn sidecar_record_down_removes_only_on_matching_runtime() {
     let runtime_a = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
     let runtime_b = OciRuntime::new(vec!["other-runtime".into()]);
     record_sidecar(&runtime_a, "c-tgvpn").unwrap();
-    let provider = for_provider(&spec(ts_cfg()));
+    let s = spec(ts_cfg());
+    let provider = for_provider(&s);
 
     provider.down(&runtime_b, "c-tgvpn").unwrap();
     assert!(recorded_sidecar("c-tgvpn").is_ok());
