@@ -977,6 +977,13 @@ fn real_cli_red_gate_hold_continues_then_plain_drain_recovers_same_row() {
     exercise(Case::RedGate);
 }
 
+// Both CLI processes use custody-owned groups and the same private fixture DB.
+// A holds its gate in the gate runner's separate group after RowClaim admission;
+// no lease time is simulated, so B observes A's live claim and emits the
+// claimed-by-another warning before attempting the gate. Releasing A lets its
+// gate pass and the drain writes `ready` then releases the claim. Thus only one
+// gate start occurs, B changes neither attempts nor generation/status, and the
+// target ref remains at its captured value.
 #[test]
 fn race_two_cli_drains_have_one_owner() {
     let mut f = one_row_fixture(FixtureOpts {
@@ -1022,6 +1029,15 @@ fn race_two_cli_drains_have_one_owner() {
     f.close();
 }
 
+// The fixture gives each CLI a custody-owned process group, while
+// `integrate_gate::Workspace::spawn` puts the gate in its own group. SIGKILL
+// therefore kills owner A but leaves its FIFO-blocked gate to write `end`.
+// The lease is the only simulated fact (`expire_lease` sets it to now - 1);
+// A's claim wrote `folding`, generation, and attempts in the real DB. Recovery
+// admits with `queued`, advances the claim generation, writes `folding`, runs
+// the gate a second time, then `Ready` and claim finish produce `ready` and
+// `unclaimed`; finish preserves the attempt count. Thus gate starts/ends are
+// 2/2 and the killed owner's signal status is SIGKILL.
 #[test]
 fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     let mut f = one_row_fixture(FixtureOpts {
@@ -1076,6 +1092,15 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     f.close();
 }
 
+// CLI A owns the first FIFO-blocked gate in its own process group; its lease
+// is expired in SQLite while A is still alive. CLI C recovers with a new claim
+// generation, folds and passes the now-open gate, then CAS-advances
+// `refs/heads/main` and writes `landed` plus the result OID. When A's gate is
+// released, `attempt_land` first sees C's target commit as an ancestor and
+// returns `UpToDate`; A's `RowClaim::write` then returns MERGE_CLAIM_LOST,
+// `stop_on_write_error!` records the exact lost-claim warning, and the finish
+// path treats a lost-claim release error as a warning. Hence A exits 0, cannot
+// change the landed row/ref, and total gate starts/ends are 2/2.
 #[test]
 fn race_late_former_owner_cannot_overwrite_recovered_row() {
     let mut f = one_row_fixture(FixtureOpts {
@@ -1110,11 +1135,6 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
     assert_eq!(target_after_recovery, result_oid);
     release_gate(&root);
     let former = f.finish_cli(owner);
-    // After release, A's claim CAS returns Moved; its retry sees the branch as
-    // an ancestor and returns UpToDate. The Landed write is fenced with
-    // MERGE_CLAIM_LOST, while the gate stays at two starts and the CLI exits 0.
-    // The recovered claim fences writes without turning a handled stale owner
-    // warning into a CLI failure; the JSON warning is the visible refusal.
     assert_eq!(former.status.code(), Some(0));
     let former_json: Value = serde_json::from_str(&former.stdout).unwrap();
     assert!(

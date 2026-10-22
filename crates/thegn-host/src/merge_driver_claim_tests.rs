@@ -577,3 +577,103 @@ fn expired_recoverable_decision_table() {
         );
     }
 }
+
+#[test]
+fn expired_claim_on_landed_or_agent_running_row_is_not_recovered() {
+    for (status, result_oid) in [
+        ("landed", Some("0123456789abcdef0123456789abcdef01234567")),
+        ("agent_running", None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("queue.sqlite");
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let db = Db::open_at(&db_path).unwrap();
+        let worktree = root.join("feature").to_string_lossy().into_owned();
+        let item = registered_row(&db, &root, &worktree, "feature");
+        let holder = Db::open_at(&db_path).unwrap();
+        let claim = holder
+            .admit_merge_claim(&MergeClaimRequest {
+                worktree: item.worktree.clone(),
+                branch: item.branch.clone(),
+                repo_root: root.to_string_lossy().into_owned(),
+                target_branch: "main".into(),
+                location: String::new(),
+                expected_status: "queued".into(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: Some("former owner".into()),
+            })
+            .unwrap()
+            .unwrap();
+        holder
+            .replace_merge_status_claimed(
+                &claim,
+                status,
+                &MergeStatusFields {
+                    result_oid: result_oid.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let sql = rusqlite::Connection::open(&db_path).unwrap();
+        sql.execute(
+            "UPDATE merge_queue SET claim_lease_until_ms=?2 WHERE worktree=?1",
+            rusqlite::params![item.worktree, util::now_ms() - 1],
+        )
+        .unwrap();
+        drop(sql);
+
+        let outcome = drive_queue_with(
+            &registered_config(),
+            &Config::default(),
+            &root,
+            &db,
+            vec![item.clone()],
+            |_| {},
+            ready_actions(
+                |_, _, _| panic!("terminal or agent-running rows must not be recovered"),
+                unexpected_agent_handoff,
+                unused_agent_runner,
+            ),
+        );
+
+        assert!(outcome.persistence_errors.is_empty(), "{status}");
+        assert_eq!(outcome.warnings.len(), 1, "{status}");
+        assert!(outcome.warnings[0].contains("not claimable"), "{status}");
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.status, status);
+        assert_eq!(row.result_oid.as_deref(), result_oid, "{status}");
+        let view = db.observe_merge_claim(&item.worktree).unwrap().unwrap();
+        assert_eq!(view.phase, "claimed_no_child", "{status}");
+    }
+}
+
+#[test]
+fn recoverable_in_progress_status_table() {
+    let cases = [
+        ("queued", false),
+        ("folding", true),
+        ("verifying", true),
+        ("landed", false),
+        ("ready", false),
+        ("deferred", false),
+        ("gate_failed", false),
+        ("gate_error", false),
+        ("agent_running", false),
+        ("needs_human", false),
+        ("agent_blocked", false),
+        ("future-status", false),
+        ("", false),
+    ];
+    for (status, expected) in cases {
+        assert_eq!(
+            recoverable_in_progress_status(status),
+            expected,
+            "{status:?}"
+        );
+    }
+    assert_eq!(
+        EXPIRED_RECOVERY_EXPECTED_STATUS,
+        thegn_core::attention::MqStatus::Queued.as_str()
+    );
+}
