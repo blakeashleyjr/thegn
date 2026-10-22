@@ -907,7 +907,8 @@
     },
     {
       "change": "pane-zoom-stack",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-22-pane-zoom-stack/",
+      "lifecycle": "archived",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -931,7 +932,7 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Queue review repairs cover visibility, original-stack keyboard focus, narrow geometry and duplicate layout work; focused, integrated, full-gate and visual verification remain before delivery."
+      "summary": "Per-tab zoom renders as a pane stack with one-row bars; keyboard, mouse and narrow-width geometry share one drawn layout."
     },
     {
       "change": "preserve-config-validation-severity",
