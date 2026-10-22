@@ -1171,7 +1171,7 @@ pub(crate) fn spawn_reminder_check_with_generation(
                             "cached calendar reminders exceed the supported 28-day lead"
                         );
                     }
-                    if due.skips.total() == 0 {
+                    if due.skipped == 0 {
                         ReminderOutcome::Complete
                     } else {
                         ReminderOutcome::Incomplete(CalendarViewError::MalformedCache(due.skips))
