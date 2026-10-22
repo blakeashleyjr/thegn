@@ -1139,12 +1139,13 @@ where
 }
 
 /// Interleave account-ranked rows fairly, retaining the first row for each
-/// stable issue id. Dedup identity is `Issue.id`; cross-workspace Linear key
-/// collisions are conflated, as elsewhere. A zero limit means unbounded,
-/// matching provider semantics.
+/// producing account and stable issue id. The same key from two accounts (for
+/// example, two Linear workspaces both having ENG-1) is kept as two rows, each
+/// stamped with its account. A zero limit means unbounded, matching provider
+/// semantics.
 fn merge_fair(per_account: Vec<Vec<Issue>>, limit: usize) -> Vec<Issue> {
     let mut positions = vec![0; per_account.len()];
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<(Option<String>, String)> = HashSet::new();
     let mut merged = Vec::new();
     loop {
         let mut advanced = false;
@@ -1154,7 +1155,7 @@ fn merge_fair(per_account: Vec<Vec<Issue>>, limit: usize) -> Vec<Issue> {
             };
             positions[account] += 1;
             advanced = true;
-            if seen.insert(issue.id.clone()) {
+            if seen.insert((issue.account.clone(), issue.id.clone())) {
                 merged.push(issue.clone());
                 if limit > 0 && merged.len() == limit {
                     return merged;
@@ -2173,13 +2174,21 @@ mod tests {
             vec!["a1", "b1", "a2"]
         );
         let unbounded = runtime.block_on(router.search("q", 0)).unwrap();
-        assert_eq!(unbounded.len(), 5);
+        assert_eq!(unbounded.len(), 6);
         assert_eq!(
             unbounded
                 .iter()
                 .filter(|issue| issue.number == "dup")
                 .count(),
-            1
+            2
+        );
+        assert_eq!(
+            unbounded
+                .iter()
+                .filter(|issue| issue.number == "dup")
+                .map(|issue| issue.account.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("B"), Some("A")]
         );
     }
 
@@ -2203,6 +2212,118 @@ mod tests {
             .block_on(router.list_issues(&IssueFilter::my_open(2)))
             .unwrap();
         assert_eq!(issues.len(), 2);
+    }
+
+    #[test]
+    fn account_key_list_keeps_same_key_from_two_accounts() {
+        let router = fixed_router(vec![
+            ("work", vec![fixed_issue("ENG-1"), fixed_issue("ENG-2")]),
+            ("home", vec![fixed_issue("ENG-1")]),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime
+            .block_on(router.list_issues(&IssueFilter {
+                limit: 0,
+                ..IssueFilter::default()
+            }))
+            .unwrap();
+
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.account.as_deref(), issue.number.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("work"), "ENG-1"),
+                (Some("home"), "ENG-1"),
+                (Some("work"), "ENG-2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn account_key_search_keeps_same_key_from_two_accounts() {
+        let router = fixed_router(vec![
+            ("work", vec![fixed_issue("ENG-1"), fixed_issue("ENG-2")]),
+            ("home", vec![fixed_issue("ENG-1")]),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime.block_on(router.search("q", 0)).unwrap();
+
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.account.as_deref(), issue.number.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("work"), "ENG-1"),
+                (Some("home"), "ENG-1"),
+                (Some("work"), "ENG-2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn account_key_repeat_within_one_account_is_still_collapsed() {
+        // Positive control: this also passes before the account-aware dedup fix.
+        let router = fixed_router(vec![(
+            "work",
+            vec![
+                fixed_issue("ENG-1"),
+                fixed_issue("ENG-1"),
+                fixed_issue("ENG-2"),
+            ],
+        )]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime
+            .block_on(router.list_issues(&IssueFilter {
+                limit: 0,
+                ..IssueFilter::default()
+            }))
+            .unwrap();
+
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.number.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ENG-1", "ENG-2"]
+        );
+    }
+
+    #[test]
+    fn account_key_limit_counts_both_accounts_rows() {
+        let router = fixed_router(vec![
+            ("work", vec![fixed_issue("ENG-1"), fixed_issue("ENG-2")]),
+            ("home", vec![fixed_issue("ENG-1")]),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let issues = runtime
+            .block_on(router.list_issues(&IssueFilter {
+                limit: 2,
+                ..IssueFilter::default()
+            }))
+            .unwrap();
+
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.account.as_deref(), issue.number.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(Some("work"), "ENG-1"), (Some("home"), "ENG-1")]
+        );
     }
 
     #[test]
@@ -3169,14 +3290,14 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(listed.len(), 301);
+        assert_eq!(listed.len(), 302);
         assert_eq!(
             issue_numbers(&listed[..4]),
             [
                 "big-0".to_string(),
+                "big-0".to_string(),
                 "big-1".to_string(),
                 "small-1".to_string(),
-                "big-2".to_string()
             ]
         );
         assert_eq!(
@@ -3184,7 +3305,15 @@ mod tests {
                 .iter()
                 .filter(|number| *number == "big-0")
                 .count(),
-            1
+            2
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|issue| issue.number == "big-0")
+                .map(|issue| issue.account.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("big"), Some("small")]
         );
         assert!(
             listed
@@ -3201,14 +3330,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(searched.len(), 301);
+        assert_eq!(searched.len(), 302);
         assert_eq!(
             issue_numbers(&searched[..4]),
             [
                 "big-0".to_string(),
+                "big-0".to_string(),
                 "big-1".to_string(),
                 "small-1".to_string(),
-                "big-2".to_string()
             ]
         );
         assert_eq!(
@@ -3216,7 +3345,15 @@ mod tests {
                 .iter()
                 .filter(|number| *number == "big-0")
                 .count(),
-            1
+            2
+        );
+        assert_eq!(
+            searched
+                .iter()
+                .filter(|issue| issue.number == "big-0")
+                .map(|issue| issue.account.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("big"), Some("small")]
         );
         assert!(
             searched
@@ -3235,9 +3372,9 @@ mod tests {
         let router = mixed_matrix_router();
         let expected = [
             "big-0".to_string(),
+            "big-0".to_string(),
             "big-1".to_string(),
             "small-1".to_string(),
-            "big-2".to_string(),
         ];
         let listed = tokio::time::timeout(
             Duration::from_secs(60),
