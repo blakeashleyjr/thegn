@@ -98,9 +98,14 @@ impl CpuCap {
 }
 
 /// Pure decision: pick the enforcement mechanism from the probed facts. Split
-/// from the probe so the 3-way ladder is exhaustively unit-testable.
-pub fn choose_cpu_cap(systemd_run: bool, cgroup_cpu_delegated: bool, nice: bool) -> CpuCap {
-    if systemd_run && cgroup_cpu_delegated {
+/// from the probe so the 4-way ladder is exhaustively unit-testable.
+pub fn choose_cpu_cap(
+    systemd_run: bool,
+    cgroup_cpu_delegated: bool,
+    user_manager: bool,
+    nice: bool,
+) -> CpuCap {
+    if systemd_run && cgroup_cpu_delegated && user_manager {
         CpuCap::ScopeHard
     } else if nice {
         CpuCap::NiceSoft
@@ -141,9 +146,59 @@ pub fn detect_cpu_cap() -> CpuCap {
         choose_cpu_cap(
             util::have("systemd-run"),
             cgroup_cpu_delegated(),
+            user_manager_reachable(
+                std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+                &|path| path.exists(),
+            ),
             util::have("nice"),
         )
     })
+}
+
+/// Whether systemd's user manager can be reached with the current environment.
+/// `systemd-run --user` looks first for `$XDG_RUNTIME_DIR/systemd/private`,
+/// then for the user bus at `DBUS_SESSION_BUS_ADDRESS` or
+/// `$XDG_RUNTIME_DIR/bus`.
+pub fn user_manager_reachable(
+    runtime_dir: Option<&std::ffi::OsStr>,
+    bus_address: Option<&std::ffi::OsStr>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> bool {
+    if bus_address.is_some_and(|address| !address.is_empty()) {
+        return true;
+    }
+    let Some(runtime_dir) = runtime_dir.filter(|dir| !dir.is_empty()) else {
+        return false;
+    };
+    let runtime_dir = std::path::Path::new(runtime_dir);
+    exists(&runtime_dir.join("systemd/private")) || exists(&runtime_dir.join("bus"))
+}
+
+/// Explain why a hard scope cap could not be used, when the user manager is
+/// the only missing prerequisite.
+pub fn scope_skipped_note(
+    systemd_run: bool,
+    cgroup_cpu_delegated: bool,
+    user_manager: bool,
+) -> Option<&'static str> {
+    (systemd_run && cgroup_cpu_delegated && !user_manager).then_some(
+        "hard cap skipped: no systemd user manager is reachable from this environment (no $XDG_RUNTIME_DIR/systemd/private, $XDG_RUNTIME_DIR/bus or DBUS_SESSION_BUS_ADDRESS); using the soft nice cap",
+    )
+}
+
+/// Probe whether a hard scope cap was skipped because the user manager is
+/// unreachable. Used by doctor to report the same host facts as the cap ladder.
+pub fn detected_scope_skipped_note() -> Option<&'static str> {
+    scope_skipped_note(
+        util::have("systemd-run"),
+        cgroup_cpu_delegated(),
+        user_manager_reachable(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+            &|path| path.exists(),
+        ),
+    )
 }
 
 /// How many CPUs the **machine** has, independent of any cgroup quota this
@@ -1064,17 +1119,85 @@ mod tests {
     #[test]
     fn choose_cpu_cap_ladder() {
         use CpuCap::*;
-        // Hard cap requires BOTH systemd-run and cgroup cpu delegation.
-        assert_eq!(choose_cpu_cap(true, true, true), ScopeHard);
-        assert_eq!(choose_cpu_cap(true, true, false), ScopeHard);
+        // Existing rows retain their expectations with a reachable manager.
+        // Hard cap requires systemd-run, cgroup cpu delegation and a user manager.
+        assert_eq!(choose_cpu_cap(true, true, true, true), ScopeHard);
+        assert_eq!(choose_cpu_cap(true, true, true, false), ScopeHard);
         // systemd present but no delegation ⇒ soft nice (if available).
-        assert_eq!(choose_cpu_cap(true, false, true), NiceSoft);
-        assert_eq!(choose_cpu_cap(false, true, true), NiceSoft);
-        assert_eq!(choose_cpu_cap(false, false, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(true, false, true, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(false, true, true, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(false, false, true, true), NiceSoft);
         // Nothing available ⇒ no cap.
-        assert_eq!(choose_cpu_cap(true, false, false), None);
-        assert_eq!(choose_cpu_cap(false, true, false), None);
-        assert_eq!(choose_cpu_cap(false, false, false), None);
+        assert_eq!(choose_cpu_cap(true, false, true, false), None);
+        assert_eq!(choose_cpu_cap(false, true, true, false), None);
+        assert_eq!(choose_cpu_cap(false, false, true, false), None);
+        // A missing user manager also falls back to nice, or no cap if nice is absent.
+        assert_eq!(choose_cpu_cap(true, true, false, true), NiceSoft);
+        assert_eq!(choose_cpu_cap(true, true, false, false), None);
+    }
+
+    #[test]
+    fn user_manager_reachable_follows_the_systemd_lookup() {
+        use std::collections::HashSet;
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+
+        let runtime = PathBuf::from("/runtime/test");
+        let cases = [
+            (
+                "private socket only",
+                Some("/runtime/test"),
+                None,
+                HashSet::from([runtime.join("systemd/private")]),
+                true,
+            ),
+            (
+                "bus socket only",
+                Some("/runtime/test"),
+                None,
+                HashSet::from([runtime.join("bus")]),
+                true,
+            ),
+            (
+                "bus address only",
+                None,
+                Some("unix:path=/bus"),
+                HashSet::new(),
+                true,
+            ),
+            (
+                "runtime without sockets",
+                Some("/runtime/test"),
+                None,
+                HashSet::new(),
+                false,
+            ),
+            (
+                "empty runtime and address",
+                Some(""),
+                Some(""),
+                HashSet::new(),
+                false,
+            ),
+            ("both unset", None, None, HashSet::new(), false),
+        ];
+
+        for (name, runtime_dir, bus_address, present, expected) in cases {
+            let reachable = user_manager_reachable(
+                runtime_dir.map(OsStr::new),
+                bus_address.map(OsStr::new),
+                &|path| present.iter().any(|candidate| candidate.as_path() == path),
+            );
+            assert_eq!(reachable, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn scope_skipped_note_only_when_the_user_manager_is_the_missing_piece() {
+        assert!(scope_skipped_note(true, true, false).is_some());
+        assert_eq!(scope_skipped_note(true, true, true), None);
+        assert_eq!(scope_skipped_note(false, true, false), None);
+        assert_eq!(scope_skipped_note(true, false, false), None);
     }
 
     #[test]
