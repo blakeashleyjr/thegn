@@ -2,6 +2,8 @@
 //! manager (`windows::Media::Control`). Implements [`MediaBackend`] against
 //! whatever app currently owns the system media session (Spotify, browsers,
 //! Groove, …).
+//! A null current session is a healthy empty result; any other lookup failure
+//! is a typed backend error.
 //!
 //! Push mode (`caps.signals = true`): a [`SmtcWatch`] subscribes to the session
 //! manager's `CurrentSessionChanged` and the current session's
@@ -36,7 +38,7 @@ use crate::model::{LoopMode, MediaKind, MediaState};
 use crate::smtc_decode::{
     BindState, ControlFlags, accepted, lock_unpoisoned, loop_from_repeat, loop_to_repeat,
     manager_unavailable, playback_state_from_status, register_pair, seek_target, session_caps,
-    snapshot_caps, timeline,
+    session_lookup_error, snapshot_caps, timeline,
 };
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
@@ -106,21 +108,13 @@ impl Smtc {
     pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
         run_blocking(|| {
             let mgr = manager().map_err(|error| manager_unavailable(&error.to_string()))?;
-            let session = match session_if_present(mgr.GetCurrentSession()) {
-                Some(session) => session,
-                None => return Ok(Vec::new()),
+            let Some(session) = current_session_opt(&mgr)? else {
+                return Ok(Vec::new());
             };
             let id = session.SourceAppUserModelId().map_err(win_err)?.to_string();
             Ok(if id.is_empty() { Vec::new() } else { vec![id] })
         })
         .await
-    }
-}
-
-fn session_if_present<T, E>(session: Result<T, E>) -> Option<T> {
-    match session {
-        Ok(session) => Some(session),
-        Err(_) => None,
     }
 }
 
@@ -371,7 +365,7 @@ fn rebind(
     {
         tracing::warn!(target: "thegn::media", error = %error, "smtc handler removal failed");
     }
-    let Ok(session) = manager.GetCurrentSession() else {
+    let Some(session) = current_session_opt(manager)? else {
         return Ok(());
     };
     let tx_info = tx.clone();
@@ -487,7 +481,17 @@ fn manager() -> windows::core::Result<GlobalSystemMediaTransportControlsSessionM
 
 fn current_session() -> Result<Session, MediaError> {
     let mgr = manager().map_err(|error| manager_unavailable(&error.to_string()))?;
-    mgr.GetCurrentSession().map_err(|_| MediaError::NoPlayer)
+    current_session_opt(&mgr)?.ok_or(MediaError::NoPlayer)
+}
+
+fn current_session_opt(mgr: &Manager) -> Result<Option<Session>, MediaError> {
+    match mgr.GetCurrentSession() {
+        Ok(session) => Ok(Some(session)),
+        Err(error) => match session_lookup_error(error.code().0, &error.to_string()) {
+            None => Ok(None),
+            Some(error) => Err(error),
+        },
+    }
 }
 
 fn win_err(e: windows::core::Error) -> MediaError {
@@ -498,9 +502,8 @@ fn win_err(e: windows::core::Error) -> MediaError {
 /// `Ok(None)` when no app owns the media session.
 fn snapshot_with_caps_blocking() -> Result<Option<MediaSnapshot>, MediaError> {
     let mgr = manager().map_err(|error| manager_unavailable(&error.to_string()))?;
-    let session = match mgr.GetCurrentSession() {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
+    let Some(session) = current_session_opt(&mgr)? else {
+        return Ok(None);
     };
 
     let info = session.GetPlaybackInfo().map_err(win_err)?;
@@ -587,14 +590,4 @@ where
     T: Send + 'static,
 {
     worker()?.run(SMTC_OP_DEADLINE, f).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::session_if_present;
-
-    #[test]
-    fn missing_current_session_is_a_healthy_empty_result() {
-        assert!(session_if_present::<(), _>(Err("no current session")).is_none());
-    }
 }

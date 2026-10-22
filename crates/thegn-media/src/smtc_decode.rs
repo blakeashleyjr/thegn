@@ -208,9 +208,54 @@ pub(crate) fn register_pair<A, B, E: std::fmt::Display>(
     }
 }
 
+/// Classify a failed current-session lookup. windows-rs represents a null
+/// WinRT interface as `Error::empty()`, whose HRESULT is S_OK (0); that means
+/// no app owns the session. Every nonzero HRESULT is a real backend failure.
+pub(crate) fn session_lookup_error(code: i32, detail: &str) -> Option<MediaError> {
+    if code == 0 {
+        None
+    } else {
+        Some(MediaError::Backend(format!(
+            "SMTC current session lookup failed (HRESULT {:#010x}): {detail}",
+            code as u32
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_lookup_null_code_is_absent() {
+        assert!(session_lookup_error(0, "x").is_none());
+    }
+
+    #[test]
+    fn session_lookup_failure_is_a_typed_backend_error() {
+        for (code, hex) in [
+            (0x8007_0005_u32 as i32, "0x80070005"),
+            (0x8001_0108_u32 as i32, "0x80010108"),
+        ] {
+            let result = session_lookup_error(code, "lookup detail");
+            assert!(matches!(
+                &result,
+                Some(MediaError::Backend(message))
+                    if message.contains("current session lookup failed")
+                        && message.contains("lookup detail")
+                        && message.contains(hex)
+            ));
+            assert!(!matches!(&result, Some(MediaError::NoPlayer)));
+        }
+    }
+
+    #[test]
+    fn session_lookup_failure_is_not_a_manager_failure() {
+        assert!(!matches!(
+            &session_lookup_error(0x8007_0005_u32 as i32, "x"),
+            Some(MediaError::Unavailable(_))
+        ));
+    }
 
     #[test]
     fn lock_unpoisoned_recovers_after_a_panicking_holder() {
