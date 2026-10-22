@@ -2087,7 +2087,7 @@ impl ControlApi for DaemonService {
             });
             if let Some(mut entry) = cached {
                 let redacted = thegn_core::ci_log::redact(&entry.text);
-                let (text, truncated) = thegn_core::ci_log::bounded_tail(
+                let (text, truncated) = thegn_core::ci_log::bounded_window(
                     &redacted,
                     tail_lines
                         .unwrap_or(self.config.ci.log_tail_lines)
@@ -2173,7 +2173,7 @@ impl ControlApi for DaemonService {
                     .await;
             }
             let redacted_text = thegn_core::ci_log::redact(&entry.text);
-            let (text, truncated) = thegn_core::ci_log::bounded_tail(
+            let (text, truncated) = thegn_core::ci_log::bounded_window(
                 &redacted_text,
                 tail_lines
                     .unwrap_or(self.config.ci.log_tail_lines)
