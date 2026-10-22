@@ -81,6 +81,76 @@ pub(crate) fn with_unambiguous<'a, T>(
     Ok(Some(reconcile(first)))
 }
 
+/// Resources one reaper pass deliberately left in place (quarantined, refused, failed). Each line is logged as it happens
+/// (`msg::warn`: the log and CLI keep it); the pass ends with ONE in-app Alert when the set of kept resources changed.
+#[derive(Debug, Default)]
+pub(crate) struct KeptReport {
+    kept: Vec<(String, String)>, // (resource, message)
+}
+
+impl KeptReport {
+    pub(crate) fn keep(&mut self, resource: &str, message: String) {
+        thegn_core::msg::warn(&message);
+        self.kept.push((resource.to_string(), message));
+    }
+
+    /// End of one provider kind's pass.
+    pub(crate) fn publish(self, kind: &str) {
+        let mut latch = kept_latch()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let alert = latch_kept(&mut latch, kind, self.kept);
+        drop(latch);
+        if let Some(message) = alert
+            && let Some(state) = crate::notify::global()
+        {
+            state.emit_toast(&message, thegn_core::notification::Priority::Alert);
+        }
+    }
+}
+
+fn kept_latch() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> {
+    static LATCH: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
+    > = std::sync::OnceLock::new();
+    LATCH.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+fn latch_kept(
+    latch: &mut std::collections::BTreeMap<String, Vec<String>>,
+    kind: &str,
+    mut kept: Vec<(String, String)>,
+) -> Option<String> {
+    kept.sort();
+    if kept.is_empty() {
+        latch.remove(kind);
+        return None;
+    }
+
+    let mut names = Vec::new();
+    for (resource, _) in &kept {
+        if names.last() != Some(resource) {
+            names.push(resource.clone());
+        }
+    }
+    if latch.get(kind) == Some(&names) {
+        return None;
+    }
+    latch.insert(kind.to_string(), names.clone());
+    Some(kept_alert_text(kind, names.len(), &kept[0].1))
+}
+
+fn kept_alert_text(kind: &str, count: usize, first_message: &str) -> String {
+    if count == 1 {
+        format!("{kind} reaper kept 1 resource for review: {first_message}")
+    } else {
+        format!(
+            "{kind} reaper kept {count} resources for review: {first_message} (+{} more in the log)",
+            count - 1
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +226,82 @@ mod tests {
         let file_path = root.path().join("not-a-directory");
         std::fs::write(&file_path, b"file").unwrap();
         assert!(try_reaper_lease_in(&file_path, "fly").is_err());
+    }
+
+    #[test]
+    fn kept_alert_is_silent_for_a_clean_pass() {
+        let mut latch = std::collections::BTreeMap::new();
+        assert_eq!(latch_kept(&mut latch, "hetzner", vec![]), None);
+        assert!(!latch.contains_key("hetzner"));
+    }
+
+    #[test]
+    fn kept_alert_fires_once_for_the_same_kept_set() {
+        let mut latch = std::collections::BTreeMap::new();
+        let first = vec![
+            ("vm-b".to_string(), "msg b".to_string()),
+            ("vm-a".to_string(), "msg a".to_string()),
+        ];
+        assert!(latch_kept(&mut latch, "hetzner", first).is_some());
+        let second = vec![
+            ("vm-a".to_string(), "changed a".to_string()),
+            ("vm-b".to_string(), "changed b".to_string()),
+        ];
+        assert_eq!(latch_kept(&mut latch, "hetzner", second), None);
+    }
+
+    #[test]
+    fn kept_alert_fires_again_when_the_kept_set_changes() {
+        let mut latch = std::collections::BTreeMap::new();
+        let first = vec![
+            ("vm-a".to_string(), "msg a".to_string()),
+            ("vm-b".to_string(), "msg b".to_string()),
+        ];
+        assert!(latch_kept(&mut latch, "hetzner", first.clone()).is_some());
+        let mut changed = first;
+        changed.push(("vm-c".to_string(), "msg c".to_string()));
+        assert!(latch_kept(&mut latch, "hetzner", changed).is_some());
+    }
+
+    #[test]
+    fn kept_alert_rearms_after_a_clean_pass() {
+        let mut latch = std::collections::BTreeMap::new();
+        let kept = vec![("vm-a".to_string(), "msg a".to_string())];
+        assert!(latch_kept(&mut latch, "hetzner", kept.clone()).is_some());
+        assert_eq!(latch_kept(&mut latch, "hetzner", vec![]), None);
+        assert!(latch_kept(&mut latch, "hetzner", kept).is_some());
+    }
+
+    #[test]
+    fn kept_alert_names_the_count_and_first_line() {
+        let mut latch = std::collections::BTreeMap::new();
+        let multiple = vec![
+            ("vm-b".to_string(), "msg b".to_string()),
+            ("vm-a".to_string(), "msg a".to_string()),
+            ("vm-a".to_string(), "msg a2".to_string()),
+        ];
+        assert_eq!(
+            latch_kept(&mut latch, "hetzner", multiple).as_deref(),
+            Some("hetzner reaper kept 2 resources for review: msg a (+1 more in the log)")
+        );
+        assert_eq!(
+            latch_kept(
+                &mut latch,
+                "digitalocean",
+                vec![("vm-a".to_string(), "single line".to_string())]
+            )
+            .as_deref(),
+            Some("digitalocean reaper kept 1 resource for review: single line")
+        );
+    }
+
+    #[test]
+    fn kept_alert_latches_per_kind() {
+        let mut latch = std::collections::BTreeMap::new();
+        let kept = vec![("vm-a".to_string(), "msg a".to_string())];
+        assert!(latch_kept(&mut latch, "hetzner", kept.clone()).is_some());
+        assert!(latch_kept(&mut latch, "fly", kept.clone()).is_some());
+        assert_eq!(latch_kept(&mut latch, "hetzner", kept.clone()), None);
+        assert_eq!(latch_kept(&mut latch, "fly", kept), None);
     }
 }
