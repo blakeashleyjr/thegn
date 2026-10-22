@@ -204,7 +204,9 @@ fetched and drawn.
 Events are cached, so they are there the moment the popup opens and survive a
 restart. A sync that fails leaves the cache alone — you get yesterday's calendar
 rather than an empty one — and a provider that returns an empty calendar when
-thegn has events cached is treated as suspect rather than believed.
+thegn has events cached is treated as suspect rather than believed. A calendar
+whose only remaining entries are cancellations is believed, so the cancelled
+events disappear instead of being kept as a suspect empty response.
 
 An event thegn cannot read (for example, one with a missing start, an invalid or
 duplicated field, or an unknown time zone) is left out rather than guessed. For
