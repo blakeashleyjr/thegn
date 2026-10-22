@@ -200,6 +200,10 @@ until config reload). A pending restart is cancelled when the plugin is
 disabled, on config reload and on shutdown; restarts wait on one background
 timer rather than a thread each. That crash/backoff state is process-lifetime
 supervisor state: it is not persisted across a daemon or compositor restart.
+If the plugin host, restart worker, or a scheduled run cannot start, the status
+line reports the failure. A restart that cannot be scheduled counts as a failed
+restart, so the plugin is disabled after the usual attempts. A scheduled run
+start failure is reported once until a run starts successfully.
 After such a restart, the offline `plugin list` command cannot reconcile live
 state and reports an enabled plugin as `unknown` with
 `live_health = unavailable` until a future attached-snapshot surface exists.
