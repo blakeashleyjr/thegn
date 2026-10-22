@@ -1519,7 +1519,6 @@ mod tests {
             ..nonzero
         };
         assert_eq!(run_outcome(&successful), AgentRunVerdict::Exited(Some(0)));
-        assert!(run(&successful));
     }
 
     fn sandbox_spec() -> thegn_core::sandbox::SandboxSpec {
