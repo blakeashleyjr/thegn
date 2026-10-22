@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const RECOMMENDED_FONTS: &[&str] = &[
@@ -914,13 +914,30 @@ fn config_read_error(path: &Path, error: std::io::Error) -> String {
 
 /// Publish only if the no-follow destination still has the bytes we observed.
 /// Existing destinations must be owned by this user and have one link; refuse
-/// ambiguity instead of breaking a hard link. The staged write is private,
-/// same-directory, synced and atomically renamed.
+/// ambiguity instead of breaking a hard link. Staging names are unpredictable
+/// and exclusively created, and destination permissions are applied to the
+/// staged file before the atomic rename.
 fn replace_config(
     path: &Path,
     observed: &[u8],
     observed_exists: bool,
     new: &[u8],
+) -> Result<(), String> {
+    replace_config_with(
+        path,
+        observed,
+        observed_exists,
+        new,
+        &mut random_staging_suffix,
+    )
+}
+
+fn replace_config_with(
+    path: &Path,
+    observed: &[u8],
+    observed_exists: bool,
+    new: &[u8],
+    suffix: &mut dyn FnMut() -> Result<String, String>,
 ) -> Result<(), String> {
     let (current, metadata) = match thegn_core::fsperm::open_regular_file_nofollow(path) {
         Ok(mut file) => {
@@ -963,25 +980,15 @@ fn replace_config(
         ));
     }
 
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("{} has no file name", path.display()))?
-        .to_string_lossy();
-    let counter = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let temporary = parent.join(format!(
-        ".{name}.tmp-{}-{nanos}-{counter}",
-        std::process::id()
-    ));
-    thegn_core::fsperm::write_owner_only_new(&temporary, new)
-        .map_err(|e| format!("stage {} failed: {e}", path.display()))?;
+    let temporary = stage_sibling(
+        path,
+        new,
+        metadata.as_ref().map(|metadata| metadata.permissions()),
+        suffix,
+    )?;
     if let Err(error) = thegn_core::fsperm::rename_replace(&temporary, path) {
         let cleanup = std::fs::remove_file(&temporary);
         return match cleanup {
@@ -993,13 +1000,87 @@ fn replace_config(
             )),
         };
     }
-    if let Some(metadata) = metadata {
-        std::fs::set_permissions(path, metadata.permissions())
-            .map_err(|e| format!("preserve permissions for {} failed: {e}", path.display()))?;
-    }
-    thegn_core::fsperm::sync_parent_dir(parent)
-        .map_err(|e| format!("sync {} failed: {e}", parent.display()))?;
+    thegn_core::fsperm::sync_parent_dir(parent).map_err(|e| {
+        format!(
+            "{} was replaced, but syncing {} failed: {e}",
+            path.display(),
+            parent.display()
+        )
+    })?;
     Ok(())
+}
+
+/// The staging create retries collisions without ever replacing an existing entry.
+const STAGING_ATTEMPTS: usize = 8;
+
+fn random_staging_suffix() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("no randomness for a staging name: {error}"))?;
+    let mut suffix = String::with_capacity(32);
+    for byte in bytes {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    Ok(suffix)
+}
+
+fn staging_cleanup_error(path: &Path, temporary: &Path, error: std::io::Error) -> String {
+    match std::fs::remove_file(temporary) {
+        Ok(()) => format!("stage {} failed: {error}; not modified", path.display()),
+        Err(cleanup_error) => format!(
+            "stage {} failed: {error}; remove staging file {} failed: {cleanup_error}; not modified",
+            path.display(),
+            temporary.display()
+        ),
+    }
+}
+
+fn stage_sibling(
+    path: &Path,
+    new: &[u8],
+    permissions: Option<std::fs::Permissions>,
+    suffix: &mut dyn FnMut() -> Result<String, String>,
+) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy();
+
+    for _ in 0..STAGING_ATTEMPTS {
+        let random =
+            suffix().map_err(|error| format!("stage {} failed: {error}", path.display()))?;
+        let temporary = parent.join(format!(".{name}.tmp-{random}"));
+        let mut file = match thegn_core::fsperm::create_owner_only_exclusive(&temporary) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("stage {} failed: {error}", path.display())),
+        };
+        if let Err(error) = file.write_all(new) {
+            drop(file);
+            return Err(staging_cleanup_error(path, &temporary, error));
+        }
+        if let Some(permissions) = permissions
+            && let Err(error) = file.set_permissions(permissions)
+        {
+            drop(file);
+            return Err(staging_cleanup_error(path, &temporary, error));
+        }
+        if let Err(error) = file.sync_all() {
+            drop(file);
+            return Err(staging_cleanup_error(path, &temporary, error));
+        }
+        return Ok(temporary);
+    }
+
+    Err(format!(
+        "stage {} failed: could not create a unique staging file after {STAGING_ATTEMPTS} attempts",
+        path.display()
+    ))
 }
 
 pub fn patch_alacritty_font_family(input: &str, family: &str) -> Result<String, String> {
@@ -1815,5 +1896,87 @@ size = 13\n\
         assert!(patched.contains("normal = { family = \"JetBrainsMono Nerd Font\" }"));
         assert!(patched.contains("# normal = { family = \"Commented\" }"));
         assert!(patched.contains("size = 13"));
+    }
+
+    #[test]
+    fn staging_suffix_is_32_random_hex_chars() {
+        let first = random_staging_suffix().unwrap();
+        let second = random_staging_suffix().unwrap();
+
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(second.len(), 32);
+        assert!(
+            second
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn staging_skips_a_precreated_name_without_touching_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+        let planted = tmp.path().join(".kitty.conf.tmp-aaaa");
+        std::fs::write(&planted, b"planted").unwrap();
+        let suffixes = ["aaaa", "bbbb"];
+        let mut next_suffix = suffixes.iter();
+        let mut suffix = || Ok(next_suffix.next().unwrap().to_string());
+
+        replace_config_with(&config, observed, true, b"font_family Hack\n", &mut suffix).unwrap();
+
+        assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
+        assert!(!tmp.path().join(".kitty.conf.tmp-bbbb").exists());
+    }
+
+    #[test]
+    fn staging_gives_up_after_bounded_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+        let planted = tmp.path().join(".kitty.conf.tmp-aaaa");
+        std::fs::write(&planted, b"planted").unwrap();
+        let mut calls = 0;
+        let mut suffix = || {
+            calls += 1;
+            Ok("aaaa".to_string())
+        };
+
+        let result =
+            replace_config_with(&config, observed, true, b"font_family Hack\n", &mut suffix);
+
+        assert!(
+            matches!(result, Err(ref error) if error.contains("could not create a unique staging file"))
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), observed);
+        assert_eq!(calls, STAGING_ATTEMPTS);
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            let entry = entry.unwrap();
+            !entry.file_name().to_string_lossy().contains(".tmp-") || entry.path() == planted
+        }));
+    }
+
+    #[test]
+    fn staged_file_carries_the_destination_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        std::fs::write(&config, b"old").unwrap();
+        let permissions = std::fs::metadata(&config).unwrap().permissions();
+        let mut suffix = || Ok("cccc".to_string());
+
+        let staged = stage_sibling(&config, b"x", Some(permissions.clone()), &mut suffix).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions(),
+            permissions
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"x");
+        std::fs::remove_file(staged).unwrap();
     }
 }
