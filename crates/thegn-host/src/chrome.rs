@@ -1885,7 +1885,7 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
             }
         };
         let clipped: String = {
-            let max = 30;
+            let max: usize = 30;
             let track_max = if model.media_stale {
                 max.saturating_sub(6)
             } else {
