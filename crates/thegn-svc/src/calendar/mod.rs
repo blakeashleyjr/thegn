@@ -298,7 +298,7 @@ pub struct RejectedEvents {
 }
 
 impl RejectedEvents {
-    fn bump(&mut self, defect: EventDefect) {
+    pub fn bump(&mut self, defect: EventDefect) {
         let count = match defect {
             EventDefect::EmptyUid => &mut self.empty_uid,
             EventDefect::MixedShape => &mut self.mixed_shape,
