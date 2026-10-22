@@ -107,6 +107,10 @@ and 64 capabilities. Each contribution allows 32 metadata entries (keys up to
 ID, name, and version, plus contribution, surface, and capability identifiers,
 are limited to 128 B, and contribution capability data to 4 KiB. `thegn plugin
 check` reports the specific quota reason when an oversized manifest is rejected.
+Command arguments, `cwd`, and `env` keys and values may not contain NUL bytes;
+`env` keys must match `[A-Za-z_][A-Za-z0-9_]*` and be at most 128 bytes, all
+launch fields together are limited to 64 KiB, and plugin ids differing only by
+letter case are duplicates.
 An alert source over 128 B is refused; a message longer than 1 KiB is truncated
 for display.
 A plugin may subscribe to 64 event kinds; a 65th subscription is refused.
