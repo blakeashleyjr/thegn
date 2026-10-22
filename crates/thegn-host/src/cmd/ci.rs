@@ -10,6 +10,9 @@
 //! host paints from; other branches and the all-branch listing never overwrite it.
 
 use anyhow::{Result, bail};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thegn_core::ci::{self, CiJob, CiRun, CiState, RerunScope};
 use thegn_core::config::Config;
 use thegn_core::config_ci::MAX_CI_RUNS;
@@ -17,7 +20,7 @@ use thegn_core::db::Db;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::CacheStore;
 use thegn_core::{msg, outln};
-use thegn_svc::ci::{CiClient, provider_for};
+use thegn_svc::ci::{CiClient, provider_for, provider_for_cancellable};
 
 use crate::cmd::resolve_worktree;
 
@@ -128,6 +131,49 @@ fn client(cfg: &Config, worktree: Option<String>) -> Result<(GitLoc, CiClient)> 
         Some(c) => Ok((loc, c)),
         None => bail!("no CI provider for this worktree (set [ci] provider, or check the remote)"),
     }
+}
+
+fn cancellable_client(
+    cfg: &Config,
+    worktree: Option<String>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(GitLoc, CiClient)> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match provider_for_cancellable(&loc, &cfg.ci, cancel) {
+        Some(c) => Ok((loc, c)),
+        None => bail!("no CI provider for this worktree (set [ci] provider, or check the remote)"),
+    }
+}
+
+const INTERRUPT_POLL: Duration = Duration::from_millis(25);
+
+fn run_interruptible<T: Send + 'static>(
+    cancel: &Arc<AtomicBool>,
+    fired: impl Fn() -> bool,
+    op: impl FnOnce() -> T + Send + 'static,
+) -> (T, bool) {
+    let handle = thegn_core::thread_name::spawn_named("thegn-ci-mutate", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
+        op()
+    });
+    let mut interrupted = false;
+    while !handle.is_finished() {
+        if !interrupted && fired() {
+            cancel.store(true, Ordering::SeqCst);
+            interrupted = true;
+        }
+        std::thread::sleep(INTERRUPT_POLL);
+    }
+    match handle.join() {
+        Ok(value) => (value, interrupted),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn interrupted_message(verb: &str) -> String {
+    format!(
+        "ci {verb} interrupted: the provider command was stopped; the {verb} may or may not have reached the provider (check `thegn ci runs`)"
+    )
 }
 
 fn validate_id_at_cli(value: &str) -> Result<()> {
@@ -545,12 +591,24 @@ fn rerun(
     failed_or_canceled: bool,
 ) -> Result<()> {
     validate_id_at_cli(run_id)?;
-    let (loc, client) = client(cfg, worktree)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag))?;
     let scope = match rerun_scope(&client.caps(), failed, failed_or_canceled) {
         Ok(scope) => scope,
         Err(message) => msg::die(message),
     };
-    match client.rerun(&loc, run_id, scope) {
+    let guard = crate::platform::InterruptGuard::install();
+    let run_id = run_id.to_string();
+    let (result, interrupted) = run_interruptible(
+        &cancel_flag,
+        || guard.fired(),
+        move || client.rerun(&loc, &run_id, scope),
+    );
+    drop(guard);
+    if interrupted {
+        msg::die(&interrupted_message("rerun"));
+    }
+    match result {
         Ok(()) => msg::info(match scope {
             RerunScope::All => "re-running",
             RerunScope::Failed => "re-running failed jobs",
@@ -574,11 +632,23 @@ fn trigger(
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let inputs = thegn_svc::ci::parse_trigger_inputs(&input)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let (loc, client) = client(cfg, worktree)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag))?;
     if !client.caps().trigger {
         msg::die("this provider can't trigger workflows");
     }
-    match client.trigger(&loc, workflow, &inputs) {
+    let guard = crate::platform::InterruptGuard::install();
+    let workflow_owned = workflow.to_string();
+    let (result, interrupted) = run_interruptible(
+        &cancel_flag,
+        || guard.fired(),
+        move || client.trigger(&loc, &workflow_owned, &inputs),
+    );
+    drop(guard);
+    if interrupted {
+        msg::die(&interrupted_message("trigger"));
+    }
+    match result {
         Ok(()) => msg::info(&format!("triggered {workflow}")),
         Err(e) => msg::die(&format!(
             "ci trigger failed: {}",
@@ -590,11 +660,23 @@ fn trigger(
 
 fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     validate_id_at_cli(run_id)?;
-    let (loc, client) = client(cfg, worktree)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag))?;
     if !client.caps().cancel {
         msg::die("this provider can't cancel runs");
     }
-    match client.cancel(&loc, run_id) {
+    let guard = crate::platform::InterruptGuard::install();
+    let run_id = run_id.to_string();
+    let (result, interrupted) = run_interruptible(
+        &cancel_flag,
+        || guard.fired(),
+        move || client.cancel(&loc, &run_id),
+    );
+    drop(guard);
+    if interrupted {
+        msg::die(&interrupted_message("cancel"));
+    }
+    match result {
         Ok(()) => msg::info("cancelled"),
         Err(e) => msg::die(&format!(
             "ci cancel failed: {}",
@@ -664,6 +746,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn runs_warms_the_shared_cache_only_for_the_current_branch() {
@@ -820,5 +903,48 @@ mod tests {
                 .to_string()
                 .contains("invalid workflow input")
         );
+    }
+
+    #[test]
+    fn interrupt_cancels_the_running_mutation_and_reports_it() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let fired_calls = AtomicUsize::new(0);
+        let cancel_op = Arc::clone(&cancel);
+        let result = run_interruptible(
+            &cancel,
+            || fired_calls.fetch_add(1, Ordering::SeqCst) + 1 == 3,
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if cancel_op.load(Ordering::SeqCst) {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                false
+            },
+        );
+
+        assert_eq!(result, (true, true));
+        assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn uninterrupted_mutation_returns_its_value() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_interruptible(&cancel, || false, || 7);
+
+        assert_eq!(result, (7, false));
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn interrupted_message_does_not_claim_success() {
+        let message = interrupted_message("cancel");
+
+        assert!(message.contains("interrupted"));
+        assert!(message.contains("may or may not"));
+        assert!(!message.contains("cancelled\n"));
+        assert!(!message.contains("done"));
     }
 }
