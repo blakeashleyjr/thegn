@@ -463,6 +463,43 @@ pub(crate) fn logs_need_purge(old: Option<&str>, new: Option<&str>) -> bool {
     matches!((old, new), (Some(old), Some(new)) if old != new)
 }
 
+pub(crate) fn purge_logs_on_context_change(
+    db: &thegn_core::db::Db,
+    key: &str,
+    new_context: Option<&str>,
+) {
+    use thegn_core::store::CacheStore;
+
+    match db.get_ci_cache_entry(key) {
+        Ok(Some((old_json, _, _))) => {
+            let old_context =
+                thegn_core::ci::decode_run_cache(&old_json).map(|cache| cache.context);
+            if logs_need_purge(old_context.as_deref(), new_context)
+                && let Err(error) = db.retain_ci_logs(key, &[])
+            {
+                tracing::debug!(target: "thegn::ci", %error, "could not purge cached CI logs after provider context change");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(target: "thegn::ci", %error, "could not read cached CI context before log purge");
+        }
+    }
+}
+
+pub(crate) fn put_ci_cache_with_context(
+    db: &thegn_core::db::Db,
+    key: &str,
+    branch: &str,
+    json: &str,
+    context: Option<&str>,
+) -> anyhow::Result<()> {
+    use thegn_core::store::CacheStore;
+
+    purge_logs_on_context_change(db, key, context);
+    db.put_ci_cache(key, branch, json)
+}
+
 pub(crate) fn daemon_ci_runs_limit(limit: usize, max_runs: usize) -> Result<usize, String> {
     match limit {
         0 => Ok(max_runs.min(thegn_core::config_ci::MAX_CI_RUNS).max(1)),
@@ -875,24 +912,21 @@ fn refresh_ci_cache_for(
                     return false;
                 }
                 thegn_core::connectivity::report_success();
-                if let Ok(Some((old_json, _, _))) = db.get_ci_cache_entry(&key) {
-                    let old_context =
-                        thegn_core::ci::decode_run_cache(&old_json).map(|cache| cache.context);
-                    if logs_need_purge(old_context.as_deref(), context.as_deref())
-                        && let Err(error) = db.retain_ci_logs(&key, &[])
-                    {
-                        tracing::debug!(target: "thegn::ci", %error, "could not purge cached CI logs after provider context change");
-                    }
-                }
                 if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
                     runs: runs.clone(),
                     discarded_rows: result.discarded_rows,
                     context: context.clone().unwrap_or_default(),
                 }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
-                    && let Err(error) =
-                        db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json)
                 {
-                    tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
+                    if let Err(error) = put_ci_cache_with_context(
+                        &db,
+                        &key,
+                        branch.as_deref().unwrap_or(""),
+                        &json,
+                        context.as_deref(),
+                    ) {
+                        tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
+                    }
                 }
                 let mut ingest_budget = CallBudget {
                     remaining: MAX_LOG_INGEST_CALLS,
@@ -1717,6 +1751,97 @@ mod tests {
                 ci_cache_is_fresh(Some(100), 131, 30)
             );
         }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: initialize an isolated Git repository"
+    )]
+    #[test]
+    fn cached_ci_row_with_changed_origin_is_not_current() {
+        use thegn_core::store::CacheStore;
+
+        let temp = private_tempdir();
+        let worktree = temp.path().join("repo");
+        std::fs::create_dir(&worktree).expect("create fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["init", "-q", "-b", "topic"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("initialize fixture repo");
+        assert!(status.success(), "git init failed for fixture repo");
+        let status = thegn_core::util::git_cmd(&worktree)
+            .args(["remote", "add", "origin", "https://github.com/o/b.git"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("add fixture origin");
+        assert!(status.success(), "adding fixture origin failed");
+
+        let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
+        let branch = local_ci_cache_branch(&loc).expect("resolve fixture branch");
+        let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+        let key = thegn_core::remote::GitLoc::worktree_cache_key(&worktree);
+        let cached_json = serde_json::to_string(&thegn_core::ci::CiRunCache {
+            context: "github:github.com/o/a".into(),
+            ..Default::default()
+        })
+        .expect("encode old context");
+        db.put_ci_cache(&key, &branch, &cached_json)
+            .expect("seed fresh cache row");
+        let cached = db.get_ci_cache_entry(&key).expect("read cache row");
+
+        assert!(!cached_ci_row_is_current(
+            &loc,
+            &thegn_core::config::CiConfig {
+                ttl_secs: 30,
+                ..Default::default()
+            },
+            cached.as_ref(),
+            thegn_core::util::now()
+        ));
+    }
+
+    #[test]
+    fn ci_runs_writer_purges_logs_before_stamping_changed_context() {
+        use thegn_core::store::CacheStore;
+
+        let db = thegn_core::db::Db::open_memory().expect("in-memory DB");
+        let key = "/wt/repo";
+        let old_json = serde_json::to_string(&thegn_core::ci::CiRunCache {
+            context: "github:github.com/o/a".into(),
+            ..Default::default()
+        })
+        .expect("encode old context");
+        db.put_ci_cache(key, "main", &old_json)
+            .expect("seed old cache row");
+        let log = thegn_core::ci_log::CiLogEntry::new(
+            key,
+            "colliding-run",
+            "colliding-job",
+            "job",
+            "old provider log",
+            20,
+            1024,
+            123,
+        );
+        db.put_ci_log(&log).expect("seed old provider log");
+
+        let new_json = serde_json::to_string(&thegn_core::ci::CiRunCache {
+            context: "github:github.com/o/b".into(),
+            ..Default::default()
+        })
+        .expect("encode new context");
+        put_ci_cache_with_context(&db, key, "main", &new_json, Some("github:github.com/o/b"))
+            .expect("write new provider cache row");
+
+        assert!(db.list_ci_logs(key).expect("read cached logs").is_empty());
+        let written = db.get_ci_cache_entry(key).expect("read written cache row");
+        assert_eq!(
+            thegn_core::ci::decode_run_cache(&written.expect("cache row").0)
+                .expect("decode cache")
+                .context,
+            "github:github.com/o/b"
+        );
     }
 
     #[test]
