@@ -365,7 +365,7 @@ impl MediaBackend for MprisZbus {
                     "GetPlaylists",
                     &(
                         0u32,
-                        u32::try_from(crate::model::MAX_PLAYLISTS + 1).unwrap_or(u32::MAX),
+                        u32::try_from(MAX_PLAYLISTS + 1).unwrap_or(u32::MAX),
                         "Alphabetical",
                         false,
                     ),
@@ -378,16 +378,19 @@ impl MediaBackend for MprisZbus {
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
             let reported = match self.props_proxy(&bus).await {
                 Ok(proxy) => match InterfaceName::try_from(PLAYLISTS_IFACE) {
-                    Ok(iface) => {
-                        let count: Result<u32, _> = proxy.get(iface, "PlaylistCount").await;
-                        match count {
+                    Ok(iface) => match proxy.get(iface, "PlaylistCount").await {
+                        Ok(value) => match u32::try_from(value) {
                             Ok(count) => Some(count),
                             Err(error) => {
-                                tracing::debug!(target: "thegn::media", %error, "MPRIS PlaylistCount read failed");
+                                tracing::debug!(target: "thegn::media", %error, "MPRIS PlaylistCount was not a u32");
                                 None
                             }
+                        },
+                        Err(error) => {
+                            tracing::debug!(target: "thegn::media", %error, "MPRIS PlaylistCount read failed");
+                            None
                         }
-                    }
+                    },
                     Err(error) => {
                         tracing::debug!(target: "thegn::media", %error, "MPRIS Playlists interface name was invalid");
                         None
@@ -938,7 +941,7 @@ fn playlist_page_from(rows: Vec<(String, String)>, reported: Option<u32>) -> Pla
     let total = rows.len().max(reported.map_or(0, |count| count as usize));
     let items = rows
         .into_iter()
-        .take(crate::model::MAX_PLAYLISTS)
+        .take(MAX_PLAYLISTS)
         .map(|(id, name)| Playlist { id, name })
         .collect();
     PlaylistPage { items, total }
