@@ -629,6 +629,11 @@ pub(crate) fn target_stamp_action(
     }
 }
 
+fn expired_recoverable(view: &thegn_core::store::MergeClaimView, now_ms: i64) -> bool {
+    matches!(view.phase.as_str(), "claimed_no_child" | "settled")
+        && view.lease_until_ms.is_some_and(|until| until < now_ms)
+}
+
 fn drive_queue_with(
     cfg: &MergeQueueConfig,
     full: &Config,
@@ -738,10 +743,12 @@ fn drive_queue_with(
                 | "agent_blocked"
         ) {
             let active_claim = db.observe_merge_claim(&item.worktree);
-            match active_claim {
+            let now_ms = util::now_ms();
+            let recoverable = match active_claim {
+                Ok(Some(view)) if expired_recoverable(&view, now_ms) => true,
                 Ok(Some(view))
                     if view.phase != "unclaimed"
-                        && view.lease_until_ms.is_some_and(|until| until > util::now_ms()) =>
+                        && view.lease_until_ms.is_some_and(|until| until > now_ms) =>
                 {
                     out.warnings.push(format!(
                         "{}: claimed by another drain (generation {}, until {}); skipped",
@@ -749,11 +756,15 @@ fn drive_queue_with(
                         view.generation,
                         view.lease_until_ms.unwrap_or_default()
                     ));
+                    false
                 }
-                Ok(_) => out.warnings.push(format!(
-                    "{}: {} row is not claimable (stale in-progress state from an earlier drain?); remove and re-add it",
-                    item.branch, fresh.status
-                )),
+                Ok(_) => {
+                    out.warnings.push(format!(
+                        "{}: {} row is not claimable (stale in-progress state from an earlier drain?); remove and re-add it",
+                        item.branch, fresh.status
+                    ));
+                    false
+                }
                 Err(error) => {
                     out.persistence_errors.push(format!(
                         "{}: could not observe merge claim: {error}",
@@ -761,8 +772,10 @@ fn drive_queue_with(
                     ));
                     break 'items;
                 }
+            };
+            if !recoverable {
+                continue;
             }
-            continue;
         }
         let admission = if unregistered {
             claim::RowClaim::admit_unregistered(
