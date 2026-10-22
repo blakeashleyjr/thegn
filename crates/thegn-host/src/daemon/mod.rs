@@ -111,8 +111,10 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
         short_runtime_dir(),
     );
     #[cfg(unix)]
-    if dcfg.socket.is_empty() && socket == private_tmp_socket_path(&state_dir, uid) {
-        return private_tmp_socket_resolved(&state_dir, uid);
+    let predictable = private_tmp_socket_path(&state_dir, uid);
+    #[cfg(unix)]
+    if socket == predictable {
+        return private_tmp_socket_resolved(&state_dir, uid, &predictable);
     }
     socket
 }
@@ -149,14 +151,15 @@ pub(crate) fn daemon_socket_usable(dcfg: &thegn_core::config::DaemonConfig) -> b
     let usable = {
         #[cfg(unix)]
         {
+            let state_dir = thegn_core::util::xdg_state_home().join("thegn");
+            let uid = effective_uid();
+            let predictable = private_tmp_socket_path(&state_dir, uid);
+            let private_tmp = private_tmp_socket_resolved(&state_dir, uid, &predictable);
             socket_usable_decision(
                 legacy_socket_state(),
                 &socket,
                 &legacy,
-                &private_tmp_socket_resolved(
-                    &thegn_core::util::xdg_state_home().join("thegn"),
-                    effective_uid(),
-                ),
+                &private_tmp,
                 !dcfg.socket.is_empty(),
                 &live_dir_meta,
             )
@@ -205,10 +208,11 @@ fn socket_usable_decision(
         return runtime_socket_parent_usable(parent, probe);
     }
     if let Some(metadata) = probe(parent) {
-        return metadata.is_dir
+        let parent_usable = metadata.is_dir
             && !metadata.is_symlink
             && metadata.owned
             && metadata.mode & 0o777 == 0o700;
+        return parent_usable || socket == private_tmp;
     }
     if socket == private_tmp {
         return probe(std::path::Path::new("/tmp")).is_some_and(|metadata| {
@@ -354,12 +358,15 @@ fn live_dir_meta(path: &std::path::Path) -> Option<DirMeta> {
 }
 
 #[cfg(unix)]
-fn private_tmp_socket_resolved(state_dir: &std::path::Path, euid: u32) -> PathBuf {
-    let predictable = private_tmp_socket_path(state_dir, euid);
+fn private_tmp_socket_resolved(
+    state_dir: &std::path::Path,
+    euid: u32,
+    predictable: &std::path::Path,
+) -> PathBuf {
     let state_key = thegn_core::config_daemon::state_endpoint_key(state_dir);
     let locator = read_tmp_fallback_locator_at(&state_dir.join("run").join("tmp-fallback-dir"));
     relocated_private_tmp(
-        &predictable,
+        predictable,
         euid,
         &state_key,
         locator.as_deref(),
@@ -381,7 +388,40 @@ fn allocate_private_tmp_fallback_in(
                     state_dir.display()
                 )
             })?;
-    let locator = state_dir.join("run").join("tmp-fallback-dir");
+    let run_dir = state_dir.join("run");
+    let locator = run_dir.join("tmp-fallback-dir");
+    let lock_path = run_dir.join("daemon-alloc.lock");
+    let lock = match thegn_core::fsperm::create_owner_only_exclusive(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file =
+                thegn_core::fsperm::open_regular_file_nofollow(&lock_path).with_context(|| {
+                    format!(
+                        "open private daemon allocation lock {}",
+                        lock_path.display()
+                    )
+                })?;
+            let metadata = file.metadata().with_context(|| {
+                format!("inspect daemon allocation lock {}", lock_path.display())
+            })?;
+            if !thegn_core::fsperm::owned_by_current_user(&metadata)
+                || thegn_core::fsperm::mode_bits_from_metadata(&metadata) != Some(0o600)
+            {
+                anyhow::bail!(
+                    "daemon allocation lock {} is not an owner-only regular file",
+                    lock_path.display()
+                );
+            }
+            file
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("create daemon allocation lock {}", lock_path.display()));
+        }
+    };
+    lock.lock()
+        .with_context(|| format!("lock daemon allocation file {}", lock_path.display()))?;
+
     let state_key = thegn_core::config_daemon::state_endpoint_key(state_dir);
     if let Some(name) = read_tmp_fallback_locator_at(&locator) {
         let candidate = tmp_root.join(&name);
@@ -392,60 +432,8 @@ fn allocate_private_tmp_fallback_in(
         {
             return Ok(candidate.join("daemon.sock"));
         }
-        // A concurrent O_EXCL publisher may be between create and write/sync.
-        // Adopt its completed directory before reconciling this as stale.
-        let mut winner = None;
-        for _ in 0..100 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            winner = read_tmp_fallback_locator_at(&locator)
-                .filter(|name| fallback_name_ok(name, euid, &state_key))
-                .map(|name| tmp_root.join(name))
-                .filter(|candidate| {
-                    live_dir_meta(candidate).is_some_and(|meta| {
-                        meta.is_dir && !meta.is_symlink && meta.owned && meta.mode & 0o777 == 0o700
-                    })
-                });
-            if winner.is_some() {
-                break;
-            }
-        }
-        if let Some(winner) = winner {
-            return Ok(winner.join("daemon.sock"));
-        }
-        match std::fs::remove_file(&locator) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "remove stale private control-runtime locator {}",
-                        locator.display()
-                    )
-                });
-            }
-        }
-    } else if std::fs::symlink_metadata(&locator).is_ok() {
-        // Another starter may have won O_EXCL and still be writing the locator.
-        // Give that publication a bounded chance to become readable before
-        // treating an existing unreadable file as stale.
-        let mut winner = None;
-        for _ in 0..100 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            winner = read_tmp_fallback_locator_at(&locator)
-                .filter(|name| fallback_name_ok(name, euid, &state_key))
-                .map(|name| tmp_root.join(name))
-                .filter(|candidate| {
-                    live_dir_meta(candidate).is_some_and(|meta| {
-                        meta.is_dir && !meta.is_symlink && meta.owned && meta.mode & 0o777 == 0o700
-                    })
-                });
-            if winner.is_some() {
-                break;
-            }
-        }
-        if let Some(winner) = winner {
-            return Ok(winner.join("daemon.sock"));
-        }
+    }
+    if std::fs::symlink_metadata(&locator).is_ok() {
         match std::fs::remove_file(&locator) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -516,50 +504,45 @@ fn allocate_private_tmp_fallback_in(
             tmp_root.display()
         );
     };
-    let publish = (|| -> std::io::Result<()> {
-        let mut file = thegn_core::fsperm::create_owner_only_exclusive(&locator)?;
+
+    let mut random = [0_u8; 16];
+    if let Err(error) = getrandom::fill(&mut random) {
+        if let Err(cleanup) = std::fs::remove_dir(&dir) {
+            tracing::debug!(target: "thegn::daemon", path = %dir.display(), %cleanup, "failed to remove unpublished private control-runtime directory");
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "draw private locator temporary suffix under {}",
+                run_dir.display()
+            )
+        });
+    }
+    let temp_locator = run_dir.join(format!(
+        "tmp-fallback-dir-{}.tmp",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ));
+    let publication = (|| -> std::io::Result<()> {
+        let mut file = thegn_core::fsperm::create_owner_only_exclusive(&temp_locator)?;
         std::io::Write::write_all(&mut file, format!("{name}\n").as_bytes())?;
-        file.sync_all()
+        file.sync_all()?;
+        std::fs::hard_link(&temp_locator, &locator)
     })();
-    match publish {
-        Ok(()) => Ok(dir.join("daemon.sock")),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if let Err(cleanup) = std::fs::remove_dir(&dir) {
-                return Err(cleanup).with_context(|| {
-                    format!(
-                        "remove losing private control-runtime directory {}",
-                        dir.display()
-                    )
-                });
+    match publication {
+        Ok(()) => {
+            if let Err(error) = std::fs::remove_file(&temp_locator) {
+                tracing::debug!(target: "thegn::daemon", path = %temp_locator.display(), %error, "failed to remove temporary private control-runtime locator");
             }
-            let mut winner = None;
-            for _ in 0..100 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                winner = read_tmp_fallback_locator_at(&locator)
-                    .filter(|name| fallback_name_ok(name, euid, &state_key))
-                    .map(|name| tmp_root.join(name))
-                    .filter(|candidate| {
-                        live_dir_meta(candidate).is_some_and(|meta| {
-                            meta.is_dir
-                                && !meta.is_symlink
-                                && meta.owned
-                                && meta.mode & 0o777 == 0o700
-                        })
-                    });
-                if winner.is_some() {
-                    break;
-                }
-            }
-            if let Some(winner) = winner {
-                Ok(winner.join("daemon.sock"))
-            } else {
-                anyhow::bail!(
-                    "another thegn published an unusable control-runtime locator at {}; remove it and retry",
-                    locator.display()
-                )
-            }
+            Ok(dir.join("daemon.sock"))
         }
         Err(error) => {
+            if let Err(cleanup) = std::fs::remove_file(&temp_locator) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(target: "thegn::daemon", path = %temp_locator.display(), %cleanup, "failed to remove temporary private control-runtime locator");
+                }
+            }
             if let Err(cleanup) = std::fs::remove_dir(&dir) {
                 tracing::debug!(target: "thegn::daemon", path = %dir.display(), %cleanup, "failed to remove unpublished private control-runtime directory");
             }
@@ -885,13 +868,11 @@ async fn run(
     #[cfg(unix)]
     let mut sock = sock;
     #[cfg(unix)]
-    if !has_socket_override
-        && cfg.daemon.socket.is_empty()
-        && sock
-            == private_tmp_socket_path(
-                &thegn_core::util::xdg_state_home().join("thegn"),
-                effective_uid(),
-            )
+    if sock
+        == private_tmp_socket_path(
+            &thegn_core::util::xdg_state_home().join("thegn"),
+            effective_uid(),
+        )
     {
         if let Err(validation_error) = validate_private_fallback_parent(&sock) {
             let old_parent = sock.parent().map(std::path::Path::to_path_buf);
@@ -1798,7 +1779,7 @@ mod tests {
                 mode: 0o755,
             })
         };
-        assert!(!socket_usable_decision(
+        assert!(socket_usable_decision(
             LegacySocketState::Absent,
             &tmp_socket,
             legacy,
@@ -1814,7 +1795,7 @@ mod tests {
                 mode: 0o700,
             })
         };
-        assert!(!socket_usable_decision(
+        assert!(socket_usable_decision(
             LegacySocketState::Absent,
             &tmp_socket,
             legacy,
@@ -1954,6 +1935,30 @@ mod tests {
             &tmp_socket,
             false,
             &symlinked_thegn,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_unusable_parent_is_usable_by_relocation() {
+        let legacy = std::path::Path::new("/state/thegn/run/daemon.sock");
+        let state = std::path::Path::new("/state/thegn");
+        let socket = private_tmp_socket_path(state, 1000);
+        let foreign_parent = |path: &std::path::Path| {
+            (path == socket.parent().unwrap()).then_some(DirMeta {
+                is_dir: true,
+                is_symlink: false,
+                owned: false,
+                mode: 0o700,
+            })
+        };
+        assert!(socket_usable_decision(
+            LegacySocketState::Absent,
+            &socket,
+            legacy,
+            &socket,
+            false,
+            &foreign_parent,
         ));
     }
 
@@ -2358,9 +2363,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tmp_fallback_allocator_concurrent_starters_converge() {
-        // Both scoped threads share the same private temp roots. They race only
-        // on the O_EXCL locator; each creates a unique sibling, and the loser
-        // removes its empty directory before adopting the published winner.
+        // Both scoped threads share the same private temp roots. The persistent
+        // allocation lock serializes locator reconciliation and publication;
+        // the second thread must observe and reuse the first thread's directory.
         let tmp = tempfile::Builder::new()
             .prefix("tg")
             .tempdir_in("/tmp")
