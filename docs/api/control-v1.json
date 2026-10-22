@@ -577,6 +577,29 @@
       ],
       "type": "object"
     },
+    "DispatchesQuery": {
+      "description": "Query params for `dispatches.list`: `limit` rows per page (default 2048, 1..=4096) and `before`, the last row id of the previous page.",
+      "properties": {
+        "before": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "EditorOpenRequest": {
       "additionalProperties": false,
       "description": "A safe editor-handoff request (`editor.open`).\n\nThe caller selects only a worktree and an optional relative file location; provider choice, executable argv and environment stay local to the owning compositor. [`EditorOpenRequest::target`] applies the core target policy at every transport boundary before the request reaches [`ControlApi`].",
@@ -2330,6 +2353,9 @@
     },
     "DispatchStatusBody": {
       "$ref": "#/definitions/DispatchStatusBody"
+    },
+    "DispatchesQuery": {
+      "$ref": "#/definitions/DispatchesQuery"
     },
     "EditorOpenRequest": {
       "$ref": "#/definitions/EditorOpenRequest"
