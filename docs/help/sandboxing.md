@@ -584,7 +584,8 @@ VPS and machine0 sandboxes pin their SSH host key on first contact with
 `$THEGN_DIR/vps/known_hosts.d/`). Thegn creates that directory with owner-only
 permissions before managed SSH connections, refuses a symlinked or
 non-private directory, requires the same key on later connections, and
-removes the pin when it destroys a VPS sandbox.
+removes the pin when it destroys a VPS or machine0 sandbox. Creating a machine0
+VM also clears a stale pin left by an earlier VM with the same name.
 
 If local parity fails during provider provisioning, autonomous launches on
 that worktree are refused until a later provision applies parity cleanly;
