@@ -297,6 +297,9 @@ line per `[[agents]]`/`[[tools]]` entry and per pipeline stage — harness,
 model, env keys (never values), permission count — resolved the way a launch
 resolves them. `thegn dispatch list --active` is the roster reduced to the rows
 that occupy a slot. Both are terse by default and take `--json`.
+`thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
+default; `--limit` sets the page size and `--before <row>` uses the cursor printed
+on stderr when older rows follow.
 
 The dispatch roster closes its own loop: `thegn dispatch verify <id>` checks
 a finished row's artifact (exists under the worktree, tracked by git — exit

@@ -743,6 +743,53 @@ impl Db {
         Ok((rows, truncated))
     }
 
+    /// Read one keyset page of the roster in its display order. `before` is
+    /// the last row id from the preceding page.
+    pub fn dispatch_history_page(
+        &self,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let cursor_stamp = if let Some(id) = before {
+            Some(
+                tx.query_row(
+                    "SELECT dispatched_at_ms FROM agent_dispatches WHERE id=?1",
+                    params![id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id} (the --before cursor)"))?,
+            )
+        } else {
+            None
+        };
+        let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows = if let (Some(id), Some(stamp)) = (before, cursor_stamp) {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {DISPATCH_COLS} FROM agent_dispatches \
+                 WHERE dispatched_at_ms < ?1 OR (dispatched_at_ms = ?1 AND id < ?2) \
+                 ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?3"
+            ))?;
+            statement
+                .query_map(params![stamp, id, fetch_limit], map_dispatch)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut statement = tx.prepare(&format!(
+                "SELECT {DISPATCH_COLS} FROM agent_dispatches \
+                 ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?1"
+            ))?;
+            statement
+                .query_map(params![fetch_limit], map_dispatch)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+        let truncated = rows.len() > limit;
+        rows.truncate(limit);
+        Ok((rows, truncated))
+    }
+
     /// Return child stage names for the whole roster. This narrow query is
     /// deliberately unbounded: child stages decide whether a lane may advance,
     /// so they must never be inferred from a bounded dispatch window.
@@ -1381,5 +1428,61 @@ mod tests {
             db.dispatch_child_stages().unwrap()[&parent],
             vec![String::from("test"), String::from("review")]
         );
+    }
+
+    #[test]
+    fn dispatch_history_page_walks_the_roster_without_gap_or_overlap() {
+        use crate::issue::NewDispatch;
+
+        let db = Db::open_memory().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            ids.push(
+                db.put_agent_dispatch(NewDispatch::new(
+                    &format!("THE-{index}"),
+                    "/wt/history-page",
+                    "codex",
+                ))
+                .unwrap(),
+            );
+        }
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET dispatched_at_ms=100 WHERE id IN (?1, ?2)",
+                params![ids[0], ids[1]],
+            )
+            .unwrap();
+        let expected = db
+            .list_dispatches()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        let (first, first_truncated) = db.dispatch_history_page(None, 2).unwrap();
+        let (second, second_truncated) = db
+            .dispatch_history_page(first.last().map(|row| row.id), 2)
+            .unwrap();
+        let (third, third_truncated) = db
+            .dispatch_history_page(second.last().map(|row| row.id), 2)
+            .unwrap();
+        let actual = first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+
+        assert!(first_truncated);
+        assert!(second_truncated);
+        assert!(!third_truncated);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn dispatch_history_page_refuses_an_unknown_cursor() {
+        let db = Db::open_memory().unwrap();
+        let error = db.dispatch_history_page(Some(999), 2).unwrap_err();
+
+        assert!(error.to_string().contains("999"));
     }
 }
