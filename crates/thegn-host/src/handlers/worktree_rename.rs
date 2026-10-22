@@ -60,7 +60,10 @@ pub(crate) fn sweep_rename_journals(
     notes
 }
 
-pub(crate) fn spawn_launch_sweep() {
+pub(crate) fn spawn_launch_sweep(
+    refresh_tx: tokio_mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
+) {
     tokio::task::spawn_blocking(move || {
         use thegn_core::store::WorkspaceStore;
 
@@ -83,15 +86,34 @@ pub(crate) fn spawn_launch_sweep() {
             .filter(|workspace| workspace.kind == "repo")
             .map(|workspace| PathBuf::from(workspace.repo_path))
             .collect();
-        for note in sweep_rename_journals(
+        let notes = sweep_rename_journals(
             &roots,
             thegn_core::worktree::rename_intent_pending,
             thegn_core::worktree::reconcile_rename_intent,
-        ) {
-            match note {
-                SweepNote::Info(text) => thegn_core::msg::info(&text),
-                SweepNote::Warn(text) => thegn_core::msg::warn(&text),
-            }
+        );
+        if notes.is_empty() {
+            return;
+        }
+        let priority = if notes.iter().any(|note| matches!(note, SweepNote::Warn(_))) {
+            thegn_core::notification::Priority::Alert
+        } else {
+            thegn_core::notification::Priority::Info
+        };
+        let message = notes
+            .into_iter()
+            .map(|note| match note {
+                SweepNote::Info(text) | SweepNote::Warn(text) => text,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(error) =
+            refresh_tx.send(crate::hydrate::RefreshKind::Toast { message, priority })
+        {
+            tracing::debug!(target: "thegn::worktree", %error, "rename journal sweep toast receiver is gone");
+            return;
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::worktree", %error, "rename journal sweep toast wake failed");
         }
     });
 }

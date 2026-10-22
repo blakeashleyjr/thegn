@@ -1146,8 +1146,8 @@ pub fn reconcile_rename_intent(root: &Path) -> Result<Option<RenameRecovery>, St
     reconcile_rename_intent_locked(root)
 }
 
-/// Check whether a rename intent journal is present using only a filesystem
-/// stat. This does not run git or acquire the repository mutation lock.
+/// Check whether a rename intent journal is present using filesystem metadata
+/// only. This does not run git or acquire the repository mutation lock.
 pub fn rename_intent_pending(root: &Path) -> Result<bool, String> {
     let path = rename_intent_path(root);
     match std::fs::symlink_metadata(&path) {
@@ -2675,5 +2675,23 @@ mod tests {
 
         assert!(!rename_intent_pending(&repo.join("missing")).unwrap());
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rename_intent_pending_reports_non_not_found_metadata_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}/child/grandchild\n", blocker.display()),
+        )
+        .unwrap();
+
+        let result = rename_intent_pending(&root);
+        assert!(matches!(result, Err(error) if error.contains("could not inspect rename intent")));
     }
 }
