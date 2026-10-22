@@ -132,9 +132,168 @@ pub(crate) fn duration_from_ticks(ticks: i64) -> Option<Duration> {
     }
 }
 
+/// Lock shared binding state even when a previous callback panicked while it
+/// held the mutex. The state remains usable for teardown and reconnection.
+pub(crate) fn lock_unpoisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Generation fence for external bindings. Callers take bindings out under
+/// the lock, perform external work without it, then install only if still
+/// current.
+pub(crate) struct BindState<B> {
+    generation: u64,
+    bound: Option<B>,
+    closed: bool,
+}
+
+impl<B> Default for BindState<B> {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            bound: None,
+            closed: false,
+        }
+    }
+}
+
+impl<B> BindState<B> {
+    pub(crate) fn begin(&mut self) -> Option<(u64, Option<B>)> {
+        if self.closed {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        Some((self.generation, self.bound.take()))
+    }
+
+    pub(crate) fn install(&mut self, generation: u64, bound: B) -> Result<(), B> {
+        if !self.closed && generation == self.generation {
+            self.bound = Some(bound);
+            Ok(())
+        } else {
+            Err(bound)
+        }
+    }
+
+    pub(crate) fn close(&mut self) -> Option<B> {
+        self.closed = true;
+        self.generation = self.generation.wrapping_add(1);
+        self.bound.take()
+    }
+}
+
+/// Register a pair atomically from the caller's perspective, rolling back the
+/// first token if registration of the second handler fails.
+pub(crate) fn register_pair<A, B, E: std::fmt::Display>(
+    first: impl FnOnce() -> Result<A, E>,
+    second: impl FnOnce() -> Result<B, E>,
+    undo_first: impl FnOnce(A) -> Result<(), E>,
+) -> Result<(A, B), MediaError> {
+    let first = first().map_err(|error| {
+        MediaError::Backend(format!("smtc handler registration failed: {error}"))
+    })?;
+    match second() {
+        Ok(second) => Ok((first, second)),
+        Err(error) => {
+            let message = match undo_first(first) {
+                Ok(()) => format!("smtc handler registration failed: {error}"),
+                Err(rollback) => format!(
+                    "smtc handler registration failed: {error}; rollback failed: {rollback}"
+                ),
+            };
+            Err(MediaError::Backend(message))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_unpoisoned_recovers_after_a_panicking_holder() {
+        let mutex = std::sync::Mutex::new(0_u32);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = mutex.lock().unwrap();
+                panic!("poison");
+            }))
+            .is_err()
+        );
+        assert_eq!(*lock_unpoisoned(&mutex), 0);
+        *lock_unpoisoned(&mutex) = 7;
+        assert_eq!(*lock_unpoisoned(&mutex), 7);
+    }
+
+    #[test]
+    fn bind_state_begin_hands_back_the_old_binding_and_bumps_generation() {
+        let mut state = BindState::default();
+        let (first_generation, old) = state.begin().unwrap();
+        assert!(old.is_none());
+        state.install(first_generation, "first").unwrap();
+        let (second_generation, old) = state.begin().unwrap();
+        assert!(second_generation > first_generation);
+        assert_eq!(old, Some("first"));
+    }
+
+    #[test]
+    fn bind_state_install_refuses_a_stale_generation() {
+        let mut state = BindState::default();
+        let (first, _) = state.begin().unwrap();
+        let (second, _) = state.begin().unwrap();
+        assert_eq!(state.install(first, "stale"), Err("stale"));
+        assert_eq!(state.install(second, "current"), Ok(()));
+        assert_eq!(state.begin(), Some((second + 1, Some("current"))));
+    }
+
+    #[test]
+    fn bind_state_close_refuses_later_begin_and_install() {
+        let mut state = BindState::default();
+        let (generation, _) = state.begin().unwrap();
+        state.install(generation, "bound").unwrap();
+        assert_eq!(state.close(), Some("bound"));
+        assert!(state.begin().is_none());
+        assert_eq!(state.install(generation, "late"), Err("late"));
+    }
+
+    #[test]
+    fn register_pair_returns_both_on_success() {
+        assert_eq!(
+            register_pair(|| Ok::<_, &str>(1), || Ok::<_, &str>(2), |_| Ok(())),
+            Ok((1, 2))
+        );
+    }
+
+    #[test]
+    fn register_pair_rolls_back_the_first_when_the_second_fails() {
+        let mut removed = None;
+        let result = register_pair(
+            || Ok::<_, &str>(11),
+            || Err::<u8, _>("second"),
+            |token| {
+                removed = Some(token);
+                Ok(())
+            },
+        );
+        assert_eq!(removed, Some(11));
+        assert!(
+            matches!(result, Err(MediaError::Backend(message)) if message.contains("registration failed"))
+        );
+    }
+
+    #[test]
+    fn register_pair_reports_a_failed_rollback() {
+        let result = register_pair(
+            || Ok::<_, &str>(11),
+            || Err::<u8, _>("second"),
+            |_| Err("remove"),
+        );
+        assert!(
+            matches!(result, Err(MediaError::Backend(message)) if message.contains("registration failed") && message.contains("rollback failed"))
+        );
+    }
 
     #[test]
     fn explicit_refusal_is_an_error() {
