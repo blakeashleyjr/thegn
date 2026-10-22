@@ -20,6 +20,7 @@ import tarfile
 import tempfile
 import tomllib
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
@@ -373,7 +374,7 @@ def _archive_required_files(manifest: Mapping[str, Any], target: str) -> list[st
     return required
 
 
-def _hash_open_file(handle: Any, path: Path) -> str:
+def _hash_open_file(handle: Any, path: Path, label: str = "release archive") -> str:
     digest = hashlib.sha256()
     total = 0
     try:
@@ -382,12 +383,12 @@ def _hash_open_file(handle: Any, path: Path) -> str:
             total += len(block)
             if total > MAX_ARCHIVE_BYTES:
                 raise ReleaseError(
-                    f"release archive {path} exceeds {MAX_ARCHIVE_BYTES} bytes"
+                    f"{label} {path} exceeds {MAX_ARCHIVE_BYTES} bytes"
                 )
             digest.update(block)
         handle.seek(0)
     except OSError as error:
-        raise ReleaseError(f"cannot read release archive {path}: {error}") from error
+        raise ReleaseError(f"cannot read {label} {path}: {error}") from error
     return digest.hexdigest()
 
 
@@ -402,7 +403,7 @@ def _hash_payload_file(path: Path) -> str:
             raise ReleaseError(f"payload file {path} exceeds {MAX_ARCHIVE_BYTES} bytes")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = None
-            return _hash_open_file(handle, path)
+            return _hash_open_file(handle, path, "payload file")
     except OSError as error:
         raise ReleaseError(f"cannot read payload file {path}: {error}") from error
     finally:
@@ -425,6 +426,12 @@ def stage_archive(
     archive_path = assets_dir / archive_name
     require_trusted_digests(assets_dir, [archive_name], trusted)
     required = _archive_required_files(manifest, target)
+    try:
+        layout_stat = archive_path.lstat()
+    except OSError as error:
+        raise ReleaseError(f"cannot inspect release archive {archive_path}: {error}") from error
+    if not stat.S_ISREG(layout_stat.st_mode):
+        raise ReleaseError(f"release archive is not a regular file: {archive_path}")
     _validate_archive_layout(archive_path, "unix", required)
 
     parent = output_dir.parent
@@ -471,6 +478,8 @@ def stage_archive(
         archive_stat = os.fstat(archive_fd)
         if not stat.S_ISREG(archive_stat.st_mode):
             raise ReleaseError(f"release archive is not a regular file: {archive_path}")
+        if (layout_stat.st_dev, layout_stat.st_ino) != (archive_stat.st_dev, archive_stat.st_ino):
+            raise ReleaseError(f"release archive changed during layout validation: {archive_path}")
         with os.fdopen(os.dup(archive_fd), "rb") as archive_file:
             actual = _hash_open_file(archive_file, archive_path)
         expected = trusted[archive_name]
@@ -536,11 +545,14 @@ def stage_archive(
             raise ReleaseError(f"staging output already exists: {output_dir}")
         os.rename(temp_name, output_dir.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temp_name = None
+        output_stat = output_dir.lstat()
+        if (temp_stat.st_dev, temp_stat.st_ino) != (output_stat.st_dev, output_stat.st_ino):
+            raise ReleaseError(f"staging output changed during handoff: {output_dir}")
         os.fsync(parent_fd)
         return staged
     except ReleaseError:
         raise
-    except (OSError, tarfile.TarError) as error:
+    except (OSError, EOFError, tarfile.TarError, zlib.error) as error:
         raise ReleaseError(f"cannot stage release archive {archive_path}: {error}") from error
     finally:
         if archive_fd is not None:
