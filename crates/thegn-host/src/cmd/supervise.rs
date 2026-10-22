@@ -47,7 +47,8 @@ pub enum Action {
     /// than silently absent.
     Plan {
         /// Only lanes for this issue (`"<provider>:<key>"`, e.g.
-        /// `linear:THE-407`).
+        /// `linear:THE-407`). Any spelling of the issue id matches (prefixed
+        /// or not, any case); different providers stay distinct.
         #[arg(long)]
         issue: Option<String>,
         /// Include lanes whose row has reached a terminal status. Off by
@@ -67,7 +68,8 @@ pub enum Action {
     /// The lane digest, grouped by what it needs from you: decisions first,
     /// then findings, then what is simply in flight.
     Status {
-        /// Only lanes for this issue.
+        /// Only lanes for this issue. Any spelling of the issue id matches
+        /// (prefixed or not, any case); different providers stay distinct.
         #[arg(long)]
         issue: Option<String>,
         /// Include lanes whose row has reached a terminal status.
@@ -228,9 +230,7 @@ fn gather(
             // Not a pipeline dispatch — the supervisor has no chart for it.
             continue;
         };
-        if let Some(want) = issue
-            && row.issue_id != want
-        {
+        if !issue_selected(&row.issue_id, issue) {
             continue;
         }
         if !all
@@ -292,6 +292,10 @@ fn gather(
         });
     }
     Ok(out)
+}
+
+fn issue_selected(row_issue: &str, want: Option<&str>) -> bool {
+    want.is_none_or(|want| thegn_core::pipeline_identity::same_issue(row_issue, want))
 }
 
 fn gather_rows(
@@ -722,6 +726,66 @@ mod tests {
             .unwrap();
         db.update_dispatch_status(id, status).unwrap();
         id
+    }
+
+    fn insert_issue_row(
+        db: &Db,
+        issue_id: &str,
+        worktree_path: &str,
+        status: AgentDispatchStatus,
+    ) -> i64 {
+        let id = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                issue_id,
+                worktree_path,
+                agent_name: "codex",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(id, status).unwrap();
+        id
+    }
+
+    #[test]
+    fn issue_filter_matches_every_spelling_of_one_issue() {
+        assert!(issue_selected("linear:THE-407", Some("THE-407")));
+        assert!(issue_selected("linear:THE-407", Some("LINEAR:the-407")));
+        assert!(issue_selected("linear:THE-407", Some("linear:THE-407")));
+        assert!(issue_selected("linear:THE-407", None));
+        assert!(!issue_selected("linear:THE-407", Some("jira:THE-407")));
+        assert!(!issue_selected("linear:THE-407", Some("THE-408")));
+    }
+
+    #[test]
+    fn gather_issue_filter_keeps_rows_stored_under_another_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        let worktree_path = dir.path().display().to_string();
+        let matched = insert_issue_row(
+            &db,
+            "linear:THE-407",
+            &worktree_path,
+            AgentDispatchStatus::Running,
+        );
+        let other = insert_issue_row(&db, "THE-408", &worktree_path, AgentDispatchStatus::Running);
+
+        let lanes = gather(
+            &Config::default(),
+            &db,
+            Some("THE-407"),
+            false,
+            RosterPage::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            lanes.iter().map(|lane| lane.row.id).collect::<Vec<_>>(),
+            vec![matched]
+        );
+        assert!(!lanes.iter().any(|lane| lane.row.id == other));
     }
 
     #[test]
