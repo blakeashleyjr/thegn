@@ -1502,7 +1502,7 @@ mod tests {
         let key = thegn_core::remote::GitLoc::worktree_cache_key(temp.path());
         let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
         db.put_ci_log(&thegn_core::ci_log::CiLogEntry {
-            worktree: key,
+            worktree: key.clone(),
             run_id: "run".into(),
             job_id: "job-run".into(),
             text: "old".into(),
