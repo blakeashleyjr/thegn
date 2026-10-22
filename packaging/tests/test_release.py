@@ -587,5 +587,182 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(output.as_posix(), stdout.getvalue().strip())
 
 
+class TrustedDigestTests(unittest.TestCase):
+    make_asset = ReleaseRendererTests.make_asset
+    setUp = ReleaseManifestTests.setUp
+    write_record = ReleaseManifestTests.write_record
+    build = ReleaseManifestTests.build
+
+    def trusted(self) -> dict[str, str]:
+        return {name: release._sha256(self.assets / name) for name in self.expected}
+
+    def write_digest_file(self, name: str, value: object) -> Path:
+        path = self.temp / name
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    def downloaded_assets(self) -> tuple[Path, list[str]]:
+        download = self.temp / "download"
+        download.mkdir()
+        names: list[str] = []
+        for target, config in self.manifest["targets"].items():
+            if config["enabled"]:
+                names.extend(release._asset_names(self.manifest, self.tag, target))
+        completions = f"thegn-{self.tag}-completions.tar.gz"
+        names.extend((completions, f"{completions}.sha256"))
+        for name in names:
+            (download / name).write_bytes((self.assets / name).read_bytes())
+        return download, sorted(names)
+
+    def test_verify_digests_accepts_matching_producer_digests(self) -> None:
+        download, names = self.downloaded_assets()
+        trusted = {name: release._sha256(download / name) for name in names}
+        self.assertEqual(
+            names,
+            release.verify_downloaded_assets(self.manifest, self.tag, download, trusted),
+        )
+
+    def test_verify_digests_rejects_archive_and_checksum_replaced_together(self) -> None:
+        target = "x86_64-unknown-linux-gnu"
+        archive_name, checksum_name = release._asset_names(self.manifest, self.tag, target)
+        download, names = self.downloaded_assets()
+        required = list(self.manifest["archive"]["root_files"])
+        required[0] = self.manifest["targets"][target].get(
+            "binary", self.manifest["project"]["binary"]
+        )
+        replacement = download / archive_name
+        with tarfile.open(replacement, "w:gz") as output:
+            for name in required:
+                content = f"substituted:{name}\n".encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                info.mode = 0o755 if name == "thegn" else 0o644
+                info.mtime = 0
+                output.addfile(info, io.BytesIO(content))
+        digest = release._sha256(replacement)
+        (download / checksum_name).write_text(
+            f"{digest}  {archive_name}\n", encoding="utf-8"
+        )
+        managers = release.selected_managers(self.manifest, None)
+        release.validate_assets(self.manifest, self.tag, download, managers)
+        trusted = {name: release._sha256(self.assets / name) for name in names}
+        archive_stem = archive_name.removesuffix(".tar.gz")
+        with self.assertRaisesRegex(release.ReleaseError, archive_stem):
+            release.verify_downloaded_assets(self.manifest, self.tag, download, trusted)
+        trusted[checksum_name] = release._sha256(download / checksum_name)
+        with self.assertRaisesRegex(release.ReleaseError, archive_name):
+            release.verify_downloaded_assets(self.manifest, self.tag, download, trusted)
+
+    def test_verify_digests_rejects_a_missing_trusted_entry(self) -> None:
+        download, names = self.downloaded_assets()
+        trusted = {name: release._sha256(download / name) for name in names[1:]}
+        with self.assertRaisesRegex(release.ReleaseError, f"no trusted digest for {names[0]}"):
+            release.verify_downloaded_assets(self.manifest, self.tag, download, trusted)
+
+    def test_verify_digests_rejects_an_unexpected_downloaded_file(self) -> None:
+        download, _ = self.downloaded_assets()
+        (download / "unexpected.txt").write_text("extra", encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "unexpected: unexpected.txt"):
+            release.verify_downloaded_assets(self.manifest, self.tag, download, self.trusted())
+
+    def test_trusted_digest_loader_rejects_malformed_input(self) -> None:
+        digest = "a" * 64
+        cases = (
+            ("array", [], "JSON object"),
+            ("uppercase", {"thegn-a.tar.gz": "A" * 64}, "lowercase 64-hex"),
+            ("short", {"thegn-a.tar.gz": "a" * 63}, "lowercase 64-hex"),
+            ("slash", {"thegn/a": digest}, "invalid trusted digest asset name"),
+            ("dotdot", {"..": digest}, "invalid trusted digest asset name"),
+            ("empty", {}, "must not be empty"),
+        )
+        for label, value, message in cases:
+            with self.subTest(case=label):
+                path = self.write_digest_file(f"{label}.json", value)
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    release.load_trusted_digests([path])
+
+        with self.subTest(case="malformed-json"):
+            malformed = self.temp / "malformed.json"
+            malformed.write_text("{not-json", encoding="utf-8")
+            with self.assertRaisesRegex(release.ReleaseError, "cannot read trusted digests"):
+                release.load_trusted_digests([malformed])
+
+        with self.subTest(case="duplicate"):
+            first = self.write_digest_file("first.json", {"thegn-a.tar.gz": digest})
+            second = self.write_digest_file("second.json", {"thegn-a.tar.gz": digest})
+            with self.assertRaisesRegex(release.ReleaseError, "given twice"):
+                release.load_trusted_digests([first, second])
+            duplicate = self.temp / "duplicate.json"
+            duplicate.write_text(
+                json.dumps({"thegn-a.tar.gz": digest})[:-1]
+                + f',"thegn-a.tar.gz":"{digest}"}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(release.ReleaseError, "given twice"):
+                release.load_trusted_digests([duplicate])
+
+        with self.subTest(case="oversized"):
+            oversized = self.temp / "oversized.json"
+            oversized.write_bytes(b" " * (release.MAX_TRUSTED_DIGESTS_BYTES + 1))
+            with self.assertRaisesRegex(release.ReleaseError, "exceed"):
+                release.load_trusted_digests([oversized])
+
+        with self.subTest(case="symlink"):
+            target = self.write_digest_file("symlink-target.json", {"thegn-a.tar.gz": digest})
+            link = self.temp / "symlink.json"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(release.ReleaseError, "not a regular file"):
+                release.load_trusted_digests([link])
+
+    def test_manifest_with_trusted_digests_rejects_a_replaced_package(self) -> None:
+        trusted = self.trusted()
+        package = next(name for name in self.expected if name.endswith(".deb"))
+        (self.assets / package).write_bytes(b"substituted package")
+        with self.assertRaisesRegex(release.ReleaseError, f"{package} does not match"):
+            release.build_release_manifest(
+                self.manifest, self.tag, self.commit, self.assets, self.record_path, trusted=trusted
+            )
+
+    def test_manifest_with_trusted_digests_requires_the_exact_set(self) -> None:
+        trusted = self.trusted()
+        trusted.pop(self.expected[0])
+        with self.assertRaisesRegex(release.ReleaseError, "missing:"):
+            release.build_release_manifest(
+                self.manifest, self.tag, self.commit, self.assets, self.record_path, trusted=trusted
+            )
+        trusted = self.trusted()
+        trusted["thegn-extra"] = "a" * 64
+        with self.assertRaisesRegex(release.ReleaseError, "unexpected: thegn-extra"):
+            release.build_release_manifest(
+                self.manifest, self.tag, self.commit, self.assets, self.record_path, trusted=trusted
+            )
+
+    def test_manifest_without_trusted_digests_is_unchanged(self) -> None:
+        result = self.build()
+        self.assertEqual(self.expected, [asset["name"] for asset in result["assets"]])
+
+    def test_verify_digests_cli_exits_nonzero_on_refusal(self) -> None:
+        download, names = self.downloaded_assets()
+        wrong = {name: release._sha256(download / name) for name in names}
+        wrong[names[0]] = "0" * 64
+        digests = self.write_digest_file("cli-digests.json", wrong)
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit) as raised:
+            with contextlib.redirect_stderr(stderr):
+                release.main(
+                    [
+                        "verify-digests",
+                        "--tag",
+                        self.tag,
+                        "--assets-dir",
+                        str(download),
+                        "--trusted-digests",
+                        str(digests),
+                    ]
+                )
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn(names[0], stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,38 @@ pub(crate) fn drive_queue(
             });
         };
 
+        match db.pr_agent_lease_view(&item.key) {
+            Ok(Some(view))
+                if pr_queue::pr_agent_lease_live(Some(&view), thegn_core::util::now_ms()) =>
+            {
+                let owner_suffix = match view.owner_hint.as_deref() {
+                    Some(hint) => format!(", held by {hint}"),
+                    None => String::new(),
+                };
+                let detail = format!(
+                    "PR #{}: a PR agent is running (lease generation {}{}); refresh skipped, agent not dispatched",
+                    item.number, view.generation, owner_suffix
+                );
+                tracing::warn!(target: "thegn::prq", "{detail}");
+                out.warnings.push(detail.clone());
+                out.blocked.push(item.number);
+                step(PrqStatus::AgentRunning.as_str(), &detail, &mut progress);
+                continue;
+            }
+            Err(error) => {
+                let detail = format!(
+                    "PR #{}: could not read the PR-agent lease ({error}); refresh skipped",
+                    item.number
+                );
+                tracing::warn!(target: "thegn::prq", "{detail}");
+                out.warnings.push(detail.clone());
+                out.blocked.push(item.number);
+                step(PrqStatus::AgentRunning.as_str(), &detail, &mut progress);
+                continue;
+            }
+            Ok(_) => {}
+        }
+
         // Where to run forge commands: the PR's own worktree when it has one,
         // else the repo root — `gh` only needs *a* checkout of the repo, so a PR
         // with no worktree is still fetchable. `None` location = local.
@@ -843,6 +875,30 @@ pub(crate) fn drive_queue(
                     credential_free: true,
                 });
 
+                let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
+                    forge
+                        .pr_status(&loc, PrRef::Number(item.number))
+                        .ok()
+                        .filter(|pr| {
+                            pr_queue::attest_pr_identity(
+                                item.pr_url.as_deref(),
+                                item.number,
+                                &pr.url,
+                                pr.number,
+                            )
+                            .is_ok()
+                        })
+                        .map(|pr| pr.head_ref_oid)
+                });
+                if let Some(own) = own
+                    && let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
+                        item.number,
+                        guard.record_own_head(db, &head, &own),
+                    )
+                {
+                    out.warnings.push(warning);
+                }
+
                 match guard.finish(db, None) {
                     Ok(true) => {}
                     Ok(false) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the next refresh re-evaluates the row", item.number)),
@@ -921,6 +977,17 @@ pub(crate) fn reattest(
         checkout_gen: item.checkout_gen,
     };
     pr_queue::attest_queue_row(&snapshot, current.as_ref())?;
+    let lease = db
+        .pr_agent_lease_view(&item.key)
+        .map_err(|error| format!("could not re-read the PR-agent lease: {error}"))?;
+    if let Some(view) = lease.as_ref()
+        && pr_queue::pr_agent_lease_live(Some(view), thegn_core::util::now_ms())
+    {
+        return Err(format!(
+            "a PR agent is running (lease generation {}); not applying the effect",
+            view.generation
+        ));
+    }
     Ok(())
 }
 
@@ -3460,5 +3527,102 @@ mod tests {
                 .any(|warning| warning.contains("agent not dispatched")),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn leased_row_is_skipped_without_forge_calls_or_writes() {
+        let (dir, db) = temp_db("prq-live-lease-refresh-skip");
+        let (checkout, item) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        let head = GitLoc::from_db(checkout.to_str().unwrap(), None)
+            .git_out(&["rev-parse", "HEAD"])
+            .unwrap();
+        let request = pr_queue::PrAgentAdmit {
+            key: &item.key,
+            expected_attempts: 0,
+            expected_checkout_gen: item.checkout_gen,
+            max_attempts: 3,
+            head: &head,
+            blocker: "ci",
+            detail: "agent is changing this PR",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("active worker"),
+            ci_candidate: None,
+        };
+        assert!(matches!(
+            db.admit_pr_agent(&request).unwrap(),
+            pr_queue::PrAgentAdmission::Admitted(_)
+        ));
+        let forge = FakeForge::new(Some(green_pr()));
+
+        let out = drive_queue(
+            &cfg(),
+            &uncontained_config(),
+            &forge,
+            &checkout,
+            &db,
+            vec![item],
+            |_| {},
+        );
+
+        assert!(forge.calls().is_empty(), "{:?}", forge.calls());
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.status, PrqStatus::AgentRunning.as_str());
+        assert_eq!(row.detail.as_deref(), Some("agent is changing this PR"));
+        assert_eq!(row.last_head_oid.as_deref(), Some(head.as_str()));
+        assert_eq!(row.agent_attempts, 1);
+        assert!(out.blocked.contains(&7), "{out:?}");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| warning.contains("refresh skipped")
+                    && warning.contains("held by active worker")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn reattest_refuses_while_a_lease_is_live() {
+        let (_, db) = temp_db("prq-reattest-live-lease");
+        db.enqueue_bound_pr(
+            "/repo",
+            7,
+            None,
+            "feat",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/7",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let item = PrItem::from(&row);
+        let request = pr_queue::PrAgentAdmit {
+            key: &item.key,
+            expected_attempts: 0,
+            expected_checkout_gen: item.checkout_gen,
+            max_attempts: 3,
+            head: "abc",
+            blocker: "ci",
+            detail: "active worker",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("active worker"),
+            ci_candidate: None,
+        };
+        assert!(matches!(
+            db.admit_pr_agent(&request).unwrap(),
+            pr_queue::PrAgentAdmission::Admitted(_)
+        ));
+        let expected = fetched(vec![]);
+        let forge = FakeForge::new(Some(green_pr()));
+
+        let result = reattest(
+            &db,
+            &forge,
+            &GitLoc::from_db("/repo", None),
+            &item,
+            &expected,
+        );
+
+        assert!(matches!(result, Err(ref error) if error.contains("a PR agent is running")));
     }
 }

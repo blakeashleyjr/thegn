@@ -446,6 +446,9 @@ pub trait WorktreeAuxStore {
     /// Update a queued PR's status and, optionally, its blocker word, detail,
     /// and last observed head. Passing `None` leaves that column unchanged, so a
     /// failed refresh can update a note without clobbering a known-good head.
+    /// A row whose PR agent holds a live lease is not written: the lease holder
+    /// writes only through its own fenced release, and the driver skips leased
+    /// rows before reaching this.
     fn update_pr_status(
         &self,
         key: &str,
@@ -456,8 +459,14 @@ pub trait WorktreeAuxStore {
     ) -> Result<()>;
 
     /// Record agent-dispatch cycles spent on a PR, so the budget belongs to the
-    /// pull request rather than to one drain.
+    /// pull request rather than to one drain. A live PR-agent lease fences this
+    /// write; the lease holder updates attempts only through its fenced release,
+    /// while the driver skips leased rows before reaching this.
     fn set_pr_agent_attempts(&self, key: &str, attempts: u32) -> Result<()>;
+
+    /// Return lease metadata only when the row has an owner and a lease deadline.
+    /// The owner token is never exposed; a missing row returns `Ok(None)`.
+    fn pr_agent_lease_view(&self, key: &str) -> Result<Option<crate::pr_queue::PrAgentLeaseView>>;
 
     fn admit_pr_agent(
         &self,
@@ -472,6 +481,15 @@ pub trait WorktreeAuxStore {
         &self,
         lease: &crate::pr_queue::PrAgentLease,
         finished: Option<(&str, &str)>,
+    ) -> Result<bool>;
+    /// Record the head an admitted agent produced, fenced on the live lease
+    /// generation and on the admitted head still being the row's last head.
+    /// Returns false when the lease is no longer this one or the row moved.
+    fn record_pr_agent_head(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        admitted_head: &str,
+        own_head: &str,
     ) -> Result<bool>;
 
     /// Atomically reserve the one automatic CI rerun for `head`. The

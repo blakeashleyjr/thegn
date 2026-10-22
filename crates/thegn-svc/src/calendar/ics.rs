@@ -32,6 +32,18 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 const _: () = assert!(MAX_AGGREGATE_SOURCE_BYTES > MAX_SOURCE_DOCUMENT_BYTES);
 const _: () = assert!(MAX_DIRECTORY_ENTRIES > MAX_FILES);
 
+/// A document that yields no in-window events and carries at least one effective
+/// series cancellation is authoritative: it is a Reset, so the host replaces the
+/// cache instead of treating the empty page as a suspicious provider glitch. Any
+/// other empty snapshot keeps the Snapshot guard.
+pub(super) fn snapshot_mode(events_empty: bool, saw_series_tombstone: bool) -> PageMode {
+    if events_empty && saw_series_tombstone {
+        PageMode::Reset
+    } else {
+        PageMode::Snapshot
+    }
+}
+
 pub struct IcsBackend {
     path: String,
     zone: thegn_core::calendar::Tz,
@@ -61,7 +73,7 @@ impl IcsBackend {
         out: &mut Vec<CalEvent>,
         remaining_bytes: usize,
         deadline: Instant,
-    ) -> Result<(usize, PageDiagnostics), ReadFailure> {
+    ) -> Result<(usize, PageDiagnostics, bool), ReadFailure> {
         check_deadline(deadline).map_err(ReadFailure::Io)?;
         let file = thegn_core::fsperm::open_regular_file_nofollow(path).map_err(ReadFailure::Io)?;
         let declared =
@@ -126,7 +138,11 @@ impl IcsBackend {
                             Err(ReadFailure::Document)
                         } else {
                             check_deadline(deadline).map_err(ReadFailure::Io)?;
-                            Ok((count, PageDiagnostics::from_report(&report)))
+                            Ok((
+                                count,
+                                PageDiagnostics::from_report(&report),
+                                !report.cancelled_uids().is_empty(),
+                            ))
                         }
                     }
                 }
@@ -155,15 +171,10 @@ impl IcsBackend {
                 MAX_AGGREGATE_SOURCE_BYTES,
                 deadline,
             ) {
-                Ok((_, diagnostics)) => {
-                    return EventPage::from_meter(
-                        meter,
-                        PageMode::Snapshot,
-                        out,
-                        Vec::new(),
-                        String::new(),
-                    )
-                    .map(|page| page.with_diagnostics(diagnostics));
+                Ok((_, diagnostics, saw_series_tombstone)) => {
+                    let mode = snapshot_mode(out.is_empty(), saw_series_tombstone);
+                    return EventPage::from_meter(meter, mode, out, Vec::new(), String::new())
+                        .map(|page| page.with_diagnostics(diagnostics));
                 }
                 Err(ReadFailure::Io(e)) => {
                     return Err(CalendarError::Io(format!("{}: {e}", self.path)));
@@ -222,6 +233,7 @@ impl IcsBackend {
         candidates = select_candidates(candidates)?;
         let mut total_bytes = 0usize;
         let mut diagnostics = PageDiagnostics::default();
+        let mut saw_series_tombstone = false;
         for path in candidates {
             check_deadline(deadline)
                 .map_err(|e| CalendarError::Io(format!("{}: {e}", self.path)))?;
@@ -235,9 +247,10 @@ impl IcsBackend {
                 remaining,
                 deadline,
             ) {
-                Ok((n, file_diagnostics)) => {
+                Ok((n, file_diagnostics, file_has_series_tombstone)) => {
                     total_bytes += n;
                     diagnostics.absorb(file_diagnostics);
+                    saw_series_tombstone |= file_has_series_tombstone;
                 }
                 Err(ReadFailure::Io(e)) => {
                     return Err(CalendarError::Io(format!("{}: {e}", path.display())));
@@ -251,7 +264,8 @@ impl IcsBackend {
                 }
             }
         }
-        EventPage::from_meter(meter, PageMode::Snapshot, out, Vec::new(), String::new())
+        let mode = snapshot_mode(out.is_empty(), saw_series_tombstone);
+        EventPage::from_meter(meter, mode, out, Vec::new(), String::new())
             .map(|page| page.with_diagnostics(diagnostics))
     }
 }
@@ -332,6 +346,90 @@ impl CalendarBackend for IcsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
+
+    fn local_account(path: &Path) -> CalendarAccount {
+        CalendarAccount {
+            name: "local".into(),
+            provider: CalendarProviderKind::Ics,
+            path: path.to_string_lossy().into_owned(),
+            ..CalendarAccount::default()
+        }
+    }
+
+    fn test_admission() -> AccountAdmission {
+        AccountAdmission::isolated(Default::default(), thegn_core::calendar::Tz::UTC)
+    }
+
+    fn test_window() -> (NaiveDate, NaiveDate) {
+        (
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        )
+    }
+
+    const TOMBSTONE_ONLY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:gone\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const EMPTY_CALENDAR: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n";
+
+    /// Regression: this assertion fails on main because an empty tombstone-only
+    /// local document is returned as Snapshot and rejected by the host guard.
+    #[test]
+    fn tombstone_only_local_file_is_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.ics");
+        std::fs::write(&path, TOMBSTONE_ONLY).unwrap();
+        let backend = IcsBackend::new(&local_account(&path), test_admission());
+
+        let page = backend.read_all(test_window()).unwrap();
+
+        assert_eq!(page.mode(), PageMode::Reset);
+        assert!(page.events().is_empty());
+    }
+
+    /// Positive control: a genuinely empty document must keep the guard.
+    #[test]
+    fn empty_local_calendar_stays_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.ics");
+        std::fs::write(&path, EMPTY_CALENDAR).unwrap();
+        let backend = IcsBackend::new(&local_account(&path), test_admission());
+
+        let page = backend.read_all(test_window()).unwrap();
+
+        assert_eq!(page.mode(), PageMode::Snapshot);
+        assert!(page.events().is_empty());
+    }
+
+    /// Positive control: a surviving event means this is still an ordinary snapshot.
+    #[test]
+    fn tombstone_beside_a_live_event_stays_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.ics");
+        let text = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:gone\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:live\r\nDTSTART:20260814T090000Z\r\nDTEND:20260814T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(&path, text).unwrap();
+        let backend = IcsBackend::new(&local_account(&path), test_admission());
+
+        let page = backend.read_all(test_window()).unwrap();
+
+        assert_eq!(page.mode(), PageMode::Snapshot);
+        assert_eq!(page.events().len(), 1);
+        assert_eq!(page.events()[0].uid, "live");
+    }
+
+    /// Regression: an effective cancellation in a vdir must make the empty
+    /// combined document authoritative, even alongside a genuinely empty file.
+    #[test]
+    fn tombstone_only_vdir_is_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ics"), TOMBSTONE_ONLY).unwrap();
+        std::fs::write(dir.path().join("b.ics"), EMPTY_CALENDAR).unwrap();
+        let backend = IcsBackend::new(&local_account(dir.path()), test_admission());
+
+        let page = backend.read_all(test_window()).unwrap();
+
+        assert_eq!(page.mode(), PageMode::Reset);
+        assert!(page.events().is_empty());
+    }
 
     #[test]
     fn capped_reader_accepts_exact_budget_and_refuses_the_first_excess_chunk() {

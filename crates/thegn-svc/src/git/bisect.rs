@@ -3,7 +3,7 @@
 //! `BISECT_TERMS`) and `refs/bisect`.
 
 use super::{GitBackend, run_w};
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use thegn_core::git_operand as op;
 use thegn_core::gitrefs::{BisectState, find_culprit, parse_bisect};
 use thegn_core::remote::GitLoc;
@@ -29,9 +29,12 @@ pub trait BisectOps: GitBackend {
             ],
         )?;
         let terms = loc
-            .read_git_path("BISECT_TERMS")
+            .read_git_path_checked("BISECT_TERMS")
+            .context("read BISECT_TERMS")?
             .map(|b| String::from_utf8_lossy(&b).into_owned());
-        let head = loc.git_out(&["rev-parse", "HEAD"]).unwrap_or_default();
+        let head = loc
+            .git_text(&["rev-parse", "HEAD"])
+            .map_err(|e| anyhow!("read bisect HEAD: {e}"))?;
         Ok(Some(parse_bisect(&refs, terms.as_deref(), &head)))
     }
 

@@ -296,6 +296,17 @@ impl OverviewModel {
                 )
             })
     }
+    fn source_discovered(&self, ids: &[CollectorId], fallback: bool) -> bool {
+        // Power discovery resolves to Ok or Absent and is published before sampling.
+        fallback
+            || ids.iter().any(|id| {
+                matches!(
+                    self.health[id.index()],
+                    thegn_metrics::collect::health::Health::Ok
+                        | thegn_metrics::collect::health::Health::Failing { .. }
+                )
+            })
+    }
     fn present(&self, index: usize) -> bool {
         match index {
             0 => self.source_present(&[CollectorId::CpuStat], self.stats.cpu_pct.is_some()),
@@ -313,7 +324,7 @@ impl OverviewModel {
                 &[CollectorId::Hwmon, CollectorId::ThermalZone],
                 self.stats.cpu_temp_c.is_some(),
             ),
-            6 => self.source_present(&[CollectorId::PowerSupply], self.stats.battery.is_some()),
+            6 => self.source_discovered(&[CollectorId::PowerSupply], self.stats.battery.is_some()),
             _ => true,
         }
     }

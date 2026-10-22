@@ -27,6 +27,7 @@
 pub mod attest;
 pub mod mcp;
 
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -363,24 +364,27 @@ impl Machine0Provider {
         let args = vm_create_args(name, image, &size, region, &key_id);
         self.call(tool::VM_CREATE, args).await?;
 
-        if self.spec.skip_ready_wait {
-            return Ok(self.vm_by_name(name).await?.unwrap_or(Machine0Vm {
-                id: String::new(),
-                name: name.to_string(),
-                status: "RUNNING".into(),
-                address: None,
-                user: None,
-            }));
-        }
-        let vm = self.ensure_running_vm(name).await?;
-        let ip = vm
-            .address
-            .clone()
-            .ok_or_else(|| anyhow!("machine0: vm {name} has no address after RUNNING"))?;
-        let user = self.ssh_user_for(&vm);
-        self.wait_reachable(name, &ip, &user).await?;
-        *self.endpoint.lock().unwrap() = Some((ip, user));
-        Ok(vm)
+        after_vm_create(thegn_core::util::thegn_dir(), name.to_string(), async {
+            if self.spec.skip_ready_wait {
+                return Ok(self.vm_by_name(name).await?.unwrap_or(Machine0Vm {
+                    id: String::new(),
+                    name: name.to_string(),
+                    status: "RUNNING".into(),
+                    address: None,
+                    user: None,
+                }));
+            }
+            let vm = self.ensure_running_vm(name).await?;
+            let ip = vm
+                .address
+                .clone()
+                .ok_or_else(|| anyhow!("machine0: vm {name} has no address after RUNNING"))?;
+            let user = self.ssh_user_for(&vm);
+            self.wait_reachable(name, &ip, &user).await?;
+            *self.endpoint.lock().unwrap() = Some((ip, user));
+            Ok(vm)
+        })
+        .await
     }
 
     /// The ssh user for a VM: the configured `ssh_user`, else the VM's own
@@ -786,17 +790,45 @@ impl Machine0Provider {
         self.ensure_provisioned(name).await
     }
 
-    async fn remove_attestation(&self, name: &str) {
+    async fn retire_local_state(&self, name: &str) {
         let root = thegn_core::util::thegn_dir();
         let name = name.to_string();
-        match tokio::task::spawn_blocking(move || attest::remove_in(&root, &name)).await {
+        match tokio::task::spawn_blocking(move || retire_local_state_in(&root, &name)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                tracing::warn!(%error, "machine0: failed to remove provisioning attestation")
+                tracing::warn!(%error, "machine0: failed to retire local VM state (attestation / known_hosts pin)")
             }
-            Err(error) => tracing::warn!(%error, "machine0: attestation removal worker failed"),
+            Err(error) => {
+                tracing::warn!(%error, "machine0: local VM state retirement worker failed")
+            }
         }
     }
+}
+
+fn retire_local_state_in(thegn_root: &Path, name: &str) -> Result<()> {
+    let attestation_result = attest::remove_in(thegn_root, name)
+        .context("machine0: failed to remove the local provisioning attestation");
+    let pin_result = crate::vps::registry::remove_known_hosts_pin_at(&thegn_root.join("vps"), name)
+        .context("machine0: failed to remove the local known_hosts pin");
+
+    match attestation_result {
+        Err(error) => Err(error),
+        Ok(()) => pin_result,
+    }
+}
+
+async fn after_vm_create<T>(
+    thegn_root: PathBuf,
+    name: String,
+    ready: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || {
+        crate::vps::registry::remove_known_hosts_pin_at(&thegn_root.join("vps"), &name)
+    })
+    .await
+    .context("machine0: stale known_hosts pin removal worker failed")?
+    .context("machine0: cannot clear the stale known_hosts pin for a new VM")?;
+    ready.await
 }
 
 /// Refuse creation when the live VM count is unknown or already at the cap.
@@ -859,13 +891,13 @@ impl RemoteProvider for Machine0Provider {
             thegn_core::managed_ssh::read("machine0", &custody_account, id)
                 .context("machine0: validate managed SSH custody before destroy")?;
             let Some(vm) = self.vm_by_name(id).await? else {
-                self.remove_attestation(id).await;
+                self.retire_local_state(id).await;
                 thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                     .context("machine0: retire managed SSH custody")?;
                 return Ok(()); // already gone
             };
             if vm.id.is_empty() {
-                self.remove_attestation(id).await;
+                self.retire_local_state(id).await;
                 thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                     .context("machine0: retire managed SSH custody")?;
                 return Ok(());
@@ -873,12 +905,12 @@ impl RemoteProvider for Machine0Provider {
             *self.endpoint.lock().unwrap() = None;
             match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
                 Ok(_) => {
-                    self.remove_attestation(id).await;
+                    self.retire_local_state(id).await;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                         .context("machine0: retire managed SSH custody")
                 }
                 Err(e) if is_not_found(&e.to_string()) => {
-                    self.remove_attestation(id).await;
+                    self.retire_local_state(id).await;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                         .context("machine0: retire managed SSH custody")
                 }
@@ -2147,5 +2179,75 @@ mod tests {
             assert!(message.contains(expected_message), "{message}");
             assert!(message.contains(expected_output), "{message}");
         }
+    }
+
+    #[test]
+    fn retire_local_state_removes_attestation_and_known_hosts_pin() {
+        let root = tempfile::tempdir().unwrap();
+        attest::store_in(
+            root.path(),
+            &attest::Attestation {
+                version: 1,
+                vm_name: "dev".into(),
+                vm_id: "vm-1".into(),
+                flake_identity: "ref:x".into(),
+                attested_at: 1,
+            },
+        )
+        .unwrap();
+        let known_hosts =
+            crate::vps::registry::ensure_known_hosts_dir_at(&root.path().join("vps")).unwrap();
+        std::fs::write(known_hosts.join("dev"), b"dev key").unwrap();
+        std::fs::write(known_hosts.join("other"), b"other key").unwrap();
+
+        retire_local_state_in(root.path(), "dev").unwrap();
+
+        assert!(attest::load_in(root.path(), "dev").is_none());
+        assert!(!known_hosts.join("dev").exists());
+        assert!(known_hosts.join("other").exists());
+    }
+
+    #[test]
+    fn retire_local_state_keeps_a_vps_record_of_the_same_name() {
+        let root = tempfile::tempdir().unwrap();
+        let vps = root.path().join("vps");
+        crate::vps::registry::write_at(
+            &vps,
+            &crate::vps::registry::VpsRecord {
+                name: "dev".into(),
+                provider: "hetzner".into(),
+                state: "ready".into(),
+                instance_id: "instance-1".into(),
+                ip: "192.0.2.1".into(),
+                created_at: 1,
+                owner: String::new(),
+            },
+        )
+        .unwrap();
+
+        retire_local_state_in(root.path(), "dev").unwrap();
+
+        assert!(crate::vps::registry::read_at(&vps, "dev").is_some());
+    }
+
+    #[tokio::test]
+    async fn new_vm_pin_is_cleared_before_ready_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let known_hosts =
+            crate::vps::registry::ensure_known_hosts_dir_at(&root.path().join("vps")).unwrap();
+        std::fs::write(known_hosts.join("dev"), b"stale key").unwrap();
+
+        let ready_root = known_hosts.clone();
+        after_vm_create(root.path().to_path_buf(), "dev".to_string(), async move {
+            assert!(
+                !ready_root.join("dev").exists(),
+                "the SSH readiness probe must not see the stale pin"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(!known_hosts.join("dev").exists());
     }
 }

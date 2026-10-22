@@ -331,14 +331,12 @@ fn release_restores_status_only_while_agent_running() {
     let db = Db::open_memory().unwrap();
     let key = enqueue(&db, 11);
     let lease = admitted(&db, &key, 0);
-    db.update_pr_status(
-        &key,
-        PrqStatus::Merged.as_str(),
-        None,
-        None,
-        Some("newer-head"),
-    )
-    .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE pr_queue SET status='merged', last_head_oid='newer-head' WHERE key=?1",
+            [&key],
+        )
+        .unwrap();
     assert!(
         db.release_pr_agent(&lease, Some((PrqStatus::BlockedCi.as_str(), "done")))
             .unwrap()

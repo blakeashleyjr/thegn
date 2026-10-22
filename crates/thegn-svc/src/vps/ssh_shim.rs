@@ -28,6 +28,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::registry;
 
+/// Retained output of a one-shot exec (the last 1 MiB of stdout and of stderr);
+/// same value as machine0's `REBUILD_OUTPUT_CAP` and the host hook capture cap.
+pub const EXEC_OUTPUT_CAP: usize = 1024 * 1024;
+
 /// A resolved ssh endpoint for one instance.
 #[derive(Debug, Clone)]
 pub struct SshShim {
@@ -43,6 +47,19 @@ pub struct CappedExec {
     pub code: i32,
     pub output: String,
     pub dropped: u64,
+}
+
+/// Render capped one-shot output, marking how many earlier bytes were dropped.
+/// Output that fits the cap remains byte-for-byte unchanged after lossy decoding.
+pub fn render_capped_output(output: &[u8], dropped: u64) -> String {
+    if dropped == 0 {
+        String::from_utf8_lossy(output).into_owned()
+    } else {
+        format!(
+            "[thegn: {dropped} earlier output bytes dropped]\n{}",
+            String::from_utf8_lossy(output)
+        )
+    }
 }
 
 async fn read_tail_capped<R: AsyncRead + Unpin>(
@@ -247,9 +264,13 @@ impl SshShim {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<(i32, String)> {
-        let script = stdin_script(&script_from_argv(argv), cwd, env)?;
-        let (code, out) = self.run_raw(&script).await?;
-        Ok((code, String::from_utf8_lossy(&out).into_owned()))
+        let exec = self
+            .run_exec_capped(argv, cwd, env, EXEC_OUTPUT_CAP)
+            .await?;
+        Ok((
+            exec.code,
+            render_capped_output(exec.output.as_bytes(), exec.dropped),
+        ))
     }
 
     /// One-shot exec retaining only the last `cap` bytes of stdout and stderr.
@@ -528,6 +549,18 @@ mod tests {
         let (tail, dropped) = read_tail_capped(reader, 4).await.unwrap();
         assert_eq!(tail, b"6789");
         assert_eq!(dropped, 6);
+    }
+
+    #[test]
+    fn render_capped_output_is_unchanged_under_the_cap() {
+        assert_eq!(render_capped_output(b"abc", 0), "abc");
+    }
+
+    #[test]
+    fn render_capped_output_marks_dropped_bytes() {
+        let rendered = render_capped_output(b"tail", 7);
+        assert!(rendered.starts_with("[thegn: 7 earlier output bytes dropped]\n"));
+        assert!(rendered.ends_with("tail"));
     }
 
     #[test]
