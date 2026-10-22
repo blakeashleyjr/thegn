@@ -412,9 +412,10 @@ source; there is nothing to retype.
 **Recovery evidence is data.** Recovery facts reach the finisher as bounded
 JSON inside an `UNTRUSTED-RECOVERY-JSON` block, with the provenance of each
 field. Prior terminal output is never replayed, and the exit is reported only
-as zero, nonzero, or unknown. This boundary is not an execution boundary: a
-finisher runs with exactly the capabilities and credentials of its ordinary
-agent launch and sandbox configuration. Read the evidence yourself;
+as zero, nonzero, or unknown. This JSON boundary is a prompt-context defense,
+not an execution boundary: a finisher runs with exactly the capabilities and
+credentials of its ordinary agent launch and sandbox configuration. Read the
+evidence yourself;
 `thegn session snapshot` in section 9 is for you, the supervisor, not something
 the finisher is given.
 
