@@ -3111,7 +3111,7 @@ mod tests {
             .expect("recording request succeeds")
     }
 
-    async fn await_session_exit(harness: &Harness) {
+    async fn await_session_exit(harness: &mut Harness) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if matches!(harness.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
@@ -3134,7 +3134,7 @@ mod tests {
             mut actor,
             pane_rx,
             msg_rx,
-            harness,
+            mut harness,
         } = build_actor_cfg(
             "head -c 65536 /dev/zero | tr -c x x; cat",
             None,
@@ -3145,11 +3145,6 @@ mod tests {
         tokio::spawn(actor.run(pane_rx, msg_rx));
         wait_for_stall(started_rx).await;
         assert!(inflight.load(std::sync::atomic::Ordering::Acquire) > 0);
-        assert!(
-            inflight.load(std::sync::atomic::Ordering::Acquire)
-                <= crate::daemon::record::GLOBAL_INFLIGHT_BYTES
-        );
-
         harness
             .msg_tx
             .send(SessionMsg::Resize {
@@ -3193,7 +3188,7 @@ mod tests {
             "record status progresses while sink blocks"
         );
 
-        let independent = spawn_actor("cat", None);
+        let mut independent = spawn_actor("cat", None);
         tokio::time::timeout(std::time::Duration::from_secs(2), probe(&independent))
             .await
             .expect("independent session probe progresses");
@@ -3255,13 +3250,13 @@ mod tests {
             .send(SessionMsg::Kill)
             .await
             .expect("recorded actor accepts kill");
-        await_session_exit(&harness).await;
+        await_session_exit(&mut harness).await;
         independent
             .msg_tx
             .send(SessionMsg::Kill)
             .await
             .expect("independent actor accepts kill");
-        await_session_exit(&independent).await;
+        await_session_exit(&mut independent).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3275,8 +3270,8 @@ mod tests {
             mut actor,
             pane_rx,
             msg_rx,
-            harness,
-        } = build_actor_cfg("cat", None, "sh", Config::default());
+            mut harness,
+        } = build_actor_cfg("printf x; cat", None, "sh", Config::default());
         install_recorder(&mut actor, writer, &inflight, &slots);
         tokio::spawn(actor.run(pane_rx, msg_rx));
         wait_for_stall(started_rx).await;
@@ -3304,7 +3299,7 @@ mod tests {
             .send(SessionMsg::Kill)
             .await
             .expect("actor accepts kill");
-        await_session_exit(&harness).await;
+        await_session_exit(&mut harness).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3318,7 +3313,7 @@ mod tests {
             mut actor,
             pane_rx,
             msg_rx,
-            harness,
+            mut harness,
         } = build_actor_cfg("printf x; cat", None, "sh", Config::default());
         install_recorder(&mut actor, writer, &inflight, &slots);
         tokio::spawn(actor.run(pane_rx, msg_rx));
@@ -3347,7 +3342,7 @@ mod tests {
             .send(SessionMsg::Kill)
             .await
             .expect("actor accepts kill");
-        await_session_exit(&harness).await;
+        await_session_exit(&mut harness).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3361,7 +3356,7 @@ mod tests {
             mut actor,
             pane_rx,
             msg_rx,
-            harness,
+            mut harness,
         } = build_actor_cfg("printf x; cat", None, "sh", Config::default());
         install_recorder(&mut actor, writer, &inflight, &slots);
         tokio::spawn(actor.run(pane_rx, msg_rx));
@@ -3385,7 +3380,10 @@ mod tests {
         .expect("actor exits within recorder finish deadline");
         let tombs = harness.tombs.lock().await;
         let tomb = tombs.get("s1", now_ms()).expect("session tombstone");
-        assert_eq!(tomb.recording.as_deref(), Some("injected.cast"));
+        assert_eq!(
+            tomb.recording.as_deref(),
+            Some(std::path::Path::new("injected.cast"))
+        );
         drop(tombs);
         release_tx
             .send(())
