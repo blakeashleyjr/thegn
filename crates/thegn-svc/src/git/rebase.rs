@@ -41,8 +41,11 @@ fn read_local_pending_todo(loc: &GitLoc) -> Result<Option<(std::path::PathBuf, V
         bail!("local todo read requested for a non-local worktree");
     };
     let resolved = loc
-        .git_out(&["rev-parse", "--git-path", "rebase-merge/git-rebase-todo"])
-        .ok_or_else(|| anyhow!("cannot resolve live rebase todo path"))?;
+        .git_text(&["rev-parse", "--git-path", "rebase-merge/git-rebase-todo"])
+        .map_err(|e| anyhow!("cannot resolve live rebase todo path: {e}"))?;
+    if resolved.is_empty() {
+        bail!("cannot resolve live rebase todo path: git returned an empty path");
+    }
     let path = if resolved.starts_with('/') {
         std::path::PathBuf::from(resolved)
     } else {
@@ -253,8 +256,11 @@ fn rebase_with_todo_inner(
     let mut cleanup_path = None;
     let result = (|| {
         let scratch = loc
-            .git_out(&["rev-parse", "--git-path", &scratch_name])
-            .ok_or_else(|| anyhow!("cannot resolve todo scratch path"))?;
+            .git_text(&["rev-parse", "--git-path", &scratch_name])
+            .map_err(|e| anyhow!("cannot resolve todo scratch path: {e}"))?;
+        if scratch.is_empty() {
+            bail!("cannot resolve todo scratch path: git returned an empty path");
+        }
         let scratch = if scratch.starts_with('/') {
             scratch
         } else {
@@ -530,8 +536,8 @@ pub trait RebaseOps: GitBackend {
                 args.extend(["commit", "--no-verify", &fixup]);
                 run_w(loc, &[], &args)?;
                 let fixup_sha = loc
-                    .git_out(&["rev-parse", "HEAD"])
-                    .ok_or_else(|| anyhow!("no HEAD after fixup commit"))?;
+                    .git_text(&["rev-parse", "HEAD"])
+                    .map_err(|e| anyhow!("no HEAD after fixup commit: {e}"))?;
                 let base = base_for(loc, target)?;
                 let todo = todo_for(loc, &base)?;
                 let todo = place_fixup(&todo, &fixup_sha, target)?;
@@ -706,8 +712,8 @@ fn reword_within<T: RebaseOps + ?Sized>(
     with_rebase_txn(loc, &["rebase", "-i"], wait, || {
         op::revision(sha)?;
         let head = loc
-            .git_out(&["rev-parse", "HEAD"])
-            .ok_or_else(|| anyhow!("no HEAD"))?;
+            .git_text(&["rev-parse", "HEAD"])
+            .map_err(|e| anyhow!("no HEAD: {e}"))?;
         let is_head = head.starts_with(sha) || sha.starts_with(&head);
         let amend = |loc: &GitLoc| -> Result<()> {
             let mut args = gpg_args(opts.override_gpg).to_vec();
@@ -809,6 +815,19 @@ mod tests {
     use super::super::testutil::{TestRepo, git_in};
     use super::super::{CliGit, MergeKind};
     use super::*;
+
+    #[test]
+    fn live_todo_path_outside_a_repository_names_gits_reason() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let result = read_local_pending_todo(&GitLoc::Local(dir.path().to_path_buf()));
+
+        assert!(result.is_err(), "expected a non-repository error");
+        let error = result.err().unwrap();
+        assert!(
+            format!("{error:#}").contains("not a git repository"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     /// A throwaway repo with local identity and deterministic rebase
     /// settings: the ops under test shell out with the ambient environment,
