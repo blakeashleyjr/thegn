@@ -62,12 +62,10 @@ pub struct DueReminder {
 }
 
 impl DueReminder {
-    /// A restart-durable identity for this exact reminder firing.
-    ///
-    /// Encoded into the notification's existing `source_ref` so a dedupe is a
-    /// `SELECT 1` and no new schema is needed. All three parts matter: the same
-    /// event can have several lead times, and a recurring event fires once per
-    /// occurrence.
+    /// A restart-durable identity for this exact reminder firing, stored in
+    /// `calendar_reminder_claims` independently of dismissible inbox rows. All
+    /// three parts matter: the same event can have several lead times, and a
+    /// recurring event fires once per occurrence.
     pub fn source_ref(&self) -> String {
         format!(
             "cal:{}@{}+{}",

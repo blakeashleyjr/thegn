@@ -10,14 +10,30 @@ use thegn_core::calendar::DueReminder;
 use thegn_core::calendar::display::{DisplayText, Field};
 use thegn_core::db::Db;
 use thegn_core::notification::NotificationKind;
-use thegn_core::store::NotificationStore;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReminderClaim {
+    Won,
+    AlreadyClaimed,
+    Failed,
+}
+
+fn claim_reminder(db: &Db, source_ref: &str, now_ms: i64) -> ReminderClaim {
+    match db.claim_calendar_reminder(source_ref, now_ms) {
+        Ok(true) => ReminderClaim::Won,
+        Ok(false) => ReminderClaim::AlreadyClaimed,
+        Err(error) => {
+            tracing::warn!(target: "thegn::calendar", %error, "calendar reminder claim failed; not delivering");
+            ReminderClaim::Failed
+        }
+    }
+}
 
 /// Raise one due reminder.
 ///
-/// Idempotent across restarts: the reminder's
-/// `(event, occurrence, lead time)` identity is stored as the notification's
-/// `source_ref`, so re-checking after a restart finds the existing row and
-/// does nothing rather than re-nagging.
+/// Idempotence comes from the durable claim ledger, independent of inbox
+/// lifecycle. Delivery is at-most-once: a crash after claiming but before
+/// delivery drops that one reminder rather than risking a duplicate alert.
 pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
     let source_ref = r.source_ref();
     let message = message_for(r);
@@ -25,10 +41,16 @@ pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
     // `hydrate_calendar::spawn_reminder_check`), so this runs inline — nesting
     // another `spawn_bg` would take a second permit from the eight-permit lane
     // for no gain.
-    let Ok(db) = Db::open() else { return };
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(target: "thegn::calendar", %error, "calendar reminder database open failed; not delivering");
+            return;
+        }
+    };
     let kind = NotificationKind::CalendarReminder.as_str();
-    // The restart guard. A `SELECT 1` rather than a new table.
-    if db.has_notification(kind, &source_ref).unwrap_or(false) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if claim_reminder(&db, &source_ref, now_ms) != ReminderClaim::Won {
         return;
     }
     if let Some(state) = crate::notify::global() {
@@ -74,6 +96,7 @@ fn message_for(r: &DueReminder) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::store::NotificationStore;
 
     fn rem(title: &str, starts_in: i64, location: &str, url: &str) -> DueReminder {
         DueReminder {
@@ -139,5 +162,26 @@ mod tests {
         );
         assert!(msg.is_ascii(), "{msg:?}");
         assert!(msg.contains("Room 3"));
+    }
+
+    #[test]
+    fn a_reminder_is_claimed_once_and_a_dismissed_row_never_refires() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(claim_reminder(&db, "", 4_999), ReminderClaim::Failed);
+        let reminder = rem("standup", 10, "", "");
+        let source_ref = reminder.source_ref();
+        assert_eq!(claim_reminder(&db, &source_ref, 5_000), ReminderClaim::Won);
+        assert_eq!(
+            claim_reminder(&db, &source_ref, 5_001),
+            ReminderClaim::AlreadyClaimed
+        );
+        let id = db
+            .put_notification("calendar_reminder", &source_ref, "standup in 10m", "")
+            .unwrap();
+        db.delete_notification(id).unwrap();
+        assert_eq!(
+            claim_reminder(&db, &source_ref, 5_002),
+            ReminderClaim::AlreadyClaimed
+        );
     }
 }

@@ -1873,6 +1873,49 @@ pub(crate) fn verify_v91_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v92: the durable at-most-once calendar reminder firing ledger (THE-461).
+pub(crate) fn migrate_v92(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS calendar_reminder_claims (
+             source_ref TEXT PRIMARY KEY,
+             claimed_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_calendar_reminder_claims_claimed
+             ON calendar_reminder_claims(claimed_ms);",
+    )?;
+    let notifications_exist: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='notifications')",
+        [],
+        |row| row.get(0),
+    )?;
+    if notifications_exist {
+        conn.execute(
+            "INSERT OR IGNORE INTO calendar_reminder_claims(source_ref, claimed_ms)
+             SELECT issue_id, MIN(created_at_ms) FROM notifications
+             WHERE kind = 'calendar_reminder' GROUP BY issue_id",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v92_schema(conn: &Connection) -> Result<()> {
+    for column in ["source_ref", "claimed_ms"] {
+        if !has_column(conn, "calendar_reminder_claims", column) {
+            bail!("schema v92 migration did not add calendar_reminder_claims.{column}");
+        }
+    }
+    let has_index: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_calendar_reminder_claims_claimed')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_index {
+        bail!("schema v92 migration did not add idx_calendar_reminder_claims_claimed");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2846,6 +2889,50 @@ mod tests {
         assert!(super::verify_v91_schema(&conn).is_err());
         super::migrate_v91(&conn).unwrap();
         super::verify_v91_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v92_creates_and_seeds_reminder_claims_idempotently() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v92_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version=91;").unwrap();
+        assert!(super::verify_v92_schema(&conn).is_err());
+        conn.execute_batch(
+            "CREATE TABLE notifications (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind TEXT NOT NULL,
+                 issue_id TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 read INTEGER NOT NULL DEFAULT 0,
+                 worktree_path TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO notifications(kind, issue_id, message, created_at_ms)
+             VALUES ('calendar_reminder', 'cal:acct/series@1000+10', 'first', 20),
+                    ('calendar_reminder', 'cal:acct/series@1000+10', 'second', 10),
+                    ('ci_failed', 'ci:run', 'failure', 5);",
+        )
+        .unwrap();
+        super::migrate_v92(&conn).unwrap();
+        super::migrate_v92(&conn).unwrap();
+        super::verify_v92_schema(&conn).unwrap();
+        let seeded: Vec<(String, i64)> = {
+            let mut statement = conn
+                .prepare("SELECT source_ref, claimed_ms FROM calendar_reminder_claims")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(seeded, vec![("cal:acct/series@1000+10".to_owned(), 10)]);
+
+        let without_notifications = Connection::open_in_memory().unwrap();
+        super::migrate_v92(&without_notifications).unwrap();
+        super::verify_v92_schema(&without_notifications).unwrap();
     }
 
     #[test]
