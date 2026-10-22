@@ -772,19 +772,17 @@ impl Db {
                  WHERE dispatched_at_ms < ?1 OR (dispatched_at_ms = ?1 AND id < ?2) \
                  ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?3"
             ))?;
-            let page_rows = statement
+            statement
                 .query_map(params![stamp, id, fetch_limit], map_dispatch)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            page_rows
+                .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             let mut statement = tx.prepare(&format!(
                 "SELECT {DISPATCH_COLS} FROM agent_dispatches \
                  ORDER BY dispatched_at_ms DESC, id DESC LIMIT ?1"
             ))?;
-            let page_rows = statement
+            statement
                 .query_map(params![fetch_limit], map_dispatch)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            page_rows
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         tx.commit()?;
         let truncated = rows.len() > limit;
