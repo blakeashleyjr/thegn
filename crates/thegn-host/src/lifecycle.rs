@@ -413,16 +413,36 @@ fn latch_halt(
             if latched.get(&key) == Some(&halt.message) {
                 None
             } else {
-                latched.insert(key, halt.message.clone()).is_some();
+                latched.insert(key, halt.message.clone());
                 Some(halt.message.clone())
             }
         }
         PoolReconcile::Ran => {
-            latched.remove(&key).is_some();
+            latched.remove(&key);
             None
         }
         PoolReconcile::Busy => None,
     }
+}
+
+/// Report a DB lookup failure from the maintainer tick before it has a repo/env
+/// pair to reconcile. The worktree is the stable fallback key until the DB is
+/// available again.
+pub(crate) fn pool_ledger_open_failed(worktree: &str) -> Option<String> {
+    let message = "warm pool: cannot open ledger for reconciliation; no pool changes made";
+    halt_toast(
+        worktree,
+        "",
+        &PoolReconcile::Halted(PoolHalt {
+            message: message.to_string(),
+        }),
+    )
+}
+
+/// Clear the fallback DB-failure latch once the maintainer can resolve the
+/// worktree's normal repo/env key again.
+pub(crate) fn clear_pool_ledger_open_failure(worktree: &str) {
+    halt_toast(worktree, "", &PoolReconcile::Ran);
 }
 
 /// Reconcile the warm-spare POOL for one `(repo, env)`: create spares toward the
@@ -1280,6 +1300,24 @@ mod tests {
             if halt.message.contains("cannot read the spare ledger for /repo (sprites)")
                 && halt.message.contains("database is locked")
                 && halt.message.contains("no pool changes made")));
+    }
+
+    #[test]
+    fn pool_halt_ledger_open_failure_toasts_once_and_clears_on_recovery() {
+        let worktree = "/worktree/pool-ledger-open-test";
+
+        assert_eq!(
+            pool_ledger_open_failed(worktree),
+            Some("warm pool: cannot open ledger for reconciliation; no pool changes made".into())
+        );
+        assert_eq!(pool_ledger_open_failed(worktree), None);
+
+        clear_pool_ledger_open_failure(worktree);
+
+        assert_eq!(
+            pool_ledger_open_failed(worktree),
+            Some("warm pool: cannot open ledger for reconciliation; no pool changes made".into())
+        );
     }
 }
 
