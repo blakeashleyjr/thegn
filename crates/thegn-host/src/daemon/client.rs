@@ -174,6 +174,41 @@ async fn scan_candidates(
     scan
 }
 
+async fn scan_startup_candidates(
+    local: Option<ControlAddr>,
+    candidates: Vec<ControlAddr>,
+    deadline: Duration,
+    probe: impl Fn(ControlAddr) -> BoxFuture<'static, StopProbe>,
+) -> CandidateScan {
+    let mut scan = CandidateScan {
+        found: None,
+        foreign: Vec::new(),
+        unassessed: Vec::new(),
+    };
+    let mut candidates = candidates;
+    if let Some(local) = local {
+        // Preserve the local client's request timeout; only registry rows
+        // share the startup reconciliation deadline below.
+        let key = addr_key(&local);
+        candidates.retain(|candidate| addr_key(candidate) != key);
+        let label = addr_label(&local);
+        match probe(local.clone()).await {
+            StopProbe::Ours => {
+                scan.found = Some(ControlClient::new(local));
+                return scan;
+            }
+            StopProbe::Foreign(scope) => scan.foreign.push((label, scope)),
+            StopProbe::NotRunning => {}
+        }
+    }
+
+    let mut registry_scan = scan_candidates(candidates, deadline, probe).await;
+    scan.foreign.append(&mut registry_scan.foreign);
+    scan.found = registry_scan.found;
+    scan.unassessed = registry_scan.unassessed;
+    scan
+}
+
 async fn startup_scan(dcfg: &DaemonConfig) -> CandidateScan {
     super::reconcile_legacy_socket(dcfg);
     let scopes = super::scope_aliases();
@@ -196,18 +231,21 @@ async fn startup_scan(dcfg: &DaemonConfig) -> CandidateScan {
     let legacy = thegn_core::config_daemon::legacy_socket_path(
         &thegn_core::util::xdg_state_home().join("thegn"),
     );
-    let mut candidates = discovered
+    let candidates = discovered
         .into_iter()
         .filter(|addr| !is_legacy_unix_addr(addr, &legacy))
         .collect::<Vec<_>>();
     let sock = super::socket_path(dcfg);
-    if !dcfg.socket.is_empty() || sock != legacy {
-        candidates.push(ControlAddr::Unix(sock));
-    }
-    scan_candidates(candidates, CONNECT_DAEMON_TOTAL_DEADLINE, move |addr| {
-        let scopes = scopes.clone();
-        Box::pin(async move { probe_stop_target(&ControlClient::new(addr), &scopes).await })
-    })
+    let local = (!dcfg.socket.is_empty() || sock != legacy).then_some(ControlAddr::Unix(sock));
+    scan_startup_candidates(
+        local,
+        candidates,
+        CONNECT_DAEMON_TOTAL_DEADLINE,
+        move |addr| {
+            let scopes = scopes.clone();
+            Box::pin(async move { probe_stop_target(&ControlClient::new(addr), &scopes).await })
+        },
+    )
     .await
 }
 
@@ -271,15 +309,15 @@ pub(crate) async fn verify_local_daemon(
     }
 }
 
-/// Find a live daemon for this state dir WITHOUT spawning one: registry
-/// discovery, then a probe of the configured socket. `None` = no daemon is
+/// Find a live daemon for this state dir WITHOUT spawning one: probe the
+/// configured socket, then registry discovery. `None` = no daemon is
 /// running (so there is nothing to kill/list — callers must not spawn one as
 /// a side effect).
 pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient> {
     let scan = startup_scan(dcfg).await;
     report_startup_scan(&scan);
     if let Some(client) = scan.found {
-        start_error_state_bridge(&client);
+        start_error_state_bridge(client);
         return Some(client);
     }
     None
@@ -314,7 +352,7 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     let scan = startup_scan(dcfg).await;
     report_startup_scan(&scan);
     if let Some(client) = scan.found.as_ref() {
-        start_error_state_bridge(&client);
+        start_error_state_bridge(client);
         return Ok(client.clone());
     }
     if super::legacy_socket_state() == super::LegacySocketState::Live {
@@ -1408,12 +1446,44 @@ mod tests {
         assert_eq!(scan.unassessed, ["/a.sock", "/b.sock", "127.0.0.1:2"]);
         assert!(scan.found.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(5));
+        let elapsed = tokio::time::Instant::now() - start;
+        assert!(elapsed >= Duration::from_secs(5));
+        assert!(elapsed < Duration::from_millis(5_002));
         assert!(
             scan.unassessed
                 .iter()
                 .all(|label| !label.contains("secret"))
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_scan_slow_registry_candidate_cannot_starve_local_socket() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let scan = scan_startup_candidates(
+            Some(ControlAddr::Unix("/configured.sock".into())),
+            vec![ControlAddr::Tcp {
+                addr: "127.0.0.1:2".into(),
+                token: "secret".into(),
+            }],
+            Duration::from_millis(1),
+            move |addr| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                if matches!(addr, ControlAddr::Unix(path) if path == std::path::Path::new("/configured.sock")) {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        StopProbe::Ours
+                    })
+                } else {
+                    Box::pin(futures::future::pending())
+                }
+            },
+        )
+        .await;
+
+        assert!(scan.found.is_some());
+        assert!(scan.unassessed.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1452,10 +1522,13 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_scan_bounds_a_listener_that_never_answers() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("d.sock");
         let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
-        let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
+        let mut listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
             .await
             .unwrap()
         {
