@@ -53,6 +53,9 @@ mod applescript_parse;
 mod mediaremote_parse;
 #[cfg(any(windows, test))]
 mod smtc_decode;
+// The SMTC operation worker is pure so it is unit-tested on Linux.
+#[cfg(any(windows, test))]
+mod smtc_worker;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -61,7 +64,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
-use model::{LoopMode, MediaState, Playlist, QueueItem, QueuePage};
+use model::{LoopMode, MediaState, Playlist, PlaylistPage, QueueItem, QueuePage};
 
 pub use mpv::MpvIpc;
 #[cfg(target_os = "linux")]
@@ -187,6 +190,11 @@ pub trait MediaBackend: Send + Sync {
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>>;
     /// Activate a playlist by its opaque id (an MPRIS object path).
     fn activate_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>>;
+
+    /// A bounded playlist page; backends that know the full count override it. Gate on [`MediaCaps::playlists`].
+    fn playlist_page(&self) -> BoxFuture<'_, Result<PlaylistPage, MediaError>> {
+        Box::pin(async move { self.playlists().await.map(PlaylistPage::from_rows) })
+    }
 
     /// Seek by `offset` relative to the current position, `forward` or back
     /// (MPRIS `Seek(±µs)`, mpv relative `seek`). Default: unsupported no-op error

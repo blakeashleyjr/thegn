@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
-use crate::model::{self, LoopMode, MediaState, Playlist, QueueItem, QueuePage};
+use crate::model::{self, LoopMode, MediaState, Playlist, PlaylistPage, QueueItem, QueuePage};
 use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaSnapshot, MediaWatch};
 
 /// A media backend whose provider data and opaque IDs pass canonical admission.
@@ -61,6 +61,21 @@ impl MediaBackend for Admitted {
                     .take(model::MAX_PLAYLISTS)
                     .filter_map(Playlist::admitted)
                     .collect()
+            })
+        })
+    }
+    /// The total may include rows dropped during admission because their IDs are invalid.
+    fn playlist_page(&self) -> BoxFuture<'_, Result<PlaylistPage, MediaError>> {
+        Box::pin(async move {
+            let page = self.0.playlist_page().await?;
+            Ok(PlaylistPage {
+                total: page.total.max(page.items.len()),
+                items: page
+                    .items
+                    .into_iter()
+                    .take(model::MAX_PLAYLISTS)
+                    .filter_map(Playlist::admitted)
+                    .collect(),
             })
         })
     }
@@ -347,6 +362,48 @@ mod tests {
             Some(format!("pl-{}", model::MAX_PLAYLISTS - 1))
         );
         assert_eq!(admitted.players().await.unwrap().len(), model::MAX_PLAYERS);
+    }
+
+    #[tokio::test]
+    async fn playlist_page_is_capped_at_ingress_and_keeps_the_reported_total() {
+        let playlists = (0..model::MAX_PLAYLISTS + 3)
+            .map(|index| Playlist {
+                id: format!("playlist-{index}"),
+                name: format!("Playlist {index}"),
+            })
+            .collect();
+        let client: MediaClient = Box::new(Fake {
+            calls: std::sync::Arc::new(Mutex::new(Vec::new())),
+            items: Mutex::new(Vec::new()),
+            playlists,
+            caps: MediaCaps::default(),
+            players: Ok(Vec::new()),
+        });
+
+        let page = Admitted(client).playlist_page().await.unwrap();
+        assert_eq!(page.items.len(), model::MAX_PLAYLISTS);
+        assert_eq!(page.total, model::MAX_PLAYLISTS + 3);
+
+        let client: MediaClient = Box::new(Fake {
+            calls: std::sync::Arc::new(Mutex::new(Vec::new())),
+            items: Mutex::new(Vec::new()),
+            playlists: vec![
+                Playlist {
+                    id: "bad\nid".into(),
+                    name: "Rejected".into(),
+                },
+                Playlist {
+                    id: "valid-id".into(),
+                    name: "Kept".into(),
+                },
+            ],
+            caps: MediaCaps::default(),
+            players: Ok(Vec::new()),
+        });
+        let page = Admitted(client).playlist_page().await.unwrap();
+        assert_eq!(page.total, 2);
+        assert!(page.total >= page.items.len());
+        assert_eq!(page.items.len(), 1);
     }
 
     #[tokio::test]

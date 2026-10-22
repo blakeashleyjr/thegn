@@ -542,8 +542,10 @@ mod tests {
             &cancelled,
             Instant::now() + OPERATION_BUDGET,
         ));
+        // `cat` drains the payload before exiting 0; `true` can exit before the
+        // write lands, and that EPIPE would make this success case flaky.
         assert!(pipe_to(
-            &["true"],
+            &["sh", "-c", "cat >/dev/null"],
             Arc::from(&b"x"[..]),
             &cancelled,
             Instant::now() + OPERATION_BUDGET,

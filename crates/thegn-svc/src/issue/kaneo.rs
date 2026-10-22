@@ -690,7 +690,12 @@ impl IssueBackend for KaneoBackend {
                     created_at_ms: parse_ms(c.created_at.as_deref()),
                 })
                 .collect();
-            Ok(IssueDetail { issue, comments })
+            Ok(IssueDetail {
+                issue,
+                comments,
+                // The unpaged comment endpoint must succeed before reaching this result.
+                comments_complete: true,
+            })
         })
     }
 

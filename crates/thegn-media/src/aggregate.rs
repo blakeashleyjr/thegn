@@ -108,6 +108,9 @@ impl MediaBackend for Aggregate {
     fn queue_page(&self) -> BoxFuture<'_, Result<crate::model::QueuePage, MediaError>> {
         Box::pin(async move { self.active_child()?.queue_page().await })
     }
+    fn playlist_page(&self) -> BoxFuture<'_, Result<crate::model::PlaylistPage, MediaError>> {
+        Box::pin(async move { self.active_child()?.playlist_page().await })
+    }
     fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move { self.active_child()?.play_queue_item(id).await })
     }
@@ -781,11 +784,38 @@ mod tests {
         assert_eq!(aggregate.queue_page().await.unwrap().items, page.items);
     }
 
+    #[tokio::test]
+    async fn playlist_page_is_forwarded_to_the_active_child() {
+        let page = crate::model::PlaylistPage {
+            items: vec![crate::model::Playlist {
+                id: "playlist-id".into(),
+                name: "Favorites".into(),
+            }],
+            total: 250,
+        };
+        let aggregate = Aggregate::new(
+            vec![snapshot_backend_with_playlist_page(
+                Ok(Some(MediaState {
+                    player: "active".into(),
+                    state: PLAYING,
+                    ..Default::default()
+                })),
+                NO_CAPS,
+                page.clone(),
+            )],
+            Vec::new(),
+        );
+
+        aggregate.snapshot().await.unwrap();
+        assert_eq!(aggregate.playlist_page().await.unwrap(), page);
+    }
+
     struct SnapshotBackend {
         result: Result<Option<MediaState>, MediaError>,
         caps: MediaCaps,
         snapshot_caps: Option<MediaCaps>,
         queue_page: Option<crate::model::QueuePage>,
+        playlist_page: Option<crate::model::PlaylistPage>,
     }
 
     fn snapshot_backend(
@@ -798,6 +828,7 @@ mod tests {
             caps,
             snapshot_caps,
             queue_page: None,
+            playlist_page: None,
         })
     }
 
@@ -811,6 +842,21 @@ mod tests {
             caps,
             snapshot_caps: None,
             queue_page: Some(queue_page),
+            playlist_page: None,
+        })
+    }
+
+    fn snapshot_backend_with_playlist_page(
+        result: Result<Option<MediaState>, MediaError>,
+        caps: MediaCaps,
+        playlist_page: crate::model::PlaylistPage,
+    ) -> MediaClient {
+        Box::new(SnapshotBackend {
+            result,
+            caps,
+            snapshot_caps: None,
+            queue_page: None,
+            playlist_page: Some(playlist_page),
         })
     }
 
@@ -863,6 +909,10 @@ mod tests {
 
         fn queue_page(&self) -> BoxFuture<'_, Result<crate::model::QueuePage, MediaError>> {
             Box::pin(async move { Ok(self.queue_page.clone().unwrap_or_default()) })
+        }
+
+        fn playlist_page(&self) -> BoxFuture<'_, Result<crate::model::PlaylistPage, MediaError>> {
+            Box::pin(async move { Ok(self.playlist_page.clone().unwrap_or_default()) })
         }
     }
 

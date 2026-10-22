@@ -2007,23 +2007,29 @@ fn connect_worktree_bridge(
         let env = cfg.resolve_env(&repo_root, &loc, &wt, env_name.as_deref());
         // For a managed provider, install and verify the resident bridge before
         // tunneling or connecting; a failed or unverified install skips both.
-        if matches!(env.placement, thegn_core::placement::Placement::Provider(_))
-            && let Some(bin) = crate::bridge_sup::bridge_binary_path()
-            && !crate::agent::ensure_remote_bridge(
+        let bridge = if matches!(env.placement, thegn_core::placement::Placement::Provider(_)) {
+            let Some(bin) = crate::bridge_sup::bridge_binary_path() else {
+                return;
+            };
+            let Some(bridge) = crate::agent::ensure_remote_bridge(
                 &cfg,
                 env_name.as_deref().unwrap_or_default(),
                 &bin,
-                &crate::bridge_sup::remote_thegn(),
-            )
-        {
-            return;
-        }
+            ) else {
+                return;
+            };
+            Some(bridge)
+        } else {
+            None
+        };
         // Reverse host→sandbox tunnels, all over the resident bridge:
         //  • host services / host-bound MCP: each `[sandbox.home]
         //    reverse_forwards` spec → bind a sandbox port → a host target.
         //  • the embedded host nix cache (below).
         // No-op when not a provider / nothing configured.
-        if let thegn_core::placement::Placement::Provider(p) = &env.placement {
+        if let (thegn_core::placement::Placement::Provider(p), Some(bridge)) =
+            (&env.placement, bridge.as_ref())
+        {
             let mut tunnels: Vec<(u16, String)> = Vec::new();
             // Embedded host nix cache: bind the cache port in the sandbox → the
             // host's ephemeral cache server, so the sprite's `extra-substituters =
@@ -2045,31 +2051,34 @@ fn connect_worktree_bridge(
                     tunnels.push(t);
                 }
             }
-            rsup.start_all(
-                &tokio::runtime::Handle::current(),
-                &cfg,
-                &env,
-                &p.id,
-                &wt.to_string_lossy(),
+            rsup.start_all(crate::revtunnel::StartAllArgs {
+                handle: &tokio::runtime::Handle::current(),
+                cfg: &cfg,
+                env: &env,
+                sandbox_id: &p.id,
+                bridge,
+                worktree: &wt.to_string_lossy(),
                 tunnels,
-            );
+            });
         }
         // CLI-free control plane: for an exec_api provider (and exec != cli),
         // start the bridge over the native exec API instead of the vendor CLI.
         if let thegn_core::placement::Placement::Provider(p) = &env.placement
             && let Some(provider) = crate::agent::native_bridge_provider(&cfg, &env)
+            && let Some(bridge) = bridge.as_ref()
         {
-            sup.connect_native(
-                &loc,
-                &loc.path(),
-                &wt.to_string_lossy(),
+            sup.connect_native(crate::bridge_sup::NativeBridgeArgs {
+                loc: &loc,
+                workdir: &loc.path(),
+                host_path: &wt.to_string_lossy(),
                 provider,
-                p.id.clone(),
-                tokio::runtime::Handle::current(),
-            );
+                sandbox_id: p.id.clone(),
+                bridge,
+                rt: tokio::runtime::Handle::current(),
+            });
             return;
         }
-        if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement) {
+        if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement, bridge.as_ref()) {
             sup.connect(&loc, &loc.path(), &wt.to_string_lossy(), cmd);
         }
     });
@@ -13538,9 +13547,13 @@ async fn event_loop<T: Terminal>(
         // Media picker results: open a secondary palette of playlists / players.
         if let Some(pick) = media_pick_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let note = crate::media_ctl::pick_note(&pick);
             match crate::media_ctl::pick_palette(pick) {
                 Ok(items) => {
                     palette = Some(crate::search_everywhere::PaletteSession::new(items));
+                    if let Some(note) = note {
+                        model.status = note;
+                    }
                 }
                 Err(text) => model.status = text,
             }

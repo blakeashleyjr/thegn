@@ -653,6 +653,26 @@ pub const CATALOG: &[Slot] = &[
         "since",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    slot(
+        "dispatch list",
+        "limit",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "dispatch list",
+        "before",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot(
+        "dispatch status",
+        "limit",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "dispatch status",
+        "before",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
     // A path under the parent row's worktree; the engine's filesystem
     // completion is the intended behavior (same shape as `--config`).
     slot("session open", "parent_artifact", SourceKind::Structural),

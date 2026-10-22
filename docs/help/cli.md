@@ -250,6 +250,9 @@ characters, and oversized keys or values are refused.
 or the provider returns a partial list containing malformed rows, it emits an
 error object (`error`, and `discarded_rows` for a partial list) and exits 0 so
 scripts can continue to consume the command's graceful-degradation result.
+Only `thegn ci runs --branch <current branch>` refreshes the cached runs shown
+in the CI panel; other branches and the all-branch listing leave that cache
+alone.
 
 `thegn host discover` is the inbound tailnet path: it lists the machines
 your tailscale client already knows (from `tailscale status --json`) as
@@ -297,6 +300,9 @@ line per `[[agents]]`/`[[tools]]` entry and per pipeline stage — harness,
 model, env keys (never values), permission count — resolved the way a launch
 resolves them. `thegn dispatch list --active` is the roster reduced to the rows
 that occupy a slot. Both are terse by default and take `--json`.
+`thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
+default; `--limit` sets the page size and `--before <row>` uses the cursor printed
+on stderr when older rows follow.
 
 The dispatch roster closes its own loop: `thegn dispatch verify <id>` checks
 a finished row's artifact (exists under the worktree, tracked by git — exit
