@@ -3993,3 +3993,50 @@ fn a_clean_ics_file_has_no_diagnostics() {
         page.diagnostics()
     );
 }
+
+#[test]
+fn page_diagnostics_break_down_rejections_without_double_counting() {
+    let input = "BEGIN:VCALENDAR\n\
+BEGIN:VEVENT\n\
+UID:mixed\n\
+DTSTART;VALUE=DATE:20261012\n\
+DTEND:20261012T100000Z\n\
+END:VEVENT\n\
+BEGIN:VEVENT\n\
+UID:valid\n\
+DTSTART:20261012T110000Z\n\
+DTEND:20261012T120000Z\n\
+END:VEVENT\n\
+END:VCALENDAR";
+    let mut meter = thegn_core::calendar::AdmissionMeter::isolated(
+        thegn_core::calendar::AdmissionBudget::default(),
+    );
+    let mut events = Vec::new();
+    let mut report = thegn_core::calendar::ics::IcsReport::default();
+    thegn_core::calendar::ics::parse_ics_window_reported(
+        input,
+        "UTC",
+        None,
+        &mut meter,
+        &mut events,
+        || Ok(()),
+        &mut report,
+    )
+    .unwrap();
+
+    assert_eq!(events.len(), 1);
+    let diagnostics = PageDiagnostics::from_report(&report);
+    assert_eq!(diagnostics.rejected.mixed_shape, 1);
+    assert!(diagnostics.quarantined_events >= 1);
+    assert_eq!(
+        diagnostics.total(),
+        diagnostics.quarantined_events
+            + diagnostics.unresolved_zones
+            + diagnostics.other
+            + diagnostics.overflow
+    );
+
+    let mut combined = diagnostics;
+    combined.absorb(diagnostics);
+    assert_eq!(combined.rejected.mixed_shape, 2);
+}
