@@ -3,6 +3,7 @@
 //! the exact machinery provider panes already use (`PaneIo::Stream` +
 //! `relay_exec`'s reconnect ladder).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -20,6 +21,10 @@ use thegn_svc::control::{OpenSpec, SessionInfo};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec};
 
 use crate::pane_source::ExecSource;
+
+const SCOPE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// One scope-probe budget shared by every startup candidate.
+const CONNECT_DAEMON_TOTAL_DEADLINE: Duration = SCOPE_PROBE_TIMEOUT;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -88,7 +93,7 @@ fn classify_scope_reply(reply: Result<Value>, expected: &[String]) -> ScopeCheck
 
 pub(super) async fn check_daemon_scope(client: &ControlClient, expected: &[String]) -> ScopeCheck {
     let result = match tokio::time::timeout(
-        Duration::from_secs(5),
+        SCOPE_PROBE_TIMEOUT,
         client.call_raw("GET", super::SCOPE_PATH, None),
     )
     .await
@@ -104,11 +109,158 @@ pub(super) async fn check_daemon_scope(client: &ControlClient, expected: &[Strin
 }
 
 fn client_socket_label(client: &ControlClient) -> String {
-    match client.addr() {
+    addr_label(client.addr())
+}
+
+fn addr_key(addr: &ControlAddr) -> String {
+    match addr {
+        ControlAddr::Unix(path) => format!("unix:{}", path.display()),
+        ControlAddr::Tcp { addr, .. } => format!("tcp:{addr}"),
+        ControlAddr::HttpOrigin { origin, .. } => format!("origin:{origin}"),
+    }
+}
+
+fn addr_label(addr: &ControlAddr) -> String {
+    match addr {
         ControlAddr::Unix(path) => path.display().to_string(),
         ControlAddr::Tcp { addr, .. } => addr.clone(),
         ControlAddr::HttpOrigin { origin, .. } => origin.clone(),
     }
+}
+
+struct CandidateScan {
+    found: Option<ControlClient>,
+    foreign: Vec<(String, String)>,
+    unassessed: Vec<String>,
+}
+
+async fn scan_candidates(
+    candidates: Vec<ControlAddr>,
+    deadline: Duration,
+    probe: impl Fn(ControlAddr) -> BoxFuture<'static, StopProbe>,
+) -> CandidateScan {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if seen.insert(addr_key(&candidate)) {
+            unique.push(candidate);
+        }
+    }
+
+    let deadline_at = tokio::time::Instant::now() + deadline;
+    let mut scan = CandidateScan {
+        found: None,
+        foreign: Vec::new(),
+        unassessed: Vec::new(),
+    };
+    let mut candidates = unique.into_iter();
+    while let Some(candidate) = candidates.next() {
+        let label = addr_label(&candidate);
+        match tokio::time::timeout_at(deadline_at, probe(candidate.clone())).await {
+            Ok(StopProbe::Ours) => {
+                scan.found = Some(ControlClient::new(candidate));
+                return scan;
+            }
+            Ok(StopProbe::Foreign(scope)) => scan.foreign.push((label, scope)),
+            Ok(StopProbe::NotRunning) => {}
+            Err(_) => {
+                scan.unassessed.push(label);
+                scan.unassessed
+                    .extend(candidates.map(|addr| addr_label(&addr)));
+                return scan;
+            }
+        }
+    }
+    scan
+}
+
+async fn scan_startup_candidates(
+    local: Option<ControlAddr>,
+    candidates: Vec<ControlAddr>,
+    deadline: Duration,
+    probe: impl Fn(ControlAddr) -> BoxFuture<'static, StopProbe>,
+) -> CandidateScan {
+    let mut scan = CandidateScan {
+        found: None,
+        foreign: Vec::new(),
+        unassessed: Vec::new(),
+    };
+    let mut candidates = candidates;
+    if let Some(local) = local {
+        // Preserve the local client's request timeout; only registry rows
+        // share the startup reconciliation deadline below.
+        let key = addr_key(&local);
+        candidates.retain(|candidate| addr_key(candidate) != key);
+        let label = addr_label(&local);
+        match probe(local.clone()).await {
+            StopProbe::Ours => {
+                scan.found = Some(ControlClient::new(local));
+                return scan;
+            }
+            StopProbe::Foreign(scope) => scan.foreign.push((label, scope)),
+            StopProbe::NotRunning => {}
+        }
+    }
+
+    let mut registry_scan = scan_candidates(candidates, deadline, probe).await;
+    scan.foreign.append(&mut registry_scan.foreign);
+    scan.found = registry_scan.found;
+    scan.unassessed = registry_scan.unassessed;
+    scan
+}
+
+async fn startup_scan(dcfg: &DaemonConfig) -> CandidateScan {
+    super::reconcile_legacy_socket(dcfg);
+    let scopes = super::scope_aliases();
+    let discovered = tokio::task::spawn_blocking({
+        let scopes = scopes.clone();
+        move || {
+            let db = Db::open().ok()?;
+            Some(
+                scopes
+                    .iter()
+                    .filter_map(|scope| thegn_svc::control::client::discover(&db, scope, now_ms()))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    let legacy = thegn_core::config_daemon::legacy_socket_path(
+        &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    let candidates = discovered
+        .into_iter()
+        .filter(|addr| !is_legacy_unix_addr(addr, &legacy))
+        .collect::<Vec<_>>();
+    let sock = super::socket_path(dcfg);
+    let local = (!dcfg.socket.is_empty() || sock != legacy).then_some(ControlAddr::Unix(sock));
+    scan_startup_candidates(
+        local,
+        candidates,
+        CONNECT_DAEMON_TOTAL_DEADLINE,
+        move |addr| {
+            let scopes = scopes.clone();
+            Box::pin(async move { probe_stop_target(&ControlClient::new(addr), &scopes).await })
+        },
+    )
+    .await
+}
+
+fn startup_refusal(scan: &CandidateScan, sock_label: &str) -> Option<anyhow::Error> {
+    if !scan.unassessed.is_empty() {
+        return Some(anyhow!(
+            "could not check pane daemon endpoint(s) {} within {}s; not starting another daemon (retry, or run `thegn daemon stop`)",
+            scan.unassessed.join(", "),
+            CONNECT_DAEMON_TOTAL_DEADLINE.as_secs()
+        ));
+    }
+    scan.foreign
+        .iter()
+        .find(|(label, _)| label == sock_label)
+        .map(|(_, scope)| scope_mismatch_error(sock_label, scope))
 }
 
 pub(crate) fn socket_label(client: &ControlClient) -> String {
@@ -157,81 +309,36 @@ pub(crate) async fn verify_local_daemon(
     }
 }
 
-/// Find a live daemon for this state dir WITHOUT spawning one: registry
-/// discovery, then a probe of the configured socket. `None` = no daemon is
+/// Find a live daemon for this state dir WITHOUT spawning one: probe the
+/// configured socket, then registry discovery. `None` = no daemon is
 /// running (so there is nothing to kill/list — callers must not spawn one as
 /// a side effect).
 pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient> {
-    super::reconcile_legacy_socket(dcfg);
-    let scopes = super::scope_aliases();
-    // 1. Registry discovery (freshest live heartbeat), verified by connect.
-    let discovered = tokio::task::spawn_blocking({
-        let scopes = scopes.clone();
-        move || {
-            let db = Db::open().ok()?;
-            Some(
-                scopes
-                    .iter()
-                    .filter_map(|scope| thegn_svc::control::client::discover(&db, scope, now_ms()))
-                    .collect::<Vec<_>>(),
-            )
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
-    let legacy = thegn_core::config_daemon::legacy_socket_path(
-        &thegn_core::util::xdg_state_home().join("thegn"),
-    );
-    for addr in discovered
-        .into_iter()
-        .filter(|addr| !is_legacy_unix_addr(addr, &legacy))
-    {
-        let client = ControlClient::new(addr);
-        if client.health().await.is_ok() {
-            match check_daemon_scope(&client, &scopes).await {
-                ScopeCheck::Match | ScopeCheck::Unknown => {
-                    start_error_state_bridge(&client);
-                    return Some(client);
-                }
-                ScopeCheck::Mismatch(actual) => {
-                    tracing::warn!(
-                        target: "thegn::daemon",
-                        socket = %client_socket_label(&client),
-                        %actual,
-                        "refusing daemon from a different state directory"
-                    );
-                }
-                ScopeCheck::NotOurs => {}
-            }
-        }
-    }
-
-    // 2. The configured socket may host a daemon the registry missed (e.g. a
-    //    fresh DB): probe it before giving up.
-    let sock = super::socket_path(dcfg);
-    if !dcfg.socket.is_empty() || sock != legacy {
-        let client = ControlClient::new(ControlAddr::Unix(sock));
-        if client.health().await.is_ok() {
-            match check_daemon_scope(&client, &scopes).await {
-                ScopeCheck::Match | ScopeCheck::Unknown => {
-                    start_error_state_bridge(&client);
-                    return Some(client);
-                }
-                ScopeCheck::Mismatch(actual) => {
-                    tracing::warn!(
-                        target: "thegn::daemon",
-                        socket = %client_socket_label(&client),
-                        %actual,
-                        "refusing daemon from a different state directory"
-                    );
-                }
-                ScopeCheck::NotOurs => {}
-            }
-        }
+    let scan = startup_scan(dcfg).await;
+    report_startup_scan(&scan);
+    if let Some(client) = scan.found {
+        start_error_state_bridge(&client);
+        return Some(client);
     }
     None
+}
+
+fn report_startup_scan(scan: &CandidateScan) {
+    for (socket, actual) in &scan.foreign {
+        tracing::warn!(
+            target: "thegn::daemon",
+            %socket,
+            %actual,
+            "refusing daemon from a different state directory"
+        );
+    }
+    if !scan.unassessed.is_empty() {
+        tracing::warn!(
+            target: "thegn::daemon",
+            candidates = ?scan.unassessed,
+            "pane daemon candidates not checked within the startup deadline"
+        );
+    }
 }
 
 /// Find a live daemon for this state dir, or spawn one detached and wait for
@@ -242,8 +349,11 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     let legacy = thegn_core::config_daemon::legacy_socket_path(
         &thegn_core::util::xdg_state_home().join("thegn"),
     );
-    if let Some(client) = connect_daemon(dcfg).await {
-        return Ok(client);
+    let scan = startup_scan(dcfg).await;
+    report_startup_scan(&scan);
+    if let Some(client) = scan.found.as_ref() {
+        start_error_state_bridge(client);
+        return Ok(client.clone());
     }
     if super::legacy_socket_state() == super::LegacySocketState::Live {
         let legacy = thegn_core::config_daemon::legacy_socket_path(
@@ -261,14 +371,8 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     }
     let sock = super::socket_path(dcfg);
     let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
-
-    // `connect_daemon` skips foreign daemons so callers that only need to
-    // discover one can degrade gracefully. Startup must stop here instead of
-    // racing a spawn against a foreign process that already owns the socket.
-    if client.health().await.is_ok()
-        && let ScopeCheck::Mismatch(actual) = check_daemon_scope(&client, &scopes).await
-    {
-        return Err(scope_mismatch_error(&sock.display().to_string(), &actual));
+    if let Some(error) = startup_refusal(&scan, &sock.display().to_string()) {
+        return Err(error);
     }
 
     // 3. Spawn detached (own process group, null stdio — the compositor must
@@ -322,11 +426,7 @@ fn start_error_state_bridge(client: &ControlClient) {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    let key = match client.addr() {
-        ControlAddr::Unix(path) => format!("unix:{}", path.display()),
-        ControlAddr::Tcp { addr, .. } => format!("tcp:{addr}"),
-        ControlAddr::HttpOrigin { origin, .. } => format!("origin:{origin}"),
-    };
+    let key = addr_key(client.addr());
     let owner = format!("{key}#{}", next_generation());
     if let Ok(mut bridges) = started().lock() {
         if bridges.contains_key(&key) {
@@ -926,6 +1026,7 @@ impl ExecSource for LazyDaemonSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use thegn_core::control_wire::MAX_WIRE_PAYLOAD;
 
     fn gap_tracker(window: Duration) -> GapTracker {
@@ -1269,6 +1370,191 @@ mod tests {
             },
             legacy
         ));
+    }
+
+    #[tokio::test]
+    async fn candidate_scan_short_circuits_on_the_first_verified_daemon() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let scan = scan_candidates(
+            vec![
+                ControlAddr::Unix("/a.sock".into()),
+                ControlAddr::Unix("/b.sock".into()),
+            ],
+            Duration::from_secs(1),
+            move |_| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { StopProbe::Ours })
+            },
+        )
+        .await;
+        assert!(scan.found.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(scan.unassessed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidate_scan_deduplicates_registry_and_configured_socket() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let scan = scan_candidates(
+            vec![
+                ControlAddr::Unix("/a.sock".into()),
+                ControlAddr::Unix("/a.sock".into()),
+                ControlAddr::Tcp {
+                    addr: "127.0.0.1:1".into(),
+                    token: "secret".into(),
+                },
+            ],
+            Duration::from_secs(1),
+            move |_| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { StopProbe::NotRunning })
+            },
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(scan.found.is_none());
+        assert!(scan.unassessed.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_scan_reports_unassessed_candidates_at_the_shared_deadline() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let start = tokio::time::Instant::now();
+        let scan = scan_candidates(
+            vec![
+                ControlAddr::Unix("/a.sock".into()),
+                ControlAddr::Unix("/b.sock".into()),
+                ControlAddr::Tcp {
+                    addr: "127.0.0.1:2".into(),
+                    token: "secret".into(),
+                },
+            ],
+            Duration::from_secs(5),
+            move |addr| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                if matches!(addr, ControlAddr::Unix(path) if path == std::path::Path::new("/a.sock")) {
+                    Box::pin(futures::future::pending())
+                } else {
+                    Box::pin(async { StopProbe::Ours })
+                }
+            },
+        )
+        .await;
+        assert_eq!(scan.unassessed, ["/a.sock", "/b.sock", "127.0.0.1:2"]);
+        assert!(scan.found.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let elapsed = tokio::time::Instant::now() - start;
+        assert!(elapsed >= Duration::from_secs(5));
+        assert!(elapsed < Duration::from_millis(5_002));
+        assert!(
+            scan.unassessed
+                .iter()
+                .all(|label| !label.contains("secret"))
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_scan_slow_registry_candidate_cannot_starve_local_socket() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let scan = scan_startup_candidates(
+            Some(ControlAddr::Unix("/configured.sock".into())),
+            vec![ControlAddr::Tcp {
+                addr: "127.0.0.1:2".into(),
+                token: "secret".into(),
+            }],
+            Duration::from_millis(1),
+            move |addr| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                if matches!(addr, ControlAddr::Unix(path) if path == std::path::Path::new("/configured.sock")) {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        StopProbe::Ours
+                    })
+                } else {
+                    Box::pin(futures::future::pending())
+                }
+            },
+        )
+        .await;
+
+        assert!(scan.found.is_some());
+        assert!(scan.unassessed.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn candidate_scan_startup_refusal_is_typed() {
+        let unassessed = CandidateScan {
+            found: None,
+            foreign: Vec::new(),
+            unassessed: vec!["/slow.sock".into()],
+        };
+        assert!(
+            startup_refusal(&unassessed, "/configured.sock")
+                .unwrap()
+                .to_string()
+                .contains("not starting another daemon")
+        );
+
+        let configured_foreign = CandidateScan {
+            found: None,
+            foreign: vec![("/configured.sock".into(), "other-scope".into())],
+            unassessed: Vec::new(),
+        };
+        assert!(
+            startup_refusal(&configured_foreign, "/configured.sock")
+                .unwrap()
+                .to_string()
+                .contains("belongs to a different state directory")
+        );
+
+        let other_foreign = CandidateScan {
+            found: None,
+            foreign: vec![("/other.sock".into(), "other-scope".into())],
+            unassessed: Vec::new(),
+        };
+        assert!(startup_refusal(&other_foreign, "/configured.sock").is_none());
+    }
+
+    #[tokio::test]
+    async fn candidate_scan_bounds_a_listener_that_never_answers() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("d.sock");
+        let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
+        let mut listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
+            .await
+            .unwrap()
+        {
+            thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
+            thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+        };
+        let accept_task = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok(stream) = listener.accept_stream().await {
+                streams.push(stream);
+            }
+            streams
+        });
+        let started = std::time::Instant::now();
+        let candidate = ControlAddr::Unix(socket.clone());
+        let scopes = vec!["scope".into()];
+        let scan = scan_candidates(vec![candidate], Duration::from_millis(300), move |addr| {
+            let scopes = scopes.clone();
+            Box::pin(async move { probe_stop_target(&ControlClient::new(addr), &scopes).await })
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(scan.unassessed, [socket.display().to_string()]);
+        assert!(scan.found.is_none());
+        accept_task.abort();
+        assert!(accept_task.await.is_err());
     }
 
     #[tokio::test]
