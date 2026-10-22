@@ -1218,7 +1218,12 @@ env = { KHAL_AUTH = "cal-env-sentinel-5e8" }
             assert_calendar_output_clean(label, output);
             assert!(output.contains("khal-thegn"), "{label}: {output}");
             assert!(output.contains("KHAL_AUTH"), "{label}: {output}");
-            assert!(output.contains("work"), "{label}: {output}");
+            let account_name = if label == "TOML" {
+                "name = \"work\""
+            } else {
+                "\"name\": \"work\""
+            };
+            assert!(output.contains(account_name), "{label}: {output}");
             assert!(output.contains("/srv/khal"), "{label}: {output}");
         }
         toml_output.parse::<toml::Table>().expect("valid TOML");
