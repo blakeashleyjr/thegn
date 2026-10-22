@@ -166,6 +166,8 @@ else. A week is how long you have to notice.
   partly cleaned up, so scripts can tell. Existing THE-596 branch holds and
   rows that cannot be identified as belonging to this repository are reported
   as informational and do not change the exit status.
+- A refused cleanup is retried with a growing delay (5 minutes, doubling up to
+  a day) and is reported as kept meanwhile; `--force` retries immediately.
 - The _merge_ section's **`c`** does the same for that repo after a second
   press: it clears the landed rows and sweeps their worktrees together. Under
   `expire` a landed row _is_ the grace-period clock, so clearing one without its worktree

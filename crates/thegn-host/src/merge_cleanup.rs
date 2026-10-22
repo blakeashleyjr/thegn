@@ -120,6 +120,47 @@ impl LocalResources {
     }
 }
 
+/// Whether the current search path contains an OCI runtime that can make a
+/// previous cleanup refusal relevant. An unreadable or malformed search path
+/// is treated as potentially containing a runtime so retry deferral stays
+/// conservative.
+pub(crate) fn oci_runtime_may_be_installed() -> bool {
+    #[cfg(not(test))]
+    let search = std::env::var_os("PATH");
+    #[cfg(test)]
+    let search = TEST_GIT_CONFIG
+        .with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|path| path.as_os_str().to_owned())
+        })
+        .or_else(|| Some(oci_free_test_search().as_os_str().to_owned()));
+
+    let Some(search) = search else {
+        return true;
+    };
+    if search.len() > 64 * 1024 {
+        return true;
+    }
+    let paths: Vec<_> = std::env::split_paths(&search).take(257).collect();
+    if paths.is_empty() || paths.len() > 256 || paths.iter().any(|path| !path.is_absolute()) {
+        return true;
+    }
+    let mut seen = BTreeSet::new();
+    for backend in thegn_core::sandbox::Backend::all_oci() {
+        let binary = backend.binary();
+        if !seen.insert(binary) {
+            continue;
+        }
+        match find_runtime(&paths, binary) {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => {}
+        }
+    }
+    false
+}
+
 fn oci_resources_absent(search: Option<&std::ffi::OsStr>, target: &Path) -> Result<(), String> {
     let search = search.ok_or("OCI availability unknown: PATH missing")?;
     if search.len() > 64 * 1024 {
