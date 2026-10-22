@@ -527,6 +527,25 @@ done
     }
 
     #[test]
+    fn plugin_detail_keeps_partial_comments_marker() {
+        let (_fixture, _session, bridge) = live_bridge();
+        let backend = PluginIssueBackend::new(bridge, "demo", IssueCaps::default()).unwrap();
+        let detail = IssueDetail {
+            issue: Issue {
+                id: "plugin:demo:7".into(),
+                number: "7".into(),
+                provider: "plugin:demo".into(),
+                ..Default::default()
+            },
+            comments: vec![],
+            comments_complete: false,
+        };
+
+        let validated = backend.validate_detail(detail).unwrap();
+        assert!(!validated.comments_complete);
+    }
+
+    #[test]
     fn mutation_with_null_or_missing_result_is_not_success() {
         let script = r#"
 while read -r line; do
