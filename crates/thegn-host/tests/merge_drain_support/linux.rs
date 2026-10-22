@@ -980,10 +980,11 @@ fn real_cli_red_gate_hold_continues_then_plain_drain_recovers_same_row() {
 // Both CLI processes use custody-owned groups and the same private fixture DB.
 // A holds its gate in the gate runner's separate group after RowClaim admission;
 // no lease time is simulated, so B observes A's live claim and emits the
-// claimed-by-another warning before attempting the gate. Releasing A lets its
-// gate pass and the drain writes `ready` then releases the claim. Thus only one
-// gate start occurs, B changes neither attempts nor generation/status, and the
-// target ref remains at its captured value.
+// claimed-by-another warning before attempting the gate (merge_driver.rs:761-779).
+// Releasing A lets its gate pass and the drain writes `ready` then releases the
+// claim (merge_driver.rs:1075-1088, 1478-1481). Thus only one gate start occurs,
+// B changes neither attempts nor generation/status, and the target ref remains
+// at its captured value because this fixture disables auto-land.
 #[test]
 fn race_two_cli_drains_have_one_owner() {
     let mut f = one_row_fixture(FixtureOpts {
@@ -1034,10 +1035,11 @@ fn race_two_cli_drains_have_one_owner() {
 // therefore kills owner A but leaves its FIFO-blocked gate to write `end`.
 // The lease is the only simulated fact (`expire_lease` sets it to now - 1);
 // A's claim wrote `folding`, generation, and attempts in the real DB. Recovery
-// admits with `queued`, advances the claim generation, writes `folding`, runs
-// the gate a second time, then `Ready` and claim finish produce `ready` and
-// `unclaimed`; finish preserves the attempt count. Thus gate starts/ends are
-// 2/2 and the killed owner's signal status is SIGKILL.
+// admits with `queued` (merge_driver.rs:797-825), writes `folding` at
+// merge_driver.rs:911, and the Ready arm writes `ready` at merge_driver.rs:1075-1088;
+// claim finish releases it at merge_driver.rs:1478-1481. Finish preserves the
+// attempt count. Thus gate starts/ends are 2/2 and the killed owner's signal
+// status is SIGKILL.
 #[test]
 fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     let mut f = one_row_fixture(FixtureOpts {
@@ -1096,11 +1098,12 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
 // is expired in SQLite while A is still alive. CLI C recovers with a new claim
 // generation, folds and passes the now-open gate, then CAS-advances
 // `refs/heads/main` and writes `landed` plus the result OID. When A's gate is
-// released, `attempt_land` first sees C's target commit as an ancestor and
-// returns `UpToDate`; A's `RowClaim::write` then returns MERGE_CLAIM_LOST,
-// `stop_on_write_error!` records the exact lost-claim warning, and the finish
-// path treats a lost-claim release error as a warning. Hence A exits 0, cannot
-// change the landed row/ref, and total gate starts/ends are 2/2.
+// released, `attempt_land` sees C's target commit as an ancestor and returns
+// `UpToDate` (integrate.rs:2938-2943); the UpToDate arm writes `landed` and
+// `stop_on_write_error!` catches a lost write (merge_driver.rs:1061-1064,
+// 877-889). Claim finish's Err(_) arm deduplicates the warning
+// (merge_driver.rs:1478-1522). Hence A exits 0, cannot change the landed row/ref,
+// and total gate starts/ends are 2/2.
 #[test]
 fn race_late_former_owner_cannot_overwrite_recovered_row() {
     let mut f = one_row_fixture(FixtureOpts {

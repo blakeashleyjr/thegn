@@ -797,7 +797,7 @@ fn drive_queue_with(
             if !recoverable {
                 continue;
             }
-            recoverable
+            true
         } else {
             false
         };
