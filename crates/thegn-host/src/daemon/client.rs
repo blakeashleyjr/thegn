@@ -26,8 +26,9 @@ const SCOPE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// One scope-probe budget shared by every startup candidate.
 const CONNECT_DAEMON_TOTAL_DEADLINE: Duration = SCOPE_PROBE_TIMEOUT;
 /// The spawn wait is bounded by the 3 s already promised by its timeout error
-/// (60 polls x 50 ms today).
+/// (the old 60 x 50 ms loop).
 const SPAWN_WAIT_DEADLINE: Duration = Duration::from_secs(3);
+/// Interval between checks while waiting for the spawned daemon to start.
 const SPAWN_WAIT_POLL: Duration = Duration::from_millis(50);
 
 fn now_ms() -> i64 {
@@ -457,8 +458,9 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     cmd.arg("daemon").arg("--socket").arg(&sock);
     let child = cmd.spawn().context("spawn pane daemon")?;
     own_spawned_daemon(child);
+    let probe_client = client.clone();
     let probe = move || {
-        let client = client.clone();
+        let client = probe_client.clone();
         let scopes = scopes.clone();
         Box::pin(async move { probe_stop_target(&client, &scopes).await })
             as BoxFuture<'static, StopProbe>
@@ -1183,10 +1185,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test must launch a real child to verify it is reaped"
-    )]
     fn spawn_daemon_child_is_reaped_after_it_exits() {
         if !crate::platform::sound_process::test_support::UNIX
             || !std::path::Path::new("/proc/self/stat").exists()
@@ -1207,11 +1205,10 @@ mod tests {
         while proc_entry.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let stat = std::fs::read_to_string(stat_path).unwrap_or_else(|error| error.to_string());
-        assert!(
-            !proc_entry.exists(),
-            "spawned child pid {pid} was not reaped; /proc/{pid}/stat: {stat}"
-        );
+        if proc_entry.exists() {
+            let stat = std::fs::read_to_string(stat_path).unwrap_or_else(|error| error.to_string());
+            panic!("spawned child pid {pid} was not reaped; /proc/{pid}/stat: {stat}");
+        }
     }
 
     #[test]
