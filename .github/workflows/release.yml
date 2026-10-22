@@ -543,19 +543,22 @@ jobs:
           archives=("$PACKAGE_ROOT/assets"/thegn-"$TAG"-*.tar.gz)
           [ "${#archives[@]}" -gt 0 ] || { echo "::error::no release archives to verify"; exit 1; }
           for archive in "${archives[@]}"; do
-            verification="$(gh attestation verify "$archive" \
+            verification_file="$PACKAGE_ROOT/attestation.json"
+            gh attestation verify "$archive" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
               --source-digest "$GITHUB_SHA" \
               --deny-self-hosted-runners \
-              --format json)"
-            if ! jq -e \
-              --arg run_uri_prefix "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/" \
-              'type == "array" and length > 0 and all(.[];
-                ((.verificationResult.signature.certificate.runInvocationURI // "")
-                  | startswith($run_uri_prefix)))' \
-              <<< "$verification" >/dev/null; then
-              echo "::error::archive attestation is not bound to this workflow run"
+              --format json > "$verification_file"
+            if ! python3 packaging/release.py verify-attestation \
+              --archive "$archive" \
+              --verification "$verification_file" \
+              --repository "$GITHUB_REPOSITORY" \
+              --server-url "$GITHUB_SERVER_URL" \
+              --source-digest "$GITHUB_SHA" \
+              --run-id "$GITHUB_RUN_ID"; then
+              echo "::error::archive attestation is not bound to this workflow run" \
+                "(release.py verify-attestation refused; see its message above)"
               exit 1
             fi
           done
@@ -729,19 +732,22 @@ jobs:
           archives=("$VERIFY_ROOT/assets/thegn-$TAG-"*.tar.gz)
           [ "${#archives[@]}" -gt 0 ] || { echo "::error::no release archives to verify"; exit 1; }
           for archive in "${archives[@]}"; do
-            verification="$(gh attestation verify "$archive" \
+            verification_file="$VERIFY_ROOT/attestation.json"
+            gh attestation verify "$archive" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
               --source-digest "$GITHUB_SHA" \
               --deny-self-hosted-runners \
-              --format json)"
-            if ! jq -e \
-              --arg run_uri_prefix "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/" \
-              'type == "array" and length > 0 and all(.[];
-                ((.verificationResult.signature.certificate.runInvocationURI // "")
-                  | startswith($run_uri_prefix)))' \
-              <<< "$verification" >/dev/null; then
-              echo "::error::archive attestation is not bound to this workflow run"
+              --format json > "$verification_file"
+            if ! python3 packaging/release.py verify-attestation \
+              --archive "$archive" \
+              --verification "$verification_file" \
+              --repository "$GITHUB_REPOSITORY" \
+              --server-url "$GITHUB_SERVER_URL" \
+              --source-digest "$GITHUB_SHA" \
+              --run-id "$GITHUB_RUN_ID"; then
+              echo "::error::archive attestation is not bound to this workflow run" \
+                "(release.py verify-attestation refused; see its message above)"
               exit 1
             fi
           done

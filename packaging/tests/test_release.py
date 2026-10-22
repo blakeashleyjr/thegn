@@ -1414,5 +1414,199 @@ class ArchiveLimitBoundaryTests(unittest.TestCase):
                     self.validate(writer(entries), platform)
 
 
+class AttestationVerificationTests(unittest.TestCase):
+    SERVER = "https://github.com"
+    REPO = "o/r"
+    SHA = "e45b37fb590f7aac8d3580ab22be6cd2b450c43f"
+    RUN = "12345"
+    DIGEST = hashlib.sha256(b"archive").hexdigest()
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.temp = Path(self.temporary.name)
+
+    def entry(self, **overrides):
+        certificate = {
+            "sourceRepositoryURI": f"{self.SERVER}/{self.REPO}",
+            "buildSignerURI": (
+                f"{self.SERVER}/{self.REPO}/.github/workflows/release.yml@refs/tags/v1.2.3"
+            ),
+            "sourceRepositoryDigest": self.SHA,
+            "runnerEnvironment": "github-hosted",
+            "runInvocationURI": (
+                f"{self.SERVER}/{self.REPO}/actions/runs/{self.RUN}/attempts/1"
+            ),
+        }
+        subject = [{
+            "name": "thegn-v1.2.3-x.tar.gz",
+            "digest": {"sha256": self.DIGEST},
+        }]
+        for key, value in overrides.items():
+            if key == "subject":
+                subject = value
+            elif value is None:
+                del certificate[key]
+            else:
+                certificate[key] = value
+        return {
+            "verificationResult": {
+                "signature": {"certificate": certificate},
+                "statement": {"subject": subject},
+            }
+        }
+
+    def check(self, verification):
+        return release.check_attestation_verification(
+            verification,
+            archive_sha256=self.DIGEST,
+            repository=self.REPO,
+            server_url=self.SERVER,
+            source_digest=self.SHA,
+            run_id=self.RUN,
+        )
+
+    def test_valid_attestations_are_accepted(self) -> None:
+        self.assertEqual(1, self.check([self.entry()]))
+        self.assertEqual(2, self.check([self.entry(), self.entry()]))
+
+    def test_wrong_repository_is_refused(self) -> None:
+        for repository in ("https://github.com/o/other", "https://github.com/o/r-fork"):
+            with self.subTest(repository=repository):
+                with self.assertRaisesRegex(release.ReleaseError, "wrong repository"):
+                    self.check([self.entry(sourceRepositoryURI=repository)])
+
+    def test_wrong_signer_workflow_is_refused(self) -> None:
+        for signer in (
+            "https://github.com/o/r/.github/workflows/ci.yml@refs/tags/v1.2.3",
+            "https://github.com/o/r/.github/workflows/release.yml.evil@refs/tags/v1.2.3",
+            "https://github.com/o/other/.github/workflows/release.yml@refs/tags/v1.2.3",
+        ):
+            with self.subTest(signer=signer):
+                with self.assertRaisesRegex(release.ReleaseError, "wrong signer workflow"):
+                    self.check([self.entry(buildSignerURI=signer)])
+
+    def test_wrong_source_commit_is_refused(self) -> None:
+        with self.assertRaisesRegex(release.ReleaseError, "wrong source commit"):
+            self.check([self.entry(sourceRepositoryDigest="0" * 40)])
+
+    def test_self_hosted_builder_is_refused(self) -> None:
+        with self.assertRaisesRegex(release.ReleaseError, "untrusted runner"):
+            self.check([self.entry(runnerEnvironment="self-hosted")])
+
+    def test_stale_or_foreign_run_is_refused(self) -> None:
+        values = (
+            "https://github.com/o/r/actions/runs/123456/attempts/1",
+            "https://github.com/o/r/actions/runs/1234/attempts/1",
+            "https://github.com/o/r/actions/runs/12345",
+            "https://github.com/o/other/actions/runs/12345/attempts/1",
+        )
+        for invocation in values:
+            with self.subTest(invocation=invocation):
+                with self.assertRaisesRegex(release.ReleaseError, "not bound to this workflow run"):
+                    self.check([self.entry(runInvocationURI=invocation)])
+
+    def test_wrong_subject_digest_is_refused(self) -> None:
+        wrong = [{"name": "archive", "digest": {"sha256": hashlib.sha256(b"other").hexdigest()}}]
+        for subject in (
+            wrong,
+            [],
+            [{"name": "archive"}],
+            [{"name": "archive", "digest": {"sha256": ""}}],
+            [{"name": "archive", "digest": []}],
+            [{"name": "archive", "digest": {"sha256": None}}],
+        ):
+            with self.subTest(subject=subject):
+                with self.assertRaisesRegex(
+                    release.ReleaseError, "subject digest does not match|malformed"
+                ):
+                    self.check([self.entry(subject=subject)])
+
+    def test_every_attestation_must_pass(self) -> None:
+        with self.assertRaisesRegex(release.ReleaseError, "untrusted runner"):
+            self.check([self.entry(), self.entry(runnerEnvironment="self-hosted")])
+
+    def test_malformed_verification_is_refused(self) -> None:
+        cases = (
+            [],
+            {},
+            ["x"],
+            [{"unexpected": "shape"}],
+            [self.entry(sourceRepositoryDigest=None)],
+        )
+        for verification in cases:
+            with self.subTest(verification=verification):
+                with self.assertRaisesRegex(release.ReleaseError, "malformed"):
+                    self.check(verification)
+
+    def test_invalid_arguments_are_refused(self) -> None:
+        valid = [self.entry()]
+        arguments = {
+            "source_digest": "a" * 39,
+            "run_id": "12a",
+            "repository": "o",
+            "server_url": "http://github.com",
+        }
+        for name, value in arguments.items():
+            with self.subTest(name=name):
+                kwargs = {
+                    "archive_sha256": self.DIGEST,
+                    "repository": self.REPO,
+                    "server_url": self.SERVER,
+                    "source_digest": self.SHA,
+                    "run_id": self.RUN,
+                    name: value,
+                }
+                with self.assertRaisesRegex(
+                    release.ReleaseError, "invalid attestation check argument"
+                ):
+                    release.check_attestation_verification(valid, **kwargs)
+
+    def test_loader_refuses_duplicate_keys_and_symlinks(self) -> None:
+        duplicate = self.temp / "duplicate.json"
+        duplicate.write_text(
+            '[{"verificationResult":{},"verificationResult":{}}]', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "duplicate JSON key"):
+            release.load_attestation_verification(duplicate)
+
+        malformed = self.temp / "malformed.json"
+        malformed.write_text("not JSON", encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "cannot read attestation verification"):
+            release.load_attestation_verification(malformed)
+
+        valid = self.temp / "valid.json"
+        valid.write_text(json.dumps([self.entry()]), encoding="utf-8")
+        self.assertEqual([self.entry()], release.load_attestation_verification(valid))
+        symlink = self.temp / "symlink.json"
+        symlink.symlink_to(valid)
+        with self.assertRaises(release.ReleaseError):
+            release.load_attestation_verification(symlink)
+
+    def test_cli_exit_codes(self) -> None:
+        archive = self.temp / "archive.tar.gz"
+        archive.write_bytes(b"archive")
+        verification = self.temp / "verification.json"
+        verification.write_text(json.dumps([self.entry()]), encoding="utf-8")
+        arguments = [
+            "verify-attestation",
+            "--archive", str(archive),
+            "--verification", str(verification),
+            "--repository", self.REPO,
+            "--server-url", self.SERVER,
+            "--source-digest", self.SHA,
+            "--run-id", self.RUN,
+        ]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, release.main(arguments))
+        verification.write_text(
+            json.dumps([self.entry(runnerEnvironment="self-hosted")]), encoding="utf-8"
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                release.main(arguments)
+        self.assertEqual(2, raised.exception.code)
+
+
 if __name__ == "__main__":
     unittest.main()
