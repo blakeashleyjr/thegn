@@ -1487,7 +1487,7 @@ release-verify tag:
 
 # Rehearse standalone deb/rpm packages in fresh Debian, Ubuntu and Fedora containers.
 # This is a manual release check and is intentionally not part of ci, smoke or test.
-rehearse-packages deb="" rpm="" previous_deb="" previous_rpm="" evidence="target/package-rehearsal":
+rehearse-packages deb="" rpm="" previous_deb="" previous_rpm="" manifest="" previous_manifest="" evidence="target/package-rehearsal":
     #!/usr/bin/env bash
     set -euo pipefail
     args=()
@@ -1495,6 +1495,8 @@ rehearse-packages deb="" rpm="" previous_deb="" previous_rpm="" evidence="target
     if [ -n {{quote(rpm)}} ]; then args+=(--rpm {{quote(rpm)}}); fi
     if [ -n {{quote(previous_deb)}} ]; then args+=(--previous-deb {{quote(previous_deb)}}); fi
     if [ -n {{quote(previous_rpm)}} ]; then args+=(--previous-rpm {{quote(previous_rpm)}}); fi
+    if [ -n {{quote(manifest)}} ]; then args+=(--release-manifest {{quote(manifest)}}); fi
+    if [ -n {{quote(previous_manifest)}} ]; then args+=(--previous-release-manifest {{quote(previous_manifest)}}); fi
     cd {{quote(invocation_directory())}}
     python3 packaging/rehearse_packages.py "${args[@]}" --evidence-dir {{quote(evidence)}}
 
