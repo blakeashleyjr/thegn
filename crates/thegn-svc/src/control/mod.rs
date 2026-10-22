@@ -536,6 +536,9 @@ pub struct CiLogsReply {
     pub fetched_at: i64,
     pub truncated: bool,
     pub redacted: bool,
+    /// Provider-fill problems with the run detail (unavailable, incomplete job list, unlisted job); empty on cache hits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// The `notify.push` verb payload — a desktop-notification-shaped note pushed
