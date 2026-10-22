@@ -38,6 +38,7 @@ impl Permit {
 }
 
 pub(crate) const HELD: &str = "own-PR automation held: current author, account, repository and head must be verified by the selected forge";
+pub(crate) const AFTER_AGENT_HELD: &str = "own-PR automation held after the agent ran: the PR author, forge account, repository or head changed or could not be verified while it ran; thegn did not record the agent's push or update the PR row";
 
 pub(crate) fn acquire(
     own_only: bool,
@@ -133,6 +134,57 @@ pub(crate) fn revalidate(
         return Err(HELD);
     }
     Ok(())
+}
+
+/// Before thegn's own follow-up writes after an automatic agent returns. `fresh` is the PR re-read
+/// by number after the agent (None = unavailable); `own_head` is what `observe_own_head` attributed
+/// to the agent (Some only for a pushed descendant of the admitted head).
+pub(crate) fn revalidate_after_agent(
+    permit: Option<&Permit>,
+    db: &Db,
+    forge: &dyn Forge,
+    loc: &GitLoc,
+    fresh: Option<&PrStatus>,
+    own_head: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(permit) = permit else {
+        return Ok(());
+    };
+    let Some(fresh) = fresh else {
+        return Err(AFTER_AGENT_HELD);
+    };
+    let advanced = own_head == Some(fresh.head_ref_oid.as_str());
+    if !advanced && fresh.head_ref_oid != permit.proof.head {
+        return Err(AFTER_AGENT_HELD);
+    }
+    if forge.id() != permit.proof.provider.as_str() || !forge.caps().pr_authorship {
+        return Err(AFTER_AGENT_HELD);
+    }
+    let Ok(worktree) = local_execution_location(db, loc) else {
+        return Err(AFTER_AGENT_HELD);
+    };
+    if worktree != permit.worktree {
+        return Err(AFTER_AGENT_HELD);
+    }
+    let Some(origin) = loc.git_out(&["remote", "get-url", "origin"]) else {
+        return Err(AFTER_AGENT_HELD);
+    };
+    if origin != permit.origin {
+        return Err(AFTER_AGENT_HELD);
+    }
+    let Some(repository) = GithubRepository::from_origin(&origin) else {
+        return Err(AFTER_AGENT_HELD);
+    };
+    let Ok(after) = forge.pr_authorship(loc, permit.proof.number) else {
+        return Err(AFTER_AGENT_HELD);
+    };
+    if after.authorizes(&permit.proof.provider, &repository, fresh)
+        && permit.proof.same_context(&after)
+    {
+        Ok(())
+    } else {
+        Err(AFTER_AGENT_HELD)
+    }
 }
 
 #[cfg(test)]
