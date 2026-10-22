@@ -1028,13 +1028,10 @@ impl WorktreeAuxStore for Db {
         row: &MergeQueueRow,
         retry: crate::merge_sweep::CleanupRetry,
     ) -> Result<bool> {
-        use crate::merge_sweep::{CleanupHold, CleanupRetry};
+        use crate::merge_sweep::CleanupHold;
         if row.status != "landed"
             || row.result_oid.as_deref().is_none_or(str::is_empty)
-            || row.error_detail.as_deref().is_some_and(|detail| {
-                CleanupHold::from_detail(Some(detail)).is_some()
-                    || (!detail.is_empty() && CleanupRetry::from_detail(Some(detail)).is_none())
-            })
+            || CleanupHold::from_detail(row.error_detail.as_deref()).is_some()
         {
             return Ok(false);
         }
