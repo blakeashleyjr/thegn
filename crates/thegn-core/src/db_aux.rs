@@ -1023,6 +1023,30 @@ impl WorktreeAuxStore for Db {
         Ok(changed == 1)
     }
 
+    fn defer_merge_cleanup(
+        &self,
+        row: &MergeQueueRow,
+        retry: crate::merge_sweep::CleanupRetry,
+    ) -> Result<bool> {
+        use crate::merge_sweep::{CleanupHold, CleanupRetry};
+        if row.status != "landed"
+            || row.result_oid.as_deref().is_none_or(str::is_empty)
+            || row.error_detail.as_deref().is_some_and(|detail| {
+                CleanupHold::from_detail(Some(detail)).is_some()
+                    || (!detail.is_empty() && CleanupRetry::from_detail(Some(detail)).is_none())
+            })
+        {
+            return Ok(false);
+        }
+        let changed = self.conn().execute(
+            "UPDATE merge_queue SET error_detail=?12 WHERE worktree=?1 AND branch=?2 AND target_branch=?3 AND status=?4 AND queued_at=?5 AND updated_at=?6 AND result_oid IS ?7 AND conflict_paths IS ?8 AND error_detail IS ?9 AND COALESCE(location,'')=?10 AND COALESCE(agent_attempts,0)=?11",
+            params![row.worktree, row.branch, row.target_branch, row.status, row.queued_at, row.updated_at,
+                row.result_oid, row.conflict_paths, row.error_detail, row.location, row.agent_attempts,
+                retry.marker()],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// The whole queue, oldest-queued first (the fold order + UI feed).
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>> {
         let mut stmt = self.conn().prepare(
