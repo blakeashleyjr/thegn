@@ -2021,8 +2021,12 @@ mod tests {
             )]
         );
         drop(claim);
-        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(%error, "test cleanup");
+        }
     }
 
     #[test]
@@ -2039,7 +2043,9 @@ mod tests {
         assert!(notes.contains(&LifecycleNote::Info(
             "merge cleanup: removed feat; branch kept for explicit cleanup".into()
         )));
-        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
     }
 
     #[test]
@@ -2056,7 +2062,11 @@ mod tests {
         let notes = apply_landed_reported(&config, &db, &root, &feat_s, "feat", "commit");
 
         assert!(notes.is_empty());
-        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(%error, "test cleanup");
+        }
     }
 }
