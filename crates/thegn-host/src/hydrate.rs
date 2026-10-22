@@ -2135,6 +2135,7 @@ fn collect_sidebar_status(
         &crate::attention_status::CiReader {
             cfg: &app_cfg.ci,
             locations: &locations,
+            branches: branch_observations,
         },
     );
 
@@ -5572,14 +5573,25 @@ fn build_across(
     repo_root: Option<&std::path::Path>,
     ci: &thegn_core::config::CiConfig,
 ) -> thegn_core::aggregate::Aggregation {
-    use thegn_core::aggregate::{Aggregation, ci_failure_excerpts};
     let rr = repo_root.map(|r| r.to_string_lossy().into_owned());
-    let mut excerpts = Vec::new();
     let rows = db.worktrees().unwrap_or_default();
-    let locations = thegn_core::remote::WorktreeLocations::from_rows(&rows);
-    for w in &rows {
-        if let Some(rr) = &rr
-            && w.repo_root != *rr
+    let observed = observe_rows_warm(&rows);
+    across_from_rows(db, &rows, rr.as_deref(), ci, &observed)
+}
+
+fn across_from_rows(
+    db: &thegn_core::db::Db,
+    rows: &[thegn_core::models::WorktreeRow],
+    repo_root: Option<&str>,
+    ci: &thegn_core::config::CiConfig,
+    observed: &std::collections::HashMap<String, crate::worktree_snapshot::BranchObservation>,
+) -> thegn_core::aggregate::Aggregation {
+    use thegn_core::aggregate::{Aggregation, ci_failure_excerpts};
+    let mut excerpts = Vec::new();
+    let locations = thegn_core::remote::WorktreeLocations::from_rows(rows);
+    for w in rows {
+        if let Some(repo_root) = repo_root
+            && w.repo_root != repo_root
         {
             continue;
         }
@@ -5588,7 +5600,14 @@ fn build_across(
         } else {
             w.branch.clone()
         };
-        if let Ok(Some((json, _))) = db.get_ci_cache(&w.worktree) {
+        if let Ok(Some((json, cached_branch, _))) = db.get_ci_cache_entry(&w.worktree)
+            && !observed
+                .get(&w.worktree)
+                .and_then(|branch| branch.branch())
+                .is_some_and(|current| {
+                    thegn_core::ci::foreign_cache_note(&cached_branch, current).is_some()
+                })
+        {
             let loc = locations.loc(std::path::Path::new(&w.worktree));
             let current_context = crate::ci_refresh::reader_cache_context(&loc, ci);
             if let Ok(Some(cache)) =
