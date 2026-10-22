@@ -159,14 +159,19 @@ pub enum PrViewAction {
         number: u64,
         expected_head: String,
     },
-    /// Approve (no body).
-    Approve,
+    /// Approve the displayed PR head (no body).
+    Approve { number: u64, expected_head: String },
     /// Re-run failed checks.
     Rerun,
     /// Post a PR-level comment.
     Comment { body: String },
-    /// Submit a review with a state + body.
-    Review { state: ReviewState, body: String },
+    /// Submit a review against the displayed PR head with a state + body.
+    Review {
+        state: ReviewState,
+        body: String,
+        number: u64,
+        expected_head: String,
+    },
     /// Reply to a review thread.
     Reply { thread_id: String, body: String },
     /// Post an inline review comment.
@@ -523,7 +528,12 @@ impl PrView {
         // Global write/action keys (available from any tab where the PR exists).
         match key {
             KeyCode::Char('M') => return PrViewOutcome::ConfirmMerge,
-            KeyCode::Char('A') => return PrViewOutcome::Act(PrViewAction::Approve),
+            KeyCode::Char('A') => {
+                return PrViewOutcome::Act(PrViewAction::Approve {
+                    number: self.number,
+                    expected_head: self.head_sha.clone(),
+                });
+            }
             KeyCode::Char('R') => {
                 self.open_composer(ComposerTarget::Review(ReviewState::RequestChanges));
                 return PrViewOutcome::Pending;
@@ -939,7 +949,12 @@ impl PrView {
         let body = comp.field.as_str().to_string();
         let action = match comp.target {
             ComposerTarget::PrComment => PrViewAction::Comment { body },
-            ComposerTarget::Review(state) => PrViewAction::Review { state, body },
+            ComposerTarget::Review(state) => PrViewAction::Review {
+                state,
+                body,
+                number: self.number,
+                expected_head: self.head_sha.clone(),
+            },
             ComposerTarget::ThreadReply { thread_id, .. } => {
                 PrViewAction::Reply { thread_id, body }
             }
@@ -1719,7 +1734,10 @@ mod tests {
         );
         assert_eq!(
             v.handle_key(&KeyCode::Char('A'), Modifiers::NONE),
-            PrViewOutcome::Act(PrViewAction::Approve)
+            PrViewOutcome::Act(PrViewAction::Approve {
+                number: 42,
+                expected_head: "deadbeef".into(),
+            })
         );
         // 'c' opens a comment composer; typing then Ctrl-D submits.
         v.handle_key(&KeyCode::Char('c'), Modifiers::NONE);
@@ -1733,6 +1751,24 @@ mod tests {
             PrViewOutcome::Act(PrViewAction::Comment { body: "hi".into() })
         );
         assert!(v.composer.is_none());
+    }
+
+    #[test]
+    fn review_composer_carries_number_and_head() {
+        let mut v = sample();
+        v.handle_key(&KeyCode::Char('R'), Modifiers::NONE);
+        for ch in "no".chars() {
+            v.handle_key(&KeyCode::Char(ch), Modifiers::NONE);
+        }
+        assert_eq!(
+            v.handle_key(&KeyCode::Char('d'), Modifiers::CTRL),
+            PrViewOutcome::Act(PrViewAction::Review {
+                state: ReviewState::RequestChanges,
+                body: "no".into(),
+                number: 42,
+                expected_head: "deadbeef".into(),
+            })
+        );
     }
 
     #[test]
