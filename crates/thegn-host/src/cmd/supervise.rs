@@ -33,7 +33,7 @@ use thegn_core::outln;
 use thegn_core::pipeline_approval::{ApprovalState, state_for};
 use thegn_core::pipeline_run::{self, RowLiveness};
 use thegn_core::pipeline_supervise::{self, LaneFacts, SuperviseAction, ValidationRecord};
-use thegn_core::store::{NotificationStore as _, WorktreeAuxStore as _};
+use thegn_core::store::WorktreeAuxStore as _;
 use thegn_core::util::{git_ok, git_out};
 
 #[derive(clap::Subcommand, Clone)]
