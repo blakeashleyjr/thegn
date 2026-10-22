@@ -176,6 +176,11 @@ Dispatch identity fields reject terminal control and Unicode format characters.
 the control API reports identity text as an invalid argument and parent
 refusals as failed preconditions.
 
+Over the control API, `GET /v1/dispatches` returns one newest-first page.
+`limit` defaults to 2048 and accepts 1 to 4096; `before` is the last row id of
+the previous page. The reply includes `truncated` and `next_before`. An invalid
+limit is rejected, and an unknown `before` row returns not found.
+
 `dispatch claim`, `dispatch put` and `session open --stage --issue` require the
 path of an existing local git worktree root; missing paths and worktree
 subdirectories are refused. Issue ids are stored trimmed, with a lowercased

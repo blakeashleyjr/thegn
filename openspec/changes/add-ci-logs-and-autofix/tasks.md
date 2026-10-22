@@ -8,9 +8,13 @@
      URL userinfo, credential-named `k = v`); unit tests per pattern class +
      false-positive guards (benign lines untouched); as built in
      `crates/thegn-core/src/ci_log.rs`
-- [ ] 2. Excerpt windowing — bounded window around
+- [x] 2. Excerpt windowing — bounded window around
      `CiLog::first_failure_line` for prompts and payloads; unit-tested
-     (marker at start/end/absent)
+     (marker at start/end/absent); as built: `ci_log::failure_excerpt` for
+     prompts (`failure_excerpt_marker_at_start_end_and_absent`) and
+     `ci_log::bounded_window` for stored/served logs
+     (`bounded_window_keeps_a_failure_older_than_the_tail`), called from
+     `ci_autofix`, `CiLogEntry::new`, drill, `thegn ci log`, and `ci.logs`
 - [x] 3. `[ci] log_cache_runs` config key (default 10, 0 = off) +
      `[ci.autofix]` table (`mode` off/suggest/auto, `agent`, `attempts`,
      `prompt`) — `config_ci.rs`, validation (unknown agent name, mode enum),
@@ -78,8 +82,8 @@
 - [ ] 19. Smoke: `thegn ci log` cache-first behaviour; e2e only if a frame
       changes (re-record with `just e2e-update`)
 
-Remaining: task 2 excerpt-window behavior and task 19 cache-first CLI smoke
-are not evidenced at this base; task 20 is the pre-PR gate.
+Remaining: task 19 (cache-first `thegn ci log` smoke) and task 20 (the pre-PR
+gate).
 
 ## Final
 

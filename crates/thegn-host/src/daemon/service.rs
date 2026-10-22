@@ -2112,6 +2112,7 @@ impl ControlApi for DaemonService {
                     fetched_at,
                     truncated,
                     redacted,
+                    warnings: Vec::new(),
                 });
             }
 
@@ -2119,25 +2120,18 @@ impl ControlApi for DaemonService {
             let provider_path = path.clone();
             let run_for_provider = run_id_owned.clone();
             let job_for_provider = job_id_owned.clone();
-            let mut entry = tokio::task::spawn_blocking(move || {
+            let (mut entry, warnings) = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
                 let client = thegn_svc::ci::provider_for(&loc, &cfg)
                     .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
-                let detail = client.run_detail(&loc, &run_for_provider).ok();
-                if let Some(detail) = &detail
-                    && detail.discarded_jobs > 0
-                {
-                    tracing::warn!(target: "thegn::ci", discarded_rows = detail.discarded_jobs, "CI detail omitted malformed job rows");
-                }
-                let (job_name, head_sha) = detail
-                    .as_ref()
-                    .and_then(|detail| {
-                        detail.run.jobs
-                            .iter()
-                            .find(|job| job.id == job_for_provider)
-                            .map(|job| (job.name.clone(), detail.run.sha.clone()))
-                    })
-                    .unwrap_or_default();
+                let detail = client
+                    .run_detail(&loc, &run_for_provider)
+                    .map_err(|error| error.to_string());
+                let identity = crate::ci_refresh::log_fill_identity(
+                    &detail,
+                    &run_for_provider,
+                    &job_for_provider,
+                );
                 let raw = client
                     .logs(&loc, &run_for_provider, &job_for_provider)
                     .map_err(|error| anyhow::anyhow!("CI provider: {error}"))?;
@@ -2146,7 +2140,7 @@ impl ControlApi for DaemonService {
                     thegn_core::remote::GitLoc::worktree_cache_key(&provider_path),
                     run_for_provider,
                     job_for_provider,
-                    job_name,
+                    identity.job_name,
                     &raw.text,
                     cfg.log_tail_lines
                         .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
@@ -2155,8 +2149,13 @@ impl ControlApi for DaemonService {
                     thegn_core::util::now(),
                 );
                 entry.truncated |= raw_truncated;
-                entry.head_sha = head_sha;
-                Ok::<_, anyhow::Error>(entry)
+                entry.head_sha = identity.head_sha;
+                let warnings = identity
+                    .warnings
+                    .iter()
+                    .map(|warning| thegn_svc::lsp::sanitize_for_terminal(warning))
+                    .collect();
+                Ok::<_, anyhow::Error>((entry, warnings))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
@@ -2198,6 +2197,7 @@ impl ControlApi for DaemonService {
                 fetched_at,
                 truncated,
                 redacted,
+                warnings,
             })
         })
     }

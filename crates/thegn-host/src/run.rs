@@ -1257,6 +1257,14 @@ pub async fn main(
             }
         }
     );
+    let media_shutdown = crate::media_ctl::shutdown_media_until(cleanup_deadline).await;
+    if !media_shutdown.is_settled() {
+        tracing::warn!(
+            target: "thegn::media",
+            ?media_shutdown,
+            "media tasks did not stop before the shutdown deadline"
+        );
+    }
     let result = if process_settlement == crate::proc_worker::Settlement::Settled {
         result
     } else {
@@ -9836,8 +9844,11 @@ async fn event_loop<T: Terminal>(
                         // the default.
                         let (repo_root, repo, env_name) =
                             crate::lifecycle::pool_context(&db, &cfg, &wt, &loc);
+                        // Hide the display-only chip on a target read error; reconcile_pool
+                        // below halts and warns on that same error before changing the pool.
                         let target =
-                            crate::lifecycle::effective_pool_target(&db, &cfg, &repo, &env_name);
+                            crate::lifecycle::effective_pool_target(&db, &cfg, &repo, &env_name)
+                                .unwrap_or(0);
                         let ready = db
                             .pool_spares_for(&repo, &env_name)
                             .unwrap_or_default()

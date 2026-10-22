@@ -413,6 +413,13 @@
         "truncated": {
           "type": "boolean"
         },
+        "warnings": {
+          "description": "Provider-fill problems with the run detail (unavailable, incomplete job list, unlisted job); empty on cache hits.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "worktree": {
           "type": "string"
         }

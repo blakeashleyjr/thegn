@@ -582,6 +582,9 @@ connection is skipped.
 The helper lives at `/var/tmp/thegn-bridge/<sha256>/thegn`, outside the
 worktree. Its digest is re-checked before thegn starts it through a provider's
 native exec API or for a reverse tunnel.
+A provider launch through its control command, such as a vendor CLI or SSH,
+checks the digest again before running the helper; changed bytes are refused
+with `thegn: resident bridge digest mismatch`.
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
 
@@ -600,6 +603,9 @@ quarantines that record and does not delete it.
 The Fly reaper also quarantines records for another account without revoking or
 destroying them. If it cannot determine the current account, it quarantines
 every record before making provider calls.
+A VPS or Fly `max_instances` cap
+counts sandboxes for the same provider account; records without an account or
+that cannot be read count against every account.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or
@@ -688,6 +694,8 @@ Cleanup is always explicit — thegn never prunes on a schedule.
   worktree is gone, both during gc and the startup sweep; an empty worktree list
   leaves those records alone.
   Safe to run any time.
+  When the startup sweep removes containers, the status
+  line reports `sandbox: removed <n> orphan container(s): <names>`.
 - `thegn sandbox prune` reclaims **thegn-owned (`thegn-` name family) stopped
   containers**, and `thegn.managed` images and volumes. On a terminal it
   lists what it would remove and asks to confirm; `--yes` skips the prompt for
