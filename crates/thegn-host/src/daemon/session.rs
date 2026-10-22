@@ -2982,4 +2982,415 @@ mod tests {
         .await
         .expect("actor tears down after test");
     }
+
+    struct StallSink {
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        fail: bool,
+        stalled: bool,
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for StallSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            use std::sync::atomic::Ordering;
+
+            if self.armed.load(Ordering::Acquire) && !self.stalled {
+                self.stalled = true;
+                self.started
+                    .send(())
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                self.release
+                    .recv()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if self.fail {
+                    return Err(std::io::Error::other("disk full"));
+                }
+            }
+            self.captured
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn install_recorder(
+        actor: &mut SessionActor,
+        writer: thegn_core::asciicast::CastWriter<StallSink>,
+        inflight: &Arc<std::sync::atomic::AtomicUsize>,
+        slots: &Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let rec = crate::daemon::record::start_with_writer_budget(
+            writer,
+            Arc::clone(inflight),
+            crate::daemon::record::GLOBAL_INFLIGHT_BYTES,
+            slots,
+            16,
+        )
+        .expect("test recorder starts");
+        actor.record_generation = rec.generation();
+        actor.record_last_path = Some(rec.path().to_path_buf());
+        actor.recorder = Some(rec);
+    }
+
+    fn stall_writer(
+        fail: bool,
+    ) -> (
+        thegn_core::asciicast::CastWriter<StallSink>,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sink = StallSink {
+            armed: Arc::clone(&armed),
+            started: started_tx,
+            release: release_rx,
+            fail,
+            stalled: false,
+            captured: Arc::clone(&captured),
+        };
+        let mut header = thegn_core::asciicast::Header::new(80, 24);
+        header.timestamp = Some(0);
+        let writer = thegn_core::asciicast::CastWriter::new(sink, &header)
+            .expect("writer emits header before arming");
+        armed.store(true, std::sync::atomic::Ordering::Release);
+        (writer, armed, started_rx, release_tx, captured)
+    }
+
+    async fn wait_for_stall(started_rx: std::sync::mpsc::Receiver<()>) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                started_rx.recv_timeout(std::time::Duration::from_secs(5))
+            }),
+        )
+        .await
+        .expect("writer reaches its first sink write")
+        .expect("blocking wait joins")
+        .expect("sink start signal arrives");
+    }
+
+    async fn await_zero(counter: &std::sync::atomic::AtomicUsize, what: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = counter.load(std::sync::atomic::Ordering::Acquire);
+        while last != 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            last = counter.load(std::sync::atomic::Ordering::Acquire);
+        }
+        assert_eq!(
+            last, 0,
+            "{what} did not return to baseline; last value {last}"
+        );
+    }
+
+    async fn record_request(harness: &Harness, spec: RecordSpec) -> RecordStatus {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .msg_tx
+            .send(SessionMsg::Record {
+                spec,
+                reply: reply_tx,
+            })
+            .await
+            .expect("actor accepts recording request");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("recording reply arrives")
+            .expect("actor sends recording reply")
+            .expect("recording request succeeds")
+    }
+
+    async fn await_session_exit(harness: &Harness) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(harness.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actor exits after test");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_isolation_blocked_sink_does_not_stall_control() {
+        use std::sync::atomic::AtomicUsize;
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(AtomicUsize::new(0));
+        let (writer, _armed, started_rx, release_tx, captured) = stall_writer(false);
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            msg_rx,
+            harness,
+        } = build_actor_cfg(
+            "head -c 65536 /dev/zero | tr -c x x; cat",
+            None,
+            "sh",
+            Config::default(),
+        );
+        install_recorder(&mut actor, writer, &inflight, &slots);
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        wait_for_stall(started_rx).await;
+        assert!(inflight.load(std::sync::atomic::Ordering::Acquire) > 0);
+        assert!(
+            inflight.load(std::sync::atomic::Ordering::Acquire)
+                <= crate::daemon::record::GLOBAL_INFLIGHT_BYTES
+        );
+
+        harness
+            .msg_tx
+            .send(SessionMsg::Resize {
+                rows: 30,
+                cols: 100,
+            })
+            .await
+            .expect("actor accepts resize while writer is blocked");
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        harness
+            .msg_tx
+            .send(SessionMsg::Snapshot { reply: snapshot_tx })
+            .await
+            .expect("actor accepts snapshot while writer is blocked");
+        tokio::time::timeout(std::time::Duration::from_secs(2), snapshot_rx)
+            .await
+            .expect("snapshot progresses with blocked sink")
+            .expect("snapshot reply arrives");
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe(&harness))
+            .await
+            .expect("probe progresses with blocked sink");
+
+        let watch_rx = watch(&harness, "after-block").await;
+        harness
+            .msg_tx
+            .send(SessionMsg::Stdin(b"after-block\n".to_vec()))
+            .await
+            .expect("actor accepts input while writer is blocked");
+        tokio::time::timeout(std::time::Duration::from_secs(2), watch_rx)
+            .await
+            .expect("input reaches output matcher with blocked sink")
+            .expect("output matcher resolves");
+        let active = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            record_request(&harness, RecordSpec::Status),
+        )
+        .await
+        .expect("record status progresses with blocked sink");
+        assert!(
+            active.recording,
+            "record status progresses while sink blocks"
+        );
+
+        let independent = spawn_actor("cat", None);
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe(&independent))
+            .await
+            .expect("independent session probe progresses");
+        let (other_snapshot_tx, other_snapshot_rx) = oneshot::channel();
+        independent
+            .msg_tx
+            .send(SessionMsg::Snapshot {
+                reply: other_snapshot_tx,
+            })
+            .await
+            .expect("independent actor accepts snapshot");
+        tokio::time::timeout(std::time::Duration::from_secs(2), other_snapshot_rx)
+            .await
+            .expect("independent snapshot progresses")
+            .expect("independent snapshot reply arrives");
+
+        release_tx.send(()).expect("release blocked writer");
+        record_request(&harness, RecordSpec::Stop).await;
+        let mut final_status = record_request(&harness, RecordSpec::Status).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (final_status.recording || final_status.stopping)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            final_status = record_request(&harness, RecordSpec::Status).await;
+        }
+        assert!(!final_status.recording && !final_status.stopping);
+        assert!(final_status.truncated.is_none());
+        await_zero(&inflight, "recording inflight bytes").await;
+        await_zero(&slots, "recording worker slots").await;
+
+        let captured = captured.lock().expect("captured cast bytes").clone();
+        let events = String::from_utf8(captured)
+            .expect("cast output is utf-8")
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("cast event json"))
+            .collect::<Vec<_>>();
+        let output = events
+            .iter()
+            .filter(|event| event[1] == "o")
+            .filter_map(|event| event[2].as_str())
+            .collect::<String>();
+        let x_count = output.chars().filter(|ch| *ch == 'x').count();
+        assert!(x_count as u64 + final_status.dropped_bytes >= 65_536);
+        if final_status.dropped_bytes == 0 {
+            assert_eq!(x_count, 65_536, "recording contains every source byte");
+        } else {
+            assert!(events.iter().any(|event| {
+                event[1] == "m"
+                    && event[2]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("thegn: output gap,"))
+            }));
+        }
+
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("recorded actor accepts kill");
+        await_session_exit(&harness).await;
+        independent
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("independent actor accepts kill");
+        await_session_exit(&independent).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_isolation_duplicate_stop_is_deterministic() {
+        use std::sync::atomic::AtomicUsize;
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(AtomicUsize::new(0));
+        let (writer, _armed, started_rx, release_tx, _captured) = stall_writer(false);
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            msg_rx,
+            harness,
+        } = build_actor_cfg("cat", None, "sh", Config::default());
+        install_recorder(&mut actor, writer, &inflight, &slots);
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        wait_for_stall(started_rx).await;
+
+        let first = record_request(&harness, RecordSpec::Stop).await;
+        let second = record_request(&harness, RecordSpec::Stop).await;
+        assert_eq!(first, second);
+        assert!(!first.recording && first.stopping);
+        release_tx.send(()).expect("release blocked writer");
+        let mut final_status = record_request(&harness, RecordSpec::Status).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while final_status.stopping && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            final_status = record_request(&harness, RecordSpec::Status).await;
+        }
+        assert!(!final_status.stopping);
+        assert_eq!(
+            record_request(&harness, RecordSpec::Stop).await,
+            record_request(&harness, RecordSpec::Stop).await
+        );
+        await_zero(&inflight, "recording inflight bytes").await;
+        await_zero(&slots, "recording worker slots").await;
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("actor accepts kill");
+        await_session_exit(&harness).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_isolation_failed_sink_returns_budget_to_baseline() {
+        use std::sync::atomic::AtomicUsize;
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(AtomicUsize::new(0));
+        let (writer, _armed, started_rx, release_tx, _captured) = stall_writer(true);
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            msg_rx,
+            harness,
+        } = build_actor_cfg("printf x; cat", None, "sh", Config::default());
+        install_recorder(&mut actor, writer, &inflight, &slots);
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        wait_for_stall(started_rx).await;
+        release_tx.send(()).expect("release failed sink");
+
+        let mut status = record_request(&harness, RecordSpec::Status).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while status.truncated.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            status = record_request(&harness, RecordSpec::Status).await;
+        }
+        assert!(
+            status
+                .truncated
+                .as_deref()
+                .is_some_and(|reason| reason.contains("recording write failed"))
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe(&harness))
+            .await
+            .expect("session remains responsive after writer failure");
+        await_zero(&inflight, "recording inflight bytes").await;
+        await_zero(&slots, "recording worker slots").await;
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("actor accepts kill");
+        await_session_exit(&harness).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_isolation_kill_with_blocked_sink_tears_down_within_the_finish_deadline() {
+        use std::sync::atomic::AtomicUsize;
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(AtomicUsize::new(0));
+        let (writer, _armed, started_rx, release_tx, _captured) = stall_writer(false);
+        let BuiltActor {
+            mut actor,
+            pane_rx,
+            msg_rx,
+            harness,
+        } = build_actor_cfg("printf x; cat", None, "sh", Config::default());
+        install_recorder(&mut actor, writer, &inflight, &slots);
+        tokio::spawn(actor.run(pane_rx, msg_rx));
+        wait_for_stall(started_rx).await;
+        harness
+            .msg_tx
+            .send(SessionMsg::Kill)
+            .await
+            .expect("actor accepts kill");
+        tokio::time::timeout(
+            crate::daemon::record::FINISH_TIMEOUT + std::time::Duration::from_secs(3),
+            async {
+                loop {
+                    if matches!(harness.feed.recv().await, Ok(frame) if matches!(frame.as_ref(), EventFrame::SessionExit { session, .. } if session == "s1")) {
+                        break;
+                    }
+                }
+            },
+        )
+        .await
+        .expect("actor exits within recorder finish deadline");
+        let tombs = harness.tombs.lock().await;
+        let tomb = tombs.get("s1", now_ms()).expect("session tombstone");
+        assert_eq!(tomb.recording.as_deref(), Some("injected.cast"));
+        drop(tombs);
+        release_tx
+            .send(())
+            .expect("release blocked writer after actor exit");
+        await_zero(&inflight, "recording inflight bytes").await;
+        await_zero(&slots, "recording worker slots").await;
+    }
 }
