@@ -273,7 +273,13 @@ fn record_exists_in(root: &thegn_core::fsperm::PrivateDir, name: &str) -> Result
         .map_err(Into::into)
 }
 
-fn occupied_at(root: &thegn_core::fsperm::PrivateDir, scope: ReserveScope) -> Result<usize> {
+/// Capacity is per provider account. Unknown-account records (legacy or unreadable)
+/// count against every account, and an unstamped reservation counts everything.
+fn occupied_at(
+    root: &thegn_core::fsperm::PrivateDir,
+    scope: ReserveScope,
+    account: &str,
+) -> Result<usize> {
     let entries = root.file_names()?;
     let mut occupied = 0;
     for file_name in entries {
@@ -286,13 +292,18 @@ fn occupied_at(root: &thegn_core::fsperm::PrivateDir, scope: ReserveScope) -> Re
         let stem = Path::new(&file_name)
             .file_stem()
             .and_then(|stem| stem.to_str());
-        let other_provider = match scope {
-            ReserveScope::All => false,
-            ReserveScope::Provider(provider) => stem
-                .and_then(|name| read_in(root, name))
-                .is_some_and(|record| record.provider != provider),
+        let other_record = if matches!(scope, ReserveScope::Provider(_)) || !account.is_empty() {
+            stem.and_then(|name| read_in(root, name))
+                .is_some_and(|record| {
+                    matches!(scope, ReserveScope::Provider(provider) if record.provider != provider)
+                        || (!account.is_empty()
+                            && !record.account.is_empty()
+                            && record.account != account)
+                })
+        } else {
+            false
         };
-        if !other_provider {
+        if !other_record {
             occupied += 1;
         }
     }
@@ -360,7 +371,7 @@ pub fn reserve_at(
             },
         }
     }
-    let occupied = occupied_at(&root, scope).map_err(ReserveError::Store)?;
+    let occupied = occupied_at(&root, scope, &rec.account).map_err(ReserveError::Store)?;
     if occupied >= cap {
         return Err(ReserveError::AtCap { occupied, cap });
     }
@@ -1401,5 +1412,122 @@ mod tests {
                 cap: 2
             })
         ));
+    }
+
+    #[test]
+    fn account_capacity_ignores_records_of_another_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let account_a = account_fingerprint("hetzner", "api.example", "TOKEN_A");
+        let account_b = account_fingerprint("hetzner", "api.example", "TOKEN_B");
+        let mut first = rec("a-one", "creating");
+        first.account = account_a.clone();
+        write_at(dir, &first).unwrap();
+        let mut second = rec("a-two", "creating");
+        second.account = account_a;
+        write_at(dir, &second).unwrap();
+
+        let mut candidate = rec("b-one", "creating");
+        candidate.account = account_b;
+        let result = reserve_at(dir, &candidate, 1, ReserveScope::All);
+        assert!(
+            matches!(&result, Ok(())),
+            "unexpected reservation result: {result:?}"
+        );
+        assert_eq!(read_at(dir, "b-one"), Some(candidate));
+    }
+
+    #[test]
+    fn account_capacity_provider_scope_combines_with_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let account_a = account_fingerprint("hetzner", "api.example", "TOKEN_A");
+        let account_b = account_fingerprint("hetzner", "api.example", "TOKEN_B");
+        let mut existing = rec("a-fly", "creating");
+        existing.provider = "fly".into();
+        existing.account = account_a;
+        write_at(dir, &existing).unwrap();
+
+        let mut candidate = rec("b-fly", "creating");
+        candidate.provider = "fly".into();
+        candidate.account = account_b;
+        let result = reserve_at(dir, &candidate, 1, ReserveScope::Provider("fly"));
+        assert!(
+            matches!(&result, Ok(())),
+            "unexpected reservation result: {result:?}"
+        );
+        assert_eq!(read_at(dir, "b-fly"), Some(candidate));
+    }
+
+    #[test]
+    fn account_capacity_counts_same_account_and_legacy_records() {
+        // positive control
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut stamped = rec("same-account", "creating");
+        stamped.account = account_fingerprint("hetzner", "api.example", "TOKEN_A");
+        write_at(dir, &stamped).unwrap();
+        write_at(dir, &rec("legacy", "creating")).unwrap();
+
+        let mut candidate = rec("blocked", "creating");
+        candidate.account = stamped.account;
+        let result = reserve_at(dir, &candidate, 2, ReserveScope::All);
+        assert!(
+            matches!(
+                &result,
+                Err(ReserveError::AtCap {
+                    occupied: 2,
+                    cap: 2
+                })
+            ),
+            "unexpected reservation result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn account_capacity_counts_unreadable_records_for_every_account() {
+        // positive control
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("bad.json"), b"{not json").unwrap();
+
+        let mut candidate = rec("blocked", "creating");
+        candidate.account = account_fingerprint("hetzner", "api.example", "TOKEN_B");
+        let result = reserve_at(dir, &candidate, 1, ReserveScope::All);
+        assert!(
+            matches!(
+                &result,
+                Err(ReserveError::AtCap {
+                    occupied: 1,
+                    cap: 1
+                })
+            ),
+            "unexpected reservation result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn account_capacity_unstamped_candidate_counts_every_account() {
+        // positive control
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut account_a = rec("account-a", "creating");
+        account_a.account = account_fingerprint("hetzner", "api.example", "TOKEN_A");
+        write_at(dir, &account_a).unwrap();
+        let mut account_b = rec("account-b", "creating");
+        account_b.account = account_fingerprint("hetzner", "api.example", "TOKEN_B");
+        write_at(dir, &account_b).unwrap();
+
+        let result = reserve_at(dir, &rec("unstamped", "creating"), 2, ReserveScope::All);
+        assert!(
+            matches!(
+                &result,
+                Err(ReserveError::AtCap {
+                    occupied: 2,
+                    cap: 2
+                })
+            ),
+            "unexpected reservation result: {result:?}"
+        );
     }
 }
