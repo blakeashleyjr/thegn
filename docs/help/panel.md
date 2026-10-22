@@ -290,6 +290,9 @@ marked.
 Sidebar attention follows the same provider-context rule: a cached CI
 failure from another context does not mark a worktree for attention, while an
 unknown current context keeps the cached failure.
+It also skips runs cached for another branch, or with no recorded branch, in
+the sidebar and **across**; when the current branch is unknown, cached runs
+still count.
 
 ### merge — the local merge queue
 

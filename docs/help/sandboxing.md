@@ -377,6 +377,10 @@ matrix can never disagree with what actually launches. The ceiling cell reflects
 what is _measured_ on this host — a machine without cgroup cpu delegation shows a
 soft ceiling for the host-toolchain backends, not a hard one. Backends thegn's
 verbs were never checked against a real install are flagged `(unverified)`.
+When `systemd-run` and cgroup CPU delegation are available but no systemd user
+manager is reachable, the ceiling uses soft `nice` or no cap if `nice` is
+unavailable. With a CPU cap configured, `thegn doctor` prints a `cpu cap note`;
+`thegn doctor --json` includes the same text as `cpu_scope_note`.
 
 `thegn doctor` also lists sandbox execution routes such as worktree panes,
 queue agents, tests and gates, hooks, language services, and host extensions,
@@ -541,6 +545,9 @@ while it is queued, followed by the result, and raising the target stops at
 eight spares for the workspace's environment.
 If the spare ledger cannot be read, reconciliation warns and makes no pool
 changes rather than treating the pool as empty.
+If the current warm-pool target cannot be read, reconciliation makes no pool
+changes rather than falling back to the configured size. The warm-pool keys
+report `warm pool: cannot read the current target: ...` and save nothing.
 Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
 A repo's `env =` setting is only a hint; if that environment would weaken
@@ -596,6 +603,8 @@ native exec API or for a reverse tunnel.
 A provider launch through its control command, such as a vendor CLI or SSH,
 checks the digest again before running the helper; changed bytes are refused
 with `thegn: resident bridge digest mismatch`.
+When a provider's `exec_command` uses `ssh` with a host, its checked bridge
+launch is passed to the remote shell as one quoted word.
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
 
@@ -617,6 +626,9 @@ every record before making provider calls.
 A VPS or Fly `max_instances` cap
 counts sandboxes for the same provider account; records without an account or
 that cannot be read count against every account.
+Machine0 creates and restores are serialized across thegn processes by an
+owner-only lock in the VPS registry. A create that cannot get the lock within
+the six-minute readiness budget is refused with a busy message.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or
