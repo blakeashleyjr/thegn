@@ -443,7 +443,9 @@ pub(crate) fn pick_palette(pick: MediaPick) -> Result<Vec<crate::palette::Palett
 pub(crate) fn pick_note(pick: &MediaPick) -> Option<String> {
     match pick {
         MediaPick::Playlists(Ok(page)) if page.hidden() > 0 && !page.items.is_empty() => {
-            Some(format!("Media: {} more playlists not shown", page.hidden()))
+            let hidden = page.hidden();
+            let noun = if hidden == 1 { "playlist" } else { "playlists" };
+            Some(format!("Media: {hidden} more {noun} not shown"))
         }
         _ => None,
     }
@@ -937,6 +939,18 @@ mod tests {
         assert_eq!(pick_note(&MediaPick::Playlists(Ok(page))), None);
         assert_eq!(pick_note(&MediaPick::Players(Ok(Vec::new()))), None);
         assert_eq!(pick_note(&MediaPick::Playlists(Err("failed".into()))), None);
+
+        let page = thegn_core::media::PlaylistPage {
+            items: vec![thegn_core::media::Playlist {
+                id: "playlist-id".into(),
+                name: "Favorites".into(),
+            }],
+            total: 2,
+        };
+        assert_eq!(
+            pick_note(&MediaPick::Playlists(Ok(page))).as_deref(),
+            Some("Media: 1 more playlist not shown")
+        );
     }
 
     #[test]
