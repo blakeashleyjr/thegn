@@ -121,6 +121,50 @@ fn consider_candidate_with_forge(
         ));
         return;
     };
+    let item = match db.pr_agent_lease_view(&item.key) {
+        Ok(Some(view))
+            if thegn_core::pr_queue::pr_agent_lease_expired(
+                Some(&view),
+                thegn_core::util::now_ms(),
+            ) =>
+        {
+            match crate::pr_agent_lease::reconcile_expired(db, &item.key, item.number, &view) {
+                Ok(Some(warning)) => {
+                    tracing::warn!(target: "thegn::ci_autofix", "{warning}");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    notify(format!(
+                        "CI autofix for PR #{} held: could not reconcile the expired PR-agent lease ({error}); agent dispatch refused",
+                        item.number
+                    ));
+                    return;
+                }
+            }
+            let reread = db.list_pr_queue().and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| row.key == item.key)
+                    .ok_or_else(|| anyhow::anyhow!("PR queue row disappeared"))
+            });
+            match reread {
+                Ok(row) => row,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "thegn::ci_autofix",
+                        pr = item.number,
+                        %error,
+                        "could not re-read the PR queue row after reconciling an expired agent lease"
+                    );
+                    notify(format!(
+                        "CI autofix for PR #{} held: could not re-read the PR queue row after reconciling an expired agent lease",
+                        item.number
+                    ));
+                    return;
+                }
+            }
+        }
+        _ => item,
+    };
     let row_status = match PrqStatus::parse(&item.status) {
         Some(status)
             if !status.is_settled()
@@ -1362,5 +1406,66 @@ mod tests {
                         && notification.message.contains(".thegn.toml")
                 })
         );
+    }
+
+    #[test]
+    fn expired_agent_running_row_is_reconciled_before_autofix() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        let request = thegn_core::pr_queue::PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: row.agent_attempts,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: &handoff.entry.head_sha,
+            blocker: "ci",
+            detail: "previous CI dispatch",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("dead worker"),
+            ci_candidate: None,
+        };
+        assert!(matches!(
+            handoff.db.admit_pr_agent(&request).unwrap(),
+            thegn_core::pr_queue::PrAgentAdmission::Admitted(_)
+        ));
+        rusqlite::Connection::open(&handoff.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE pr_queue SET agent_claim_lease_until_ms=0 WHERE key=?1",
+                [&row.key],
+            )
+            .unwrap();
+
+        consider(&handoff, false);
+
+        let notifications = handoff.db.get_unread_notifications().unwrap();
+        let row_after = handoff
+            .db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|current| current.key == row.key)
+            .unwrap();
+        let new_lease = handoff.db.pr_agent_lease_view(&row.key).unwrap();
+        assert!(
+            new_lease.is_none_or(|view| view.generation > 1)
+                || row_after.status != PrqStatus::AgentRunning.as_str(),
+            "row={row_after:?}; notifications={notifications:?}"
+        );
+        assert!(
+            notifications.iter().all(|notification| {
+                !notification
+                    .message
+                    .contains("PR queue row is `agent_running`")
+            }),
+            "notifications={notifications:?}"
+        );
+        if row_after.agent_attempts > 1 {
+            assert_eq!(
+                row_after.agent_attempts, 2,
+                "row={row_after:?}; notifications={notifications:?}"
+            );
+        }
     }
 }

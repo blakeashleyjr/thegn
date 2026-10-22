@@ -172,6 +172,9 @@ mod pr_agent_head_tests;
 mod pr_agent_lease_tests;
 
 #[cfg(test)]
+#[path = "db_pr_agent_reap_tests.rs"]
+mod pr_agent_reap_tests;
+#[cfg(test)]
 #[path = "db_pr_lease_fence_tests.rs"]
 mod pr_lease_fence_tests;
 
@@ -1597,6 +1600,20 @@ impl WorktreeAuxStore for Db {
                 util::now_ms(),
                 admitted_head
             ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn reap_expired_pr_agent(&self, key: &str, generation: i64, detail: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE pr_queue SET agent_claim_owner=NULL, agent_claim_lease_until_ms=NULL,
+                    agent_claim_owner_hint=NULL,
+                    status=CASE WHEN status='agent_running' THEN 'watching' ELSE status END,
+                    detail=CASE WHEN status='agent_running' THEN ?3 ELSE detail END,
+                    updated_at=?4
+             WHERE key=?1 AND agent_claim_generation=?2 AND agent_claim_owner IS NOT NULL
+               AND agent_claim_lease_until_ms IS NOT NULL AND agent_claim_lease_until_ms < ?5",
+            params![key, generation, detail, util::now(), util::now_ms()],
         )?;
         Ok(changed == 1)
     }
