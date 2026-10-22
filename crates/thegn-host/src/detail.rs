@@ -2145,12 +2145,15 @@ fn badge_detail(
         BarBadge::Media => {
             let m = model.panel.media.as_ref()?;
             let text = m.badge()?;
-            Some(keyval(
-                "Now playing",
-                vec![("track".into(), text, Tok::Hue(Hue::Green))],
-                50,
-                near,
-            ))
+            let mut rows = vec![("track".into(), text, Tok::Hue(Hue::Green))];
+            if model.media_stale {
+                rows.push((
+                    "state".into(),
+                    "stale (provider not answering)".into(),
+                    Tok::Hue(Hue::Amber),
+                ));
+            }
+            Some(keyval("Now playing", rows, 50, near))
         }
         // The usage chip drills into the same per-account overlay `open-usage`
         // opens — one view, reached two ways, rather than a second summary that
