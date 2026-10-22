@@ -120,6 +120,7 @@ While a PR agent's lease is live, other refresh passes skip that PR entirely: no
 
 If thegn cannot confirm a running PR agent's lease before it expires, it stops
 the agent and reports that the next refresh re-evaluates the row.
+CI autofix reports the same lost-lease condition when it stops its PR agent.
 
 ## Review comment tasks
 
