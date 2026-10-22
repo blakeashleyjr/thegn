@@ -1259,7 +1259,11 @@ pub async fn main(
     );
     let media_shutdown = crate::media_ctl::shutdown_media_until(cleanup_deadline).await;
     if !media_shutdown.is_settled() {
-        tracing::warn!(target: "thegn::media", ?media_shutdown, "media tasks did not stop before the shutdown deadline");
+        tracing::warn!(
+            target: "thegn::media",
+            ?media_shutdown,
+            "media tasks did not stop before the shutdown deadline"
+        );
     }
     let result = if process_settlement == crate::proc_worker::Settlement::Settled {
         result

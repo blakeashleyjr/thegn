@@ -577,19 +577,6 @@ async fn shutdown_media_parts(
     watchers: &crate::media_watch::WatcherRegistry,
     deadline: tokio::time::Instant,
 ) -> MediaShutdown {
-    shutdown_media_parts_with_watchers(tail, in_flight, watchers.shutdown_until(deadline), deadline)
-        .await
-}
-
-async fn shutdown_media_parts_with_watchers<F>(
-    tail: &MediaOpTail,
-    in_flight: &[&Mutex<Option<tokio::task::JoinHandle<()>>>],
-    watcher_shutdown: F,
-    deadline: tokio::time::Instant,
-) -> MediaShutdown
-where
-    F: Future<Output = usize>,
-{
     cancel_op_chain(tail);
     for slot in in_flight {
         let handle = slot
@@ -600,7 +587,7 @@ where
             handle.abort();
         }
     }
-    let unsettled_watchers = watcher_shutdown.await;
+    let unsettled_watchers = watchers.shutdown_until(deadline).await;
     let drain = tail
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -617,14 +604,14 @@ where
 }
 
 pub(crate) async fn shutdown_media_until(deadline: tokio::time::Instant) -> MediaShutdown {
-    shutdown_media_parts_with_watchers(
+    shutdown_media_parts(
         &MEDIA_OP_TAIL,
         &[
             &MEDIA_PICK_IN_FLIGHT,
             &MEDIA_QUEUE_IN_FLIGHT,
             &MEDIA_SOURCES_IN_FLIGHT,
         ],
-        crate::media_watch::shutdown_watchers_until(deadline),
+        &crate::media_watch::WATCHERS,
         deadline,
     )
     .await
