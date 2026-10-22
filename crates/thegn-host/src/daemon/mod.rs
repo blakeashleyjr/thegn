@@ -563,6 +563,8 @@ async fn run(
         .transpose()
         .map_err(anyhow::Error::msg)
         .context("invalid remote control transport")?;
+    // The pane daemon and `thegn serve` are long-lived sweep owners.
+    thegn_core::db::enable_semantic_sweep();
     let db: service::SharedDb = Arc::new(Mutex::new(Db::open()?));
     let state_dir = thegn_core::util::xdg_state_home().join("thegn");
     let scope = scope_key_for(&state_dir);

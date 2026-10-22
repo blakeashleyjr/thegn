@@ -1101,6 +1101,9 @@ fn run_main() -> anyhow::Result<()> {
         );
     }
 
+    // The interactive compositor is long-lived and owns the semantic-index growth bound.
+    thegn_core::db::enable_semantic_sweep();
+
     // Per-profile advisory singleton (H): one interactive window per profile.
     // Advisory only — if the profile is already running we warn for named
     // profiles and continue (per-profile DBs are separate + WAL-safe; a hard

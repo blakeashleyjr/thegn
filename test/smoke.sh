@@ -1682,6 +1682,7 @@ SQL
   DRY_STALE="$TMP/session-move-dry-run-stale"
   init_move_case "$DRY_STALE"
   move_cli "$DRY_STALE" --profile target dispatch list --json >/dev/null 2>&1
+  check "a short CLI run leaves no un-checkpointed target WAL" "[[ ! -s \"$DRY_STALE/thegn/profiles/target/state/thegn/thegn.db-wal\" ]]"
   DRY_STALE_WT="$DRY_STALE/stale-worktree"
   seed_move_rows "$DRY_STALE" "$DRY_STALE_WT" move-dry-stale ""
   DRY_STALE_TARGET_ROOT="$DRY_STALE/thegn/profiles/target"
