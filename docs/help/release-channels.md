@@ -10,7 +10,7 @@ thegn ships as one binary that runs in one of two **channels**. The
 channel decides which subsystems are live — not which code was compiled,
 so nothing is missing, it is simply inert and hidden.
 
-- **stable** — the regular pre-alpha shell. The default.
+- **stable** — the regular alpha shell. The default.
 - **dev** — everything, including the experimental subsystems below.
 
 `thegn doctor` prints the channel you are running in and the state of
