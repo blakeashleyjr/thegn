@@ -710,6 +710,12 @@ pub struct PanelData {
     /// The local merge queue (the fold-actor), from `merge_queue` — feeds the
     /// `MergeQueue` section + statusbar badge. Empty when the queue is unused.
     pub merge_queue: Vec<thegn_core::db::MergeQueueRow>,
+    /// Claim views for listed merge-queue rows (unclaimed rows omitted), read
+    /// during hydration.
+    pub merge_claims: Vec<thegn_core::store::MergeClaimView>,
+    /// Set when a claim read failed, so the panel shows unavailable instead
+    /// of showing rows as unclaimed.
+    pub merge_claim_error: Option<String>,
     /// `PrQueue` section + statusbar badge. Empty when the queue is unused.
     pub pr_queue: Vec<thegn_core::db::PrQueueRow>,
     /// Per-thread tasks derived only from the explicit rows above.
