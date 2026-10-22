@@ -36,14 +36,16 @@ fn retryable_err(e: &reqwest::Error) -> bool {
 /// A dedicated HTTP client for the MCP endpoint that **disables keep-alive
 /// pooling** (`pool_max_idle_per_host(0)`), so every call dials a fresh
 /// connection instead of risking a reused-but-reset socket — the observed
-/// "error sending request" mid-poll. Bounds connection setup like the shared
-/// provider client.
+/// "error sending request" mid-poll. It follows the shared provider control
+/// policy and refuses redirects so the `x-api-key` is never replayed elsewhere.
 fn mcp_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(CONTROL_TIMEOUT)
         .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("machine0 MCP HTTP client policy must be supported")
 }
 
 /// Whether a tool is safe to **retry after an ambiguous transport failure**
@@ -216,8 +218,17 @@ impl Mcp0Client {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    let text = resp.text().await.unwrap_or_default();
                     if !status.is_success() {
+                        let text = match crate::provider::response_text(
+                            resp,
+                            "machine0",
+                            &format!("mcp {name}"),
+                        )
+                        .await
+                        {
+                            Ok(text) => error_body_snippet(&text),
+                            Err(error) => format!("(error body unavailable: {error})"),
+                        };
                         last = format!("machine0 mcp {name}: HTTP {status}: {text}");
                         if retry_ok && transient_status(status) && attempt + 1 < ATTEMPTS {
                             tokio::time::sleep(BACKOFF).await;
@@ -225,6 +236,10 @@ impl Mcp0Client {
                         }
                         return Err(anyhow!(last));
                     }
+                    let text =
+                        crate::provider::response_text(resp, "machine0", &format!("mcp {name}"))
+                            .await
+                            .with_context(|| format!("machine0 mcp {name}: read response"))?;
                     let rpc = parse_rpc_body(&ctype, &text)
                         .with_context(|| format!("machine0 mcp {name}: decode response"))?;
                     if let Some(err) = rpc.error {
@@ -241,8 +256,16 @@ impl Mcp0Client {
                         .with_context(|| format!("machine0 mcp {name}: tool error"));
                 }
                 Err(e) => {
-                    last = format!("machine0 mcp {name}: {e}");
-                    if retry_ok && retryable_err(&e) && attempt + 1 < ATTEMPTS {
+                    let should_retry = retry_ok && retryable_err(&e) && attempt + 1 < ATTEMPTS;
+                    last = format!(
+                        "machine0 mcp {name}: {}",
+                        crate::provider::redacted_transport_error(
+                            "machine0",
+                            &format!("mcp {name}"),
+                            &e
+                        )
+                    );
+                    if should_retry {
                         tokio::time::sleep(BACKOFF).await;
                         continue;
                     }
@@ -251,6 +274,23 @@ impl Mcp0Client {
             }
         }
         Err(anyhow!(last))
+    }
+}
+
+fn error_body_snippet(body: &str) -> String {
+    let limit = crate::http::MAX_ERROR_BODY_BYTES;
+    let mut end = 0;
+    for (index, character) in body.char_indices() {
+        let next_end = index + character.len_utf8();
+        if next_end > limit {
+            break;
+        }
+        end = next_end;
+    }
+    if end < body.len() {
+        format!("{} [truncated]", &body[..end])
+    } else {
+        body.to_string()
     }
 }
 
@@ -370,6 +410,72 @@ fn first_text_content(result: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn fault_server(
+        reply: impl Fn(&str) -> Vec<u8> + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut tool_calls = 0;
+            loop {
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                        .await;
+                let (mut stream, _) = match accepted {
+                    Ok(Ok(accepted)) => accepted,
+                    Ok(Err(_)) | Err(_) => break,
+                };
+                let Some(request) = read_http_request(&mut stream).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request);
+                let response = if request.contains("tools/call") {
+                    tool_calls += 1;
+                    reply(&request)
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                };
+                if stream.write_all(&response).await.is_err() {
+                    break;
+                }
+            }
+            tool_calls
+        });
+        (format!("http://{address}/mcp"), task)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let (header_end, body_end) = loop {
+            if let Some(header_start) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header_end = header_start + 4;
+                let headers = String::from_utf8_lossy(&bytes[..header_start]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })?;
+                let body_end = header_end.checked_add(content_length)?;
+                if bytes.len() >= body_end {
+                    break (header_end, body_end);
+                }
+            }
+            let count = stream.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        };
+        Some(bytes.drain(header_end..body_end).collect())
+    }
+
+    fn torn_success_response() -> Vec<u8> {
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n1234567890".to_vec()
+    }
 
     #[test]
     fn create_verbs_are_not_retried() {
@@ -477,5 +583,106 @@ mod tests {
         // non-JSON / unrelated shapes pass through untouched
         assert_eq!(business_error_message("plain text"), "plain text");
         assert_eq!(business_error_message(r#"{"other":1}"#), r#"{"other":1}"#);
+    }
+
+    #[tokio::test]
+    async fn call_tool_refuses_an_oversized_success_body() {
+        let (endpoint, server) = fault_server(|_| {
+            let body = vec![b'x'; crate::provider::CONTROL_BODY_LIMIT + 1];
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response.extend_from_slice(b"\r\n0\r\n\r\n");
+            response
+        })
+        .await;
+        let error = Mcp0Client::new(&endpoint, "test-api-key")
+            .call_tool("vm_list", json!({}))
+            .await
+            .expect_err("oversized response must be refused");
+        assert!(format!("{error:#}").contains("body limit"));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn call_tool_does_not_follow_a_redirect_with_the_api_key() {
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second.local_addr().unwrap();
+        let second_server = tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), second.accept()).await {
+                Ok(Ok((mut stream, _))) => {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    1
+                }
+                Ok(Err(error)) => panic!("second listener failed: {error}"),
+                Err(_) => 0,
+            }
+        });
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{second_address}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let (endpoint, server) = fault_server(move |_| redirect.clone()).await;
+        let error = Mcp0Client::new(&endpoint, "test-api-key")
+            .call_tool("vm_list", json!({}))
+            .await
+            .expect_err("redirect must be reported as an HTTP error");
+        assert!(format!("{error:#}").contains("307"));
+        assert_eq!(server.await.unwrap(), 1);
+        assert_eq!(second_server.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn call_tool_bounds_the_error_body_in_the_message() {
+        let (endpoint, server) = fault_server(|_| {
+            let body = vec![b'e'; 64 * 1024];
+            let mut response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response
+        })
+        .await;
+        let error = Mcp0Client::new(&endpoint, "test-api-key")
+            .call_tool("vm_list", json!({}))
+            .await
+            .expect_err("HTTP error must be returned");
+        let message = format!("{error:#}");
+        assert!(message.contains("HTTP 400"));
+        assert!(message.len() <= crate::http::MAX_ERROR_BODY_BYTES + 256);
+        assert!(message.contains("[truncated]"));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn call_tool_reports_a_torn_success_body() {
+        let (endpoint, server) = fault_server(|_| torn_success_response()).await;
+        let error = Mcp0Client::new(&endpoint, "test-api-key")
+            .call_tool("vm_list", json!({}))
+            .await
+            .expect_err("torn successful response must be an error");
+        assert!(format!("{error:#}").contains("response body failed"));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn call_tool_sends_a_create_verb_once_after_a_torn_body() {
+        // Positive control: the create retry guard already passes this case on main.
+        let (endpoint, server) = fault_server(|_| torn_success_response()).await;
+        let result = Mcp0Client::new(&endpoint, "test-api-key")
+            .call_tool("vm_create", json!({}))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(server.await.unwrap(), 1);
     }
 }
