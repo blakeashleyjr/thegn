@@ -35,8 +35,6 @@ fn claim_reminder(db: &Db, source_ref: &str, now_ms: i64) -> ReminderClaim {
 /// lifecycle. Delivery is at-most-once: a crash after claiming but before
 /// delivery drops that one reminder rather than risking a duplicate alert.
 pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
-    let source_ref = r.source_ref();
-    let message = message_for(r);
     // Already on the background lane (see
     // `hydrate_calendar::spawn_reminder_check`), so this runs inline — nesting
     // another `spawn_bg` would take a second permit from the eight-permit lane
@@ -48,21 +46,35 @@ pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
             return;
         }
     };
-    let kind = NotificationKind::CalendarReminder.as_str();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    if claim_reminder(&db, &source_ref, now_ms) != ReminderClaim::Won {
-        return;
+    raise_reminder_on(&db, r, now_ms, |db, source_ref, message| {
+        let kind = NotificationKind::CalendarReminder.as_str();
+        if let Some(state) = crate::notify::global() {
+            let _ = crate::notify::record(db, &state, kind, source_ref, message, "");
+            let _ = waker.wake(); // best-effort: waker pulse: a routed reminder must repaint the inbox
+            return;
+        }
+        // best-effort: the inbox is a cache, and a reminder that fails to record
+        // must not take down the compositor.
+        if crate::automation_events::emit(db, kind, source_ref, message, "").is_ok() {
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }
+    });
+}
+
+fn raise_reminder_on(
+    db: &Db,
+    r: &DueReminder,
+    now_ms: i64,
+    deliver: impl FnOnce(&Db, &str, &str),
+) -> ReminderClaim {
+    let source_ref = r.source_ref();
+    let message = message_for(r);
+    let claim = claim_reminder(db, &source_ref, now_ms);
+    if claim == ReminderClaim::Won {
+        deliver(db, &source_ref, &message);
     }
-    if let Some(state) = crate::notify::global() {
-        let _ = crate::notify::record(&db, &state, kind, &source_ref, &message, "");
-        let _ = waker.wake(); // best-effort: waker pulse: a routed reminder must repaint the inbox
-        return;
-    }
-    // best-effort: the inbox is a cache, and a reminder that fails to record
-    // must not take down the compositor.
-    if crate::automation_events::emit(&db, kind, &source_ref, &message, "").is_ok() {
-        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-    }
+    claim
 }
 
 /// `standup in 10m — Room 3`
@@ -96,6 +108,10 @@ fn message_for(r: &DueReminder) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use thegn_core::store::NotificationStore;
 
     fn rem(title: &str, starts_in: i64, location: &str, url: &str) -> DueReminder {
@@ -183,5 +199,222 @@ mod tests {
             claim_reminder(&db, &source_ref, 5_002),
             ReminderClaim::AlreadyClaimed
         );
+    }
+
+    #[test]
+    fn raise_reminder_on_delivers_once_across_threads_and_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reminders.sqlite");
+        drop(Db::open_at(&path).unwrap());
+        let barrier = Arc::new(Barrier::new(4));
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let deliveries = Arc::clone(&deliveries);
+            workers.push(
+                std::thread::Builder::new()
+                    .name("thegn-test-rem".into())
+                    .spawn(move || {
+                        let db = Db::open_at(&path).unwrap();
+                        barrier.wait();
+                        raise_reminder_on(&db, &rem("standup", 10, "", ""), 5_000, |_, _, _| {
+                            deliveries.fetch_add(1, Ordering::SeqCst);
+                        })
+                    })
+                    .unwrap(),
+            );
+        }
+        let claims: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1, "claims: {claims:?}");
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| **claim == ReminderClaim::Won)
+                .count(),
+            1,
+            "claims: {claims:?}"
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| **claim == ReminderClaim::AlreadyClaimed)
+                .count(),
+            3,
+            "claims: {claims:?}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test: waits on its own child test processes"
+    )]
+    fn raise_reminder_on_delivers_once_across_processes() {
+        if let (Some(db_path), Some(out_path)) = (
+            std::env::var_os("TG_REMINDER_RACE_CHILD_DB"),
+            std::env::var_os("TG_REMINDER_RACE_CHILD_OUT"),
+        ) {
+            let db_path = std::path::PathBuf::from(db_path);
+            let db = Db::open_at(&db_path).unwrap();
+            let claim = raise_reminder_on(&db, &rem("standup", 10, "", ""), 5_000, |_, _, _| {});
+            let outcome = match claim {
+                ReminderClaim::Won => "won",
+                ReminderClaim::AlreadyClaimed => "already",
+                ReminderClaim::Failed => "failed",
+            };
+            fs::write(out_path, outcome).unwrap();
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("reminders.sqlite");
+        drop(Db::open_at(&db_path).unwrap());
+        let exe = std::env::current_exe().unwrap();
+        let out_a = temp.path().join("child-a.out");
+        let out_b = temp.path().join("child-b.out");
+        let child_a = Command::new(&exe)
+            .args([
+                "--exact",
+                "handlers::calendar::tests::raise_reminder_on_delivers_once_across_processes",
+                "--nocapture",
+            ])
+            .env("TG_REMINDER_RACE_CHILD_DB", &db_path)
+            .env("TG_REMINDER_RACE_CHILD_OUT", &out_a)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let child_b = match Command::new(exe)
+            .args([
+                "--exact",
+                "handlers::calendar::tests::raise_reminder_on_delivers_once_across_processes",
+                "--nocapture",
+            ])
+            .env("TG_REMINDER_RACE_CHILD_DB", &db_path)
+            .env("TG_REMINDER_RACE_CHILD_OUT", &out_b)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _output_a = child_a.wait_with_output().unwrap();
+                panic!("spawning child B failed: {error}");
+            }
+        };
+        let output_a = child_a.wait_with_output().unwrap();
+        let output_b = child_b.wait_with_output().unwrap();
+        assert!(
+            output_a.status.success(),
+            "child A stdout: {}\nchild A stderr: {}",
+            String::from_utf8_lossy(&output_a.stdout),
+            String::from_utf8_lossy(&output_a.stderr)
+        );
+        assert!(
+            output_b.status.success(),
+            "child B stdout: {}\nchild B stderr: {}",
+            String::from_utf8_lossy(&output_b.stdout),
+            String::from_utf8_lossy(&output_b.stderr)
+        );
+        let mut outcomes = [
+            fs::read_to_string(out_a).unwrap(),
+            fs::read_to_string(out_b).unwrap(),
+        ];
+        outcomes.sort();
+        assert_eq!(outcomes, [String::from("already"), String::from("won")]);
+    }
+
+    #[test]
+    fn raise_reminder_on_survives_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reminders.sqlite");
+        let deliveries = std::cell::Cell::new(0);
+        {
+            let db = Db::open_at(&path).unwrap();
+            assert_eq!(
+                raise_reminder_on(&db, &rem("standup", 10, "", ""), 5_000, |_, _, _| {
+                    deliveries.set(deliveries.get() + 1);
+                }),
+                ReminderClaim::Won
+            );
+        }
+        let db = Db::open_at(&path).unwrap();
+        assert_eq!(
+            raise_reminder_on(&db, &rem("standup", 10, "", ""), 5_001, |_, _, _| {
+                deliveries.set(deliveries.get() + 1);
+            }),
+            ReminderClaim::AlreadyClaimed
+        );
+        assert_eq!(deliveries.get(), 1);
+    }
+
+    #[test]
+    fn raise_reminder_on_ignores_changed_event_text() {
+        let db = Db::open_memory().unwrap();
+        let deliveries = std::cell::Cell::new(0);
+        assert_eq!(
+            raise_reminder_on(&db, &rem("standup", 10, "Room 3", ""), 5_000, |_, _, _| {
+                deliveries.set(deliveries.get() + 1);
+            }),
+            ReminderClaim::Won
+        );
+        assert_eq!(
+            raise_reminder_on(
+                &db,
+                &rem("standup moved", 5, "Room 9", "https://x.test/j"),
+                5_001,
+                |_, _, _| deliveries.set(deliveries.get() + 1),
+            ),
+            ReminderClaim::AlreadyClaimed
+        );
+        assert_eq!(deliveries.get(), 1);
+    }
+
+    #[test]
+    fn raise_reminder_on_fires_each_occurrence_and_each_lead() {
+        let db = Db::open_memory().unwrap();
+        let deliveries = std::cell::Cell::new(0);
+        let base = rem("standup", 10, "", "");
+        let mut next_occurrence = rem("standup", 10, "", "");
+        next_occurrence.occurrence_start_ms += 86_400_000;
+        let mut other_lead = rem("standup", 5, "", "");
+        other_lead.trigger_mins = 5;
+
+        for reminder in [&base, &next_occurrence, &other_lead] {
+            assert_eq!(
+                raise_reminder_on(&db, reminder, 5_000, |_, _, _| {
+                    deliveries.set(deliveries.get() + 1);
+                }),
+                ReminderClaim::Won
+            );
+            assert_eq!(
+                raise_reminder_on(&db, reminder, 5_001, |_, _, _| {
+                    deliveries.set(deliveries.get() + 1);
+                }),
+                ReminderClaim::AlreadyClaimed
+            );
+        }
+        assert_eq!(deliveries.get(), 3);
+    }
+
+    #[test]
+    fn raise_reminder_on_claim_failure_delivers_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reminders.sqlite");
+        drop(Db::open_at(&path).unwrap());
+        let db = Db::open_read_only_at(&path).unwrap().unwrap();
+        let deliveries = std::cell::Cell::new(0);
+        assert_eq!(
+            raise_reminder_on(&db, &rem("standup", 10, "", ""), 5_000, |_, _, _| {
+                deliveries.set(deliveries.get() + 1);
+            }),
+            ReminderClaim::Failed
+        );
+        assert_eq!(deliveries.get(), 0);
     }
 }
