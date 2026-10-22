@@ -49,11 +49,9 @@ reproducible problems that are not listed here.
   loopback bind and refuses non-loopback plaintext unless the explicit unsafe
   override is enabled. Use a same-host TLS terminator or an encrypted tunnel
   for remote access; bearer credentials do not provide confidentiality.
-- **Unix-socket admin trust relies on filesystem ownership and modes.** The
-  daemon does not independently verify peer credentials.
-- **`route_to_host` may hold off-host provider worktrees from automatic
-  draining.** If the host cannot verify the provider source, it holds the row
-  for review rather than folding it. See
+- **`route_to_host` (dev channel) may hold off-host provider worktrees from
+  automatic draining.** If the host cannot verify the provider source, it holds
+  the row for review rather than folding it. See
   [`docs/help/merge-queue.md`](docs/help/merge-queue.md#across-hosts).
 - Remote and provider surfaces remain under the deferred THE-41 audit; do not
   treat RDP, VNC, Telnet, SFTP, serial, public sharing, or multi-user parity as
@@ -63,13 +61,15 @@ reproducible problems that are not listed here.
 
 - **Active-tab persistence can race across rapid switches.** Focus changes are
   written by independent background tasks, so overlapping writes can finish
-  out of order. The in-memory selection is unaffected; a restart may restore a
-  stale active tab.
+  out of order. The in-memory selection is unaffected; after a crash or forced
+  kill, the restored active tab may be one switch stale. A clean quit re-persists
+  the full layout.
 
 ## Security model limits
 
-- The sandbox-to-control regression suite runs on Linux with `bwrap` and
-  working user namespaces. Run `just security-e2e`; it is not part of `just ci`.
+- From a source checkout, `just security-e2e` runs the sandbox-to-control
+  regression suite on Linux with `bwrap` and working user namespaces. It is not
+  part of `just ci` or the default CI gate.
 - `sealed-tunnel` refuses to launch when a VPN is configured because thegn
   cannot yet enforce that the tunnel is the only network route. Docker Desktop
   and WSL/WSL2 sandbox binds are best-effort and unverified.
