@@ -652,6 +652,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_context_keeps_cached_ci_attention() {
+        order_memo().lock().unwrap().clear();
+        let path = "/wt/none";
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", path, "topic", None, None)
+            .unwrap();
+        db.put_ci_cache(path, "topic", &failing_cache("github:github.com/o/a"))
+            .unwrap();
+        let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
+        let cfg = thegn_core::config::CiConfig::default();
+        let ci = CiReader {
+            cfg: &cfg,
+            locations: &locations,
+            branches: &std::collections::HashMap::new(),
+        };
+        let session = session_with(&[("app/c", path)]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+
+        collect_attention_with_ci(&session, &db, &mut status, &ci);
+
+        assert_eq!(
+            status.attention[path].reason,
+            thegn_core::attention::AttentionReason::CiFailed
+        );
+    }
+
+    #[test]
     fn unknown_current_branch_keeps_cached_ci_attention() {
         order_memo().lock().unwrap().clear();
         let path = "/wt/none";
