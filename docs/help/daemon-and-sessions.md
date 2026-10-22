@@ -36,6 +36,10 @@ endpoints share a 5-second check budget; if an endpoint is still unchecked when
 that budget expires, thegn does not start another daemon and names the
 unchecked endpoints, suggesting a retry or `thegn daemon stop`.
 
+After starting a pane daemon, thegn waits up to 3 seconds for it to answer and
+reports an error if it does not. A daemon that cannot acquire its control-socket
+lock gives up after 5 seconds instead of waiting indefinitely.
+
 When the UI exits, in-flight custom git commands, CI refreshes, and CI rerun or
 cancel actions are cancelled. Thegn waits up to two seconds for them before
 exiting; work still running after that is logged. A CI action requested while
