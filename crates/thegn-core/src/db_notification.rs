@@ -780,6 +780,49 @@ impl Db {
             .query_map([raw, canonical], map_dispatch)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// List pipeline worktree spellings without a bound: merge admission must
+    /// never infer that a worktree has no pipeline rows from a bounded window.
+    pub fn pipeline_worktree_paths(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT worktree_path FROM agent_dispatches \
+             WHERE stage IS NOT NULL AND TRIM(stage) <> '' \
+             AND artifact_path IS NOT NULL AND TRIM(artifact_path) <> '' \
+             ORDER BY worktree_path",
+        )?;
+        Ok(stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Pipeline rows under any supplied spelling, newest first.
+    pub fn pipeline_rows_for_worktree_paths(
+        &self,
+        paths: &[&str],
+    ) -> Result<Vec<crate::issue::AgentDispatch>> {
+        let unique_paths = paths
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=unique_paths.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {DISPATCH_COLS} FROM agent_dispatches \
+             WHERE worktree_path IN ({placeholders}) AND stage IS NOT NULL AND TRIM(stage) <> '' \
+             AND artifact_path IS NOT NULL AND TRIM(artifact_path) <> '' ORDER BY id DESC"
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(params_from_iter(unique_paths.iter().copied()), map_dispatch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 impl Db {
