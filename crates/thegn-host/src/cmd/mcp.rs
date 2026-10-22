@@ -5,7 +5,7 @@
 //! declared servers, emits the `mcpServers` settings block the agent consumes,
 //! and installs a server's binary via the shared managed-tool resolver —
 //! grant-checked: acquisition proceeds only when the server's capability grants
-//! cover it.
+//! cover it. npm/cargo installers run under bubblewrap filesystem containment.
 //!
 //! `serve` runs thegn *as* an MCP server over stdio (a Context7-style endpoint):
 //! it exposes the in-app help corpus, the generated keybindings/config-reference
@@ -53,6 +53,11 @@ pub enum Action {
     Install {
         /// The `[mcp_servers.<name>]` to install.
         name: String,
+        /// Run an npm/cargo installer without bubblewrap containment when bwrap
+        /// is unavailable (interactive terminals only; install scripts then run
+        /// with your host files).
+        #[arg(long)]
+        unsafe_host_install: bool,
     },
     /// Run the aggregation hub: one stdio MCP endpoint over every *exposed*
     /// `[mcp_servers.<name>]` upstream (namespaced `<upstream>__<tool>`). An
@@ -203,7 +208,10 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
             outln!("{}", serde_json::to_string_pretty(&block)?);
             Ok(())
         }
-        Action::Install { name } => install(cfg, &name),
+        Action::Install {
+            name,
+            unsafe_host_install,
+        } => install(cfg, &name, unsafe_host_install),
         Action::Serve {
             scopes,
             allow_session_input,
@@ -875,7 +883,23 @@ fn source_label(srv: &thegn_core::mcp::config::McpServerConfig) -> String {
     }
 }
 
-fn install(cfg: &Config, name: &str) -> Result<()> {
+fn host_install_choice(
+    unsafe_flag: bool,
+    interactive: bool,
+) -> Result<crate::managed_tool::HostInstall> {
+    if unsafe_flag && !interactive {
+        bail!(
+            "--unsafe-host-install requires an interactive terminal; connect a terminal and rerun the install"
+        );
+    }
+    Ok(if unsafe_flag {
+        crate::managed_tool::HostInstall::AllowUnsafe
+    } else {
+        crate::managed_tool::HostInstall::Refuse
+    })
+}
+
+fn install(cfg: &Config, name: &str, unsafe_host_install: bool) -> Result<()> {
     let Some(srv) = cfg.mcp_servers.get(name) else {
         bail!("no such MCP server `{name}` in [mcp_servers]");
     };
@@ -894,7 +918,11 @@ fn install(cfg: &Config, name: &str) -> Result<()> {
         );
     }
     let tool = source.to_tool(name, name);
-    crate::managed_tool::install(&tool, false)?;
+    let choice = host_install_choice(
+        unsafe_host_install,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    )?;
+    crate::managed_tool::install_with(&tool, false, choice)?;
     outln!("installed `{name}` → {}", tool.bin_path().display());
     Ok(())
 }
@@ -902,6 +930,7 @@ fn install(cfg: &Config, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::allowed_state_caps;
+    use super::host_install_choice;
     use thegn_core::control::ScopeSet;
 
     const READ_CAPS: &[&str] = &[
@@ -919,6 +948,26 @@ mod tests {
         "automations.list",
         "automations.test",
     ];
+
+    #[test]
+    fn unsafe_host_install_requires_a_terminal() {
+        assert!(matches!(
+            host_install_choice(true, false),
+            Err(error) if error.to_string().contains("--unsafe-host-install")
+        ));
+        assert_eq!(
+            host_install_choice(true, true).unwrap(),
+            crate::managed_tool::HostInstall::AllowUnsafe
+        );
+        assert_eq!(
+            host_install_choice(false, false).unwrap(),
+            crate::managed_tool::HostInstall::Refuse
+        );
+        assert_eq!(
+            host_install_choice(false, true).unwrap(),
+            crate::managed_tool::HostInstall::Refuse
+        );
+    }
 
     fn sorted(mut v: Vec<&'static str>) -> Vec<&'static str> {
         v.sort_unstable();
