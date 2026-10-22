@@ -13,6 +13,7 @@ use thegn_core::testenv::{IsolatedState, state_env_all};
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: u64 = 64 * 1024;
+const BUS_SENTINEL: &str = "unix:path=/nonexistent/tg-sec-bus-sentinel";
 
 struct Captured {
     program: String,
@@ -367,6 +368,10 @@ impl Fixture {
         command
             .envs(state_env_all(self.state.root()))
             .env("XDG_RUNTIME_DIR", self.runtime.path())
+            // Never pass the developer's real bus to a security probe. The
+            // sentinel also reaches fixture daemon and CLI children; a daemon
+            // session-spawn test must account for it because it is unreachable.
+            .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL)
             .env_remove("THEGN_LOG")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
@@ -597,6 +602,32 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
     let host = fixture.host_sessions_with_config("sessions-after-open", &config_home);
     fixture.assert_no_sessions(&host);
     fixture.assert_daemon_alive("after the open probe");
+}
+
+#[test]
+fn security_e2e_hardened_pane_does_not_inherit_the_session_bus_address() {
+    if !required_prerequisites() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let probe = fixture.run_pane(
+        "bus-env",
+        "printenv DBUS_SESSION_BUS_ADDRESS || echo tg-no-bus-address",
+    );
+    let stdout = String::from_utf8_lossy(&probe.stdout);
+    let stderr = String::from_utf8_lossy(&probe.stderr);
+    assert!(
+        probe.status.success(),
+        "session bus environment probe failed: stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("tg-no-bus-address"),
+        "hardened pane retained a session bus address: stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains(BUS_SENTINEL) && !stderr.contains(BUS_SENTINEL),
+        "sentinel bus address appeared in pane output: stdout: {stdout} stderr: {stderr}"
+    );
 }
 
 fn shell_quote(value: &str) -> String {

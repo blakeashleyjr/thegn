@@ -3607,6 +3607,12 @@ fn backend_enter_argv_guarded_with_env(
                 }
                 v.extend(["--setenv".into(), k.clone(), val.clone()]);
             }
+            // The session bus is host command authority. Unset it after every
+            // explicit --setenv so a passthrough cannot restore the address;
+            // the outer CPU-cap systemd scope runs outside this sandbox.
+            if spec.read_only_root {
+                v.extend(["--unsetenv".into(), "DBUS_SESSION_BUS_ADDRESS".into()]);
+            }
             v.extend([
                 "--".into(),
                 "/bin/sh".into(),
@@ -3645,6 +3651,26 @@ fn backend_enter_argv_guarded_with_env(
                 // allowlist, worktree and caches are bound back in below.
                 let protect_home = if sealed_home { "tmpfs" } else { "read-only" };
                 v.extend(["-p".into(), format!("ProtectHome={protect_home}")]);
+                // The session bus grants authority to run commands on the host.
+                // These properties apply to the pane unit; the outer CPU-cap
+                // systemd-run scope still uses the launcher's bus.
+                v.extend([
+                    "-p".into(),
+                    "UnsetEnvironment=DBUS_SESSION_BUS_ADDRESS".into(),
+                ]);
+                if let Some(runtime_dir) = env.runtime_dir.as_deref()
+                    && runtime_dir != std::path::Path::new("/run/user")
+                {
+                    v.extend([
+                        "-p".into(),
+                        format!("InaccessiblePaths=-{}", runtime_dir.join("bus").display()),
+                        "-p".into(),
+                        format!(
+                            "InaccessiblePaths=-{}",
+                            runtime_dir.join("systemd/private").display()
+                        ),
+                    ]);
+                }
                 if let Some(runtime_dir) = env.runtime_dir.as_deref() {
                     let control_dir = if runtime_dir == std::path::Path::new("/run/user") {
                         runtime_dir.to_path_buf()
