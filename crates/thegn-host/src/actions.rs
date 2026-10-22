@@ -614,6 +614,7 @@ pub(crate) fn spawn_ci_detail(
                     entry.truncated |= log.truncated;
                     entry.head_sha = detail.sha.clone();
                     if cfg.log_cache_runs > 0
+                        && thegn_core::ci_log::cacheable_log_entry(&entry)
                         && let Some(db) = db.as_ref()
                     {
                         use thegn_core::store::CacheStore;

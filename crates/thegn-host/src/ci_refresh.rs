@@ -1143,18 +1143,25 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                 run_complete = false;
                 continue;
             }
-            match db.put_ci_log(&entry) {
-                Ok(()) if crate::hydrate_schedule::generation_is_current(generation.as_ref()) => {
-                    ci_autofix::consider(full, db, &entry);
-                    if let Ok(mut memo) = ingest_memo().lock() {
-                        memo.touch(job_key, now, cfg.poll_interval_secs, false);
+            if thegn_core::ci_log::cacheable_log_entry(&entry) {
+                match db.put_ci_log(&entry) {
+                    Ok(())
+                        if crate::hydrate_schedule::generation_is_current(generation.as_ref()) =>
+                    {
+                        ci_autofix::consider(full, db, &entry);
+                        if let Ok(mut memo) = ingest_memo().lock() {
+                            memo.touch(job_key, now, cfg.poll_interval_secs, false);
+                        }
+                    }
+                    Ok(()) => run_complete = false,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::ci", %error, "could not cache fetched CI log");
+                        run_complete = false;
                     }
                 }
-                Ok(()) => run_complete = false,
-                Err(error) => {
-                    tracing::debug!(target: "thegn::ci", %error, "could not cache fetched CI log");
-                    run_complete = false;
-                }
+            } else if let Ok(mut memo) = ingest_memo().lock() {
+                // This fetch cannot become cache evidence, but still bound retries by the memo.
+                memo.touch(job_key, now, cfg.poll_interval_secs, false);
             }
             if !within_byte_budget {
                 break 'runs;
@@ -1521,12 +1528,17 @@ mod tests {
                 .iter()
                 .any(|call| call == &("run".into(), "job-run".into()))
         );
+
+        let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+        let cached = db
+            .get_ci_log(&key, "run", "job-run")
+            .expect("read cached log")
+            .expect("seeded cached log remains");
+        assert_eq!(cached.text, "old");
     }
 
     #[test]
     fn job_finished_after_capture_refetches_log() {
-        use thegn_core::store::CacheStore;
-
         fn seed(temp: &tempfile::TempDir) {
             use thegn_core::store::CacheStore;
 

@@ -283,13 +283,15 @@ pub fn cached_log_is_evidence_for(
     run_sha: &str,
     job_finished_at: Option<&str>,
 ) -> bool {
-    if entry.head_sha.is_empty() || run_sha.is_empty() || entry.head_sha != run_sha {
+    if entry.head_sha.trim().is_empty() || run_sha.trim().is_empty() || entry.head_sha != run_sha {
         return false;
     }
-    match job_finished_at.and_then(crate::ci::epoch_secs) {
-        Some(finished_at) if finished_at > entry.fetched_at => false,
-        _ => true,
+    if let Some(finished_at) = job_finished_at.and_then(crate::ci::epoch_secs)
+        && finished_at > entry.fetched_at
+    {
+        return false;
     }
+    true
 }
 
 /// Unknown-head log entries may be shown from a provider fetch, but never
@@ -537,6 +539,15 @@ mod tests {
             None
         ));
         assert!(!cached_log_is_evidence_for(&entry, "other", None));
+    }
+
+    #[test]
+    fn whitespace_only_head_is_not_cached_log_evidence() {
+        let entry = CiLogEntry {
+            head_sha: "  \t".into(),
+            ..Default::default()
+        };
+        assert!(!cached_log_is_evidence_for(&entry, "  \t", None));
     }
 
     #[test]
