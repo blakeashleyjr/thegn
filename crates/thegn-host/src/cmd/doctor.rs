@@ -2155,7 +2155,7 @@ fn build_parity_lines() {
         }
         None => outln!("  schema        (no database yet) build v{build}"),
     }
-    match Db::open_read_only() {
+    match Db::open_read_only_current() {
         Ok(Some(db)) => match db.space() {
             Ok(space) => {
                 let step = thegn_core::plan_maintenance(&space, 1);

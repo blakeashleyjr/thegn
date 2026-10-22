@@ -1489,9 +1489,67 @@ impl Db {
         }))
     }
 
+    /// Open the current contents of an existing state DB without writing it.
+    ///
+    /// Immutable mode ignores the WAL. A non-empty WAL is therefore read
+    /// through [`Self::open_read_only_wal_at`] when its shared-memory index
+    /// exists; a non-empty WAL without that index is refused. Neither path
+    /// creates a file or writes the main database.
+    pub fn open_read_only_current_at(path: &std::path::Path) -> Result<Option<Db>> {
+        use anyhow::Context as _;
+
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let wal = wal_sidecar(path);
+        match std::fs::metadata(&wal) {
+            Ok(metadata) if metadata.len() > 0 => {
+                let shm = shm_sidecar(path);
+                match std::fs::metadata(&shm) {
+                    Ok(_) => Self::open_read_only_wal_at(path).with_context(|| {
+                        format!(
+                            "open state database read-only with its write-ahead log at {}",
+                            path.display()
+                        )
+                    }),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Err(ReadOnlyOpenError::WalWithoutIndex {
+                            path: path.to_path_buf(),
+                        }
+                        .into())
+                    }
+                    Err(error) => Err(error).with_context(|| {
+                        format!(
+                            "inspect state database shared-memory index at {}",
+                            shm.display()
+                        )
+                    }),
+                }
+            }
+            Ok(_) => Self::open_read_only_at(path)
+                .with_context(|| format!("open state database read-only at {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::open_read_only_at(path)
+                    .with_context(|| format!("open state database read-only at {}", path.display()))
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "inspect state database write-ahead log at {}",
+                    wal.display()
+                )
+            }),
+        }
+    }
+
     /// Read-only counterpart to [`Db::open`] for dry-run command paths.
     pub fn open_read_only() -> Result<Option<Db>> {
         Self::open_read_only_at(&db_path())
+    }
+
+    /// Read the current state DB without creating, migrating, pruning, or
+    /// changing its journal mode.
+    pub fn open_read_only_current() -> Result<Option<Db>> {
+        Self::open_read_only_current_at(&db_path())
     }
 
     /// Open a state DB read-only when it was written by a newer build. The
@@ -2601,6 +2659,39 @@ impl Db {
         tx.commit()?;
         Ok(out)
     }
+}
+
+/// A current-state read could not safely use the immutable view or join the WAL.
+#[derive(Debug)]
+pub enum ReadOnlyOpenError {
+    /// A non-empty WAL exists without the SHM index needed to read it safely.
+    WalWithoutIndex { path: PathBuf },
+}
+
+impl std::fmt::Display for ReadOnlyOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WalWithoutIndex { path } => write!(
+                f,
+                "state database at {} has an un-checkpointed write-ahead log but no shared-memory index; open thegn on it once to recover it",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadOnlyOpenError {}
+
+fn wal_sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+fn shm_sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-shm");
+    PathBuf::from(name)
 }
 
 /// Run the bounded semantic-file prune until it reaches the terminal slice.
