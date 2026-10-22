@@ -5575,7 +5575,15 @@ fn build_across(
 ) -> thegn_core::aggregate::Aggregation {
     let rr = repo_root.map(|r| r.to_string_lossy().into_owned());
     let rows = db.worktrees().unwrap_or_default();
-    let observed = observe_rows_warm(&rows);
+    let observation_rows = rows
+        .iter()
+        .filter(|row| {
+            rr.as_deref()
+                .is_none_or(|repo_root| row.repo_root == repo_root)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let observed = observe_rows_warm(&observation_rows);
     across_from_rows(db, &rows, rr.as_deref(), ci, &observed)
 }
 
