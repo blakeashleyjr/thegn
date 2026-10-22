@@ -1490,7 +1490,9 @@ impl Db {
                     let mut snapshot_rows = std::collections::HashSet::new();
                     let mut after_candidates = Vec::new();
                     for row in &rows {
-                        if row.issue_id != new.issue_id || row.worktree_path != new.worktree_path {
+                        if !crate::pipeline_identity::same_issue(&row.issue_id, new.issue_id)
+                            || row.worktree_path != new.worktree_path
+                        {
                             continue;
                         }
                         let Some(path) = row.chunk_path.as_deref().filter(|p| !p.trim().is_empty())
@@ -2157,21 +2159,26 @@ impl Db {
 }
 
 fn active_bound_leases(conn: &rusqlite::Connection, issue_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT DISTINCT lead_lease FROM agent_dispatches WHERE issue_id=?1 AND lead_lease IS NOT NULL AND status IN (?2,?3,?4,?5,?6)")?;
+    let mut stmt = conn.prepare("SELECT issue_id, lead_lease FROM agent_dispatches WHERE lead_lease IS NOT NULL AND status IN (?1,?2,?3,?4,?5) ORDER BY id")?;
     let bound = stmt
         .query_map(
             rusqlite::params![
-                issue_id,
                 AgentDispatchStatus::Queued.as_str(),
                 AgentDispatchStatus::Spawning.as_str(),
                 AgentDispatchStatus::Running.as_str(),
                 AgentDispatchStatus::WaitingHuman.as_str(),
                 AgentDispatchStatus::PrOpen.as_str()
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(bound)
+    let mut leases = Vec::new();
+    for (row_issue, lease) in bound {
+        if crate::pipeline_identity::same_issue(&row_issue, issue_id) && !leases.contains(&lease) {
+            leases.push(lease);
+        }
+    }
+    Ok(leases)
 }
 
 fn map_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchNote> {
@@ -4991,6 +4998,74 @@ mod tests {
             matches!(other, Err(ref error) if matches!(error.downcast_ref::<LeadLeaseConflict>(), Some(LeadLeaseConflict::Mismatch { .. })))
         );
         assert!(lead_claim(&db, "linear:X-2", "/wt/c", LeadProof::Unbound).is_ok());
+    }
+
+    #[test]
+    fn lead_lease_unbound_claim_refused_for_an_alias_of_a_bound_issue() {
+        let db = Db::open_memory().unwrap();
+        db.acquire_pipeline_lease("repo:linear:X-1", "owner-a", 300)
+            .unwrap()
+            .unwrap();
+        lead_claim(
+            &db,
+            "linear:X-1",
+            "/wt/a",
+            LeadProof::Lease {
+                name: "repo:linear:X-1",
+                owner: "owner-a",
+            },
+        )
+        .unwrap();
+        let alias = lead_claim(&db, "X-1", "/wt/b", LeadProof::Unbound);
+        assert!(matches!(
+            alias,
+            Err(ref error)
+                if matches!(error.downcast_ref::<LeadLeaseConflict>(),
+                    Some(LeadLeaseConflict::Required { .. }))
+        ));
+        assert!(lead_claim(&db, "jira:X-1", "/wt/c", LeadProof::Unbound).is_ok());
+    }
+
+    #[test]
+    fn issue_alias_chunk_sibling_overlap_is_refused() {
+        let db = Db::open_memory().unwrap();
+        let worktree = "/wt/alias-scope";
+        let mut first = crate::issue::NewDispatch::new("linear:X-1", worktree, "claude");
+        first.chunk_path = Some("a.md");
+        let sibling = db
+            .claim_dispatch_admitted(
+                first,
+                10,
+                None,
+                Some(&admitted_chunk("a.md", vec!["a.rs".into()], vec![])),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let mut next = crate::issue::NewDispatch::new("X-1", worktree, "claude");
+        next.chunk_path = Some("b.md");
+        let overlap = crate::pipeline_chunk::PreparedSiblingScope {
+            row: sibling,
+            path: "a.md".into(),
+            scope: Some(Ok(crate::pipeline_chunk::ChunkScope {
+                files: vec!["a.rs".into()],
+                ..Default::default()
+            })),
+        };
+        let result = db
+            .claim_dispatch_admitted(
+                next,
+                10,
+                None,
+                Some(&admitted_chunk("b.md", vec!["a.rs".into()], vec![overlap])),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(DispatchAdmissionDecision::ScopeRefused(_))
+        ));
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
     }
 
     #[test]
