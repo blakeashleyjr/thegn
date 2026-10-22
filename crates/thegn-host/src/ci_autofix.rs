@@ -131,26 +131,32 @@ fn consider_candidate_with_forge(
             match crate::pr_agent_lease::reconcile_expired(db, &item.key, item.number, &view) {
                 Ok(Some(warning)) => {
                     tracing::warn!(target: "thegn::ci_autofix", "{warning}");
-                    let reread = db.list_pr_queue().and_then(|rows| {
-                        rows.into_iter()
-                            .find(|row| row.key == item.key)
-                            .ok_or_else(|| anyhow::anyhow!("PR queue row disappeared"))
-                    });
-                    match reread {
-                        Ok(row) => row,
-                        Err(_) => {
-                            notify(format!(
-                                "CI autofix for PR #{} held: could not re-read the PR queue row after reconciling an expired agent lease",
-                                item.number
-                            ));
-                            return;
-                        }
-                    }
                 }
-                Ok(None) => item,
+                Ok(None) => {}
                 Err(error) => {
                     notify(format!(
                         "CI autofix for PR #{} held: could not reconcile the expired PR-agent lease ({error}); agent dispatch refused",
+                        item.number
+                    ));
+                    return;
+                }
+            }
+            let reread = db.list_pr_queue().and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| row.key == item.key)
+                    .ok_or_else(|| anyhow::anyhow!("PR queue row disappeared"))
+            });
+            match reread {
+                Ok(row) => row,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "thegn::ci_autofix",
+                        pr = item.number,
+                        %error,
+                        "could not re-read the PR queue row after reconciling an expired agent lease"
+                    );
+                    notify(format!(
+                        "CI autofix for PR #{} held: could not re-read the PR queue row after reconciling an expired agent lease",
                         item.number
                     ));
                     return;

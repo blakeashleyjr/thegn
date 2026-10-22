@@ -72,6 +72,8 @@ fn expired_running_claim_becomes_watching_and_the_old_owner_is_fenced() {
     assert_eq!(row.detail.as_deref(), Some("d"));
     assert_eq!(row.agent_attempts, 1);
     assert_eq!(db.pr_agent_lease_view(&key).unwrap(), None);
+    // This release assertion is discriminating: renew and head recording also fail for the
+    // backdated lease alone.
     assert!(
         !db.release_pr_agent(&lease, Some(("blocked_ci", "x")))
             .unwrap()
