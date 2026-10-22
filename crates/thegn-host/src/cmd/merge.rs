@@ -427,7 +427,7 @@ struct ListedRow<'a> {
     claim: Option<ClaimJson>,
 }
 
-#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
 struct ClaimJson {
     phase: String,
     generation: i64,
@@ -1673,6 +1673,15 @@ mod list_claim_tests {
         assert_eq!(
             claim_suffix(Some(&expired), 6_000),
             "  [claim by drain-a expired 5s ago, recoverable]"
+        );
+        let unavailable = ClaimJson {
+            live: false,
+            lease_until_ms: None,
+            ..live.clone()
+        };
+        assert_eq!(
+            claim_suffix(Some(&unavailable), 1_000),
+            "  [claim by drain-a, claimed_no_child, lease unavailable]"
         );
         let unknown = ClaimJson {
             owner_hint: None,
