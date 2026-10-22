@@ -59,10 +59,14 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         "merge queue empty (this project · g = all)"
     };
     if rows.is_empty() {
-        return vec![
-            PanelRow::plain(Line::segs(vec![seg(d(), scope_tail)])),
-            mq_hint_row(),
-        ];
+        let mut out = Vec::new();
+        if let Some(notice) = claim_unavailable_notice(ctx.model.panel.merge_claim_error.as_deref())
+        {
+            out.push(notice);
+        }
+        out.push(PanelRow::plain(Line::segs(vec![seg(d(), scope_tail)])));
+        out.push(mq_hint_row());
+        return out;
     }
     if ctx.full() {
         return full_view(ctx, rows);
@@ -74,6 +78,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             "all projects (g = this project)",
         )])));
     }
+    if let Some(notice) = claim_unavailable_notice(ctx.model.panel.merge_claim_error.as_deref()) {
+        out.push(notice);
+    }
     for (i, r) in rows.iter().enumerate() {
         let mut left = vec![status_glyph(&r.status), seg(d(), format!(" {}", r.branch))];
         // Off-host branches get a host chip so the reader sees which rows live on
@@ -81,10 +88,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         if let Some(host) = host_label(&r.location) {
             left.push(seg(hue(Hue::Blue), format!(" @{host}")));
         }
-        if ctx.model.panel.merge_claim_error.is_some() {
-            left.push(seg(g(), "  "));
-            left.push(seg(hue(Hue::Amber), "claim unavailable"));
-        } else if let Some(view) = claim_for_row(ctx, &r.worktree)
+        if let Some(view) = claim_for_row(ctx, &r.worktree)
             && let Some(chip) = row_claim_chip(Some(view), thegn_core::util::now_ms())
         {
             left.push(seg(g(), "  "));
@@ -223,7 +227,7 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
         ctx.model.panel.merge_claim_error.as_deref(),
         thegn_core::util::now_ms(),
     ) {
-        detail.push(vec![seg(hue(tone), label)]);
+        detail.push(vec![seg(g2(), "claim  "), seg(hue(tone), label)]);
     }
     if r.agent_attempts > 0 {
         detail.push(vec![seg(
@@ -335,6 +339,15 @@ fn claim_detail_line(
         ));
     }
     claim_label(view, now_ms)
+}
+
+fn claim_unavailable_notice(error: Option<&str>) -> Option<PanelRow> {
+    error.map(|_| {
+        PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            "claim state unavailable",
+        )]))
+    })
 }
 
 /// The right-column countdown for a landed row under `on_landed = "expire"`:
@@ -585,6 +598,17 @@ mod claim_tests {
             line.0
         );
         assert!(!line.0.contains("claimed by"), "{}", line.0);
+    }
+
+    #[test]
+    fn unavailable_claim_state_has_one_panel_notice_without_row_chip_text() {
+        let notice = claim_unavailable_notice(Some("boom")).unwrap();
+        let Line::Segs(segments) = notice.line else {
+            panic!("claim notice should be a text row");
+        };
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "claim state unavailable");
+        assert!(claim_unavailable_notice(None).is_none());
     }
 
     #[test]
