@@ -9840,34 +9840,96 @@ async fn event_loop<T: Terminal>(
                 last_pool_reconcile = Some(std::time::Instant::now());
                 let cfg = current_config.clone();
                 let wk = waker.clone();
+                let tx = refresh_tx.clone();
                 task::spawn_blocking(move || {
-                    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
-                    let chip = if loc.is_remote()
-                        && let Ok(db) = thegn_core::db::Db::open()
-                    {
-                        // (repo_root, repo, env) via the worktree's EFFECTIVE
-                        // env — see `lifecycle::pool_context` for why never
-                        // the default.
-                        let (repo_root, repo, env_name) =
-                            crate::lifecycle::pool_context(&db, &cfg, &wt, &loc);
-                        // Hide the display-only chip on a target read error; reconcile_pool
-                        // below halts and warns on that same error before changing the pool.
-                        let target =
-                            crate::lifecycle::effective_pool_target(&db, &cfg, &repo, &env_name)
-                                .unwrap_or(0);
-                        let ready = db
-                            .pool_spares_for(&repo, &env_name)
-                            .unwrap_or_default()
-                            .iter()
-                            .filter(|s| s.state == "ready")
-                            .count();
-                        let wk2 = wk.clone();
-                        crate::lifecycle::reconcile_pool(&cfg, &repo_root, &env_name, move || {
-                            let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                        });
-                        (target > 0).then_some((ready, target))
-                    } else {
-                        None
+                    let loc =
+                        thegn_core::remote::GitLoc::for_worktree_checked(std::path::Path::new(&wt));
+                    let chip = match loc {
+                        Err(_) => {
+                            if let Some(message) = crate::lifecycle::pool_ledger_open_failed(&wt)
+                                && let Err(error) = tx.send(RefreshKind::Toast {
+                                    message,
+                                    priority: thegn_core::notification::Priority::Alert,
+                                })
+                            {
+                                tracing::debug!(
+                                    target: "thegn::lifecycle",
+                                    %error,
+                                    "pool halt toast receiver is gone"
+                                );
+                            }
+                            None
+                        }
+                        Ok(loc) if loc.is_remote() => {
+                            let db = match thegn_core::db::Db::open() {
+                                Ok(db) => db,
+                                Err(_) => {
+                                    if let Some(message) =
+                                        crate::lifecycle::pool_ledger_open_failed(&wt)
+                                        && let Err(error) = tx.send(RefreshKind::Toast {
+                                            message,
+                                            priority: thegn_core::notification::Priority::Alert,
+                                        })
+                                    {
+                                        tracing::debug!(
+                                            target: "thegn::lifecycle",
+                                            %error,
+                                            "pool halt toast receiver is gone"
+                                        );
+                                    }
+                                    *crate::lifecycle::pool_chip()
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = Some((wt, None));
+                                    let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                                    return;
+                                }
+                            };
+                            crate::lifecycle::clear_pool_ledger_open_failure(&wt);
+                            // (repo_root, repo, env) via the worktree's EFFECTIVE
+                            // env — see `lifecycle::pool_context` for why never
+                            // the default.
+                            let (repo_root, repo, env_name) =
+                                crate::lifecycle::pool_context(&db, &cfg, &wt, &loc);
+                            // Hide the display-only chip on a target read error; reconcile_pool
+                            // below halts and warns on that same error before changing the pool.
+                            let target = crate::lifecycle::effective_pool_target(
+                                &db, &cfg, &repo, &env_name,
+                            )
+                            .unwrap_or(0);
+                            let ready = db
+                                .pool_spares_for(&repo, &env_name)
+                                .unwrap_or_default()
+                                .iter()
+                                .filter(|s| s.state == "ready")
+                                .count();
+                            let wk2 = wk.clone();
+                            let outcome = crate::lifecycle::reconcile_pool(
+                                &cfg,
+                                &repo_root,
+                                &env_name,
+                                move || {
+                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                                },
+                            );
+                            if let Some(message) =
+                                crate::lifecycle::halt_toast(&repo, &env_name, &outcome)
+                                && let Err(error) = tx.send(RefreshKind::Toast {
+                                    message,
+                                    priority: thegn_core::notification::Priority::Alert,
+                                })
+                            {
+                                tracing::debug!(
+                                    target: "thegn::lifecycle",
+                                    %error,
+                                    "pool halt toast receiver is gone"
+                                );
+                            }
+                            (target > 0).then_some((ready, target))
+                        }
+                        Ok(_) => {
+                            crate::lifecycle::clear_pool_ledger_open_failure(&wt);
+                            None
+                        }
                     };
                     *crate::lifecycle::pool_chip()
                         .lock()
