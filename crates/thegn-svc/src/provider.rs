@@ -2962,6 +2962,25 @@ impl Provider {
         .await
     }
 
+    /// Create and validate private directories before installing an executable.
+    /// Symlinks, non-directories and directories owned by another user refuse.
+    pub async fn ensure_private_exec_dir(&self, id: &str, root: &str, dir: &str) -> Result<()> {
+        let (code, output) = self
+            .run_exec(id, &private_exec_dir_argv(root, dir), None, &[])
+            .await?;
+        if code != 0 {
+            let mut tail_start = output.len().saturating_sub(200);
+            while !output.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            return Err(anyhow!(
+                "private bridge directory refused (exit {code}): {}",
+                &output[tail_start..]
+            ));
+        }
+        Ok(())
+    }
+
     /// Push a local directory into the sandbox fs (provider `sync` projection).
     pub async fn upload_dir(&self, id: &str, local: &Path, remote: &str) -> Result<()> {
         self.files_ops()
@@ -3056,6 +3075,26 @@ impl Provider {
             _ => Err(anyhow!("provider '{}' has no native exec API", self.name())),
         }
     }
+}
+
+const PRIVATE_DIR_SCRIPT: &str = r#"umask 077
+for d in "$1" "$2"; do
+    if [ -L "$d" ]; then echo 'thegn: private bridge directory is a symlink' >&2; exit 3; fi
+    if [ ! -e "$d" ]; then mkdir -m 0700 -- "$d" || { echo 'thegn: cannot create private bridge directory' >&2; exit 4; }; fi
+    if [ ! -d "$d" ]; then echo 'thegn: private bridge path is not a directory' >&2; exit 5; fi
+    if [ ! -O "$d" ]; then echo 'thegn: private bridge directory has a foreign owner' >&2; exit 6; fi
+    chmod 0700 -- "$d" || { echo 'thegn: cannot secure private bridge directory' >&2; exit 7; }
+done"#;
+
+pub(crate) fn private_exec_dir_argv(root: &str, dir: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        PRIVATE_DIR_SCRIPT.to_string(),
+        "thegn-bridge-dir".to_string(),
+        root.to_string(),
+        dir.to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -3404,6 +3443,68 @@ mod tests {
             Some(&b"prior"[..])
         );
         assert!(!files.contains_stage());
+    }
+
+    #[test]
+    fn private_exec_dir_argv_shape() {
+        let argv = private_exec_dir_argv("/var/tmp/thegn-bridge", "/var/tmp/thegn-bridge/abc");
+        assert_eq!(&argv[..2], &["/bin/sh", "-c"]);
+        assert!(argv[2].contains("[ -L \"$d\" ]"));
+        assert_eq!(
+            &argv[3..],
+            &[
+                "thegn-bridge-dir",
+                "/var/tmp/thegn-bridge",
+                "/var/tmp/thegn-bridge/abc"
+            ]
+        );
+    }
+
+    #[test]
+    fn private_exec_dir_script_refuses_symlinks_and_leaves_0700() {
+        if !Path::new("/bin/sh").exists() {
+            // This host has no local POSIX shell for the script test.
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fresh-root");
+        let leaf = root.join("leaf");
+        let argv = private_exec_dir_argv(root.to_str().unwrap(), leaf.to_str().unwrap());
+        let mut command = std::process::Command::new(&argv[0]);
+        command.args(&argv[1..]);
+        let created = command.output().unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        assert_eq!(thegn_core::fsperm::mode_bits(&root).unwrap(), Some(0o700));
+        assert_eq!(thegn_core::fsperm::mode_bits(&leaf).unwrap(), Some(0o700));
+
+        let target = temp.path().join("link-target");
+        let linked_root = temp.path().join("linked-root");
+        let link = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "ln -s -- \"$1\" \"$2\"",
+                "symlink-root",
+                target.to_str().unwrap(),
+                linked_root.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            link.success(),
+            "local shell could not create the symlink fixture"
+        );
+        let target_leaf = target.join("leaf");
+        let argv =
+            private_exec_dir_argv(linked_root.to_str().unwrap(), target_leaf.to_str().unwrap());
+        let mut command = std::process::Command::new(&argv[0]);
+        command.args(&argv[1..]);
+        let refused = command.output().unwrap();
+        assert_eq!(refused.status.code(), Some(3));
+        assert!(!target.exists());
     }
 
     #[test]
