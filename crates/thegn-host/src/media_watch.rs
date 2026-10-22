@@ -44,13 +44,13 @@ struct WatcherStop {
 }
 
 impl WatcherRegistry {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             live: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    fn spawn_tracked<F>(&self, future: F) -> tokio::task::JoinHandle<()>
+    pub(crate) fn spawn_tracked<F>(&self, future: F) -> tokio::task::JoinHandle<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -76,7 +76,7 @@ impl WatcherRegistry {
         handle
     }
 
-    async fn shutdown_until(&self, deadline: tokio::time::Instant) -> usize {
+    pub(crate) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> usize {
         let stops = {
             let mut live = self
                 .live
@@ -102,6 +102,7 @@ async fn join_stops(stops: Vec<WatcherStop>, deadline: tokio::time::Instant) -> 
     for stop in &stops {
         stop.abort.abort();
     }
+    tokio::task::yield_now().await;
     let mut unsettled = 0;
     for stop in stops {
         if tokio::time::timeout_at(deadline, stop.done).await.is_err() {
@@ -109,10 +110,6 @@ async fn join_stops(stops: Vec<WatcherStop>, deadline: tokio::time::Instant) -> 
         }
     }
     unsettled
-}
-
-pub(crate) async fn shutdown_watchers_until(deadline: tokio::time::Instant) -> usize {
-    WATCHERS.shutdown_until(deadline).await
 }
 
 /// Freshness of the most recent watcher delivery shown by the Media panel.
