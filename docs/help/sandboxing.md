@@ -374,8 +374,8 @@ admission; `admitted-no-handle` means admission passes without carrying the
 handle, and `partial` means only some spawns carry it. `own-gate` means a
 separate floor or sealed gate; `host-capped` means host execution under the
 shared resource ceiling; and `host-trust` means host execution on user trust.
-`thegn doctor --json` includes the table as
-`sandbox.admission_routes`, with `id`, `route`, `status`, and `path` fields.
+`thegn doctor --json` includes the table as `sandbox.admission_routes`, with
+`id`, `route`, `status`, and `path` fields.
 
 The honest **isolation class**, weakest to strongest:
 
@@ -578,8 +578,8 @@ The bridge helper is uploaded to a staged file and checked by SHA-256 before
 it is moved into place. If the install cannot be verified, the bridge
 connection is skipped.
 The helper lives at `/var/tmp/thegn-bridge/<sha256>/thegn`, outside the
-worktree, and its digest is checked again before thegn runs it in the remote
-environment.
+worktree. Its digest is re-checked before thegn starts it through a provider's
+native exec API or for a reverse tunnel.
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
 
@@ -591,11 +591,10 @@ shows that floor.
 A thegn-derived VPS or Fly sandbox name is bound to the worktree that created
 it. Another worktree resolving to the same name is refused before a provider
 call.
-With a token environment-variable reference configured, VPS and Fly ledger
-records carry a credential-free fingerprint of the provider kind, API
-authority, and variable name, never the token itself. A name recorded under
-another account is refused; the VPS reaper quarantines that record and does
-not delete it.
+VPS and Fly ledger records carry a credential-free fingerprint of the provider
+kind, API authority, and configured (or default) token variable name, never the
+token itself. A name recorded under another account is refused; the VPS reaper
+quarantines that record and does not delete it.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or

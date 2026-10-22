@@ -238,9 +238,11 @@ redacted cached job-log tail. It reads the cache first and uses the daemon's
 blocking provider lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
-A cached job log is reused only when its head matches the run's current head
-and the job has not finished again since the log was fetched; a log with an
-unknown head is printed but not cached.
+`ci logs` reuses a cached log only when it has a recorded head commit; a log
+with an unknown head is printed but not cached. The CI panel's failed-job log
+tails and background log ingestion apply a stricter check: they reuse a cached
+tail only for the run's current head and only if the job has not finished again
+since the tail was fetched.
 
 When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
@@ -287,8 +289,9 @@ read-scope MCP tool (`semantic.map`) on `thegn mcp serve`.
 
 `thegn mcp install <name>` installs a declared `[mcp_servers.<name>]` source.
 npm and cargo installers run inside bubblewrap with a read-only host root, the
-host home and temporary directories hidden, and only the staging and install
-directories writable; network access remains available. If bubblewrap with
+host home hidden (with toolchain directories under it kept readable) and
+temporary directories hidden, and only the staging and install directories
+writable; network access remains available. If bubblewrap with
 user namespaces is unusable, or on a non-Linux platform, installation is
 refused unless `--unsafe-host-install` is given at an interactive terminal;
 that runs the installer uncontained and prints a warning.
