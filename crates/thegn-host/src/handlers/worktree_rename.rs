@@ -13,8 +13,110 @@
 //! by a stale index would corrupt an unrelated worktree's name + path.
 
 use crate::session::Session;
+use std::path::{Path, PathBuf};
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SweepNote {
+    Info(String),
+    Warn(String),
+}
+
+pub(crate) fn sweep_rename_journals(
+    roots: &[PathBuf],
+    pending: impl Fn(&Path) -> Result<bool, String>,
+    reconcile: impl Fn(&Path) -> Result<Option<thegn_core::worktree::RenameRecovery>, String>,
+) -> Vec<SweepNote> {
+    let mut notes = Vec::new();
+    for root in roots {
+        let shown_root = crate::merge_sweep::safe_display(&root.display().to_string());
+        match pending(root) {
+            Ok(false) => {}
+            Err(error) => notes.push(SweepNote::Warn(format!(
+                "rename journal check failed for {shown_root}: {}",
+                crate::merge_sweep::safe_display(&error)
+            ))),
+            Ok(true) => match reconcile(root) {
+                Ok(Some(thegn_core::worktree::RenameRecovery::RolledBack)) => {
+                    notes.push(SweepNote::Info(format!(
+                        "rolled back an interrupted worktree rename in {shown_root}"
+                    )));
+                }
+                Ok(Some(
+                    thegn_core::worktree::RenameRecovery::Completed
+                    | thegn_core::worktree::RenameRecovery::NotStarted,
+                )) => notes.push(SweepNote::Info(format!(
+                    "cleared a finished rename journal in {shown_root}"
+                ))),
+                Ok(None) => {}
+                Err(error) => notes.push(SweepNote::Warn(format!(
+                    "interrupted worktree rename in {shown_root}: {}",
+                    crate::merge_sweep::safe_display(&error)
+                ))),
+            },
+        }
+    }
+    notes
+}
+
+pub(crate) fn spawn_launch_sweep(
+    refresh_tx: tokio_mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
+) {
+    tokio::task::spawn_blocking(move || {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = match thegn_core::db::Db::open() {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::debug!(target: "thegn::worktree", %error, "rename journal sweep skipped: state DB unavailable");
+                return;
+            }
+        };
+        let workspaces = match db.workspaces() {
+            Ok(workspaces) => workspaces,
+            Err(error) => {
+                tracing::debug!(target: "thegn::worktree", %error, "rename journal sweep skipped: state DB unavailable");
+                return;
+            }
+        };
+        let roots: Vec<PathBuf> = workspaces
+            .into_iter()
+            .filter(|workspace| workspace.kind == "repo")
+            .map(|workspace| PathBuf::from(workspace.repo_path))
+            .collect();
+        let notes = sweep_rename_journals(
+            &roots,
+            thegn_core::worktree::rename_intent_pending,
+            thegn_core::worktree::reconcile_rename_intent,
+        );
+        if notes.is_empty() {
+            return;
+        }
+        let priority = if notes.iter().any(|note| matches!(note, SweepNote::Warn(_))) {
+            thegn_core::notification::Priority::Alert
+        } else {
+            thegn_core::notification::Priority::Info
+        };
+        let message = notes
+            .into_iter()
+            .map(|note| match note {
+                SweepNote::Info(text) | SweepNote::Warn(text) => text,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(error) =
+            refresh_tx.send(crate::hydrate::RefreshKind::Toast { message, priority })
+        {
+            tracing::debug!(target: "thegn::worktree", %error, "rename journal sweep toast receiver is gone");
+            return;
+        }
+        if let Err(error) = waker.wake() {
+            tracing::debug!(target: "thegn::worktree", %error, "rename journal sweep toast wake failed");
+        }
+    });
+}
 
 pub(crate) struct RegistryRename {
     pub(crate) old_path: String,
@@ -151,9 +253,161 @@ fn apply_with(
 mod tests {
     use super::*;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+    use std::cell::RefCell;
 
     fn group(name: &str, path: &str) -> WorktreeGroup {
         WorktreeGroup::new(name, GroupKind::Branch, path)
+    }
+
+    #[test]
+    fn launch_sweep_reconciles_only_roots_with_a_journal() {
+        let roots = [
+            PathBuf::from("/repo/a"),
+            PathBuf::from("/repo/b"),
+            PathBuf::from("/repo/c"),
+        ];
+        let reconciled = RefCell::new(Vec::new());
+        let notes = sweep_rename_journals(
+            &roots,
+            |root| Ok(root.file_name().is_some_and(|name| name == "b")),
+            |root| {
+                reconciled.borrow_mut().push(root.to_path_buf());
+                Ok(Some(thegn_core::worktree::RenameRecovery::RolledBack))
+            },
+        );
+        assert_eq!(*reconciled.borrow(), vec![PathBuf::from("/repo/b")]);
+        assert_eq!(
+            notes,
+            vec![SweepNote::Info(
+                "rolled back an interrupted worktree rename in /repo/b".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn launch_sweep_keeps_going_after_an_ambiguous_journal() {
+        let roots = [PathBuf::from("/repo/b"), PathBuf::from("/repo/c")];
+        let notes = sweep_rename_journals(
+            &roots,
+            |_| Ok(true),
+            |root| {
+                if root.file_name().is_some_and(|name| name == "b") {
+                    Err("ambiguous state; journal kept at /x".into())
+                } else {
+                    Ok(Some(thegn_core::worktree::RenameRecovery::Completed))
+                }
+            },
+        );
+        assert!(matches!(
+            notes.as_slice(),
+            [SweepNote::Warn(warning), SweepNote::Info(info)]
+                if warning.contains("journal kept") && info.contains("/repo/c")
+        ));
+
+        let pending_error = sweep_rename_journals(
+            &[PathBuf::from("/repo/unreadable")],
+            |_| Err("permission denied".into()),
+            |_| Ok(None),
+        );
+        assert!(matches!(
+            pending_error.as_slice(),
+            [SweepNote::Warn(text)] if text.contains("check failed")
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "real git fixture exercises journal rollback"
+    )]
+    fn launch_sweep_rolls_back_a_real_split_rename() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            thegn_core::util::git_cmd(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        assert!(run(&["init", "-q", "-b", "main"]).success());
+        assert!(run(&["config", "user.email", "t@t.t"]).success());
+        assert!(run(&["config", "user.name", "t"]).success());
+        assert!(
+            run(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init"
+            ])
+            .success()
+        );
+
+        let wt_old = dir.path().join("wt-old");
+        assert!(
+            run(&[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "old",
+                wt_old.to_str().unwrap(),
+                "main"
+            ])
+            .success()
+        );
+        let repo = std::fs::canonicalize(repo).unwrap();
+        let wt_old = std::fs::canonicalize(wt_old).unwrap();
+        let wt_new = dir.path().join("wt-new");
+        let journal = repo.join(".git/thegn-rename-intent.json");
+        std::fs::write(
+            journal.as_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "old_branch": "old",
+                "new_branch": "new",
+                "old_path": wt_old.to_string_lossy(),
+                "new_path": wt_new.to_string_lossy(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            thegn_core::util::git_cmd(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["branch", "-m", "old", "new"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let notes = sweep_rename_journals(
+            std::slice::from_ref(&repo),
+            thegn_core::worktree::rename_intent_pending,
+            thegn_core::worktree::reconcile_rename_intent,
+        );
+        assert!(matches!(&notes[..], [SweepNote::Info(text)] if text.contains("rolled back")));
+        assert!(
+            thegn_core::util::git_cmd(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/old"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !thegn_core::util::git_cmd(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/new"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!journal.exists());
     }
 
     #[test]
