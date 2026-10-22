@@ -65,15 +65,15 @@
     },
     {
       "change": "add-ci-logs-and-autofix",
-      "lifecycle": "proposed",
-      "disposition": "strategic-unstarted",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
       "owners": [
         {
           "issue": "THE-114",
           "project": "Agent & Workflow Platform"
         }
       ],
-      "summary": "CI-log caching and guarded autofix are unstarted deferred product work."
+      "summary": "Redacted CI-log caching, failure windows and guarded autofix are delivered; the cache-first CLI smoke and pre-PR gate remain."
     },
     {
       "change": "add-crash-reporting-and-traceability",
