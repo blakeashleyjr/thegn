@@ -366,10 +366,11 @@ fn serve(
 fn explain_key(key: &str, path: PathBuf) -> String {
     use thegn_core::config::ProcessEnv;
     use thegn_core::config_resolve;
-    let origin = match config_resolve::explain(&ProcessEnv, &[], Some(path), key) {
+    let mut origin = match config_resolve::explain(&ProcessEnv, &[], Some(path), key) {
         Ok(origin) => origin,
         Err(error) => return format!("{key}: unadmitted configuration: {error}\n"),
     };
+    redact_explain_origin(&mut origin);
     let mut s = format!(
         "{} = {}\n  set by: {}\n",
         origin.key,
@@ -380,6 +381,36 @@ fn explain_key(key: &str, path: PathBuf) -> String {
         s.push_str(&format!("    {}: {val}\n", layer.as_str()));
     }
     s
+}
+
+fn redact_explain_origin(origin: &mut thegn_core::config_resolve::KeyOrigin) {
+    let key = origin.key.clone();
+    origin.value = redact_explain_value(&key, origin.value.take());
+    for (_, value) in &mut origin.trace {
+        *value = redact_explain_value(&key, value.take());
+    }
+}
+
+fn redact_explain_value(key: &str, value: serde_json::Value) -> serde_json::Value {
+    let segments: Vec<&str> = key.split('.').collect();
+    let leaf = segments.last().copied().unwrap_or(key);
+    let sensitive_key = segments
+        .iter()
+        .find(|segment| thegn_core::redact::is_sensitive(segment));
+    let wrapper_key = sensitive_key.copied().unwrap_or(leaf);
+    let mut wrapped = serde_json::json!({ wrapper_key: value });
+    if sensitive_key.is_some() {
+        thegn_core::redact::redact_json(&mut wrapped);
+    } else {
+        thegn_core::redact::redact_json_at(
+            &segments[..segments.len().saturating_sub(1)],
+            &mut wrapped,
+        );
+    }
+    wrapped
+        .get_mut(wrapper_key)
+        .map(serde_json::Value::take)
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// The one scope→caps mapping: a state capability is allowed iff the
@@ -930,6 +961,7 @@ fn install(cfg: &Config, name: &str, unsafe_host_install: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::allowed_state_caps;
+    use super::explain_key;
     use super::host_install_choice;
     use thegn_core::control::ScopeSet;
 
@@ -1051,5 +1083,44 @@ mod tests {
             sorted(allowed_state_caps(ScopeSet::parse("write,git,exec"), true)),
             sorted(thegn_core::mcp::state::MCP_STATE_CAPS.to_vec()),
         );
+    }
+
+    #[test]
+    fn mcp_explain_config_redacts_effective_values_and_every_trace_layer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[calendar.accounts]]
+name = "work"
+provider = "ics_url"
+url = "https://cal.example.test/feed.ics?sig=mcp-url-sentinel-1a2"
+username = "mcp-user-sentinel-3b4"
+command = ["khal-thegn", "--auth", "mcp-argv-sentinel-5c6"]
+env = { KHAL_AUTH = "mcp-env-sentinel-7d8" }
+
+[issues.linear]
+api_key = "mcp-token-sentinel-9e0"
+"#,
+        )
+        .expect("write config");
+
+        let calendar = explain_key("calendar.accounts.0", path.clone());
+        let token = explain_key("issues.linear.api_key", path);
+        let output = format!("{calendar}{token}");
+        for sentinel in [
+            "mcp-url-sentinel-1a2",
+            "mcp-user-sentinel-3b4",
+            "mcp-argv-sentinel-5c6",
+            "mcp-env-sentinel-7d8",
+            "mcp-token-sentinel-9e0",
+        ] {
+            assert!(!output.contains(sentinel), "leaked {sentinel}: {output}");
+        }
+        assert!(calendar.contains("work"), "{calendar}");
+        assert!(calendar.contains("khal-thegn"), "{calendar}");
+        assert!(calendar.contains("KHAL_AUTH"), "{calendar}");
+        assert!(token.contains(thegn_core::redact::PLACEHOLDER), "{token}");
     }
 }
