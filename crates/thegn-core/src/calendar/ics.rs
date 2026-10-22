@@ -63,6 +63,10 @@ pub enum IcsDiagnostic {
     NestedEvent,
     EventWithoutStart,
     InvalidEvent,
+    /// An event the shared admission validator refused; value-free: the defect category only.
+    /// At the diagnostic cap this is dropped without adding overflow because the paired
+    /// `InvalidEvent` is counted and represents the rejected event in the report total.
+    RejectedEvent(super::validate::EventDefect),
     DuplicateProperty(&'static str),
     Truncated,
     MissingEnvelope,
@@ -90,7 +94,8 @@ impl IcsReport {
         &self.diagnostics
     }
 
-    /// Number of diagnostics omitted after the cap was reached.
+    /// Number of diagnostics omitted after the cap was reached. Capped `RejectedEvent`
+    /// records are excluded because their paired `InvalidEvent` is counted instead.
     pub fn overflow(&self) -> usize {
         self.overflow
     }
@@ -117,7 +122,8 @@ impl IcsReport {
         }
         if self.diagnostics.len() < MAX_ICS_DIAGNOSTICS {
             self.diagnostics.push(diagnostic);
-        } else {
+        } else if !matches!(diagnostic, IcsDiagnostic::RejectedEvent(_)) {
+            // Every validator rejection is paired with an InvalidEvent by the caller.
             self.overflow = self.overflow.saturating_add(1);
         }
     }
@@ -1593,7 +1599,8 @@ impl Builder {
             report.record(IcsDiagnostic::InvalidRecurrenceValue(error));
             return None;
         }
-        if validate_event(&e).is_err() {
+        if let Err(defect) = validate_event(&e) {
+            report.record(IcsDiagnostic::RejectedEvent(defect));
             return None;
         }
         Some(e)
