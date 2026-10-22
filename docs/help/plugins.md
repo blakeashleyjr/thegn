@@ -79,7 +79,11 @@ admitted with.
   timeout, the run times out. Output still unread at the reader deadline is
   discarded; messages already read are kept. Each run accepts at most 20,000
   lines, 1 MiB per line, 8 MiB of retained stdout, and keeps up to 8 KiB of
-  stderr.
+  stderr. At most four one-shot runs, scheduled or started from the palette,
+  run at once across all plugins. A scheduled run waits for its next interval
+  if that limit is reached or its previous run is still going; a palette action
+  reports `... is already running` or `... not started: too many plugin runs in
+flight (4 max)` in the status line.
 - `mode = "resident"`: one long-lived process for the session; thegn sends
   `activate`, then `render` per cadence, and `deactivate` on shutdown.
 
