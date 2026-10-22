@@ -30,9 +30,10 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    binary whose ELF interpreter is under `/nix/store`, because that binary
    depends on this host's Nix store; pass `host_only=1` to allow it with a loud
    warning while still validating the archive. A Nix-shell build does not prove
-   portability to ordinary Linux distributions. No local rehearsal covers the
-   musl and darwin legs, the deb/rpm assets, or provenance attestations; those
-   can be rehearsed only from a draft release produced by CI.
+   portability to ordinary Linux distributions. On Linux, no local rehearsal
+   covers the musl or darwin legs (a Mac rehearses only the darwin archive);
+   the deb/rpm assets and provenance attestations can be rehearsed only from a
+   CI draft release.
 
    The package renderer consumes the generated checksum; no release version or
    digest is pasted into a formula or package manifest.

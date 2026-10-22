@@ -123,6 +123,10 @@ class HostOnlyFindingTests(ElfFixture, unittest.TestCase):
         self.assertEqual(1, result)
         self.assertIn("release-rehearsal:", stderr.getvalue())
         self.assertNotIn("WARNING (host-only rehearsal)", stderr.getvalue())
+        self.assertIn(
+            "rerun with 'just release-verify <tag> host_only=1' to rehearse the archive anyway",
+            stderr.getvalue(),
+        )
 
     def test_check_binary_warns_and_exits_0_with_host_only(self) -> None:
         path = self.make_elf(b"/nix/store/abc-glibc/lib/ld-linux-x86-64.so.2\0")
