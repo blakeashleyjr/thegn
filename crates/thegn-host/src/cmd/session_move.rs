@@ -719,68 +719,16 @@ fn profile_db_path(paths: &ProfilePaths, default_state_home: &Path) -> PathBuf {
     }
 }
 
-/// Opens a profile database without writing it, while accounting for committed
-/// changes that a short CLI may leave in its WAL. SQLite's immutable mode
-/// ignores WAL frames, so a non-empty WAL is read through the read-only WAL
-/// opener when its shared-memory index is present. Neither read-only opener
-/// creates files, and the WAL-aware connection does not checkpoint the main
-/// database.
+/// Opens a profile database without writing it, accounting for committed
+/// changes that a short CLI may leave in its WAL. The core opener selects the
+/// immutable or WAL-aware view and refuses an unindexed WAL.
 fn dry_run_open_at(path: &Path, role: &str) -> Result<Option<Db>> {
-    let wal = wal_sidecar(path);
-    match std::fs::metadata(&wal) {
-        Ok(metadata) if metadata.len() > 0 => {
-            let shm = shm_sidecar(path);
-            match std::fs::metadata(&shm) {
-                Ok(_) => Db::open_read_only_wal_at(path).with_context(|| {
-                    format!(
-                        "open {role} profile database read-only (with its write-ahead log) at {}",
-                        path.display()
-                    )
-                }),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
-                    "{role} profile database at {} has an un-checkpointed write-ahead log but no shared-memory index; open thegn for that profile once, or run the move without --dry-run",
-                    path.display()
-                ),
-                Err(error) => Err(error).with_context(|| {
-                    format!(
-                        "inspect {role} profile database shared-memory index at {}",
-                        shm.display()
-                    )
-                }),
-            }
-        }
-        Ok(_) => Db::open_read_only_at(path).with_context(|| {
-            format!(
-                "open {role} profile database read-only at {}",
-                path.display()
-            )
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Db::open_read_only_at(path)
-            .with_context(|| {
-                format!(
-                    "open {role} profile database read-only at {}",
-                    path.display()
-                )
-            }),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "inspect {role} profile database write-ahead log at {}",
-                wal.display()
-            )
-        }),
-    }
-}
-
-fn wal_sidecar(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push("-wal");
-    PathBuf::from(name)
-}
-
-fn shm_sidecar(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push("-shm");
-    PathBuf::from(name)
+    Db::open_read_only_current_at(path).with_context(|| {
+        format!(
+            "open {role} profile database read-only at {} (or run the move without --dry-run)",
+            path.display()
+        )
+    })
 }
 
 fn now_ms() -> i64 {
@@ -798,6 +746,18 @@ mod tests {
         MigrationCleanupResult, MigrationDispatch, MigrationGroup, MigrationImportResult,
         MigrationNote, MigrationPlan, MigrationTab, MigrationTarget, make_bundle,
     };
+
+    fn wal_sidecar(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push("-wal");
+        PathBuf::from(name)
+    }
+
+    fn shm_sidecar(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push("-shm");
+        PathBuf::from(name)
+    }
 
     #[derive(Clone, Default)]
     struct FakeControl {
