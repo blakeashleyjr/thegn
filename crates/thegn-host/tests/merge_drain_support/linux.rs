@@ -22,6 +22,8 @@ const GATE: &str = "if [ -f red-gate-marker ]; then printf 'private-red-gate\\n'
 // The credential-free queue-agent hold (THE-419): no sandbox, and autonomous agents never fall back to the host.
 const HOLD: &str = "no sandbox could be established for the queued agent in ";
 
+type StartedCommand = (Vec<String>, BTreeMap<String, Option<String>>);
+
 fn lexical_tool(name: &str) -> PathBuf {
     let found = PathBuf::from(
         thegn_core::util::which_path(name)
@@ -62,7 +64,7 @@ struct Fixture {
     config: PathBuf,
     serial: usize,
     binary_hash: String,
-    started: BTreeMap<usize, (Vec<String>, BTreeMap<String, Option<String>>)>,
+    started: BTreeMap<usize, StartedCommand>,
 }
 struct FixtureOpts {
     gate: String,
