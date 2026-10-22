@@ -298,6 +298,85 @@ fn running_sidecar_with_the_same_plan_is_reused() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sidecar_record_round_trips_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    use thegn_core::testenv::IsolatedState;
+
+    let _state = IsolatedState::new();
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let script = dir.path().join("fake.sh");
+    std::fs::write(
+        &script,
+        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; fi\n",
+    )
+    .unwrap();
+    let runtime = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
+
+    let recorded = record_sidecar(&runtime, "c-tgvpn").unwrap();
+    assert_eq!(recorded_sidecar("c-tgvpn").unwrap(), recorded);
+    let path = std::env::var("XDG_STATE_HOME").unwrap();
+    let path = std::path::PathBuf::from(path).join("thegn/vpn-runtime");
+    assert_eq!(thegn_core::fsperm::mode_bits(&path).unwrap(), Some(0o700));
+    assert_eq!(
+        thegn_core::fsperm::mode_bits(&path.join("c-tgvpn.json")).unwrap(),
+        Some(0o600)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sidecar_record_refuses_a_non_hex_container_id() {
+    use thegn_core::testenv::IsolatedState;
+
+    let _state = IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake.sh");
+    std::fs::write(&script, "printf '%s\\n' deadbeef\n").unwrap();
+    let runtime = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
+
+    assert!(record_sidecar(&runtime, "c-tgvpn").is_err());
+    let root = std::path::PathBuf::from(std::env::var("XDG_STATE_HOME").unwrap())
+        .join("thegn/vpn-runtime/c-tgvpn.json");
+    assert!(!root.exists());
+}
+
+#[test]
+fn sidecar_record_missing_is_a_typed_refusal() {
+    let _state = thegn_core::testenv::IsolatedState::new();
+
+    let result = recorded_sidecar("c-tgvpn");
+    assert!(matches!(result, Err(ref error) if error.to_string().contains("no recorded runtime")));
+}
+
+#[cfg(unix)]
+#[test]
+fn sidecar_record_down_removes_only_on_matching_runtime() {
+    use thegn_core::testenv::IsolatedState;
+
+    let _state = IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake.sh");
+    std::fs::write(
+        &script,
+        "if [ \"$1\" = inspect ]; then printf '%s\\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; fi\n",
+    )
+    .unwrap();
+    let runtime_a = OciRuntime::new(vec!["sh".into(), script.display().to_string()]);
+    let runtime_b = OciRuntime::new(vec!["other-runtime".into()]);
+    record_sidecar(&runtime_a, "c-tgvpn").unwrap();
+    let provider = for_provider(&spec(ts_cfg()));
+
+    provider.down(&runtime_b, "c-tgvpn").unwrap();
+    assert!(recorded_sidecar("c-tgvpn").is_ok());
+    provider.down(&runtime_a, "c-tgvpn").unwrap();
+    assert!(recorded_sidecar("c-tgvpn").is_err());
+}
+
 #[test]
 fn wireguard_plan_mounts_conf_and_adds_tun() {
     let mut c = VpnConfig {
