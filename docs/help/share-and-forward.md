@@ -22,7 +22,8 @@ reason and can simply be retried. If a tailscale share's teardown cannot be
 confirmed, it stays in the list as failed with the reason and keeps its saved
 entry; stopping it again retries the teardown. If thegn cannot stop a bore,
 frp or iroh client, that share also stays in the list as failed with the
-reason and keeps its saved entry (`state=failed` in `thegn share list`). A
+reason and keeps its saved entry (shown as `failed` in `thegn share list`;
+`"state": "failed"` with `--json`). A
 restart on that port is refused until stopping it again succeeds. At the
 panel's full width the list gains a detail column with the untruncated URL (or
 iroh consumer command), provider, and reach.

@@ -1008,7 +1008,7 @@ mod tests {
                 &startup_shared.shutdown,
             )
         });
-        instance.kill().expect("already reaped child is stopped");
+        instance.kill().expect("no stop handle installed yet");
         let result = starter.join().expect("startup thread");
         assert!(result.is_err_and(|error| {
             error
