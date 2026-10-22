@@ -524,7 +524,9 @@ fn drain_with_responder(
             PluginMsg::Event { .. }
             | PluginMsg::Loaded(_)
             | PluginMsg::Refused(_)
-            | PluginMsg::Respawned { .. } => 1,
+            | PluginMsg::Respawned { .. }
+            | PluginMsg::RespawnWorkerStartFailed { .. }
+            | PluginMsg::RetryRespawn { .. } => 1,
         });
         match msg {
             PluginMsg::Loaded(list) => {
@@ -536,7 +538,7 @@ fn drain_with_responder(
                         entry.plugin.spec.mode == PluginMode::Resident && entry.writer.is_none();
                     state.plugins.insert(id.clone(), entry);
                     if failed_resident_start {
-                        damage.merge(handle_exit(state, model, host, &id, None));
+                        damage.merge(handle_exit(state, model, host, &id, None, false));
                     }
                 }
                 sync_provider_registry(state);
@@ -568,7 +570,7 @@ fn drain_with_responder(
                     tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
                 }
                 SessionEvent::Exit { code } => {
-                    damage.merge(handle_exit(state, model, host, &plugin, code));
+                    damage.merge(handle_exit(state, model, host, &plugin, code, false));
                 }
             },
             PluginMsg::OneShot { plugin, run } => match run {
@@ -613,7 +615,15 @@ fn drain_with_responder(
                     }
                     // The respawn itself failed: treat like another crash so
                     // the backoff keeps climbing toward the cap.
-                    None => damage.merge(handle_exit(state, model, host, &plugin, None)),
+                    None => damage.merge(handle_exit(state, model, host, &plugin, None, false)),
+                }
+            }
+            PluginMsg::RespawnWorkerStartFailed { plugin } => {
+                damage.merge(handle_exit(state, model, host, &plugin, None, true));
+            }
+            PluginMsg::RetryRespawn { plugin } => {
+                if let Some(host) = host {
+                    host.respawn(plugin, std::time::Duration::ZERO);
                 }
             }
         }
@@ -653,6 +663,7 @@ fn handle_exit(
     host: Option<&PluginsHost>,
     plugin: &str,
     code: Option<i32>,
+    worker_start_failed: bool,
 ) -> PluginDamage {
     let Some(entry) = state.plugins.get_mut(plugin) else {
         return PluginDamage::None;
@@ -674,7 +685,11 @@ fn handle_exit(
                 "plugin exited; restarting"
             );
             if let Some(host) = host {
-                host.respawn(entry.plugin.clone(), delay);
+                if worker_start_failed {
+                    host.retry_respawn_after_worker_start_failure(entry.plugin.clone(), delay);
+                } else {
+                    host.respawn(entry.plugin.clone(), delay);
+                }
             }
         }
         None => {
