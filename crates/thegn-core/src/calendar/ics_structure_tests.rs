@@ -764,6 +764,8 @@ fn rejected_events_keep_the_dtend_duration_count() {
             .count(),
         1
     );
+    // The InvalidEvent assertion above is the positive control: DTEND plus DURATION
+    // is rejected before the shared validator runs.
     assert!(
         !report
             .diagnostics()
@@ -771,6 +773,27 @@ fn rejected_events_keep_the_dtend_duration_count() {
             .any(|diagnostic| matches!(diagnostic, IcsDiagnostic::RejectedEvent(_)))
     );
     assert!(events.is_empty());
+}
+
+#[test]
+fn rejected_events_at_capacity_do_not_double_count_overflow() {
+    let events = (0..20)
+        .map(|i| {
+            format!(
+                "BEGIN:VEVENT\nUID:m{i}\nDTSTART;VALUE=DATE:20261012\nDTEND:20261012T100000Z\nEND:VEVENT"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input = format!("BEGIN:VCALENDAR\n{events}\nEND:VCALENDAR");
+    let (_, report) = parse_report(&input);
+    let invalid_events = report
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| **diagnostic == IcsDiagnostic::InvalidEvent)
+        .count();
+
+    assert_eq!(report.overflow() + invalid_events, 20);
 }
 
 #[test]
