@@ -69,6 +69,9 @@ verdict MUST be preserved. The finisher's rendered prompt MUST bind its own
 row id and row-derived artifact (with the source artifact only as parent/recovery
 context), so the path the worker is told to commit is the path its roster row
 publishes and the completion gate verifies.
+Recovery evidence given to a finisher MUST be carried as bounded,
+provenance-tagged data that cannot terminate its container, and prior terminal
+output MUST NOT be replayed into the finisher prompt.
 
 #### Scenario: Parallel chunks are not duplicates
 
@@ -129,6 +132,14 @@ publishes and the completion gate verifies.
 - **THEN** the rendered stage task and finisher instruction name the new row's
   exact id and row-derived artifact, while the older path appears only as
   source/parent recovery context
+
+#### Scenario: Recovery evidence is data, not instructions
+
+- **WHEN** a finisher is composed from a source whose git status, diff stat or
+  artifact path contains instruction-shaped text or delimiter text
+- **THEN** those values appear only inside the untrusted recovery block with
+  their provenance, the block cannot be closed early, and no prior terminal
+  output appears in the prompt
 
 #### Scenario: A restarted monitor cannot refill an occupied stage
 
