@@ -86,14 +86,15 @@ fn check_installed_provenance(
             ));
         }
     };
-    let mode = match thegn_core::fsperm::mode_bits(&record_path) {
-        Ok(mode) => mode,
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
         Err(error) => {
             return ProvenanceCheck::Mismatch(format!(
                 "inspect install record permissions: {error}"
             ));
         }
     };
+    let mode = thegn_core::fsperm::mode_bits_from_metadata(&metadata);
     if !record_mode_ok(mode) {
         return ProvenanceCheck::Mismatch("install record is readable by other users".to_owned());
     }
@@ -121,10 +122,7 @@ fn check_installed_provenance(
         ("source", serde_json::json!(source)),
         ("package", serde_json::json!(package)),
         ("version", serde_json::json!(tool.version.as_str())),
-        (
-            "binary",
-            serde_json::json!(bin_rel.to_string_lossy().to_string()),
-        ),
+        ("binary", serde_json::json!(bin_rel.to_string_lossy())),
     ];
     for (field, expected) in expected_fields {
         let found = record
@@ -150,7 +148,7 @@ fn check_installed_provenance(
         .get("binary_sha256")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    if expected_target != serde_json::json!(staged.target_rel.to_string_lossy().to_string())
+    if expected_target != serde_json::json!(staged.target_rel.to_string_lossy())
         || expected_sha256 != serde_json::json!(staged.sha256.as_str())
     {
         return ProvenanceCheck::Mismatch(
