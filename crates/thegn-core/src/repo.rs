@@ -306,7 +306,8 @@ pub struct DiscoveryReport {
 }
 
 /// Bounded, cancellable discovery. `emit` receives batches no larger than the
-/// budget and returns false when its consumer has gone away.
+/// budget and returns false when its consumer has gone away. Repositories are
+/// deduplicated by filesystem identity within one scan (first spelling wins).
 pub fn discover_repos_bounded(
     cfg: &Config,
     budget: DiscoveryBudget,
@@ -324,6 +325,7 @@ pub fn discover_repos_bounded(
     let mut report = DiscoveryReport::default();
     let mut batch = Vec::with_capacity(budget.batch_size.min(256));
     let mut roots = std::collections::HashSet::new();
+    let mut seen_repos: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw_root in &cfg.repo_roots {
         if cancel.load(Ordering::Relaxed) {
             report.cancelled = true;
@@ -384,6 +386,12 @@ pub fn discover_repos_bounded(
                 && entry.file_name() == ".git"
                 && let Some(parent) = entry.path().parent()
             {
+                let key = util::file_identity(parent)
+                    .unwrap_or_else(|| format!("path:{}", parent.to_string_lossy()));
+                if !seen_repos.insert(key) {
+                    walker.skip_current_dir();
+                    continue;
+                }
                 let path = parent.to_string_lossy().into_owned();
                 let len = path.len();
                 if len > budget.max_single_path_bytes
@@ -793,5 +801,102 @@ mod tests {
             repo_slug_guess(root),
             repo_slug_with_checked(&db, root).unwrap()
         );
+    }
+
+    #[test]
+    fn discovery_emits_a_repo_reached_through_a_symlinked_root_once() {
+        #[cfg(unix)]
+        {
+            let base = tempfile::tempdir().unwrap();
+            let repo = base.path().join("a/sub/r");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            let link = base.path().join("link");
+            std::os::unix::fs::symlink(base.path().join("a/sub"), &link).unwrap();
+            let cfg = Config {
+                repo_roots: vec![
+                    base.path().join("a").to_string_lossy().into_owned(),
+                    link.to_string_lossy().into_owned(),
+                ],
+                repo_scan_depth: 4,
+                ..Config::default()
+            };
+            let mut found = Vec::new();
+            let report = discover_repos_bounded(
+                &cfg,
+                DiscoveryBudget::default(),
+                &AtomicBool::new(false),
+                |batch| {
+                    found.extend(batch);
+                    true
+                },
+            );
+
+            assert_eq!(found, vec![repo.to_string_lossy().into_owned()]);
+            assert_eq!(report.repositories, 1);
+        }
+    }
+
+    #[test]
+    fn discovery_counts_a_repo_under_nested_roots_once() {
+        let base = tempfile::tempdir().unwrap();
+        let a = base.path().join("a");
+        let sub = a.join("sub");
+        let repo = sub.join("r");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let cfg = Config {
+            repo_roots: vec![
+                a.to_string_lossy().into_owned(),
+                sub.to_string_lossy().into_owned(),
+            ],
+            repo_scan_depth: 4,
+            ..Config::default()
+        };
+        let mut found = Vec::new();
+        let report = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget::default(),
+            &AtomicBool::new(false),
+            |batch| {
+                found.extend(batch);
+                true
+            },
+        );
+
+        assert_eq!(found, vec![repo.to_string_lossy().into_owned()]);
+        assert_eq!(report.repositories, 1);
+    }
+
+    #[test]
+    fn discovery_keeps_distinct_repos_with_one_basename() {
+        // Positive control: equal basenames with different filesystem identities stay distinct.
+        let base = tempfile::tempdir().unwrap();
+        let first = base.path().join("x/r");
+        let second = base.path().join("y/r");
+        std::fs::create_dir_all(first.join(".git")).unwrap();
+        std::fs::create_dir_all(second.join(".git")).unwrap();
+        let cfg = Config {
+            repo_roots: vec![base.path().to_string_lossy().into_owned()],
+            repo_scan_depth: 4,
+            ..Config::default()
+        };
+        let mut found = Vec::new();
+        let report = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget::default(),
+            &AtomicBool::new(false),
+            |batch| {
+                found.extend(batch);
+                true
+            },
+        );
+        found.sort();
+
+        let mut expected = vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(report.repositories, 2);
     }
 }
