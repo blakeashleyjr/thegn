@@ -1081,7 +1081,7 @@ fn defer_reap_with(
 fn defer_reap(job: ReapJob) {
     defer_reap_with(job, &PENDING_REAPS, |task| {
         std::thread::Builder::new()
-            .name("forge-credential-reaper".into())
+            .name("thegn-forgereap".into())
             .spawn(task)
             .map(drop)
     });

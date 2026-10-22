@@ -84,7 +84,7 @@ pub(crate) fn spawn(
     gate: std::sync::Arc<HealGate>,
 ) {
     let spawned = std::thread::Builder::new()
-        .name("startup-heal".into())
+        .name("thegn-heal".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let (healed, _roots) = run(&cwd, &group_paths, start);

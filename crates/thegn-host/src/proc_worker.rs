@@ -347,7 +347,7 @@ impl ProcessWorker {
             }),
             |task| {
                 std::thread::Builder::new()
-                    .name("thegn-procs-audit".into())
+                    .name("thegn-procaudit".into())
                     .spawn(task)
             },
         )
