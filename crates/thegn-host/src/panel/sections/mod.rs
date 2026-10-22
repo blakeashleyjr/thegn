@@ -808,13 +808,19 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                     crate::panel::gitui::DocLoad::Ready => vec![seg(g2(), "clear")],
                     crate::panel::gitui::DocLoad::Failed(_) => vec![seg(g2(), "failed")],
                 }
-            } else if linked > 0 {
-                vec![
-                    seg(hue(Hue::Amber), format!("◈{linked} ")),
-                    seg(g(), format!("{open}/{n}")),
-                ]
             } else {
-                vec![seg(g(), format!("{open} open"))]
+                let mut summary = if linked > 0 {
+                    vec![
+                        seg(hue(Hue::Amber), format!("◈{linked} ")),
+                        seg(g(), format!("{open}/{n}")),
+                    ]
+                } else {
+                    vec![seg(g(), format!("{open} open"))]
+                };
+                if !model.panel.tracker_partial.is_empty() {
+                    summary.push(seg(hue(Hue::Amber), " partial".to_string()));
+                }
+                summary
             }
         }
         Section::Notifications => {
