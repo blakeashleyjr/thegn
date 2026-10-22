@@ -109,10 +109,34 @@ fn observe_attention_edges(rows: &[thegn_core::osc_attention::SessionAttention])
 /// Compute `status.attention` / `attention_ranks` / `workspace_attention` for
 /// every registered + live worktree. All inputs are cheap DB/snapshot reads;
 /// the branching lives in `thegn_core::attention::score`.
+pub(crate) struct CiReader<'a> {
+    pub cfg: &'a thegn_core::config::CiConfig,
+    pub locations: &'a thegn_core::remote::WorktreeLocations,
+}
+
+pub(crate) fn collect_attention_with_ci(
+    session: &crate::session::Session,
+    db: &thegn_core::db::Db,
+    status: &mut crate::sidebar::SidebarStatus,
+    ci: &CiReader<'_>,
+) {
+    collect_attention_inner(session, db, status, Some(ci));
+}
+
+#[cfg(test)]
 pub(crate) fn collect_attention(
     session: &crate::session::Session,
     db: &thegn_core::db::Db,
     status: &mut crate::sidebar::SidebarStatus,
+) {
+    collect_attention_inner(session, db, status, None);
+}
+
+fn collect_attention_inner(
+    session: &crate::session::Session,
+    db: &thegn_core::db::Db,
+    status: &mut crate::sidebar::SidebarStatus,
+    ci: Option<&CiReader<'_>>,
 ) {
     // Worktree universe: registered rows, overlaid with live session groups
     // (which may be unpersisted). `(is_home, position)` is the fresh-sort
@@ -328,8 +352,22 @@ pub(crate) fn collect_attention(
         // Latest cached CI run (newest first in the cache), last-known-good.
         let (mut ci_failing, mut ci_running) = (false, false);
         let (mut ci_episode, mut ci_since) = (0u64, None);
-        if let Ok(Some((json, _))) = db.get_ci_cache(path)
-            && let Some(cache) = thegn_core::ci::decode_run_cache(&json)
+        let cache = if let Ok(Some((json, _))) = db.get_ci_cache(path) {
+            match ci {
+                Some(ci) => {
+                    let loc = ci.locations.loc(std::path::Path::new(path));
+                    let current = crate::ci_refresh::reader_cache_context(&loc, ci.cfg);
+                    match crate::ci_refresh::cached_runs_for_reader(&json, current.as_deref()) {
+                        Ok(cache) => cache,
+                        Err(_) => None,
+                    }
+                }
+                None => thegn_core::ci::decode_run_cache(&json),
+            }
+        } else {
+            None
+        };
+        if let Some(cache) = cache
             && let Some(latest) = cache
                 .runs
                 .iter()
@@ -503,6 +541,121 @@ mod tests {
             body: "pick a branch".into(),
             since,
         }
+    }
+
+    fn failing_cache(context: &str) -> String {
+        serde_json::to_string(&thegn_core::ci::CiRunCache {
+            runs: vec![thegn_core::ci::CiRun {
+                id: "101".into(),
+                state: thegn_core::ci::CiState::Fail,
+                started_at: Some("2026-06-25T10:00:00Z".into()),
+                ..Default::default()
+            }],
+            context: context.into(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture: initialize an isolated Git repository"
+    )]
+    fn add_github_origin(repo: &std::path::Path) {
+        let init = thegn_core::util::git_cmd(repo)
+            .args(["init", "-q", "-b", "topic"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let remote = thegn_core::util::git_cmd(repo)
+            .args(["remote", "add", "origin", "https://github.com/o/b.git"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(remote.success());
+    }
+
+    #[test]
+    fn foreign_context_ci_failure_raises_no_attention() {
+        order_memo().lock().unwrap().clear();
+        let repo = tempfile::tempdir().unwrap();
+        add_github_origin(repo.path());
+        let path = repo.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", path, "topic", None, None)
+            .unwrap();
+        db.put_ci_cache(path, "topic", &failing_cache("github:github.com/o/a"))
+            .unwrap();
+        let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
+        let cfg = thegn_core::config::CiConfig::default();
+        let ci = CiReader {
+            cfg: &cfg,
+            locations: &locations,
+        };
+        let session = session_with(&[("app/c", path)]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+
+        collect_attention_with_ci(&session, &db, &mut status, &ci);
+
+        assert_ne!(
+            status.attention[path].reason,
+            thegn_core::attention::AttentionReason::CiFailed
+        );
+    }
+
+    #[test]
+    fn matching_context_ci_failure_still_raises_attention() {
+        order_memo().lock().unwrap().clear();
+        let repo = tempfile::tempdir().unwrap();
+        add_github_origin(repo.path());
+        let path = repo.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", path, "topic", None, None)
+            .unwrap();
+        db.put_ci_cache(path, "topic", &failing_cache("github:github.com/o/b"))
+            .unwrap();
+        let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
+        let cfg = thegn_core::config::CiConfig::default();
+        let ci = CiReader {
+            cfg: &cfg,
+            locations: &locations,
+        };
+        let session = session_with(&[("app/c", path)]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+
+        collect_attention_with_ci(&session, &db, &mut status, &ci);
+
+        assert_eq!(
+            status.attention[path].reason,
+            thegn_core::attention::AttentionReason::CiFailed
+        );
+    }
+
+    #[test]
+    fn unknown_context_keeps_cached_ci_attention() {
+        order_memo().lock().unwrap().clear();
+        let path = "/wt/none";
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/c", "/repo", path, "topic", None, None)
+            .unwrap();
+        db.put_ci_cache(path, "topic", &failing_cache("github:github.com/o/a"))
+            .unwrap();
+        let locations = thegn_core::remote::WorktreeLocations::from_rows(&db.worktrees().unwrap());
+        let cfg = thegn_core::config::CiConfig::default();
+        let ci = CiReader {
+            cfg: &cfg,
+            locations: &locations,
+        };
+        let session = session_with(&[("app/c", path)]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+
+        collect_attention_with_ci(&session, &db, &mut status, &ci);
+
+        assert_eq!(
+            status.attention[path].reason,
+            thegn_core::attention::AttentionReason::CiFailed
+        );
     }
 
     #[test]
