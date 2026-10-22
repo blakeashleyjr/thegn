@@ -1346,15 +1346,27 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
     // `branch` is a param (not captured) so the arms can still move it below.
     let lifecycle = |event: LifecycleEvent, branch: &str| {
         if let (Ok(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
-            crate::merge_lifecycle::apply(
+            crate::merge_lifecycle::apply_reported(
                 &cfg.repo_merge_queue(&root),
                 db,
                 &root,
                 wt,
                 branch,
                 event,
-            );
+            )
+            .into_iter()
+            .map(|note| note.text().to_owned())
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
         }
+    };
+    let append_lifecycle_notes = |mut message: String, notes: Vec<String>| {
+        if !notes.is_empty() {
+            message.push_str("; ");
+            message.push_str(&notes.join("; "));
+        }
+        message
     };
     match outcome {
         AttemptOutcome::Landed {
@@ -1375,7 +1387,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     );
                 }
             }
-            let out = landed_outcome_after_record(
+            let mut out = landed_outcome_after_record(
                 record(MqStatus::Landed, Some(&commit), None, None),
                 &branch,
                 &target,
@@ -1386,13 +1398,17 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 return DriveMsg::Done(out);
             }
             if let (Ok(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
-                crate::merge_lifecycle::apply_landed(
-                    &cfg.repo_merge_queue(&root),
-                    db,
-                    &root,
-                    wt,
-                    &branch,
-                    &commit,
+                out.warnings.extend(
+                    crate::merge_lifecycle::apply_landed_reported(
+                        &cfg.repo_merge_queue(&root),
+                        db,
+                        &root,
+                        wt,
+                        &branch,
+                        &commit,
+                    )
+                    .into_iter()
+                    .map(|note| note.text().to_owned()),
                 );
             }
             DriveMsg::Done(out)
@@ -1404,11 +1420,14 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 Some("already merged"),
                 None,
             );
-            if write.is_ok() {
-                lifecycle(LifecycleEvent::Landed, &branch);
-            }
+            let notes = if write.is_ok() {
+                lifecycle(LifecycleEvent::Landed, &branch)
+            } else {
+                Vec::new()
+            };
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
+                warnings: notes,
                 persistence_errors: write.err().into_iter().collect(),
                 ..DriveOutcome::default()
             })
@@ -1430,11 +1449,16 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 Some(&detail),
                 driver_refusal.as_deref(),
             );
-            if write.is_ok() {
-                lifecycle(LifecycleEvent::Failed, &branch);
-            }
+            let notes = if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch)
+            } else {
+                Vec::new()
+            };
             DriveMsg::Failed(append_write_error(
-                format!("{branch} conflicts: {}", message.replace('\n', ", ")),
+                append_lifecycle_notes(
+                    format!("{branch} conflicts: {}", message.replace('\n', ", ")),
+                    notes,
+                ),
                 write,
             ))
         }
@@ -1447,11 +1471,13 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 format!("breaks build\n{}", log.trim())
             };
             let write = record(MqStatus::GateFailed, None, None, Some(&detail));
-            if write.is_ok() {
-                lifecycle(LifecycleEvent::Failed, &branch);
-            }
+            let notes = if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch)
+            } else {
+                Vec::new()
+            };
             DriveMsg::Failed(append_write_error(
-                format!("{branch} breaks the build (gate red)"),
+                append_lifecycle_notes(format!("{branch} breaks the build (gate red)"), notes),
                 write,
             ))
         }
@@ -1464,20 +1490,27 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 format!("{reason}\n{}", log.trim())
             };
             let write = record(MqStatus::GateError, None, None, Some(&detail));
-            if write.is_ok() {
-                lifecycle(LifecycleEvent::Failed, &branch);
-            }
+            let notes = if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch)
+            } else {
+                Vec::new()
+            };
             DriveMsg::Failed(append_write_error(
-                format!("{branch} was NOT gated — {reason}"),
+                append_lifecycle_notes(format!("{branch} was NOT gated — {reason}"), notes),
                 write,
             ))
         }
         AttemptOutcome::Unreachable { detail } => {
             let write = record(MqStatus::Deferred, None, Some(&detail), None);
-            if write.is_ok() {
-                lifecycle(LifecycleEvent::Failed, &branch);
-            }
-            DriveMsg::Failed(append_write_error(format!("{branch}: {detail}"), write))
+            let notes = if write.is_ok() {
+                lifecycle(LifecycleEvent::Failed, &branch)
+            } else {
+                Vec::new()
+            };
+            DriveMsg::Failed(append_write_error(
+                append_lifecycle_notes(format!("{branch}: {detail}"), notes),
+                write,
+            ))
         }
         AttemptOutcome::Ready { tip } => {
             let write = record(
