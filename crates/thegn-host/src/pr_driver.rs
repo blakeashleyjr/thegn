@@ -875,6 +875,30 @@ pub(crate) fn drive_queue(
                     credential_free: true,
                 });
 
+                let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
+                    forge
+                        .pr_status(&loc, PrRef::Number(item.number))
+                        .ok()
+                        .filter(|pr| {
+                            pr_queue::attest_pr_identity(
+                                item.pr_url.as_deref(),
+                                item.number,
+                                &pr.url,
+                                pr.number,
+                            )
+                            .is_ok()
+                        })
+                        .map(|pr| pr.head_ref_oid)
+                });
+                if let Some(own) = own
+                    && let Some(warning) = crate::pr_agent_lease::own_head_record_warning(
+                        item.number,
+                        guard.record_own_head(db, &head, &own),
+                    )
+                {
+                    out.warnings.push(warning);
+                }
+
                 match guard.finish(db, None) {
                     Ok(true) => {}
                     Ok(false) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the next refresh re-evaluates the row", item.number)),

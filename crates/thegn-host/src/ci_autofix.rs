@@ -8,7 +8,7 @@ use std::path::Path;
 
 use thegn_core::ci_log::CiLogEntry;
 use thegn_core::config::{CiAutofixMode, Config};
-use thegn_core::forge::{FetchedPr, Forge};
+use thegn_core::forge::{FetchedPr, Forge, PrRef};
 use thegn_core::pr_queue::{Blocker, PrQueueFacts, PrqStatus};
 use thegn_core::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
@@ -424,6 +424,32 @@ fn consider_candidate_with_forge(
         sandbox,
         credential_free: true,
     });
+    let own = crate::pr_agent_lease::observe_own_head(&loc, &entry.head_sha, || {
+        provider
+            .pr_status(&loc, PrRef::Number(item.number))
+            .ok()
+            .filter(|pr| {
+                thegn_core::pr_queue::attest_pr_identity(
+                    item.pr_url.as_deref(),
+                    item.number,
+                    &pr.url,
+                    pr.number,
+                )
+                .is_ok()
+            })
+            .map(|pr| pr.head_ref_oid)
+    });
+    if let Some(own) = own {
+        match guard.record_own_head(db, &entry.head_sha, &own) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(target: "thegn::ci_autofix", pr = item.number, "agent push could not be recorded under its lease; next refresh treats it as foreign")
+            }
+            Err(error) => {
+                tracing::warn!(target: "thegn::ci_autofix", %error, pr = item.number, "agent push could not be recorded under its lease; next refresh treats it as foreign")
+            }
+        }
+    }
     let outcome = if exited_zero {
         "exit ok"
     } else {

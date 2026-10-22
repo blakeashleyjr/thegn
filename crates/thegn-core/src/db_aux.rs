@@ -165,6 +165,9 @@ mod cleanup_hold_tests;
 mod merge_claim_tests;
 
 #[cfg(test)]
+#[path = "db_pr_agent_head_tests.rs"]
+mod pr_agent_head_tests;
+#[cfg(test)]
 #[path = "db_pr_agent_lease_tests.rs"]
 mod pr_agent_lease_tests;
 
@@ -1566,6 +1569,33 @@ impl WorktreeAuxStore for Db {
                 detail,
                 util::now(),
                 lease.generation
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn record_pr_agent_head(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        admitted_head: &str,
+        own_head: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            !admitted_head.is_empty() && !own_head.is_empty() && admitted_head != own_head,
+            "invalid PR-agent head record"
+        );
+        let changed = self.conn().execute(
+            "UPDATE pr_queue SET last_head_oid=?4, ci_rerun_head=NULL, updated_at=?5
+             WHERE key=?1 AND agent_claim_owner=?2 AND agent_claim_generation=?3
+               AND agent_claim_lease_until_ms>=?6 AND last_head_oid IS ?7",
+            params![
+                lease.key,
+                lease.owner_token,
+                lease.generation,
+                own_head,
+                util::now(),
+                util::now_ms(),
+                admitted_head
             ],
         )?;
         Ok(changed == 1)
