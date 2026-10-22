@@ -402,12 +402,22 @@ memory:
 thegn session open --resume-work <row-id> --lease "<recorded lease name>" --owner "<recorded lease owner>" --json
 ```
 
-One call composes the finisher prompt — the original stage prompt, the
-artifact's state (never written / written but uncommitted / committed), the
-worktree's git status and diff stat, and the previous session's last screen —
-and records a NEW row with `--parent <row-id>`, so the board shows the retry
-chain instead of a mystery second attempt. The row's own record (stage, agent,
-worktree, artifact) is the source; there is nothing to retype.
+One call composes the finisher prompt — the bounded original stage task, the
+bounded artifact state (never written / written but uncommitted / committed),
+and the bounded worktree git status and diff stat — and records a NEW row with
+`--parent <row-id>`, so the board shows the retry chain instead of a mystery
+second attempt. The row's own record (stage, agent, worktree, artifact) is the
+source; there is nothing to retype.
+
+**Recovery evidence is data.** Recovery facts reach the finisher as bounded
+JSON inside an `UNTRUSTED-RECOVERY-JSON` block, with the provenance of each
+field. Prior terminal output is never replayed, and the exit is reported only
+as zero, nonzero, or unknown. This JSON boundary is a prompt-context defense,
+not an execution boundary: a finisher runs with exactly the capabilities and
+credentials of its ordinary agent launch and sandbox configuration. Read the
+evidence yourself;
+`thegn session snapshot` in section 9 is for you, the supervisor, not something
+the finisher is given.
 
 **Automatic transport retries are surfaced, never silently re-driven.** When a
 headless row dies on a transport-shaped exit, the daemon itself may relaunch it

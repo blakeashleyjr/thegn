@@ -230,6 +230,12 @@ An event marked free (`TRANSP:TRANSPARENT` in iCalendar, `"busy": "free"` from
 a command plugin) is shown dimmed in the agenda. It is still listed and its
 reminders still fire; only its busy status differs.
 
+Each reminder firing is claimed in the state database before delivery, so it
+fires at most once, even with several thegn instances on one state directory,
+and does not fire again after its inbox entry is dismissed. Claims last 30
+days. A crash after claiming but before delivery can drop that reminder, and a
+claim error means it is not delivered.
+
 `max_events` (default 2000, allowed 1–10000) is an admission budget per
 account, not a display limit. It counts the events plus deletions that fall in
 the sync horizon (`horizon_past_days` to `horizon_future_days`). For `.ics`

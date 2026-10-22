@@ -760,6 +760,19 @@ pub struct DispatchPutReq {
     pub artifact_path: Option<String>,
 }
 
+/// One newest-first page of the dispatch roster (`dispatches.list`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchPage {
+    /// Dispatch rows in newest-first order.
+    pub dispatches: Vec<thegn_core::issue::AgentDispatch>,
+    /// Whether older rows exist beyond this page.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Pass this row id as `before` to read older rows; set only when truncated.
+    #[serde(default)]
+    pub next_before: Option<i64>,
+}
+
 /// A capability-authenticated worker write. The token is never included in
 /// formatted diagnostics.
 #[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1194,10 +1207,12 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
-    /// The agent-dispatch roster, newest first (`dispatches.list`).
+    /// One newest-first keyset page of the agent-dispatch roster (`dispatches.list`).
     fn dispatches_list(
         &self,
-    ) -> BoxFuture<'_, ControlResult<Vec<thegn_core::issue::AgentDispatch>>> {
+        _before: Option<i64>,
+        _limit: usize,
+    ) -> BoxFuture<'_, ControlResult<DispatchPage>> {
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
     }
 

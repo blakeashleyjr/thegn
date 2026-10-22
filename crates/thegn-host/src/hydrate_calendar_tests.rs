@@ -1587,3 +1587,189 @@ fn plugin_secret_sentinel_never_reaches_the_stored_error_logs_or_status() {
         );
     }
 }
+
+type CalendarAuditBuffer = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+struct CalendarAuditWriter(CalendarAuditBuffer);
+
+impl std::io::Write for CalendarAuditWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn calendar_audit_subscriber() -> (CalendarAuditBuffer, impl tracing::Subscriber + Send + Sync) {
+    let capture = CalendarAuditBuffer::default();
+    let writer = std::sync::Arc::clone(&capture);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || CalendarAuditWriter(std::sync::Arc::clone(&writer)))
+        .finish();
+    (capture, subscriber)
+}
+
+fn calendar_audit_config(
+    alpha_token: &str,
+    beta_token: &str,
+) -> thegn_core::config_calendar::CalendarConfig {
+    use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
+
+    CalendarConfig {
+        enabled: true,
+        accounts: vec![
+            CalendarAccount {
+                name: "alpha".into(),
+                provider: CalendarProviderKind::IcsUrl,
+                enabled: true,
+                url: "https://calendar.invalid/a.ics".into(),
+                token: alpha_token.into(),
+                ..CalendarAccount::default()
+            },
+            CalendarAccount {
+                name: "beta".into(),
+                provider: CalendarProviderKind::IcsUrl,
+                enabled: true,
+                url: "https://calendar.invalid/b.ics".into(),
+                token: beta_token.into(),
+                ..CalendarAccount::default()
+            },
+        ],
+        ..CalendarConfig::default()
+    }
+}
+
+fn calendar_audit_lines(capture: &str) -> Vec<&str> {
+    capture
+        .lines()
+        .filter(|line| line.contains("secret resolve"))
+        .collect()
+}
+
+#[test]
+fn calendar_token_resolution_audits_each_account_without_values() {
+    thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
+
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let token_path = fixture.path().join("calendar-token");
+    let file_sentinel = "cal-file-sentinel-b72c";
+    std::fs::write(&token_path, file_sentinel).unwrap();
+    let literal_sentinel = "cal-lit-sentinel-a41f";
+    let literal_ref = format!("literal:{}", thegn_core::redact::PLACEHOLDER);
+    let cfg = calendar_audit_config(literal_sentinel, &format!("file:{}", token_path.display()));
+    let (capture, subscriber) = calendar_audit_subscriber();
+
+    tracing::subscriber::with_default(subscriber, || {
+        drop(thegn_svc::calendar::CalendarRouter::from_config(&cfg));
+    });
+
+    let log = String::from_utf8(
+        capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .unwrap();
+    let lines = calendar_audit_lines(&log);
+    let alpha: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consumer=calendar:alpha"))
+        .collect();
+    let beta: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consumer=calendar:beta"))
+        .collect();
+    assert_eq!(lines.len(), 2, "capture: {log}");
+    assert_eq!(alpha.len(), 1, "capture: {log}");
+    assert!(alpha[0].contains("backend=\"literal\""), "capture: {log}");
+    assert!(alpha[0].contains(&literal_ref), "capture: {log}");
+    assert_eq!(beta.len(), 1, "capture: {log}");
+    assert!(beta[0].contains("backend=\"file\""), "capture: {log}");
+    assert!(
+        beta[0].contains(&format!("file:{}", token_path.display())),
+        "capture: {log}"
+    );
+    assert!(!log.contains(literal_sentinel), "capture: {log}");
+    assert!(!log.contains(file_sentinel), "capture: {log}");
+}
+
+#[test]
+fn calendar_token_reload_rebinds_audit_events_to_their_own_accounts() {
+    thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
+
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    let token_path = fixture.path().join("calendar-token");
+    let file_sentinel = "cal-file-sentinel-b72c";
+    std::fs::write(&token_path, file_sentinel).unwrap();
+    let literal_sentinel = "cal-lit-sentinel-a41f";
+    let literal_ref = format!("literal:{}", thegn_core::redact::PLACEHOLDER);
+    let initial =
+        calendar_audit_config(literal_sentinel, &format!("file:{}", token_path.display()));
+    let reloaded =
+        calendar_audit_config(&format!("file:{}", token_path.display()), literal_sentinel);
+    let (first_capture, first_subscriber) = calendar_audit_subscriber();
+    tracing::subscriber::with_default(first_subscriber, || {
+        drop(thegn_svc::calendar::CalendarRouter::from_config(&initial));
+    });
+    let first_log = String::from_utf8(
+        first_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .unwrap();
+
+    let (capture, subscriber) = calendar_audit_subscriber();
+    tracing::subscriber::with_default(subscriber, || {
+        drop(thegn_svc::calendar::CalendarRouter::from_config(&reloaded));
+    });
+
+    let log = String::from_utf8(
+        capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .unwrap();
+    let lines = calendar_audit_lines(&log);
+    let alpha: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consumer=calendar:alpha"))
+        .collect();
+    let beta: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consumer=calendar:beta"))
+        .collect();
+    let evidence = format!("initial capture: {first_log}; reloaded capture: {log}");
+    assert_eq!(lines.len(), 2, "{evidence}");
+    assert_eq!(alpha.len(), 1, "{evidence}");
+    assert!(alpha[0].contains("backend=\"file\""), "{evidence}");
+    assert!(
+        alpha[0].contains(&format!("file:{}", token_path.display())),
+        "{evidence}"
+    );
+    assert_eq!(beta.len(), 1, "{evidence}");
+    assert!(beta[0].contains("backend=\"literal\""), "{evidence}");
+    assert!(beta[0].contains(&literal_ref), "{evidence}");
+    assert!(
+        lines.iter().all(|line| {
+            !(line.contains("consumer=calendar:alpha") && line.contains(&literal_ref))
+                && !(line.contains("consumer=calendar:beta")
+                    && line.contains(&format!("file:{}", token_path.display())))
+        }),
+        "{evidence}"
+    );
+    for sentinel in [literal_sentinel, file_sentinel] {
+        assert!(!first_log.contains(sentinel), "{evidence}");
+        assert!(!log.contains(sentinel), "{evidence}");
+    }
+}

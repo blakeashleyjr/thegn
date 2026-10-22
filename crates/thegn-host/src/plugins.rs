@@ -158,6 +158,7 @@ pub(crate) enum PluginMsg {
 pub(crate) enum OneShotStart {
     Started,
     Busy,
+    Overloaded,
     Failed,
 }
 
@@ -396,6 +397,14 @@ impl StopSignal {
     }
 }
 
+pub(crate) const MAX_INFLIGHT_ONE_SHOTS: usize = 4; // planner call (batch 67): global one-shot run cap; owner may override
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateRefusal {
+    Busy,
+    Overloaded,
+}
+
 #[derive(Clone, Default)]
 struct OneShotGate(Arc<Mutex<BTreeSet<String>>>);
 
@@ -405,12 +414,16 @@ struct OneShotTicket {
 }
 
 impl OneShotGate {
-    fn try_begin(&self, plugin: &str) -> Option<OneShotTicket> {
+    fn try_begin(&self, plugin: &str) -> Result<OneShotTicket, GateRefusal> {
         let mut in_flight = lock(&self.0);
-        if !in_flight.insert(plugin.to_string()) {
-            return None;
+        if in_flight.contains(plugin) {
+            return Err(GateRefusal::Busy);
         }
-        Some(OneShotTicket {
+        if in_flight.len() >= MAX_INFLIGHT_ONE_SHOTS {
+            return Err(GateRefusal::Overloaded);
+        }
+        in_flight.insert(plugin.to_string());
+        Ok(OneShotTicket {
             gate: self.clone(),
             plugin: plugin.to_string(),
         })
@@ -608,8 +621,10 @@ impl PluginsHost {
     /// run.
     pub(crate) fn run_one_shot(&self, plugin: LoadedPlugin) -> OneShotStart {
         let id = plugin.spec.manifest.id.as_str().to_string();
-        let Some(ticket) = self.one_shot_gate.try_begin(&id) else {
-            return OneShotStart::Busy;
+        let ticket = match self.one_shot_gate.try_begin(&id) {
+            Ok(ticket) => ticket,
+            Err(GateRefusal::Busy) => return OneShotStart::Busy,
+            Err(GateRefusal::Overloaded) => return OneShotStart::Overloaded,
         };
         let tx = self.tx.clone();
         let waker = self.waker.clone();
@@ -747,6 +762,7 @@ struct SchedEntry {
     interval: Duration,
     next: Instant,
     skipped: u64,
+    overloaded: u64,
 }
 
 /// Build cadence entries from negotiated contributions. Resident callbacks
@@ -784,6 +800,7 @@ fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
                 // Due immediately: the first poll doubles as the initial view.
                 next: now,
                 skipped: 0,
+                overloaded: 0,
             });
         }
     }
@@ -822,14 +839,24 @@ fn run_due(
                 }
             }
             PluginMode::OneShot => match gate.try_begin(&entry.plugin) {
-                Some(ticket) => spawn_poll(ticket, entry),
-                None => {
+                Ok(ticket) => spawn_poll(ticket, entry),
+                Err(GateRefusal::Busy) => {
                     entry.skipped += 1;
                     tracing::debug!(
                         target: "thegn::plugin",
                         plugin = %entry.plugin,
                         skipped = entry.skipped,
                         "one-shot poll skipped: previous run still in flight"
+                    );
+                }
+                Err(GateRefusal::Overloaded) => {
+                    entry.overloaded += 1;
+                    tracing::debug!(
+                        target: "thegn::plugin",
+                        plugin = %entry.plugin,
+                        overloaded = entry.overloaded,
+                        cap = MAX_INFLIGHT_ONE_SHOTS,
+                        "one-shot poll deferred: global in-flight cap reached"
                     );
                 }
             },
@@ -1616,11 +1643,28 @@ mod tests {
     fn one_shot_gate_admits_one_run_per_plugin() {
         let gate = OneShotGate::default();
         let first = gate.try_begin("p").unwrap();
-        assert!(gate.try_begin("p").is_none());
+        assert!(matches!(gate.try_begin("p"), Err(GateRefusal::Busy)));
         let other = gate.try_begin("q").unwrap();
         drop(first);
-        assert!(gate.try_begin("p").is_some());
+        assert!(gate.try_begin("p").is_ok());
         drop(other);
+    }
+
+    #[test]
+    fn one_shot_gate_refuses_past_the_global_cap() {
+        let gate = OneShotGate::default();
+        let mut tickets: Vec<_> = (0..MAX_INFLIGHT_ONE_SHOTS)
+            .map(|index| gate.try_begin(&format!("p{index}")).unwrap())
+            .collect();
+
+        assert!(matches!(
+            gate.try_begin("next"),
+            Err(GateRefusal::Overloaded)
+        ));
+        assert!(matches!(gate.try_begin("p0"), Err(GateRefusal::Busy)));
+
+        drop(tickets.pop());
+        assert!(gate.try_begin("next").is_ok());
     }
 
     #[test]
@@ -1648,6 +1692,7 @@ mod tests {
 
         assert_eq!(spawned, 0);
         assert_eq!(schedule[0].skipped, 1);
+        assert_eq!(schedule[0].overloaded, 0);
         assert_eq!(schedule[0].next, now + interval);
 
         drop(ticket);
@@ -1662,6 +1707,52 @@ mod tests {
 
         assert_eq!(spawned, 1);
         assert_eq!(schedule[0].skipped, 1);
+        assert_eq!(schedule[0].overloaded, 0);
+    }
+
+    #[test]
+    fn sched_overloaded_tick_is_counted_apart_from_busy() {
+        let now = Instant::now();
+        let mut schedule = build_schedule(
+            &[loaded_state(spec_with_two_intervals(PluginMode::OneShot))],
+            now,
+        );
+        let interval = schedule[0].interval;
+        let gate = OneShotGate::default();
+        let mut tickets: Vec<_> = (0..MAX_INFLIGHT_ONE_SHOTS)
+            .map(|index| gate.try_begin(&format!("holder-{index}")).unwrap())
+            .collect();
+        let disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut spawned = 0;
+
+        run_due(
+            &mut schedule,
+            now,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |_, _| spawned += 1,
+        );
+
+        assert_eq!(spawned, 0);
+        assert_eq!(schedule[0].overloaded, 1);
+        assert_eq!(schedule[0].skipped, 0);
+        assert_eq!(schedule[0].next, now + interval);
+
+        drop(tickets.pop());
+        run_due(
+            &mut schedule,
+            now + interval,
+            &disabled,
+            &sessions,
+            &gate,
+            &mut |ticket, _| {
+                spawned += 1;
+                drop(ticket);
+            },
+        );
+        assert_eq!(spawned, 1);
     }
 
     #[test]
@@ -1703,6 +1794,7 @@ mod tests {
 
         assert_eq!(spawned, 1);
         assert_eq!(schedule[0].skipped, 1);
+        assert_eq!(schedule[0].overloaded, 0);
         drop(held_ticket.take());
         run_due(
             &mut schedule,
@@ -1717,6 +1809,7 @@ mod tests {
         );
         assert_eq!(spawned, 2);
         assert_eq!(schedule[0].skipped, 1);
+        assert_eq!(schedule[0].overloaded, 0);
     }
 
     #[test]
@@ -1815,6 +1908,55 @@ mod tests {
         assert!(
             matches!(rx.blocking_recv(), Some(PluginMsg::OneShot { plugin, .. }) if plugin == "single-flight")
         );
+    }
+
+    #[test]
+    fn run_one_shot_reports_overloaded_when_the_cap_is_full() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(tmp.path()).unwrap();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = ResidentSupervisor::new(runtime.handle().clone());
+        let (tx, mut rx) = plugin_channel();
+        let gate = OneShotGate::default();
+        let host = PluginsHost {
+            stop: Arc::new(StopSignal::default()),
+            supervisor,
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            disabled: Arc::new(Mutex::new(Default::default())),
+            tx,
+            waker,
+            one_shot_gate: gate.clone(),
+            state_anchor: tmp.path().join("state"),
+            respawns: Arc::new(RespawnTimers::default()),
+            retry_runtime: runtime.handle().clone(),
+        };
+        let tickets: Vec<_> = (0..MAX_INFLIGHT_ONE_SHOTS)
+            .map(|index| gate.try_begin(&format!("holder-{index}")).unwrap())
+            .collect();
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("overloaded");
+        spec.command = vec!["sh".into(), "-c".into(), "sleep 0.2".into()];
+        spec.timeout_secs = 2;
+        let plugin = LoadedPlugin {
+            spec,
+            dir: Some(tmp.path().to_path_buf()),
+            trusted_native_ignored: false,
+        };
+
+        assert_eq!(host.run_one_shot(plugin), OneShotStart::Overloaded);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio_mpsc::error::TryRecvError::Empty)
+        ));
+        drop(tickets);
     }
 
     #[test]

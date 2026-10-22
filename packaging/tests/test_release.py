@@ -1207,6 +1207,30 @@ class ReleaseAssetManifestTests(unittest.TestCase):
         self.assertEqual(2, raised.exception.code)
         self.assertIn("does not match the release manifest", stderr.getvalue())
 
+    def test_verify_assets_cli_does_not_require_the_workspace_version(self) -> None:
+        tag = "v0.0.1-fixture"
+        manifest = self.write_manifest([self.valid_asset()], tag=tag)
+        asset = self.temp / self.asset
+        asset.write_bytes(self.content)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            release.main(["verify-assets", "--tag", tag, "--release-manifest", str(manifest), "--asset", str(asset)])
+        self.assertIn(f"{self.asset}: matches the release manifest", stdout.getvalue())
+
+    def test_verify_assets_cli_rejects_an_invalid_tag_syntax(self) -> None:
+        manifest = self.write_manifest([self.valid_asset()])
+        asset = self.temp / self.asset
+        asset.write_bytes(self.content)
+        for tag in ("1.2.3", "v1.2.3;rm"):
+            with self.subTest(tag=tag):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                    release.main(
+                        ["verify-assets", "--tag", tag, "--release-manifest", str(manifest), "--asset", str(asset)]
+                    )
+                self.assertEqual(2, raised.exception.code)
+                self.assertIn("invalid release tag", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

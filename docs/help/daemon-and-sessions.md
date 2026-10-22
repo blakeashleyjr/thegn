@@ -36,6 +36,10 @@ endpoints share a 5-second check budget; if an endpoint is still unchecked when
 that budget expires, thegn does not start another daemon and names the
 unchecked endpoints, suggesting a retry or `thegn daemon stop`.
 
+After starting a pane daemon, thegn waits up to 3 seconds for it to answer and
+reports an error if it does not. A daemon that cannot acquire its control-socket
+lock gives up after 5 seconds instead of waiting indefinitely.
+
 When the UI exits, in-flight custom git commands, CI refreshes, and CI rerun or
 cancel actions are cancelled. Thegn waits up to two seconds for them before
 exiting; work still running after that is logged. A CI action requested while
@@ -145,6 +149,9 @@ second listing must show no survivors before either database is written.
 `--dry-run` performs no kill and no database write, and `--json` emits a
 redacted audit containing the selected group names, row counts, liveness,
 commit/confirmation/deletion state, resume state, and notification status.
+It reads changes still held in a profile database's write-ahead log without
+writing the database, and refuses with the database path when that log has no
+shared-memory index.
 After confirmed cleanup, notification through a reachable daemon registered
 in the target database is best effort; failure is reported as a warning.
 

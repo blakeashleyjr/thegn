@@ -426,6 +426,7 @@ pub(crate) fn pick_palette(pick: MediaPick) -> Result<Vec<crate::palette::Palett
             .collect()),
         MediaPick::Players(Ok(players)) => Ok(players
             .into_iter()
+            .take(thegn_core::media::MAX_PLAYERS)
             .map(|player| {
                 crate::palette::PaletteItem::new(
                     format!("media-player:{player}"),
@@ -446,6 +447,12 @@ pub(crate) fn pick_note(pick: &MediaPick) -> Option<String> {
             let hidden = page.hidden();
             let noun = if hidden == 1 { "playlist" } else { "playlists" };
             Some(format!("Media: {hidden} more {noun} not shown"))
+        }
+        MediaPick::Players(Ok(players)) if players.len() > thegn_core::media::MAX_PLAYERS => {
+            Some(format!(
+                "Media: more than {max} players; the first {max} are shown",
+                max = thegn_core::media::MAX_PLAYERS
+            ))
         }
         _ => None,
     }
@@ -951,6 +958,31 @@ mod tests {
             pick_note(&MediaPick::Playlists(Ok(page))).as_deref(),
             Some("Media: 1 more playlist not shown")
         );
+    }
+
+    #[test]
+    fn player_picker_shows_the_cap_and_notes_overflow() {
+        let names = (0..thegn_core::media::PLAYER_LIST_LIMIT)
+            .map(|index| format!("player-{index}"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            pick_note(&MediaPick::Players(Ok(names.clone()))),
+            Some(text) if text.contains("more than 64 players")
+        ));
+
+        let items = pick_palette(MediaPick::Players(Ok(names))).unwrap();
+        assert_eq!(items.len(), thegn_core::media::MAX_PLAYERS);
+        let expected_last_key =
+            format!("media-player:player-{}", thegn_core::media::MAX_PLAYERS - 1);
+        assert_eq!(
+            items.last().map(|item| item.key.as_str()),
+            Some(expected_last_key.as_str())
+        );
+
+        let exactly_max = (0..thegn_core::media::MAX_PLAYERS)
+            .map(|index| format!("player-{index}"))
+            .collect();
+        assert_eq!(pick_note(&MediaPick::Players(Ok(exactly_max))), None);
     }
 
     #[test]
