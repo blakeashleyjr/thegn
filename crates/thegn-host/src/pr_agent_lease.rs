@@ -4,7 +4,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use thegn_core::db::Db;
-use thegn_core::pr_queue::{PR_AGENT_MAX_LEASE_MS, PrAgentAdmit, PrAgentLease, PrAgentRefusal};
+use thegn_core::pr_queue::{
+    PR_AGENT_MAX_LEASE_MS, PrAgentAdmit, PrAgentLease, PrAgentLeaseView, PrAgentRefusal,
+    expired_pr_agent_detail, pr_agent_lease_live,
+};
 use thegn_core::store::WorktreeAuxStore;
 
 const LEASE_MS: i64 = PR_AGENT_MAX_LEASE_MS - 10_000;
@@ -160,6 +163,23 @@ pub(crate) fn own_head_record_warning(number: u64, result: anyhow::Result<bool>)
         Err(error) => Some(format!(
             "PR #{number}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push ({error})"
         )),
+    }
+}
+
+pub(crate) fn reconcile_expired(
+    db: &Db,
+    key: &str,
+    number: u64,
+    view: &PrAgentLeaseView,
+) -> anyhow::Result<Option<String>> {
+    if pr_agent_lease_live(Some(view), thegn_core::util::now_ms()) {
+        return Ok(None);
+    }
+    let detail = expired_pr_agent_detail(view);
+    if db.reap_expired_pr_agent(key, view.generation, &detail)? {
+        Ok(Some(format!("PR #{number}: {detail}")))
+    } else {
+        Ok(None)
     }
 }
 

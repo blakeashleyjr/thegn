@@ -228,7 +228,27 @@ pub(crate) fn drive_queue(
                 step(PrqStatus::AgentRunning.as_str(), &detail, &mut progress);
                 continue;
             }
-            Ok(_) => {}
+            Ok(Some(view)) => {
+                match crate::pr_agent_lease::reconcile_expired(db, &item.key, item.number, &view) {
+                    Ok(Some(warning)) => {
+                        tracing::warn!(target: "thegn::prq", "{warning}");
+                        out.warnings.push(warning);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let detail = format!(
+                            "PR #{}: could not reconcile the expired PR-agent lease ({error}); refresh skipped",
+                            item.number
+                        );
+                        tracing::warn!(target: "thegn::prq", "{detail}");
+                        out.warnings.push(detail.clone());
+                        out.blocked.push(item.number);
+                        step(PrqStatus::AgentRunning.as_str(), &detail, &mut progress);
+                        continue;
+                    }
+                }
+            }
+            Ok(None) => {}
         }
 
         // Where to run forge commands: the PR's own worktree when it has one,
@@ -3624,5 +3644,56 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ref error) if error.contains("a PR agent is running")));
+    }
+
+    #[test]
+    fn expired_agent_lease_is_reconciled_before_refresh() {
+        let (dir, db) = temp_db("prq-expired-lease-refresh");
+        let (checkout, item) =
+            enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+        let head = GitLoc::from_db(checkout.to_str().unwrap(), None)
+            .git_out(&["rev-parse", "HEAD"])
+            .unwrap();
+        let request = pr_queue::PrAgentAdmit {
+            key: &item.key,
+            expected_attempts: 0,
+            expected_checkout_gen: item.checkout_gen,
+            max_attempts: 3,
+            head: &head,
+            blocker: "ci",
+            detail: "previous agent",
+            lease_until_ms: crate::pr_agent_lease::lease_until_ms(),
+            owner_hint: Some("dead worker"),
+            ci_candidate: None,
+        };
+        assert!(matches!(
+            db.admit_pr_agent(&request).unwrap(),
+            pr_queue::PrAgentAdmission::Admitted(_)
+        ));
+        rusqlite::Connection::open(dir.path().join("prq-expired-lease-refresh.db"))
+            .unwrap()
+            .execute(
+                "UPDATE pr_queue SET agent_claim_lease_until_ms=0 WHERE key=?1",
+                [&item.key],
+            )
+            .unwrap();
+
+        let forge = FakeForge::new(Some(green_pr()));
+        let out = drive_queue(
+            &cfg(),
+            &uncontained_config(),
+            &forge,
+            &checkout,
+            &db,
+            vec![item],
+            |_| {},
+        );
+
+        assert!(!forge.calls().is_empty(), "{:?}", forge.calls());
+        let row = db.list_pr_queue().unwrap().remove(0);
+        assert_ne!(row.status, PrqStatus::AgentRunning.as_str());
+        assert_eq!(row.agent_attempts, 1);
+        assert_eq!(out.warnings.len(), 1, "{out:?}");
+        assert!(out.warnings[0].contains("lost its lease"), "{out:?}");
     }
 }
