@@ -674,12 +674,14 @@ pub(crate) fn overdue_notifications(
         .collect()
 }
 
+type ProviderIssueResultRow<'a> = (
+    String,
+    &'a str,
+    Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
+);
+
 pub(crate) fn shared_issue_ids(
-    per_provider: &[(
-        String,
-        &str,
-        Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
-    )],
+    per_provider: &[ProviderIssueResultRow<'_>],
 ) -> std::collections::HashSet<String> {
     let rows = per_provider.iter().flat_map(|(_, _, result)| {
         let issues = match result {
@@ -800,7 +802,7 @@ mod tests {
                         account: Some("home".into()),
                         ..Default::default()
                     }],
-                    reason: "page cap".into(),
+                    reason: "page cap",
                 }),
             ),
             ("x".to_owned(), "linear", Err(IssueError::NotConfigured)),
