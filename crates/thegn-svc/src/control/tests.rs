@@ -2037,3 +2037,22 @@ async fn dispatches_list_refuses_an_out_of_range_limit_before_the_api() {
         assert!(r.api.calls().is_empty());
     }
 }
+
+#[test]
+fn ci_logs_reply_without_warnings_still_decodes() {
+    let reply: super::CiLogsReply = serde_json::from_value(serde_json::json!({
+        "worktree": "/repo",
+        "run_id": "run",
+        "job_id": "job",
+        "logs": [],
+        "source": "cache",
+        "fetched_at": 1,
+        "truncated": false,
+        "redacted": true
+    }))
+    .unwrap();
+
+    assert!(reply.warnings.is_empty());
+    let encoded = serde_json::to_value(reply).unwrap();
+    assert!(encoded.get("warnings").is_none());
+}
