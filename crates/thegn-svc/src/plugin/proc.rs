@@ -1296,6 +1296,8 @@ mod process_tree_deadline_tests {
         spawn_ndjson,
     };
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -1318,17 +1320,33 @@ mod process_tree_deadline_tests {
         assert_eq!(LIVE_PIPE_READERS.load(Ordering::SeqCst), 0);
     }
 
-    fn run_holding_pipe(which: &str) -> super::PluginRun {
+    /// Wait for the setsid'd shell to create its marker before the leader
+    /// exits. Otherwise leader-exit kill_group can kill a background child
+    /// before it detaches, draining the pipes and hiding the reader deadline.
+    fn escaped_holder(holder: &str, redirection: &str) -> String {
+        assert!(!holder.contains('\''));
+        format!(
+            "setsid sh -c ': > \"$1\"; {holder}' sh \"$1\" {redirection} & i=0; while [ ! -e \"$1\" ]; do i=$((i+1)); [ \"$i\" -gt 500 ] && exit 97; sleep 0.01; done; "
+        )
+    }
+
+    fn marker_dir() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = dir.path().join("escaped").to_string_lossy().into_owned();
+        (dir, marker)
+    }
+
+    fn run_holding_pipe(which: &str, marker: &str) -> super::PluginRun {
         let redirection = match which {
             "stdout" => "2>/dev/null",
             "stderr" => ">/dev/null",
             _ => unreachable!(),
         };
-        let script =
-            format!("setsid sh -c 'sleep 30 & p=$!; sleep 2; kill $p' {redirection} & sleep 0.1");
+        let script = escaped_holder("sleep 30 & p=$!; sleep 2; kill $p", redirection);
         let started = Instant::now();
         let run = spawn_ndjson(
-            &["sh".into(), "-c".into(), script],
+            &["sh".into(), "-c".into(), script, "sh".into(), marker.into()],
             &BTreeMap::new(),
             None,
             Duration::from_millis(300),
@@ -1343,7 +1361,9 @@ mod process_tree_deadline_tests {
         if !setsid_available() {
             return;
         }
-        let run = run_holding_pipe("stdout");
+        let (_dir, marker) = marker_dir();
+        let run = run_holding_pipe("stdout", &marker);
+        assert!(Path::new(&marker).exists(), "escaped holder never detached");
         assert!(run.outcome.abandoned);
         assert!(!run.outcome.drained);
         assert!(run.outcome.reaped);
@@ -1356,18 +1376,20 @@ mod process_tree_deadline_tests {
         if !setsid_available() {
             return;
         }
-        let run = run_holding_pipe("stderr");
+        let (_dir, marker) = marker_dir();
+        let run = run_holding_pipe("stderr", &marker);
+        assert!(Path::new(&marker).exists(), "escaped holder never detached");
         assert!(run.outcome.abandoned);
         assert!(!run.outcome.drained);
         assert!(run.outcome.reaped);
         assert!(!run.truncated);
-        // The leader exits at about 100 ms, lowering the reader cutoff to
-        // leader exit + the 500 ms grace (about 600 ms from start). The
-        // 50 ms poll cap gives about 13 waits for the held pipe, plus EOF
+        // The leader exits once the holder has detached (typically tens of
+        // ms), lowering the reader cutoff to leader exit + the 500 ms grace.
+        // The 50 ms poll cap gives about 13 waits for the held pipe, plus EOF
         // events for stdout; 200 allows ample scheduling and event overhead.
         assert!(
             run.outcome.poll_calls < 200,
-            "poll calls: {}; reader cutoff is about leader exit (~100 ms) + {} ms grace (~600 ms from start)",
+            "poll calls: {}; reader cutoff is about leader exit once the holder has detached (typically tens of ms) + {} ms grace",
             run.outcome.poll_calls,
             READER_GRACE.as_millis()
         );
@@ -1419,13 +1441,24 @@ mod process_tree_deadline_tests {
             return;
         }
         let started = Instant::now();
+        let (_dir, marker) = marker_dir();
         let run = spawn_ndjson(
-            &["sh".into(), "-c".into(), "setsid sleep 30 & exit 0".into()],
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("{}exit 0", escaped_holder("exec sleep 30", "")),
+                "sh".into(),
+                marker.clone(),
+            ],
             &BTreeMap::new(),
             None,
             Duration::from_secs(10),
         )
         .unwrap();
+        assert!(
+            Path::new(&marker).exists(),
+            "escaped holder never detached (leader gave up waiting)"
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(run.outcome.abandoned);
         assert!(!run.truncated);
@@ -1437,18 +1470,53 @@ mod process_tree_deadline_tests {
         if !setsid_available() {
             return;
         }
+        let (_dir, marker) = marker_dir();
         let run = spawn_ndjson(
             &[
                 "sh".into(),
                 "-c".into(),
-                "printf '{\"jsonrpc\":\"2.0\",\"method\":\"log\"}'; setsid sleep 30 & exit 0"
-                    .into(),
+                format!(
+                    "printf '{{\"jsonrpc\":\"2.0\",\"method\":\"log\"}}'; {}exit 0",
+                    escaped_holder("exec sleep 30", "")
+                ),
+                "sh".into(),
+                marker.clone(),
             ],
             &BTreeMap::new(),
             None,
             Duration::from_secs(10),
         )
         .unwrap();
+        assert!(
+            Path::new(&marker).exists(),
+            "escaped holder never detached (leader gave up waiting)"
+        );
+        assert!(run.outcome.abandoned);
+        assert!(!run.truncated);
+        assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn late_detaching_holder_is_still_abandoned_not_group_killed() {
+        if !setsid_available() {
+            return;
+        }
+        let (_dir, marker) = marker_dir();
+        let script = "(sleep 0.3; exec setsid sh -c ': > \"$1\"; exec sleep 30' sh \"$1\") & i=0; while [ ! -e \"$1\" ]; do i=$((i+1)); [ \"$i\" -gt 500 ] && exit 97; sleep 0.01; done; exit 0";
+        let run = spawn_ndjson(
+            &[
+                "sh".into(),
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                marker.clone(),
+            ],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(Path::new(&marker).exists(), "late holder never detached");
         assert!(run.outcome.abandoned);
         assert!(!run.truncated);
         assert_readers_exit_within_margin();
