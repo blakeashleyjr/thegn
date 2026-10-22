@@ -52,12 +52,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    git push origin v<version>
    ```
 
-   Release tags must be annotated, SemVer-shaped, and equal `v<workspace
-version>`. The `admit` job runs in the protected `release-admission`
-   environment; no job with write permission starts until that approval. One-time
-   owner setup: create `release-admission` with a required reviewer and a
-   deployment rule limited to `v*` tags, and create a tag ruleset that restricts
-   creating, updating, and deleting `v*` tags to maintainers.
+   Release tags must be annotated, SemVer-shaped, and equal
+   `v<workspace version>`. The `admit` job runs in the protected
+   `release-admission` environment; no job with write permission starts until
+   that approval. One-time owner setup: create `release-admission` with a
+   required reviewer and a deployment rule allowing the protected `main`
+   branch and `v*` tags, and create a tag ruleset that restricts creating,
+   updating, and deleting `v*` tags to maintainers.
 
    The [`release`](.github/workflows/release.yml) workflow builds the `thegn`
    binary for **x86_64 linux (gnu + musl)** and **aarch64-apple-darwin** in
