@@ -271,8 +271,9 @@ fn hash_plan_field(hash: &mut Sha256, name: &str, value: &[u8]) {
     hash.update(value);
 }
 
-/// The VPN provider seam. One built-in impl ([`BuiltinProvider`]) dispatches on
-/// the resolved provider; external providers could plug in here later.
+/// The internal VPN dispatcher. One built-in impl ([`BuiltinProvider`])
+/// dispatches on the resolved provider kind; adding providers is core/service
+/// work.
 ///
 /// Methods are synchronous (blocking subprocess work, like
 /// `thegn_core::sandbox::ensure`); the host runs them off the event loop on a
