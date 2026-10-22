@@ -518,6 +518,7 @@ fn limits_json(cfg: &Config) -> serde_json::Value {
             limits.cpu_total.as_deref().unwrap_or("auto"), ncpu),
         "memory": limits.memory,
         "cpu_enforcement": cpu_cap_key(thegn_core::sandbox_cpucap::detect_cpu_cap()),
+        "cpu_scope_note": thegn_core::sandbox_cpucap::detected_scope_skipped_note(),
         "slice_live": live.as_ref().map(|l| serde_json::json!({
             "unit": thegn_core::sandbox_cpucap::CPU_SLICE,
             "cpu_quota": l.cpu_quota,
@@ -4647,6 +4648,9 @@ fn cpu_cap_report(cfg: &Config) {
             parts.join(" · "),
             mech.label_on(thegn_core::sandbox_backend::host_os())
         );
+        if let Some(note) = thegn_core::sandbox_cpucap::detected_scope_skipped_note() {
+            outln!("  cpu cap note  {note}");
+        }
     }
     // Memory is reported separately because the two halves mean different
     // things: per-pane is a hard `MemoryMax` (exceed it and the pane's tree is
