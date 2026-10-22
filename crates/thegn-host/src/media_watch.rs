@@ -19,6 +19,8 @@
 //! - **Respawn on stream end.** If the D-Bus signal stream ends (bus restart,
 //!   player teardown) the task re-resolves the backend with backoff rather than
 //!   dying permanently.
+//! - **Shutdown ownership.** Every watcher is registered so application
+//!   shutdown can abort and join it, including an unpolled replacement.
 
 use std::sync::atomic::Ordering;
 
@@ -28,6 +30,90 @@ use tokio::time::MissedTickBehavior;
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::MediaConfig;
 use thegn_core::media::{MediaSnapshot, MediaState};
+
+/// Every media watcher task this process started that has not finished, so
+/// application shutdown can abort and join them (THE-500 slice c).
+pub(crate) struct WatcherRegistry {
+    live: std::sync::Mutex<Vec<WatcherStop>>,
+}
+
+struct WatcherStop {
+    abort: tokio::task::AbortHandle,
+    /// Closed when the task's future is dropped (finished or aborted).
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl WatcherRegistry {
+    const fn new() -> Self {
+        Self {
+            live: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn spawn_tracked<F>(&self, future: F) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _done_signal = done_tx;
+            future.await;
+        });
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.retain_mut(|entry| {
+            !matches!(
+                entry.done.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            )
+        });
+        live.push(WatcherStop {
+            abort: handle.abort_handle(),
+            done: done_rx,
+        });
+        handle
+    }
+
+    async fn shutdown_until(&self, deadline: tokio::time::Instant) -> usize {
+        let stops = {
+            let mut live = self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *live)
+        };
+        join_stops(stops, deadline).await
+    }
+
+    #[cfg(test)]
+    fn live_len(&self) -> usize {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+pub(crate) static WATCHERS: WatcherRegistry = WatcherRegistry::new();
+
+async fn join_stops(stops: Vec<WatcherStop>, deadline: tokio::time::Instant) -> usize {
+    for stop in &stops {
+        stop.abort.abort();
+    }
+    let mut unsettled = 0;
+    for stop in stops {
+        if tokio::time::timeout_at(deadline, stop.done).await.is_err() {
+            unsettled += 1;
+        }
+    }
+    unsettled
+}
+
+pub(crate) async fn shutdown_watchers_until(deadline: tokio::time::Instant) -> usize {
+    WATCHERS.shutdown_until(deadline).await
+}
 
 /// Freshness of the most recent watcher delivery shown by the Media panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,7 +175,7 @@ pub(crate) fn spawn(
     if !cfg.enabled {
         return None;
     }
-    Some(tokio::spawn(async move {
+    Some(WATCHERS.spawn_tracked(async move {
         abort_and_join(previous).await;
         run(cfg, generation, tx, waker).await;
     }))
@@ -668,11 +754,119 @@ mod tests {
 
     use super::{
         FlapAction, Freshness, MediaHealth, MediaSnapshotDelivery, STREAM_STABILITY, WatchState,
-        abort_and_join, backoff_after_stream, drain_snapshots, failure_delivery, flap_action,
-        interval, jittered, join_within, next_push_wake, offer, reset_probe_on_activation,
-        should_confirm_flap, should_deliver, stale_grace,
+        WatcherRegistry, WatcherStop, abort_and_join, backoff_after_stream, drain_snapshots,
+        failure_delivery, flap_action, interval, jittered, join_stops, join_within, next_push_wake,
+        offer, reset_probe_on_activation, should_confirm_flap, should_deliver, stale_grace,
     };
     use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_a_silent_watcher() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let registry = WatcherRegistry::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        drop(registry.spawn_tracked(async move {
+            let _guard = DropFlag(task_dropped);
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+
+        assert_eq!(
+            registry
+                .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await,
+            0
+        );
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(registry.live_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaps_an_older_watcher_whose_replacement_never_ran() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let registry = WatcherRegistry::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle_a = registry.spawn_tracked(async move {
+            let _guard = DropFlag(task_dropped);
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let handle_b = registry.spawn_tracked(async move {
+            abort_and_join(Some(handle_a)).await;
+            std::future::pending::<()>().await;
+        });
+        handle_b.abort();
+
+        assert_eq!(
+            registry
+                .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await,
+            0
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "shutdown must still own watcher A after an unpolled replacement detached its handle"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_a_watcher_that_outlives_the_deadline() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let stop = WatcherStop {
+            abort,
+            done: done_rx,
+        };
+
+        assert_eq!(
+            join_stops(
+                vec![stop],
+                tokio::time::Instant::now() + std::time::Duration::from_millis(50)
+            )
+            .await,
+            1
+        );
+        drop(done_tx);
+    }
+
+    #[tokio::test]
+    async fn shutdown_registry_prunes_finished_watchers_on_spawn() {
+        let registry = WatcherRegistry::new();
+        registry.spawn_tracked(async {}).await.unwrap();
+        registry.spawn_tracked(std::future::pending::<()>()).abort();
+        assert_eq!(registry.live_len(), 1);
+        assert_eq!(
+            registry
+                .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await,
+            0
+        );
+    }
 
     #[test]
     fn confirms_only_on_the_disappear_edge() {
