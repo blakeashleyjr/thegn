@@ -854,6 +854,7 @@ where
     Ok(count)
 }
 
+#[cfg(test)]
 fn rerun_failed_for_number<F, R>(number: u64, output: F, rerun: R) -> Result<u32, GhError>
 where
     F: FnMut(&[&str]) -> Result<String, GhError>,
