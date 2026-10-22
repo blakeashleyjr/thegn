@@ -100,8 +100,7 @@ fn check_installed_provenance(
     }
 
     let mut bytes = Vec::new();
-    if let Err(error) = file
-        .by_ref()
+    if let Err(error) = std::io::Read::by_ref(&mut file)
         .take(PROVENANCE_RECORD_LIMIT)
         .read_to_end(&mut bytes)
     {
