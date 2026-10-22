@@ -676,6 +676,9 @@ pub struct AddError {
     /// the lock a concurrent create could be mid-flight on the same path, and
     /// a rollback would destroy ITS checkout and branch.
     pub lock_unavailable: bool,
+    /// A leftover rename intent journal could not be reconciled; the add was
+    /// refused before Git ran and no rollback may run.
+    pub rename_journal_pending: bool,
 }
 
 /// [`add`] with the failure reason returned instead of warned, for callers
@@ -732,9 +735,27 @@ pub fn add_checked_with_state(
                 branch_created: false,
                 destination_preexisted: false,
                 lock_unavailable: true,
+                rename_journal_pending: false,
             });
         }
     };
+    match reconcile_rename_intent_locked(root) {
+        Ok(Some(recovery)) => tracing::info!(
+            target: "thegn::worktree",
+            ?recovery,
+            "reconciled leftover rename intent before worktree creation"
+        ),
+        Ok(None) => {}
+        Err(reason) => {
+            return Err(AddError {
+                message: format!("refusing to create worktree for {branch}: {reason}"),
+                branch_created: false,
+                destination_preexisted: false,
+                lock_unavailable: false,
+                rename_journal_pending: true,
+            });
+        }
+    }
     // A pre-created destination (directory, file or symlink — `git worktree
     // add` happily adopts an empty directory) is never reused: it may be
     // another branch's checkout, a racing create, or unrelated user data.
@@ -752,6 +773,7 @@ pub fn add_checked_with_state(
             branch_created: false,
             destination_preexisted: true,
             lock_unavailable: false,
+            rename_journal_pending: false,
         });
     }
     let branch_preexisted = branch_exists(root, branch);
@@ -776,6 +798,7 @@ pub fn add_checked_with_state(
                 branch_created: !branch_preexisted && branch_exists(root, branch),
                 destination_preexisted: false,
                 lock_unavailable: false,
+                rename_journal_pending: false,
             })
         }
         Err(e) => Err(AddError {
@@ -783,6 +806,7 @@ pub fn add_checked_with_state(
             branch_created: !branch_preexisted && branch_exists(root, branch),
             destination_preexisted: false,
             lock_unavailable: false,
+            rename_journal_pending: false,
         }),
     }
 }
@@ -1227,7 +1251,9 @@ pub(crate) fn reconcile_rename_intent_locked(
 /// collision-resistant path allocated for the new branch (`git worktree
 /// move`). An owner-only intent journal records both exact paths before Git is
 /// mutated. A later call to [`reconcile_rename_intent`] classifies a leftover
-/// journal and rolls back the branch if a crash split the two Git steps.
+/// journal and rolls back the branch if a crash split the two Git steps. A
+/// later worktree creation also reconciles a leftover journal under the same
+/// repository mutation lock before checking its destination or running Git.
 ///
 /// Shared by the new-worktree wizard's finalize-name step and the sidebar's
 /// post-creation "rename worktree" action.
@@ -2346,6 +2372,131 @@ mod tests {
                 .unwrap()
                 .to_owned(),
         }
+    }
+
+    #[test]
+    fn create_reconciles_not_started_journal_first() {
+        let repo = temp_repo("create-reconciles-not-started");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        write_rename_intent(&repo, &rename_intent_for(&repo, &old_path, &cfg)).unwrap();
+        let path = allocate_worktree_path(&repo, "other", &cfg).unwrap();
+
+        add_checked_with_state(&repo, "other", "main", &path, &cfg).unwrap();
+
+        assert!(path.exists());
+        assert!(!rename_intent_path(&repo).exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn create_reconciles_completed_journal_first() {
+        let repo = temp_repo("create-reconciles-completed");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        let intent = rename_intent_for(&repo, &old_path, &cfg);
+        let new_path = PathBuf::from(&intent.new_path);
+        write_rename_intent(&repo, &intent).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "-m", "old", "new"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "move"])
+                .arg(&old_path)
+                .arg(&new_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = allocate_worktree_path(&repo, "other", &cfg).unwrap();
+
+        add_checked_with_state(&repo, "other", "main", &path, &cfg).unwrap();
+
+        assert!(path.exists());
+        assert!(new_path.exists());
+        assert!(!branch_exists(&repo, "old"));
+        assert!(branch_exists(&repo, "new"));
+        assert!(!rename_intent_path(&repo).exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn create_reconciles_split_journal_by_rolling_back() {
+        let repo = temp_repo("create-reconciles-split");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        write_rename_intent(&repo, &rename_intent_for(&repo, &old_path, &cfg)).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "-m", "old", "new"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = allocate_worktree_path(&repo, "other", &cfg).unwrap();
+
+        add_checked_with_state(&repo, "other", "main", &path, &cfg).unwrap();
+
+        assert!(path.exists());
+        assert!(branch_exists(&repo, "old"));
+        assert!(!branch_exists(&repo, "new"));
+        assert!(!rename_intent_path(&repo).exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn create_reconciles_ambiguous_journal_refuses() {
+        let repo = temp_repo("create-reconciles-ambiguous");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        write_rename_intent(&repo, &rename_intent_for(&repo, &old_path, &cfg)).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "new", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = allocate_worktree_path(&repo, "other", &cfg).unwrap();
+
+        let error = add_checked_with_state(&repo, "other", "main", &path, &cfg).unwrap_err();
+
+        assert!(error.rename_journal_pending);
+        assert!(!error.branch_created);
+        assert!(error.message.contains("journal kept"), "{}", error.message);
+        assert!(!path.exists());
+        assert!(!branch_exists(&repo, "other"));
+        assert!(rename_intent_path(&repo).exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn create_reconciles_malformed_journal_refuses() {
+        let repo = temp_repo("create-reconciles-malformed");
+        let cfg = scratch_cfg(&repo);
+        let old_path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &old_path, &cfg).unwrap();
+        let journal = rename_intent_path(&repo);
+        std::fs::write(&journal, b"not json").unwrap();
+        let path = allocate_worktree_path(&repo, "other", &cfg).unwrap();
+
+        let error = add_checked_with_state(&repo, "other", "main", &path, &cfg).unwrap_err();
+
+        assert!(error.rename_journal_pending);
+        assert!(error.message.contains("malformed rename intent"));
+        assert!(!path.exists());
+        assert!(!branch_exists(&repo, "other"));
+        assert!(journal.exists());
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
