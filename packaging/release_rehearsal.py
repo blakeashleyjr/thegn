@@ -130,6 +130,12 @@ def main(argv: list[str]) -> int:
             return 0
         for finding in findings:
             print(f"release-rehearsal: {finding}", file=sys.stderr)
+        if findings:
+            print(
+                "release-rehearsal: rerun with 'just release-verify <tag> host_only=1' "
+                "to rehearse the archive anyway",
+                file=sys.stderr,
+            )
         return 1 if findings else 0
     except RehearsalError as error:
         print(f"release-rehearsal: {error}", file=sys.stderr)

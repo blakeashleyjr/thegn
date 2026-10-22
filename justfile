@@ -1476,9 +1476,11 @@ release-verify tag host_only="":
     done
     manager="$(python3 packaging/release_rehearsal.py manager --target "$target")"
     python3 packaging/release.py validate --tag "$tag" --assets-dir "$out" --manager "$manager"
-    host_only_args=()
-    if [ -n "$host_only" ]; then host_only_args+=(--host-only); fi
-    python3 packaging/release_rehearsal.py check-binary --binary "$tmp/thegn" "${host_only_args[@]}"
+    if [ -n "$host_only" ]; then
+      python3 packaging/release_rehearsal.py check-binary --binary "$tmp/thegn" --host-only
+    else
+      python3 packaging/release_rehearsal.py check-binary --binary "$tmp/thegn"
+    fi
     got="$("$tmp/thegn" --version)"
     echo "runs: $got"
     case "$(uname -s)" in
