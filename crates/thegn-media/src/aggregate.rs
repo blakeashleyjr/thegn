@@ -150,6 +150,9 @@ impl MediaBackend for Aggregate {
                     }
                 };
                 for p in source_players {
+                    if !crate::model::is_valid_opaque_id(&p) {
+                        continue;
+                    }
                     if out.len() == crate::model::PLAYER_LIST_LIMIT {
                         break;
                     }
@@ -617,6 +620,23 @@ mod tests {
         );
 
         assert_eq!(aggregate.players().await, Ok(expected));
+    }
+
+    #[tokio::test]
+    async fn players_union_skips_invalid_names_before_the_cap() {
+        let valid_players = (0..crate::model::PLAYER_LIST_LIMIT)
+            .map(|index| format!("player-{index}"))
+            .collect::<Vec<_>>();
+        let child_players = std::iter::once(String::new())
+            .chain(std::iter::once("bad\u{7}".to_owned()))
+            .chain(valid_players.iter().cloned())
+            .collect();
+        let aggregate = Aggregate::new(
+            vec![players_backend(Ok(child_players), Ok(None))],
+            Vec::new(),
+        );
+
+        assert_eq!(aggregate.players().await, Ok(valid_players));
     }
 
     #[tokio::test]
