@@ -725,7 +725,7 @@ fn profile_db_path(paths: &ProfilePaths, default_state_home: &Path) -> PathBuf {
 fn dry_run_open_at(path: &Path, role: &str) -> Result<Option<Db>> {
     Db::open_read_only_current_at(path).with_context(|| {
         format!(
-            "open {role} profile database read-only at {}",
+            "open {role} profile database read-only at {} (or run the move without --dry-run)",
             path.display()
         )
     })
