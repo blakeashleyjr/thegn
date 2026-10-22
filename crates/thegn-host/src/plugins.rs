@@ -131,7 +131,10 @@ pub(crate) enum PluginMsg {
     /// explicit trust for their unsandboxed native execution.
     Refused(Vec<thegn_svc::plugin::loader::SpecProblem>),
     /// One resident session's stdout produced a line (or the session exited).
-    Event { plugin: String, event: SessionEvent },
+    Event {
+        plugin: String,
+        event: SessionEvent,
+    },
     /// One completed `spawn_ndjson` run of a one-shot plugin.
     OneShot {
         plugin: String,
@@ -142,6 +145,12 @@ pub(crate) enum PluginMsg {
     Respawned {
         plugin: String,
         writer: Option<SessionWriter>,
+    },
+    RespawnWorkerStartFailed {
+        plugin: String,
+    },
+    RetryRespawn {
+        plugin: LoadedPlugin,
     },
 }
 
@@ -173,19 +182,19 @@ pub(crate) fn restart_delay(restarts: u32) -> Option<Duration> {
 }
 
 fn report_host_start_failure(tx: &PluginTx, waker: &TerminalWaker, error: &std::io::Error) {
-    if let Err(error) = tx.send(PluginMsg::Loaded(Vec::new())) {
-        tracing::debug!(target: "thegn::plugin", %error, "plugin load message consumer is gone");
+    if let Err(send_error) = tx.send(PluginMsg::Loaded(Vec::new())) {
+        tracing::debug!(target: "thegn::plugin", %send_error, "plugin load message consumer is gone");
     }
-    if let Err(error) = tx.send(PluginMsg::Refused(vec![
+    if let Err(send_error) = tx.send(PluginMsg::Refused(vec![
         thegn_svc::plugin::loader::SpecProblem {
             plugin: "plugins".into(),
             problem: format!("plugin host thread failed to start: {error}; no plugin is running"),
         },
     ])) {
-        tracing::debug!(target: "thegn::plugin", %error, "plugin start failure consumer is gone");
+        tracing::debug!(target: "thegn::plugin", %send_error, "plugin start failure consumer is gone");
     }
-    if let Err(error) = waker.wake() {
-        tracing::debug!(target: "thegn::plugin", %error, "plugin start failure waker pulse failed");
+    if let Err(wake_error) = waker.wake() {
+        tracing::debug!(target: "thegn::plugin", %wake_error, "plugin start failure waker pulse failed");
     }
 }
 
@@ -199,18 +208,18 @@ fn report_poll_start_failure(
     if !failed.insert(plugin.to_string()) {
         return false;
     }
-    if let Err(error) = tx.send(PluginMsg::Refused(vec![
+    if let Err(send_error) = tx.send(PluginMsg::Refused(vec![
         thegn_svc::plugin::loader::SpecProblem {
             plugin: plugin.into(),
             problem: format!("scheduled run failed to start: {error}"),
         },
     ])) {
-        tracing::debug!(target: "thegn::plugin", %error, "scheduled run failure consumer is gone");
+        tracing::debug!(target: "thegn::plugin", %send_error, "scheduled run failure consumer is gone");
     }
     if let Some(waker) = waker
-        && let Err(error) = waker.wake()
+        && let Err(wake_error) = waker.wake()
     {
-        tracing::debug!(target: "thegn::plugin", %error, "scheduled run failure waker pulse failed");
+        tracing::debug!(target: "thegn::plugin", %wake_error, "scheduled run failure waker pulse failed");
     }
     true
 }
@@ -444,6 +453,7 @@ pub(crate) struct PluginsHost {
     one_shot_gate: OneShotGate,
     state_anchor: PathBuf,
     respawns: Arc<RespawnTimers<LoadedPlugin>>,
+    retry_runtime: tokio::runtime::Handle,
 }
 
 /// Start the plugin host. A SETUP thread does discovery (fs I/O) and spawns
@@ -473,6 +483,7 @@ pub(crate) fn spawn_plugins_host(
         one_shot_gate: one_shot_gate.clone(),
         state_anchor: state_anchor.clone(),
         respawns,
+        retry_runtime: tokio::runtime::Handle::current(),
     };
     let spawn = std::thread::Builder::new()
         .name("thegn-plugins".into())
@@ -508,23 +519,41 @@ impl PluginsHost {
             state.worker = false;
             self.respawns.cv.notify_all();
         }
-        if let Err(error) = self.tx.send(PluginMsg::Refused(vec![
+        if let Err(send_error) = self.tx.send(PluginMsg::Refused(vec![
             thegn_svc::plugin::loader::SpecProblem {
                 plugin: id.into(),
                 problem: format!("restart worker failed to start: {error}"),
             },
         ])) {
-            tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "restart failure consumer is gone");
+            tracing::debug!(target: "thegn::plugin", plugin = %id, %send_error, "restart failure consumer is gone");
         }
-        if let Err(error) = self.tx.send(PluginMsg::Respawned {
-            plugin: id.into(),
-            writer: None,
-        }) {
-            tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "restart failure consumer is gone");
+        if let Err(send_error) = self
+            .tx
+            .send(PluginMsg::RespawnWorkerStartFailed { plugin: id.into() })
+        {
+            tracing::debug!(target: "thegn::plugin", plugin = %id, %send_error, "restart failure consumer is gone");
         }
-        if let Err(error) = self.waker.wake() {
-            tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "restart failure waker pulse failed");
+        if let Err(wake_error) = self.waker.wake() {
+            tracing::debug!(target: "thegn::plugin", plugin = %id, %wake_error, "restart failure waker pulse failed");
         }
+    }
+
+    pub(crate) fn retry_respawn_after_worker_start_failure(
+        &self,
+        plugin: LoadedPlugin,
+        delay: Duration,
+    ) {
+        let tx = self.tx.clone();
+        let waker = self.waker.clone();
+        self.retry_runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Err(send_error) = tx.send(PluginMsg::RetryRespawn { plugin }) {
+                tracing::debug!(target: "thegn::plugin", %send_error, "delayed restart consumer is gone");
+            }
+            if let Err(wake_error) = waker.wake() {
+                tracing::debug!(target: "thegn::plugin", %wake_error, "delayed restart waker pulse failed");
+            }
+        });
     }
 
     /// Schedule a resident plugin respawn after `delay` on the shared timer
@@ -1059,7 +1088,7 @@ fn setup_and_schedule_with_waker(
                         let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
                     }
                 }) {
-                    Ok(()) => {
+                    Ok(_handle) => {
                         failed_poll_starts.remove(&entry.plugin);
                     }
                     Err(error) => {
@@ -1159,6 +1188,7 @@ mod tests {
             one_shot_gate: OneShotGate::default(),
             state_anchor: PathBuf::new(),
             respawns: Arc::new(RespawnTimers::default()),
+            retry_runtime: runtime.handle().clone(),
         };
         let mut spec = example_spec();
         spec.manifest.id = PluginId::new("p");
@@ -1183,7 +1213,7 @@ mod tests {
             assert!(!state.worker);
         }
         let mut saw_refusal = false;
-        let mut saw_respawn = false;
+        let mut saw_start_failure = false;
         let mut message_order = Vec::new();
         for _ in 0..8 {
             match rx.try_recv() {
@@ -1194,19 +1224,54 @@ mod tests {
                     saw_refusal = true;
                     message_order.push("refused");
                 }
-                Ok(PluginMsg::Respawned { plugin, writer }) => {
+                Ok(PluginMsg::RespawnWorkerStartFailed { plugin }) => {
                     assert_eq!(plugin, "p");
-                    assert!(writer.is_none());
-                    saw_respawn = true;
-                    message_order.push("respawned");
+                    saw_start_failure = true;
+                    message_order.push("start-failed");
                 }
                 Err(_) => break,
                 Ok(_) => panic!("unexpected plugin message"),
             }
         }
         assert!(saw_refusal);
-        assert!(saw_respawn);
-        assert_eq!(message_order, ["refused", "respawned"]);
+        assert!(saw_start_failure);
+        assert_eq!(message_order, ["refused", "start-failed"]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_failure_respawn_worker_retry_waits_for_backoff() {
+        let runtime = tokio::runtime::Handle::current();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, mut rx) = plugin_channel();
+        let host = PluginsHost {
+            stop: Arc::new(StopSignal::default()),
+            supervisor: ResidentSupervisor::new(runtime.clone()),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            disabled: Arc::new(Mutex::new(Default::default())),
+            tx,
+            waker,
+            one_shot_gate: OneShotGate::default(),
+            state_anchor: PathBuf::new(),
+            respawns: Arc::new(RespawnTimers::default()),
+            retry_runtime: runtime,
+        };
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("p");
+        let plugin = LoadedPlugin {
+            spec,
+            dir: None,
+            trusted_native_ignored: false,
+        };
+
+        host.retry_respawn_after_worker_start_failure(plugin, Duration::from_secs(5));
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(rx.try_recv(), Ok(PluginMsg::RetryRespawn { .. })));
         assert!(rx.try_recv().is_err());
     }
 
@@ -1479,6 +1544,7 @@ mod tests {
             one_shot_gate: OneShotGate::default(),
             state_anchor: PathBuf::new(),
             respawns: Arc::new(RespawnTimers::default()),
+            retry_runtime: runtime.handle().clone(),
         });
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -1728,6 +1794,7 @@ mod tests {
             one_shot_gate: OneShotGate::default(),
             state_anchor: tmp.path().join("state"),
             respawns: Arc::new(RespawnTimers::default()),
+            retry_runtime: runtime.handle().clone(),
         };
         let mut spec = example_spec();
         spec.manifest.id = PluginId::new("single-flight");
