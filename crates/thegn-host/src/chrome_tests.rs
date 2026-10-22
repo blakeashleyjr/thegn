@@ -3663,3 +3663,58 @@ fn panel_drill_drag_hit_reports_overflow() {
         "an above-zone drag finds the first drill line past the staging path header"
     );
 }
+
+#[test]
+fn statusbar_media_badge_marks_a_stale_snapshot() {
+    let model = FrameModel {
+        panel: crate::panel::PanelData {
+            media: Some(thegn_core::media::MediaState {
+                player: "mpv".into(),
+                title: "Song".into(),
+                state: thegn_core::media::PlaybackState::Playing,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        media_stale: true,
+        ..Default::default()
+    };
+    let badge = statusbar_items(&model)
+        .into_iter()
+        .find(|(id, _)| *id == BarItemId::Badge(BarBadge::Media))
+        .expect("playing media has a statusbar badge");
+    let text: String = badge
+        .1
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect();
+    assert!(text.contains("stale"), "stale badge text: {text:?}");
+}
+
+#[test]
+fn statusbar_media_badge_fresh_has_no_stale_marker() {
+    // Positive control: a fresh snapshot must keep the existing badge text.
+    let model = FrameModel {
+        panel: crate::panel::PanelData {
+            media: Some(thegn_core::media::MediaState {
+                player: "mpv".into(),
+                title: "Song".into(),
+                state: thegn_core::media::PlaybackState::Playing,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        media_stale: false,
+        ..Default::default()
+    };
+    let badge = statusbar_items(&model)
+        .into_iter()
+        .find(|(id, _)| *id == BarItemId::Badge(BarBadge::Media))
+        .expect("playing media has a statusbar badge");
+    let text: String = badge
+        .1
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect();
+    assert!(!text.contains("stale"), "fresh badge text: {text:?}");
+}

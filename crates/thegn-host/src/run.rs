@@ -12107,6 +12107,8 @@ async fn event_loop<T: Terminal>(
             // on the next media push) and the `Some` vs `None` panel diff defeats
             // both the idle guard and the hunk-preview cache on every tick.
             next_model.panel.media = model.panel.media.take();
+            // Loop-owned watcher health follows its now-playing snapshot.
+            next_model.media_stale = model.media_stale;
             // Same contract for AI-account usage: loop-owned (the usage poller
             // pushes it), so hydration must carry it or the badge blanks on
             // every 2s tick and reappears only on the next poll.
@@ -13645,6 +13647,8 @@ async fn event_loop<T: Terminal>(
             media_position_visible,
             &mut last_media_full,
         );
+        model.media_stale = model.panel.media.is_some()
+            && panel_ui.media.health == crate::media_watch::MediaHealth::Degraded;
         if let Some(outcome) = crate::media_ctl::take_op_outcome() {
             model.status = outcome.status_text().into();
             dirty = true;
