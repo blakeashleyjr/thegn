@@ -344,6 +344,21 @@ pub fn bounded_window(text: &str, max_lines: usize, max_bytes: usize) -> (String
     )
 }
 
+/// Redact and window a log for a reader. A caller's `requested_lines` can only
+/// narrow the configured policy; both limits stay under the hard ceilings.
+pub fn served_window(
+    text: &str,
+    requested_lines: Option<usize>,
+    policy_lines: usize,
+    policy_bytes: usize,
+) -> (String, bool) {
+    let lines = requested_lines
+        .map_or(policy_lines, |requested| requested.min(policy_lines))
+        .min(HARD_MAX_LOG_LINES);
+    let bytes = policy_bytes.min(HARD_MAX_LOG_BYTES);
+    bounded_window(&redact(text), lines, bytes)
+}
+
 fn build_bounded_window(
     chunks: &[&str],
     anchor: usize,
@@ -584,6 +599,45 @@ fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn served_window_never_widens_past_the_configured_policy() {
+        let text = (0..50).map(|n| format!("line {n}\n")).collect::<String>();
+
+        let (served, truncated) = served_window(&text, Some(40), 10, 1 << 20);
+
+        assert_eq!(served.lines().count(), 10);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn served_window_narrows_on_request() {
+        let text = (0..50).map(|n| format!("line {n}\n")).collect::<String>();
+
+        let (narrowed, narrowed_truncated) = served_window(&text, Some(3), 10, 1 << 20);
+        let (policy, policy_truncated) = served_window(&text, None, 10, 1 << 20);
+
+        assert_eq!(narrowed.lines().count(), 3);
+        assert!(narrowed_truncated);
+        assert_eq!(policy.lines().count(), 10);
+        assert!(policy_truncated);
+    }
+
+    #[test]
+    fn served_window_redacts_cached_text() {
+        let (served, _) = served_window("token=plain-secret\nok\n", None, 100, 4096);
+
+        assert!(!served.contains("plain-secret"));
+        assert!(served.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn served_window_clamps_to_hard_caps() {
+        assert_eq!(
+            served_window("a\n", None, usize::MAX, usize::MAX),
+            ("a\n".to_string(), false)
+        );
+    }
 
     #[test]
     fn tail_keeps_newest_complete_lines_and_marks_truncation() {

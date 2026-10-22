@@ -626,13 +626,11 @@ pub(crate) fn spawn_ci_detail(
                 })
             };
             if let Some(mut entry) = entry {
-                let redacted = thegn_core::ci_log::redact(&entry.text);
-                let (text, truncated) = thegn_core::ci_log::bounded_window(
-                    &redacted,
-                    cfg.log_tail_lines
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                    cfg.log_max_bytes
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                let (text, truncated) = thegn_core::ci_log::served_window(
+                    &entry.text,
+                    None,
+                    cfg.log_tail_lines,
+                    cfg.log_max_bytes,
                 );
                 entry.text = text;
                 entry.truncated |= truncated;
