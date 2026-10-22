@@ -2007,17 +2007,21 @@ fn connect_worktree_bridge(
         let env = cfg.resolve_env(&repo_root, &loc, &wt, env_name.as_deref());
         // For a managed provider, install and verify the resident bridge before
         // tunneling or connecting; a failed or unverified install skips both.
-        if matches!(env.placement, thegn_core::placement::Placement::Provider(_))
-            && let Some(bin) = crate::bridge_sup::bridge_binary_path()
-            && !crate::agent::ensure_remote_bridge(
+        let bridge = if matches!(env.placement, thegn_core::placement::Placement::Provider(_)) {
+            let Some(bin) = crate::bridge_sup::bridge_binary_path() else {
+                return;
+            };
+            let Some(bridge) = crate::agent::ensure_remote_bridge(
                 &cfg,
                 env_name.as_deref().unwrap_or_default(),
                 &bin,
-                &crate::bridge_sup::remote_thegn(),
-            )
-        {
-            return;
-        }
+            ) else {
+                return;
+            };
+            Some(bridge)
+        } else {
+            None
+        };
         // Reverse host→sandbox tunnels, all over the resident bridge:
         //  • host services / host-bound MCP: each `[sandbox.home]
         //    reverse_forwards` spec → bind a sandbox port → a host target.
@@ -2050,6 +2054,7 @@ fn connect_worktree_bridge(
                 &cfg,
                 &env,
                 &p.id,
+                bridge.as_ref().expect("provider bridge was installed"),
                 &wt.to_string_lossy(),
                 tunnels,
             );
@@ -2058,6 +2063,7 @@ fn connect_worktree_bridge(
         // start the bridge over the native exec API instead of the vendor CLI.
         if let thegn_core::placement::Placement::Provider(p) = &env.placement
             && let Some(provider) = crate::agent::native_bridge_provider(&cfg, &env)
+            && let Some(bridge) = bridge.as_ref()
         {
             sup.connect_native(
                 &loc,
@@ -2065,11 +2071,12 @@ fn connect_worktree_bridge(
                 &wt.to_string_lossy(),
                 provider,
                 p.id.clone(),
+                bridge,
                 tokio::runtime::Handle::current(),
             );
             return;
         }
-        if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement) {
+        if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement, bridge.as_ref()) {
             sup.connect(&loc, &loc.path(), &wt.to_string_lossy(), cmd);
         }
     });
