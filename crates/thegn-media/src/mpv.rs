@@ -11,7 +11,10 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist, QueueItem};
+use crate::model::{
+    LoopMode, MAX_FIELD_BYTES, MAX_QUEUE_ITEMS, MediaKind, MediaState, PlaybackState, Playlist,
+    QueueItem, QueuePage,
+};
 use crate::{MediaBackend, MediaCaps, MediaError};
 
 pub struct MpvIpc {
@@ -122,9 +125,60 @@ fn queue_id(idx: usize, entry: &Value) -> String {
     }
 }
 
+fn clip_field(value: &str) -> String {
+    let mut boundary = value.len().min(MAX_FIELD_BYTES);
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_string()
+}
+
+fn queue_rows(entries: &[Value], limit: usize) -> Vec<QueueItem> {
+    let mut rows = Vec::with_capacity(limit.min(entries.len()));
+    for (i, entry) in entries.iter().enumerate().take(limit) {
+        let title = entry
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                entry
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
+            })
+            .map(clip_field)
+            .unwrap_or_default();
+        let is_current = entry
+            .get("current")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        rows.push(QueueItem {
+            id: queue_id(i, entry),
+            title,
+            artist: String::new(),
+            duration: None,
+            is_current,
+        });
+    }
+    rows
+}
+
 impl MpvIpc {
     pub fn new(socket: String) -> Self {
         Self { socket }
+    }
+
+    async fn playlist_entries(&self) -> Result<Value, MediaError> {
+        let list = self
+            .get("playlist")
+            .await?
+            .ok_or_else(|| MediaError::Backend("mpv playlist unavailable".into()))?;
+        if list.as_array().is_none() {
+            return Err(MediaError::Backend(
+                "mpv playlist has unexpected shape".into(),
+            ));
+        }
+        Ok(list)
     }
 
     /// Send one `{"command": ..., "request_id": 1}` and decode its reply.
@@ -382,43 +436,23 @@ impl MediaBackend for MpvIpc {
 
     fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
         Box::pin(async move {
-            let list = self
-                .get("playlist")
-                .await?
-                .ok_or_else(|| MediaError::Backend("mpv playlist unavailable".into()))?;
+            let list = self.playlist_entries().await?;
             let arr = list
                 .as_array()
                 .ok_or_else(|| MediaError::Backend("mpv playlist has unexpected shape".into()))?;
-            Ok(arr
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let title = entry
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            // Fall back to the file's basename.
-                            entry
-                                .get("filename")
-                                .and_then(|v| v.as_str())
-                                .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f).to_string())
-                        })
-                        .unwrap_or_default();
-                    let is_current = entry
-                        .get("current")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    QueueItem {
-                        id: queue_id(i, entry),
-                        title,
-                        artist: String::new(),
-                        duration: None,
-                        is_current,
-                    }
-                })
-                .collect())
+            Ok(queue_rows(arr, MAX_QUEUE_ITEMS))
+        })
+    }
+    fn queue_page(&self) -> BoxFuture<'_, Result<QueuePage, MediaError>> {
+        Box::pin(async move {
+            let list = self.playlist_entries().await?;
+            let arr = list
+                .as_array()
+                .ok_or_else(|| MediaError::Backend("mpv playlist has unexpected shape".into()))?;
+            Ok(QueuePage {
+                total: arr.len(),
+                items: queue_rows(arr, MAX_QUEUE_ITEMS),
+            })
         })
     }
     fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
@@ -573,20 +607,70 @@ mod tests {
         assert!(s.chars().count() <= MAX_REASON);
         assert!(!s.chars().any(char::is_control));
     }
+
+    #[test]
+    fn queue_rows_decode_at_most_the_limit() {
+        let entries = (0..7)
+            .map(|i| json!({"filename": format!("/m/{i}.mp3"), "id": i}))
+            .collect::<Vec<_>>();
+        let rows = queue_rows(&entries, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.capacity() <= 3);
+        assert_eq!(rows[0].id, "0:0");
+        assert_eq!(rows[1].id, "1:1");
+        assert_eq!(rows[2].id, "2:2");
+    }
+
+    #[test]
+    fn queue_rows_clip_titles_to_the_field_budget() {
+        let expected = "a".repeat(MAX_FIELD_BYTES - 1);
+        let title = format!("{expected}éb");
+        let filename = format!("/m/{title}");
+        let entries = vec![json!({"title": title}), json!({"filename": filename})];
+        let rows = queue_rows(&entries, entries.len());
+        assert!(rows[0].title.len() <= MAX_FIELD_BYTES);
+        assert_eq!(rows[0].title, expected);
+        assert!(rows[1].title.len() <= MAX_FIELD_BYTES);
+        assert_eq!(rows[1].title, expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queue_page_reports_the_playlist_total_and_caps_the_rows() {
+        use super::socket_tests::{err, ok, serve};
+
+        let playlist = (0..MAX_QUEUE_ITEMS + 3)
+            .map(|i| json!({"filename": format!("/m/{i}.mp3"), "id": i}))
+            .collect::<Vec<_>>();
+        let payload = json!(playlist);
+        let (_dir, mpv, _seen) = serve(move |_| Some(vec![ok(payload.clone())]));
+        let page = mpv.queue_page().await.unwrap();
+        assert_eq!(page.items.len(), MAX_QUEUE_ITEMS);
+        assert_eq!(page.total, MAX_QUEUE_ITEMS + 3);
+        assert_eq!(
+            page.items[MAX_QUEUE_ITEMS - 1].id,
+            format!("{}:{}", MAX_QUEUE_ITEMS - 1, MAX_QUEUE_ITEMS - 1)
+        );
+
+        let (_dir, unavailable, _seen) = serve(|_| Some(vec![err("property unavailable")]));
+        assert!(unavailable.queue_page().await.is_err());
+        let (_dir, unexpected, _seen) = serve(|_| Some(vec![ok(json!("oops"))]));
+        assert!(unexpected.queue_page().await.is_err());
+    }
 }
 
 #[cfg(all(test, unix))]
-mod socket_tests {
+pub(super) mod socket_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    type Seen = Arc<Mutex<Vec<Value>>>;
+    pub(super) type Seen = Arc<Mutex<Vec<Value>>>;
 
     /// Fake mpv: one request per connection. `handler` maps the command array
     /// to the raw lines to send back, or `None` to drop the connection.
-    fn serve<F>(handler: F) -> (tempfile::TempDir, MpvIpc, Seen)
+    pub(super) fn serve<F>(handler: F) -> (tempfile::TempDir, MpvIpc, Seen)
     where
         F: Fn(&Value) -> Option<Vec<String>> + Send + Sync + 'static,
     {
@@ -623,13 +707,13 @@ mod socket_tests {
         (dir, mpv, seen)
     }
 
-    fn ok(data: Value) -> String {
+    pub(super) fn ok(data: Value) -> String {
         json!({"request_id": 1, "error": "success", "data": data}).to_string()
     }
     fn ok_nodata() -> String {
         json!({"request_id": 1, "error": "success"}).to_string()
     }
-    fn err(reason: &str) -> String {
+    pub(super) fn err(reason: &str) -> String {
         json!({"request_id": 1, "error": reason}).to_string()
     }
 
