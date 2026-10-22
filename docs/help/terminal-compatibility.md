@@ -57,7 +57,8 @@ is not the emulator pinned by the batteries package. macOS font-picker and
 alternate-emulator parity remain deferred until they have a macOS host
 rehearsal.
 
-The Linux standalone installer supports `./install.sh --batteries`: it reuses
+From a source checkout, the Linux installer `./install.sh --batteries` (it
+builds thegn with Cargo and is not part of the release archive) reuses
 host Alacritty or builds pinned Alacritty 0.17.0 user-local, verifies the
 FiraCode Nerd Font v3.5.0 archive by SHA-256 before installing its TTF files
 under `~/.local/share/fonts/thegn-nerd-fonts`, and creates a writable

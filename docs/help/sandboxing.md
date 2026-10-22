@@ -233,6 +233,11 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
 > host; `bwrap`/`systemd` are Linux-only.
 
+> **Platform status:** the public alpha supports Linux on x86_64, where
+> `bwrap`, `systemd`, podman and docker are the backends to use. The `apple`
+> backend and macOS are best-effort; the Windows `jobobject` and `wsl` entries
+> are not supported in this alpha.
+
 `thegn doctor` reports which backends this machine actually has.
 
 ## Devcontainers

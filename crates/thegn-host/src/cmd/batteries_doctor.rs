@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-const REMEDIATION: &str = "run ./install.sh --batteries from a thegn checkout, or nix run github:blakeashleyjr/thegn#batteries";
+const REMEDIATION: &str = "from a thegn source checkout run ./install.sh --batteries (the release archive does not include it), or nix run github:blakeashleyjr/thegn#batteries";
 const MARKER_LIMIT: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,7 +388,7 @@ pub fn json(report: &BatteriesReport) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatteriesEnv, ComponentState, inspect_with, lines};
+    use super::{BatteriesEnv, ComponentState, REMEDIATION, inspect_with, lines};
     use std::fs;
 
     fn write_executable(path: &std::path::Path) {
@@ -444,6 +444,12 @@ mod tests {
                     .is_some_and(|fix| fix.contains("./install.sh --batteries"))
             );
         }
+    }
+
+    #[test]
+    fn remediation_names_the_source_checkout() {
+        assert!(REMEDIATION.contains("source checkout"));
+        assert!(REMEDIATION.contains("release archive"));
     }
 
     #[test]
