@@ -25,8 +25,9 @@ actions: [pr-open, pr-create]
 4. Act from the panel's _pr_ section: `A` approves and `o` opens the PR in
    your browser. `M` opens a merge-method menu (squash is the default) and
    lists blockers; `c` comments when a PR exists and asks
-   before creating one otherwise. `r` needs a PR. Enter on an OPEN PRS row
-   opens that PR read-only; Enter on the branch PR opens its PR view;
+   before creating one otherwise. `r` needs a PR and re-runs only the failed
+   workflow runs of the PR's current head commit. Enter on an OPEN PRS row opens
+   that PR read-only; Enter on the branch PR opens its PR view;
    Full shows its two-column page: header and checks beside threads and OPEN
    PRS. Or run `gh` in the pane, or open the PR view for the conversation
    feed. The palette's **PR — open in browser** action (`pr-open`) does the
