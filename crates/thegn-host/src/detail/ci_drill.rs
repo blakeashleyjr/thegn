@@ -18,12 +18,29 @@ use thegn_core::theme::Hue;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiDetailPayload {
     pub run: thegn_core::ci::CiRun,
+    /// The worktree the fetch ran against; a drill fills only from its own worktree.
+    pub origin: std::path::PathBuf,
     pub discarded_jobs: usize,
     pub incomplete: Option<String>,
     pub log_tail: Vec<String>,
     /// Cache metadata for each displayed failed-job excerpt.  The text is
     /// already bounded and redacted by the producer.
     pub log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
+}
+
+/// The CI drill fetch in flight: which run, and the worktree it is fetched
+/// against. `origin` is None until the caller that spawns the fetch binds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CiPending {
+    pub(crate) run_id: String,
+    pub(crate) origin: Option<std::path::PathBuf>,
+}
+
+/// A drilled run still in flight and the worktree its fills came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveCi {
+    pub(crate) run: thegn_core::ci::CiRun,
+    pub(crate) origin: std::path::PathBuf,
 }
 
 /// Glyph + marker tone for a CI state — caps-routed so it degrades to ASCII.
@@ -123,23 +140,40 @@ impl DetailOverlay {
         self.hint = None;
         self.scroll = 0;
         self.sel = 0;
-        self.pending_ci = Some(run.id.clone());
+        self.pending_ci = Some(CiPending {
+            run_id: run.id.clone(),
+            origin: None,
+        });
         self.live_ci = None;
         self.ci_autofix = None;
     }
 
+    /// Bind the outstanding drill fetch to the worktree its worker will read.
+    pub(crate) fn bind_ci_origin(&mut self, run_id: &str, origin: &std::path::Path) -> bool {
+        if let Some(pending) = self.pending_ci.as_mut()
+            && pending.run_id == run_id
+        {
+            pending.origin = Some(origin.to_path_buf());
+            return true;
+        }
+        false
+    }
+
     /// The drilled run to re-poll while it's still in flight (live drill
     /// updates, ridden by the loop's CI tick): re-arms `pending_ci` so the
-    /// refreshed fill lands, and returns the run for the off-loop fetch.
+    /// refreshed fill lands, and returns the run and its origin for the fetch.
     /// `None` when the drill is closed, a fetch is already in flight, or the
     /// run has reached a terminal state.
-    pub(crate) fn live_ci_repoll(&mut self) -> Option<thegn_core::ci::CiRun> {
+    pub(crate) fn live_ci_repoll(&mut self) -> Option<(thegn_core::ci::CiRun, std::path::PathBuf)> {
         if self.pending_ci.is_some() {
             return None;
         }
-        let run = self.live_ci.clone()?;
-        self.pending_ci = Some(run.id.clone());
-        Some(run)
+        let live = self.live_ci.clone()?;
+        self.pending_ci = Some(CiPending {
+            run_id: live.run.id.clone(),
+            origin: Some(live.origin.clone()),
+        });
+        Some((live.run, live.origin))
     }
 
     /// Replace the drilled CI view with the fully-fetched run: header + per-job
@@ -153,6 +187,7 @@ impl DetailOverlay {
         log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
         incomplete: Option<&str>,
     ) {
+        let origin = self.pending_ci.take().and_then(|pending| pending.origin);
         let now = thegn_core::util::now();
         let mut secs = vec![ci_header_section(run)];
         let mut note_parts = Vec::new();
@@ -249,10 +284,13 @@ impl DetailOverlay {
         self.rows = self.content_rows().clamp(3, 22);
         // A live re-fill of the same in-flight run keeps the user's scroll
         // position; a fresh drill starts at the top.
-        if self.live_ci.as_ref().is_none_or(|r| r.id != run.id) {
+        if self
+            .live_ci
+            .as_ref()
+            .is_none_or(|live| live.run.id != run.id)
+        {
             self.scroll = 0;
         }
-        self.pending_ci = None;
         // A single `f` action authorizes the first available failed-job entry;
         // its complete candidate identity is carried into the blocking worker.
         // Entries without text or a head SHA fail closed and never become UI
@@ -272,7 +310,14 @@ impl DetailOverlay {
                 })
         };
         // Keep re-polling until the run settles (live drill updates).
-        self.live_ci = (!run.state.is_terminal()).then(|| run.clone());
+        self.live_ci = if run.state.is_terminal() {
+            None
+        } else {
+            origin.map(|origin| LiveCi {
+                run: run.clone(),
+                origin,
+            })
+        };
     }
 }
 
@@ -309,7 +354,10 @@ pub(crate) fn overlay_for_run(run: &thegn_core::ci::CiRun) -> DetailOverlay {
 /// filled the overlay, so the loop can mark the frame dirty to repaint it.
 pub fn apply_ci_detail(slot: &mut Option<DetailOverlay>, payload: CiDetailPayload) -> bool {
     if let Some(ov) = slot.as_mut()
-        && ov.pending_ci.as_deref() == Some(payload.run.id.as_str())
+        && ov.pending_ci.as_ref().is_some_and(|pending| {
+            pending.run_id == payload.run.id
+                && pending.origin.as_deref() == Some(payload.origin.as_path())
+        })
     {
         ov.set_ci_detail(
             &payload.run,
@@ -330,6 +378,7 @@ mod tests {
     use crate::compositor::Rect;
     use crate::detail::{DetailAction, DetailContent, DetailOutcome, StatusCtx, open_detail_for};
     use crate::telemetry::TelemetryHistory;
+    use std::path::{Path, PathBuf};
     use termwiz::input::{KeyCode, Modifiers};
 
     fn item_at(y: usize) -> Rect {
@@ -392,7 +441,13 @@ mod tests {
             other => panic!("expected in-place drill, got {other:?}"),
         }
         assert!(matches!(ov.content, DetailContent::Sections(_)));
-        assert_eq!(ov.pending_ci.as_deref(), Some("42"));
+        assert_eq!(
+            ov.pending_ci
+                .as_ref()
+                .map(|pending| pending.run_id.as_str()),
+            Some("42")
+        );
+        assert!(ov.bind_ci_origin("42", Path::new("/wt/repo")));
 
         // A stale result for a different run is ignored (user drilled elsewhere).
         let mut slot = Some(ov);
@@ -403,6 +458,7 @@ mod tests {
                     id: "999".into(),
                     ..run.clone()
                 },
+                origin: "/wt/repo".into(),
                 discarded_jobs: 0,
                 incomplete: None,
                 log_tail: vec![],
@@ -410,7 +466,8 @@ mod tests {
             },
         );
         assert_eq!(
-            slot.as_ref().and_then(|o| o.pending_ci.as_deref()),
+            slot.as_ref()
+                .and_then(|o| o.pending_ci.as_ref().map(|pending| pending.run_id.as_str())),
             Some("42"),
             "stale fill must not land"
         );
@@ -435,6 +492,7 @@ mod tests {
             &mut slot,
             CiDetailPayload {
                 run: filled,
+                origin: "/wt/repo".into(),
                 discarded_jobs: 1,
                 incomplete: None,
                 log_tail: vec!["error: boom".into()],
@@ -501,14 +559,22 @@ mod tests {
         )
         .expect("ci badge opens");
         ov.enter_ci_view(&running);
+        assert!(ov.bind_ci_origin("7", Path::new("/wt/repo")));
         // While the first fetch is in flight, no repoll piles on.
         assert!(ov.live_ci_repoll().is_none());
         // A fill that's still running arms the live repoll…
         ov.set_ci_detail(&running, 0, vec![], vec![], None);
         ov.scroll = 3;
-        let again = ov.live_ci_repoll().expect("running run repolls");
+        let (again, origin) = ov.live_ci_repoll().expect("running run repolls");
         assert_eq!(again.id, "7");
-        assert_eq!(ov.pending_ci.as_deref(), Some("7"), "pending re-armed");
+        assert_eq!(origin, PathBuf::from("/wt/repo"));
+        assert_eq!(
+            ov.pending_ci
+                .as_ref()
+                .map(|pending| pending.run_id.as_str()),
+            Some("7"),
+            "pending re-armed"
+        );
         // …a live re-fill of the same run preserves the scroll position…
         ov.set_ci_detail(&running, 0, vec![], vec![], None);
         assert_eq!(ov.scroll, 3);
@@ -521,6 +587,96 @@ mod tests {
         assert!(
             ov.live_ci_repoll().is_none(),
             "terminal run stops repolling"
+        );
+    }
+
+    #[test]
+    fn late_detail_from_another_worktree_is_dropped() {
+        let run = thegn_core::ci::CiRun {
+            id: "42".into(),
+            ..Default::default()
+        };
+        let mut overlay = overlay_for_run(&run);
+        assert!(overlay.bind_ci_origin("42", Path::new("/wt/b")));
+        let mut slot = Some(overlay);
+        let payload = |origin: &str| CiDetailPayload {
+            run: run.clone(),
+            origin: origin.into(),
+            discarded_jobs: 0,
+            incomplete: None,
+            log_tail: Vec::new(),
+            log_entries: Vec::new(),
+        };
+
+        assert!(!apply_ci_detail(&mut slot, payload("/wt/a")));
+        assert_eq!(
+            slot.as_ref()
+                .and_then(|overlay| overlay.pending_ci.as_ref())
+                .map(|pending| pending.run_id.as_str()),
+            Some("42"),
+            "foreign-origin detail leaves the drill pending"
+        );
+        assert!(apply_ci_detail(&mut slot, payload("/wt/b")));
+    }
+
+    #[test]
+    fn unbound_drill_accepts_no_detail() {
+        let run = thegn_core::ci::CiRun {
+            id: "42".into(),
+            ..Default::default()
+        };
+        let overlay = overlay_for_run(&run);
+        let expected_pending = overlay.pending_ci.clone();
+        let mut slot = Some(overlay);
+        let payload = CiDetailPayload {
+            run,
+            origin: "/wt/any".into(),
+            discarded_jobs: 0,
+            incomplete: None,
+            log_tail: Vec::new(),
+            log_entries: Vec::new(),
+        };
+
+        assert!(!apply_ci_detail(&mut slot, payload));
+        assert_eq!(
+            slot.as_ref()
+                .and_then(|overlay| overlay.pending_ci.as_ref()),
+            expected_pending.as_ref(),
+            "unbound drill keeps its pending identity"
+        );
+    }
+
+    #[test]
+    fn live_repoll_keeps_the_drill_origin() {
+        let run = thegn_core::ci::CiRun {
+            id: "7".into(),
+            state: thegn_core::ci::CiState::Running,
+            ..Default::default()
+        };
+        let mut overlay = overlay_for_run(&run);
+        assert!(overlay.bind_ci_origin("7", Path::new("/wt/a")));
+        let mut slot = Some(overlay);
+        assert!(apply_ci_detail(
+            &mut slot,
+            CiDetailPayload {
+                run: run.clone(),
+                origin: "/wt/a".into(),
+                discarded_jobs: 0,
+                incomplete: None,
+                log_tail: Vec::new(),
+                log_entries: Vec::new(),
+            }
+        ));
+        let overlay = slot.as_mut().expect("overlay remains after fill");
+        let (again, origin) = overlay.live_ci_repoll().expect("running run repolls");
+        assert_eq!(again.id, "7");
+        assert_eq!(origin, PathBuf::from("/wt/a"));
+        assert_eq!(
+            overlay.pending_ci,
+            Some(CiPending {
+                run_id: "7".into(),
+                origin: Some(PathBuf::from("/wt/a")),
+            })
         );
     }
 
@@ -556,11 +712,13 @@ mod tests {
             overlay.handle_key(&KeyCode::Enter, Modifiers::NONE),
             DetailOutcome::Act(DetailAction::DrillCiRun { .. })
         ));
+        assert!(overlay.bind_ci_origin("42", Path::new("/wt/repo")));
         let mut slot = Some(overlay);
         assert!(apply_ci_detail(
             &mut slot,
             CiDetailPayload {
                 run,
+                origin: "/wt/repo".into(),
                 discarded_jobs: 0,
                 incomplete: Some("job list stopped after 50 pages (page budget)".into()),
                 log_tail: Vec::new(),
