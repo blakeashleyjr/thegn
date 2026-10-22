@@ -94,6 +94,7 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
     let kinds: std::collections::BTreeSet<&str> =
         envs.iter().map(|(_, pc)| pc.provider.trim()).collect();
     for kind in kinds {
+        let mut kept = crate::reaper_policy::KeptReport::default();
         let lease = match crate::reaper_policy::try_reaper_lease(kind) {
             Ok(Some(lease)) => lease,
             Ok(None) => {
@@ -101,9 +102,10 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
                 continue;
             }
             Err(reason) => {
-                thegn_core::msg::warn(&format!(
+                kept.keep(kind, format!(
                     "vps reaper: skipped {kind}: {reason}; no provider or ledger actions attempted"
                 ));
+                kept.publish(kind);
                 continue;
             }
         };
@@ -112,16 +114,20 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
             envs.iter()
                 .filter(|(_, pc)| pc.provider.trim() == kind)
                 .map(|(_, pc)| pc),
-            reap_unambiguous,
+            |pc| reap_unambiguous(pc, &mut kept),
         ) {
-            thegn_core::msg::warn(&format!(
+            kept.keep(kind, format!(
                 "vps reaper: quarantined {kind}: {reason}; no provider or ledger actions attempted"
             ));
         }
+        kept.publish(kind);
     }
 }
 
-fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
+fn reap_unambiguous(
+    pc: &thegn_core::config::EnvProviderConfig,
+    kept: &mut crate::reaper_policy::KeptReport,
+) {
     let kind = pc.provider.trim();
     // The outer gate permits exactly one account/policy per provider kind.
     // Failed or unavailable inventory must preserve all ownership records.
@@ -131,7 +137,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
     let ours_account = match probe.account() {
         Ok(account) => account,
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            kept.keep(kind, format!(
                 "vps reaper: skipped {kind}: provider account unavailable ({error:#}); no provider or ledger actions attempted"
             ));
             return;
@@ -140,7 +146,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
     let view = match registry::list_checked() {
         Ok(view) => view,
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            kept.keep(kind, format!(
                 "vps reaper: skipped {kind}: ledger unreadable ({error:#}); no provider or ledger actions attempted"
             ));
             return;
@@ -149,7 +155,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
     let ours_ctl = match vps::controller::controller_id() {
         Ok(id) => id,
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            kept.keep(kind, format!(
                 "vps reaper: skipped {kind}: controller id unavailable ({error:#}); no provider or ledger actions attempted"
             ));
             return;
@@ -160,7 +166,10 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
     {
         Ok(list) => list,
         Err(error) => {
-            tracing::debug!(target: "thegn::lifecycle", %error, "vps reap: list failed");
+            kept.keep(
+                kind,
+                format!("vps reaper: skipped {kind}: provider inventory unavailable ({error:#}); no provider or ledger actions attempted"),
+            );
             return;
         }
     };
@@ -175,10 +184,13 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         match owner_admission(class, state) {
             OwnerAdmission::Proceed => {}
             OwnerAdmission::Quarantine(reason) => {
-                thegn_core::msg::warn(&format!(
-                    "vps reaper: quarantined {}: {reason}; no deletion attempted",
-                    inst.name
-                ));
+                kept.keep(
+                    &inst.name,
+                    format!(
+                        "vps reaper: quarantined {}: {reason}; no deletion attempted",
+                        inst.name
+                    ),
+                );
                 continue;
             }
             OwnerAdmission::Skip => {
@@ -193,7 +205,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         let record = match state {
             LedgerState::Recorded(record) => Some(record),
             LedgerState::Unreadable => {
-                thegn_core::msg::warn(&format!(
+                kept.keep(&inst.name, format!(
                     "vps reaper: quarantined {}: ledger record unreadable; reconcile ownership; no deletion attempted",
                     inst.name
                 ));
@@ -202,7 +214,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             LedgerState::Absent => None,
         };
         if record.is_some_and(|record| !record_account_matches(record, &ours_account)) {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&inst.name, format!(
                 "vps reaper: quarantined {}: the ledger record belongs to another provider account; reconcile ownership; no deletion attempted",
                 inst.name
             ));
@@ -213,14 +225,14 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             && record
                 .is_some_and(|record| record.state == "creating" && record.instance_id.is_empty())
         {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&inst.name, format!(
                 "vps reaper: quarantined {}: bake source with an unfinalized ledger record; destroy it with the provider console or `thegn env image-bake` cleanup; no deletion attempted",
                 inst.name
             ));
             continue;
         }
         if record.is_some_and(|record| !recorded_identity_matches(record, kind, &inst.id)) {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&inst.name, format!(
                 "vps reaper: quarantined {}: inventory identity differs from the ledger; reconcile ownership; no deletion attempted",
                 inst.name
             ));
@@ -233,7 +245,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             orphan_age_for(state),
         );
         if !admit_reap(decision, |reason| {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&inst.name, format!(
                 "vps reaper: quarantined {}: {reason}; no deletion attempted; next pass will retry",
                 inst.name
             ));
@@ -247,7 +259,7 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         if let Some(p) = crate::provider_factory::vps_provider_for(pc, &inst.name) {
             if let Err(error) = crate::remote_enqueue_auth::revoke_for_sandbox(pc, &inst.name, None)
             {
-                thegn_core::msg::warn(&format!(
+                kept.keep(&inst.name, format!(
                     "vps reaper: refusing to destroy {} because route-to-host credential revocation failed: {error:#}",
                     inst.name
                 ));
@@ -264,16 +276,19 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
                         let _ = db.delete_pool_spare(&inst.name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     }
                 }
-                Err(e) => thegn_core::msg::warn(&format!(
-                    "vps reaper: destroy {} failed: {e}; will retry next pass",
-                    inst.name
-                )),
+                Err(e) => kept.keep(
+                    &inst.name,
+                    format!(
+                        "vps reaper: destroy {} failed: {e}; will retry next pass",
+                        inst.name
+                    ),
+                ),
             }
         }
     }
     // Only this successfully reconciled kind can retire absent ledger rows.
     let records = cleanup_candidates(view.records, kind, &ours_account);
-    cleanup_ledger(&records, &live_anywhere);
+    cleanup_ledger(&records, &live_anywhere, kept);
 }
 
 pub(crate) fn record_account_matches(record: &registry::VpsRecord, ours: &str) -> bool {
@@ -398,13 +413,17 @@ fn should_drop_record(
 /// Drop ledger records with no live instance ANYWHERE (across all accounts of
 /// the same kind): stale `creating` (the POST never landed) or a `ready` record
 /// whose instance is gone out-of-band.
-fn cleanup_ledger(records: &[registry::VpsRecord], live: &std::collections::HashSet<String>) {
+fn cleanup_ledger(
+    records: &[registry::VpsRecord],
+    live: &std::collections::HashSet<String>,
+    kept: &mut crate::reaper_policy::KeptReport,
+) {
     let now = thegn_core::util::now();
     for rec in records {
         if rec.state == "creating"
             && thegn_core::time_policy::age_seconds(now, rec.created_at).is_none()
         {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&rec.name, format!(
                 "vps reaper: quarantined ledger {}: invalid/future intent time; reconcile inventory; record retained",
                 rec.name
             ));
