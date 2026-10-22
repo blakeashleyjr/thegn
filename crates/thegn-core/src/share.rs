@@ -10,8 +10,8 @@
 //!
 //! Provider knowledge is split exactly as the VPN seam: the config shape lives
 //! in [`crate::config`], the resolved [`ShareSpec`] here, and the plan builders
-//! plus subprocess I/O in `thegn-svc`. `bore` is the first backend; the
-//! [`ShareProviderKind`] enum reserves room for rathole/zrok/ngrok/iroh.
+//! plus subprocess I/O in `thegn-svc`. The [`ShareProviderKind`] enum lists the
+//! built-in backends; it reserves nothing.
 
 use crate::config::{
     BoreConfig, FrpConfig, IrohShareConfig, ShareConfig, ShareOnError, ShareProviderKind,

@@ -151,6 +151,10 @@ only inside their implementation files. Account routers accept
 dynamically-provided backends (`push_backend`) — how provider-as-plugin
 composes (§6).
 
+Share tunnels (`thegn_svc::share`) are not a seam: `ShareProvider` is a sealed
+internal dispatcher over the built-in bore/frp/tailscale/iroh backends, and
+share-provider plugins are intentionally unsupported (THE-329).
+
 **Gate:** `test/forge-leak-ratchet.txt` (4 impl files), `kind_coverage` per
 seam, `test/async-trait-ratchet.txt` (**empty and stays empty** — clippy's
 `-D warnings` catches a bare `async fn` in a public trait, and the allow
