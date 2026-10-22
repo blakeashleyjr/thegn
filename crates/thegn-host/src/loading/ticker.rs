@@ -75,7 +75,7 @@ impl SplashTicker {
             let tick = self.tick.clone();
             let period = self.period;
             std::thread::Builder::new()
-                .name("thegn-splash-tick".into())
+                .name("thegn-splash".into())
                 .spawn(move || {
                     loop {
                         std::thread::sleep(period);

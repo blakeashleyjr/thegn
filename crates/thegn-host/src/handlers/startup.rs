@@ -162,7 +162,7 @@ fn reap_legacy_projection_mounts() {
         }
 
         let spawn = std::thread::Builder::new()
-            .name("projection-reap".into())
+            .name("thegn-proj-reap".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 thegn_svc::projection::reap_legacy_mounts(&mounts_dir);
@@ -185,7 +185,7 @@ fn clear_stale_raised_hands() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         std::thread::Builder::new()
-            .name("attn-boot-clear".into())
+            .name("thegn-attn-boot".into())
             .spawn(|| {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 if let Ok(db) = thegn_core::db::Db::open() {

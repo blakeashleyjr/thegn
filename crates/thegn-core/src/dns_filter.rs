@@ -257,7 +257,7 @@ fn start_server(
     // best-effort: if the listener thread cannot spawn, the sandbox's DNS
     // queries fail fast (the socket drops with us) — surfaced, not silent.
     if let Err(e) = std::thread::Builder::new()
-        .name("dns-filter".into())
+        .name("thegn-dnsfilter".into())
         .spawn(move || {
             let resolver = policy.upstream.unwrap_or_else(find_system_resolver);
             let mut buf = [0u8; 512];
