@@ -757,9 +757,9 @@ mod cross_surface_tests {
 
     #[test]
     fn outer_model_flags_a_global_delete() {
-        let mut outer = OuterKit {
+        let mut outer = OuterKitty {
             shown: [11, 22].into_iter().collect(),
-            ..OuterKit::default()
+            ..OuterKitty::default()
         };
         outer.apply(b"\x1b_Ga=d\x1b\\");
         assert!(
@@ -802,7 +802,7 @@ mod cross_surface_tests {
         outer.apply(&chunked);
         assert_eq!(
             outer.shown,
-            [crate::graphics::PREVIEW_IMAGE_ID].into_iter().collect()
+            BTreeSet::from([crate::graphics::PREVIEW_IMAGE_ID])
         );
         assert_eq!(
             outer.log,
@@ -901,6 +901,7 @@ mod cross_surface_tests {
         wire.refuse = true;
         assert!(wire.submit(child_delete.clone()).is_err());
         wire.refuse = false;
+        // Child deletes relay directly through try_submit_oob, outside a retry slot.
         wire.submit(child_delete)
             .unwrap_or_else(|_| panic!("wire unexpectedly refused child delete"));
         wire.flush(&mut outer);
@@ -986,5 +987,13 @@ mod cross_surface_tests {
         pending.retry(|bytes| wire.submit(bytes));
         wire.flush(&mut outer);
         record_step(&outer, "preview occlusion", false, true);
+
+        let un_occluded = preview.frame(Some(panel()), Some("b.png"), false, true);
+        wire.refuse = true;
+        pending.offer(un_occluded, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        pending.retry(|bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "preview un-occlude", true, true);
     }
 }
