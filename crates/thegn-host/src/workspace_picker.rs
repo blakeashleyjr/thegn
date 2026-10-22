@@ -212,6 +212,8 @@ pub(crate) struct WorkspacePicker {
     /// Manual-entry field (kept across Tab toggles).
     manual: TextField,
     items: Vec<RepoEntry>,
+    /// Paths in `items`, so discovery and seed merges dedup in O(1) on the event loop.
+    item_paths: HashSet<String>,
     /// Already-registered workspace paths, kept out of both the seed and any
     /// discovery results streamed in later.
     excluded: HashSet<String>,
@@ -255,12 +257,14 @@ fn entry(path: String) -> RepoEntry {
 impl WorkspacePicker {
     pub(crate) fn new(seed: Vec<String>, excluded: HashSet<String>) -> Self {
         let (result_tx, result_rx) = tokio::sync::mpsc::channel(4);
+        let items = seed.into_iter().map(entry).collect::<Vec<_>>();
         let mut p = Self {
             mode: PickerMode::Fuzzy,
             phase: Phase::Browse,
             query: TextField::default(),
             manual: TextField::default(),
-            items: seed.into_iter().map(entry).collect(),
+            item_paths: items.iter().map(|item| item.path.clone()).collect(),
+            items,
             excluded,
             matches: Vec::new(),
             selected: 0,
@@ -321,14 +325,14 @@ impl WorkspacePicker {
 
     pub(crate) fn apply_db_seed(&mut self, seed: Vec<String>, excluded: HashSet<String>) {
         let mut items = seed.into_iter().map(entry).collect::<Vec<_>>();
+        let mut paths: HashSet<String> = items.iter().map(|item| item.path.clone()).collect();
         for existing in &self.items {
-            if !excluded.contains(&existing.path)
-                && !items.iter().any(|item| item.path == existing.path)
-            {
+            if !excluded.contains(&existing.path) && paths.insert(existing.path.clone()) {
                 items.push(existing.clone());
             }
         }
         self.items = items;
+        self.item_paths = paths;
         self.excluded = excluded;
         self.recompute();
     }
@@ -438,7 +442,7 @@ impl WorkspacePicker {
                 DiscoveryEvent::Batch { generation, paths } if generation == self.generation => {
                     changed = true;
                     for p in paths {
-                        if !self.excluded.contains(&p) && !self.items.iter().any(|e| e.path == p) {
+                        if !self.excluded.contains(&p) && self.item_paths.insert(p.clone()) {
                             self.items.push(entry(p));
                         }
                     }
@@ -1106,6 +1110,101 @@ mod tests {
         assert!(p.truncated, "the UI must retain partial scan state");
         // Idempotent: nothing new → no change.
         assert!(!p.drain_discovery());
+    }
+
+    #[test]
+    fn item_paths_track_items_through_seed_and_discovery() {
+        let mut p = picker(&["/a", "/b"]);
+        p.scanning = true;
+        p.generation = 7;
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/b".into(), "/c".into()],
+            })
+            .unwrap();
+        assert!(p.drain_discovery());
+
+        p.apply_db_seed(
+            vec!["/c".into(), "/d".into()],
+            HashSet::from(["/a".to_string()]),
+        );
+
+        let paths: Vec<&str> = p.items.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(paths, vec!["/c", "/d", "/b"]);
+        assert_eq!(
+            p.item_paths,
+            HashSet::from(["/c".to_string(), "/d".to_string(), "/b".to_string()])
+        );
+    }
+
+    #[test]
+    fn drain_discovery_dedups_twenty_thousand_paths_in_scan_order() {
+        let mut p = WorkspacePicker::new(vec!["/r/00007".into()], HashSet::new());
+        p.scanning = true;
+        p.generation = 7;
+
+        let mut next = 0;
+        let mut previous = None;
+        while next < 20_000 {
+            let mut batch = Vec::with_capacity(64);
+            if let Some(path) = previous.take() {
+                batch.push(path);
+            }
+            while batch.len() < 64 && next < 20_000 {
+                batch.push(format!("/r/{next:05}"));
+                next += 1;
+            }
+            previous = batch.last().cloned();
+            p.result_tx
+                .try_send(DiscoveryEvent::Batch {
+                    generation: 7,
+                    paths: batch,
+                })
+                .unwrap();
+            assert!(p.drain_discovery());
+        }
+
+        let paths: Vec<&str> = p.items.iter().map(|item| item.path.as_str()).collect();
+        let mut expected = vec!["/r/00007".to_string()];
+        expected.extend(
+            (0..20_000)
+                .filter(|index| *index != 7)
+                .map(|index| format!("/r/{index:05}")),
+        );
+        assert_eq!(
+            paths,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(p.items.len(), 20_000);
+        assert_eq!(p.item_paths.len(), 20_000);
+    }
+
+    #[test]
+    fn apply_db_seed_keeps_existing_items_once_after_the_seed() {
+        let mut p = picker(&["/x", "/y"]);
+        p.apply_db_seed(vec!["/y".into(), "/z".into()], HashSet::new());
+
+        let paths: Vec<&str> = p.items.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(paths, vec!["/y", "/z", "/x"]);
+    }
+
+    #[test]
+    fn drain_discovery_keeps_excluded_paths_out_of_items_and_index() {
+        let mut p = WorkspacePicker::new(Vec::new(), HashSet::from(["/excluded".to_string()]));
+        p.scanning = true;
+        p.generation = 7;
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/excluded".into(), "/included".into()],
+            })
+            .unwrap();
+
+        assert!(p.drain_discovery());
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].path, "/included");
+        assert_eq!(p.item_paths, HashSet::from(["/included".to_string()]));
     }
 
     #[test]
