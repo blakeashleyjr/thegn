@@ -11,7 +11,8 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
@@ -56,6 +57,55 @@ enum DiscoveryEvent {
 }
 
 static DISCOVERY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// One current scan plus one retiring scan; the owner may adjust this policy value.
+const MAX_LIVE_DISCOVERY_WORKERS: usize = 2;
+
+static LIVE_DISCOVERY_WORKERS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+fn live_discovery_workers() -> Arc<AtomicUsize> {
+    LIVE_DISCOVERY_WORKERS
+        .get_or_init(|| Arc::new(AtomicUsize::new(0)))
+        .clone()
+}
+
+struct DiscoverySlot {
+    live: Arc<AtomicUsize>,
+    waker: Option<TerminalWaker>,
+}
+
+impl Drop for DiscoverySlot {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        if let Some(waker) = self.waker.take()
+            && let Err(error) = waker.wake()
+        {
+            tracing::debug!(target: "thegn::workspace_picker", %error, "discovery slot release wake failed");
+        }
+    }
+}
+
+fn try_acquire_slot(
+    live: &Arc<AtomicUsize>,
+    cap: usize,
+    waker: Option<TerminalWaker>,
+) -> Option<DiscoverySlot> {
+    let mut current = live.load(Ordering::SeqCst);
+    loop {
+        if current >= cap {
+            return None;
+        }
+        match live.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {
+                return Some(DiscoverySlot {
+                    live: live.clone(),
+                    waker,
+                });
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// What a key delivered to the picker meant.
 #[derive(Debug, PartialEq, Eq)]
@@ -234,6 +284,10 @@ pub(crate) struct WorkspacePicker {
     truncated: bool,
     generation: u64,
     cancel: Option<Arc<AtomicBool>>,
+    /// Deferred scans retain only the newest request; the UI loop never joins workers.
+    deferred_discovery: Option<(thegn_core::config::Config, TerminalWaker)>,
+    /// Shared process-wide live worker count, replaceable in isolated tests.
+    live_workers: Arc<AtomicUsize>,
     scan_roots: Vec<String>,
     scan_depth: usize,
     result_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>,
@@ -284,6 +338,8 @@ impl WorkspacePicker {
             truncated: false,
             generation: 0,
             cancel: None,
+            deferred_discovery: None,
+            live_workers: live_discovery_workers(),
             scan_roots: Vec::new(),
             scan_depth: 0,
             result_tx,
@@ -378,7 +434,8 @@ impl WorkspacePicker {
     }
 
     /// Kick the (potentially slow — it walks every `repo_roots` tree) repo
-    /// scan on `spawn_blocking`; results land via [`drain_discovery`].
+    /// scan on `spawn_blocking`; at most two workers stay live, and a newer
+    /// request waits for a slot without blocking or joining on the UI loop.
     ///
     /// [`drain_discovery`]: WorkspacePicker::drain_discovery
     pub(crate) fn spawn_discovery(
@@ -390,7 +447,7 @@ impl WorkspacePicker {
         let generation = DISCOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        self.result_tx = tx.clone();
+        self.result_tx = tx;
         self.result_rx = rx;
         self.generation = generation;
         self.cancel = Some(cancel.clone());
@@ -398,7 +455,29 @@ impl WorkspacePicker {
         self.scan_depth = cfg.repo_scan_depth;
         self.truncated = false;
         self.scanning = true;
+        if let Some(slot) = try_acquire_slot(
+            &self.live_workers,
+            MAX_LIVE_DISCOVERY_WORKERS,
+            Some(waker.clone()),
+        ) {
+            self.deferred_discovery = None;
+            self.start_scan(cfg, waker, slot, cancel);
+        } else {
+            self.deferred_discovery = Some((cfg, waker));
+        }
+    }
+
+    fn start_scan(
+        &mut self,
+        cfg: thegn_core::config::Config,
+        waker: TerminalWaker,
+        slot: DiscoverySlot,
+        cancel: Arc<AtomicBool>,
+    ) {
+        let generation = self.generation;
+        let tx = self.result_tx.clone();
         tokio::task::spawn_blocking(move || {
+            let _slot = slot;
             let report = thegn_core::repo::discover_repos_bounded(
                 &cfg,
                 thegn_core::repo::DiscoveryBudget::default(),
@@ -423,6 +502,7 @@ impl WorkspacePicker {
         if let Some(cancel) = self.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
+        self.deferred_discovery = None;
         self.scanning = false;
     }
 
@@ -440,10 +520,24 @@ impl WorkspacePicker {
         cfg.repo_roots != self.scan_roots || cfg.repo_scan_depth != self.scan_depth
     }
 
-    /// Merge any finished discovery results into the list (seed entries keep
-    /// their frecency positions; new paths append in scan order). Returns
-    /// whether anything changed (→ the caller marks the frame dirty).
+    /// Start a deferred scan when a slot is free and merge finished results.
+    /// Returns whether anything changed (→ the caller marks the frame dirty).
     pub(crate) fn drain_discovery(&mut self) -> bool {
+        let deferred_waker = self
+            .deferred_discovery
+            .as_ref()
+            .map(|(_, waker)| waker.clone());
+        let started = if let Some(waker) = deferred_waker
+            && let Some(cancel) = self.cancel.clone()
+            && let Some(slot) =
+                try_acquire_slot(&self.live_workers, MAX_LIVE_DISCOVERY_WORKERS, Some(waker))
+            && let Some((cfg, waker)) = self.deferred_discovery.take()
+        {
+            self.start_scan(cfg, waker, slot, cancel);
+            true
+        } else {
+            false
+        };
         let mut changed = false;
         let old_len = self.items.len();
         while let Ok(event) = self.result_rx.try_recv() {
@@ -469,7 +563,7 @@ impl WorkspacePicker {
         if self.items.len() > old_len {
             self.rank_appended(old_len);
         }
-        changed
+        changed || started
     }
 
     #[cfg(test)]
@@ -1625,5 +1719,148 @@ mod tests {
         );
         assert!(excluded.contains(&added_s));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn discovery_slots_stop_at_the_live_worker_cap() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let mut slots = Vec::new();
+        for _ in 0..MAX_LIVE_DISCOVERY_WORKERS {
+            slots.push(try_acquire_slot(&live, MAX_LIVE_DISCOVERY_WORKERS, None).unwrap());
+        }
+        assert!(try_acquire_slot(&live, MAX_LIVE_DISCOVERY_WORKERS, None).is_none());
+        assert_eq!(live.load(Ordering::SeqCst), MAX_LIVE_DISCOVERY_WORKERS);
+
+        drop(slots.pop());
+        slots.push(try_acquire_slot(&live, MAX_LIVE_DISCOVERY_WORKERS, None).unwrap());
+        assert_eq!(live.load(Ordering::SeqCst), MAX_LIVE_DISCOVERY_WORKERS);
+
+        drop(slots);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn spawn_discovery_at_the_cap_defers_without_spawning() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let mut p = picker(&["/r/a"]);
+        p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
+        let first = thegn_core::config::Config {
+            repo_roots: Vec::new(),
+            repo_scan_depth: 2,
+            ..thegn_core::config::Config::default()
+        };
+        let second = thegn_core::config::Config {
+            repo_roots: Vec::new(),
+            repo_scan_depth: 7,
+            ..thegn_core::config::Config::default()
+        };
+
+        p.spawn_discovery(first, waker.clone());
+        p.spawn_discovery(second, waker);
+
+        assert!(p.scanning);
+        assert_eq!(
+            p.live_workers.load(Ordering::SeqCst),
+            MAX_LIVE_DISCOVERY_WORKERS
+        );
+        assert_eq!(
+            p.deferred_discovery
+                .as_ref()
+                .map(|(cfg, _)| cfg.repo_scan_depth),
+            Some(7)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn deferred_discovery_starts_from_drain_once_a_slot_frees() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let mut p = picker(&["/r/a"]);
+        p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
+        let cfg = thegn_core::config::Config {
+            repo_roots: Vec::new(),
+            ..thegn_core::config::Config::default()
+        };
+        p.spawn_discovery(cfg, waker);
+        assert!(p.deferred_discovery.is_some());
+
+        p.live_workers
+            .store(MAX_LIVE_DISCOVERY_WORKERS - 1, Ordering::SeqCst);
+        assert!(p.drain_discovery());
+        assert!(p.deferred_discovery.is_none());
+
+        for _ in 0..200 {
+            p.drain_discovery();
+            if !p.scanning
+                && p.live_workers.load(Ordering::SeqCst) == MAX_LIVE_DISCOVERY_WORKERS - 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!p.scanning, "empty-root discovery must finish");
+        assert_eq!(
+            p.live_workers.load(Ordering::SeqCst),
+            MAX_LIVE_DISCOVERY_WORKERS - 1
+        );
+    }
+
+    #[test]
+    fn closing_the_picker_drops_a_deferred_scan() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let mut p = picker(&["/r/a"]);
+        p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
+        let cfg = thegn_core::config::Config {
+            repo_roots: Vec::new(),
+            ..thegn_core::config::Config::default()
+        };
+        p.spawn_discovery(cfg, waker);
+
+        p.cancel_discovery();
+
+        assert!(p.deferred_discovery.is_none());
+        assert!(!p.scanning);
+    }
+
+    #[test]
+    fn deferred_scan_waits_when_its_cancel_flag_is_missing() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let mut p = picker(&["/r/a"]);
+        p.live_workers = Arc::new(AtomicUsize::new(MAX_LIVE_DISCOVERY_WORKERS));
+        let cfg = thegn_core::config::Config {
+            repo_roots: Vec::new(),
+            ..thegn_core::config::Config::default()
+        };
+        p.spawn_discovery(cfg, waker);
+        p.cancel = None;
+        p.live_workers
+            .store(MAX_LIVE_DISCOVERY_WORKERS - 1, Ordering::SeqCst);
+
+        let drained =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.drain_discovery()));
+        assert!(
+            matches!(drained, Ok(false)),
+            "a deferred scan without a cancel flag must remain idle"
+        );
+        assert!(p.deferred_discovery.is_some());
+        assert_eq!(
+            p.live_workers.load(Ordering::SeqCst),
+            MAX_LIVE_DISCOVERY_WORKERS - 1
+        );
     }
 }
