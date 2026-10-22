@@ -374,9 +374,12 @@ fn enrich_event(db: &thegn_core::db::Db, event: &mut AutomationEvent) {
         if let Some(exact) = rows.iter().find(|row| row.worktree == worktree) {
             Some(exact.clone())
         } else {
-            let mut matches = rows
-                .into_iter()
-                .filter(|row| same_worktree(&row.worktree, worktree, resolved.as_deref()));
+            let mut matches = rows.into_iter().filter(|row| {
+                std::path::Path::new(&row.worktree).is_absolute()
+                    && !thegn_core::remote::GitLoc::from_db(&row.worktree, Some(&row.location))
+                        .is_remote()
+                    && same_worktree(&row.worktree, worktree, resolved.as_deref())
+            });
             let first = matches.next()?;
             if matches.all(|row| row.repo_root == first.repo_root) {
                 Some(first)
@@ -668,6 +671,37 @@ mod tests {
         assert_eq!(event.workspace.as_deref(), Some("product"));
         assert_eq!(event.repo.as_deref(), Some("/repo"));
         assert_eq!(event.branch.as_deref(), Some("tg/feature"));
+    }
+
+    #[test]
+    fn worktree_enrichment_does_not_resolve_remote_registry_paths_locally() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo", "product", "repo").unwrap();
+        let remote_location = thegn_core::remote::GitLoc::remote_db_string(
+            "example.invalid",
+            22,
+            false,
+            &temp.real_path().display().to_string(),
+        );
+        db.put_worktree(
+            "product/remote",
+            "/repo",
+            &temp.real_path().display().to_string(),
+            "tg/remote",
+            Some(&remote_location),
+            None,
+        )
+        .unwrap();
+
+        let mut event = event_for_dispatch(&temp.path().display().to_string(), None);
+        enrich_event(&db, &mut event);
+        assert_eq!(event.repo, None);
+        assert_eq!(event.branch, None);
+        assert_eq!(event.workspace, None);
     }
 
     #[test]
