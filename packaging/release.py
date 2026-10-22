@@ -1460,7 +1460,11 @@ def build_parser() -> argparse.ArgumentParser:
     payload_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     payload_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
     verify_assets_parser = subparsers.add_parser("verify-assets")
-    verify_assets_parser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
+    verify_assets_parser.add_argument(
+        "--tag",
+        required=True,
+        help="release tag (v<major>.<minor>.<patch>[-pre]); must match the release manifest's tag",
+    )
     verify_assets_parser.add_argument("--release-manifest", required=True, type=Path)
     verify_assets_parser.add_argument("--asset", required=True, type=Path, action="append")
     verify_assets_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
