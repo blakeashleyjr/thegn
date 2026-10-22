@@ -255,6 +255,7 @@ pub(crate) fn dispatch_sweep_merged(
     toasts: &mut Toasts,
     cfg: Config,
     any_path: PathBuf,
+    notify: crate::merge_sweep::SweepNotify,
 ) {
     let now = std::time::Instant::now();
     if !enabled {
@@ -267,7 +268,7 @@ pub(crate) fn dispatch_sweep_merged(
     }
     toasts.success("Sweeping merged worktrees…".to_string(), now);
     // Off-loop: stats worktrees and shells out to git.
-    crate::merge_sweep::spawn(cfg, any_path);
+    crate::merge_sweep::spawn(cfg, any_path, notify);
 }
 
 /// The `integrate` action: batch-fold the queued branches (no agent — CLI

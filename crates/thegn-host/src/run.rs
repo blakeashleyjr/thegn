@@ -914,7 +914,15 @@ pub async fn main(
     // reason: it stats worktrees and shells out to git. This is the sweep's
     // primary trigger — there is no timer, so an entry that comes due while
     // thegn is closed (or idle) is collected at the next launch.
-    crate::merge_sweep::spawn(cfg.clone(), std::env::current_dir().unwrap_or_default());
+    crate::merge_sweep::spawn(
+        cfg.clone(),
+        std::env::current_dir().unwrap_or_default(),
+        crate::merge_sweep::SweepNotify {
+            refresh_tx: refresh_tx.clone(),
+            waker: waker.clone(),
+            report_empty: false,
+        },
+    );
 
     // Check registered repos for interrupted rename journals off-thread.
     // This stats each repo and runs git only when a journal is present.
@@ -925,6 +933,8 @@ pub async fn main(
     {
         let gc_wanted_without_repo_overlay = crate::sandbox_gc_gate::startup_gc_wanted(&cfg);
         let startup_gc_cfg = cfg.clone();
+        let gc_refresh_tx = refresh_tx.clone();
+        let gc_waker = waker.clone();
         tokio::task::spawn_blocking(move || {
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
@@ -952,11 +962,20 @@ pub async fn main(
             let db_worktrees: Vec<String> = rows.into_iter().map(|r| r.worktree).collect();
             let removed = thegn_core::sandbox::run_gc(&db_worktrees);
             if !removed.is_empty() {
-                thegn_core::msg::info(&format!(
+                let message = format!(
                     "sandbox: removed {} orphan container(s): {}",
                     removed.len(),
                     removed.join(", ")
-                ));
+                );
+                thegn_core::msg::info(&message);
+                if crate::merge_sweep::deliver_toast_lines(
+                    vec![(thegn_core::notification::Priority::Info, message)],
+                    None,
+                    &gc_refresh_tx,
+                ) && let Err(error) = gc_waker.wake()
+                {
+                    tracing::debug!(target: "thegn::sandbox", %error, "orphan GC terminal wake failed");
+                }
                 // Hand the list to the loop so the Sandbox section's orphan
                 // notice actually renders — the field existed but nothing
                 // ever wrote it outside tests.
@@ -6577,6 +6596,7 @@ fn attach_agent_pane(
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
     center: Rect,
+    toasts: &mut crate::toast::Toasts,
 ) -> Option<u32> {
     let gi = session.worktrees.iter().position(|g| g.name == tab_name)?;
     let cwd = spec.cwd.clone();
@@ -6598,7 +6618,14 @@ fn attach_agent_pane(
             Some(id)
         }
         Err(e) => {
-            thegn_core::msg::warn(&format!("agent launch failed: {e}"));
+            let message = format!("agent launch failed: {e}");
+            thegn_core::msg::warn(&message);
+            toasts.push(
+                crate::toast::priority_color(thegn_core::notification::Priority::Alert),
+                message,
+                std::time::Instant::now(),
+                crate::toast::DEFAULT_TTL,
+            );
             None
         }
     }
@@ -10802,10 +10829,19 @@ async fn event_loop<T: Terminal>(
                         }
                         run_pending_db::PresetDrainPlan::FallBackToCommands => {
                             let layout_name = preset.layout_name().unwrap_or("");
-                            thegn_core::msg::warn(&format!(
+                            let message = format!(
                                 "preset {:?}: no saved layout {layout_name:?}; falling back to commands",
                                 preset.name
-                            ));
+                            );
+                            thegn_core::msg::warn(&message);
+                            toasts.push(
+                                crate::toast::priority_color(
+                                    thegn_core::notification::Priority::Alert,
+                                ),
+                                message,
+                                std::time::Instant::now(),
+                                crate::toast::DEFAULT_TTL,
+                            );
                             crate::handlers::launch::spawn_resolve(
                                 launch_tx.clone(),
                                 waker.clone(),
@@ -13191,6 +13227,7 @@ async fn event_loop<T: Terminal>(
                             &payload.tab,
                             &payload.spec,
                             chrome.center,
+                            &mut toasts,
                         )
                     };
                     // THE-733: remember which row this pane runs, so its exit
@@ -13356,10 +13393,19 @@ async fn event_loop<T: Terminal>(
                                     (preset.layout.clone(), preset.commands.clone())
                                 }
                                 None => {
-                                    thegn_core::msg::warn(&format!(
+                                    let message = format!(
                                         "worktree template {:?}: unknown preset {pname:?}",
                                         tmpl.name
-                                    ));
+                                    );
+                                    thegn_core::msg::warn(&message);
+                                    toasts.push(
+                                        crate::toast::priority_color(
+                                            thegn_core::notification::Priority::Alert,
+                                        ),
+                                        message,
+                                        std::time::Instant::now(),
+                                        crate::toast::DEFAULT_TTL,
+                                    );
                                     (tmpl.layout.clone(), tmpl.commands.clone())
                                 }
                             },
@@ -24464,8 +24510,16 @@ async fn event_loop<T: Terminal>(
                                                             &mut model,
                                                         );
                                                     } else {
-                                                        thegn_core::msg::warn(
-                                                            "new-worktree: not inside a git repository",
+                                                        let message =
+                                                            "new-worktree: not inside a git repository";
+                                                        thegn_core::msg::warn(message);
+                                                        toasts.push(
+                                                            crate::toast::priority_color(
+                                                                thegn_core::notification::Priority::Alert,
+                                                            ),
+                                                            message,
+                                                            std::time::Instant::now(),
+                                                            crate::toast::DEFAULT_TTL,
                                                         );
                                                     }
                                                 }
@@ -25545,6 +25599,11 @@ async fn event_loop<T: Terminal>(
                                     &mut toasts,
                                     current_config.clone(),
                                     crate::hydrate::active_tab_path(&session),
+                                    crate::merge_sweep::SweepNotify {
+                                        refresh_tx: refresh_tx.clone(),
+                                        waker: waker.clone(),
+                                        report_empty: true,
+                                    },
                                 );
                             }
                             Action::DrainMergeQueue => {
@@ -26891,8 +26950,16 @@ async fn event_loop<T: Terminal>(
                                                 &mut model,
                                             );
                                         } else {
-                                            thegn_core::msg::warn(
-                                                "new-worktree: not inside a git repository",
+                                            let message =
+                                                "new-worktree: not inside a git repository";
+                                            thegn_core::msg::warn(message);
+                                            toasts.push(
+                                                crate::toast::priority_color(
+                                                    thegn_core::notification::Priority::Alert,
+                                                ),
+                                                message,
+                                                std::time::Instant::now(),
+                                                crate::toast::DEFAULT_TTL,
                                             );
                                         }
                                     }
