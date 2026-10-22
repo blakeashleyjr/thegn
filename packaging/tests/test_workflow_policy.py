@@ -1025,6 +1025,15 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn("duplicate asset name", result.stderr)
 
+                duplicate_published_asset_manifest = dict(
+                    manifest,
+                    assets=[manifest["assets"][0], manifest["assets"][0]],
+                )
+                manifest_path.write_text(json.dumps(duplicate_published_asset_manifest), encoding="utf-8")
+                result = run_case()
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("duplicate asset name", result.stderr)
+
                 wrong_size_asset = dict(manifest["assets"][0], size=len(asset_bytes) + 1)
                 wrong_size_manifest = dict(manifest, assets=[wrong_size_asset])
                 manifest_path.write_text(json.dumps(wrong_size_manifest), encoding="utf-8")

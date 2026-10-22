@@ -983,7 +983,7 @@ jobs:
           formula="thegn-$TAG-homebrew.rb"
           if ! python3 packaging/release.py verify-assets --tag "$TAG" \
             --release-manifest "$manifest" --asset "$publish_root/metadata/$formula"; then
-            echo "::error::$formula does not match the release manifest " \
+            echo "::error::$formula does not match the release manifest" \
               "(release.py verify-assets refused; see its message above)"
             exit 1
           fi
@@ -1206,7 +1206,7 @@ jobs:
           pkgbuild="thegn-$TAG-PKGBUILD"
           if ! python3 packaging/release.py verify-assets --tag "$TAG" \
             --release-manifest "$manifest" --asset "$publish_root/metadata/$pkgbuild"; then
-            echo "::error::$pkgbuild does not match the release manifest " \
+            echo "::error::$pkgbuild does not match the release manifest" \
               "(release.py verify-assets refused; see its message above)"
             exit 1
           fi
