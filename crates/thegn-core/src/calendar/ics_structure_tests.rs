@@ -1,4 +1,5 @@
 use super::*;
+use crate::calendar::validate::EventDefect;
 
 #[test]
 fn recurrence_id_parses_for_overrides_and_keeps_the_master() {
@@ -726,6 +727,73 @@ fn date_start_with_timed_end_is_reported_and_dropped() {
     assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
     assert!(events.is_empty());
     assert_legacy_matches(&input, &events);
+}
+
+#[test]
+fn rejected_events_record_their_defect() {
+    let mixed = one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDTEND:20261012T100000Z");
+    let (events, report) = parse_report(&mixed);
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::RejectedEvent(EventDefect::MixedShape))
+    );
+    assert!(report.diagnostics().contains(&IcsDiagnostic::InvalidEvent));
+    assert!(events.is_empty());
+
+    let reversed = one_event("UID:r\nDTSTART:20261012T100000Z\nDTEND:20261012T090000Z");
+    let (events, report) = parse_report(&reversed);
+    assert!(
+        report
+            .diagnostics()
+            .contains(&IcsDiagnostic::RejectedEvent(EventDefect::Reversed))
+    );
+    assert!(events.is_empty());
+}
+
+#[test]
+fn rejected_events_keep_the_dtend_duration_count() {
+    let input =
+        one_event("UID:x\nDTSTART;VALUE=DATE:20261012\nDTEND;VALUE=DATE:20261013\nDURATION:P1D");
+    let (events, report) = parse_report(&input);
+    assert_eq!(
+        report
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| **diagnostic == IcsDiagnostic::InvalidEvent)
+            .count(),
+        1
+    );
+    // The InvalidEvent assertion above is the positive control: DTEND plus DURATION
+    // is rejected before the shared validator runs.
+    assert!(
+        !report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| matches!(diagnostic, IcsDiagnostic::RejectedEvent(_)))
+    );
+    assert!(events.is_empty());
+}
+
+#[test]
+fn rejected_events_at_capacity_do_not_double_count_overflow() {
+    let events = (0..20)
+        .map(|i| {
+            format!(
+                "BEGIN:VEVENT\nUID:m{i}\nDTSTART;VALUE=DATE:20261012\nDTEND:20261012T100000Z\nEND:VEVENT"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input = format!("BEGIN:VCALENDAR\n{events}\nEND:VCALENDAR");
+    let (_, report) = parse_report(&input);
+    let invalid_events = report
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| **diagnostic == IcsDiagnostic::InvalidEvent)
+        .count();
+
+    assert_eq!(report.overflow() + invalid_events, 20);
 }
 
 #[test]
