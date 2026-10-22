@@ -9193,6 +9193,7 @@ async fn event_loop<T: Terminal>(
         // Writer-thread health: a transient write failure means the terminal's
         // actual content is unknown — resync with a full repaint (the async
         // sibling of the old inline EIO retry); a fatal one tears down.
+        let clipboard_outcome = writer.take_clipboard_outcome();
         match writer.take_status() {
             crate::frame_writer::WriterStatus::Ok => {}
             crate::frame_writer::WriterStatus::Transient => {
@@ -9204,8 +9205,19 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             crate::frame_writer::WriterStatus::Fatal(e) => {
-                return Err(anyhow::anyhow!("terminal writer failed: {e}"));
+                let note = match clipboard_outcome {
+                    Some(outcome) => format!(
+                        "; {}",
+                        crate::frame_writer::clipboard_outcome_status(outcome)
+                    ),
+                    None => String::new(),
+                };
+                return Err(anyhow::anyhow!("terminal writer failed: {e}{note}"));
             }
+        }
+        if let Some(outcome) = clipboard_outcome {
+            model.status = crate::frame_writer::clipboard_outcome_status(outcome).to_string();
+            dirty = true;
         }
         // OOB capacity releases pulse the existing terminal waker; retrying
         // here keeps this path independent of cell composition and timers.
