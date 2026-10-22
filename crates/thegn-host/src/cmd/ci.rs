@@ -341,21 +341,25 @@ fn runs(
 }
 
 fn detail_warnings(detail: &thegn_svc::ci::CiRunDetail) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if detail.discarded_jobs > 0 {
-        warnings.push(format!(
-            "CI provider omitted {} malformed job row(s)",
-            detail.discarded_jobs
-        ));
-    }
-    if let Some(incomplete) = detail.incomplete {
-        warnings.push(format!(
-            "CI job list is incomplete: {}; showing the first {} job(s)",
-            incomplete.reason(),
-            detail.run.jobs.len()
-        ));
-    }
-    warnings
+    crate::ci_refresh::ci_detail_warnings(detail)
+}
+
+fn log_json(
+    entry: &thegn_core::ci_log::CiLogEntry,
+    source: &str,
+    warnings: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "worktree": entry.worktree,
+        "run_id": entry.run_id,
+        "job_id": entry.job_id,
+        "logs": [entry.clone()],
+        "source": source,
+        "fetched_at": entry.fetched_at,
+        "truncated": entry.truncated,
+        "redacted": entry.redacted,
+        "warnings": warnings,
+    })
 }
 
 fn view(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
@@ -454,7 +458,7 @@ fn log(
         entry.text = text;
         entry.redacted = true;
         entry.truncated |= truncated;
-        Some((entry, "cache"))
+        Some((entry, "cache", Vec::new()))
     } else {
         None
     };
@@ -476,23 +480,13 @@ fn log(
                     )));
                 }
             };
-            let detail = provider.run_detail(&loc, run_id).ok();
-            if let Some(detail) = &detail {
-                for warning in detail_warnings(detail) {
-                    msg::warn(&warning);
-                }
+            let detail = provider
+                .run_detail(&loc, run_id)
+                .map_err(|error| error.to_string());
+            let identity = crate::ci_refresh::log_fill_identity(&detail, run_id, job_id);
+            for warning in &identity.warnings {
+                msg::warn(&thegn_svc::lsp::sanitize_for_terminal(warning));
             }
-            let (job_name, head_sha) = detail
-                .as_ref()
-                .and_then(|detail| {
-                    detail
-                        .run
-                        .jobs
-                        .iter()
-                        .find(|job| job.id == job_id)
-                        .map(|job| (job.name.clone(), detail.run.sha.clone()))
-                })
-                .unwrap_or_default();
             let raw = match provider.logs(&loc, run_id, job_id) {
                 Ok(raw) => raw,
                 Err(error) if json_out => {
@@ -513,7 +507,7 @@ fn log(
                 key.clone(),
                 run_id,
                 job_id,
-                job_name,
+                identity.job_name,
                 &raw.text,
                 cfg.ci
                     .log_tail_lines
@@ -524,28 +518,19 @@ fn log(
                 thegn_core::util::now(),
             );
             entry.truncated |= raw.truncated;
-            entry.head_sha = head_sha;
+            entry.head_sha = identity.head_sha;
             if cfg.ci.log_cache_runs > 0
                 && thegn_core::ci_log::cacheable_log_entry(&entry)
                 && let Ok(db) = Db::open()
             {
                 let _ = db.put_ci_log(&entry);
             }
-            (entry, "provider")
+            (entry, "provider", identity.warnings)
         }
     };
-    let (entry, source) = entry;
+    let (entry, source, warnings) = entry;
     if json_out {
-        return super::emit_json(&serde_json::json!({
-            "worktree": entry.worktree,
-            "run_id": entry.run_id,
-            "job_id": entry.job_id,
-            "logs": [entry.clone()],
-            "source": source,
-            "fetched_at": entry.fetched_at,
-            "truncated": entry.truncated,
-            "redacted": entry.redacted,
-        }));
+        return super::emit_json(&log_json(&entry, source, &warnings));
     }
     outln!(
         "{}",
@@ -967,5 +952,19 @@ mod tests {
         assert!(message.contains("may or may not"));
         assert!(!message.contains("cancelled\n"));
         assert!(!message.contains("done"));
+    }
+
+    #[test]
+    fn log_json_carries_fill_warnings() {
+        let entry = thegn_core::ci_log::CiLogEntry::default();
+
+        assert_eq!(
+            log_json(&entry, "provider", &["w".into()])["warnings"],
+            serde_json::json!(["w"])
+        );
+        assert_eq!(
+            log_json(&entry, "cache", &[])["warnings"],
+            serde_json::json!([])
+        );
     }
 }

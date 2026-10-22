@@ -540,6 +540,74 @@ pub(crate) fn daemon_ci_runs_limit(limit: usize, max_runs: usize) -> Result<usiz
     }
 }
 
+pub(crate) fn ci_detail_warnings(detail: &thegn_svc::ci::CiRunDetail) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if detail.discarded_jobs > 0 {
+        warnings.push(format!(
+            "CI provider omitted {} malformed job row(s)",
+            detail.discarded_jobs
+        ));
+    }
+    if let Some(incomplete) = detail.incomplete {
+        warnings.push(format!(
+            "CI job list is incomplete: {}; showing the first {} job(s)",
+            incomplete.reason(),
+            detail.run.jobs.len()
+        ));
+    }
+    warnings
+}
+
+pub(crate) struct LogFillIdentity {
+    pub job_name: String,
+    pub head_sha: String,
+    pub warnings: Vec<String>,
+}
+
+pub(crate) fn log_fill_identity(
+    detail: &Result<thegn_svc::ci::CiRunDetail, String>,
+    run_id: &str,
+    job_id: &str,
+) -> LogFillIdentity {
+    match detail {
+        Err(error) => LogFillIdentity {
+            job_name: String::new(),
+            head_sha: String::new(),
+            warnings: vec![format!(
+                "CI run {run_id} detail is unavailable ({}); the log is shown without a job name or head and is not cached",
+                thegn_svc::lsp::sanitize_for_terminal(error)
+            )],
+        },
+        Ok(detail) => {
+            let mut warnings = ci_detail_warnings(detail);
+            if let Some(job) = detail.run.jobs.iter().find(|job| job.id == job_id) {
+                LogFillIdentity {
+                    job_name: job.name.clone(),
+                    head_sha: detail.run.sha.clone(),
+                    warnings,
+                }
+            } else {
+                let message = if detail.incomplete.is_some() {
+                    format!(
+                        "CI job {job_id} is not among the {} job(s) listed before the job list stopped; the log is shown without a job name or head and is not cached",
+                        detail.run.jobs.len()
+                    )
+                } else {
+                    format!(
+                        "CI job {job_id} is not listed in run {run_id}; the log is shown without a job name or head and is not cached"
+                    )
+                };
+                warnings.push(message);
+                LogFillIdentity {
+                    job_name: String::new(),
+                    head_sha: String::new(),
+                    warnings,
+                }
+            }
+        }
+    }
+}
+
 /// Resolve the local cache identity through gix regardless of the configured
 /// read backend. This is used on the refresh tick and when writing local rows,
 /// so neither path spawns a process and both agree for unborn or ambiguous refs.
@@ -2358,5 +2426,85 @@ mod tests {
                 .running
                 .is_none()
         );
+    }
+
+    #[test]
+    fn log_fill_identity_reports_an_unavailable_detail() {
+        let identity = log_fill_identity(&Err("boom".into()), "run", "job");
+
+        assert!(identity.job_name.is_empty());
+        assert!(identity.head_sha.is_empty());
+        assert_eq!(identity.warnings.len(), 1);
+        assert!(identity.warnings[0].contains("detail is unavailable"));
+        assert!(identity.warnings[0].contains("boom"));
+        assert!(identity.warnings[0].contains("not cached"));
+    }
+
+    #[test]
+    fn log_fill_identity_reports_a_job_missing_from_a_complete_list() {
+        let detail = thegn_svc::ci::CiRunDetail {
+            run: thegn_core::ci::CiRun {
+                jobs: vec![thegn_core::ci::CiJob {
+                    id: "1".into(),
+                    ..thegn_core::ci::CiJob::default()
+                }],
+                ..thegn_core::ci::CiRun::default()
+            },
+            discarded_jobs: 0,
+            incomplete: None,
+        };
+
+        let identity = log_fill_identity(&Ok(detail), "run", "2");
+
+        assert!(identity.job_name.is_empty());
+        assert!(identity.head_sha.is_empty());
+        assert_eq!(identity.warnings.len(), 1);
+        assert!(identity.warnings[0].contains("is not listed in run"));
+    }
+
+    #[test]
+    fn log_fill_identity_reports_a_job_beyond_an_incomplete_list() {
+        let detail = thegn_svc::ci::CiRunDetail {
+            run: thegn_core::ci::CiRun {
+                jobs: vec![thegn_core::ci::CiJob {
+                    id: "1".into(),
+                    ..thegn_core::ci::CiJob::default()
+                }],
+                ..thegn_core::ci::CiRun::default()
+            },
+            discarded_jobs: 0,
+            incomplete: Some(thegn_svc::ci::CiDetailIncomplete::PageBudget { pages: 5 }),
+        };
+
+        let identity = log_fill_identity(&Ok(detail), "run", "2");
+
+        assert!(identity.job_name.is_empty());
+        assert!(identity.head_sha.is_empty());
+        assert_eq!(identity.warnings.len(), 2);
+        assert!(identity.warnings[0].contains("incomplete"));
+        assert!(identity.warnings[1].contains("is not among the 1 job(s) listed"));
+    }
+
+    #[test]
+    fn log_fill_identity_names_a_listed_job() {
+        let detail = thegn_svc::ci::CiRunDetail {
+            run: thegn_core::ci::CiRun {
+                sha: "abc".into(),
+                jobs: vec![thegn_core::ci::CiJob {
+                    id: "1".into(),
+                    name: "build".into(),
+                    ..thegn_core::ci::CiJob::default()
+                }],
+                ..thegn_core::ci::CiRun::default()
+            },
+            discarded_jobs: 0,
+            incomplete: None,
+        };
+
+        let identity = log_fill_identity(&Ok(detail), "run", "1");
+
+        assert_eq!(identity.job_name, "build");
+        assert_eq!(identity.head_sha, "abc");
+        assert!(identity.warnings.is_empty());
     }
 }
