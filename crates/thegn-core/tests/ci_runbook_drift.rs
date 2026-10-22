@@ -3,7 +3,7 @@
 
 use serde_yaml::Value;
 
-const RUNNER_EXPRESSION: &str = "${{ fromJSON(vars.CI_RUNS_ON || '[\"ubuntu-latest\"]') }}";
+const RUNNER_EXPRESSION: &str = "${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '[\"ubuntu-latest\"]') }}";
 
 fn mapping_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.as_mapping()?.get(Value::String(key.to_string()))

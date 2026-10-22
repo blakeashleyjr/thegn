@@ -81,26 +81,30 @@ on:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-# Runner selection. Every Linux job reads the repo variable `CI_RUNS_ON`; unset,
-# it falls back to GitHub-hosted `ubuntu-latest`. Opt IN to the self-hosted
-# ageless runners (see docs/self-hosted-ci.md) with one toggle, no edits:
+# Runner selection. Self-hosted runners are selected ONLY for `workflow_dispatch`
+# runs of `blakeashleyjr/thegn`, when `CI_RUNS_ON` is set. Re-runs keep the
+# original dispatch event; GitHub restricts dispatch and re-run to users with
+# write access. Every other event and every fork uses GitHub-hosted
+# `ubuntu-latest`, even if triggers are restored. This includes `push`,
+# `pull_request`, `pull_request_target` and `schedule`.
+#
+# Opt IN to the self-hosted ageless runners (see docs/self-hosted-ci.md) with
+# one toggle, no edits:
 #   gh variable set CI_RUNS_ON --body '["self-hosted", "ageless"]'
 #   gh variable delete CI_RUNS_ON        # ← back to GitHub-hosted
-# `ci-setup` adapts either way (installs nix + caches only on github-hosted).
+# `ci-setup` installs nix and restores caches only on GitHub-hosted runners.
 # The `macos` job is always GitHub-hosted (macos-15).
 #
-# SECURITY — why GitHub-hosted is the fallback, not self-hosted. thegn is a
-# PUBLIC repo. This workflow is currently dispatch-only; if pull_request is
-# restored, fork code may run here. On a self-hosted runner, untrusted code can
-# execute against a PERSISTENT /nix/store, sccache and CARGO_HOME and poison
-# later runs. Treat repository content and dependencies as hostile. Before
-# opting in, require approval for ALL outside contributors (Settings → Actions
-# → "Require approval for all external contributors"), isolate credentials and
-# caches from other workloads, and treat approving fork code as running it on
-# your machine. Approval is a human gate, not runner isolation.
+# SECURITY — thegn is a PUBLIC repo. The event and repository gate above keeps
+# self-hosted runners away from push, pull_request, pull_request_target,
+# schedule and fork runs, even if those triggers are restored. Treat repository
+# content and dependencies as hostile. Before opting in, require approval for
+# ALL outside contributors (Settings → Actions → "Require approval for all
+# external contributors") and treat approving a dispatch as running repository
+# code on the self-hosted host. Approval is a human gate, not runner isolation.
 jobs:
   fmt:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -110,7 +114,7 @@ jobs:
       - run: nix develop --command just fmt-check
   lint:
     # `just lint` also carries the git_cmd guard (no raw Command::new("git")).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -121,7 +125,7 @@ jobs:
   deps-audit:
     # cargo-deny (advisories/licenses/dup majors) + cargo-machete; fetches the
     # RustSec DB over the network on a cold cache.
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -137,7 +141,7 @@ jobs:
       - run: rm -rf target/advisory-dbs
       - run: nix develop --command just deps-audit
   test:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     # `just build && just test` from a cold cache after a large refactor pushes
     # close to the old 40m cap; give it headroom.
     timeout-minutes: 50
@@ -156,7 +160,7 @@ jobs:
           git config --global user.name "thegn CI"
       - run: nix develop --command bash -lc "just build && just test"
   doc:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -172,7 +176,7 @@ jobs:
   check-features:
     # Every named cargo feature compiles alone and all together (the
     # platform-portability spec's feature matrix).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -182,7 +186,7 @@ jobs:
       - run: nix develop --command just check-features
   check-msrv:
     # The declared `rust-version` builds, on the flake's pinned MSRV toolchain.
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -193,7 +197,7 @@ jobs:
   term-check:
     # The terminal-capability degradation matrix (`thegn doctor` under six
     # TERM/COLORTERM/NO_COLOR/override environments).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -205,7 +209,7 @@ jobs:
     # Typechecks the leaf crates' macOS/Windows code paths from Linux
     # (`cargo check --target`, no cross linker needed; targets come from the
     # flake's rust toolchain).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -214,7 +218,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just check-cross
   openspec:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -223,7 +227,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just openspec-validate
   coverage:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -234,7 +238,7 @@ jobs:
   smoke:
     # Hermetic end-to-end CLI tests against the debug binary (isolated
     # XDG_STATE_HOME; includes the pty-smoke harness, which works on runners).
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -244,7 +248,7 @@ jobs:
       - run: nix develop --command just smoke
   sandbox-e2e:
     # Tier-1 only (DNS filter + DB audit trail) — no container runtime needed.
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -253,7 +257,7 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
   nix-build:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     # Routinely builds `.#thegn-nobridge` (the shipped stable binary). The full
     # `.#default` adds a second, cross-to-musl release compile of the whole
     # workspace for the provider bridge — dev-channel-only functionality — which
@@ -341,7 +345,7 @@ jobs:
     # runners) across resize/focus/input boundaries and end-to-end LSP/git flows.
     # On failure the per-case artifacts (final screen as text/png, snapshot
     # diffs, a trace) are uploaded — read those before reaching for a retry.
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
