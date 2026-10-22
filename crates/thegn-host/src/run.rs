@@ -13538,9 +13538,13 @@ async fn event_loop<T: Terminal>(
         // Media picker results: open a secondary palette of playlists / players.
         if let Some(pick) = media_pick_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let note = crate::media_ctl::pick_note(&pick);
             match crate::media_ctl::pick_palette(pick) {
                 Ok(items) => {
                     palette = Some(crate::search_everywhere::PaletteSession::new(items));
+                    if let Some(note) = note {
+                        model.status = note;
+                    }
                 }
                 Err(text) => model.status = text,
             }

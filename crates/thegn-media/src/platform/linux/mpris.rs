@@ -15,8 +15,8 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
 use crate::model::{
-    LoopMode, MAX_FIELD_BYTES, MAX_QUEUE_ITEMS, MediaKind, MediaState, PlaybackState, Playlist,
-    QueueItem, QueuePage,
+    LoopMode, MAX_FIELD_BYTES, MAX_PLAYLISTS, MAX_QUEUE_ITEMS, MediaKind, MediaState,
+    PlaybackState, Playlist, PlaylistPage, QueueItem, QueuePage,
 };
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot, MediaWatch};
 
@@ -349,6 +349,10 @@ impl MediaBackend for MprisZbus {
     }
 
     fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
+        Box::pin(async move { self.playlist_page().await.map(|page| page.items) })
+    }
+
+    fn playlist_page(&self) -> BoxFuture<'_, Result<PlaylistPage, MediaError>> {
         Box::pin(async move {
             let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
             // GetPlaylists(index, max, order, reverse) -> a(oss)
@@ -361,7 +365,7 @@ impl MediaBackend for MprisZbus {
                     "GetPlaylists",
                     &(
                         0u32,
-                        u32::try_from(crate::model::MAX_PLAYLISTS).unwrap_or(u32::MAX),
+                        u32::try_from(crate::model::MAX_PLAYLISTS + 1).unwrap_or(u32::MAX),
                         "Alphabetical",
                         false,
                     ),
@@ -372,14 +376,33 @@ impl MediaBackend for MprisZbus {
                 .body()
                 .deserialize()
                 .map_err(|e| MediaError::Backend(e.to_string()))?;
-            Ok(lists
+            let reported = match self.props_proxy(&bus).await {
+                Ok(proxy) => match InterfaceName::try_from(PLAYLISTS_IFACE) {
+                    Ok(iface) => {
+                        let count: Result<u32, _> = proxy.get(iface, "PlaylistCount").await;
+                        match count {
+                            Ok(count) => Some(count),
+                            Err(error) => {
+                                tracing::debug!(target: "thegn::media", %error, "MPRIS PlaylistCount read failed");
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::media", %error, "MPRIS Playlists interface name was invalid");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(target: "thegn::media", %error, "MPRIS properties proxy unavailable for PlaylistCount");
+                    None
+                }
+            };
+            let rows = lists
                 .into_iter()
-                .take(crate::model::MAX_PLAYLISTS)
-                .map(|(path, name, _icon)| Playlist {
-                    id: path.as_str().to_string(),
-                    name,
-                })
-                .collect())
+                .map(|(path, name, _icon)| (path.as_str().to_string(), name))
+                .collect();
+            Ok(playlist_page_from(rows, reported))
         })
     }
 
@@ -911,6 +934,16 @@ fn artists_of(meta: &HashMap<String, OwnedValue>) -> String {
     }
 }
 
+fn playlist_page_from(rows: Vec<(String, String)>, reported: Option<u32>) -> PlaylistPage {
+    let total = rows.len().max(reported.map_or(0, |count| count as usize));
+    let items = rows
+        .into_iter()
+        .take(crate::model::MAX_PLAYLISTS)
+        .map(|(id, name)| Playlist { id, name })
+        .collect();
+    PlaylistPage { items, total }
+}
+
 fn queue_metadata_window(paths: &[OwnedObjectPath]) -> &[OwnedObjectPath] {
     &paths[..paths.len().min(MAX_QUEUE_ITEMS)]
 }
@@ -1034,6 +1067,29 @@ fn caps_from_props(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_page_counts_reported_and_extra_rows() {
+        let rows = (0..MAX_PLAYLISTS + 1)
+            .map(|index| (format!("/playlist/{index}"), format!("Playlist {index}")))
+            .collect();
+        let page = playlist_page_from(rows, None);
+        assert_eq!(page.items.len(), MAX_PLAYLISTS);
+        assert_eq!(page.total, MAX_PLAYLISTS + 1);
+
+        let rows = (0..3)
+            .map(|index| (format!("/playlist/{index}"), format!("Playlist {index}")))
+            .collect();
+        let page = playlist_page_from(rows, Some(250));
+        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.total, 250);
+
+        let rows = (0..MAX_PLAYLISTS)
+            .map(|index| (format!("/playlist/{index}"), format!("Playlist {index}")))
+            .collect();
+        let page = playlist_page_from(rows, Some(50));
+        assert_eq!(page.total, MAX_PLAYLISTS);
+    }
 
     #[test]
     fn queue_metadata_window_caps_at_max_queue_items() {
