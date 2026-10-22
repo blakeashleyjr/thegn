@@ -2463,6 +2463,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
         "devcontainer": devcontainer_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
+        "warm_pool": warm_pool_json(cfg),
         "merge_gate_quarantines": crate::integrate::gate_quarantines().iter().map(|(path, reason)| serde_json::json!({
             "path": path.display().to_string(),
             "reason": reason,
@@ -2957,6 +2958,9 @@ pub fn run(
     provider_cache_report(cfg);
 
     outln!("");
+    warm_pool_report(cfg);
+
+    outln!("");
     home_layer_report(cfg);
 
     outln!("");
@@ -3271,6 +3275,88 @@ fn provider_cache_json(cfg: &Config) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(map)
+}
+
+fn warm_pool_rows_json(
+    rows: &[thegn_core::db::PoolSpare],
+    now: i64,
+    cfg: &Config,
+) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|row| {
+            let reason = match row.state.as_str() {
+                "claimed" => {
+                    "claimed, but no worktree is bound to it (its worktree was deleted or closed)"
+                        .into()
+                }
+                "quarantined" => "quarantined (left for the operator)".into(),
+                state => format!("state {state}"),
+            };
+            serde_json::json!({
+                "sandbox": row.sandbox_name,
+                "repo": row.repo_path,
+                "env": row.env_name,
+                "state": row.state,
+                "reason": reason,
+                "age_secs": thegn_core::time_policy::age_seconds(now, row.updated_at),
+                "provider_configured": crate::provision_gate::poolable_env(cfg, &row.env_name),
+            })
+        })
+        .collect()
+}
+
+fn warm_pool_json(cfg: &Config) -> serde_json::Value {
+    match doctor_db() {
+        DoctorDb::Ready(db) => match thegn_core::store::PoolStore::unattended_pool_spares(&db) {
+            Ok(rows) => serde_json::json!({
+                "state_db": "ok",
+                "spares": warm_pool_rows_json(&rows, thegn_core::util::now(), cfg),
+            }),
+            Err(error) => serde_json::json!({
+                "state_db": format!("unavailable: {error:#}"),
+                "spares": [],
+            }),
+        },
+        other => serde_json::json!({
+            "state_db": other.describe(),
+            "spares": [],
+        }),
+    }
+}
+
+fn warm_pool_report(cfg: &Config) {
+    outln!("Warm pool (provider spares needing review)");
+    let report = warm_pool_json(cfg);
+    let state_db = report["state_db"]
+        .as_str()
+        .unwrap_or("unavailable: invalid report");
+    if state_db != "ok" {
+        outln!("  state DB      {state_db}");
+        return;
+    }
+    let Some(spares) = report["spares"].as_array() else {
+        outln!("  state DB      unavailable: invalid spare report");
+        return;
+    };
+    if spares.is_empty() {
+        outln!("  needing review  none");
+        return;
+    }
+    outln!("  needing review  {} spare(s)", spares.len());
+    for spare in spares {
+        let sandbox = spare["sandbox"].as_str().unwrap_or("?");
+        let state = spare["state"].as_str().unwrap_or("?");
+        let repo = spare["repo"].as_str().unwrap_or("?");
+        let env = spare["env"].as_str().unwrap_or("?");
+        let age = spare["age_secs"]
+            .as_u64()
+            .map_or_else(|| "?".to_string(), |seconds| seconds.to_string());
+        let reason = spare["reason"].as_str().unwrap_or("unknown reason");
+        outln!("    {sandbox}  {state}  repo={repo} env={env} age={age}s  — {reason}");
+    }
+    outln!(
+        "  resolve       thegn will not destroy these on its own; check each sandbox in its provider's console or CLI and destroy it there if nothing uses it"
+    );
 }
 
 /// The output of `<bin> <args…>` trimmed to one line, or `None` if the binary is
@@ -5219,6 +5305,58 @@ mod tests {
     fn doctor_json_reports_quarantined_merge_gate_workspaces() {
         let report = doctor_json(&Config::default());
         assert!(report["merge_gate_quarantines"].is_array());
+    }
+
+    #[test]
+    fn warm_pool_rows_json_names_reason_age_and_provider() {
+        let rows = [
+            thegn_core::db::PoolSpare {
+                sandbox_name: "claimed-one".into(),
+                repo_path: "/repo".into(),
+                env_name: "sprites".into(),
+                state: "claimed".into(),
+                checkpoint_id: Some("cp".into()),
+                lock_hash: Some("lock".into()),
+                created_at: 1_000,
+                updated_at: 1_000,
+            },
+            thegn_core::db::PoolSpare {
+                sandbox_name: "quarantined-one".into(),
+                repo_path: "/repo".into(),
+                env_name: "gone".into(),
+                state: "quarantined".into(),
+                checkpoint_id: None,
+                lock_hash: None,
+                created_at: 2_000,
+                updated_at: 2_000,
+            },
+        ];
+
+        let report = warm_pool_rows_json(&rows, 1_600, &Config::default());
+        assert!(
+            report[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no worktree is bound")
+        );
+        assert_eq!(report[0]["age_secs"], 600);
+        assert!(!report[0]["provider_configured"].as_bool().unwrap());
+        assert!(
+            report[1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("quarantined")
+        );
+        assert!(report[1]["age_secs"].is_null());
+    }
+
+    #[test]
+    fn warm_pool_json_is_always_present_with_a_state() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let report = doctor_json(&Config::default())["warm_pool"].clone();
+        assert!(report.is_object());
+        assert_eq!(report["state_db"], "no database yet");
+        assert!(report["spares"].is_array());
     }
 
     #[test]
