@@ -224,7 +224,15 @@ fn runs(
                         context: context.clone().unwrap_or_default(),
                     })
                     .unwrap_or_default();
-                    let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    if let Err(error) = crate::ci_refresh::put_ci_cache_with_context(
+                        &db,
+                        &cache_key,
+                        cache_branch,
+                        &json,
+                        context.as_deref(),
+                    ) {
+                        tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
+                    }
                 }
                 return super::emit_json(&runs);
             }
@@ -243,7 +251,15 @@ fn runs(
                     context: context.clone().unwrap_or_default(),
                 })
                 .unwrap_or_default();
-                let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if let Err(error) = crate::ci_refresh::put_ci_cache_with_context(
+                    &db,
+                    &cache_key,
+                    cache_branch,
+                    &json,
+                    context.as_deref(),
+                ) {
+                    tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
+                }
             }
             for r in &runs {
                 outln!(

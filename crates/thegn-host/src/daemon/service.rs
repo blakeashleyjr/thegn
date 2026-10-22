@@ -2006,20 +2006,22 @@ impl ControlApi for DaemonService {
             if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
                 runs: fetched.runs.clone(),
                 discarded_rows: fetched.discarded_rows,
-                context: context.unwrap_or_default(),
+                context: context.clone().unwrap_or_default(),
             }) {
                 let key_for_write = key.clone();
                 let branch_for_write = branch.clone();
+                let context_for_write = context.clone();
                 let _ = self
                     .with_db(move |db| {
-                        use thegn_core::store::CacheStore;
-                        db.put_ci_cache(
+                        crate::ci_refresh::put_ci_cache_with_context(
+                            db,
                             &key_for_write,
                             branch_for_write
                                 .as_deref()
                                 .filter(|branch| !branch.is_empty() && *branch != "HEAD")
                                 .unwrap_or(""),
                             &json,
+                            context_for_write.as_deref(),
                         )
                     })
                     .await;
