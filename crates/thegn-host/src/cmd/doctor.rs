@@ -486,7 +486,7 @@ fn devcontainer_report(cfg: &Config) {
 /// [`enforcement_matrix_report`]).
 fn enforcement_matrix_json() -> serde_json::Value {
     let os = thegn_core::sandbox_backend::host_os();
-    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let probed = thegn_core::sandbox_cpucap::detect_cap_facts();
     let rows: Vec<serde_json::Value> = thegn_core::sandbox_matrix::column_for(os)
         .into_iter()
         .map(|r| {
@@ -512,13 +512,15 @@ fn limits_json(cfg: &Config) -> serde_json::Value {
     // would actually be written rather than this process's cgroup share.
     let ncpu = thegn_core::sandbox_cpucap::physical_ncpu();
     let live = live_slice_caps();
+    let facts = thegn_core::sandbox_cpucap::detect_cap_facts();
     serde_json::json!({
         "cpu_per_pane": limits.cpu,
         "cpu_total": thegn_core::sandbox_cpucap::resolve_cpu_total(
             limits.cpu_total.as_deref().unwrap_or("auto"), ncpu),
         "memory": limits.memory,
-        "cpu_enforcement": cpu_cap_key(thegn_core::sandbox_cpucap::detect_cpu_cap()),
+        "cpu_enforcement": cpu_cap_key(facts.cap()),
         "cpu_scope_note": thegn_core::sandbox_cpucap::detected_scope_skipped_note(),
+        "cpu_soft_reason": facts.soft_reason(),
         "slice_live": live.as_ref().map(|l| serde_json::json!({
             "unit": thegn_core::sandbox_cpucap::CPU_SLICE,
             "cpu_quota": l.cpu_quota,
@@ -4184,7 +4186,7 @@ fn compiler_cache_report(cfg: &Config, config_path: &std::path::Path, cli_overri
 fn enforcement_matrix_report(cfg: &Config) {
     use thegn_core::sandbox_matrix;
     let os = thegn_core::sandbox_backend::host_os();
-    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let probed = thegn_core::sandbox_cpucap::detect_cap_facts();
     outln!(
         "Enforcement matrix ({}, derived from the resolver)",
         os.as_str()
@@ -4628,7 +4630,7 @@ fn cpu_cap_report(cfg: &Config) {
         outln!("  cpu cap       (unset)");
         return;
     }
-    let mech = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let facts = thegn_core::sandbox_cpucap::detect_cap_facts();
     let mut parts = Vec::new();
     if let Some(c) = per_pane {
         parts.push(format!("{c} cores/pane"));
@@ -4646,7 +4648,7 @@ fn cpu_cap_report(cfg: &Config) {
         outln!(
             "  cpu cap       {}  ({})",
             parts.join(" · "),
-            mech.label_on(thegn_core::sandbox_backend::host_os())
+            facts.label_on(thegn_core::sandbox_backend::host_os())
         );
         if let Some(note) = thegn_core::sandbox_cpucap::detected_scope_skipped_note() {
             outln!("  cpu cap note  {note}");
@@ -5006,6 +5008,15 @@ fn summary(c: &TermCaps) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_cap_limits_json_carries_the_soft_reason_key() {
+        let limits = limits_json(&Config::default());
+        let reason = limits
+            .get("cpu_soft_reason")
+            .expect("cpu_soft_reason key is present");
+        assert!(reason.is_null() || reason.is_string(), "{reason}");
+    }
 
     #[test]
     fn medium_word_maps_each_network_medium() {

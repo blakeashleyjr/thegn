@@ -11,7 +11,7 @@
 //! - filesystem / network / scoping — the backend's profile *family*
 //!   ([`Backend::is_oci`] / [`Backend::is_host_toolchain`] / the profile table);
 //! - the resource ceiling — the [`CpuCap`]-shaped
-//!   rule the pane wrapper applies, overlaid with the *probed* mechanism when
+//!   rule the pane wrapper applies, overlaid with the *probed facts* when
 //!   doctor renders the host column, so a degraded ceiling shows as soft, never
 //!   hard.
 //!
@@ -26,7 +26,7 @@ use crate::capabilities::{Capabilities, EgressKind, IsolationClass};
 use crate::placement::Placement;
 use crate::sandbox::Backend;
 use crate::sandbox_backend::{HostOs, backend_runs_on};
-use crate::sandbox_cpucap::CpuCap;
+use crate::sandbox_cpucap::{CapFacts, CpuCap};
 
 /// Filesystem isolation a backend provides on the default (`hardened`) profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,16 +172,19 @@ pub struct EnforcementRow {
 
 impl EnforcementRow {
     /// The ceiling cell for doctor, refined by the probed
-    /// [`CpuCap`] when this is the running host and
+    /// [`CapFacts`] when this is the running host and
     /// the backend's strength is [`HostProbed`](CeilingStrength::HostProbed) — so
-    /// a Linux box with no cgroup cpu delegation shows *soft*, not hard. `probed`
-    /// is the measured cap for `self.os`, or `None` when it can't be probed (a
+    /// a Linux box missing hard-cap prerequisites shows *soft* with the reason.
+    /// `probed` is the measured facts for `self.os`, or `None` when it can't be probed (a
     /// non-host OS column, or JSON output).
-    pub fn ceiling_label(&self, probed: Option<CpuCap>) -> String {
+    pub fn ceiling_label(&self, probed: Option<CapFacts>) -> String {
         match (self.ceiling, probed) {
-            (CeilingStrength::HostProbed, Some(cap)) => match cap {
+            (CeilingStrength::HostProbed, Some(facts)) => match facts.cap() {
                 CpuCap::ScopeHard => "hard (systemd scope)".to_string(),
-                CpuCap::NiceSoft => "soft (nice — no cgroup cpu delegation)".to_string(),
+                CpuCap::NiceSoft => match facts.soft_reason() {
+                    Some(reason) => format!("soft (nice — {reason})"),
+                    None => "soft (nice)".to_string(),
+                },
                 CpuCap::None => "none (no cap mechanism)".to_string(),
             },
             (strength, _) => strength.as_str().to_string(),
@@ -438,22 +441,42 @@ mod tests {
 
     #[test]
     fn host_toolchain_ceiling_degrades_hard_to_soft_when_delegation_absent() {
-        // The doctor overlay: HostProbed renders hard WITH cgroup cpu delegation,
-        // soft WITHOUT it. This is the 1.2 scenario, as a pure test.
+        // The doctor overlay: HostProbed renders hard with all prerequisites,
+        // and names the missing prerequisite for a soft cap.
         let bwrap = row(Backend::Bwrap, HostOs::Linux);
-        assert!(
-            bwrap
-                .ceiling_label(Some(CpuCap::ScopeHard))
-                .contains("hard")
-        );
-        let soft = bwrap.ceiling_label(Some(CpuCap::NiceSoft));
+        let hard = CapFacts {
+            systemd_run: true,
+            cgroup_cpu_delegated: true,
+            user_manager: true,
+            nice: true,
+        };
+        let no_delegation = CapFacts {
+            cgroup_cpu_delegated: false,
+            ..hard
+        };
+        assert!(bwrap.ceiling_label(Some(hard)).contains("hard"));
+        let soft = bwrap.ceiling_label(Some(no_delegation));
         assert!(soft.contains("soft"), "{soft}");
         assert!(soft.contains("nice"), "{soft}");
         // With no probe (a non-host column), the structural label stands.
         assert!(bwrap.ceiling_label(None).contains("host cpu cap"));
         // A native-hard backend ignores the probe entirely.
         let podman = row(Backend::Podman, HostOs::Linux);
-        assert_eq!(podman.ceiling_label(Some(CpuCap::NiceSoft)), "hard");
+        assert_eq!(podman.ceiling_label(Some(no_delegation)), "hard");
+    }
+
+    #[test]
+    fn soft_ceiling_names_the_missing_user_manager() {
+        let bwrap = row(Backend::Bwrap, HostOs::Linux);
+        let facts = CapFacts {
+            systemd_run: true,
+            cgroup_cpu_delegated: true,
+            user_manager: false,
+            nice: true,
+        };
+        let soft = bwrap.ceiling_label(Some(facts));
+        assert!(soft.contains("no reachable systemd user manager"), "{soft}");
+        assert!(!soft.contains("cgroup"), "{soft}");
     }
 
     #[test]
