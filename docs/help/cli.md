@@ -37,6 +37,9 @@ Before reclaiming pages, `thegn db vacuum` removes semantic-index rows for
 deleted files and cache keys left by removed worktrees, and reports both
 counts. `--json` emits one report (including `pruned_semantic_rows` and
 `pruned_cache_keys`); `--dry-run` removes nothing.
+The dry run reads the live database, including changes still in its
+write-ahead log, without writing it; it refuses a non-empty log without its
+`-shm` index.
 
 Some of these are dev-channel only — see [[release-channels]].
 
@@ -244,6 +247,10 @@ with an unknown head is printed but not cached. The CI panel's failed-job log
 windows and background log ingestion apply a stricter check: they reuse a
 cached window only for the run's current head and only if the job has not
 finished again since the log was fetched.
+If run detail is unavailable or the job is not listed, `ci logs` still prints
+the log without a job name or head, warns, and does not cache it. With `--json`,
+the warnings are in a `warnings` array (empty for a cached log); the control
+API's `ci.logs` reply carries the same field.
 
 When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
@@ -316,6 +323,10 @@ to remove before reinstalling.
 newest-first roster page. `--limit` defaults to 2048 and is capped at 4096;
 `--before <row>` continues before a row id. Both options require `--all`, and
 a truncated page prints its next cursor on stderr.
+
+The `--issue` filters on `supervise plan` and `supervise status` match every
+spelling of one issue (`THE-74`, `linear:THE-74`, any case); ids from different
+providers stay distinct.
 
 Exit codes:
 
