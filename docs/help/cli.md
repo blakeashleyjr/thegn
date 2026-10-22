@@ -305,11 +305,12 @@ Before replacing an install, the staged binary must resolve to a regular file
 inside staging or installation is refused and the previous install is kept. An
 owner-only `.thegn-provenance.json`, installed beside the tool, records the
 package and version, binary and available lock-file SHA-256s, and the
-containment used. Before reusing an installed npm or cargo tool, thegn checks
+containment used.
+Before reusing an installed npm or cargo tool, thegn checks
 that the record matches its package, version, binary path and current SHA-256.
-A missing record triggers a reinstall; a mismatched, unreadable or other-user-
-readable record refuses use and names the install directory to remove before
-reinstalling.
+A missing record triggers a reinstall; when a record is mismatched, unreadable
+or readable by other users, the tool refuses it and names the install directory
+to remove before reinstalling.
 
 `thegn supervise plan --all` and `thegn supervise status --all` read one
 newest-first roster page. `--limit` defaults to 2048 and is capped at 4096;
