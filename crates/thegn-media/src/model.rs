@@ -474,6 +474,27 @@ impl QueuePage {
     }
 }
 
+/// A bounded playlist read with the total number of playlists the backend reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistPage {
+    pub items: Vec<Playlist>,
+    pub total: usize,
+}
+
+impl PlaylistPage {
+    /// Retain at most [`MAX_PLAYLISTS`] rows while recording the input count.
+    pub fn from_rows(mut rows: Vec<Playlist>) -> PlaylistPage {
+        let total = rows.len();
+        rows.truncate(MAX_PLAYLISTS);
+        PlaylistPage { items: rows, total }
+    }
+
+    /// Number of backend rows omitted from this page.
+    pub fn hidden(&self) -> usize {
+        self.total.saturating_sub(self.items.len())
+    }
+}
+
 /// Format a duration as `m:ss` (or `h:mm:ss` past an hour).
 pub(crate) fn fmt_mmss(d: Duration) -> String {
     let secs = d.as_secs();
@@ -507,6 +528,27 @@ mod tests {
         assert_eq!(page.hidden(), 3);
 
         let page = QueuePage::from_rows(vec![QueueItem::default(); 2]);
+        assert_eq!(page.total, 2);
+        assert_eq!(page.hidden(), 0);
+    }
+
+    #[test]
+    fn playlist_page_from_rows_caps_and_counts() {
+        let row = |index| Playlist {
+            id: format!("playlist-{index}"),
+            name: format!("Playlist {index}"),
+        };
+        let page = PlaylistPage::from_rows((0..MAX_PLAYLISTS).map(row).collect());
+        assert_eq!(page.items.len(), MAX_PLAYLISTS);
+        assert_eq!(page.total, MAX_PLAYLISTS);
+        assert_eq!(page.hidden(), 0);
+
+        let page = PlaylistPage::from_rows((0..MAX_PLAYLISTS + 3).map(row).collect());
+        assert_eq!(page.items.len(), MAX_PLAYLISTS);
+        assert_eq!(page.total, MAX_PLAYLISTS + 3);
+        assert_eq!(page.hidden(), 3);
+
+        let page = PlaylistPage::from_rows((0..2).map(row).collect());
         assert_eq!(page.total, 2);
         assert_eq!(page.hidden(), 0);
     }
