@@ -420,12 +420,71 @@ fn queue_error_json(err: &anyhow::Error) -> serde_json::Value {
     })
 }
 
+#[derive(serde::Serialize)]
+struct ListedRow<'a> {
+    #[serde(flatten)]
+    row: &'a thegn_core::db::MergeQueueRow,
+    claim: Option<ClaimJson>,
+}
+
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+struct ClaimJson {
+    phase: String,
+    generation: i64,
+    lease_until_ms: Option<i64>,
+    owner_hint: Option<String>,
+    live: bool,
+}
+
+fn claim_json(view: Option<&thegn_core::store::MergeClaimView>, now_ms: i64) -> Option<ClaimJson> {
+    let view = view.filter(|view| view.phase != "unclaimed")?;
+    Some(ClaimJson {
+        phase: view.phase.clone(),
+        generation: view.generation,
+        lease_until_ms: view.lease_until_ms,
+        owner_hint: view.owner_hint.clone(),
+        live: view
+            .lease_until_ms
+            .is_some_and(|lease_until_ms| lease_until_ms > now_ms),
+    })
+}
+
+fn claim_suffix(claim: Option<&ClaimJson>, now_ms: i64) -> String {
+    let Some(claim) = claim else {
+        return String::new();
+    };
+    let owner = claim.owner_hint.as_deref().unwrap_or("unknown owner");
+    if claim.live {
+        let seconds = claim
+            .lease_until_ms
+            .map(|until| until.saturating_sub(now_ms) / 1000)
+            .unwrap_or(0);
+        format!(
+            "  [claimed by {owner}, {}, lease {seconds}s left]",
+            claim.phase
+        )
+    } else if let Some(until) = claim.lease_until_ms {
+        let seconds = now_ms.saturating_sub(until) / 1000;
+        format!("  [claim by {owner} expired {seconds}s ago, recoverable]")
+    } else {
+        format!("  [claim by {owner}, {}, lease unavailable]", claim.phase)
+    }
+}
+
 fn list(json: bool) -> Result<()> {
     // Scope to the current repo (same membership rule as `drain`) so a shared
     // state DB holding several repos' queues doesn't leak other repos' rows into
     // this repo's listing — `merge` is per-repo, and `list` must match `drain`.
     let root = repo_root()?;
-    let rows = match rows_for_repo(&root) {
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) if json => {
+            super::emit_json(&queue_error_json(&error))?;
+            return Err(error.context("merge queue unreadable"));
+        }
+        Err(error) => return Err(queue_error_context(error)),
+    };
+    let rows = match merge_driver::rows_for_repo(&db, &root) {
         Ok(rows) => rows,
         Err(error) if json => {
             super::emit_json(&queue_error_json(&error))?;
@@ -433,21 +492,43 @@ fn list(json: bool) -> Result<()> {
         }
         Err(error) => return Err(queue_error_context(error)),
     };
+    let now_ms = thegn_core::util::now_ms();
+    let mut listed = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let view = match db.observe_merge_claim(&row.worktree) {
+            Ok(view) => view,
+            Err(error) if json => {
+                super::emit_json(&queue_error_json(&error))?;
+                return Err(error.context("merge queue unreadable"));
+            }
+            Err(error) => return Err(queue_error_context(error)),
+        };
+        listed.push(ListedRow {
+            row,
+            claim: claim_json(view.as_ref(), now_ms),
+        });
+    }
     if json {
-        return super::emit_json(&rows);
+        return super::emit_json(&listed);
     }
     if rows.is_empty() {
         outln!("Merge queue empty.");
         return Ok(());
     }
-    for r in &rows {
+    for (r, listed_row) in rows.iter().zip(&listed) {
         let detail = r
             .conflict_paths
             .as_deref()
             .or(r.error_detail.as_deref())
             .map(|d| format!("  — {}", d.replace('\n', ", ")))
             .unwrap_or_default();
-        outln!("  {} {} → {}{detail}", r.status, r.branch, r.target_branch);
+        let claim = claim_suffix(listed_row.claim.as_ref(), now_ms);
+        outln!(
+            "  {} {} → {}{detail}{claim}",
+            r.status,
+            r.branch,
+            r.target_branch
+        );
     }
     Ok(())
 }
@@ -1474,5 +1555,201 @@ mod retry_tests {
                 "{worktree} is being worked by a drain; retry it after the drain finishes"
             ))
         );
+    }
+}
+
+#[cfg(test)]
+mod list_claim_tests {
+    use super::{ClaimJson, ListedRow, claim_json, claim_suffix};
+    use std::path::Path;
+    use thegn_core::db::{Db, MergeQueueRow};
+    use thegn_core::store::{MergeClaimRequest, MergeClaimView, WorkspaceStore, WorktreeAuxStore};
+    use thegn_core::util;
+
+    fn claim_view(phase: &str, lease_until_ms: Option<i64>) -> MergeClaimView {
+        MergeClaimView {
+            worktree: "/repo/worktree".to_owned(),
+            generation: 7,
+            phase: phase.to_owned(),
+            lease_until_ms,
+            owner_hint: Some("thegn pid 42".to_owned()),
+        }
+    }
+
+    fn row() -> MergeQueueRow {
+        MergeQueueRow {
+            worktree: "/repo/worktree".to_owned(),
+            branch: "feature".to_owned(),
+            target_branch: "main".to_owned(),
+            status: "ready".to_owned(),
+            queued_at: 1,
+            updated_at: 2,
+            result_oid: Some("fold-oid".to_owned()),
+            conflict_paths: None,
+            error_detail: None,
+            location: "local".to_owned(),
+            agent_attempts: 3,
+        }
+    }
+
+    #[test]
+    fn claim_json_is_null_for_unclaimed_rows() {
+        assert_eq!(claim_json(None, 100), None);
+        assert_eq!(
+            claim_json(Some(&claim_view("unclaimed", Some(200))), 100),
+            None
+        );
+    }
+
+    #[test]
+    fn claim_json_marks_live_and_expired_claims() {
+        let live_view = claim_view("claimed_no_child", Some(101));
+        let live = claim_json(Some(&live_view), 100).unwrap();
+        assert_eq!(
+            live,
+            ClaimJson {
+                phase: "claimed_no_child".to_owned(),
+                generation: 7,
+                lease_until_ms: Some(101),
+                owner_hint: Some("thegn pid 42".to_owned()),
+                live: true,
+            }
+        );
+
+        let expired_view = claim_view("claimed_no_child", Some(99));
+        let expired = claim_json(Some(&expired_view), 100).unwrap();
+        assert!(!expired.live);
+        assert_eq!(expired.phase, "claimed_no_child");
+        assert_eq!(expired.generation, 7);
+        assert_eq!(expired.lease_until_ms, Some(99));
+        assert_eq!(expired.owner_hint.as_deref(), Some("thegn pid 42"));
+    }
+
+    #[test]
+    fn listed_row_json_keeps_row_fields_and_adds_claim() {
+        let view = claim_view("claimed_no_child", Some(101));
+        let fixture_row = row();
+        let listed = ListedRow {
+            row: &fixture_row,
+            claim: claim_json(Some(&view), 100),
+        };
+        let value = serde_json::to_value(listed).unwrap();
+        assert_eq!(value["worktree"], "/repo/worktree");
+        assert_eq!(value["branch"], "feature");
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["agent_attempts"], 3);
+        assert_eq!(value["claim"]["phase"], "claimed_no_child");
+        assert!(value["claim"]["live"].as_bool().unwrap());
+        let serialized = value.to_string();
+        assert!(!serialized.contains("owner_token"));
+
+        let unclaimed = ListedRow {
+            row: &fixture_row,
+            claim: claim_json(None, 100),
+        };
+        let unclaimed_value = serde_json::to_value(unclaimed).unwrap();
+        assert!(unclaimed_value["claim"].is_null());
+    }
+
+    #[test]
+    fn claim_suffix_names_owner_phase_and_lease() {
+        assert_eq!(claim_suffix(None, 1_000), "");
+        let live = ClaimJson {
+            phase: "claimed_no_child".to_owned(),
+            generation: 1,
+            lease_until_ms: Some(61_000),
+            owner_hint: Some("drain-a".to_owned()),
+            live: true,
+        };
+        assert_eq!(
+            claim_suffix(Some(&live), 1_000),
+            "  [claimed by drain-a, claimed_no_child, lease 60s left]"
+        );
+        let expired = ClaimJson {
+            live: false,
+            lease_until_ms: Some(1_000),
+            ..live.clone()
+        };
+        assert_eq!(
+            claim_suffix(Some(&expired), 6_000),
+            "  [claim by drain-a expired 5s ago, recoverable]"
+        );
+        let unknown = ClaimJson {
+            owner_hint: None,
+            ..live
+        };
+        assert!(claim_suffix(Some(&unknown), 1_000).contains("unknown owner"));
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "deterministic real-Git fixture for the store observation"
+    )]
+    fn init_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let output = util::git_cmd(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["init", "-q", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        for args in [
+            &["config", "user.name", "Thegn Test"][..],
+            &["config", "user.email", "thegn@example.invalid"][..],
+            &["config", "commit.gpgsign", "false"][..],
+        ] {
+            let output = util::git_cmd(path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        std::fs::write(path.join("base.txt"), "base\n").unwrap();
+        for args in [
+            &["add", "-A"][..],
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"][..],
+        ] {
+            let output = util::git_cmd(path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+    }
+
+    #[test]
+    fn observed_claim_round_trips_through_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repo(temp.path());
+        let worktree = temp.path().to_string_lossy().into_owned();
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("main", &worktree, &worktree, "main", None, None)
+            .unwrap();
+        db.enqueue_merge(&worktree, "main", "main").unwrap();
+        db.update_merge_status(&worktree, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+        db.admit_merge_claim(&MergeClaimRequest {
+            worktree: worktree.clone(),
+            branch: "main".to_owned(),
+            repo_root: worktree.clone(),
+            target_branch: "main".to_owned(),
+            location: String::new(),
+            expected_status: "ready".to_owned(),
+            lease_until_ms: util::now_ms() + 60_000,
+            owner_hint: Some("test-drain".to_owned()),
+        })
+        .unwrap()
+        .unwrap();
+
+        // Positive control: the token-free observation API already persists and reads this claim.
+        let observed = db.observe_merge_claim(&worktree).unwrap();
+        let claim = claim_json(observed.as_ref(), util::now_ms()).unwrap();
+        assert!(claim.live);
+        assert_eq!(claim.owner_hint.as_deref(), Some("test-drain"));
     }
 }
