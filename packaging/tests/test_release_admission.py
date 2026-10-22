@@ -61,6 +61,35 @@ class ReleaseAdmissionTests(unittest.TestCase):
     def test_admit_runs_in_release_admission_environment(self) -> None:
         self.assertEqual("release-admission", self.jobs["admit"].get("environment"))
 
+    def test_releasing_setup_allows_dispatch_branch_and_release_tags(self) -> None:
+        releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+        self.assertIn("deployment rule allowing the protected `main`", releasing)
+        self.assertIn("branch and `v*` tags", releasing)
+        self.assertIn("`v<workspace version>`", releasing)
+
+    def test_tag_object_name_reads_only_the_header(self) -> None:
+        script = self._resolve_script()
+        command = "sed -n '/^$/q; s/^tag //p'"
+        self.assertIn(command, script)
+        self.assertNotIn("| head -n 1", script)
+        tag_content = (
+            "object " + "a" * 40 + "\n"
+            "type commit\n"
+            "tag v1.2.3\n"
+            "tagger T <t@example.invalid> 0 +0000\n"
+            "\n"
+            "release notes\n"
+            "tag attacker-controlled-body-line\n"
+        )
+        result = subprocess.run(
+            ["sed", "-n", "/^$/q; s/^tag //p"],
+            input=tag_content,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual("v1.2.3\n", result.stdout)
+
     def test_every_write_job_depends_on_admit(self) -> None:
         for job_name, job in self.jobs.items():
             permissions = job.get("permissions", {})

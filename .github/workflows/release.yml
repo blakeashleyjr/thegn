@@ -99,7 +99,7 @@ jobs:
             echo "::error::release tag must be an annotated tag (git tag -a)"
             exit 1
           }
-          tag_name="$(git cat-file tag "$tag_object" | sed -n 's/^tag //p' | head -n 1)"
+          tag_name="$(git cat-file tag "$tag_object" | sed -n '/^$/q; s/^tag //p')"
           [ "$tag_name" = "$TAG" ] || {
             echo "::error::release tag object names a different tag"
             exit 1
