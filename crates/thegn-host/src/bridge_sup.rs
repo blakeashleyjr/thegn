@@ -289,7 +289,7 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
     None
 }
 
-/// The program of an ssh transport prefix: the last `/`- or `\\`-separated
+/// The program of an ssh transport prefix: the last `/`- or `\`-separated
 /// component is exactly `ssh`, or `ssh.exe` in any ASCII case (Windows
 /// OpenSSH; Windows file names are case-insensitive).
 fn is_ssh_program(program: &str) -> bool {
