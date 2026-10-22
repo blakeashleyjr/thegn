@@ -533,6 +533,10 @@ impl WorkspacePicker {
                 .into_iter()
                 .map(|(index, score)| (old_len + index, score));
             let ranked_appended: Vec<(usize, u16)> = appended.collect();
+            if ranked_appended.is_empty() {
+                self.clamp_selection_and_scroll();
+                return;
+            }
             let mut merged_matches = Vec::with_capacity(self.matches.len() + ranked_appended.len());
             let mut merged_scores =
                 Vec::with_capacity(self.match_scores.len() + ranked_appended.len());
@@ -549,16 +553,10 @@ impl WorkspacePicker {
                     added += 1;
                 }
             }
-            while existing < self.matches.len() {
-                merged_matches.push(self.matches[existing]);
-                merged_scores.push(self.match_scores[existing]);
-                existing += 1;
-            }
-            while added < ranked_appended.len() {
-                merged_matches.push(ranked_appended[added].0);
-                merged_scores.push(ranked_appended[added].1);
-                added += 1;
-            }
+            merged_matches.extend_from_slice(&self.matches[existing..]);
+            merged_scores.extend_from_slice(&self.match_scores[existing..]);
+            merged_matches.extend(ranked_appended[added..].iter().map(|(index, _)| *index));
+            merged_scores.extend(ranked_appended[added..].iter().map(|(_, score)| *score));
             self.matches = merged_matches;
             self.match_scores = merged_scores;
         }
@@ -1345,6 +1343,28 @@ mod tests {
 
         assert!(p.drain_discovery());
         assert_eq!(p.ranked_haystacks, ranked_before);
+    }
+
+    #[test]
+    fn non_matching_discovery_batch_keeps_existing_match_allocation() {
+        let mut p = picker(&["/code/rust", "/code/rust-analyzer"]);
+        type_str(&mut p, "rust");
+        p.generation = 7;
+        p.scanning = true;
+        let matches_ptr = p.matches.as_ptr();
+        let scores_ptr = p.match_scores.as_ptr();
+
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/code/python".into(), "/code/go".into()],
+            })
+            .unwrap();
+
+        assert!(p.drain_discovery());
+        assert_eq!(p.matches.as_ptr(), matches_ptr);
+        assert_eq!(p.match_scores.as_ptr(), scores_ptr);
+        assert_eq!(p.matches.len(), 2);
     }
 
     #[test]
