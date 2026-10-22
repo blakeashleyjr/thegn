@@ -357,15 +357,42 @@ fn bounded(value: &str) -> String {
     value.chars().take(512).collect()
 }
 
+fn same_worktree(stored: &str, worktree: &str, resolved: Option<&str>) -> bool {
+    stored == worktree
+        || resolved.is_some_and(|resolved| {
+            crate::monitor_pipeline::resolved_worktree(stored).as_deref() == Some(resolved)
+        })
+}
+
 fn enrich_event(db: &thegn_core::db::Db, event: &mut AutomationEvent) {
     use thegn_core::store::{NotificationStore, WorkspaceStore};
     let Some(worktree) = event.worktree.as_deref() else {
         return;
     };
-    let row = db
-        .worktrees()
-        .ok()
-        .and_then(|rows| rows.into_iter().find(|row| row.worktree == worktree));
+    let resolved = crate::monitor_pipeline::resolved_worktree(worktree);
+    let row = db.worktrees().ok().and_then(|rows| {
+        if let Some(exact) = rows.iter().find(|row| row.worktree == worktree) {
+            Some(exact.clone())
+        } else {
+            let mut matches = rows.into_iter().filter(|row| {
+                std::path::Path::new(&row.worktree).is_absolute()
+                    && !thegn_core::remote::GitLoc::from_db(&row.worktree, Some(&row.location))
+                        .is_remote()
+                    && same_worktree(&row.worktree, worktree, resolved.as_deref())
+            });
+            let first = matches.next()?;
+            if matches.all(|row| row.repo_root == first.repo_root) {
+                Some(first)
+            } else {
+                tracing::debug!(
+                    target: "thegn::automation",
+                    worktree,
+                    "worktree alias matches registry rows from multiple repositories"
+                );
+                None
+            }
+        }
+    });
     if let Some(row) = row {
         if event.repo.is_none() {
             event.repo = Some(row.repo_root.clone());
@@ -386,12 +413,20 @@ fn enrich_event(db: &thegn_core::db::Db, event: &mut AutomationEvent) {
             db.dispatch_by_session(session)
                 .ok()
                 .flatten()
-                .filter(|dispatch| dispatch.worktree_path == worktree)
+                .filter(|dispatch| {
+                    same_worktree(&dispatch.worktree_path, worktree, resolved.as_deref())
+                })
                 .and_then(|dispatch| dispatch.stage)
         } else {
             db.dispatch_for_worktree(worktree)
                 .ok()
                 .flatten()
+                .or_else(|| {
+                    resolved
+                        .as_deref()
+                        .filter(|resolved| *resolved != worktree)
+                        .and_then(|resolved| db.dispatch_for_worktree(resolved).ok().flatten())
+                })
                 .and_then(|id| db.get_dispatch(id).ok().flatten())
                 .and_then(|dispatch| dispatch.stage)
         };
@@ -611,6 +646,148 @@ mod tests {
             chunk_path: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn worktree_enrichment_matches_a_registered_worktree_through_a_symlink_alias() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo", "product", "repo").unwrap();
+        db.put_worktree(
+            "product/feature",
+            "/repo",
+            &temp.real_path().display().to_string(),
+            "tg/feature",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut event = event_for_dispatch(&temp.path().display().to_string(), None);
+        enrich_event(&db, &mut event);
+        assert_eq!(event.workspace.as_deref(), Some("product"));
+        assert_eq!(event.repo.as_deref(), Some("/repo"));
+        assert_eq!(event.branch.as_deref(), Some("tg/feature"));
+    }
+
+    #[test]
+    fn worktree_enrichment_does_not_resolve_remote_registry_paths_locally() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/repo", "product", "repo").unwrap();
+        let remote_location = thegn_core::remote::GitLoc::remote_db_string(
+            "example.invalid",
+            22,
+            false,
+            &temp.real_path().display().to_string(),
+        );
+        db.put_worktree(
+            "product/remote",
+            "/repo",
+            &temp.real_path().display().to_string(),
+            "tg/remote",
+            Some(&remote_location),
+            None,
+        )
+        .unwrap();
+
+        let mut event = event_for_dispatch(&temp.path().display().to_string(), None);
+        enrich_event(&db, &mut event);
+        assert_eq!(event.repo, None);
+        assert_eq!(event.branch, None);
+        assert_eq!(event.workspace, None);
+    }
+
+    #[test]
+    fn session_dispatch_enrichment_accepts_its_row_under_an_alias_spelling() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        put_dispatch(
+            &db,
+            &temp.real_path().display().to_string(),
+            "s-alias",
+            "code",
+        );
+
+        let mut event = event_for_dispatch(&temp.path().display().to_string(), Some("s-alias"));
+        enrich_event(&db, &mut event);
+        assert_eq!(event.agent_role.as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn worktree_dispatch_enrichment_falls_back_to_the_resolved_path() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        put_dispatch(
+            &db,
+            &temp.real_path().display().to_string(),
+            "s-any",
+            "review",
+        );
+
+        let mut event = event_for_dispatch(&temp.path().display().to_string(), None);
+        enrich_event(&db, &mut event);
+        assert_eq!(event.agent_role.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn session_dispatch_enrichment_rejects_an_alias_of_another_worktree() {
+        let a = thegn_core::testenv::symlinked_tempdir();
+        let b = thegn_core::testenv::symlinked_tempdir();
+        if a.path() == a.real_path() || b.path() == b.real_path() {
+            return;
+        }
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        put_dispatch(&db, &b.real_path().display().to_string(), "s-x", "wrong");
+
+        let mut event = event_for_dispatch(&a.path().display().to_string(), Some("s-x"));
+        enrich_event(&db, &mut event);
+        assert_eq!(event.agent_role, None);
+    }
+
+    #[test]
+    fn ambiguous_alias_registry_match_enriches_nothing() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree(
+            "t/one",
+            "/repo-one",
+            &temp.path().display().to_string(),
+            "b1",
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_worktree(
+            "t/two",
+            "/repo-two",
+            &temp.real_path().display().to_string(),
+            "b2",
+            None,
+            None,
+        )
+        .unwrap();
+        let event_path = format!("{}/.", temp.real_path().display());
+
+        let mut event = event_for_dispatch(&event_path, None);
+        enrich_event(&db, &mut event);
+        assert_eq!(event.repo, None);
+        assert_eq!(event.branch, None);
     }
 
     #[test]
