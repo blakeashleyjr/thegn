@@ -10,7 +10,8 @@
 //! the host (attach bridge, reaper) read it — and every create/destroy flows
 //! through the provider, so no call site can forget the bookkeeping.
 //! Count-and-reserve is serialised by a lock file, and unreadable records count as occupied.
-//! Reads, listing and the lock are resolved through the held registry root.
+//! Machine0 create is serialised by its own lock file. Reads, listing and both locks are
+//! resolved through the held registry root.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const RESERVE_LOCK: &str = ".reserve.lock";
+pub const MACHINE0_CREATE_LOCK: &str = ".machine0-create.lock";
 pub const BAKE_NAME_PREFIX: &str = "tg-bake-";
 
 #[derive(Debug, Default)]
@@ -208,6 +210,19 @@ fn open_root(d: &Path, create: bool) -> Result<Option<thegn_core::fsperm::Privat
     thegn_core::fsperm::open_private_dir(d)
         .map(Some)
         .context("vps registry: registry root is not an owned private directory")
+}
+
+/// Open a supported registry lock file without following symlinks.
+pub fn open_lock_at(d: &Path, lock_name: &str) -> Result<std::fs::File> {
+    anyhow::ensure!(
+        matches!(lock_name, RESERVE_LOCK | MACHINE0_CREATE_LOCK),
+        "vps registry: unsupported lock name"
+    );
+    let root = open_root(d, true)?.ok_or_else(|| {
+        anyhow::anyhow!("vps registry: registry root was not opened after creation")
+    })?;
+    root.open_or_create_regular_nofollow(lock_name)
+        .with_context(|| format!("vps registry: open {lock_name}"))
 }
 
 pub fn ensure_known_hosts_dir_at(d: &Path) -> Result<PathBuf> {
@@ -1529,5 +1544,50 @@ mod tests {
             ),
             "unexpected reservation result: {result:?}"
         );
+    }
+
+    #[test]
+    fn create_lock_opens_in_the_registry_root_and_is_never_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let _lock = open_lock_at(dir, MACHINE0_CREATE_LOCK).unwrap();
+        assert!(dir.join(MACHINE0_CREATE_LOCK).exists());
+        assert!(
+            thegn_core::fsperm::mode_bits(&dir.join(MACHINE0_CREATE_LOCK))
+                .unwrap()
+                .is_none_or(|mode| mode & 0o777 == 0o600)
+        );
+
+        let record = rec("a", "creating");
+        reserve_at(dir, &record, 1, ReserveScope::All).unwrap();
+        assert_eq!(list_at(dir), vec![record]);
+    }
+
+    #[test]
+    fn create_lock_refuses_unknown_names_and_a_symlinked_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("registry");
+        std::fs::create_dir(&dir).unwrap();
+
+        assert!(open_lock_at(&dir, "../x.lock").is_err());
+        assert!(open_lock_at(&dir, "x.json").is_err());
+        assert!(open_lock_at(&dir, ".other.lock").is_err());
+
+        let outside = tmp.path().join("outside-lock");
+        std::fs::write(&outside, b"leave unchanged").unwrap();
+        if let Err(error) =
+            thegn_core::fsperm::create_symlink(&outside, &dir.join(MACHINE0_CREATE_LOCK), false)
+        {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+        assert!(open_lock_at(&dir, MACHINE0_CREATE_LOCK).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"leave unchanged");
     }
 }

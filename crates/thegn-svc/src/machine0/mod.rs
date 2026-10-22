@@ -45,6 +45,49 @@ use crate::vps::ssh_shim::{CappedExec, SshShim};
 use mcp::Mcp0Client;
 use thegn_core::remote::SshTarget;
 
+const VM_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(360);
+const VM_READY_POLL: std::time::Duration = std::time::Duration::from_secs(4);
+/// A lock holder is inside one create; bound contenders by the VM readiness budget.
+const CREATE_LOCK_WAIT: std::time::Duration = VM_READY_BUDGET;
+/// Poll at the same cadence as VM readiness checks.
+const CREATE_LOCK_POLL: std::time::Duration = VM_READY_POLL;
+
+async fn acquire_create_lock(
+    lock: std::fs::File,
+    wait: std::time::Duration,
+) -> Result<std::fs::File> {
+    let start = std::time::Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let elapsed = start.elapsed();
+                if elapsed >= wait {
+                    return Err(anyhow!(
+                        "machine0: another thegn process is creating a machine0 VM; refusing to count capacity concurrently (retry when it finishes)"
+                    ));
+                }
+                tokio::time::sleep(CREATE_LOCK_POLL.min(wait.saturating_sub(elapsed))).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("machine0: lock the create serialization file");
+            }
+        }
+    }
+}
+
+async fn create_lock() -> Result<std::fs::File> {
+    let file = tokio::task::spawn_blocking(|| {
+        crate::vps::registry::open_lock_at(
+            &crate::vps::registry::dir(),
+            crate::vps::registry::MACHINE0_CREATE_LOCK,
+        )
+    })
+    .await
+    .context("machine0: create lock worker failed")??;
+    acquire_create_lock(file, CREATE_LOCK_WAIT).await
+}
+
 /// MCP tool names (verified against a live machine0 `tools/list`), isolated so a
 /// future rename is a one-liner.
 mod tool {
@@ -409,7 +452,6 @@ impl Machine0Provider {
     /// machine0 says provisioning takes 1–3 min; bounded. Unifies the
     /// create-wait and the resume-on-claim wait.
     async fn ensure_running_vm(&self, name: &str) -> Result<Machine0Vm> {
-        const BUDGET: std::time::Duration = std::time::Duration::from_secs(360);
         let start = std::time::Instant::now();
         let mut last: String;
         loop {
@@ -439,13 +481,13 @@ impl Machine0Provider {
                 Ok(None) => last = "not-found".into(),
                 Err(e) => last = format!("transient: {e}"),
             }
-            if start.elapsed() >= BUDGET {
+            if start.elapsed() >= VM_READY_BUDGET {
                 return Err(anyhow!(
                     "machine0: vm {name} not RUNNING after {}s (last {last})",
-                    BUDGET.as_secs(),
+                    VM_READY_BUDGET.as_secs(),
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            tokio::time::sleep(VM_READY_POLL).await;
         }
     }
 
@@ -472,7 +514,7 @@ impl Machine0Provider {
                     BUDGET.as_secs(),
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            tokio::time::sleep(VM_READY_POLL).await;
         }
     }
 
@@ -859,12 +901,15 @@ impl RemoteProvider for Machine0Provider {
             if name.is_empty() {
                 return Err(anyhow!("machine0: the sandbox name is empty"));
             }
+            let create_guard = create_lock().await?;
             // Spend guardrail: unknown inventory and a reached cap both refuse.
             admit_create(
                 self.list().await.map(|v| v.len()),
                 self.spec.max_instances(),
             )?;
-            let vm = self.spawn(&name, &self.spec.image).await?;
+            let spawned = self.spawn(&name, &self.spec.image).await;
+            drop(create_guard);
+            let vm = spawned?;
             // NixOS flake apply (no-op unless `provision_flake` is set). Attestation-gated
             // so a failed apply here is re-attempted on the next wake rather than
             // leaving a permanently half-provisioned VM.
@@ -1018,9 +1063,12 @@ impl ProviderCheckpoints for Machine0Provider {
                      restore that cannot succeed (run `thegn env checkpoints` to list valid images)"
                 ));
             }
+            let restore_guard = create_lock().await?;
             self.destroy(id).await?;
             *self.endpoint.lock().unwrap() = None;
-            self.spawn(id, checkpoint).await?;
+            let spawned = self.spawn(id, checkpoint).await;
+            drop(restore_guard);
+            spawned?;
             Ok(())
         })
     }
@@ -2250,5 +2298,62 @@ mod tests {
         .unwrap();
 
         assert!(!known_hosts.join("dev").exists());
+    }
+
+    #[tokio::test]
+    async fn create_lock_busy_refuses_immediately_with_a_zero_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let held = crate::vps::registry::open_lock_at(
+            root.path(),
+            crate::vps::registry::MACHINE0_CREATE_LOCK,
+        )
+        .unwrap();
+        held.try_lock().unwrap();
+        let second = crate::vps::registry::open_lock_at(
+            root.path(),
+            crate::vps::registry::MACHINE0_CREATE_LOCK,
+        )
+        .unwrap();
+
+        let result = acquire_create_lock(second, std::time::Duration::ZERO).await;
+        match result {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("another thegn process is creating a machine0 VM")
+            ),
+            Ok(_) => panic!("a held create lock must refuse immediately"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_lock_is_acquired_once_the_holder_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let held = crate::vps::registry::open_lock_at(
+            root.path(),
+            crate::vps::registry::MACHINE0_CREATE_LOCK,
+        )
+        .unwrap();
+        held.try_lock().unwrap();
+        drop(held);
+
+        let acquired = acquire_create_lock(
+            crate::vps::registry::open_lock_at(
+                root.path(),
+                crate::vps::registry::MACHINE0_CREATE_LOCK,
+            )
+            .unwrap(),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let third = crate::vps::registry::open_lock_at(
+            root.path(),
+            crate::vps::registry::MACHINE0_CREATE_LOCK,
+        )
+        .unwrap();
+        let result = acquire_create_lock(third, std::time::Duration::ZERO).await;
+        assert!(result.is_err(), "the returned file must hold the lock");
+        drop(acquired);
     }
 }
