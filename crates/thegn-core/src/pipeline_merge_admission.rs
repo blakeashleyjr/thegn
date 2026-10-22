@@ -153,6 +153,52 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_rows_for_worktree_paths_unions_every_spelling_newest_first() {
+        let db = Db::open_memory().unwrap();
+        for (path, stage, artifact) in [
+            ("/wt/a", Some("code"), Some("code.md")),
+            ("/wt/./a", Some("review"), Some("review.md")),
+            ("/wt/b", Some("code"), Some("other.md")),
+            ("/wt/a", None, None),
+        ] {
+            db.put_agent_dispatch(NewDispatch {
+                stage,
+                artifact_path: artifact,
+                ..NewDispatch::new("linear:THE-1204", path, "fixture")
+            })
+            .unwrap();
+        }
+        let rows = db
+            .pipeline_rows_for_worktree_paths(&["/wt/a", "/wt/./a", "/wt/a"])
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].stage.as_deref(), Some("review"));
+        assert_eq!(rows[1].stage.as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn pipeline_worktree_paths_lists_distinct_pipeline_paths_only() {
+        let db = Db::open_memory().unwrap();
+        for (path, stage, artifact) in [
+            ("/wt/a", Some("code"), Some("code.md")),
+            ("/wt/./a", Some("review"), Some("review.md")),
+            ("/wt/b", Some("code"), Some("other.md")),
+            ("/wt/a", None, None),
+        ] {
+            db.put_agent_dispatch(NewDispatch {
+                stage,
+                artifact_path: artifact,
+                ..NewDispatch::new("linear:THE-1204", path, "fixture")
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            db.pipeline_worktree_paths().unwrap(),
+            ["/wt/./a", "/wt/a", "/wt/b"]
+        );
+    }
+
+    #[test]
     fn pipeline_merge_refusal_names_gate_and_override_commands() {
         let refusal = super::PipelineMergeRefused {
             worktree: "/wt/a".to_string(),
