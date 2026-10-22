@@ -1,7 +1,8 @@
 //! The sidebar's derived pipeline **folders**: under each workspace, one
 //! `Pipelines` folder holding one folder per pipeline the dispatch roster
-//! knows — named from the roster's `issue_id` — with every worktree that
-//! pipeline's roster rows reference inside it.
+//! knows — named from the roster's canonical issue identity — with every
+//! worktree that pipeline's roster rows reference inside it. Unprefixed ids
+//! join a matching provider lane only when that key identifies one provider.
 //!
 //! Pure — a fold over roster rows already in memory. It runs on the hydration
 //! thread beside the other roster derivations
@@ -19,14 +20,23 @@
 
 use thegn_core::issue::AgentDispatch;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LaneId {
+    Issue {
+        provider: Option<String>,
+        key: String,
+    },
+    Raw(String),
+}
+
 /// One derived lane folder: all the roster's rows for one issue (or, absent an
 /// issue id, for one worktree).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Lane {
-    /// Stable identity — the row's `issue_id`, else its worktree basename.
-    /// Keys the collapse state, so it must not change as the lane advances.
+    /// Stable canonical identity — the earliest canonical issue spelling,
+    /// else the raw trimmed id or worktree basename. Keys collapse state.
     pub key: String,
-    /// The folder's name. The lane is **named from the roster's issue id**
+    /// The folder's name. The lane is **named from the canonical issue id**
     /// (degrading to the worktree basename when the rows carry none); its
     /// worktrees hang below it as leaves, so the label needs no suffix.
     pub label: String,
@@ -52,9 +62,11 @@ pub(crate) struct LaneWorktree {
 /// - **Every row participates** — `queued`, `running`, `merged`, `failed`, all
 ///   of them. The roster is a ledger, not a live-session view, so a lane
 ///   survives a restart and outlives its last active dispatch.
-/// - **Lane key / name**: the row's `issue_id` when non-blank, else the
-///   basename of its `worktree_path`. A row with neither is skipped — it has
-///   no identity to file under, and inventing one would merge unrelated work.
+/// - **Lane key / name**: issue ids use canonical provider and case-insensitive
+///   key identity. An unprefixed key joins a prefixed lane only when exactly
+///   one provider has that key; ambiguous unprefixed ids stay separate. Invalid
+///   ids retain their raw trimmed identity. Blank ids use the worktree basename.
+///   A row with neither is skipped — it has no identity to file under.
 /// - **Worktrees**: distinct by full path; ordered by the earliest dispatch
 ///   that references them, tie-broken by name, so the tree never reshuffles
 ///   frame to frame.
@@ -62,25 +74,72 @@ pub(crate) struct LaneWorktree {
 ///   (the order work started — the same reading
 ///   `monitor_pipeline::ordered_rows` uses), tie-broken by key.
 pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
-    // Grouped by key, in first-seen order; the real ordering happens below.
-    let mut keys: Vec<String> = Vec::new();
-    let mut by_key: std::collections::HashMap<String, Vec<&AgentDispatch>> =
-        std::collections::HashMap::new();
+    use std::collections::{HashMap, HashSet};
+
+    // Count distinct providers per canonical key before assigning unprefixed
+    // rows; an unprefixed id cannot choose between multiple providers.
+    let mut providers_by_key: HashMap<String, HashSet<String>> = HashMap::new();
     for d in dispatches {
-        let Some(key) = lane_key(d) else {
+        if let Some(LaneId::Issue {
+            provider: Some(provider),
+            key,
+        }) = lane_identity(d)
+        {
+            providers_by_key.entry(key).or_default().insert(provider);
+        }
+    }
+
+    // Group in first-seen order. The final lane sort is independent of this
+    // order, while retaining it makes row collection deterministic.
+    let mut ids: Vec<LaneId> = Vec::new();
+    let mut by_id: HashMap<LaneId, Vec<&AgentDispatch>> = HashMap::new();
+    for d in dispatches {
+        let Some(mut id) = lane_identity(d) else {
             continue;
         };
-        let slot = by_key.entry(key.clone()).or_insert_with(|| {
-            keys.push(key.clone());
+        if let LaneId::Issue {
+            provider: None,
+            key,
+        } = &id
+            && let Some(providers) = providers_by_key.get(key)
+            && providers.len() == 1
+        {
+            id = LaneId::Issue {
+                provider: providers.iter().next().cloned(),
+                key: key.clone(),
+            };
+        }
+        let slot = by_id.entry(id.clone()).or_insert_with(|| {
+            ids.push(id.clone());
             Vec::new()
         });
         slot.push(d);
     }
 
+    // The displayed key is also the public row identity used for collapse and
+    // pin state. Preserve the pre-canonical fold's uniqueness by coalescing
+    // any distinct identities that resolve to the same display spelling.
+    let mut keys: Vec<String> = Vec::new();
+    let mut rows_by_key: HashMap<String, Vec<&AgentDispatch>> = HashMap::new();
+    for id in ids {
+        let Some(rows) = by_id.remove(&id) else {
+            continue;
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let key = lane_display_key(&id, &rows);
+        let slot = rows_by_key.entry(key.clone()).or_insert_with(|| {
+            keys.push(key.clone());
+            Vec::new()
+        });
+        slot.extend(rows);
+    }
+
     let mut lanes: Vec<(i64, Lane)> = keys
         .into_iter()
         .filter_map(|key| {
-            let rows = by_key.remove(&key)?;
+            let rows = rows_by_key.remove(&key)?;
             if rows.is_empty() {
                 return None;
             }
@@ -104,7 +163,7 @@ pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
                 }
             }
             seen.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| a.name.cmp(&b.name)));
-            let earliest = rows.iter().map(|d| d.dispatched_at_ms).min().unwrap_or(0);
+            let earliest = rows.iter().map(|d| d.dispatched_at_ms).min()?;
             Some((
                 earliest,
                 Lane {
@@ -120,15 +179,63 @@ pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
     lanes.into_iter().map(|(_, lane)| lane).collect()
 }
 
-/// The lane a row files under: its issue id, else its worktree basename.
-/// `None` when it has neither — the row has no identity a folder could carry.
-fn lane_key(d: &AgentDispatch) -> Option<String> {
+/// The grouping identity before unprefixed-provider ambiguity is resolved.
+fn lane_identity(d: &AgentDispatch) -> Option<LaneId> {
     let issue = d.issue_id.trim();
     if !issue.is_empty() {
-        return Some(issue.to_string());
+        return Some(
+            match thegn_core::pipeline_identity::canonical_issue_id(issue) {
+                Ok(canonical) => {
+                    let (provider, key) = thegn_core::pipeline_identity::split_issue_id(&canonical);
+                    LaneId::Issue {
+                        provider: provider.map(str::to_string),
+                        key: key.to_ascii_uppercase(),
+                    }
+                }
+                Err(_) => LaneId::Raw(issue.to_string()),
+            },
+        );
     }
     let wt = thegn_core::util::basename(d.worktree_path.trim());
-    (!wt.is_empty()).then(|| wt.to_string())
+    (!wt.is_empty()).then(|| LaneId::Raw(wt.to_string()))
+}
+
+/// Choose a stable display spelling: the earliest prefixed row when present,
+/// otherwise the earliest row. Dispatch id breaks timestamp ties.
+fn lane_display_key(id: &LaneId, rows: &[&AgentDispatch]) -> String {
+    match id {
+        LaneId::Raw(raw) => raw.clone(),
+        LaneId::Issue {
+            provider: Some(provider),
+            key: _,
+        } => {
+            let row = rows
+                .iter()
+                .filter_map(|d| {
+                    let issue = d.issue_id.trim();
+                    let canonical =
+                        thegn_core::pipeline_identity::canonical_issue_id(issue).ok()?;
+                    let (row_provider, _) =
+                        thegn_core::pipeline_identity::split_issue_id(&canonical);
+                    (row_provider == Some(provider.as_str())).then_some((*d, canonical))
+                })
+                .min_by_key(|(d, _)| (d.dispatched_at_ms, d.id));
+            let (_, canonical) = row.expect("prefixed lane must have a canonical row");
+            canonical
+        }
+        LaneId::Issue {
+            provider: None,
+            key,
+        } => {
+            let Some(row) = rows.iter().min_by_key(|d| (d.dispatched_at_ms, d.id)) else {
+                return key.clone();
+            };
+            match thegn_core::pipeline_identity::canonical_issue_id(row.issue_id.trim()) {
+                Ok(canonical) => canonical,
+                Err(_) => key.clone(),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -365,5 +472,244 @@ mod tests {
         let second = lanes(&rows);
         assert_eq!(first, second);
         assert_eq!(key_of(&first), vec!["THE-9", "THE-74"]);
+    }
+
+    #[test]
+    fn provider_case_and_whitespace_aliases_fold_into_one_lane() {
+        let rows = vec![
+            dispatch(
+                1,
+                "LINEAR:THE-74",
+                "/wt/a",
+                AgentDispatchStatus::Running,
+                1_000,
+            ),
+            dispatch(
+                2,
+                " linear:THE-74 ",
+                "/wt/b",
+                AgentDispatchStatus::Queued,
+                2_000,
+            ),
+            dispatch(
+                3,
+                "linear:the-74",
+                "/wt/c",
+                AgentDispatchStatus::Done,
+                3_000,
+            ),
+        ];
+
+        let out = lanes(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "linear:THE-74");
+        assert_eq!(wt_names(&out[0]), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_unprefixed_row_joins_the_only_provider_lane_for_its_key() {
+        let rows = vec![
+            dispatch(1, "THE-74", "/wt/a", AgentDispatchStatus::Running, 1_000),
+            dispatch(
+                2,
+                "linear:THE-74",
+                "/wt/b",
+                AgentDispatchStatus::Queued,
+                2_000,
+            ),
+        ];
+
+        let out = lanes(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "linear:THE-74");
+        assert_eq!(wt_names(&out[0]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn an_unprefixed_row_next_to_two_providers_stays_its_own_lane() {
+        let rows = vec![
+            dispatch(
+                1,
+                "jira:X-1",
+                "/wt/jira",
+                AgentDispatchStatus::Running,
+                1_000,
+            ),
+            dispatch(
+                2,
+                "linear:X-1",
+                "/wt/linear",
+                AgentDispatchStatus::Running,
+                2_000,
+            ),
+            dispatch(3, "X-1", "/wt/plain", AgentDispatchStatus::Running, 3_000),
+        ];
+
+        let out = lanes(&rows);
+        assert_eq!(out.len(), 3);
+        assert_eq!(key_of(&out), vec!["jira:X-1", "linear:X-1", "X-1"]);
+    }
+
+    #[test]
+    fn distinct_providers_with_one_key_stay_distinct() {
+        let rows = vec![
+            dispatch(
+                1,
+                "jira:X-1",
+                "/wt/jira",
+                AgentDispatchStatus::Running,
+                1_000,
+            ),
+            dispatch(
+                2,
+                "linear:X-1",
+                "/wt/linear",
+                AgentDispatchStatus::Running,
+                2_000,
+            ),
+        ];
+
+        assert_eq!(key_of(&lanes(&rows)), vec!["jira:X-1", "linear:X-1"]);
+    }
+
+    #[test]
+    fn the_lane_key_is_stable_as_the_lane_advances() {
+        let first = lanes(&[dispatch(
+            1,
+            "linear:THE-74",
+            "/wt/a",
+            AgentDispatchStatus::Running,
+            1_000,
+        )]);
+        let advanced = lanes(&[
+            dispatch(
+                1,
+                "linear:THE-74",
+                "/wt/a",
+                AgentDispatchStatus::Running,
+                1_000,
+            ),
+            dispatch(
+                2,
+                "LINEAR:THE-74",
+                "/wt/b",
+                AgentDispatchStatus::Queued,
+                2_000,
+            ),
+            dispatch(3, "THE-74", "/wt/c", AgentDispatchStatus::Done, 3_000),
+        ]);
+
+        assert_eq!(key_of(&first), vec!["linear:THE-74"]);
+        assert_eq!(key_of(&advanced), vec!["linear:THE-74"]);
+    }
+
+    #[test]
+    fn a_basename_lane_and_a_same_text_issue_lane_never_share_a_key() {
+        let rows = vec![
+            dispatch(1, "", "/wt/THE-74", AgentDispatchStatus::Running, 1_000),
+            dispatch(
+                2,
+                "THE-74",
+                "/wt/issue",
+                AgentDispatchStatus::Running,
+                2_000,
+            ),
+        ];
+
+        let out = lanes(&rows);
+        assert_eq!(out.len(), 1, "equal display keys must coalesce");
+        let keys = key_of(&out);
+        assert_eq!(keys, vec!["THE-74"]);
+        assert_eq!(
+            keys.iter().collect::<std::collections::HashSet<_>>().len(),
+            keys.len()
+        );
+        assert_eq!(wt_names(&out[0]), vec!["THE-74", "issue"]);
+    }
+
+    #[test]
+    fn ambiguous_unprefixed_issue_and_same_text_basename_coalesce() {
+        let rows = vec![
+            dispatch(
+                1,
+                "jira:X-1",
+                "/wt/jira",
+                AgentDispatchStatus::Running,
+                1_000,
+            ),
+            dispatch(
+                2,
+                "linear:X-1",
+                "/wt/linear",
+                AgentDispatchStatus::Running,
+                2_000,
+            ),
+            dispatch(3, "X-1", "/wt/plain", AgentDispatchStatus::Running, 3_000),
+            dispatch(4, "", "/wt/X-1", AgentDispatchStatus::Running, 4_000),
+        ];
+
+        let out = lanes(&rows);
+        assert_eq!(key_of(&out), vec!["jira:X-1", "linear:X-1", "X-1"]);
+        assert_eq!(
+            out.iter()
+                .map(|lane| lane.key.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            out.len()
+        );
+        assert_eq!(wt_names(&out[2]), vec!["plain", "X-1"]);
+    }
+
+    #[test]
+    fn refused_raw_issue_ids_stay_separate_from_valid_ids_with_related_text() {
+        let rows = vec![
+            dispatch(
+                1,
+                "THE-74\u{7}",
+                "/wt/raw",
+                AgentDispatchStatus::Running,
+                1_000,
+            ),
+            dispatch(
+                2,
+                "THE-74",
+                "/wt/valid",
+                AgentDispatchStatus::Running,
+                2_000,
+            ),
+        ];
+
+        let out = lanes(&rows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(key_of(&out), vec!["THE-74\u{7}", "THE-74"]);
+        assert_eq!(
+            out.iter()
+                .map(|lane| lane.key.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            out.len()
+        );
+    }
+
+    #[test]
+    fn earliest_prefixed_case_variant_sets_the_canonical_lane_key() {
+        let rows = vec![
+            dispatch(
+                1,
+                "linear:the-74",
+                "/wt/a",
+                AgentDispatchStatus::Running,
+                1_000,
+            ),
+            dispatch(
+                2,
+                "LINEAR:THE-74",
+                "/wt/b",
+                AgentDispatchStatus::Running,
+                2_000,
+            ),
+        ];
+
+        assert_eq!(key_of(&lanes(&rows)), vec!["linear:the-74"]);
     }
 }

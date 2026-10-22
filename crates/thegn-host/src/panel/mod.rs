@@ -710,6 +710,12 @@ pub struct PanelData {
     /// The local merge queue (the fold-actor), from `merge_queue` — feeds the
     /// `MergeQueue` section + statusbar badge. Empty when the queue is unused.
     pub merge_queue: Vec<thegn_core::db::MergeQueueRow>,
+    /// Claim views for listed merge-queue rows (unclaimed rows omitted), read
+    /// during hydration.
+    pub merge_claims: Vec<thegn_core::store::MergeClaimView>,
+    /// Set when a claim read failed, so the panel shows unavailable instead
+    /// of showing rows as unclaimed.
+    pub merge_claim_error: Option<String>,
     /// `PrQueue` section + statusbar badge. Empty when the queue is unused.
     pub pr_queue: Vec<thegn_core::db::PrQueueRow>,
     /// Per-thread tasks derived only from the explicit rows above.
@@ -792,6 +798,8 @@ pub struct PanelData {
     pub tracker_issues: Vec<thegn_core::issue::Issue>,
     /// Issue ids (in `"<provider>:<key>"` form) linked to the current worktree.
     pub tracker_links: Vec<String>,
+    /// Accounts whose latest issue refresh stopped early (bounded listing): their rows are the last good ones. Empty when every account's cache is complete.
+    pub tracker_partial: Vec<thegn_core::issue::IssueCachePartial>,
     /// Whether any `[issues]` provider is configured for this repo. Distinguishes
     /// "off" (no provider) from "clear" (configured but currently empty).
     pub issues_configured: bool,

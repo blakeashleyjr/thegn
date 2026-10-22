@@ -916,6 +916,10 @@ pub async fn main(
     // thegn is closed (or idle) is collected at the next launch.
     crate::merge_sweep::spawn(cfg.clone(), std::env::current_dir().unwrap_or_default());
 
+    // Check registered repos for interrupted rename journals off-thread.
+    // This stats each repo and runs git only when a journal is present.
+    crate::handlers::worktree_rename::spawn_launch_sweep(refresh_tx.clone(), waker.clone());
+
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
     {
@@ -9189,6 +9193,7 @@ async fn event_loop<T: Terminal>(
         // Writer-thread health: a transient write failure means the terminal's
         // actual content is unknown — resync with a full repaint (the async
         // sibling of the old inline EIO retry); a fatal one tears down.
+        let clipboard_outcome = writer.take_clipboard_outcome();
         match writer.take_status() {
             crate::frame_writer::WriterStatus::Ok => {}
             crate::frame_writer::WriterStatus::Transient => {
@@ -9200,8 +9205,19 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             crate::frame_writer::WriterStatus::Fatal(e) => {
-                return Err(anyhow::anyhow!("terminal writer failed: {e}"));
+                let note = match clipboard_outcome {
+                    Some(outcome) => format!(
+                        "; {}",
+                        crate::frame_writer::clipboard_outcome_status(outcome)
+                    ),
+                    None => String::new(),
+                };
+                return Err(anyhow::anyhow!("terminal writer failed: {e}{note}"));
             }
+        }
+        if let Some(outcome) = clipboard_outcome {
+            model.status = crate::frame_writer::clipboard_outcome_status(outcome).to_string();
+            dirty = true;
         }
         // OOB capacity releases pulse the existing terminal waker; retrying
         // here keeps this path independent of cell composition and timers.

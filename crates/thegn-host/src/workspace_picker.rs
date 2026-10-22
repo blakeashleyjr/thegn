@@ -218,7 +218,12 @@ pub(crate) struct WorkspacePicker {
     /// discovery results streamed in later.
     excluded: HashSet<String>,
     /// Indices into `items`, best match first (seed order when query empty).
+    /// Discovery appends are ranked incrementally; query edits and seed reorders
+    /// fully recompute this list.
     matches: Vec<usize>,
+    match_scores: Vec<u16>,
+    #[cfg(test)]
+    ranked_haystacks: usize,
     selected: usize,
     scroll_offset: usize,
     /// True while the off-loop `discover_repos` scan is in flight.
@@ -267,6 +272,9 @@ impl WorkspacePicker {
             items,
             excluded,
             matches: Vec::new(),
+            match_scores: Vec::new(),
+            #[cfg(test)]
+            ranked_haystacks: 0,
             selected: 0,
             scroll_offset: 0,
             scanning: false,
@@ -437,6 +445,7 @@ impl WorkspacePicker {
     /// whether anything changed (→ the caller marks the frame dirty).
     pub(crate) fn drain_discovery(&mut self) -> bool {
         let mut changed = false;
+        let old_len = self.items.len();
         while let Ok(event) = self.result_rx.try_recv() {
             match event {
                 DiscoveryEvent::Batch { generation, paths } if generation == self.generation => {
@@ -457,8 +466,8 @@ impl WorkspacePicker {
                 _ => {}
             }
         }
-        if changed {
-            self.recompute();
+        if self.items.len() > old_len {
+            self.rank_appended(old_len);
         }
         changed
     }
@@ -485,15 +494,76 @@ impl WorkspacePicker {
 
     fn recompute(&mut self) {
         if self.query.as_str().trim().is_empty() {
-            self.matches = (0..self.items.len()).collect();
+            self.matches.clear();
+            self.matches.extend(0..self.items.len());
+            self.match_scores.clear();
+            self.match_scores.resize(self.items.len(), 0);
         } else {
             // Fuzzy over "name path" so a path fragment narrows like a basename.
             let refs: Vec<&str> = self.items.iter().map(|it| it.haystack.as_str()).collect();
-            self.matches = crate::fff_backend::fuzzy_rank(self.query.as_str(), &refs)
-                .into_iter()
-                .map(|(i, _)| i)
-                .collect();
+            #[cfg(test)]
+            {
+                self.ranked_haystacks += refs.len();
+            }
+            let ranked = crate::fff_backend::fuzzy_rank(self.query.as_str(), &refs);
+            self.matches.clear();
+            self.match_scores.clear();
+            self.matches.extend(ranked.iter().map(|(i, _)| *i));
+            self.match_scores
+                .extend(ranked.into_iter().map(|(_, score)| score));
         }
+        self.clamp_selection_and_scroll();
+    }
+
+    fn rank_appended(&mut self, old_len: usize) {
+        if self.query.as_str().trim().is_empty() {
+            self.matches.extend(old_len..self.items.len());
+            self.match_scores
+                .resize(self.match_scores.len() + self.items.len() - old_len, 0);
+        } else {
+            let refs: Vec<&str> = self.items[old_len..]
+                .iter()
+                .map(|it| it.haystack.as_str())
+                .collect();
+            #[cfg(test)]
+            {
+                self.ranked_haystacks += refs.len();
+            }
+            let appended = crate::fff_backend::fuzzy_rank(self.query.as_str(), &refs)
+                .into_iter()
+                .map(|(index, score)| (old_len + index, score));
+            let ranked_appended: Vec<(usize, u16)> = appended.collect();
+            if ranked_appended.is_empty() {
+                self.clamp_selection_and_scroll();
+                return;
+            }
+            let mut merged_matches = Vec::with_capacity(self.matches.len() + ranked_appended.len());
+            let mut merged_scores =
+                Vec::with_capacity(self.match_scores.len() + ranked_appended.len());
+            let (mut existing, mut added) = (0, 0);
+            while existing < self.matches.len() && added < ranked_appended.len() {
+                // New item indices are greater, so existing items win score ties.
+                if self.match_scores[existing] >= ranked_appended[added].1 {
+                    merged_matches.push(self.matches[existing]);
+                    merged_scores.push(self.match_scores[existing]);
+                    existing += 1;
+                } else {
+                    merged_matches.push(ranked_appended[added].0);
+                    merged_scores.push(ranked_appended[added].1);
+                    added += 1;
+                }
+            }
+            merged_matches.extend_from_slice(&self.matches[existing..]);
+            merged_scores.extend_from_slice(&self.match_scores[existing..]);
+            merged_matches.extend(ranked_appended[added..].iter().map(|(index, _)| *index));
+            merged_scores.extend(ranked_appended[added..].iter().map(|(_, score)| *score));
+            self.matches = merged_matches;
+            self.match_scores = merged_scores;
+        }
+        self.clamp_selection_and_scroll();
+    }
+
+    fn clamp_selection_and_scroll(&mut self) {
         if self.selected >= self.matches.len() {
             self.selected = self.matches.len().saturating_sub(1);
         }
@@ -1178,6 +1248,146 @@ mod tests {
         );
         assert_eq!(p.items.len(), 20_000);
         assert_eq!(p.item_paths.len(), 20_000);
+    }
+
+    #[test]
+    fn discovery_batches_rank_only_new_items_against_a_live_query() {
+        let mut p = WorkspacePicker::new(vec!["/r/seed".into()], HashSet::new());
+        type_str(&mut p, "r");
+        p.generation = 7;
+        p.scanning = true;
+
+        let mut next = 0;
+        while next < 20_000 {
+            let end = (next + 64).min(20_000);
+            let paths = (next..end).map(|index| format!("/r/{index:05}")).collect();
+            p.result_tx
+                .try_send(DiscoveryEvent::Batch {
+                    generation: 7,
+                    paths,
+                })
+                .unwrap();
+            assert!(p.drain_discovery());
+            next = end;
+        }
+
+        assert_eq!(p.items.len(), 20_001);
+        assert!(
+            p.ranked_haystacks <= 2 * p.items.len(),
+            "ranked {} haystacks for {} items",
+            p.ranked_haystacks,
+            p.items.len()
+        );
+    }
+
+    #[test]
+    fn incremental_discovery_matches_equal_a_full_recompute() {
+        let mut p = WorkspacePicker::new(
+            vec!["/seed/rust".into(), "/seed/zzz".into()],
+            HashSet::new(),
+        );
+        type_str(&mut p, "rust");
+        p.generation = 7;
+        p.scanning = true;
+
+        for paths in [
+            vec!["/code/rust".into(), "/code/rust-analyzer".into()],
+            vec![
+                "/x/r/u/s/t".into(),
+                "/deep/trusty".into(),
+                "/code/zzz".into(),
+            ],
+            vec!["/first/rust".into(), "/second/rust".into()],
+        ] {
+            p.result_tx
+                .try_send(DiscoveryEvent::Batch {
+                    generation: 7,
+                    paths,
+                })
+                .unwrap();
+            assert!(p.drain_discovery());
+        }
+
+        let mut fresh = WorkspacePicker::new(
+            p.items.iter().map(|entry| entry.path.clone()).collect(),
+            HashSet::new(),
+        );
+        type_str(&mut fresh, "rust");
+        let incremental_paths: Vec<&str> = p
+            .matches()
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        let fresh_paths: Vec<&str> = fresh
+            .matches()
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(incremental_paths, fresh_paths);
+        assert_eq!(p.match_scores, fresh.match_scores);
+    }
+
+    #[test]
+    fn finished_only_drain_does_not_rerank() {
+        let mut p = picker(&["/code/rust", "/code/other"]);
+        type_str(&mut p, "rust");
+        p.generation = 7;
+        p.scanning = true;
+        let ranked_before = p.ranked_haystacks;
+        p.result_tx
+            .try_send(DiscoveryEvent::Finished {
+                generation: 7,
+                report: thegn_core::repo::DiscoveryReport::default(),
+            })
+            .unwrap();
+
+        assert!(p.drain_discovery());
+        assert_eq!(p.ranked_haystacks, ranked_before);
+    }
+
+    #[test]
+    fn non_matching_discovery_batch_keeps_existing_match_allocation() {
+        let mut p = picker(&["/code/rust", "/code/rust-analyzer"]);
+        type_str(&mut p, "rust");
+        p.generation = 7;
+        p.scanning = true;
+        let matches_ptr = p.matches.as_ptr();
+        let scores_ptr = p.match_scores.as_ptr();
+
+        p.result_tx
+            .try_send(DiscoveryEvent::Batch {
+                generation: 7,
+                paths: vec!["/code/python".into(), "/code/go".into()],
+            })
+            .unwrap();
+
+        assert!(p.drain_discovery());
+        assert_eq!(p.matches.as_ptr(), matches_ptr);
+        assert_eq!(p.match_scores.as_ptr(), scores_ptr);
+        assert_eq!(p.matches.len(), 2);
+    }
+
+    #[test]
+    fn empty_query_discovery_appends_in_scan_order() {
+        let mut p = picker(&["/seed"]);
+        p.generation = 7;
+        p.scanning = true;
+        for paths in [vec!["/scan/a".into()], vec!["/scan/b".into()]] {
+            p.result_tx
+                .try_send(DiscoveryEvent::Batch {
+                    generation: 7,
+                    paths,
+                })
+                .unwrap();
+            assert!(p.drain_discovery());
+        }
+
+        let paths: Vec<&str> = p
+            .matches()
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["/seed", "/scan/a", "/scan/b"]);
     }
 
     #[test]

@@ -668,6 +668,122 @@ def load_staged_digests(path: Path) -> dict[str, str]:
     return value
 
 
+def load_release_manifest(path: Path, tag: str) -> dict[str, tuple[str, int]]:
+    descriptor: int | None = None
+    try:
+        path_metadata = path.lstat()
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise ReleaseError(f"release manifest is not a regular file: {path}")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ReleaseError(f"cannot inspect release manifest {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ReleaseError(f"release manifest is not a regular file: {path}")
+    if metadata.st_size > MAX_TRUSTED_DIGESTS_BYTES:
+        os.close(descriptor)
+        raise ReleaseError(f"release manifest {path} exceeds {MAX_TRUSTED_DIGESTS_BYTES} bytes")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ReleaseError(f"release manifest {path} has duplicate JSON key {name}")
+            value[name] = item
+        return value
+
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_TRUSTED_DIGESTS_BYTES + 1)
+            if len(raw) > MAX_TRUSTED_DIGESTS_BYTES:
+                raise ReleaseError(f"release manifest {path} exceeds {MAX_TRUSTED_DIGESTS_BYTES} bytes")
+            value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ReleaseError(f"cannot read release manifest {path}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    value = _object(value, f"release manifest {path}")
+    required = {"schema_version", "tag", "commit", "tag_object", "workflow_sha", "run_id", "assets"}
+    if set(value) != required:
+        raise ReleaseError(f"release manifest {path} must contain exactly the producer fields")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ReleaseError(f"release manifest {path} schema_version must be integer 1")
+    if value["tag"] != tag:
+        raise ReleaseError(f"release manifest {path} tag {value['tag']!r} does not match requested tag {tag!r}")
+    for field_name in ("commit", "tag_object", "workflow_sha", "run_id"):
+        _string(value[field_name], f"release manifest {path} {field_name}")
+    assets = value["assets"]
+    if not isinstance(assets, list) or not assets:
+        raise ReleaseError(f"release manifest {path} assets must be a non-empty list")
+    entries: dict[str, tuple[str, int]] = {}
+    for item in assets:
+        asset = _object(item, f"release manifest asset in {path}")
+        if set(asset) != {"name", "sha256", "size"}:
+            raise ReleaseError(f"release manifest asset in {path} must contain exactly name, sha256, and size")
+        name = _string(asset["name"], f"release manifest asset name in {path}")
+        if name in (".", "..") or TRUSTED_NAME_RE.fullmatch(name) is None:
+            raise ReleaseError(f"release manifest asset name in {path} is invalid: {name!r}")
+        digest = asset["sha256"]
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ReleaseError(f"release manifest asset {name} sha256 in {path} must be lowercase 64-hex SHA-256")
+        size = asset["size"]
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ReleaseError(f"release manifest asset {name} size in {path} must be a non-negative integer")
+        if name in entries:
+            raise ReleaseError(f"release manifest {path} has duplicate asset name {name}")
+        entries[name] = (digest, size)
+    return entries
+
+
+def verify_release_asset_files(
+    entries: Mapping[str, tuple[str, int]], paths: Sequence[Path]
+) -> dict[str, str]:
+    verified: dict[str, str] = {}
+    for path in paths:
+        name = path.name
+        if name not in entries:
+            raise ReleaseError(f"{name} is not in the release manifest")
+        if name in verified:
+            raise ReleaseError(f"{name} was given more than once")
+        expected_digest, expected_size = entries[name]
+        descriptor: int | None = None
+        try:
+            path_metadata = path.lstat()
+            if not stat.S_ISREG(path_metadata.st_mode):
+                raise ReleaseError(f"{name} is not a regular file")
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            metadata = os.fstat(descriptor)
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise ReleaseError(f"cannot inspect release asset {path}: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
+            raise ReleaseError(f"{name} is not a regular file")
+        if metadata.st_size != expected_size:
+            os.close(descriptor)
+            raise ReleaseError(f"{name} size does not match the release manifest: expected {expected_size}, got {metadata.st_size}")
+        try:
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = None
+                actual_digest = _hash_open_file(handle, path, "release asset")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if actual_digest != expected_digest:
+            raise ReleaseError(
+                f"{name} does not match the release manifest: expected {expected_digest}, got {actual_digest}"
+            )
+        verified[name] = actual_digest
+    return verified
+
+
 def verify_downloaded_assets(
     manifest: Mapping[str, Any],
     tag: str,
@@ -1259,6 +1375,12 @@ def _run(args: argparse.Namespace) -> None:
         verify_package_payload(staged, args.payload_root, args.label)
         print(f"{args.label} payload matches staged bytes")
         return
+    if args.command == "verify-assets":
+        entries = load_release_manifest(args.release_manifest, args.tag)
+        verified = verify_release_asset_files(entries, args.asset)
+        for name in verified:
+            print(f"{name}: matches the release manifest")
+        return
     if args.command == "manifest":
         value = build_release_manifest(
             manifest,
@@ -1334,6 +1456,12 @@ def build_parser() -> argparse.ArgumentParser:
     payload_parser.add_argument("--label", required=True, choices=("deb", "rpm"))
     payload_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     payload_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
+    verify_assets_parser = subparsers.add_parser("verify-assets")
+    verify_assets_parser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
+    verify_assets_parser.add_argument("--release-manifest", required=True, type=Path)
+    verify_assets_parser.add_argument("--asset", required=True, type=Path, action="append")
+    verify_assets_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    verify_assets_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
     return parser
 
 

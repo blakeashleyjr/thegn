@@ -13,6 +13,8 @@
 //! Legacy local created_at is never promoted to provider age. Unknown or changed
 //! inventory remains visible in quarantine, with retry on the next pass. A
 //! staged create without authoritative machine identity cannot authorize expiry.
+//! Records stamped for another provider account, or whose account cannot be
+//! computed, are quarantined before any provider call.
 //!
 //! Runs from the hydration thread ([`tick`] self-throttles to [`TICK_INTERVAL`]);
 //! network work runs on its own spawned thread. A pass is single-flight across
@@ -156,6 +158,13 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
             ));
             continue;
         };
+        if let Some(reason) = account_quarantine(&rec, &provider.account()) {
+            thegn_core::msg::warn(&format!(
+                "fly reaper: quarantined {}: {reason}; no deletion attempted",
+                rec.name
+            ));
+            continue;
+        }
         let created = match crate::agent::block_on_provider(|| async {
             provider
                 .reaper_creation_time(&rec.name, &rec.instance_id)
@@ -214,6 +223,17 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
     }
 }
 
+fn account_quarantine(record: &registry::VpsRecord, ours: &Result<String>) -> Option<String> {
+    match ours {
+        Err(error) => Some(format!("provider account unavailable ({error:#})")),
+        Ok(ours) if !crate::vps_reaper::record_account_matches(record, ours) => Some(
+            "the ledger record belongs to another provider account; reconcile ownership"
+                .to_string(),
+        ),
+        Ok(_) => None,
+    }
+}
+
 fn has_fly_work(view: &registry::LedgerView) -> bool {
     view.records.iter().any(|record| record.provider == "fly") || !view.unreadable.is_empty()
 }
@@ -255,6 +275,19 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    fn account_record(account: &str) -> registry::VpsRecord {
+        registry::VpsRecord {
+            name: "app".to_string(),
+            provider: "fly".to_string(),
+            state: "ready".to_string(),
+            instance_id: String::new(),
+            ip: String::new(),
+            created_at: 1,
+            owner: String::new(),
+            account: account.to_string(),
+        }
+    }
+
     fn run_with_failure(fail: Option<&str>) -> (Result<()>, Vec<&'static str>) {
         let calls = RefCell::new(Vec::new());
         let result = complete_reap(
@@ -277,6 +310,36 @@ mod tests {
             },
         );
         (result, calls.into_inner())
+    }
+
+    #[test]
+    fn account_gate_lets_legacy_and_same_account_records_proceed() {
+        assert_eq!(
+            account_quarantine(&account_record(""), &Ok("acct1-a".into())),
+            None
+        );
+        assert_eq!(
+            account_quarantine(&account_record("acct1-a"), &Ok("acct1-a".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn account_gate_quarantines_another_accounts_record() {
+        let reason = account_quarantine(&account_record("acct1-a"), &Ok("acct1-b".into()))
+            .expect("different accounts must be quarantined");
+        assert!(reason.contains("another provider account"));
+    }
+
+    #[test]
+    fn account_gate_quarantines_when_the_account_is_unavailable() {
+        let reason = account_quarantine(
+            &account_record(""),
+            &Err(anyhow::anyhow!("authority unavailable")),
+        )
+        .expect("unavailable account must be quarantined");
+        assert!(reason.contains("provider account unavailable"));
+        assert!(reason.contains("authority unavailable"));
     }
 
     #[test]

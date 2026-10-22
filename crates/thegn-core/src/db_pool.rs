@@ -130,8 +130,10 @@ impl PoolStore for Db {
                     updated_at: r.get(7)?,
                 })
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| {
+                format!("warm pool: undecodable spare ledger row for {repo} ({env})")
+            })?;
         Ok(rows)
     }
 
@@ -254,31 +256,30 @@ impl PoolStore for Db {
                 })
             },
         );
-        // best-effort read: no rows is the None case; a real DB error is
-        // surfaced but still degrades to a miss.
         let r = match res {
             Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => {
-                tracing::warn!(target: "thegn::db", error = %e, "pool_spare_by_name read failed; treating as a miss");
-                None
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("warm pool: cannot read spare ledger row {name}")));
             }
         };
         Ok(r)
     }
 
     fn worktree_provider_sandbox(&self, worktree: &str) -> Result<Option<String>> {
-        let r = self
-            .conn()
-            .query_row(
-                "SELECT provider_sandbox_id FROM worktrees WHERE worktree=?1",
-                params![worktree],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten()
-            .filter(|s: &String| !s.is_empty());
-        Ok(r)
+        let result = self.conn().query_row(
+            "SELECT provider_sandbox_id FROM worktrees WHERE worktree=?1",
+            params![worktree],
+            |r| r.get::<_, Option<String>>(0),
+        );
+        match result {
+            Ok(Some(sandbox)) if !sandbox.is_empty() => Ok(Some(sandbox)),
+            Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(anyhow::Error::new(error).context(format!(
+                "warm pool: cannot read the provider sandbox binding for {worktree}"
+            ))),
+        }
     }
 
     fn pool_target(&self, repo: &str, env: &str) -> Result<Option<i64>> {
@@ -342,6 +343,38 @@ mod tests {
 
         db.delete_pool_spare("repo-pool-1").unwrap();
         assert!(db.pool_spare_by_name("repo-pool-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn ledger_read_undecodable_spare_row_is_an_error() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("good", "/repo", "sprites").unwrap();
+        db.insert_pool_spare("bad", "/repo", "sprites").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE pool_spares SET created_at='not-a-number' WHERE sandbox_name='bad'",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.pool_spares_for("/repo", "sprites").is_err());
+    }
+
+    #[test]
+    fn ledger_read_spare_by_name_db_error_is_an_error() {
+        let db = Db::open_memory().unwrap();
+        db.conn().execute("DROP TABLE pool_spares", []).unwrap();
+
+        assert!(db.pool_spare_by_name("x").is_err());
+    }
+
+    #[test]
+    fn ledger_read_binding_db_error_is_an_error_and_missing_is_none() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.worktree_provider_sandbox("/wt/none").unwrap().is_none());
+
+        db.conn().execute("DROP TABLE worktrees", []).unwrap();
+        assert!(db.worktree_provider_sandbox("/wt/none").is_err());
     }
 
     #[test]

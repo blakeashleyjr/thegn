@@ -5,6 +5,7 @@
 //!
 //! This is the native view + matcher the host drives, populated from host state.
 
+use std::collections::HashSet;
 use termwiz::surface::Surface;
 
 use crate::chrome::S;
@@ -575,6 +576,27 @@ pub(crate) fn build_workspace_switch_palette(
     crate::palette::order_by_frecency(items, &usage)
 }
 
+fn issue_palette_label(issue: &thegn_core::issue::Issue, shared: &HashSet<&str>) -> String {
+    let account_tag = if shared.contains(issue.id.as_str()) {
+        format!(
+            " ({})",
+            issue
+                .account
+                .as_deref()
+                .map(|account| thegn_core::pipeline_report::display_clip(account, 16))
+                .unwrap_or_else(|| "?".to_string())
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {}{account_tag} {}",
+        issue.status.glyph(),
+        issue.number,
+        issue.title
+    )
+}
+
 /// Build the palette's item list: the command actions + a nav row per open tab
 /// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
 /// of the old engine's command + nav + frecency sources).
@@ -672,9 +694,13 @@ pub(crate) fn build_palette(
     }
 
     // Tracked issues: `issue:<id>` prefix, searchable by number + title.
+    let shared = thegn_core::issue::ids_shared_across_accounts(
+        issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
+    );
     for issue in issues {
-        let status_glyph = issue.status.glyph();
-        let label = format!("{status_glyph} {} {}", issue.number, issue.title);
+        let label = issue_palette_label(issue, &shared);
         items.push(PaletteItem::new(format!("issue:{}", issue.id), label));
     }
 
@@ -734,10 +760,15 @@ pub(crate) fn build_palette_seed(
             ),
         ));
     }
+    let shared = thegn_core::issue::ids_shared_across_accounts(
+        issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
+    );
     for issue in issues {
         items.push(PaletteItem::new(
             format!("issue:{}", issue.id),
-            format!("{} {} {}", issue.status.glyph(), issue.number, issue.title),
+            issue_palette_label(issue, &shared),
         ));
     }
     items
@@ -1882,6 +1913,59 @@ mod tests {
                 full.iter()
                     .any(|full_row| full_row.key == row.key && full_row.label == row.label),
                 "DB-backed palette omitted its immediate row: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_suffix_only_for_shared_issue_ids() {
+        let work = thegn_core::issue::Issue {
+            id: "linear:ENG-1".into(),
+            number: "ENG-1".into(),
+            title: "first".into(),
+            account: Some("work".into()),
+            ..Default::default()
+        };
+        let home = thegn_core::issue::Issue {
+            id: "linear:ENG-1".into(),
+            number: "ENG-1".into(),
+            title: "second".into(),
+            account: Some("home".into()),
+            ..Default::default()
+        };
+        let solo = thegn_core::issue::Issue {
+            id: "linear:ENG-2".into(),
+            number: "ENG-2".into(),
+            title: "solo".into(),
+            account: Some("work".into()),
+            ..Default::default()
+        };
+        let issues = [work, home, solo];
+        let session = crate::session::Session::default();
+        let cfg = thegn_core::config::Config::default();
+        let seed = build_palette_seed(&session, &cfg, &issues);
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let full = build_palette(&session, &db, &cfg, &issues, &[]);
+        let rows = seed
+            .iter()
+            .filter(|row| row.key.starts_with("issue:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            [
+                "issue:linear:ENG-1",
+                "issue:linear:ENG-1",
+                "issue:linear:ENG-2",
+            ]
+        );
+        assert!(rows[0].label.contains("(work)"), "{rows:?}");
+        assert!(rows[1].label.contains("(home)"), "{rows:?}");
+        assert!(!rows[2].label.contains("(work)"), "{rows:?}");
+        for row in rows {
+            assert!(
+                full.iter()
+                    .any(|full_row| full_row.key == row.key && full_row.label == row.label),
+                "DB-backed palette omitted the account label: {row:?}"
             );
         }
     }
