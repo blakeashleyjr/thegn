@@ -942,6 +942,7 @@ static SEMANTIC_SWEEP_STARTED: std::sync::Once = std::sync::Once::new();
 /// Short CLI processes must not leave a second SQLite connection open when they exit.
 pub fn enable_semantic_sweep() {
     SEMANTIC_SWEEP_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     maybe_start_semantic_sweep();
 }
 
@@ -1330,6 +1331,7 @@ impl Db {
                 if SEMANTIC_SWEEP_PATH.set(path.clone()).is_err() {
                     tracing::debug!("semantic sweep database path was already recorded");
                 }
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                 maybe_start_semantic_sweep();
             });
         }
