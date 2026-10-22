@@ -386,6 +386,15 @@ impl ControlApi for FakeApi {
         self.record("shutdown");
         Box::pin(async {})
     }
+
+    fn dispatches_list(
+        &self,
+        before: Option<i64>,
+        limit: usize,
+    ) -> BoxFuture<'_, ControlResult<super::DispatchPage>> {
+        self.record(&format!("dispatches_list:before={before:?}:limit={limit}"));
+        Box::pin(async { Ok(super::DispatchPage::default()) })
+    }
 }
 
 struct Rig {
@@ -1971,5 +1980,60 @@ async fn malformed_issue_identity_reaches_no_control_api_operation() {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert!(r.api.calls().is_empty());
         }
+    }
+}
+
+#[tokio::test]
+async fn dispatches_list_page_params_reach_the_api() {
+    let r = rig(false);
+    let read = token(&r, "read");
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/dispatches?limit=5&before=7")
+        .header("authorization", format!("Bearer {read}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(r.state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"dispatches": [], "truncated": false, "next_before": null})
+    );
+    assert_eq!(
+        r.api.calls(),
+        vec!["dispatches_list:before=Some(7):limit=5"]
+    );
+
+    let r = rig(false);
+    let read = token(&r, "read");
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/dispatches")
+        .header("authorization", format!("Bearer {read}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(r.state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        r.api.calls(),
+        vec!["dispatches_list:before=None:limit=2048"]
+    );
+}
+
+#[tokio::test]
+async fn dispatches_list_refuses_an_out_of_range_limit_before_the_api() {
+    for limit in [0, 4097] {
+        let r = rig(false);
+        let read = token(&r, "read");
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/dispatches?limit={limit}"))
+            .header("authorization", format!("Bearer {read}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router(r.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(r.api.calls().is_empty());
     }
 }

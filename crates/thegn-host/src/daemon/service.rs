@@ -20,8 +20,8 @@ use thegn_core::editor::EditorTarget;
 use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow, NotificationStore};
 use thegn_svc::control::{
-    AttachKind, AttachReply, ControlApi, ControlError, ControlResult, ForkSpec, GitFileStatus,
-    OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
+    AttachKind, AttachReply, ControlApi, ControlError, ControlResult, DispatchPage, ForkSpec,
+    GitFileStatus, OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
     SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
@@ -2547,13 +2547,40 @@ impl ControlApi for DaemonService {
 
     fn dispatches_list(
         &self,
-    ) -> BoxFuture<'_, ControlResult<Vec<thegn_core::issue::AgentDispatch>>> {
+        before: Option<i64>,
+        limit: usize,
+    ) -> BoxFuture<'_, ControlResult<DispatchPage>> {
         Box::pin(async move {
-            self.with_db(|db| {
+            if limit == 0 || limit > Db::ROSTER_ACTIVE_LIMIT {
+                return Err(ControlError::InvalidArgument(format!(
+                    "limit must be between 1 and {}",
+                    Db::ROSTER_ACTIVE_LIMIT
+                )));
+            }
+            let cursor_label = before.map_or_else(|| "unknown".to_string(), |id| id.to_string());
+            self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
-                db.list_dispatches()
+                if let Some(id) = before
+                    && db.get_dispatch(id)?.is_none()
+                {
+                    return Ok(None);
+                }
+                let (dispatches, truncated) = db.dispatch_history_page(before, limit)?;
+                let next_before = if truncated {
+                    dispatches.last().map(|row| row.id)
+                } else {
+                    None
+                };
+                Ok(Some(DispatchPage {
+                    dispatches,
+                    truncated,
+                    next_before,
+                }))
             })
-            .await
+            .await?
+            .ok_or_else(|| {
+                ControlError::NotFound(format!("dispatch {cursor_label} (the before cursor)"))
+            })
         })
     }
 
@@ -4979,7 +5006,13 @@ mod tests {
     async fn dispatch_roster_put_list_and_set_status_round_trip() {
         use thegn_core::issue::AgentDispatchStatus as St;
         let (svc, _rx) = service(0);
-        assert!(svc.dispatches_list().await.unwrap().is_empty());
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
         let row = svc
             .dispatch_put(thegn_svc::control::DispatchPutReq {
                 issue_id: "linear:A-1".into(),
@@ -5026,9 +5059,10 @@ mod tests {
             Err(ControlError::FailedPrecondition(_))
         ));
         assert_eq!(
-            svc.dispatches_list()
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
                 .await
                 .unwrap()
+                .dispatches
                 .into_iter()
                 .find(|dispatch| dispatch.id == child.id)
                 .unwrap()
@@ -5041,9 +5075,10 @@ mod tests {
             Err(ControlError::InvalidArgument(_))
         ));
         assert_eq!(
-            svc.dispatches_list()
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
                 .await
                 .unwrap()
+                .dispatches
                 .into_iter()
                 .find(|dispatch| dispatch.id == row.id)
                 .unwrap()
@@ -5052,7 +5087,11 @@ mod tests {
             "unknown is rejected without modifying the row"
         );
         svc.dispatch_set_status(row.id, St::Running).await.unwrap();
-        let rows = svc.dispatches_list().await.unwrap();
+        let rows = svc
+            .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+            .await
+            .unwrap()
+            .dispatches;
         assert_eq!(rows.len(), 2);
         // Newest first (id DESC breaks the same-millisecond tie).
         assert_eq!(rows[0].id, child.id);
@@ -5113,7 +5152,13 @@ mod tests {
             result,
             Err(ControlError::FailedPrecondition(message)) if message.contains("4242")
         ));
-        assert!(svc.dispatches_list().await.unwrap().is_empty());
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -5141,7 +5186,14 @@ mod tests {
             result,
             Err(ControlError::FailedPrecondition(message)) if message.contains("another issue")
         ));
-        assert_eq!(svc.dispatches_list().await.unwrap().len(), 1);
+        assert_eq!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -5156,7 +5208,82 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
-        assert!(svc.dispatches_list().await.unwrap().is_empty());
+        assert!(
+            svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                .await
+                .unwrap()
+                .dispatches
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_list_pages_the_roster_newest_first() {
+        use std::collections::HashSet;
+
+        let (svc, _rx) = service(0);
+        let mut inserted = Vec::new();
+        for index in 1..=5 {
+            inserted.push(
+                svc.dispatch_put(thegn_svc::control::DispatchPutReq {
+                    issue_id: format!("linear:P-{index}"),
+                    worktree_path: "/wt/p".into(),
+                    agent_name: "claude".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            );
+        }
+
+        let first = svc.dispatches_list(None, 2).await.unwrap();
+        assert_eq!(first.dispatches.len(), 2);
+        assert_eq!(first.dispatches[0].id, inserted[4].id);
+        assert_eq!(first.dispatches[1].id, inserted[3].id);
+        assert!(first.truncated);
+        assert_eq!(first.next_before, Some(first.dispatches[1].id));
+
+        let second = svc.dispatches_list(first.next_before, 2).await.unwrap();
+        assert_eq!(second.dispatches.len(), 2);
+        assert!(second.truncated);
+        assert_eq!(second.next_before, Some(second.dispatches[1].id));
+
+        let third = svc.dispatches_list(second.next_before, 2).await.unwrap();
+        assert_eq!(third.dispatches.len(), 1);
+        assert!(!third.truncated);
+        assert_eq!(third.next_before, None);
+
+        let walked_ids: Vec<_> = first
+            .dispatches
+            .iter()
+            .chain(&second.dispatches)
+            .chain(&third.dispatches)
+            .map(|row| row.id)
+            .collect();
+        let complete = svc
+            .dispatches_list(None, Db::ROSTER_ACTIVE_LIMIT)
+            .await
+            .unwrap();
+        let complete_ids: Vec<_> = complete.dispatches.iter().map(|row| row.id).collect();
+        assert_eq!(walked_ids, complete_ids);
+        assert_eq!(walked_ids.iter().copied().collect::<HashSet<_>>().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn dispatches_list_refuses_an_unknown_cursor_and_a_bad_limit() {
+        let (svc, _rx) = service(0);
+        assert!(matches!(
+            svc.dispatches_list(Some(9_999), 2).await,
+            Err(ControlError::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.dispatches_list(None, 0).await,
+            Err(ControlError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            svc.dispatches_list(None, 4097).await,
+            Err(ControlError::InvalidArgument(_))
+        ));
     }
 
     #[tokio::test]
