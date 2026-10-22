@@ -403,6 +403,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         }
     };
     let mut entries = Vec::new();
+    let now = util::now();
     for row in &rows {
         // Held rows have already completed worktree collection. Their paths
         // are expected to be gone, so preserve the hold semantics first.
@@ -410,21 +411,6 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             if force {
                 report.held_branches.push(row.branch.clone());
             }
-            continue;
-        }
-        if !force
-            && let Some(retry) = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
-            && !retry.is_due(now)
-        {
-            let remaining = u64::try_from(retry.next_at.saturating_sub(now)).unwrap_or(u64::MAX);
-            report.kept.push((
-                row.branch.clone(),
-                format!(
-                    "cleanup deferred after {} refusal(s); next retry in {}",
-                    retry.attempts,
-                    merge_sweep::humanize_remaining(remaining)
-                ),
-            ));
             continue;
         }
         // A non-local worktree identifier is opaque. Do not pass it to Git or
@@ -476,13 +462,27 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
                 continue;
             }
         }
+        if !force
+            && let Some(retry) = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
+            && !retry.is_due(now)
+        {
+            let remaining = u64::try_from(retry.next_at.saturating_sub(now)).unwrap_or(u64::MAX);
+            report.kept.push((
+                row.branch.clone(),
+                format!(
+                    "cleanup deferred after {} refusal(s); next retry in {}",
+                    retry.attempts,
+                    merge_sweep::humanize_remaining(remaining)
+                ),
+            ));
+            continue;
+        }
         entries.push(MergedEntry {
             worktree: row.worktree.clone(),
             branch: row.branch.clone(),
             landed_at: row.updated_at,
         });
     }
-    let now = util::now();
     let due: Vec<&MergedEntry> = if force {
         entries.iter().collect()
     } else {
@@ -1373,7 +1373,20 @@ mod tests {
                     assert!(report.discarded_build_state.is_empty());
                     assert!(report.discarded_tool_state.is_empty());
                     assert!(wt.exists(), "{state}, force={force}");
-                    assert_eq!(db.list_merge_queue().unwrap(), before);
+                    let after = db.list_merge_queue().unwrap();
+                    if ordinary_dirty || force {
+                        assert_eq!(after, before, "{state}, force={force}");
+                    } else {
+                        let retry = merge_sweep::CleanupRetry::from_detail(
+                            after[0].error_detail.as_deref(),
+                        )
+                        .expect("non-force cleanup refusal records retry marker");
+                        assert_eq!(retry.attempts, 1, "{state}, force={force}");
+                        assert!(retry.next_at > util::now(), "{state}, force={force}");
+                        let mut expected = before[0].clone();
+                        expected.error_detail = after[0].error_detail.clone();
+                        assert_eq!(after, [expected], "{state}, force={force}");
+                    }
                     assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
                 }
             }
@@ -2427,6 +2440,7 @@ mod retry_tests {
     use thegn_core::store::WorktreeAuxStore;
 
     struct RetryFixture {
+        _isolation: crate::merge_lifecycle::TestIsolation,
         _dir: tempfile::TempDir,
         db_path: std::path::PathBuf,
         db: Db,
@@ -2455,6 +2469,7 @@ mod retry_tests {
         cfg.merge_queue.target_branch = "main".into();
         cfg.merge_queue.merged_ttl_secs = 1;
         RetryFixture {
+            _isolation: isolation,
             _dir: dir,
             db_path,
             db,
