@@ -137,6 +137,23 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let mut rows = Vec::new();
+    if !ctx.model.panel.tracker_partial.is_empty() {
+        let accounts = ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .map(|partial| display_cell(&partial.account))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            display_clip(
+                &format!("partial results: {accounts} — showing the last complete list"),
+                cols,
+            ),
+        )])));
+    }
     let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
 
@@ -211,6 +228,23 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let mut rows = Vec::new();
+    if !ctx.model.panel.tracker_partial.is_empty() {
+        let accounts = ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .map(|partial| display_cell(&partial.account))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            display_clip(
+                &format!("partial results: {accounts} — showing the last complete list"),
+                cols,
+            ),
+        )])));
+    }
     let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
 
@@ -339,6 +373,17 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .map(|p| format!(" [{p}]"))
             .unwrap_or_default();
         format!("{sigils} {names}  {open} open / {total}{filter_tag}")
+    };
+    let provider_label = if data.tracker_partial.is_empty() {
+        provider_label
+    } else {
+        let accounts = data
+            .tracker_partial
+            .iter()
+            .map(|partial| display_cell(&partial.account))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{provider_label}  partial: {accounts}")
     };
 
     rows.push(PanelRow::plain(Line::segs(vec![
@@ -691,6 +736,64 @@ mod tests {
             .collect();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].hit, Some(PanelHit::Row(Section::Issues, 1)));
+    }
+
+    #[test]
+    fn partial_notice_names_the_account() {
+        let issue = issue("ABC-1", IssuePriority::High, IssueStatus::Todo, "");
+        let partial = thegn_core::issue::IssueCachePartial {
+            account: "work".into(),
+            reason: "page cap".into(),
+            checked_at_ms: 7,
+        };
+        let render = |tracker_partial| {
+            let model = crate::chrome::FrameModel {
+                panel: crate::panel::PanelData {
+                    tracker_issues: vec![issue.clone()],
+                    tracker_partial,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let ui = crate::panel::PanelUi {
+                open: Section::Issues,
+                ..Default::default()
+            };
+            let ctx = SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 60,
+                rows: 20,
+            };
+            content(&ctx)
+        };
+        let partial_rows = render(vec![partial]);
+        let text = partial_rows
+            .iter()
+            .flat_map(|row| match &row.line {
+                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>(),
+                Line::Blank
+                | Line::Fill { .. }
+                | Line::Split { .. }
+                | Line::SplitMinLeft { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("partial results"));
+        assert!(text.contains("work"));
+        assert_eq!(
+            partial_rows
+                .iter()
+                .filter_map(|row| row.hit)
+                .collect::<Vec<_>>(),
+            vec![PanelHit::Row(Section::Issues, 0)]
+        );
+
+        let complete_rows = render(Vec::new());
+        assert!(!complete_rows.iter().any(|row| match &row.line {
+            Line::Segs(segs) => segs.iter().any(|seg| seg.text.contains("partial results")),
+            _ => false,
+        }));
     }
 
     #[test]

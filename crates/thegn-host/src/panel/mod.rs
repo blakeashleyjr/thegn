@@ -792,6 +792,8 @@ pub struct PanelData {
     pub tracker_issues: Vec<thegn_core::issue::Issue>,
     /// Issue ids (in `"<provider>:<key>"` form) linked to the current worktree.
     pub tracker_links: Vec<String>,
+    /// Accounts whose latest issue refresh stopped early (bounded listing): their rows are the last good ones. Empty when every account's cache is complete.
+    pub tracker_partial: Vec<thegn_core::issue::IssueCachePartial>,
     /// Whether any `[issues]` provider is configured for this repo. Distinguishes
     /// "off" (no provider) from "clear" (configured but currently empty).
     pub issues_configured: bool,
