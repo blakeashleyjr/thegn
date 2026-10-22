@@ -628,6 +628,10 @@ pub struct FrameModel {
     pub key_locked: bool,
     /// True while a zone is zoomed fullscreen (statusbar indicator).
     pub zoomed: bool,
+    /// True while the shown now-playing snapshot is last-known-good after a
+    /// failed provider read (watcher health Degraded); loop-owned and carried
+    /// across hydration.
+    pub media_stale: bool,
     /// True while the focused pane is maximized within the chrome — the middle
     /// stop of Ctrl+Alt+z (statusbar indicator, distinct from `zoomed`).
     pub maximized: bool,
@@ -1872,15 +1876,24 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         && let Some(text) = m.badge()
     {
         use thegn_core::media::PlaybackState;
-        let hue = match m.state {
-            PlaybackState::Playing => thegn_core::theme::Hue::Green,
-            _ => thegn_core::theme::Hue::Blue,
+        let hue = if model.media_stale {
+            thegn_core::theme::Hue::Amber
+        } else {
+            match m.state {
+                PlaybackState::Playing => thegn_core::theme::Hue::Green,
+                _ => thegn_core::theme::Hue::Blue,
+            }
         };
         let clipped: String = {
             let max = 30;
-            if crate::seg::take_cols(&text, max) != text.as_str() {
+            let track_max = if model.media_stale {
+                max.saturating_sub(6)
+            } else {
+                max
+            };
+            if crate::seg::take_cols(&text, track_max) != text.as_str() {
                 let g = crate::caps::active_glyphs();
-                let body = crate::seg::take_cols(&text, max.saturating_sub(3));
+                let body = crate::seg::take_cols(&text, track_max.saturating_sub(3));
                 format!("{}{}", body.trim_end(), g.ellipsis)
             } else {
                 text
@@ -1888,7 +1901,14 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         };
         items.push((
             BarItemId::Badge(BarBadge::Media),
-            vec![Seg::chip(Tok::Hue(hue), format!(" {clipped} "))],
+            vec![Seg::chip(
+                Tok::Hue(hue),
+                if model.media_stale {
+                    format!(" {clipped} stale ")
+                } else {
+                    format!(" {clipped} ")
+                },
+            )],
         ));
     }
     if model.zoomed {
