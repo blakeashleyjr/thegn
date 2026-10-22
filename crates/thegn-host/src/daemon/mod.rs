@@ -123,14 +123,13 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
         }
         return socket;
     }
-    let socket = socket_path_for(
+    socket_path_for(
         dcfg,
         runtime_dir.as_deref(),
         &state_dir,
         uid,
         short_runtime_dir(),
-    );
-    socket
+    )
 }
 
 /// Compose must not make the live daemon control directory reachable.
@@ -922,24 +921,23 @@ async fn run(
             &thegn_core::util::xdg_state_home().join("thegn"),
             effective_uid(),
         )
+        && let Err(validation_error) = validate_private_fallback_parent(&sock)
     {
-        if let Err(validation_error) = validate_private_fallback_parent(&sock) {
-            let old_parent = sock.parent().map(std::path::Path::to_path_buf);
-            match allocate_private_tmp_fallback(
-                &thegn_core::util::xdg_state_home().join("thegn"),
-                effective_uid(),
-            ) {
-                Ok(relocated) => {
-                    if let Some(old_parent) = old_parent {
-                        tracing::warn!(target: "thegn::daemon", path = %old_parent.display(), "private control fallback directory is owned by another user or has the wrong mode; using a private sibling");
-                    }
-                    sock = relocated;
+        let old_parent = sock.parent().map(std::path::Path::to_path_buf);
+        match allocate_private_tmp_fallback(
+            &thegn_core::util::xdg_state_home().join("thegn"),
+            effective_uid(),
+        ) {
+            Ok(relocated) => {
+                if let Some(old_parent) = old_parent {
+                    tracing::warn!(target: "thegn::daemon", path = %old_parent.display(), "private control fallback directory is owned by another user or has the wrong mode; using a private sibling");
                 }
-                Err(allocation_error) => {
-                    return Err(allocation_error).with_context(|| {
-                        format!("{validation_error:#}; unable to relocate private control fallback")
-                    });
-                }
+                sock = relocated;
+            }
+            Err(allocation_error) => {
+                return Err(allocation_error).with_context(|| {
+                    format!("{validation_error:#}; unable to relocate private control fallback")
+                });
             }
         }
     }
