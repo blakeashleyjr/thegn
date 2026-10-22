@@ -36,7 +36,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thegn_core::asciicast::{CastWriter, Header, Utf8Carry};
@@ -47,7 +47,7 @@ const MAX_CHUNK_BYTES: usize = 16 * 1024;
 pub(super) const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) const LATE_TIMEOUT_REASON: &str =
     "recording finalization timed out; writer may still be flushing";
-const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const GLOBAL_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECORDING_WORKERS: usize = 16;
 const RECORDING_THREAD_NAME: &str = "thegn-record";
 
@@ -341,32 +341,30 @@ impl Recorder {
         let worker_state = Arc::clone(&state);
         let worker_late = Arc::clone(&late);
         let worker_path = path.clone();
-        let worker = thread::Builder::new()
-            .name(RECORDING_THREAD_NAME.to_owned())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_worker(
-                        rx,
-                        WorkerStart {
-                            path: &worker_path,
-                            cols,
-                            rows,
-                            max_bytes,
-                            stamp,
-                            generation,
-                        },
-                        worker_state.as_ref(),
-                    )
-                }))
-                .unwrap_or_else(|_| {
-                    worker_panic_finished(&worker_path, generation, worker_state.as_ref())
-                });
-                dispatch_finished(finished, &result_tx, &worker_late);
-                worker_state.completion_wake.notify_one();
-                drop(worker_slot);
-            })
-            .map_err(StartError::Io)?;
+        let worker = thegn_core::thread_name::try_spawn_named(RECORDING_THREAD_NAME, move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_worker(
+                    rx,
+                    WorkerStart {
+                        path: &worker_path,
+                        cols,
+                        rows,
+                        max_bytes,
+                        stamp,
+                        generation,
+                    },
+                    worker_state.as_ref(),
+                )
+            }))
+            .unwrap_or_else(|_| {
+                worker_panic_finished(&worker_path, generation, worker_state.as_ref())
+            });
+            dispatch_finished(finished, &result_tx, &worker_late);
+            worker_state.completion_wake.notify_one();
+            drop(worker_slot);
+        })
+        .map_err(StartError::Io)?;
         Ok(Self {
             tx: Some(tx),
             worker: Some(worker),
@@ -841,7 +839,7 @@ fn start_with_writer<W: Write + Send + 'static>(writer: CastWriter<W>) -> Record
 }
 
 #[cfg(test)]
-fn start_with_writer_budget<W: Write + Send + 'static>(
+pub(super) fn start_with_writer_budget<W: Write + Send + 'static>(
     writer: CastWriter<W>,
     inflight: Arc<AtomicUsize>,
     inflight_limit: usize,
@@ -1040,6 +1038,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[derive(Clone)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
