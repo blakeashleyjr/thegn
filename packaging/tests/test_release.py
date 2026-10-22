@@ -812,6 +812,19 @@ class StagedPayloadTests(unittest.TestCase):
             self.assertEqual(expected_mode, stat.S_IMODE((output / name).stat().st_mode))
         self.assertEqual([], list(parent.glob(".stage-*")))
 
+    def test_stage_cleans_temp_dir_when_handoff_fails(self) -> None:
+        _, _, trusted = self.archive_and_trusted()
+        parent = self.temp / "package"
+        parent.mkdir()
+        output = parent / "stage"
+        with mock.patch.object(release.os, "rename", side_effect=OSError("boom")):
+            with self.assertRaisesRegex(release.ReleaseError, "cannot stage release archive"):
+                release.stage_archive(
+                    self.manifest, self.tag, self.assets, self.target, output, trusted
+                )
+        self.assertFalse(output.exists())
+        self.assertEqual([], list(parent.glob(".stage-*")))
+
     def test_stage_refuses_existing_output_dir(self) -> None:
         _, _, trusted = self.archive_and_trusted()
         parent = self.temp / "package"
@@ -900,7 +913,7 @@ class StagedPayloadTests(unittest.TestCase):
                 {},
             )
 
-    def make_payload(self, staged: dict[str, str]) -> Path:
+    def make_payload(self) -> Path:
         payload = self.temp / "payload"
         binary = payload / "usr/bin/thegn"
         binary.parent.mkdir(parents=True)
@@ -913,26 +926,23 @@ class StagedPayloadTests(unittest.TestCase):
         return payload
 
     def staged_payload(self) -> tuple[Path, dict[str, str]]:
-        stage, digests = self.stage()
-        self._staged_root = stage
-        return stage, digests
+        return self.stage()
 
     def test_payload_accepts_matching_tree(self) -> None:
-        stage, digests = self.staged_payload()
-        self._staged_root = stage
-        payload = self.make_payload(digests)
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
         release.verify_package_payload(digests, payload, "deb")
 
     def test_payload_rejects_replaced_binary(self) -> None:
-        stage, digests = self.staged_payload()
-        payload = self.make_payload(digests)
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
         (payload / "usr/bin/thegn").write_bytes(b"replaced")
         with self.assertRaisesRegex(release.ReleaseError, "deb payload bytes differ at usr/bin/thegn"):
             release.verify_package_payload(digests, payload, "deb")
 
     def test_payload_rejects_symlinked_binary(self) -> None:
         _, digests = self.staged_payload()
-        payload = self.make_payload(digests)
+        payload = self.make_payload()
         binary = payload / "usr/bin/thegn"
         binary.unlink()
         binary.symlink_to("/bin/sh")
@@ -941,7 +951,7 @@ class StagedPayloadTests(unittest.TestCase):
 
     def test_payload_rejects_extra_file(self) -> None:
         _, digests = self.staged_payload()
-        payload = self.make_payload(digests)
+        payload = self.make_payload()
         extra = payload / "usr/share/doc/thegn/x"
         extra.parent.mkdir(parents=True)
         extra.write_text("extra", encoding="utf-8")
@@ -950,7 +960,7 @@ class StagedPayloadTests(unittest.TestCase):
 
     def test_payload_rejects_wrong_alias_target(self) -> None:
         _, digests = self.staged_payload()
-        payload = self.make_payload(digests)
+        payload = self.make_payload()
         alias = payload / "usr/bin/tg"
         alias.unlink()
         alias.symlink_to("/bin/sh")
@@ -959,7 +969,7 @@ class StagedPayloadTests(unittest.TestCase):
 
     def test_payload_rejects_missing_license(self) -> None:
         _, digests = self.staged_payload()
-        payload = self.make_payload(digests)
+        payload = self.make_payload()
         (payload / "usr/share/licenses/thegn/LICENSE-MIT").unlink()
         with self.assertRaisesRegex(release.ReleaseError, "missing entry"):
             release.verify_package_payload(digests, payload, "rpm")
@@ -1009,8 +1019,8 @@ class StagedPayloadTests(unittest.TestCase):
         self.assertFalse((parent / "stage").exists())
         self.assertFalse((self.temp / "digests.json").exists())
 
-        stage, staged = self.stage()
-        payload = self.make_payload(staged)
+        _, staged = self.stage()
+        payload = self.make_payload()
         (payload / "usr/bin/thegn").write_bytes(b"tampered")
         staged_path = self.temp / "staged.json"
         staged_path.write_text(json.dumps(staged), encoding="utf-8")
