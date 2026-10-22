@@ -1233,11 +1233,10 @@ fn add_worktree(cfg: &Config, wt: &Path) -> String {
     // and deriving the workspace slug shells out to git.
     let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
-    let branch = util::git_out(wt, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let Some(branch) = branch else {
-        return "Add failed: not on a branch (detached HEAD?)".into();
+    let branch = match crate::merge_ops::branch_of(wt) {
+        Ok(Some(branch)) => branch,
+        Ok(None) => return "Add failed: not on a branch (detached HEAD?)".into(),
+        Err(reason) => return format!("Add failed: branch could not be read: {reason}"),
     };
     if branch == target {
         return format!("Skipped {branch} — that's the target branch");
