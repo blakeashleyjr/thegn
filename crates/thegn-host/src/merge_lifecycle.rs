@@ -29,6 +29,10 @@ mod cleanup;
 pub(crate) use cleanup::TestIsolation;
 pub(crate) use cleanup::common as repository_identity;
 
+pub(crate) fn oci_runtime_may_be_installed() -> bool {
+    cleanup::oci_runtime_may_be_installed()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CleanupRefusal {
     Database,

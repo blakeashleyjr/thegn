@@ -464,6 +464,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         }
         if !force
             && let Some(retry) = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
+            && crate::merge_lifecycle::oci_runtime_may_be_installed()
             && !retry.is_due(now)
         {
             let remaining = u64::try_from(retry.next_at.saturating_sub(now)).unwrap_or(u64::MAX);
@@ -2564,5 +2565,26 @@ mod retry_tests {
         )
         .expect("due refusal advances marker");
         assert_eq!(retry.attempts, 2);
+    }
+
+    #[test]
+    fn cleanup_retry_without_installed_runtime_collects_on_clock_alone() {
+        let fixture = refused_fixture("retry-no-runtime");
+        let marker = merge_sweep::CleanupRetry {
+            attempts: 1,
+            next_at: util::now().saturating_add(300),
+        }
+        .marker();
+        rusqlite::Connection::open(&fixture.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET error_detail=?1 WHERE worktree=?2",
+                rusqlite::params![marker, fixture.worktree.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let retry = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert_eq!(retry.collected, ["feature"]);
+        assert!(!fixture.worktree.exists());
     }
 }
