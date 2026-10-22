@@ -166,7 +166,20 @@ mod tests {
         let further = worker.submit(|| Ok(()));
         assert!(matches!(further, Err(MediaError::Backend(message)) if message.contains("busy")));
         gate_tx.send(()).unwrap();
-        worker.run(Duration::from_secs(2), || Ok(())).await.unwrap();
+        // The worker still has to dequeue (and skip) the abandoned job, so the
+        // single slot may stay busy briefly after the gate opens.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match worker.run(Duration::from_secs(2), || Ok(())).await {
+                Ok(()) => break,
+                Err(MediaError::Backend(message))
+                    if message.contains("busy") && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("worker did not recover: {error:?}"),
+            }
+        }
         assert!(!timed_out_ran.load(Ordering::SeqCst));
         worker.stop_and_join().unwrap();
     }
