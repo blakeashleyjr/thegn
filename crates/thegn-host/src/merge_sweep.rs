@@ -464,11 +464,10 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         }
         if !force
             && let Some(retry) = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
-            && crate::merge_lifecycle::oci_runtime_may_be_installed()
             && !retry.is_due(now)
         {
             let remaining = u64::try_from(retry.next_at.saturating_sub(now)).unwrap_or(u64::MAX);
-            report.kept.push((
+            report.informational.push((
                 row.branch.clone(),
                 format!(
                     "cleanup deferred after {} refusal(s); next retry in {}",
@@ -2505,8 +2504,11 @@ mod retry_tests {
 
         clear_dispatch(&fixture);
         let second = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
-        assert_eq!(second.kept.len(), 1);
-        assert!(second.kept[0].1.contains("cleanup deferred"));
+        assert!(second.kept.is_empty());
+        assert_eq!(second.informational.len(), 1);
+        assert!(second.informational[0].1.contains("cleanup deferred"));
+        assert!(!second.is_incomplete());
+        assert!(second.collected.is_empty());
         assert!(
             fixture.worktree.exists(),
             "deferred sweep must not run cleanup"
@@ -2568,8 +2570,8 @@ mod retry_tests {
     }
 
     #[test]
-    fn cleanup_retry_without_installed_runtime_collects_on_clock_alone() {
-        let fixture = refused_fixture("retry-no-runtime");
+    fn cleanup_retry_deferred_row_does_not_fail_the_sweep() {
+        let fixture = refused_fixture("retry-not-due");
         let marker = merge_sweep::CleanupRetry {
             attempts: 1,
             next_at: util::now().saturating_add(300),
@@ -2582,9 +2584,29 @@ mod retry_tests {
                 rusqlite::params![marker, fixture.worktree.to_str().unwrap()],
             )
             .unwrap();
+        clear_dispatch(&fixture);
 
-        let retry = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
-        assert_eq!(retry.collected, ["feature"]);
+        let deferred = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert!(deferred.collected.is_empty());
+        assert!(deferred.kept.is_empty());
+        assert_eq!(deferred.informational.len(), 1);
+        assert!(
+            deferred.informational[0]
+                .1
+                .contains("cleanup deferred after 1 refusal(s)")
+        );
+        assert!(!deferred.is_incomplete());
+        assert!(fixture.worktree.exists());
+        assert_eq!(
+            fixture.db.list_merge_queue().unwrap()[0]
+                .error_detail
+                .as_deref(),
+            Some(marker.as_str()),
+            "deferral leaves retry marker unchanged"
+        );
+
+        let forced = sweep_with_db(&fixture.cfg, &fixture.root, true, &fixture.db);
+        assert_eq!(forced.collected, ["feature"]);
         assert!(!fixture.worktree.exists());
     }
 }

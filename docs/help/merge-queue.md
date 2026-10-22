@@ -167,7 +167,8 @@ else. A week is how long you have to notice.
   rows that cannot be identified as belonging to this repository are reported
   as informational and do not change the exit status.
 - A refused cleanup is retried with a growing delay (5 minutes, doubling up to
-  a day) and is reported as kept meanwhile; `--force` retries immediately.
+  a day). Until then it is reported as informational and does not make that
+  sweep incomplete; `--force` retries immediately.
 - The _merge_ section's **`c`** does the same for that repo after a second
   press: it clears the landed rows and sweeps their worktrees together. Under
   `expire` a landed row _is_ the grace-period clock, so clearing one without its worktree
