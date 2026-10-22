@@ -317,7 +317,7 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
     let scan = startup_scan(dcfg).await;
     report_startup_scan(&scan);
     if let Some(client) = scan.found {
-        start_error_state_bridge(client);
+        start_error_state_bridge(&client);
         return Some(client);
     }
     None
