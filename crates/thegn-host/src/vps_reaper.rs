@@ -12,6 +12,7 @@
 //!   instance ⇒ drop the record (the POST never landed);
 //! - `ready` record whose instance is gone ⇒ drop the record (destroyed
 //!   out-of-band — heals the attach bridge's IP cache);
+//! - records stamped for another provider account are quarantined and retained;
 //! - instance older than the env's `max_lifetime_secs` (when set) ⇒ destroy
 //!   (the hard spend ceiling); bake sources also expire at
 //!   [`BAKE_MAX_AGE_SECS`] even when that policy is disabled.
@@ -121,12 +122,26 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
 }
 
 fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
+    let kind = pc.provider.trim();
+    // The outer gate permits exactly one account/policy per provider kind.
+    // Failed or unavailable inventory must preserve all ownership records.
+    let Some(probe) = crate::provider_factory::vps_provider_for(pc, "reaper-probe") else {
+        return;
+    };
+    let ours_account = match probe.account() {
+        Ok(account) => account,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: skipped {kind}: provider account unavailable ({error:#}); no provider or ledger actions attempted"
+            ));
+            return;
+        }
+    };
     let view = match registry::list_checked() {
         Ok(view) => view,
         Err(error) => {
             thegn_core::msg::warn(&format!(
-                "vps reaper: skipped {}: ledger unreadable ({error:#}); no provider or ledger actions attempted",
-                pc.provider.trim()
+                "vps reaper: skipped {kind}: ledger unreadable ({error:#}); no provider or ledger actions attempted"
             ));
             return;
         }
@@ -135,19 +150,12 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         Ok(id) => id,
         Err(error) => {
             thegn_core::msg::warn(&format!(
-                "vps reaper: skipped {}: controller id unavailable ({error:#}); no provider or ledger actions attempted",
-                pc.provider.trim()
+                "vps reaper: skipped {kind}: controller id unavailable ({error:#}); no provider or ledger actions attempted"
             ));
             return;
         }
     };
     let ours = vps::host_label();
-    let kind = pc.provider.trim();
-    // The outer gate permits exactly one account/policy per provider kind.
-    // Failed or unavailable inventory must preserve all ownership records.
-    let Some(probe) = crate::provider_factory::vps_provider_for(pc, "reaper-probe") else {
-        return;
-    };
     let instances = match crate::agent::block_on_provider(|| async { probe.list_detailed().await })
     {
         Ok(list) => list,
@@ -193,6 +201,13 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
             }
             LedgerState::Absent => None,
         };
+        if record.is_some_and(|record| !record_account_matches(record, &ours_account)) {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: quarantined {}: the ledger record belongs to another provider account; reconcile ownership; no deletion attempted",
+                inst.name
+            ));
+            continue;
+        }
         if record.is_some_and(|record| !recorded_identity_matches(record, kind, &inst.id))
             && registry::is_bake_name(&inst.name)
             && record
@@ -257,12 +272,23 @@ fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
         }
     }
     // Only this successfully reconciled kind can retire absent ledger rows.
-    let records: Vec<_> = view
-        .records
-        .into_iter()
-        .filter(|r| r.provider == kind)
-        .collect();
+    let records = cleanup_candidates(view.records, kind, &ours_account);
     cleanup_ledger(&records, &live_anywhere);
+}
+
+fn record_account_matches(record: &registry::VpsRecord, ours: &str) -> bool {
+    record.account.is_empty() || record.account == ours
+}
+
+fn cleanup_candidates(
+    records: Vec<registry::VpsRecord>,
+    kind: &str,
+    ours: &str,
+) -> Vec<registry::VpsRecord> {
+    records
+        .into_iter()
+        .filter(|record| record.provider == kind && record_account_matches(record, ours))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -559,6 +585,7 @@ mod tests {
             ip: String::new(),
             created_at,
             owner: String::new(),
+            account: String::new(),
         }
     }
 
@@ -601,6 +628,34 @@ mod tests {
         assert!(
             !should_drop_record(&r, &live, now),
             "a live sibling-account VPS must never be reaped from the ledger"
+        );
+    }
+
+    #[test]
+    fn account_mismatch_record_is_kept_and_never_matches() {
+        let mut record = rec("resource", "ready", 1);
+        record.account = "acct1-ours".into();
+        assert!(record_account_matches(&record, "acct1-ours"));
+        assert!(!record_account_matches(&record, "acct1-other"));
+        record.account.clear();
+        assert!(record_account_matches(&record, "acct1-other"));
+    }
+
+    #[test]
+    fn account_cleanup_keeps_other_account_records() {
+        let mut other = rec("other", "ready", 1);
+        other.account = "acct1-other".into();
+        let mut same = rec("same", "ready", 1);
+        same.account = "acct1-ours".into();
+        let legacy = rec("legacy", "ready", 1);
+        let selected = cleanup_candidates(vec![other, legacy, same], "hetzner", "acct1-ours");
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy", "same"]
         );
     }
 

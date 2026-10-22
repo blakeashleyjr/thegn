@@ -38,6 +38,7 @@ pub enum ReserveScope {
 pub enum ReserveError {
     AtCap { occupied: usize, cap: usize },
     OwnedByOther { name: String },
+    OtherAccount { name: String },
     Store(anyhow::Error),
 }
 
@@ -89,6 +90,10 @@ impl std::fmt::Display for ReserveError {
                 formatter,
                 "vps registry: sandbox name {name} is bound to a different worktree; refusing to reuse it"
             ),
+            Self::OtherAccount { name } => write!(
+                formatter,
+                "vps registry: sandbox name {name} is recorded under a different provider account; refusing to reuse it"
+            ),
             Self::Store(error) => write!(formatter, "registry reservation failed: {error}"),
         }
     }
@@ -99,6 +104,7 @@ impl std::error::Error for ReserveError {
         match self {
             Self::AtCap { .. } => None,
             Self::OwnedByOther { .. } => None,
+            Self::OtherAccount { .. } => None,
             Self::Store(error) => Some(error.as_ref()),
         }
     }
@@ -125,6 +131,9 @@ pub struct VpsRecord {
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner: String,
+    /// Credential-free provider-account fingerprint; empty means legacy/unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account: String,
 }
 
 /// Whether `name` is a bake source name: the fixed prefix and exactly sixteen
@@ -233,6 +242,22 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
             }
         }
     }
+    if record.account.is_empty() {
+        match read_in(&root, &record.name) {
+            Some(existing) if !existing.account.is_empty() => {
+                record.account = existing.account;
+            }
+            Some(_) => {}
+            None => {
+                if record_exists_in(&root, &record.name)? {
+                    anyhow::bail!(
+                        "vps registry: cannot preserve account for unreadable existing record {}",
+                        record.name
+                    );
+                }
+            }
+        }
+    }
     let bytes = serde_json::to_vec_pretty(&record)?;
     root.write_owner_only_atomic(&format!("{}.json", rec.name), &bytes)
         .with_context(|| format!("publish VPS registry record {}", rec.name))?;
@@ -315,6 +340,26 @@ pub fn reserve_at(
             },
         }
     }
+    if !rec.account.is_empty() {
+        match read_in(&root, &rec.name) {
+            Some(existing) if !existing.account.is_empty() && existing.account != rec.account => {
+                return Err(ReserveError::OtherAccount {
+                    name: rec.name.clone(),
+                });
+            }
+            Some(_) => {}
+            None => match record_exists_in(&root, &rec.name) {
+                Ok(true) => {
+                    return Err(ReserveError::Store(anyhow::anyhow!(
+                        "vps registry: cannot verify account for existing record {}",
+                        rec.name
+                    )));
+                }
+                Ok(false) => {}
+                Err(error) => return Err(ReserveError::Store(error)),
+            },
+        }
+    }
     let occupied = occupied_at(&root, scope).map_err(ReserveError::Store)?;
     if occupied >= cap {
         return Err(ReserveError::AtCap { occupied, cap });
@@ -333,6 +378,23 @@ pub fn worktree_owner(worktree: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("wt1-{digest_hex}")
+}
+
+/// A stable, credential-free fingerprint for one provider account authority.
+pub fn account_fingerprint(kind: &str, authority: &str, credential_ref: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"thegn.provider-account.v1\0");
+    digest.update(kind.as_bytes());
+    digest.update([0]);
+    digest.update(authority.as_bytes());
+    digest.update([0]);
+    digest.update(credential_ref.as_bytes());
+    let bytes = digest.finalize();
+    let digest_hex = bytes[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("acct1-{digest_hex}")
 }
 
 pub fn check_owner_at(d: &Path, name: &str, owner: &str) -> Result<()> {
@@ -520,6 +582,7 @@ mod tests {
             ip: String::new(),
             created_at: 1_700_000_000,
             owner: String::new(),
+            account: String::new(),
         }
     }
 
@@ -850,6 +913,9 @@ mod tests {
                 Err(ReserveError::OwnedByOther { .. }) => {
                     panic!("owner refusal is not expected for distinct names")
                 }
+                Err(ReserveError::OtherAccount { .. }) => {
+                    panic!("account refusal is not expected for unstamped records")
+                }
                 Err(ReserveError::Store(error)) => panic!("reservation store error: {error}"),
             }
         }
@@ -1090,6 +1156,72 @@ mod tests {
         assert!(record.owner.is_empty());
         let encoded = serde_json::to_value(record).unwrap();
         assert!(encoded.get("owner").is_none());
+    }
+
+    #[test]
+    fn account_fingerprint_is_deterministic_and_credential_free() {
+        let account = account_fingerprint("hetzner", "api.example", "HCLOUD_TOKEN");
+        assert_eq!(
+            account,
+            account_fingerprint("hetzner", "api.example", "HCLOUD_TOKEN")
+        );
+        assert!(account.starts_with("acct1-"));
+        assert_eq!(account.len(), 38);
+        assert!(account[6..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!account.contains("HCLOUD_TOKEN"));
+        assert_ne!(
+            account,
+            account_fingerprint("fly", "api.example", "HCLOUD_TOKEN")
+        );
+        assert_ne!(
+            account,
+            account_fingerprint("hetzner", "other.example", "HCLOUD_TOKEN")
+        );
+        assert_ne!(
+            account,
+            account_fingerprint("hetzner", "api.example", "HCLOUD_TOKEN_WORK")
+        );
+    }
+
+    #[test]
+    fn account_reserve_refuses_a_record_of_another_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut first = rec("tg-a-x1", "creating");
+        first.account = account_fingerprint("hetzner", "api.example", "TOKEN_A");
+        reserve_at(dir, &first, 5, ReserveScope::All).unwrap();
+
+        let mut second = rec("tg-a-x1", "creating");
+        second.account = account_fingerprint("hetzner", "api.example", "TOKEN_B");
+        assert!(matches!(
+            reserve_at(dir, &second, 5, ReserveScope::All),
+            Err(ReserveError::OtherAccount { name }) if name == "tg-a-x1"
+        ));
+        assert_eq!(read_at(dir, "tg-a-x1").unwrap().account, first.account);
+    }
+
+    #[test]
+    fn account_legacy_json_without_account_still_parses() {
+        let json = r#"{"name":"tg-a-x1","provider":"hetzner","state":"ready","instance_id":"i-1","ip":"192.0.2.1","created_at":7}"#;
+        let record: VpsRecord = serde_json::from_str(json).unwrap();
+        assert!(record.account.is_empty());
+        let encoded = serde_json::to_value(rec("tg-a-x1", "ready")).unwrap();
+        assert!(encoded.get("account").is_none());
+    }
+
+    #[test]
+    fn account_empty_rewrite_preserves_existing_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut stamped = rec("tg-a-x1", "ready");
+        stamped.account = account_fingerprint("hetzner", "api.example", "TOKEN_A");
+        write_at(dir, &stamped).unwrap();
+
+        let mut rewrite = rec("tg-a-x1", "ready");
+        rewrite.ip = "192.0.2.9".into();
+        write_at(dir, &rewrite).unwrap();
+
+        assert_eq!(read_at(dir, "tg-a-x1").unwrap().account, stamped.account);
     }
 
     #[test]
