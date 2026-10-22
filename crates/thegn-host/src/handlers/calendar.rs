@@ -57,7 +57,7 @@ pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
         // best-effort: the inbox is a cache, and a reminder that fails to record
         // must not take down the compositor.
         if crate::automation_events::emit(db, kind, source_ref, message, "").is_ok() {
-            let _ = waker.wake(); // best-effort: a waker pulse: an input nudge must never fail the calling path
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -109,7 +109,7 @@ fn message_for(r: &DueReminder) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use thegn_core::store::NotificationStore;
@@ -285,9 +285,11 @@ mod tests {
             ])
             .env("TG_REMINDER_RACE_CHILD_DB", &db_path)
             .env("TG_REMINDER_RACE_CHILD_OUT", &out_a)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut child_b = Command::new(exe)
+        let mut child_b = match Command::new(exe)
             .args([
                 "--exact",
                 "handlers::calendar::tests::raise_reminder_on_delivers_once_across_processes",
@@ -295,8 +297,16 @@ mod tests {
             ])
             .env("TG_REMINDER_RACE_CHILD_DB", &db_path)
             .env("TG_REMINDER_RACE_CHILD_OUT", &out_b)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-            .unwrap();
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _output_a = child_a.wait_with_output().unwrap();
+                panic!("spawning child B failed: {error}");
+            }
+        };
         let output_a = child_a.wait_with_output().unwrap();
         let output_b = child_b.wait_with_output().unwrap();
         assert!(
