@@ -3,7 +3,8 @@
 //! platform-free.
 //!
 //! **The endpoint is the lock.** On unix, whoever binds the socket is the
-//! daemon (a connectable socket ⇒ a live daemon; a stale file is unlinked).
+//! daemon (a socket that accepts or has a full backlog ⇒ a live daemon; only
+//! a refused socket is stale and unlinked). Other probe outcomes fail startup.
 //! On Windows, `first_pipe_instance(true)` gives the same semantics — the
 //! first creator owns the pipe name and a second daemon gets `ACCESS_DENIED`
 //! (⇒ [`BindOutcome::AlreadyRunning`]). Pipes die with their handles, so
@@ -28,7 +29,7 @@
 //! in that namespace is the same filesystem principal, so token-only
 //! deployments must keep this private parent outside sandbox mounts. Migrate
 //! custom token-only sockets into a private per-user runtime/state directory.
-//! Lock contention fails closed after a bounded wait.
+//! Lock contention and socket probes fail closed after the same bounded wait.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -380,6 +381,11 @@ fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
 /// unbounded wait.
 const BIND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The listener probe shares the bind-lock budget; a healthy probe completes
+/// in microseconds.
+#[cfg(unix)]
+const BIND_PROBE_WAIT: std::time::Duration = BIND_LOCK_WAIT;
+
 #[cfg(unix)]
 fn bind_lock_with_wait(sock: &Path, wait: std::time::Duration) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -485,6 +491,55 @@ fn require_live_endpoint(
     }
 }
 
+/// Classification of a non-blocking probe of an existing Unix socket.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum UnixProbe {
+    Live,
+    Stale,
+    Gone,
+}
+
+/// A probe is live when it connects or the accept backlog is full. Only
+/// `ConnectionRefused` proves that the socket is stale; unclassified failures
+/// carry path context and must never cause the endpoint to be unlinked.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn classify_unix_probe(probe: io::Result<()>, sock: &Path) -> io::Result<UnixProbe> {
+    match probe {
+        Ok(()) => Ok(UnixProbe::Live),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(UnixProbe::Live),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(UnixProbe::Stale),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(UnixProbe::Gone),
+        Err(error) => Err(io_error_with_path_context(
+            error,
+            "probe existing control socket",
+            sock,
+        )),
+    }
+}
+
+/// Probe from the existing `spawn_blocking` worker. `Handle::block_on` is
+/// legal there, and the runtime thread awaiting that worker drives the I/O
+/// driver even when it uses a current-thread runtime.
+#[cfg(unix)]
+fn probe_unix_listener(sock: &Path) -> io::Result<()> {
+    let handle = tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
+    match handle.block_on(tokio::time::timeout(
+        BIND_PROBE_WAIT,
+        tokio::net::UnixStream::connect(sock),
+    )) {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "existing control socket did not answer the probe within {}ms; refusing to replace it",
+                BIND_PROBE_WAIT.as_millis()
+            ),
+        )),
+    }
+}
+
 /// Outcome of [`IpcListener::bind_exclusive`]: the caller either *is* the
 /// daemon or found a live one.
 pub enum BindOutcome {
@@ -526,8 +581,9 @@ impl IpcListener {
             IpcEndpoint::Unix(sock) => {
                 #[cfg(unix)]
                 {
-                    // A connectable socket ⇒ a live daemon; a stale file
-                    // (bind would fail with AddrInUse) is unlinked. The whole
+                    // An accepting socket or one with a full backlog is a
+                    // live daemon; only a refused socket is unlinked. Any
+                    // other probe result is a startup error. The whole
                     // probe→unlink→bind sequence runs under the advisory bind
                     // lock (see [`bind_lock`]) on a blocking thread — two
                     // racing binders could otherwise BOTH probe-fail the same
@@ -576,9 +632,10 @@ impl IpcListener {
                                     &sock,
                                 ));
                             }
-                            match std::os::unix::net::UnixStream::connect(&sock) {
-                                Ok(_) => return Ok(UnixBind::AlreadyRunning),
-                                Err(_) => match std::fs::remove_file(&sock) {
+                            match classify_unix_probe(probe_unix_listener(&sock), &sock)? {
+                                UnixProbe::Live => return Ok(UnixBind::AlreadyRunning),
+                                UnixProbe::Gone => {}
+                                UnixProbe::Stale => match std::fs::remove_file(&sock) {
                                     Ok(()) => {}
                                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                                     Err(error) => {
@@ -610,9 +667,20 @@ impl IpcListener {
                                 Ok(UnixBind::Bound(l))
                             }
                             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                                let probe = match classify_unix_probe(
+                                    probe_unix_listener(&sock),
+                                    &sock,
+                                ) {
+                                    Ok(UnixProbe::Live) => Ok(()),
+                                    Ok(UnixProbe::Stale | UnixProbe::Gone) => Err(io::Error::new(
+                                        io::ErrorKind::ConnectionRefused,
+                                        "no live listener",
+                                    )),
+                                    Err(error) => Err(error),
+                                };
                                 match require_live_endpoint(
                                     e,
-                                    std::os::unix::net::UnixStream::connect(&sock).map(|_| ()),
+                                    probe,
                                     &sock,
                                 ) {
                                     Ok(()) => Ok(UnixBind::AlreadyRunning),
@@ -914,6 +982,106 @@ fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_probe_classifies_every_probe_result() {
+        let sock = Path::new("control.sock");
+        assert_eq!(classify_unix_probe(Ok(()), sock).unwrap(), UnixProbe::Live);
+
+        let cases = [
+            (io::ErrorKind::WouldBlock, Some(UnixProbe::Live)),
+            (io::ErrorKind::ConnectionRefused, Some(UnixProbe::Stale)),
+            (io::ErrorKind::NotFound, Some(UnixProbe::Gone)),
+            (io::ErrorKind::TimedOut, None),
+            (io::ErrorKind::PermissionDenied, None),
+            (io::ErrorKind::Other, None),
+        ];
+        for (kind, expected) in cases {
+            let result = classify_unix_probe(Err(io::Error::new(kind, "probe failure")), sock);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected, "{kind:?}"),
+                None => {
+                    let error = result.expect_err("unclassified probe errors must fail closed");
+                    assert!(error.to_string().contains("probe existing control socket"));
+                    assert!(error.to_string().contains(&sock.display().to_string()));
+                    let context = error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<IoPathContext>())
+                        .expect("probe error keeps its path context");
+                    assert_eq!(context.source.kind(), kind);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_probe_treats_a_full_backlog_as_a_live_daemon() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::io::AsRawFd as _;
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("busy.sock");
+        assert_socket_path_fits(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // SAFETY: listener owns a valid listening socket fd; listen updates its backlog.
+        let result = unsafe { libc::listen(listener.as_raw_fd(), 0) };
+        assert_eq!(result, 0, "listen must shrink the backlog");
+
+        let mut connections = Vec::new();
+        let mut backlog_full = false;
+        for _ in 0..64 {
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(stream) => connections.push(stream),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    backlog_full = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected backlog fill error: {error}"),
+            }
+        }
+        if !backlog_full {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "a unix listener whose accept backlog fills (EAGAIN)",
+                false,
+            ));
+            return;
+        }
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            IpcListener::bind_exclusive(&IpcEndpoint::for_socket_path(&sock)),
+        )
+        .await
+        .expect("probe must not block on a full backlog")
+        .unwrap();
+        assert!(matches!(outcome, BindOutcome::AlreadyRunning));
+        assert!(sock.exists(), "live listener socket must survive the probe");
+        drop(connections);
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_probe_still_replaces_a_refused_stale_socket() {
+        let dir = private_tempdir();
+        prepare_control_directory(dir.path(), false).unwrap();
+        let sock = dir.path().join("stale.sock");
+        assert_socket_path_fits(&sock);
+        let endpoint = IpcEndpoint::for_socket_path(&sock);
+        let listener = match IpcListener::bind_exclusive(&endpoint).await.unwrap() {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh path must bind"),
+        };
+        drop(listener);
+
+        assert!(matches!(
+            IpcListener::bind_exclusive(&endpoint).await.unwrap(),
+            BindOutcome::Bound(_)
+        ));
+    }
 
     #[cfg(unix)]
     fn open_lock_holder(path: &Path) -> std::fs::File {
