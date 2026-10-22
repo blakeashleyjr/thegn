@@ -342,6 +342,22 @@ pub fn refill_pool_after_claim(cfg: &Config, worktree: &str) {
     });
 }
 
+fn spares_or_halt(
+    read: anyhow::Result<Vec<PoolSpare>>,
+    repo: &str,
+    env_name: &str,
+) -> Option<Vec<PoolSpare>> {
+    match read {
+        Ok(spares) => Some(spares),
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "warm pool: cannot read the spare ledger for {repo} ({env_name}): {error:#}; no pool changes made"
+            ));
+            None
+        }
+    }
+}
+
 /// Reconcile the warm-spare POOL for one `(repo, env)`: create spares toward the
 /// target and destroy over-target/idle ones. Runs on a background thread (each
 /// spare provision is minutes); destroys are quick + synchronous, creates are
@@ -375,7 +391,9 @@ where
     let target = effective_pool_target(&db, cfg, &repo, env_name);
     let max_idle = cfg.lifecycle.pool.max_idle_secs;
 
-    let spares = db.pool_spares_for(&repo, env_name).unwrap_or_default();
+    let Some(spares) = spares_or_halt(db.pool_spares_for(&repo, env_name), &repo, env_name) else {
+        return;
+    };
     // Nothing configured and nothing to clean up ⇒ cheap no-op.
     if target == 0 && spares.is_empty() {
         return;
@@ -518,8 +536,10 @@ where
                 .iter()
                 .find(|s| &s.sandbox_name == name)
                 .is_some_and(|s| recycle_spare(cfg, env_name, s, &current_lock));
-        if !recycled {
-            let _ = crate::provision_gate::destroy_spare(cfg, env_name, name); // best-effort: spare cleanup: a failed destroy is retried on the next reconcile
+        if !recycled && let Err(error) = crate::provision_gate::destroy_spare(cfg, env_name, name) {
+            thegn_core::msg::warn(&format!(
+                "warm pool: spare {name} destroy failed; kept for retry on the next reconcile: {error:#}"
+            ));
         }
         notify();
     }
@@ -1047,6 +1067,25 @@ mod tests {
             orphaned_claim_action(None, free_spare_probe),
             ClaimingAction::Keep
         ));
+    }
+
+    #[test]
+    fn pool_ledger_read_error_halts_reconcile() {
+        assert!(
+            spares_or_halt(
+                Err(anyhow::anyhow!("database is locked")),
+                "/repo",
+                "sprites"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pool_ledger_rows_pass_through() {
+        assert!(
+            spares_or_halt(Ok(vec![]), "/repo", "sprites").is_some_and(|spares| spares.is_empty())
+        );
     }
 }
 
