@@ -18,18 +18,24 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    provider bridge — because building the bridge doubles the job. `nix profile
 install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    so it must be proven before a tag even though no release asset comes from it.
-5. **Rehearse the build locally** — with remote CI paused, this is the only way
-   to learn that a release build is broken _before_ the tag is public:
+5. **Rehearse the build locally** before tagging:
 
    ```sh
-   just release-artifacts v<version>   # same archive + checksum shape as CI
-   just release-verify   v<version>    # layout, runs, no quarantine
+   just release-artifacts v<version>   # local archive + checksum
+   just release-verify v<version>      # strict archive validation + local run
    ```
 
+   `release-verify` runs the package job's strict archive validator for this
+   host's target, then checks that the binary runs here. It refuses a Linux
+   binary whose ELF interpreter is under `/nix/store`, because that binary
+   depends on this host's Nix store; pass `host_only=1` to allow it with a loud
+   warning while still validating the archive. A Nix-shell build does not prove
+   portability to ordinary Linux distributions. No local rehearsal covers the
+   musl and darwin legs, the deb/rpm assets, or provenance attestations; those
+   can be rehearsed only from a draft release produced by CI.
+
    The package renderer consumes the generated checksum; no release version or
-   digest is pasted into a formula or package manifest. Note the archive is
-   built for _this_ machine's target, so it rehearses the
-   darwin leg on a Mac and the linux-gnu leg on Linux — not the musl one.
+   digest is pasted into a formula or package manifest.
 
    After downloading a draft release's `.deb`/`.rpm` assets and manifest with
    `gh release download <tag> --pattern 'thegn_*_amd64.deb' --pattern 'thegn-*-1.x86_64.rpm' --pattern 'thegn-<tag>-manifest.json'`,
