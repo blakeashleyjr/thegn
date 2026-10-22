@@ -350,7 +350,9 @@ Capabilities are declared metadata as `"kind:target"` strings — `"run:khal"`,
 `"network:example.com"` — compared with the account's list when a manifest
 arrives. They describe intent and do not limit what the process can do. A plugin
 that runs past `timeout_secs` has its whole process group killed, and its stderr
-is kept and surfaced.
+is kept and surfaced. Kept stderr, junk lines and `log` messages have every
+account `env` value and every command argument after the program replaced by
+`<redacted>`.
 
 ## Related
 
