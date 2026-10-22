@@ -48,6 +48,34 @@ enum ProvenanceCheck {
     Mismatch(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProvenanceStatus {
+    NotApplicable,
+    NotInstalled,
+    Verified,
+    MissingRecord,
+    Mismatch(String),
+}
+
+impl ProvenanceStatus {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not-applicable",
+            Self::NotInstalled => "not-installed",
+            Self::Verified => "verified",
+            Self::MissingRecord => "missing",
+            Self::Mismatch(_) => "mismatch",
+        }
+    }
+
+    pub(crate) fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Mismatch(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum InstalledStep {
     Use,
@@ -156,6 +184,43 @@ fn check_installed_provenance(
         );
     }
     ProvenanceCheck::Verified
+}
+
+fn provenance_source(tool: &ManagedTool) -> Option<(&'static str, &str)> {
+    match &tool.source {
+        Source::GithubRelease { .. } => None,
+        Source::Npm { package } => Some(("npm", package)),
+        Source::Cargo { crate_name } => Some(("cargo", crate_name)),
+    }
+}
+
+fn provenance_status_at(tool: &ManagedTool, managed: &Path, bin_rel: &Path) -> ProvenanceStatus {
+    let Some((source, package)) = provenance_source(tool) else {
+        return ProvenanceStatus::NotApplicable;
+    };
+    if let Err(error) = std::fs::symlink_metadata(managed.join(bin_rel))
+        && error.kind() == std::io::ErrorKind::NotFound
+    {
+        return ProvenanceStatus::NotInstalled;
+    }
+    match check_installed_provenance(managed, tool, source, package, bin_rel) {
+        ProvenanceCheck::Verified => ProvenanceStatus::Verified,
+        ProvenanceCheck::Missing => ProvenanceStatus::MissingRecord,
+        ProvenanceCheck::Mismatch(reason) => ProvenanceStatus::Mismatch(reason),
+    }
+}
+
+pub(crate) fn installed_provenance(tool: &ManagedTool) -> ProvenanceStatus {
+    let managed = tool.managed_dir();
+    let bin_rel = match tool.bin_path().strip_prefix(&managed) {
+        Ok(bin_rel) => bin_rel.to_path_buf(),
+        Err(_) => {
+            return ProvenanceStatus::Mismatch(
+                "managed binary is outside its install directory".to_owned(),
+            );
+        }
+    };
+    provenance_status_at(tool, &managed, &bin_rel)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1353,27 +1418,16 @@ pub(crate) fn install_with(
     host_install: HostInstall,
 ) -> Result<()> {
     if !tool.needs_install(force) {
-        let provenance = match &tool.source {
-            Source::GithubRelease { .. } => return Ok(()),
-            Source::Npm { package } => {
-                let managed = tool.managed_dir();
-                let bin_rel = tool
-                    .bin_path()
-                    .strip_prefix(&managed)
-                    .context("managed binary is outside its install directory")?
-                    .to_path_buf();
-                check_installed_provenance(&managed, tool, "npm", package, &bin_rel)
-            }
-            Source::Cargo { crate_name } => {
-                let managed = tool.managed_dir();
-                let bin_rel = tool
-                    .bin_path()
-                    .strip_prefix(&managed)
-                    .context("managed binary is outside its install directory")?
-                    .to_path_buf();
-                check_installed_provenance(&managed, tool, "cargo", crate_name, &bin_rel)
-            }
+        let Some((source, package)) = provenance_source(tool) else {
+            return Ok(());
         };
+        let managed = tool.managed_dir();
+        let bin_rel = tool
+            .bin_path()
+            .strip_prefix(&managed)
+            .context("managed binary is outside its install directory")?
+            .to_path_buf();
+        let provenance = check_installed_provenance(&managed, tool, source, package, &bin_rel);
         match installed_step(provenance) {
             InstalledStep::Use => return Ok(()),
             InstalledStep::Reinstall => {
@@ -2732,6 +2786,80 @@ mod tests {
         write_provenance(staging.path(), &record).unwrap();
         promote_staging(staging.path(), &managed, &bin_rel).unwrap();
         (root, managed, tool, bin_rel)
+    }
+
+    #[test]
+    fn provenance_status_reports_a_verified_install() {
+        let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
+        assert_eq!(
+            provenance_status_at(&tool, &managed, &bin_rel),
+            ProvenanceStatus::Verified
+        );
+    }
+
+    #[test]
+    fn provenance_status_reports_a_swapped_binary_as_mismatch() {
+        let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
+        std::fs::write(managed.join(&bin_rel), b"replacement binary").unwrap();
+        assert!(matches!(
+            provenance_status_at(&tool, &managed, &bin_rel),
+            ProvenanceStatus::Mismatch(reason)
+                if reason.contains("does not match its install record")
+        ));
+    }
+
+    #[test]
+    fn provenance_status_reports_a_missing_record() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let managed = root.path().join("tool");
+        let bin_rel = PathBuf::from("bin/x");
+        std::fs::create_dir_all(managed.join("bin")).unwrap();
+        std::fs::write(managed.join(&bin_rel), b"legacy binary").unwrap();
+        let tool = ManagedTool::cargo("x", "pkg", "x", "1.2.3");
+        assert_eq!(
+            provenance_status_at(&tool, &managed, &bin_rel),
+            ProvenanceStatus::MissingRecord
+        );
+    }
+
+    #[test]
+    fn provenance_status_reports_not_installed() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let managed = root.path().join("tool");
+        std::fs::create_dir_all(&managed).unwrap();
+        let tool = ManagedTool::cargo("x", "pkg", "x", "1.2.3");
+        assert_eq!(
+            provenance_status_at(&tool, &managed, Path::new("bin/x")),
+            ProvenanceStatus::NotInstalled
+        );
+    }
+
+    #[test]
+    fn provenance_status_is_not_applicable_for_release_downloads() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let tool = ManagedTool::github(
+            "unreviewed-tool",
+            "example/unreachable",
+            "0.1.0",
+            vec![thegn_core::managed_tool::AssetRule {
+                os: Os::current().unwrap(),
+                arch: Arch::current().unwrap(),
+                asset: "unreviewed-tool.tar.gz".to_string(),
+            }],
+        )
+        .with_layout(root.path().to_path_buf(), "bin/unreviewed-tool", ".version");
+        assert_eq!(
+            provenance_status_at(&tool, root.path(), Path::new("bin/unreviewed-tool")),
+            ProvenanceStatus::NotApplicable
+        );
+    }
+
+    #[test]
+    fn provenance_status_and_install_agree_on_the_source() {
+        let (_root, _managed, tool, _bin_rel) = promoted_provenance_fixture();
+        assert_eq!(provenance_source(&tool), Some(("cargo", "pkg")));
+        let npm = ManagedTool::npm("x", "pkg", "x", "1.2.3");
+        assert_eq!(provenance_source(&npm), Some(("npm", "pkg")));
     }
 
     #[test]

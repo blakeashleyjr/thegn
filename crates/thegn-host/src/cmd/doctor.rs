@@ -4763,9 +4763,30 @@ fn managed_tools_report(cfg: &Config) {
         {
             outln!("             note: {reason}");
         }
+        if matches!(res, Resolution::Managed { .. }) {
+            let status = crate::managed_tool::installed_provenance(&tool);
+            let provenance = match &status {
+                crate::managed_tool::ProvenanceStatus::NotApplicable => {
+                    "n/a (release download)".to_owned()
+                }
+                crate::managed_tool::ProvenanceStatus::NotInstalled => "not installed".to_owned(),
+                crate::managed_tool::ProvenanceStatus::Verified => "verified".to_owned(),
+                crate::managed_tool::ProvenanceStatus::MissingRecord => {
+                    "no install record (the next use reinstalls it through the contained installer)"
+                        .to_owned()
+                }
+                crate::managed_tool::ProvenanceStatus::Mismatch(reason) => format!(
+                    "MISMATCH: {reason} (refused until reinstalled: remove {})",
+                    tool.managed_dir().display()
+                ),
+            };
+            outln!("             provenance: {provenance}");
+        }
     }
 }
 
+/// Every tool has a provenance status; `external` and a null reason mean the
+/// tool resolves through an override or PATH rather than its managed install.
 fn managed_tools_json(cfg: &Config) -> serde_json::Value {
     let tools: Vec<serde_json::Value> = crate::managed_tool::known()
         .into_iter()
@@ -4780,6 +4801,15 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
                 "pinned": tool.version,
                 "current": matches!(res, Resolution::Managed { current: true, .. }),
             });
+            let (provenance, provenance_reason) = match &res {
+                Resolution::Managed { .. } => {
+                    let status = crate::managed_tool::installed_provenance(&tool);
+                    (status.as_str(), status.reason().map(str::to_owned))
+                }
+                _ => ("external", None),
+            };
+            report["provenance"] = serde_json::json!(provenance);
+            report["provenance_reason"] = serde_json::json!(provenance_reason);
             if is_bugstalker {
                 report["platform_supported"] =
                     serde_json::json!(thegn_core::debug::platform_supported());
@@ -5488,6 +5518,34 @@ agent = "unsafe"
         assert_eq!(bs["path"], "/opt/custom/bs");
         // The report runs without panicking too.
         managed_tools_report(&cfg);
+    }
+
+    #[test]
+    fn managed_tools_json_reports_provenance_keys() {
+        let tools = managed_tools_json(&Config::default());
+        let rows = tools.as_array().expect("managed tools array");
+        for tool in rows {
+            let provenance = tool
+                .get("provenance")
+                .and_then(serde_json::Value::as_str)
+                .expect("provenance string");
+            assert!(
+                [
+                    "external",
+                    "not-applicable",
+                    "not-installed",
+                    "verified",
+                    "missing",
+                    "mismatch",
+                ]
+                .contains(&provenance),
+                "unexpected provenance {provenance}"
+            );
+            let reason = tool
+                .get("provenance_reason")
+                .expect("provenance_reason key");
+            assert!(reason.is_null() || reason.is_string());
+        }
     }
 
     #[test]
