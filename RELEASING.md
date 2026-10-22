@@ -79,8 +79,12 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    renders the Homebrew formula, AUR `PKGBUILD`, and nfpm specs from
    `packaging/release.json`. It then adds deterministic
    `thegn_<version>_amd64.deb` and `thegn-<version>-1.x86_64.rpm` assets plus
-   the rendered metadata to the same draft. The `.deb` and `.rpm` are
-   **standalone release assets**; there is no hosted apt or rpm update
+   the rendered metadata to the same draft. Before nfpm runs, the package job
+   stages only the admitted Linux archive members through `release.py stage`,
+   re-checking the archive against the upload broker's trusted digest without
+   system `tar` extraction. It then rehashes the binary and licenses inside
+   both built packages against those staged bytes before upload. The `.deb`
+   and `.rpm` are **standalone release assets**; there is no hosted apt or rpm update
    repository.
 
    windows-msvc is still out: that CI job has never executed. Add a target only

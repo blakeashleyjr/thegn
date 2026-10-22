@@ -20,6 +20,7 @@ import tarfile
 import tempfile
 import tomllib
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
@@ -363,6 +364,308 @@ def require_trusted_digests(
                 f"{name} does not match the producer job's digest: "
                 f"expected {expected}, got {actual}"
             )
+
+
+def _archive_required_files(manifest: Mapping[str, Any], target: str) -> list[str]:
+    project = manifest["project"]
+    target_config = manifest["targets"][target]
+    required = list(manifest["archive"]["root_files"])
+    required[0] = target_config.get("binary", project["binary"])
+    return required
+
+
+def _hash_open_file(handle: Any, path: Path, label: str = "release archive") -> str:
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        handle.seek(0)
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            total += len(block)
+            if total > MAX_ARCHIVE_BYTES:
+                raise ReleaseError(
+                    f"{label} {path} exceeds {MAX_ARCHIVE_BYTES} bytes"
+                )
+            digest.update(block)
+        handle.seek(0)
+    except OSError as error:
+        raise ReleaseError(f"cannot read {label} {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def _hash_payload_file(path: Path) -> str:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(f"payload entry is not a regular file: {path}")
+        if metadata.st_size > MAX_ARCHIVE_BYTES:
+            raise ReleaseError(f"payload file {path} exceeds {MAX_ARCHIVE_BYTES} bytes")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            return _hash_open_file(handle, path, "payload file")
+    except OSError as error:
+        raise ReleaseError(f"cannot read payload file {path}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def stage_archive(
+    manifest: Mapping[str, Any],
+    tag: str,
+    assets_dir: Path,
+    target: str,
+    output_dir: Path,
+    trusted: Mapping[str, str],
+) -> dict[str, str]:
+    target_config = manifest["targets"].get(target)
+    if target_config is None or target_config.get("platform") != "unix":
+        raise ReleaseError(f"archive staging supports unix targets only: {target}")
+    archive_name, _ = _asset_names(manifest, tag, target)
+    archive_path = assets_dir / archive_name
+    require_trusted_digests(assets_dir, [archive_name], trusted)
+    required = _archive_required_files(manifest, target)
+    try:
+        layout_stat = archive_path.lstat()
+    except OSError as error:
+        raise ReleaseError(f"cannot inspect release archive {archive_path}: {error}") from error
+    if not stat.S_ISREG(layout_stat.st_mode):
+        raise ReleaseError(f"release archive is not a regular file: {archive_path}")
+    _validate_archive_layout(archive_path, "unix", required)
+
+    parent = output_dir.parent
+    try:
+        parent_mode = parent.lstat().st_mode
+    except OSError as error:
+        raise ReleaseError(f"cannot inspect staging parent {parent}: {error}") from error
+    if not stat.S_ISDIR(parent_mode):
+        raise ReleaseError(f"staging parent is not a real directory: {parent}")
+    if os.path.lexists(output_dir):
+        raise ReleaseError(f"staging output already exists: {output_dir}")
+
+    temp_path: Path | None = None
+    temp_name: str | None = None
+    parent_fd: int | None = None
+    temp_fd: int | None = None
+    archive_fd: int | None = None
+    try:
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent_stat = os.fstat(parent_fd)
+        current_parent = parent.lstat()
+        if not stat.S_ISDIR(current_parent.st_mode) or (parent_stat.st_dev, parent_stat.st_ino) != (
+            current_parent.st_dev,
+            current_parent.st_ino,
+        ):
+            raise ReleaseError(f"staging parent changed during validation: {parent}")
+        temp_path = Path(tempfile.mkdtemp(prefix=".stage-", dir=parent))
+        temp_name = temp_path.name
+        temp_fd = os.open(temp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        temp_stat = os.fstat(temp_fd)
+        current_parent = parent.lstat()
+        current_temp = temp_path.lstat()
+        if (
+            not stat.S_ISDIR(current_parent.st_mode)
+            or (parent_stat.st_dev, parent_stat.st_ino)
+            != (current_parent.st_dev, current_parent.st_ino)
+            or not stat.S_ISDIR(current_temp.st_mode)
+            or (temp_stat.st_dev, temp_stat.st_ino)
+            != (current_temp.st_dev, current_temp.st_ino)
+        ):
+            raise ReleaseError(f"staging path changed during creation: {temp_path}")
+
+        archive_fd = os.open(archive_path, os.O_RDONLY | os.O_NOFOLLOW)
+        archive_stat = os.fstat(archive_fd)
+        if not stat.S_ISREG(archive_stat.st_mode):
+            raise ReleaseError(f"release archive is not a regular file: {archive_path}")
+        if (layout_stat.st_dev, layout_stat.st_ino) != (archive_stat.st_dev, archive_stat.st_ino):
+            raise ReleaseError(f"release archive changed during layout validation: {archive_path}")
+        with os.fdopen(os.dup(archive_fd), "rb") as archive_file:
+            actual = _hash_open_file(archive_file, archive_path)
+        expected = trusted[archive_name]
+        if actual != expected:
+            raise ReleaseError(
+                f"{archive_name} does not match the producer job's digest: "
+                f"expected {expected}, got {actual}"
+            )
+
+        staged: dict[str, str] = {}
+        with os.fdopen(os.dup(archive_fd), "rb") as archive_file:
+            with tarfile.open(fileobj=archive_file, mode="r:gz") as archive:
+                seen: set[str] = set()
+                for member in archive:
+                    name = member.name.removeprefix("./").rstrip("/")
+                    if not member.isfile() or name not in required:
+                        continue
+                    if name in seen:
+                        raise ReleaseError(
+                            f"archive {archive_path} repeats required member {name!r}"
+                        )
+                    seen.add(name)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ReleaseError(f"cannot read archive member {name!r} from {archive_path}")
+                    output_fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=temp_fd,
+                    )
+                    digest = hashlib.sha256()
+                    copied = 0
+                    try:
+                        with os.fdopen(output_fd, "wb") as destination:
+                            while block := source.read(1024 * 1024):
+                                copied += len(block)
+                                if copied > member.size or copied > MAX_MEMBER_BYTES:
+                                    raise ReleaseError(
+                                        f"archive member {name!r} exceeds its admitted size"
+                                    )
+                                destination.write(block)
+                                digest.update(block)
+                            if copied != member.size:
+                                raise ReleaseError(
+                                    f"archive member {name!r} ended before its admitted size"
+                                )
+                            os.fsync(destination.fileno())
+                            os.fchmod(
+                                destination.fileno(),
+                                0o755 if name == required[0] else 0o644,
+                            )
+                    finally:
+                        source.close()
+                    staged[name] = digest.hexdigest()
+        missing = [name for name in required if name not in staged]
+        if missing:
+            raise ReleaseError(
+                f"archive {archive_path} is missing root file(s): {', '.join(missing)}"
+            )
+        os.fsync(temp_fd)
+        if os.path.lexists(output_dir):
+            raise ReleaseError(f"staging output already exists: {output_dir}")
+        os.rename(temp_name, output_dir.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temp_name = None
+        output_stat = output_dir.lstat()
+        if (temp_stat.st_dev, temp_stat.st_ino) != (output_stat.st_dev, output_stat.st_ino):
+            raise ReleaseError(f"staging output changed during handoff: {output_dir}")
+        os.fsync(parent_fd)
+        return staged
+    except ReleaseError:
+        raise
+    except (OSError, EOFError, tarfile.TarError, zlib.error) as error:
+        raise ReleaseError(f"cannot stage release archive {archive_path}: {error}") from error
+    finally:
+        if archive_fd is not None:
+            os.close(archive_fd)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_name is not None and parent_fd is not None:
+            shutil.rmtree(parent / temp_name, ignore_errors=True)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def verify_package_payload(staged: Mapping[str, str], payload_root: Path, label: str) -> None:
+    expected = {
+        "usr/bin/thegn": ("thegn", "file"),
+        "usr/bin/tg": (None, "alias"),
+        "usr/share/licenses/thegn/LICENSE-MIT": ("LICENSE-MIT", "file"),
+        "usr/share/licenses/thegn/LICENSE-APACHE": ("LICENSE-APACHE", "file"),
+    }
+    for digest_name in ("thegn", "LICENSE-MIT", "LICENSE-APACHE"):
+        digest = staged.get(digest_name)
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ReleaseError(
+                f"staged digest for {digest_name} must be lowercase 64-hex SHA-256"
+            )
+    found: set[str] = set()
+
+    def walk_error(error: OSError) -> None:
+        raise ReleaseError(f"cannot inspect {label} payload {payload_root}: {error}") from error
+
+    try:
+        for root, directories, files in os.walk(
+            payload_root, followlinks=False, onerror=walk_error
+        ):
+            for name in [*directories, *files]:
+                path = Path(root) / name
+                relative = path.relative_to(payload_root).as_posix()
+                metadata = path.lstat()
+                if stat.S_ISDIR(metadata.st_mode):
+                    continue
+                if relative not in expected:
+                    raise ReleaseError(f"{label} payload contains unexpected entry {relative}")
+                wanted_digest, kind = expected[relative]
+                if kind == "alias":
+                    if (
+                        not stat.S_ISLNK(metadata.st_mode)
+                        or os.readlink(path) != "/usr/bin/thegn"
+                    ):
+                        raise ReleaseError(f"{label} payload has invalid entry {relative}")
+                else:
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ReleaseError(f"{label} payload has invalid entry {relative}")
+                    if wanted_digest is None:
+                        raise ReleaseError(f"invalid payload verifier entry {relative}")
+                    actual = _hash_payload_file(path)
+                    if actual != staged[wanted_digest]:
+                        raise ReleaseError(f"{label} payload bytes differ at {relative}")
+                found.add(relative)
+    except OSError as error:
+        raise ReleaseError(f"cannot inspect {label} payload {payload_root}: {error}") from error
+    missing = sorted(set(expected) - found)
+    if missing:
+        raise ReleaseError(f"{label} payload is missing entry {missing[0]}")
+
+
+def load_staged_digests(path: Path) -> dict[str, str]:
+    descriptor: int | None = None
+    try:
+        path_metadata = path.lstat()
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise ReleaseError(f"staged digests are not a regular file: {path}")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ReleaseError(f"cannot inspect staged digests {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ReleaseError(f"staged digests are not a regular file: {path}")
+    if metadata.st_size > MAX_TRUSTED_DIGESTS_BYTES:
+        os.close(descriptor)
+        raise ReleaseError(f"staged digests {path} exceed {MAX_TRUSTED_DIGESTS_BYTES} bytes")
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, digest in pairs:
+            if name in value:
+                raise ReleaseError(f"staged digest for {name} given twice")
+            value[name] = digest
+        return value
+
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_TRUSTED_DIGESTS_BYTES + 1)
+            if len(raw) > MAX_TRUSTED_DIGESTS_BYTES:
+                raise ReleaseError(f"staged digests {path} exceed {MAX_TRUSTED_DIGESTS_BYTES} bytes")
+            value = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=unique_object
+            )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseError(f"cannot read staged digests {path}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    value = _object(value, f"staged digests in {path}")
+    required = {"thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md"}
+    if set(value) != required:
+        raise ReleaseError("staged digests must contain exactly the four archive root files")
+    for name, digest in value.items():
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ReleaseError(f"staged digest for {name} must be lowercase 64-hex SHA-256")
+    return value
 
 
 def verify_downloaded_assets(
@@ -907,6 +1210,55 @@ def _run(args: argparse.Namespace) -> None:
         for name in names:
             print(f"{name}: {_sha256(args.assets_dir / name)}")
         return
+    if args.command == "stage":
+        digest_path = args.digests_out
+        if os.path.lexists(digest_path):
+            raise ReleaseError(f"staged digest output already exists: {digest_path}")
+        output_absolute = Path(os.path.abspath(args.output_dir))
+        digest_absolute = Path(os.path.abspath(digest_path))
+        try:
+            inside = os.path.commonpath((output_absolute, digest_absolute)) == str(output_absolute)
+        except ValueError:
+            inside = False
+        if inside:
+            raise ReleaseError(f"staged digest output must be outside the staging directory: {digest_path}")
+        trusted = load_trusted_digests(args.trusted_digests)
+        staged = stage_archive(
+            manifest, args.tag, args.assets_dir, args.target, args.output_dir, trusted
+        )
+        digest_created = False
+        try:
+            descriptor = os.open(
+                digest_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            digest_created = True
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(staged, handle, sort_keys=True, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except (OSError, ValueError) as error:
+            shutil.rmtree(args.output_dir, ignore_errors=True)
+            cleanup_error: OSError | None = None
+            if digest_created:
+                try:
+                    digest_path.unlink()
+                except OSError as cleanup:
+                    cleanup_error = cleanup
+            message = f"cannot write staged digests {digest_path}: {error}"
+            if cleanup_error is not None:
+                message += f"; cleanup failed: {cleanup_error}"
+            raise ReleaseError(message) from error
+        for name in sorted(staged):
+            print(f"{name}: {staged[name]}")
+        return
+    if args.command == "verify-payload":
+        staged = load_staged_digests(args.staged_digests)
+        verify_package_payload(staged, args.payload_root, args.label)
+        print(f"{args.label} payload matches staged bytes")
+        return
     if args.command == "manifest":
         value = build_release_manifest(
             manifest,
@@ -966,6 +1318,22 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--trusted-digests", required=True, type=Path, action="append")
     verify_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     verify_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
+    stage_parser = subparsers.add_parser("stage")
+    stage_parser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
+    stage_parser.add_argument("--assets-dir", required=True, type=Path)
+    stage_parser.add_argument("--target", required=True)
+    stage_parser.add_argument("--trusted-digests", required=True, type=Path, action="append")
+    stage_parser.add_argument("--output-dir", required=True, type=Path)
+    stage_parser.add_argument("--digests-out", required=True, type=Path)
+    stage_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    stage_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
+    payload_parser = subparsers.add_parser("verify-payload")
+    payload_parser.add_argument("--tag", required=True, help="release tag, exactly v<workspace version>")
+    payload_parser.add_argument("--staged-digests", required=True, type=Path)
+    payload_parser.add_argument("--payload-root", required=True, type=Path)
+    payload_parser.add_argument("--label", required=True, choices=("deb", "rpm"))
+    payload_parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    payload_parser.add_argument("--repo-root", type=Path, default=REPOSITORY_ROOT)
     return parser
 
 
