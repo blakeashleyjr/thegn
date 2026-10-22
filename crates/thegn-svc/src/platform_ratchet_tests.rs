@@ -124,3 +124,18 @@ fn runtime_platform_guard_predicate_tracks_only_direct_probes() {
         assert_eq!(has_runtime_platform_guard(&code), expected, "{source}");
     }
 }
+
+#[test]
+fn thread_names_fit_the_comm_limit_ratchet() {
+    file_ratchet(
+        env!("CARGO_MANIFEST_DIR"),
+        "thread-name-length-svc-ratchet.txt",
+        &[],
+        |key, body| {
+            !thegn_core::test_support::thread_spawn::is_test_module_file(key)
+                && !thegn_core::test_support::thread_spawn::bad_thread_name_literals(body)
+                    .is_empty()
+        },
+        "A thread name literal must start with `thegn-` and be at most 15 bytes (the Linux comm limit; longer names are truncated in /proc and break attribution). Use `thegn_core::thread_name::spawn_named`/`try_spawn_named`; the allowlist is seeded debt (THE-931) and shrink-only.",
+    );
+}
