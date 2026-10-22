@@ -933,6 +933,36 @@ fn enter_background_worker() {
     }
 }
 
+static SEMANTIC_SWEEP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SEMANTIC_SWEEP_PATH: OnceLock<PathBuf> = OnceLock::new();
+static SEMANTIC_SWEEP_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// Opt in long-lived compositor and daemon processes to the semantic-index growth bound.
+/// Short CLI processes must not leave a second SQLite connection open when they exit.
+pub fn enable_semantic_sweep() {
+    SEMANTIC_SWEEP_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    maybe_start_semantic_sweep();
+}
+
+fn semantic_sweep_should_start(enabled: bool, path: Option<&Path>) -> bool {
+    enabled && path.is_some()
+}
+
+fn maybe_start_semantic_sweep() {
+    let enabled = SEMANTIC_SWEEP_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(path) = SEMANTIC_SWEEP_PATH.get()
+        && semantic_sweep_should_start(enabled, Some(path.as_path()))
+    {
+        SEMANTIC_SWEEP_STARTED.call_once(|| {
+            // The bounded, idempotent sweep is intentionally detached.
+            if let Err(error) = spawn_semantic_sweep(path.clone()) {
+                tracing::debug!(%error, "could not start semantic entity prune worker");
+            }
+        });
+    }
+}
+
 /// A no-migration handle for one cataloged operation on an already-existing
 /// schema. The held shared lease prevents an authorized controller from
 /// migrating the file while this operation is using the older shape.
@@ -1288,20 +1318,19 @@ impl Db {
         let _ = crate::fsperm::restrict_to_owner(&path); // best-effort: hardening: a failed chmod must never block DB open
         // The common fast-path init (user_version already current) skips the
         // startup prunes so a plain open takes NO write lock. Run them once
-        // per process here so a long-lived install still gets its growth
-        // bound. (A full init also prunes inline; the overlap on the first
-        // open after a migration is an idempotent no-op.)
+        // per process here. The semantic sweep starts only in processes that
+        // opted in (the compositor and daemon), so a short CLI never leaves a
+        // second SQLite connection open at exit. (A full init also prunes
+        // inline; the overlap on the first open after a migration is an
+        // idempotent no-op.)
         static PRUNE_ONCE: std::sync::Once = std::sync::Once::new();
         if db.schema_mismatch.is_none() {
             PRUNE_ONCE.call_once(|| {
                 db.startup_prune();
-                // Semantic-file checks perform filesystem metadata I/O. Run
-                // the bounded-delete sweep on its own worker so opening the
-                // DB from the event loop never waits for that walk.
-                let sweep_path = path.clone();
-                if let Err(error) = spawn_semantic_sweep(sweep_path) {
-                    tracing::debug!(%error, "could not start semantic entity prune worker");
+                if SEMANTIC_SWEEP_PATH.set(path.clone()).is_err() {
+                    tracing::debug!("semantic sweep database path was already recorded");
                 }
+                maybe_start_semantic_sweep();
             });
         }
         Ok(db)
