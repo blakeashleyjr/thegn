@@ -105,9 +105,10 @@ unstaged-only stash, and undo hold the git lock for their full multi-command
 operation. If restoring the index after an
 unstaged-only stash fails, the error says the temporary `[thegn] temp index`
 commit remains on `HEAD`.
-Thegn records its own resets so undo and redo do not reverse them. If that
-record cannot be read, undo and redo are refused; if recording fails after an
-operation, its result says `undo provenance not recorded`.
+Thegn records the HEAD before each history-rewriting operation so undo and redo
+can distinguish Thegn's resets from yours. If that record cannot be read, undo
+and redo are refused; if recording fails after an operation, its result says
+`undo provenance not recorded`.
 
 ### files
 

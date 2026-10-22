@@ -251,7 +251,8 @@ or the provider returns a partial list containing malformed rows, it emits an
 error object (`error`, and `discarded_rows` for a partial list) and exits 0 so
 scripts can continue to consume the command's graceful-degradation result.
 Only `thegn ci runs --branch <current branch>` refreshes the cached runs shown
-in the CI panel; other branches and the all-branch listing leave that cache alone.
+in the CI panel; other branches and the all-branch listing leave that cache
+alone.
 
 `thegn host discover` is the inbound tailnet path: it lists the machines
 your tailscale client already knows (from `tailscale status --json`) as
