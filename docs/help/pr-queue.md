@@ -112,6 +112,8 @@ once, since plenty of red CI is a flake.
 
 Each PR-agent run holds a durable per-PR lease, so the PR queue and CI autofix cannot run two agents on the same PR at once; each admitted run spends exactly one attempt. A second dispatcher is refused while the lease is live. If thegn exits mid-run, the lease lapses within five minutes and a later pass may dispatch again.
 
+While a PR agent's lease is live, other refresh passes skip that PR entirely: no merge, re-run or status change happens under a running agent.
+
 ## Review comment tasks
 
 An explicitly queued row whose `watch` includes `"review"` gets one durable
