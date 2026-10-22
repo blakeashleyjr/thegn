@@ -12,6 +12,10 @@ One process, one session: each git repo is a **project**, each git
 [[panel|right panel]], the tab bar, the status bar, and the pin strip —
 is rendered in-process.
 
+This is a public alpha. Linux on x86_64 is the supported platform; macOS is
+best-effort, and Windows is not supported yet. Install from the GitHub release
+archive or the Nix flake (the README's Install section has both).
+
 In the `F1` overlay, press `/` to search every page; `Tab` switches between
 the contents list and the page; `↵` follows a link; `[` goes back. The
 docked panel tab scrolls its help body. Press `F1` anywhere to open this help at
