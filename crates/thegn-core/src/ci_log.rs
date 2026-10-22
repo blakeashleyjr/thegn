@@ -660,7 +660,7 @@ mod tests {
 
         let (window, truncated) = bounded_window(&text, 10, 9);
 
-        assert_eq!(window, &anchor[..7]);
+        assert_eq!(window, &anchor[..9]);
         assert!(truncated);
     }
 
