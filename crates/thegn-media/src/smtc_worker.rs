@@ -152,13 +152,22 @@ mod tests {
         });
         assert!(first.is_ok());
         started_rx.recv().unwrap();
-        let result = worker.run(Duration::from_millis(50), || Ok(())).await;
+        let timed_out_ran = Arc::new(AtomicBool::new(false));
+        let timed_out_job_ran = Arc::clone(&timed_out_ran);
+        let result = worker
+            .run(Duration::from_millis(50), move || {
+                timed_out_job_ran.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
         assert!(
             matches!(result, Err(MediaError::Backend(message)) if message.contains("timed out"))
         );
         let further = worker.submit(|| Ok(()));
         assert!(matches!(further, Err(MediaError::Backend(message)) if message.contains("busy")));
         gate_tx.send(()).unwrap();
+        worker.run(Duration::from_secs(2), || Ok(())).await.unwrap();
+        assert!(!timed_out_ran.load(Ordering::SeqCst));
         worker.stop_and_join().unwrap();
     }
 
@@ -195,6 +204,10 @@ mod tests {
     )]
     async fn panicking_op_reports_an_error_and_the_worker_survives() {
         let worker = spawn("thegn-smtc-test", 2).unwrap();
+        let before_panic_id = worker
+            .run(Duration::from_secs(2), || Ok(std::thread::current().id()))
+            .await
+            .unwrap();
         let failed = worker
             .run(Duration::from_secs(2), || -> Result<(), MediaError> {
                 panic!("operation panic")
@@ -211,6 +224,7 @@ mod tests {
             .run(Duration::from_secs(2), || Ok(std::thread::current().id()))
             .await
             .unwrap();
+        assert_eq!(before_panic_id, first_id);
         assert_eq!(first_id, second_id);
         worker.stop_and_join().unwrap();
     }
