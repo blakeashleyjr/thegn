@@ -42,7 +42,9 @@ is not shown in rail mode. The bottom-bar summary is opt-in: set
   A row for a worktree thegn has not registered is claimed only when
   `git worktree list` attributes it to this repository on the queued
   branch; otherwise it is skipped with a warning.
-- `thegn merge list` shows the drain holding each row (its owner, claim phase and lease), and `--json` adds a `claim` object (`null` when unclaimed); the claim token is never shown.
+- `thegn merge list` shows the drain holding each row (its owner, claim
+  phase and lease), and `--json` adds a `claim` object (`null` when
+  unclaimed); the claim token is never shown.
 - `thegn integrate` does the same from any shell. It prints the branches
   it is about to fold and asks before folding any of them; `--dry-run`
   prints that plan and stops, and `--yes` skips the prompt (required to
