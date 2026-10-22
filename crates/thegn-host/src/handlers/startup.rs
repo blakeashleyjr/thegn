@@ -75,9 +75,9 @@ pub(crate) fn daemon_socket_usable(cfg: &thegn_core::config::Config) -> bool {
 /// costs only detach/reattach persistence, so decide it here, once, alongside
 /// the other opt-outs.
 ///
-/// Cheap enough for the per-pane callers: one env read and two path joins, no
-/// I/O — and deliberately NOT cached, so a live `[daemon] socket` edit is
-/// re-evaluated on reload.
+/// Cheap enough for the per-pane callers: one env read, path joins and (for the
+/// private-tmp fallback) small locator and metadata reads. Deliberately NOT
+/// cached, so a live `[daemon] socket` edit is re-evaluated on reload.
 fn socket_path_fits(cfg: &thegn_core::config::Config) -> bool {
     use thegn_core::config_daemon::{check_socket_path_len, max_socket_path_len};
 
