@@ -10621,7 +10621,7 @@ async fn event_loop<T: Terminal>(
                                         key.clone(),
                                         run_palette_db::PaletteRows::PickerSeed(
                                             Vec::new(),
-                                            std::collections::HashSet::new(),
+                                            crate::workspace_picker::PickerExclusions::default(),
                                         ),
                                     );
                                     let run_palette_db::PaletteRows::PickerSeed(seed, excluded) =
@@ -26737,7 +26737,7 @@ async fn event_loop<T: Terminal>(
                                     key.clone(),
                                     run_palette_db::PaletteRows::PickerSeed(
                                         Vec::new(),
-                                        std::collections::HashSet::new(),
+                                        crate::workspace_picker::PickerExclusions::default(),
                                     ),
                                 );
                                 let run_palette_db::PaletteRows::PickerSeed(seed, excluded) = rows
@@ -26822,7 +26822,7 @@ async fn event_loop<T: Terminal>(
                                     key.clone(),
                                     run_palette_db::PaletteRows::PickerSeed(
                                         Vec::new(),
-                                        std::collections::HashSet::new(),
+                                        crate::workspace_picker::PickerExclusions::default(),
                                     ),
                                 );
                                 let run_palette_db::PaletteRows::PickerSeed(seed, excluded) = rows
