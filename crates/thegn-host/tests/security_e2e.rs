@@ -162,17 +162,11 @@ fn run_bounded(
     wait_bounded(child, program, &stdout, &stderr, timeout)
 }
 
-fn print_skip() {
-    writeln!(
-        std::io::stderr().lock(),
-        "security_e2e: skipped; set THEGN_REQUIRE_SECURITY_TESTS=1 or run `just security-e2e`"
-    )
-    .expect("write security-e2e skip message");
-}
-
 fn required_prerequisites() -> bool {
-    if std::env::var("THEGN_REQUIRE_SECURITY_TESTS").as_deref() != Ok("1") {
-        print_skip();
+    if !thegn_core::testenv::require_or_skip(
+        "THEGN_REQUIRE_SECURITY_TESTS=1",
+        std::env::var("THEGN_REQUIRE_SECURITY_TESTS").as_deref() == Ok("1"),
+    ) {
         return false;
     }
     if !cfg!(target_os = "linux") {
@@ -185,7 +179,10 @@ fn required_prerequisites() -> bool {
         .map(|dir| dir.join("bwrap"))
         .find(|candidate| candidate.is_file())
     else {
-        panic!("security-e2e requires bwrap on PATH");
+        if !thegn_core::testenv::require_or_skip("bwrap on PATH", false) {
+            return false;
+        }
+        unreachable!("required_or_skip must reject unavailable bwrap");
     };
     let probe_dir = tempfile::tempdir().expect("private bwrap probe directory");
     let probe = run_bounded(
@@ -194,11 +191,38 @@ fn required_prerequisites() -> bool {
         "userns-probe",
         PROCESS_TIMEOUT,
     );
-    assert!(
-        probe.status.success(),
-        "security-e2e requires working bwrap user namespaces; stderr: {}",
-        String::from_utf8_lossy(&probe.stderr)
+    if !probe.status.success()
+        && !thegn_core::testenv::require_or_skip("working bwrap user namespaces", false)
+    {
+        return false;
+    }
+    let config = thegn_core::config::SandboxConfig {
+        enabled: true,
+        backend: SandboxBackend::Bwrap,
+        backend_chain: vec!["bwrap".into()],
+        profile: SandboxProfile::Hardened,
+        ..Default::default()
+    };
+    let location = GitLoc::from_db(
+        probe_dir
+            .path()
+            .to_str()
+            .expect("bwrap probe path is UTF-8"),
+        None,
     );
+    let resolves_bwrap = sandbox::resolve_placed_exact(
+        &config,
+        &location,
+        "security-e2e-prerequisite",
+        SandboxProfile::Hardened,
+        Placement::Local,
+    )
+    .is_some_and(|spec| spec.backend == Backend::Bwrap);
+    if !resolves_bwrap
+        && !thegn_core::testenv::require_or_skip("bwrap hardened pane backend resolution", false)
+    {
+        return false;
+    }
     true
 }
 
@@ -456,10 +480,15 @@ fn security_e2e_hardened_pane_cannot_stop_daemon() {
     }
     let fixture = Fixture::new();
     let (config_home, _) = fixture.probe_config();
-    let inner = format!(
-        "XDG_CONFIG_HOME={} ./thegn daemon stop",
-        shell_quote(config_home.to_str().expect("config home path is UTF-8"))
+    let home = shell_quote(
+        fixture
+            .worktree
+            .path()
+            .to_str()
+            .expect("worktree path is UTF-8"),
     );
+    let config_home_env = shell_quote(config_home.to_str().expect("config home path is UTF-8"));
+    let inner = format!("env HOME={home} XDG_CONFIG_HOME={config_home_env} ./thegn daemon stop");
     let host = fixture.host_sessions_with_config("host-stop-control", &config_home);
     fixture.assert_no_sessions(&host);
     let version = fixture.run_pane("version-control", "./thegn --version");
@@ -519,9 +548,16 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
         String::from_utf8_lossy(&version.stdout),
         String::from_utf8_lossy(&version.stderr)
     );
+    let home = shell_quote(
+        fixture
+            .worktree
+            .path()
+            .to_str()
+            .expect("worktree path is UTF-8"),
+    );
+    let config_home_env = shell_quote(config_home.to_str().expect("config home path is UTF-8"));
     let inner = format!(
-        "XDG_CONFIG_HOME={} ./thegn session open --agent probe --worktree . --prompt x",
-        shell_quote(config_home.to_str().expect("config home path is UTF-8"))
+        "env HOME={home} XDG_CONFIG_HOME={config_home_env} ./thegn session open --agent probe --worktree . --prompt x"
     );
     let probe = fixture.run_pane("open-probe", &inner);
     assert!(
