@@ -1701,6 +1701,16 @@ SQL
   dry_stale_target_after="$(find "$DRY_STALE_TARGET_ROOT" -mindepth 1 -print | sort)"
   dry_stale_source_after="$(sqlite3 "$DRY_STALE_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$DRY_STALE_WT';")"
   dry_stale_db_after="$(sha256sum "$DRY_STALE_TARGET_DB")"
+  if [[ $dry_stale_human_rc -ne 0 || $dry_stale_json_rc -ne 0 || $dry_stale_db_before != "$dry_stale_db_after" ]]; then
+    printf 'session move stale dry-run diagnostics: human rc=%s, json rc=%s\n' \
+      "$dry_stale_human_rc" "$dry_stale_json_rc" >&2
+    printf 'human output (first 5 lines):\n' >&2
+    head -5 <<<"$dry_stale_human" >&2
+    printf 'json output (first 5 lines):\n' >&2
+    head -5 <<<"$dry_stale_json" >&2
+    printf 'target state directory:\n' >&2
+    ls -la "$DRY_STALE_TARGET_ROOT/state/thegn" >&2
+  fi
   check "session move dry-run leaves a stale target DB unchanged" \
     "[[ $dry_stale_human_rc -eq 0 && $dry_stale_json_rc -eq 0 ]] && [[ \"$dry_stale_source_before\" == \"$dry_stale_source_after\" ]] && [[ \"$dry_stale_target_before\" == \"$dry_stale_target_after\" ]] && [[ \"$dry_stale_db_before\" == \"$dry_stale_db_after\" ]]"
   check "session move stale dry-run outputs remain redacted" \

@@ -145,6 +145,9 @@ second listing must show no survivors before either database is written.
 `--dry-run` performs no kill and no database write, and `--json` emits a
 redacted audit containing the selected group names, row counts, liveness,
 commit/confirmation/deletion state, resume state, and notification status.
+It reads changes still held in a profile database's write-ahead log without
+writing the database, and refuses with the database path when that log has no
+shared-memory index.
 After confirmed cleanup, notification through a reachable daemon registered
 in the target database is best effort; failure is reported as a warning.
 
