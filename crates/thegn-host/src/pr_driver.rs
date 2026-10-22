@@ -33,6 +33,8 @@ use thegn_core::store::{CacheStore, WorktreeAuxStore};
 pub(crate) struct PrItem {
     pub key: String,
     pub number: u64,
+    /// The queue status word the row had when this pass loaded it.
+    pub status: String,
     pub branch: String,
     pub worktree: Option<String>,
     pub agent_attempts: u32,
@@ -47,6 +49,7 @@ impl From<&PrQueueRow> for PrItem {
         PrItem {
             key: r.key.clone(),
             number: r.number,
+            status: r.status.clone(),
             branch: r.branch.clone(),
             worktree: r.worktree.clone(),
             agent_attempts: r.agent_attempts,
@@ -71,7 +74,8 @@ pub(crate) struct PrStep<'a> {
 /// Summary of one pass over the queue.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PrOutcome {
-    /// Direct merges confirmed by the forge during this pass.
+    /// Merges confirmed by the forge during this pass, including a merge thegn
+    /// requested earlier and a later poll confirmed at the requested head.
     pub merged: Vec<u64>,
     /// Auto-merge was enabled; the forge may merge these after its own rules pass.
     pub auto_merge_armed: Vec<u64>,
@@ -93,6 +97,13 @@ pub(crate) struct PrOutcome {
     /// only after the roster upsert succeeds; a future automation consumer can
     /// observe the same deduped event without starting a second agent here.
     pub review_events: Vec<(ReviewTaskEvent, bool)>,
+}
+
+fn later_poll_confirms_requested_merge(item: &PrItem, state: &str, head: &str) -> bool {
+    state.eq_ignore_ascii_case("MERGED")
+        && item.status == PrqStatus::Merging.as_str()
+        && !head.is_empty()
+        && item.last_head_oid.as_deref() == Some(head)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,21 +389,40 @@ pub(crate) fn drive_queue(
 
         match action {
             QueueAction::Drop => {
+                let confirmed_later =
+                    later_poll_confirms_requested_merge(&item, &fetched.pr.state, &head);
                 let status = if fetched.pr.state.eq_ignore_ascii_case("MERGED") {
                     PrqStatus::Merged
                 } else {
                     PrqStatus::Closed
+                };
+                let persisted_detail = if confirmed_later {
+                    "merged (confirmed on a later poll)".to_owned()
+                } else {
+                    format!("{} on the forge", status.as_str())
                 };
                 // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     status.as_str(),
                     Some(blocker.as_str()),
-                    Some(&format!("{} on the forge", status.as_str())),
+                    Some(&persisted_detail),
                     Some(&head),
                 );
-                step(status.as_str(), "", &mut progress);
-                out.dropped.push(item.number);
+                step(
+                    status.as_str(),
+                    if confirmed_later {
+                        &persisted_detail
+                    } else {
+                        ""
+                    },
+                    &mut progress,
+                );
+                if confirmed_later {
+                    out.merged.push(item.number);
+                } else {
+                    out.dropped.push(item.number);
+                }
             }
 
             QueueAction::Wait => {
@@ -1590,6 +1620,7 @@ mod tests {
         PrItem {
             key: "/repo#7".into(),
             number: 7,
+            status: "ready".into(),
             branch: "feat".into(),
             worktree: Some("/w/feat".into()),
             agent_attempts: 0,
@@ -3280,8 +3311,156 @@ mod tests {
             vec![PrItem::from(&db.list_pr_queue().unwrap()[0])],
             |_| {},
         );
+        assert_eq!(second.merged, vec![7]);
+        assert!(second.dropped.is_empty());
+        let confirmed = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(confirmed.status, "merged");
+        assert_eq!(
+            confirmed.detail.as_deref(),
+            Some("merged (confirmed on a later poll)")
+        );
+    }
+
+    #[test]
+    fn later_poll_confirms_requested_merge_predicate() {
+        let mut merging = item();
+        merging.status = "merging".into();
+        assert!(later_poll_confirms_requested_merge(
+            &merging, "MERGED", "abc"
+        ));
+
+        let mut ready = merging.clone();
+        ready.status = "ready".into();
+        assert!(!later_poll_confirms_requested_merge(
+            &ready, "MERGED", "abc"
+        ));
+        assert!(!later_poll_confirms_requested_merge(
+            &merging, "CLOSED", "abc"
+        ));
+        assert!(!later_poll_confirms_requested_merge(
+            &merging, "MERGED", "def"
+        ));
+        assert!(!later_poll_confirms_requested_merge(&merging, "MERGED", ""));
+    }
+
+    #[test]
+    fn offline_merge_error_then_merged_poll_counts_merged() {
+        let (dir, db) = temp_db("prq-offline-later-confirmation");
+        let row = enqueue_merge_test_row(&dir, &db);
+        let forge = FakeForge::new(Some(green_pr())).with_merge_error(ForgeError::Offline);
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let first = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(first.merge_requested, vec![7]);
+
+        forge.pr.lock().unwrap().as_mut().unwrap().state = "MERGED".into();
+        let second = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&db.list_pr_queue().unwrap()[0])],
+            |_| {},
+        );
+        assert_eq!(second.merged, vec![7]);
+        assert!(second.dropped.is_empty());
+    }
+
+    // Positive control: a merge at a different head is still reported as having left the queue.
+    #[test]
+    fn merged_at_another_head_after_request_is_dropped_not_merged() {
+        let (dir, db) = temp_db("prq-other-head-merged");
+        let row = enqueue_merge_test_row(&dir, &db);
+        let forge = FakeForge::new(Some(green_pr())).without_direct_confirmation();
+        let mut config = cfg();
+        config.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let first = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(first.merge_requested, vec![7]);
+        {
+            let mut pr = forge.pr.lock().unwrap();
+            let pr = pr.as_mut().unwrap();
+            pr.head_ref_oid = "def".into();
+            pr.state = "MERGED".into();
+        }
+        let second = drive_queue(
+            &config,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&db.list_pr_queue().unwrap()[0])],
+            |_| {},
+        );
         assert_eq!(second.dropped, vec![7]);
         assert!(second.merged.is_empty());
+    }
+
+    // Positive control: an externally merged ready row is not attributed to thegn.
+    #[test]
+    fn externally_merged_ready_row_is_dropped_not_merged() {
+        let (dir, db) = temp_db("prq-external-ready-merged");
+        let row = enqueue_merge_test_row(&dir, &db);
+        let forge = FakeForge::new(Some(green_pr()));
+        forge.pr.lock().unwrap().as_mut().unwrap().state = "MERGED".into();
+        let outcome = drive_queue(
+            &cfg(),
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(outcome.dropped, vec![7]);
+        assert!(outcome.merged.is_empty());
+    }
+
+    // Positive control: an armed auto-merge that is later closed remains a drop.
+    #[test]
+    fn armed_auto_merge_then_closed_pr_is_dropped_never_merged() {
+        let (dir, db) = temp_db("prq-auto-merge-closed");
+        let row = enqueue_merge_test_row(&dir, &db);
+        let forge = FakeForge::new(Some(green_pr()));
+        let first = drive_queue(
+            &cfg(),
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+        assert_eq!(first.auto_merge_armed, vec![7]);
+        forge.pr.lock().unwrap().as_mut().unwrap().state = "CLOSED".into();
+        let second = drive_queue(
+            &cfg(),
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![PrItem::from(&db.list_pr_queue().unwrap()[0])],
+            |_| {},
+        );
+        assert_eq!(second.dropped, vec![7]);
+        assert!(second.merged.is_empty());
+        assert_eq!(db.list_pr_queue().unwrap()[0].status, "closed");
     }
 
     #[expect(

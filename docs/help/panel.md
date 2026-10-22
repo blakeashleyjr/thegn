@@ -262,7 +262,8 @@ there is one. At Half and Full width, the detail follows the highlighted run.
 
 `v` (or Enter) opens the run's detail popup. The **f** action is available
 inside that popup, not as a panel key. The drill reads bounded, redacted
-job-log tails from the CI cache first and labels their source, age, truncation,
+job-log windows (newest lines, or a window around the first failure) from the CI
+cache first and labels their source, age, truncation,
 and redaction state while a missing or stale entry is fetched off-loop. In
 `suggest` mode, the same **f** action is available from the actionable
 notification when its evidence-ready message appears. The cache policy is controlled by
@@ -276,8 +277,16 @@ and canceled jobs together, while **R** is refused because GitLab has no full re
 
 The daemon serves a cached CI run list only while it is younger than
 `[ci] ttl_secs` and recorded for the worktree's current branch; otherwise it
-asks the provider. Cached job-log tails written under an older redaction policy
-are redacted and bounded again when read.
+asks the provider. Cached job logs written under an older redaction policy are
+redacted and bounded into a window again when read.
+
+Cached run lists are shown when their recorded provider context matches the
+worktree's current context. A different or unknown cached context shows
+"refresh pending (g)" until refresh; when local origin context is unavailable,
+including for remote worktrees, the cached display is kept. CI autofix gives
+the PR-queue agent a redacted log excerpt starting 20 lines before the first
+recognised failure, or the newest lines if none is found; omitted lines are
+marked.
 
 ### merge — the local merge queue
 
@@ -309,6 +318,12 @@ handoff for a selected queued PR.
 Issues from the configured `[issues]` providers for this repo. Before the
 first load, the list says "loading…"; a failed read names the error instead
 of appearing empty. A Busy tracker refresh is retried.
+
+When issue numbers are shared across tracker accounts, each row shows its
+account in parentheses, including in My Work and the palette. If a tracker
+listing stops early, an amber `partial results: <accounts> — ...` line names
+the accounts and says whether the last complete list, partial list or cached
+rows are shown.
 
 {{keys:issues}}
 

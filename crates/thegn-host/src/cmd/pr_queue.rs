@@ -182,9 +182,7 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
     }
 
     let wt_main = integrate::main_checkout(&wt_path);
-    let wt_branch = loc
-        .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .filter(|branch| !branch.is_empty());
+    let wt_branch = worktree_branch(&loc)?;
     let bound_worktree = bind_checkout(
         &root,
         &wt_path,
@@ -220,6 +218,17 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn worktree_branch(loc: &thegn_core::remote::GitLoc) -> Result<Option<String>> {
+    match loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(branch) if branch.is_empty() => Ok(None),
+        Ok(branch) => Ok(Some(branch)),
+        Err(error) => anyhow::bail!(
+            "could not read the branch of worktree {}: {error}",
+            loc.path()
+        ),
+    }
 }
 
 fn bind_checkout(
@@ -308,13 +317,16 @@ fn rebind(number: u64, worktree: Option<String>, no_worktree: bool) -> Result<()
         .pr_status(&loc, thegn_core::forge::PrRef::Number(number))
         .map_err(|error| anyhow::anyhow!("could not resolve PR #{number}: {}", error.describe()))?;
     let wt_main = wt_path.as_deref().and_then(integrate::main_checkout);
-    let wt_branch = wt_path.as_deref().and_then(|path| {
-        thegn_core::remote::GitLoc::from_db(&path.to_string_lossy(), None).git_out(&[
-            "rev-parse",
-            "--abbrev-ref",
-            "HEAD",
-        ])
-    });
+    let wt_branch = wt_path
+        .as_deref()
+        .map(|path| {
+            worktree_branch(&thegn_core::remote::GitLoc::from_db(
+                &path.to_string_lossy(),
+                None,
+            ))
+        })
+        .transpose()?
+        .flatten();
     let binding_worktree = if let Some(path) = &wt_path {
         bind_checkout(
             &root,
@@ -691,6 +703,62 @@ mod bind_checkout_tests {
             .as_deref(),
             Some(wt.as_path()),
             "equivalent repository path spellings must remain bound"
+        );
+    }
+}
+
+#[cfg(test)]
+mod typed_branch_tests {
+    use super::worktree_branch;
+    use std::path::Path;
+    use thegn_core::remote::GitLoc;
+
+    #[test]
+    fn worktree_branch_failure_is_an_error_not_unknown() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let result = worktree_branch(&GitLoc::Local(dir.path().to_path_buf()));
+        assert!(
+            matches!(&result, Err(error) if error.to_string().contains("could not read the branch")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn worktree_branch_reads_the_branch() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        git(dir.path(), &["init", "-q", "-b", "feat"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        );
+        assert_eq!(
+            worktree_branch(&GitLoc::Local(dir.path().to_path_buf())).unwrap(),
+            Some("feat".into())
+        );
+    }
+
+    #[allow(clippy::disallowed_methods, reason = "test fixture git")]
+    fn git(path: &Path, args: &[&str]) {
+        let status = thegn_core::util::git_cmd(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "git {args:?} failed in {}",
+            path.display()
         );
     }
 }

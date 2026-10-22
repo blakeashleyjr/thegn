@@ -1364,15 +1364,39 @@ pub(super) async fn issue_comment(
 
 // ── agent orchestration: dispatch roster (THE-57) ────────────────────────────
 
+/// Query params for `dispatches.list`: `limit` rows per page (default 2048,
+/// 1..=4096) and `before`, the last row id of the previous page.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DispatchesQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    before: Option<i64>,
+}
+
 pub(super) async fn dispatches_list(
     State(state): State<ControlState>,
     headers: HeaderMap,
+    Query(q): Query<DispatchesQuery>,
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::DispatchesList) {
         return r;
     }
-    match state.api.dispatches_list().await {
-        Ok(rows) => axum::Json(json!({ "dispatches": rows })).into_response(),
+    let limit = q.limit.unwrap_or(thegn_core::db::Db::ROSTER_HISTORY_LIMIT);
+    if limit == 0 || limit > thegn_core::db::Db::ROSTER_ACTIVE_LIMIT {
+        return ControlError::InvalidArgument(format!(
+            "limit must be between 1 and {}",
+            thegn_core::db::Db::ROSTER_ACTIVE_LIMIT
+        ))
+        .into_response();
+    }
+    match state.api.dispatches_list(q.before, limit).await {
+        Ok(page) => axum::Json(json!({
+            "dispatches": page.dispatches,
+            "truncated": page.truncated,
+            "next_before": page.next_before
+        }))
+        .into_response(),
         Err(e) => e.into_response(),
     }
 }

@@ -233,16 +233,17 @@ secrets, or CI logs. With autopilot disabled it reports the disabled state and
 an empty/bounded journal view. (`notify list --json`
 is NDJSON and `doctor --json` is a single object — both historical.)
 
-`thegn ci logs <run-id> <job-id> --worktree <path>` prints the bounded,
-redacted cached job-log tail. It reads the cache first and uses the daemon's
-blocking provider lane for a miss; `ci log` remains a compatibility alias.
+`thegn ci logs <run-id> <job-id> --worktree <path>` prints a redacted,
+bounded window of the cached job log (newest lines, or a window around the
+first failure). It reads the cache first and uses the daemon's blocking provider
+lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
 `ci logs` reuses a cached log only when it has a recorded head commit; a log
 with an unknown head is printed but not cached. The CI panel's failed-job log
-tails and background log ingestion apply a stricter check: they reuse a cached
-tail only for the run's current head and only if the job has not finished again
-since the tail was fetched.
+windows and background log ingestion apply a stricter check: they reuse a
+cached window only for the run's current head and only if the job has not
+finished again since the log was fetched.
 
 When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
@@ -250,6 +251,10 @@ details are not used to ingest job logs, so their logs are not cached and CI
 autofix does not start from them. `thegn ci trigger -i KEY=VALUE` inputs are
 validated before any provider request; malformed or duplicate keys, control
 characters, and oversized keys or values are refused.
+
+On Unix, Ctrl-C or SIGTERM during `thegn ci rerun`, `ci trigger` or `ci cancel`
+stops the provider command and exits non-zero; the action may or may not have
+reached the provider. Check with `thegn ci runs`.
 
 `thegn ci runs --json` emits a JSON array on success. If provider fetching fails,
 or the provider returns a partial list containing malformed rows, it emits an
@@ -295,6 +300,17 @@ writable; network access remains available. If bubblewrap with
 user namespaces is unusable, or on a non-Linux platform, installation is
 refused unless `--unsafe-host-install` is given at an interactive terminal;
 that runs the installer uncontained and prints a warning.
+
+Before replacing an install, the staged binary must resolve to a regular file
+inside staging or installation is refused and the previous install is kept. An
+owner-only `.thegn-provenance.json`, installed beside the tool, records the
+package and version, binary and available lock-file SHA-256s, and the
+containment used.
+
+`thegn supervise plan --all` and `thegn supervise status --all` read one
+newest-first roster page. `--limit` defaults to 2048 and is capped at 4096;
+`--before <row>` continues before a row id. Both options require `--all`, and
+a truncated page prints its next cursor on stderr.
 
 Exit codes:
 

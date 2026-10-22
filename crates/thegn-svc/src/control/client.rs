@@ -27,7 +27,8 @@ use thegn_core::store::{ControlStore, DaemonRow};
 
 use super::ControlErrorCode;
 use super::{
-    CiLogsReply, CiRunsReply, EditorOpenRequest, ForkSpec, OpenSpec, RecordStatus, SessionInfo,
+    CiLogsReply, CiRunsReply, DispatchPage, EditorOpenRequest, ForkSpec, OpenSpec, RecordStatus,
+    SessionInfo,
 };
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
@@ -1161,12 +1162,31 @@ impl ControlClient {
             .map(|_| ())
     }
 
-    /// `GET /v1/dispatches` — the durable dispatch roster.
-    pub async fn dispatches_list(&self) -> Result<Vec<thegn_core::issue::AgentDispatch>> {
-        let v = self.request("GET", "/v1/dispatches", None).await?;
-        Ok(serde_json::from_value(
-            required_array(&v, "dispatches")?.clone(),
-        )?)
+    /// `GET /v1/dispatches` — one page of the durable dispatch roster.
+    pub async fn dispatches_list(
+        &self,
+        limit: Option<usize>,
+        before: Option<i64>,
+    ) -> Result<DispatchPage> {
+        let path = Self::dispatches_path(limit, before);
+        let v = self.request("GET", &path, None).await?;
+        required_array(&v, "dispatches")?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn dispatches_path(limit: Option<usize>, before: Option<i64>) -> String {
+        let mut path = String::from("/v1/dispatches");
+        let mut separator = '?';
+        if let Some(limit) = limit {
+            path.push(separator);
+            path.push_str(&format!("limit={limit}"));
+            separator = '&';
+        }
+        if let Some(before) = before {
+            path.push(separator);
+            path.push_str(&format!("before={before}"));
+        }
+        path
     }
 
     /// `POST /v1/dispatches` — record a new dispatch.
@@ -2873,6 +2893,32 @@ mod tests {
         assert_eq!(with_repo_query("/v1/issues".into(), None), "/v1/issues");
     }
 
+    #[test]
+    fn dispatches_path_carries_limit_and_before() {
+        assert_eq!(ControlClient::dispatches_path(None, None), "/v1/dispatches");
+        assert_eq!(
+            ControlClient::dispatches_path(Some(5), None),
+            "/v1/dispatches?limit=5"
+        );
+        assert_eq!(
+            ControlClient::dispatches_path(Some(5), Some(7)),
+            "/v1/dispatches?limit=5&before=7"
+        );
+        assert_eq!(
+            ControlClient::dispatches_path(None, Some(7)),
+            "/v1/dispatches?before=7"
+        );
+    }
+
+    #[test]
+    fn dispatch_page_without_metadata_parses_as_untruncated() {
+        assert_eq!(
+            serde_json::from_value::<super::super::DispatchPage>(json!({"dispatches": []}))
+                .unwrap(),
+            super::super::DispatchPage::default()
+        );
+    }
+
     async fn one_response_client(
         origin: bool,
         content_type: Option<&str>,
@@ -2931,7 +2977,10 @@ mod tests {
                 .issues_list(&[], 0, None)
                 .await
                 .map(|_| Value::Bool(true)),
-            "/v1/dispatches" => client.dispatches_list().await.map(|_| Value::Bool(true)),
+            "/v1/dispatches" => client
+                .dispatches_list(None, None)
+                .await
+                .map(|_| Value::Bool(true)),
             path if path.ends_with("/snapshot") => {
                 client.snapshot("s1").await.map(|_| Value::Bool(true))
             }

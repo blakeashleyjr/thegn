@@ -890,10 +890,11 @@ class WorkflowPolicyTests(unittest.TestCase):
             for expected in (
                 'thegn-$TAG-manifest.json',
                 "gh attestation verify",
-                "sha256sum",
-                "'.tag'",
+                "packaging/release.py verify-assets",
+                '--release-manifest "$manifest"',
             ):
                 self.assertIn(expected, step["run"])
+            self.assertNotIn("jq -r", step["run"])
         self.assertEqual({"contents": "read"}, jobs["aur-srcinfo"]["permissions"])
 
     def test_publisher_manifest_check_rehearsal(self) -> None:
@@ -922,8 +923,19 @@ class WorkflowPolicyTests(unittest.TestCase):
                 asset_bytes = f"fixture for {asset_name}\n".encode()
                 (fixtures / asset_name).write_bytes(asset_bytes)
                 manifest = {
+                    "schema_version": 1,
                     "tag": "v1.2.3",
-                    "assets": [{"name": asset_name, "sha256": hashlib.sha256(asset_bytes).hexdigest()}],
+                    "commit": "fixture-commit",
+                    "tag_object": "fixture-tag-object",
+                    "workflow_sha": "fixture-workflow-sha",
+                    "run_id": "fixture-run-id",
+                    "assets": [
+                        {
+                            "name": asset_name,
+                            "sha256": hashlib.sha256(asset_bytes).hexdigest(),
+                            "size": len(asset_bytes),
+                        }
+                    ],
                 }
                 manifest_path = fixtures / manifest_name
                 manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -967,7 +979,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     (root / "github-env").write_text("", encoding="utf-8")
                     env["GH_FAIL_ATTESTATION"] = "1" if fail_attestation else "0"
                     return subprocess.run(
-                        ["bash", "-c", script], env=env, check=False, capture_output=True, text=True
+                        ["bash", "-c", script], cwd=ROOT, env=env, check=False, capture_output=True, text=True
                     )
 
                 result = run_case()
@@ -990,13 +1002,44 @@ class WorkflowPolicyTests(unittest.TestCase):
                 manifest_path.write_text(json.dumps(wrong_tag), encoding="utf-8")
                 result = run_case()
                 self.assertNotEqual(0, result.returncode)
-                self.assertIn("release manifest tag does not match", result.stdout)
+                self.assertIn("does not match requested tag", result.stderr)
 
                 manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
                 (fixtures / asset_name).write_bytes(b"different asset bytes\n")
                 result = run_case()
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn(f"{asset_name} does not match the release manifest", result.stdout)
+
+                (fixtures / asset_name).write_bytes(asset_bytes)
+                other_asset = {
+                    "name": "thegn-v1.2.3-linux-x86_64.tar.gz",
+                    "sha256": hashlib.sha256(b"another release asset").hexdigest(),
+                    "size": len(b"another release asset"),
+                }
+                duplicate_asset_manifest = dict(
+                    manifest,
+                    assets=[manifest["assets"][0], other_asset, other_asset],
+                )
+                manifest_path.write_text(json.dumps(duplicate_asset_manifest), encoding="utf-8")
+                result = run_case()
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("duplicate asset name", result.stderr)
+
+                duplicate_published_asset_manifest = dict(
+                    manifest,
+                    assets=[manifest["assets"][0], manifest["assets"][0]],
+                )
+                manifest_path.write_text(json.dumps(duplicate_published_asset_manifest), encoding="utf-8")
+                result = run_case()
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("duplicate asset name", result.stderr)
+
+                wrong_size_asset = dict(manifest["assets"][0], size=len(asset_bytes) + 1)
+                wrong_size_manifest = dict(manifest, assets=[wrong_size_asset])
+                manifest_path.write_text(json.dumps(wrong_size_manifest), encoding="utf-8")
+                result = run_case()
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("size does not match", result.stderr)
 
     def test_upload_publishes_trusted_asset_digests(self) -> None:
         job = read_workflow("release.yml")["jobs"]["upload"]
