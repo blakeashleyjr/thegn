@@ -31,6 +31,8 @@ database only caches and resurrects what git already knows.
 
 - `Alt-W` — **new project**: pick a repo from your scanned roots
   (`repo_roots` in the config) or paste a git URL to clone and open.
+  A repository reached through multiple roots, such as symlinked or nested
+  roots, is listed once.
 - `Alt-w` — **new worktree**: branches off the base branch
   (`base_branch = "auto"` follows the current branch), names it with your
   `branch_prefix`, opens a tab, and asks what to run: a coding agent from

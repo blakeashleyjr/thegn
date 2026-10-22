@@ -683,8 +683,8 @@ async fn poll_media(
 /// on screen: while the Media panel section is open (`coalesce_full` — it shows
 /// the live position stamp) coalesce full frames
 /// to ~1/s, repainting immediately only when the statusbar badge text changed;
-/// with both closed, a badge change takes the cheap bars path and a
-/// position-only change repaints nothing.
+/// with both closed, a badge change or badge-visible health change takes the
+/// cheap bars path and a position-only change repaints nothing.
 ///
 /// Returns `(full, bars)` repaint intent for the loop's `dirty` / `bars_dirty`.
 #[allow(clippy::too_many_arguments)]
@@ -738,7 +738,8 @@ pub(crate) fn drain_snapshots(
             full = true;
             *last_full = Some(std::time::Instant::now());
         }
-    } else if badge_changed {
+    } else if badge_changed || (health_changed && media.as_ref().and_then(|m| m.badge()).is_some())
+    {
         bars = true;
     }
     (full, bars)
@@ -1240,6 +1241,88 @@ mod tests {
             },
         )
         .unwrap();
+        let mut health = MediaHealth::Fresh;
+        let mut last_full = None;
+        let repaint = drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            1,
+            &mut media,
+            &mut caps,
+            &mut health,
+            false,
+            &mut last_full,
+        );
+        assert_eq!(health, MediaHealth::Degraded);
+        assert_eq!(repaint, (false, false));
+    }
+
+    #[test]
+    fn drain_badge_health_only_change_repaints_bars_when_a_badge_shows() {
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "player".into(),
+                title: "track".into(),
+                state: thegn_core::media::PlaybackState::Playing,
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        let (tx, mut rx) = watch::channel(None);
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: Some(snapshot.clone()),
+                health: Some(MediaHealth::Degraded),
+            },
+        )
+        .unwrap();
+        let mut perf = crate::perf::LoopPerf::new();
+        let mut media = Some(snapshot.state);
+        let mut caps = Some(snapshot.caps);
+        let mut health = MediaHealth::Fresh;
+        let mut last_full = None;
+        let repaint = drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            1,
+            &mut media,
+            &mut caps,
+            &mut health,
+            false,
+            &mut last_full,
+        );
+        assert_eq!(health, MediaHealth::Degraded);
+        assert_eq!(repaint, (false, true));
+    }
+
+    #[test]
+    fn drain_badge_health_change_without_a_badge_repaints_nothing() {
+        // Positive control: a stopped snapshot has no badge to repaint.
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "player".into(),
+                title: "track".into(),
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        let (tx, mut rx) = watch::channel(None);
+        offer(
+            &tx,
+            MediaSnapshotDelivery {
+                generation: 1,
+                snapshot: Some(snapshot.clone()),
+                health: Some(MediaHealth::Degraded),
+            },
+        )
+        .unwrap();
+        let mut perf = crate::perf::LoopPerf::new();
+        let mut media = Some(snapshot.state);
+        let mut caps = Some(snapshot.caps);
         let mut health = MediaHealth::Fresh;
         let mut last_full = None;
         let repaint = drain_snapshots(

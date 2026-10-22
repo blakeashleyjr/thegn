@@ -516,10 +516,15 @@ fn list(json: bool) -> Result<()> {
         return Ok(());
     }
     for (r, listed_row) in rows.iter().zip(&listed) {
-        let detail = r
-            .conflict_paths
-            .as_deref()
-            .or(r.error_detail.as_deref())
+        let detail_text = if let Some(paths) = r.conflict_paths.as_deref() {
+            Some(paths.to_string())
+        } else {
+            r.error_detail.as_deref().map(|detail| {
+                thegn_core::merge_sweep::describe_reserved_detail(detail, thegn_core::util::now())
+                    .unwrap_or_else(|| detail.to_string())
+            })
+        };
+        let detail = detail_text
             .map(|d| format!("  — {}", d.replace('\n', ", ")))
             .unwrap_or_default();
         let claim = claim_suffix(listed_row.claim.as_ref(), now_ms);

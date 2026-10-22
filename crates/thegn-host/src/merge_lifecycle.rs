@@ -258,6 +258,26 @@ pub(crate) fn apply_landed_reported(
     )
 }
 
+/// The main checkout is a fixed anchor; aliases are compared by canonical path.
+fn home_checkout(worktree: &str, repo_root: &Path) -> std::result::Result<bool, String> {
+    let worktree_path = Path::new(worktree);
+    if worktree_path == repo_root {
+        return Ok(true);
+    }
+    let worktree_canonical = std::fs::canonicalize(worktree_path);
+    let root_canonical = std::fs::canonicalize(repo_root);
+    match (worktree_canonical, root_canonical) {
+        (Ok(worktree), Ok(root)) => Ok(worktree == root),
+        (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(false)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(format!(
+            "merge lifecycle: worktree identity unreadable for {}: {error}",
+            crate::merge_sweep::safe_display(worktree)
+        )),
+    }
+}
+
 fn apply_inner(
     cfg: &MergeQueueConfig,
     db: &Db,
@@ -269,8 +289,13 @@ fn apply_inner(
 ) -> Vec<LifecycleNote> {
     let mut notes = Vec::new();
     // The home / main checkout is a fixed anchor — never file or remove it.
-    if Path::new(worktree) == repo_root {
-        return notes;
+    match home_checkout(worktree, repo_root) {
+        Ok(true) => return notes,
+        Ok(false) => {}
+        Err(reason) => {
+            notes.push(LifecycleNote::Warn(reason));
+            return notes;
+        }
     }
     let result = match decide(cfg, event) {
         LifecycleAction::Noop => Ok(()),
@@ -363,8 +388,10 @@ pub(crate) fn apply_landed_in_place_checked(
     worktree: &str,
     branch: &str,
 ) -> Result<()> {
-    if Path::new(worktree) == repo_root {
-        return Ok(());
+    match home_checkout(worktree, repo_root) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(reason) => anyhow::bail!(reason),
     }
     match decide(cfg, LifecycleEvent::LandedInPlace) {
         LifecycleAction::Noop => Ok(()),
@@ -1980,6 +2007,187 @@ mod tests {
         assert!(root.is_dir(), "main checkout must not be removed");
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "read the fixture repository HEAD"
+    )]
+    fn home_checkout_alias_is_never_filed() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "home-alias-filed");
+        let root_s = root.to_string_lossy().to_string();
+        let alias = root.join("..").join(root.file_name().unwrap());
+        let alias_s = alias.to_string_lossy().to_string();
+
+        for event in [LifecycleEvent::Enqueued, LifecycleEvent::Failed] {
+            apply(&cfg(OnLanded::Move), &db, &root, &alias_s, "main", event);
+            assert!(
+                db.worktrees()
+                    .unwrap()
+                    .iter()
+                    .all(|worktree| worktree.worktree != alias_s),
+                "home alias must never be registered for {event:?}"
+            );
+            assert_eq!(folder_of(&db, &root_s, &alias_s), None);
+        }
+
+        let output = cleanup::test_git(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let commit = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        apply_landed(&cfg(OnLanded::Move), &db, &root, &alias_s, "main", &commit);
+        assert!(
+            db.worktrees()
+                .unwrap()
+                .iter()
+                .all(|worktree| worktree.worktree != alias_s),
+            "landed home alias must never be registered"
+        );
+        assert_eq!(folder_of(&db, &root_s, &alias_s), None);
+        assert!(root.is_dir(), "main checkout remains present");
+
+        // best-effort: remove the fixture repository after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture root cleanup failed");
+        }
+        // best-effort: remove the linked worktree after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture worktree cleanup failed");
+        }
+    }
+
+    #[test]
+    fn home_checkout_alias_is_a_no_op_for_land_in_place() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "home-alias-land");
+        let alias = root.join("..").join(root.file_name().unwrap());
+        let alias_s = alias.to_string_lossy().to_string();
+
+        apply_landed_in_place_checked(&cfg(OnLanded::Move), &db, &root, &alias_s, "main").unwrap();
+        assert!(
+            db.worktrees()
+                .unwrap()
+                .iter()
+                .all(|worktree| worktree.worktree != alias_s),
+            "land-in-place must not register a home alias"
+        );
+        assert!(root.is_dir(), "main checkout remains present");
+
+        // best-effort: remove the fixture repository after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture root cleanup failed");
+        }
+        // best-effort: remove the linked worktree after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture worktree cleanup failed");
+        }
+    }
+
+    #[test]
+    fn home_checkout_unreadable_identity_is_refused() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "home-unreadable");
+        let bad = format!("{}/bad\0path", root.display());
+        let notes = apply_reported(
+            &cfg(OnLanded::Move),
+            &db,
+            &root,
+            &bad,
+            "feat",
+            LifecycleEvent::Enqueued,
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(matches!(
+            &notes[0],
+            LifecycleNote::Warn(note) if note.contains("worktree identity unreadable")
+        ));
+        assert!(
+            db.worktrees()
+                .unwrap()
+                .iter()
+                .all(|worktree| worktree.worktree != bad)
+        );
+
+        let checked = apply_landed_in_place_checked(&cfg(OnLanded::Move), &db, &root, &bad, "feat");
+        assert!(matches!(
+            checked,
+            Err(error) if error.to_string().contains("worktree identity unreadable")
+        ));
+
+        // best-effort: remove the fixture repository after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture root cleanup failed");
+        }
+        // best-effort: remove the linked worktree after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture worktree cleanup failed");
+        }
+    }
+
+    #[test]
+    fn home_checkout_real_worktree_is_still_filed() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "home-real-worktree");
+        let root_s = root.to_string_lossy().to_string();
+        let feat_s = feat.to_string_lossy().to_string();
+
+        apply(
+            &cfg(OnLanded::Move),
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::Enqueued,
+        );
+        assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merging"));
+
+        // best-effort: remove the fixture repository after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture root cleanup failed");
+        }
+        // best-effort: remove the linked worktree after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture worktree cleanup failed");
+        }
+    }
+
+    #[test]
+    fn home_checkout_decision_table() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "home-decision-table");
+        let root_s = root.to_string_lossy().to_string();
+        let alias = root.join("..").join(root.file_name().unwrap());
+        let missing = root.join("missing");
+        let missing_root = root.join("missing-root");
+        let bad = format!("{}/bad\0path", root.display());
+
+        assert_eq!(home_checkout(&root_s, &root), Ok(true));
+        assert_eq!(home_checkout(&alias.to_string_lossy(), &root), Ok(true));
+        assert_eq!(home_checkout(&feat.to_string_lossy(), &root), Ok(false));
+        assert_eq!(home_checkout(&missing.to_string_lossy(), &root), Ok(false));
+        assert_eq!(home_checkout(&root_s, &missing_root), Ok(false));
+        assert!(matches!(
+            home_checkout(&bad, &root),
+            Err(reason) if reason.contains("worktree identity unreadable")
+        ));
+
+        // best-effort: remove the fixture repository after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture root cleanup failed");
+        }
+        // best-effort: remove the linked worktree after the assertions.
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(target: "merge_lifecycle::tests", %error, "fixture worktree cleanup failed");
+        }
     }
 
     #[test]

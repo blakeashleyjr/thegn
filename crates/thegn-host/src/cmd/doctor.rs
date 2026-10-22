@@ -298,7 +298,7 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
     // not cwd-scoped.  In a linked worktree `root` is the common checkout's
     // root, while `--show-toplevel` is the worktree the user is diagnosing.
     let worktree = current_worktree_root().unwrap_or_else(|| root.clone());
-    let db = thegn_core::db::Db::open().ok();
+    let db = doctor_db().ready();
     let approvals = db
         .as_ref()
         .map(|db| crate::handlers::repo_trust::approvals_for(db, &root.to_string_lossy()))
@@ -486,7 +486,7 @@ fn devcontainer_report(cfg: &Config) {
 /// [`enforcement_matrix_report`]).
 fn enforcement_matrix_json() -> serde_json::Value {
     let os = thegn_core::sandbox_backend::host_os();
-    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let probed = thegn_core::sandbox_cpucap::detect_cap_facts();
     let rows: Vec<serde_json::Value> = thegn_core::sandbox_matrix::column_for(os)
         .into_iter()
         .map(|r| {
@@ -512,13 +512,15 @@ fn limits_json(cfg: &Config) -> serde_json::Value {
     // would actually be written rather than this process's cgroup share.
     let ncpu = thegn_core::sandbox_cpucap::physical_ncpu();
     let live = live_slice_caps();
+    let facts = thegn_core::sandbox_cpucap::detect_cap_facts();
     serde_json::json!({
         "cpu_per_pane": limits.cpu,
         "cpu_total": thegn_core::sandbox_cpucap::resolve_cpu_total(
             limits.cpu_total.as_deref().unwrap_or("auto"), ncpu),
         "memory": limits.memory,
-        "cpu_enforcement": cpu_cap_key(thegn_core::sandbox_cpucap::detect_cpu_cap()),
+        "cpu_enforcement": cpu_cap_key(facts.cap()),
         "cpu_scope_note": thegn_core::sandbox_cpucap::detected_scope_skipped_note(),
+        "cpu_soft_reason": facts.soft_reason(),
         "slice_live": live.as_ref().map(|l| serde_json::json!({
             "unit": thegn_core::sandbox_cpucap::CPU_SLICE,
             "cpu_quota": l.cpu_quota,
@@ -654,7 +656,7 @@ fn providers_json(cfg: &Config) -> serde_json::Value {
 fn toolchain_json(cfg: &Config) -> serde_json::Value {
     let worktree = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
     let root = thegn_core::repo::main_worktree(&worktree).unwrap_or_else(|| worktree.clone());
-    let db = thegn_core::db::Db::open().ok();
+    let db = doctor_db().ready();
     serde_json::to_value(crate::mise_provider::doctor_status(
         cfg,
         &worktree,
@@ -2091,8 +2093,12 @@ pub(crate) fn log_sinks(cfg: &Config) -> Vec<SinkInfo> {
 /// Version is the daemon's reported `CARGO_PKG_VERSION` when a row exists.
 fn daemon_health() -> (&'static str, Option<String>) {
     use thegn_core::store::ControlStore;
-    let Some(db) = thegn_core::db::Db::open().ok() else {
-        return ("unknown (no DB)", None);
+    let db = match doctor_db() {
+        DoctorDb::Ready(db) => db,
+        DoctorDb::Absent => return ("no daemon registered", None),
+        DoctorDb::OtherSchema { .. } | DoctorDb::Unavailable(_) => {
+            return ("unknown (state DB not read)", None);
+        }
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2116,6 +2122,53 @@ fn daemon_health() -> (&'static str, Option<String>) {
         )
     } else {
         ("no daemon registered", None)
+    }
+}
+
+/// The state DB as `thegn doctor` may see it: opened read-only, and only when
+/// its schema is this build's. Doctor never creates, migrates or prunes it.
+enum DoctorDb {
+    Ready(Db),
+    Absent,
+    OtherSchema { on_disk: i64, build: i64 },
+    Unavailable(String),
+}
+
+impl DoctorDb {
+    fn ready(self) -> Option<Db> {
+        match self {
+            Self::Ready(db) => Some(db),
+            Self::Absent | Self::OtherSchema { .. } | Self::Unavailable(_) => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Ready(_) => "ok".into(),
+            Self::Absent => "no database yet".into(),
+            Self::OtherSchema { on_disk, build } if on_disk < build => format!(
+                "not read: db v{on_disk} < build v{build} (migrates on the next thegn start)"
+            ),
+            Self::OtherSchema { on_disk, build } => {
+                format!("not read: db v{on_disk} > build v{build} (this build is too old)")
+            }
+            Self::Unavailable(error) => format!("unavailable: {error}"),
+        }
+    }
+}
+
+fn doctor_db() -> DoctorDb {
+    match Db::open_read_only_current() {
+        Ok(None) => DoctorDb::Absent,
+        Err(error) => DoctorDb::Unavailable(format!("{error:#}")),
+        Ok(Some(db)) => match thegn_core::db::on_disk_schema_version() {
+            Some(on_disk) if on_disk == thegn_core::db::SCHEMA_VERSION => DoctorDb::Ready(db),
+            Some(on_disk) => DoctorDb::OtherSchema {
+                on_disk,
+                build: thegn_core::db::SCHEMA_VERSION,
+            },
+            None => DoctorDb::Unavailable("schema version unreadable".into()),
+        },
     }
 }
 
@@ -2201,7 +2254,7 @@ fn build_parity_lines() {
     // Every registered daemon's actual executable — a daemon still running an
     // older build is invisible in its reported version but obvious here.
     use thegn_core::store::ControlStore;
-    let Ok(db) = thegn_core::db::Db::open() else {
+    let Some(db) = doctor_db().ready() else {
         return;
     };
     for d in db.daemons().unwrap_or_default() {
@@ -2455,7 +2508,7 @@ fn lifecycle_hooks_json(cfg: &Config) -> serde_json::Value {
         .and_then(thegn_core::config::load_repo_hooks)
         .map(|(hooks, _)| hooks)
         .unwrap_or_default();
-    let db = Db::open().ok();
+    let db = doctor_db().ready();
     let resolved = repo_root
         .as_deref()
         .map(|root| crate::worktree_lifecycle::resolve(cfg, root, db.as_ref()));
@@ -2505,19 +2558,25 @@ fn lifecycle_hooks_json(cfg: &Config) -> serde_json::Value {
 /// routed by that tab, so it must be REPORTED — `thegn doctor` is the durable
 /// surface for it (the TUI shows a one-line notice at launch).
 fn worktree_identity_json() -> serde_json::Value {
-    match Db::open().and_then(|db| db.quarantined_worktree_rows()) {
-        Ok(rows) => serde_json::json!({
-            "state_db": "ok",
-            "quarantined": rows
-                .into_iter()
-                .map(|(worktree, reason)| serde_json::json!({
-                    "worktree": worktree,
-                    "reason": reason,
-                }))
-                .collect::<Vec<_>>(),
-        }),
-        Err(error) => serde_json::json!({
-            "state_db": format!("unavailable: {error}"),
+    match doctor_db() {
+        DoctorDb::Ready(db) => match db.quarantined_worktree_rows() {
+            Ok(rows) => serde_json::json!({
+                "state_db": "ok",
+                "quarantined": rows
+                    .into_iter()
+                    .map(|(worktree, reason)| serde_json::json!({
+                        "worktree": worktree,
+                        "reason": reason,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            Err(error) => serde_json::json!({
+                "state_db": format!("unavailable: {error}"),
+                "quarantined": Vec::<serde_json::Value>::new(),
+            }),
+        },
+        other => serde_json::json!({
+            "state_db": other.describe(),
             "quarantined": Vec::<serde_json::Value>::new(),
         }),
     }
@@ -2945,10 +3004,14 @@ fn hosts_report(cfg: &Config) {
         outln!("  (none — add one with `thegn host add user@box` or [host.<name>])");
         return;
     }
-    let db = match thegn_core::db::Db::open() {
-        Ok(db) => Some(db),
-        Err(e) => {
-            outln!("  (db unavailable: {e} — host sections below may be incomplete)");
+    let db = match doctor_db() {
+        DoctorDb::Ready(db) => Some(db),
+        DoctorDb::Absent => None,
+        other => {
+            outln!(
+                "  (db {} — host sections below may be incomplete)",
+                other.describe()
+            );
             None
         }
     };
@@ -4184,7 +4247,7 @@ fn compiler_cache_report(cfg: &Config, config_path: &std::path::Path, cli_overri
 fn enforcement_matrix_report(cfg: &Config) {
     use thegn_core::sandbox_matrix;
     let os = thegn_core::sandbox_backend::host_os();
-    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let probed = thegn_core::sandbox_cpucap::detect_cap_facts();
     outln!(
         "Enforcement matrix ({}, derived from the resolver)",
         os.as_str()
@@ -4628,7 +4691,7 @@ fn cpu_cap_report(cfg: &Config) {
         outln!("  cpu cap       (unset)");
         return;
     }
-    let mech = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let facts = thegn_core::sandbox_cpucap::detect_cap_facts();
     let mut parts = Vec::new();
     if let Some(c) = per_pane {
         parts.push(format!("{c} cores/pane"));
@@ -4646,7 +4709,7 @@ fn cpu_cap_report(cfg: &Config) {
         outln!(
             "  cpu cap       {}  ({})",
             parts.join(" · "),
-            mech.label_on(thegn_core::sandbox_backend::host_os())
+            facts.label_on(thegn_core::sandbox_backend::host_os())
         );
         if let Some(note) = thegn_core::sandbox_cpucap::detected_scope_skipped_note() {
             outln!("  cpu cap note  {note}");
@@ -4761,9 +4824,30 @@ fn managed_tools_report(cfg: &Config) {
         {
             outln!("             note: {reason}");
         }
+        if matches!(res, Resolution::Managed { .. }) {
+            let status = crate::managed_tool::installed_provenance(&tool);
+            let provenance = match &status {
+                crate::managed_tool::ProvenanceStatus::NotApplicable => {
+                    "n/a (release download)".to_owned()
+                }
+                crate::managed_tool::ProvenanceStatus::NotInstalled => "not installed".to_owned(),
+                crate::managed_tool::ProvenanceStatus::Verified => "verified".to_owned(),
+                crate::managed_tool::ProvenanceStatus::MissingRecord => {
+                    "no install record (the next use reinstalls it through the contained installer)"
+                        .to_owned()
+                }
+                crate::managed_tool::ProvenanceStatus::Mismatch(reason) => format!(
+                    "MISMATCH: {reason} (refused until reinstalled: remove {})",
+                    tool.managed_dir().display()
+                ),
+            };
+            outln!("             provenance: {provenance}");
+        }
     }
 }
 
+/// Every tool has a provenance status; `external` and a null reason mean the
+/// tool resolves through an override or PATH rather than its managed install.
 fn managed_tools_json(cfg: &Config) -> serde_json::Value {
     let tools: Vec<serde_json::Value> = crate::managed_tool::known()
         .into_iter()
@@ -4778,6 +4862,15 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
                 "pinned": tool.version,
                 "current": matches!(res, Resolution::Managed { current: true, .. }),
             });
+            let (provenance, provenance_reason) = match &res {
+                Resolution::Managed { .. } => {
+                    let status = crate::managed_tool::installed_provenance(&tool);
+                    (status.as_str(), status.reason().map(str::to_owned))
+                }
+                _ => ("external", None),
+            };
+            report["provenance"] = serde_json::json!(provenance);
+            report["provenance_reason"] = serde_json::json!(provenance_reason);
             if is_bugstalker {
                 report["platform_supported"] =
                     serde_json::json!(thegn_core::debug::platform_supported());
@@ -5006,6 +5099,15 @@ fn summary(c: &TermCaps) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_cap_limits_json_carries_the_soft_reason_key() {
+        let limits = limits_json(&Config::default());
+        let reason = limits
+            .get("cpu_soft_reason")
+            .expect("cpu_soft_reason key is present");
+        assert!(reason.is_null() || reason.is_string(), "{reason}");
+    }
 
     #[test]
     fn medium_word_maps_each_network_medium() {
@@ -5477,6 +5579,34 @@ agent = "unsafe"
         assert_eq!(bs["path"], "/opt/custom/bs");
         // The report runs without panicking too.
         managed_tools_report(&cfg);
+    }
+
+    #[test]
+    fn managed_tools_json_reports_provenance_keys() {
+        let tools = managed_tools_json(&Config::default());
+        let rows = tools.as_array().expect("managed tools array");
+        for tool in rows {
+            let provenance = tool
+                .get("provenance")
+                .and_then(serde_json::Value::as_str)
+                .expect("provenance string");
+            assert!(
+                [
+                    "external",
+                    "not-applicable",
+                    "not-installed",
+                    "verified",
+                    "missing",
+                    "mismatch",
+                ]
+                .contains(&provenance),
+                "unexpected provenance {provenance}"
+            );
+            let reason = tool
+                .get("provenance_reason")
+                .expect("provenance_reason key");
+            assert!(reason.is_null() || reason.is_string());
+        }
     }
 
     #[test]
@@ -5985,5 +6115,82 @@ args = ["--verbose"]
                 .map(|route| (route.id, route.status.as_str()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn doctor_db_sections_never_create_the_state_db() {
+        let state = thegn_core::testenv::IsolatedState::new();
+
+        assert_eq!(daemon_health(), ("no daemon registered", None));
+        assert_eq!(worktree_identity_json()["state_db"], "no database yet");
+        assert!(lifecycle_hooks_json(&Config::default()).is_object());
+        assert!(toolchain_json(&Config::default()).is_object());
+
+        assert!(
+            !state.state_home().join("thegn/thegn.db").exists()
+                && !state.state_home().join("thegn").exists(),
+            "doctor must not create the state DB"
+        );
+    }
+
+    #[test]
+    fn doctor_db_older_schema_is_reported_and_not_migrated() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        drop(Db::open().expect("create isolated db"));
+        let path = state.state_home().join("thegn/thegn.db");
+        let conn = rusqlite::Connection::open(&path).expect("open isolated db");
+        conn.pragma_update(None, "user_version", thegn_core::db::SCHEMA_VERSION - 1)
+            .expect("lower isolated db schema version");
+        drop(conn);
+
+        let report = worktree_identity_json();
+        let _health = daemon_health();
+
+        assert_eq!(
+            thegn_core::db::on_disk_schema_version(),
+            Some(thegn_core::db::SCHEMA_VERSION - 1),
+            "doctor must not migrate"
+        );
+        let state_db = report["state_db"].as_str().expect("state_db is a string");
+        assert!(
+            state_db.starts_with("not read: db v")
+                && state_db.contains("migrates on the next thegn start"),
+            "older schema must be reported as not read until the next thegn start: {state_db}"
+        );
+    }
+
+    // Keep the writer connection open so its committed row remains represented
+    // by the WAL/SHM pair while doctor opens its separate read-only connection.
+    #[test]
+    fn doctor_db_reads_rows_still_in_the_wal() {
+        use thegn_core::store::ControlStore as _;
+
+        let state = thegn_core::testenv::IsolatedState::new();
+        let db = Db::open().expect("create isolated db");
+        db.put_daemon(&thegn_core::store::DaemonRow {
+            daemon_id: "doctor-test".into(),
+            pid: 1,
+            scope: "elsewhere".into(),
+            endpoint: "/nonexistent/sock".into(),
+            tcp_addr: None,
+            control_origin: None,
+            hostname: "h".into(),
+            version: "9.9.9-test".into(),
+            started_at: 1,
+            heartbeat_at: 1,
+        })
+        .expect("write daemon row");
+
+        assert_eq!(
+            daemon_health().1,
+            Some("9.9.9-test".to_string()),
+            "doctor must see daemon rows committed only to the live WAL"
+        );
+        let wal = state.state_home().join("thegn/thegn.db-wal");
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),
+            "the live WAL must remain present and nonempty while the writer DB is open"
+        );
+        drop(db);
     }
 }

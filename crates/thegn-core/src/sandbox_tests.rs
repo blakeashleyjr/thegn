@@ -692,6 +692,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::VolumeOwner,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
+        RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
     ] {
         let error = refusal(
@@ -728,6 +729,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::VolumeOwner,
         RefusalClass::TunnelUnenforced,
         RefusalClass::MountDrift,
+        RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
     ] {
         let label = class.label();
@@ -1438,6 +1440,7 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
         SandboxArgvEnv {
             resolver_dir: None,
             runtime_dir: Some("/run/user/42".into()),
+            control_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -1453,6 +1456,126 @@ fn empty_xdg_runtime_dir_uses_run_user_for_systemd_hardening() {
     assert_eq!(
         systemd_runtime_dir(Some(std::ffi::OsString::new())),
         Some(std::path::PathBuf::from("/run/user"))
+    );
+}
+
+#[test]
+fn user_bus_hardened_bwrap_pane_unsets_the_session_bus_address() {
+    let _env = crate::testenv::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"]);
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.read_only_root = true;
+    sandbox
+        .env
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), "unix:path=/x".into()));
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let unset = argv
+        .windows(2)
+        .position(|pair| pair == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"])
+        .expect("hardened bwrap explicitly unsets the inherited session bus");
+    let end = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("bwrap argv has a command separator");
+    assert!(
+        unset < end,
+        "bus address is unset before the pane command: {argv:?}"
+    );
+    assert!(
+        !argv[unset + 2..end].iter().any(|arg| arg == "--setenv"),
+        "unset follows every explicit setenv: {argv:?}"
+    );
+    assert!(
+        argv.windows(3)
+            .any(|triple| { triple == ["--setenv", "DBUS_SESSION_BUS_ADDRESS", "unix:path=/x"] }),
+        "fixture proves an explicit bus passthrough precedes the unset: {argv:?}"
+    );
+}
+
+#[test]
+fn user_bus_open_bwrap_pane_keeps_the_session_bus_address() {
+    // Positive control: absence of an unset is already true at the frozen base.
+    let sandbox = spec(Backend::Bwrap);
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !argv
+            .windows(2)
+            .any(|pair| pair == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]),
+        "open bwrap panes keep the session bus address: {argv:?}"
+    );
+}
+
+#[test]
+fn user_bus_hardened_systemd_pane_hides_the_user_bus() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for property in [
+        "UnsetEnvironment=DBUS_SESSION_BUS_ADDRESS",
+        "InaccessiblePaths=-/run/user/42/bus",
+        "InaccessiblePaths=-/run/user/42/systemd/private",
+        "InaccessiblePaths=-/run/user/42/thegn",
+    ] {
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "-p" && pair[1] == property),
+            "hardened systemd pane includes -p {property}: {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn user_bus_systemd_run_user_fallback_adds_no_bus_paths() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2).any(|pair| {
+            pair[0] == "-p" && pair[1] == "UnsetEnvironment=DBUS_SESSION_BUS_ADDRESS"
+        }),
+        "fallback systemd panes still unset the inherited bus address: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| {
+            arg == "InaccessiblePaths=-/run/user/bus"
+                || arg == "InaccessiblePaths=-/run/user/systemd"
+        }),
+        "fallback runtime is already inaccessible as a whole: {argv:?}"
     );
 }
 
@@ -3869,6 +3992,7 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
         SandboxArgvEnv {
             resolver_dir: None,
             runtime_dir: Some("/run/user/9".into()),
+            control_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -3888,6 +4012,7 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
         SandboxArgvEnv {
             resolver_dir: None,
             runtime_dir: Some("/run/user/9".into()),
+            control_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -4731,6 +4856,180 @@ fn sealed_systemd_enter_is_refused_strict() {
         Err(EnterError::Refused(refusal))
             if refusal.class == RefusalClass::StrictUnsupported
     ));
+}
+
+#[test]
+fn control_socket_bwrap_masks_a_visible_control_dir_after_the_binds() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let mount = temp.path().to_path_buf();
+    let control_dir = mount.join("run/thegn");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: mount.display().to_string(),
+        dest: mount.display().to_string(),
+        ro: true,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: None,
+            control_dirs: vec![control_dir.clone()],
+        },
+    )
+    .unwrap();
+    let mask = argv
+        .windows(2)
+        .position(|pair| pair[0] == "--tmpfs" && pair[1] == control_dir.display().to_string())
+        .unwrap();
+    let last_bind = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_str() == "--bind" || arg.as_str() == "--ro-bind")
+        .map(|(index, _)| index)
+        .max()
+        .unwrap();
+    let command = argv.iter().position(|arg| arg == "--").unwrap();
+    assert!(mask > last_bind, "control tmpfs follows every bind");
+    assert!(
+        mask < command,
+        "control tmpfs precedes the command separator"
+    );
+}
+
+#[test]
+fn control_socket_bwrap_refuses_a_mask_that_would_hide_a_bind() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let mount = temp.path().to_path_buf();
+    let control_dir = mount.join("run");
+    std::fs::create_dir(&control_dir).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: mount.display().to_string(),
+        dest: mount.display().to_string(),
+        ro: true,
+        cache: false,
+    });
+    sandbox.mounts.push(Mount {
+        host: mount.join("source").display().to_string(),
+        dest: mount.join("run/child").display().to_string(),
+        ro: true,
+        cache: false,
+    });
+    assert!(matches!(
+        backend_enter_argv_with_env(
+            &sandbox,
+            "true",
+            SandboxArgvEnv {
+                resolver_dir: None,
+                runtime_dir: None,
+                control_dirs: vec![control_dir],
+            },
+        ),
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+    ));
+}
+
+#[test]
+fn control_socket_bwrap_translates_a_host_dir_to_a_renamed_mount() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let control_dir = temp.path().join("run/thegn");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: temp.path().display().to_string(),
+        dest: "/data".into(),
+        ro: true,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: None,
+            control_dirs: vec![control_dir],
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--tmpfs" && pair[1] == "/data/run/thegn")
+    );
+}
+
+#[test]
+fn control_socket_systemd_adds_inaccessible_paths_for_published_dirs() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: Some("/run/user/42".into()),
+            control_dirs: vec!["/srv/ctl".into()],
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "InaccessiblePaths=-/run/user/42/thegn")
+    );
+    assert!(argv.iter().any(|arg| arg == "InaccessiblePaths=-/srv/ctl"));
+}
+
+#[test]
+fn control_socket_systemd_refuses_a_dir_that_hides_the_worktree() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    sandbox.worktree = "/wt/feat".into();
+    assert!(matches!(
+        backend_enter_argv_with_env(
+            &sandbox,
+            "true",
+            SandboxArgvEnv {
+                resolver_dir: None,
+                runtime_dir: None,
+                control_dirs: vec!["/wt".into()],
+            },
+        ),
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+    ));
+}
+
+#[test]
+fn control_socket_systemd_leaves_private_tmp_unmasked() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: None,
+            control_dirs: vec!["/tmp".into()],
+        },
+    )
+    .unwrap();
+    assert!(!argv.iter().any(|arg| arg == "InaccessiblePaths=-/tmp"));
+}
+
+#[test]
+fn control_socket_label_and_remediation_are_stable() {
+    assert_eq!(
+        RefusalClass::ControlSocketReachable.label(),
+        "control-socket-reachable"
+    );
+    assert_eq!(
+        RefusalClass::ControlSocketReachable.remediation(),
+        "move [daemon] socket and $XDG_RUNTIME_DIR out of $HOME, the worktree and every sandbox mount (the default /run/user/<uid> is never mounted)"
+    );
 }
 
 #[path = "sandbox_evidence_tests.rs"]

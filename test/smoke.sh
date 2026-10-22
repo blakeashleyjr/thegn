@@ -538,6 +538,25 @@ check "list runs without error" \
 check "recent runs without error" \
   "'$SZ' recent >/dev/null 2>&1"
 
+# ci log is cache-first (OpenSpec add-ci-logs-and-autofix task 19): a seeded
+# cache row is served with no provider, re-redacted on read, and a miss never
+# claims a cache source. WT comes from mktemp and contains no single quote.
+if command -v sqlite3 >/dev/null 2>&1; then
+  CIDB="$XDG_STATE_HOME/thegn/thegn.db"
+  CIHEAD="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  sqlite3 "$CIDB" "INSERT OR REPLACE INTO ci_log_cache (worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at) VALUES ('$WT', '7101', '7202', 'build', '$CIHEAD', 'smoke cached failure line' || char(10) || 'token=smoke-secret-value' || char(10), 0, 2, $(date +%s))"
+  check "ci log --json serves a cached entry with no provider" \
+    "'$SZ' ci log 7101 7202 --worktree '$WT' --json | grep -q '\"source\":\"cache\"'"
+  check "ci log prints the cached text" \
+    "'$SZ' ci log 7101 7202 --worktree '$WT' | grep -q 'smoke cached failure line'"
+  check "ci log re-redacts a cached credential on read" \
+    "! '$SZ' ci log 7101 7202 --worktree '$WT' --json | grep -q 'smoke-secret-value'"
+  check "ci log never reports a cache source for an uncached job" \
+    "! '$SZ' ci log 7101 7203 --worktree '$WT' --json 2>/dev/null | grep -q '\"source\":\"cache\"'"
+else
+  echo "  skip ci log cache-first checks (sqlite3 not on PATH)"
+fi
+
 # ── CLI surface v2: wt/repo namespaces + headless lifecycle + --json ─────────
 # Namespaced spellings mirror the (hidden but functional) legacy verbs.
 check "wt list matches legacy list" \

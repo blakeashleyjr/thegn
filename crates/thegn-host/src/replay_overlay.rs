@@ -603,7 +603,7 @@ impl SearchWorker {
         let thread_state = state.clone();
         let (result_tx, results) = mpsc::sync_channel(1);
         match std::thread::Builder::new()
-            .name("replay-search".into())
+            .name("thegn-replay-sr".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 loop {

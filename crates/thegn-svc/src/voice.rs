@@ -392,7 +392,7 @@ fn terminate_child(mut child: Child, on_reaped: &Arc<dyn Fn() + Send + Sync>) ->
     }
     let reaped = Arc::clone(on_reaped);
     match thread::Builder::new()
-        .name("voice-transcriber-reaper".into())
+        .name("thegn-stt-reap".into())
         .spawn(move || {
             // thegn-svc has no QoS seam; reaper scheduling follows the platform default.
             if let Err(error) = child.wait() {

@@ -1,4 +1,4 @@
-//! Frame output + terminal-write resilience.
+//! Termwiz debug-renderer frame encoding and terminal-write resilience.
 //!
 //! A transient write hiccup to the controlling terminal — `EIO`/`EINTR`/`EAGAIN`,
 //! e.g. a subprocess briefly disturbing the terminal's foreground process group
@@ -6,12 +6,15 @@
 //! used to `?`-propagate any flush error out of the event loop; that drops the
 //! `BufferedTerminal`, and termwiz's `UnixTerminal::drop` does `flush().unwrap()`
 //! — a second EIO there panics, leaving the screen frozen with the tty echoing.
-//! Instead the loop skips the frame, forces a full repaint, and retries; only a
-//! persistent failure (retries exhausted) or a genuinely fatal error tears down.
+//! Frames are rendered to bytes here and sent through the writer FIFO, so a
+//! terminal write cannot block the event loop and stays ordered with OOB writes
+//! (THE-344).
 
 use anyhow::Context as _;
 use std::collections::VecDeque;
 use termwiz::input::InputEvent;
+use termwiz::render::RenderTty;
+use termwiz::render::terminfo::TerminfoRenderer;
 use termwiz::surface::Change;
 use termwiz::terminal::Terminal;
 use termwiz::terminal::buffered::BufferedTerminal;
@@ -20,14 +23,68 @@ use termwiz::terminal::buffered::BufferedTerminal;
 /// tears down (a truly gone terminal, not a transient blip).
 pub(crate) const RETRY_MAX: u32 = 30;
 
-/// Outcome of writing one frame to the terminal.
-pub(crate) enum FrameWrite {
-    /// Delivered.
-    Ok,
-    /// A transient tty condition (EIO/EINTR/EAGAIN): retry after a full repaint.
-    Transient,
-    /// Unrecoverable — propagate and tear down.
-    Fatal(anyhow::Error),
+/// Loop-held termwiz renderer. It only encodes bytes; frames must ride the
+/// writer FIFO so terminal I/O stays off the event loop and ordered with OOB
+/// writes (THE-344).
+pub(crate) struct TermwizFrames {
+    caps: termwiz::caps::Capabilities,
+    renderer: TerminfoRenderer,
+}
+
+impl TermwizFrames {
+    pub(crate) fn with_caps(caps: termwiz::caps::Capabilities) -> Self {
+        let renderer = TerminfoRenderer::new(caps.clone());
+        Self { caps, renderer }
+    }
+
+    pub(crate) fn from_env() -> anyhow::Result<Self> {
+        let caps = termwiz::caps::Capabilities::new_from_env().context("term capabilities")?;
+        Ok(Self::with_caps(caps))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.renderer = TerminfoRenderer::new(self.caps.clone());
+    }
+
+    pub(crate) fn render(
+        &mut self,
+        wire: &[Change],
+        cols: usize,
+        rows: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut out = FrameBytes {
+            buf: Vec::new(),
+            cols,
+            rows,
+        };
+        self.renderer
+            .render_to(wire, &mut out)
+            .context("termwiz render")?;
+        Ok(out.buf)
+    }
+}
+
+struct FrameBytes {
+    buf: Vec<u8>,
+    cols: usize,
+    rows: usize,
+}
+
+impl std::io::Write for FrameBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl RenderTty for FrameBytes {
+    fn get_size_in_cells(&mut self) -> termwiz::Result<(usize, usize)> {
+        Ok((self.cols, self.rows))
+    }
 }
 
 /// Enter the alternate screen NOW, not at the next termwiz flush.
@@ -42,53 +99,6 @@ pub(crate) fn enter_alt_screen<T: Terminal>(term: &mut T) -> anyhow::Result<()> 
     term.enter_alternate_screen()?;
     term.flush()?;
     Ok(())
-}
-
-/// Render + flush one frame's `wire` change list, then ring the latched bell.
-/// Any write failure is classified as [`FrameWrite::Transient`] (retry) or
-/// [`FrameWrite::Fatal`] (propagate).
-pub(crate) fn emit_frame<T: Terminal>(
-    use_termwiz_renderer: bool,
-    buf: &mut BufferedTerminal<T>,
-    wire_renderer: &mut crate::wire::WireRenderer,
-    recorder: &mut Option<crate::recorder::Recorder>,
-    wire: &[Change],
-    ring_bell: bool,
-) -> FrameWrite {
-    let result = if use_termwiz_renderer {
-        buf.terminal()
-            .render(wire)
-            .context("render")
-            .and_then(|()| buf.terminal().flush().context("terminal flush"))
-    } else {
-        let mut bytes = String::new();
-        wire_renderer.render(wire, &mut bytes);
-        if let Some(rec) = recorder {
-            let _ = rec.write_frame(&bytes); // best-effort: recorder write: recording is advisory; a lost frame degrades replay fidelity only
-        }
-        use std::io::Write as _;
-        let mut out = std::io::stdout();
-        out.write_all(bytes.as_bytes())
-            .context("render")
-            .and_then(|()| out.flush().context("terminal flush"))
-    };
-    if let Err(e) = result {
-        return if is_transient_write_error(&e) {
-            FrameWrite::Transient
-        } else {
-            FrameWrite::Fatal(e)
-        };
-    }
-    // Terminal bell (item 429): a latched notification sound, written right after
-    // the frame flush so it never interleaves with the diff writes. BEL neither
-    // moves the cursor nor prints, so it is safe between frames. Best-effort.
-    if ring_bell {
-        use std::io::Write as _;
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x07"); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
-        let _ = out.flush(); // best-effort: flush: display-only
-    }
-    FrameWrite::Ok
 }
 
 /// After a frame is flushed, emit the muse sync `ready` marker — but only once
@@ -144,16 +154,6 @@ pub(crate) fn pty_input_pending<T: Terminal>(
     }
 }
 
-/// True when `err` (or anything in its source chain) is a transient terminal
-/// write condition worth retrying rather than tearing the compositor down.
-fn is_transient_write_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(is_transient_io)
-    })
-}
-
 pub(crate) fn is_transient_io(io: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     if matches!(io.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) {
@@ -182,8 +182,8 @@ mod tests {
     #[cfg(unix)] // raw-errno classification is unix-only
     #[test]
     fn classifies_eio_as_transient() {
-        let e = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EIO)).context("flush");
-        assert!(is_transient_write_error(&e));
+        let error = std::io::Error::from_raw_os_error(libc::EIO);
+        assert!(is_transient_io(&error));
     }
 
     #[test]
@@ -192,8 +192,8 @@ mod tests {
             std::io::ErrorKind::Interrupted,
             std::io::ErrorKind::WouldBlock,
         ] {
-            let e = anyhow::Error::new(std::io::Error::from(kind)).context("write");
-            assert!(is_transient_write_error(&e), "{kind:?} should be transient");
+            let error = std::io::Error::from(kind);
+            assert!(is_transient_io(&error), "{kind:?} should be transient");
         }
     }
 
@@ -283,11 +283,64 @@ mod tests {
 
     #[test]
     fn classifies_broken_pipe_and_non_io_as_fatal() {
-        let broken =
-            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe)).context("x");
-        assert!(!is_transient_write_error(&broken));
-        assert!(!is_transient_write_error(&anyhow::anyhow!(
-            "plain string error"
-        )));
+        let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(!is_transient_io(&broken));
+    }
+
+    #[test]
+    fn termwiz_frame_renders_text_to_bytes_without_io() {
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        let mut frames = TermwizFrames::with_caps(caps);
+        let bytes = frames
+            .render(&[Change::Text("hello".into())], 80, 24)
+            .unwrap();
+        assert!(bytes.windows(5).any(|window| window == b"hello"));
+    }
+
+    #[test]
+    fn termwiz_frame_clear_screen_uses_the_given_size() {
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        let mut frames = TermwizFrames::with_caps(caps);
+        let bytes = frames
+            .render(
+                &[
+                    Change::ClearScreen(Default::default()),
+                    Change::Text("x".into()),
+                ],
+                10,
+                3,
+            )
+            .unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "clear uses the adapter size, not a tty query"
+        );
+    }
+
+    #[test]
+    fn termwiz_frame_reset_restarts_attribute_state() {
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        let mut frames = TermwizFrames::with_caps(caps);
+        frames
+            .render(
+                &[
+                    Change::Attribute(termwiz::cell::AttributeChange::Intensity(
+                        termwiz::cell::Intensity::Bold,
+                    )),
+                    Change::Text("a".into()),
+                ],
+                80,
+                24,
+            )
+            .unwrap();
+        frames.reset();
+        let bytes = frames.render(&[Change::Text("b".into())], 80, 24).unwrap();
+        assert!(bytes.contains(&b'b'));
     }
 }

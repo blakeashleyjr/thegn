@@ -8,6 +8,20 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::store::WorkspaceStore;
 
+/// Drop a destroyed spare's ledger row only after the provider destroy
+/// succeeded; a failure keeps the row (ownership).
+fn after_destroy(
+    outcome: Result<(), String>,
+    disposition: crate::lifecycle::DeleteRecycle,
+    forget: impl FnOnce(),
+) -> Result<(), String> {
+    outcome?;
+    if disposition == (crate::lifecycle::DeleteRecycle::Destroy { pool_spare: true }) {
+        forget();
+    }
+    Ok(())
+}
+
 /// Suspend-on-close (8-E): for a provider env with `auto_checkpoint`, snapshot the
 /// sandbox when the worktree closes (fast resume next open). Called from the
 /// fire-and-forget close thread, which has only the path — so it loads config +
@@ -71,23 +85,68 @@ pub fn destroy_provider_sandbox_with(
     crate::remote_enqueue_auth::revoke_for_sandbox(pc, &name, Some(worktree))
         .map_err(|error| format!("revoke route-to-host credential: {error:#}"))?;
     // A CLAIMED pool spare with a fresh provisioned-base checkpoint is RECYCLED
-    // back into the pool (restore-in-place, row → `ready`) instead of destroyed
-    // — see `lifecycle::recycle_claimed_on_delete`. `false` ⇒ destroy as usual.
-    if crate::lifecycle::recycle_claimed_on_delete(cfg, env_name, &name) {
+    // back into the pool (restore-in-place, row → `ready`) instead of destroyed.
+    let disposition = crate::lifecycle::recycle_claimed_on_delete(cfg, env_name, &name);
+    if disposition == crate::lifecycle::DeleteRecycle::Recycled {
         thegn_core::msg::info(&format!("recycled spare {name} into the pool on delete"));
         return Ok(());
     }
     let Some(provider) = provider_for_named(pc, &name) else {
         return Ok(());
     };
-    match block_on_provider(|| async { provider.destroy(&name).await }) {
+    let outcome = match block_on_provider(|| async { provider.destroy(&name).await }) {
         Ok(()) => {
             thegn_core::msg::info(&format!("destroyed sandbox {name} on worktree delete"));
+            Ok(())
         }
-        Err(e) => return Err(e.to_string()),
-    }
+        Err(e) => Err(e.to_string()),
+    };
+    after_destroy(outcome, disposition, || {
+        crate::lifecycle::forget_destroyed_spare(&name)
+    })?;
     // Drop the local provisioned marker so a later sandbox reusing this id isn't
     // treated as provisioned (the attach gate would skip re-provisioning).
     crate::provider_workdir::clear_provisioned(&name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::DeleteRecycle;
+
+    #[test]
+    fn pool_delete_destroy_failure_keeps_the_row() {
+        let mut called = false;
+        let result = after_destroy(
+            Err("boom".into()),
+            DeleteRecycle::Destroy { pool_spare: true },
+            || called = true,
+        );
+
+        assert_eq!(result, Err("boom".into()));
+        assert!(!called);
+    }
+
+    #[test]
+    fn pool_delete_destroy_success_drops_the_row_once() {
+        let mut calls = 0;
+        let result = after_destroy(Ok(()), DeleteRecycle::Destroy { pool_spare: true }, || {
+            calls += 1
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn pool_delete_success_without_spare_row_skips_forget() {
+        let mut called = false;
+        let result = after_destroy(Ok(()), DeleteRecycle::Destroy { pool_spare: false }, || {
+            called = true
+        });
+
+        assert_eq!(result, Ok(()));
+        assert!(!called);
+    }
 }

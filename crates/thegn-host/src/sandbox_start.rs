@@ -97,7 +97,7 @@ fn run_with(
                     tracing::warn!(target: "thegn::sandbox", cmd = %argv.join(" "), "runtime start timed out; leaving it to finish");
                     pending.fetch_add(1, Ordering::SeqCst);
                     let reaper = std::thread::Builder::new()
-                        .name("thegn-sandbox-start-reap".to_owned())
+                        .name("thegn-sbx-reap".to_owned())
                         .spawn(move || {
                             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                             #[expect(clippy::disallowed_methods, reason = "the timed-out child must be reaped without killing it")]

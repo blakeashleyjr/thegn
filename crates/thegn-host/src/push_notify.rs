@@ -59,7 +59,7 @@ pub fn spawn(
     snapshot: DeliverySnapshot,
 ) {
     std::thread::Builder::new()
-        .name("notify-push".into())
+        .name("thegn-push".into())
         .spawn(move || {
             // Housekeeping, not interactive: keep it off the perf cores (no-op
             // off Apple silicon).

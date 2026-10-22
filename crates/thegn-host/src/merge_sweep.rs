@@ -13,7 +13,9 @@
 //! next natural wake, which is the whole point of an idle loop that never polls.
 
 use crate::merge_lifecycle::CleanupOutcome;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use thegn_core::config::{Config, OnLanded};
 use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_sweep::{self, MergedEntry};
@@ -55,7 +57,7 @@ pub struct SweepReport {
     pub collected_partial: Vec<(String, Vec<String>)>,
     /// Branches retained for explicit cleanup after worktree removal.
     pub held_branches: Vec<String>,
-    /// Rows left untouched because they cannot be attributed to this repository.
+    /// Informational notes for held branches, foreign rows, and deferred cleanup retries.
     pub informational: Vec<(String, String)>,
     /// Refused or failed physical cleanup, with an actionable reason.
     pub kept: Vec<(String, String)>,
@@ -70,6 +72,16 @@ pub(crate) struct SweepNotify {
 }
 
 pub(crate) const NOTHING_TO_SWEEP: &str = "merge queue: nothing to sweep";
+
+fn first_retry_deferral_report(worktree: &str, attempts: u32, next_at: i64, now: i64) -> bool {
+    static REPORTED: OnceLock<Mutex<HashSet<(String, u32, i64)>>> = OnceLock::new();
+    let reported = REPORTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut reported = reported
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reported.retain(|(_, _, deadline)| *deadline > now);
+    reported.insert((worktree.to_string(), attempts, next_at))
+}
 
 pub(crate) fn report_lines(report: &SweepReport) -> Vec<(Priority, String)> {
     let mut lines = Vec::new();
@@ -403,6 +415,7 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         }
     };
     let mut entries = Vec::new();
+    let now = util::now();
     for row in &rows {
         // Held rows have already completed worktree collection. Their paths
         // are expected to be gone, so preserve the hold semantics first.
@@ -461,13 +474,30 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
                 continue;
             }
         }
+        if !force
+            && let Some(retry) = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
+            && !retry.is_due(now)
+        {
+            if !first_retry_deferral_report(&row.worktree, retry.attempts, retry.next_at, now) {
+                continue;
+            }
+            let remaining = u64::try_from(retry.next_at.saturating_sub(now)).unwrap_or(u64::MAX);
+            report.informational.push((
+                row.branch.clone(),
+                format!(
+                    "cleanup deferred after {} refusal(s); next retry in {}",
+                    retry.attempts,
+                    merge_sweep::humanize_remaining(remaining)
+                ),
+            ));
+            continue;
+        }
         entries.push(MergedEntry {
             worktree: row.worktree.clone(),
             branch: row.branch.clone(),
             landed_at: row.updated_at,
         });
     }
-    let now = util::now();
     let due: Vec<&MergedEntry> = if force {
         entries.iter().collect()
     } else {
@@ -557,6 +587,26 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             &row,
             /* delete_branch */ true,
         );
+        if !force
+            && let crate::merge_lifecycle::CleanupOutcome::Refused { class, .. } = &outcome
+            && *class != crate::merge_lifecycle::CleanupRefusal::ClaimBusy
+        {
+            let retry = merge_sweep::CleanupRetry::after_refusal(
+                merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref()),
+                util::now(),
+            );
+            match db.defer_merge_cleanup(&row, retry) {
+                Ok(true) => {}
+                Ok(false) => report.bookkeeping_errors.push(format!(
+                    "cleanup retry marker was not written for {}: landed row changed or detail is reserved",
+                    entry.worktree
+                )),
+                Err(error) => report.bookkeeping_errors.push(format!(
+                    "cleanup retry marker could not be written for {}: {error}",
+                    entry.worktree
+                )),
+            }
+        }
         record_cleanup(&mut report, &entry.branch, &entry.worktree, outcome);
     }
     report
@@ -613,14 +663,14 @@ mod tests {
     use super::*;
     use thegn_core::store::WorkspaceStore;
 
-    fn local_config() -> Config {
+    pub(super) fn local_config() -> Config {
         let mut cfg = Config::default();
         cfg.sandbox.enabled = false;
         cfg
     }
 
     #[expect(clippy::disallowed_methods)]
-    fn fixture(
+    pub(super) fn fixture(
         parent: &Path,
         name: &str,
         db: &Db,
@@ -1338,7 +1388,20 @@ mod tests {
                     assert!(report.discarded_build_state.is_empty());
                     assert!(report.discarded_tool_state.is_empty());
                     assert!(wt.exists(), "{state}, force={force}");
-                    assert_eq!(db.list_merge_queue().unwrap(), before);
+                    let after = db.list_merge_queue().unwrap();
+                    if ordinary_dirty || force {
+                        assert_eq!(after, before, "{state}, force={force}");
+                    } else {
+                        let retry = merge_sweep::CleanupRetry::from_detail(
+                            after[0].error_detail.as_deref(),
+                        )
+                        .expect("non-force cleanup refusal records retry marker");
+                        assert_eq!(retry.attempts, 1, "{state}, force={force}");
+                        assert!(retry.next_at > util::now(), "{state}, force={force}");
+                        let mut expected = before[0].clone();
+                        expected.error_detail = after[0].error_detail.clone();
+                        assert_eq!(after, [expected], "{state}, force={force}");
+                    }
                     assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
                 }
             }
@@ -1377,7 +1440,7 @@ mod tests {
         }
     }
 
-    fn age_landed_row(db_path: &Path, worktree: &str) {
+    pub(super) fn age_landed_row(db_path: &Path, worktree: &str) {
         rusqlite::Connection::open(db_path)
             .unwrap()
             .execute(
@@ -1459,7 +1522,19 @@ mod tests {
                 "force={force}: {report:?}"
             );
             assert!(wt.exists(), "force={force}");
-            assert_eq!(db.list_merge_queue().unwrap(), before, "force={force}");
+            let after = db.list_merge_queue().unwrap();
+            if force {
+                assert_eq!(after, before, "force={force}");
+            } else {
+                let retry =
+                    merge_sweep::CleanupRetry::from_detail(after[0].error_detail.as_deref())
+                        .expect("refusal records retry marker");
+                assert_eq!(retry.attempts, 1);
+                assert!(retry.next_at > util::now());
+                let mut expected = before[0].clone();
+                expected.error_detail = after[0].error_detail.clone();
+                assert_eq!(after, [expected]);
+            }
             assert_eq!(db.groups_for_session("layout-a").unwrap().len(), 1);
             assert_eq!(db.groups_for_session("layout-b").unwrap().len(), 1);
         }
@@ -1509,11 +1584,19 @@ mod tests {
                     "{hold}, force={force}: {report:?}"
                 );
                 assert!(wt.exists(), "{hold}, force={force}");
-                assert_eq!(
-                    db.list_merge_queue().unwrap(),
-                    before,
-                    "{hold}, force={force}"
-                );
+                let after = db.list_merge_queue().unwrap();
+                if force {
+                    assert_eq!(after, before, "{hold}, force={force}");
+                } else {
+                    let retry =
+                        merge_sweep::CleanupRetry::from_detail(after[0].error_detail.as_deref())
+                            .expect("refusal records retry marker");
+                    assert_eq!(retry.attempts, 1, "{hold}, force={force}");
+                    assert!(retry.next_at > util::now(), "{hold}, force={force}");
+                    let mut expected = before[0].clone();
+                    expected.error_detail = after[0].error_detail.clone();
+                    assert_eq!(after, [expected], "{hold}, force={force}");
+                }
                 assert_eq!(db.groups_for_session("layout-a").unwrap().len(), 1);
                 assert_eq!(db.groups_for_session("layout-b").unwrap().len(), 1);
             }
@@ -2362,5 +2445,212 @@ mod status_route_tests {
             None,
             &tx,
         ));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::tests::{age_landed_row, fixture, local_config};
+    use super::*;
+    use thegn_core::store::WorktreeAuxStore;
+
+    struct RetryFixture {
+        _isolation: crate::merge_lifecycle::TestIsolation,
+        _dir: tempfile::TempDir,
+        db_path: std::path::PathBuf,
+        db: Db,
+        root: std::path::PathBuf,
+        worktree: std::path::PathBuf,
+        cfg: Config,
+    }
+
+    fn refused_fixture(name: &str) -> RetryFixture {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, worktree) = fixture(&parent, name, &db, &isolation);
+        age_landed_row(&db_path, worktree.to_str().unwrap());
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status) VALUES('private',?1,'private',0,'running')",
+                [worktree.to_str().unwrap()],
+            )
+            .unwrap();
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.merge_queue.merged_ttl_secs = 1;
+        RetryFixture {
+            _isolation: isolation,
+            _dir: dir,
+            db_path,
+            db,
+            root,
+            worktree,
+            cfg,
+        }
+    }
+
+    fn clear_dispatch(fixture: &RetryFixture) {
+        rusqlite::Connection::open(&fixture.db_path)
+            .unwrap()
+            .execute("DELETE FROM agent_dispatches", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn cleanup_retry_refused_cleanup_records_marker_and_defers_next_sweep() {
+        let fixture = refused_fixture("retry-deferred");
+        let before = fixture.db.list_merge_queue().unwrap().remove(0);
+        let first = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert_eq!(first.kept.len(), 1);
+        let marked = fixture.db.list_merge_queue().unwrap().remove(0);
+        let retry = merge_sweep::CleanupRetry::from_detail(marked.error_detail.as_deref())
+            .expect("non-claim refusal is durable");
+        assert_eq!(retry.attempts, 1);
+        assert!(retry.next_at > util::now());
+        assert_eq!(
+            marked.updated_at, before.updated_at,
+            "retry metadata preserves landed clock"
+        );
+
+        clear_dispatch(&fixture);
+        let second = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert!(second.kept.is_empty());
+        assert_eq!(second.informational.len(), 1);
+        assert!(second.informational[0].1.contains("cleanup deferred"));
+        assert!(!second.is_incomplete());
+        assert!(second.collected.is_empty());
+        assert!(
+            fixture.worktree.exists(),
+            "deferred sweep must not run cleanup"
+        );
+
+        let repeated = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert!(
+            repeated.informational.is_empty(),
+            "one retry-window deferral is reported once per worktree and deadline"
+        );
+    }
+
+    #[test]
+    fn cleanup_retry_force_sweep_ignores_the_deferral() {
+        let fixture = refused_fixture("retry-force");
+        let first = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert_eq!(first.kept.len(), 1);
+        clear_dispatch(&fixture);
+        let forced = sweep_with_db(&fixture.cfg, &fixture.root, true, &fixture.db);
+        assert_eq!(forced.collected, ["feature"]);
+        assert!(!fixture.worktree.exists());
+    }
+
+    #[test]
+    fn cleanup_retry_claim_busy_refusal_writes_no_marker() {
+        let fixture = refused_fixture("retry-claim-busy");
+        clear_dispatch(&fixture);
+        let before = fixture.db.list_merge_queue().unwrap();
+        let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&fixture.worktree).unwrap();
+        let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(fixture.db.list_merge_queue().unwrap(), before);
+        drop(claim);
+    }
+
+    #[test]
+    fn cleanup_retry_due_marker_is_retried_and_counts_up() {
+        let fixture = refused_fixture("retry-due");
+        let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert_eq!(report.kept.len(), 1);
+        let mut row = fixture.db.list_merge_queue().unwrap().remove(0);
+        row.error_detail = Some(
+            merge_sweep::CleanupRetry {
+                attempts: 1,
+                next_at: 0,
+            }
+            .marker(),
+        );
+        rusqlite::Connection::open(&fixture.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET error_detail=?1 WHERE worktree=?2",
+                rusqlite::params![row.error_detail, row.worktree],
+            )
+            .unwrap();
+        let next = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert_eq!(next.kept.len(), 1);
+        let retry = merge_sweep::CleanupRetry::from_detail(
+            fixture.db.list_merge_queue().unwrap()[0]
+                .error_detail
+                .as_deref(),
+        )
+        .expect("due refusal advances marker");
+        assert_eq!(retry.attempts, 2);
+    }
+
+    #[test]
+    fn cleanup_retry_deferred_row_does_not_fail_the_sweep() {
+        let fixture = refused_fixture("retry-not-due");
+        let marker = merge_sweep::CleanupRetry {
+            attempts: 1,
+            next_at: util::now().saturating_add(300),
+        }
+        .marker();
+        rusqlite::Connection::open(&fixture.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET error_detail=?1 WHERE worktree=?2",
+                rusqlite::params![marker, fixture.worktree.to_str().unwrap()],
+            )
+            .unwrap();
+        clear_dispatch(&fixture);
+
+        let deferred = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert!(deferred.collected.is_empty());
+        assert!(deferred.kept.is_empty());
+        assert_eq!(deferred.informational.len(), 1);
+        assert!(
+            deferred.informational[0]
+                .1
+                .contains("cleanup deferred after 1 refusal(s)")
+        );
+        assert!(!deferred.is_incomplete());
+        assert!(fixture.worktree.exists());
+        assert_eq!(
+            fixture.db.list_merge_queue().unwrap()[0]
+                .error_detail
+                .as_deref(),
+            Some(marker.as_str()),
+            "deferral leaves retry marker unchanged"
+        );
+
+        let repeated = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        assert!(repeated.informational.is_empty());
+        assert!(!repeated.is_incomplete());
+
+        let forced = sweep_with_db(&fixture.cfg, &fixture.root, true, &fixture.db);
+        assert_eq!(forced.collected, ["feature"]);
+        assert!(!fixture.worktree.exists());
+    }
+
+    #[test]
+    fn cleanup_retry_already_merged_row_is_deferred() {
+        let fixture = refused_fixture("retry-already-merged");
+        rusqlite::Connection::open(&fixture.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET error_detail='already merged' WHERE worktree=?1",
+                [fixture.worktree.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+        let row = fixture.db.list_merge_queue().unwrap().remove(0);
+        let retry = merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref())
+            .expect("ordinary landed detail is replaced by retry metadata");
+        assert_eq!(retry.attempts, 1);
+        assert!(report.bookkeeping_errors.is_empty());
     }
 }

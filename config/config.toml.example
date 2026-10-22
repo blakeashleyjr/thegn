@@ -4165,6 +4165,8 @@ enabled = true
 # Named profiles are the usual cause — they reroot state under
 # <thegn_dir>/profiles/<name>/state, so a long profile name on a deep $HOME can
 # overflow. Set this to something short (e.g. "/tmp/thegn-work.sock") to fix it.
+# A control-socket directory visible through a sandbox bind is masked on bwrap
+# and systemd, and container backends refuse the launch.
 socket = ""
 # The daemon exits after this long with no live sessions. 0 = never exit on
 # idle. Ignored by `thegn serve`: a serving daemon keeps its TCP listener up for

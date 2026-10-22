@@ -297,8 +297,9 @@ class WorkflowPolicyTests(unittest.TestCase):
             "--source-digest",
             "--deny-self-hosted-runners",
             "--format json",
-            "runInvocationURI",
-            "$GITHUB_RUN_ID",
+            "packaging/release.py verify-attestation",
+            '--source-digest "$GITHUB_SHA"',
+            '--run-id "$GITHUB_RUN_ID"',
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, script)
@@ -341,13 +342,25 @@ class WorkflowPolicyTests(unittest.TestCase):
                 "else\n"
                 '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1"\n'
                 "fi\n"
-                'printf \'[{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"%s"}}}}]\\n\' "$run_uri"\n',
+                'runner_environment="github-hosted"\n'
+                'if [ "$GH_SELF_HOSTED" = 1 ]; then runner_environment="self-hosted"; fi\n'
+                'printf \'[{"verificationResult":{"signature":{"certificate":{"sourceRepositoryURI":"%s/%s",'
+                '"buildSignerURI":"%s/%s/.github/workflows/release.yml@refs/tags/v1.2.3",'
+                '"sourceRepositoryDigest":"%s","runnerEnvironment":"%s","runInvocationURI":"%s"}},'
+                '"statement":{"subject":[{"name":"archive","digest":{"sha256":"%s"}}]}}}]\\n\' '
+                '"$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" '
+                '"$GITHUB_SHA" "$runner_environment" "$run_uri" '
+                f'"{hashlib.sha256(bytes()).hexdigest()}"\n',
                 encoding="utf-8",
             )
             stub.chmod(0o755)
 
             def run_case(
-                *, fail: str = "", foreign_run: bool = False, empty: bool = False
+                *,
+                fail: str = "",
+                foreign_run: bool = False,
+                self_hosted: bool = False,
+                empty: bool = False,
             ) -> subprocess.CompletedProcess[str]:
                 log_path.write_text("", encoding="utf-8")
                 if empty:
@@ -368,6 +381,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                         "GH_LOG": str(log_path),
                         "GH_FAIL": fail,
                         "GH_FOREIGN_RUN": "1" if foreign_run else "0",
+                        "GH_SELF_HOSTED": "1" if self_hosted else "0",
                     }
                 )
                 return subprocess.run(
@@ -376,6 +390,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     check=False,
                     capture_output=True,
                     text=True,
+                    cwd=ROOT,
                 )
 
             result = run_case(fail="")
@@ -397,6 +412,12 @@ class WorkflowPolicyTests(unittest.TestCase):
             result = run_case(foreign_run=True)
             self.assertNotEqual(0, result.returncode)
             self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("not bound to this workflow run", result.stderr)
+
+            result = run_case(self_hosted=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("untrusted runner", result.stderr)
 
             result = run_case(fail="", empty=True)
             self.assertNotEqual(0, result.returncode)
@@ -860,7 +881,12 @@ class WorkflowPolicyTests(unittest.TestCase):
         }
         self.assertEqual(sorted(positions.values()), list(positions.values()))
         provenance = steps[positions["Verify archive provenance"]]["run"]
-        for expected in ("--signer-workflow", "--source-digest", "--deny-self-hosted-runners", "runInvocationURI"):
+        for expected in (
+            "--signer-workflow",
+            "--source-digest",
+            "--deny-self-hosted-runners",
+            "packaging/release.py verify-attestation",
+        ):
             self.assertIn(expected, provenance)
         download = steps[positions["Download every draft asset"]]["run"]
         self.assertIn('gh release download "$TAG" --dir "$root/assets"', download)
@@ -1207,6 +1233,89 @@ class WorkflowPolicyTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertIn(command, verify)
+
+    def test_verify_manifest_provenance_rehearsal(self) -> None:
+        if shutil.which("bash") is None:
+            self.skipTest("bash is required for the verify-manifest provenance rehearsal")
+        job = read_workflow("release.yml")["jobs"]["verify-manifest"]
+        step = next(
+            candidate
+            for candidate in job.get("steps", [])
+            if candidate.get("name") == "Verify archive provenance"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            assets = temporary_path / "assets"
+            assets.mkdir()
+            (assets / "thegn-v1.2.3-a.tar.gz").write_bytes(b"")
+            stub_dir = temporary_path / "bin"
+            stub_dir.mkdir()
+            log_path = temporary_path / "gh.log"
+            stub = stub_dir / "gh"
+            stub.write_text(
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$*" >> "$GH_LOG"\n'
+                'if [ "$GH_FOREIGN_RUN" = 1 ]; then\n'
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/other/attempts/1"\n'
+                "else\n"
+                '  run_uri="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1"\n'
+                "fi\n"
+                'runner_environment="github-hosted"\n'
+                'if [ "$GH_SELF_HOSTED" = 1 ]; then runner_environment="self-hosted"; fi\n'
+                'printf \'[{"verificationResult":{"signature":{"certificate":{"sourceRepositoryURI":"%s/%s",'
+                '"buildSignerURI":"%s/%s/.github/workflows/release.yml@refs/tags/v1.2.3",'
+                '"sourceRepositoryDigest":"%s","runnerEnvironment":"%s","runInvocationURI":"%s"}},'
+                '"statement":{"subject":[{"name":"archive","digest":{"sha256":"%s"}}]}}}]\\n\' '
+                '"$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" '
+                '"$GITHUB_SHA" "$runner_environment" "$run_uri" '
+                f'"{hashlib.sha256(bytes()).hexdigest()}"\n',
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+
+            def run_case(*, foreign_run: bool = False, self_hosted: bool = False):
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "PATH": f"{stub_dir}{os.pathsep}{environment.get('PATH', '')}",
+                        "VERIFY_ROOT": str(temporary_path),
+                        "TAG": "v1.2.3",
+                        "GITHUB_REPOSITORY": "o/r",
+                        "GITHUB_SHA": "e45b37fb590f7aac8d3580ab22be6cd2b450c43f",
+                        "GITHUB_SERVER_URL": "https://github.com",
+                        "GITHUB_RUN_ID": "12345",
+                        "GITHUB_TOKEN": "x",
+                        "GH_LOG": str(log_path),
+                        "GH_FOREIGN_RUN": "1" if foreign_run else "0",
+                        "GH_SELF_HOSTED": "1" if self_hosted else "0",
+                    }
+                )
+                return subprocess.run(
+                    ["bash", "-c", step["run"]],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=ROOT,
+                )
+
+            result = run_case()
+            self.assertEqual(0, result.returncode, result.stderr)
+            calls = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, len(calls))
+            self.assertIn("--source-digest e45b37fb590f7aac8d3580ab22be6cd2b450c43f", calls[0])
+            self.assertIn("--repo o/r", calls[0])
+            self.assertIn("--format json", calls[0])
+
+            result = run_case(foreign_run=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("not bound to this workflow run", result.stderr)
+
+            result = run_case(self_hosted=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("untrusted runner", result.stderr)
 
 
 if __name__ == "__main__":

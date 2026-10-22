@@ -73,7 +73,7 @@
           "project": "Agent & Workflow Platform"
         }
       ],
-      "summary": "Redacted CI-log caching, failure windows and guarded autofix are delivered; the cache-first CLI smoke and pre-PR gate remain."
+      "summary": "Redacted CI-log caching, failure windows, guarded autofix and the cache-first CLI smoke are delivered; the pre-PR gate remains."
     },
     {
       "change": "add-crash-reporting-and-traceability",
