@@ -114,11 +114,18 @@ fn admission_for_decision(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteStatus {
+    /// The launch carries the opaque admission handle.
     Handle,
+    /// The route passes `sandbox_admission::admit`, but the handle is not carried to the spawn.
     AdmittedNoHandle,
+    /// Some spawns on the route carry the handle, and others do not.
     Partial,
+    /// The route has a separate floor or sealed gate outside the handle.
     OwnGate,
+    /// The route runs on the host under the shared resource ceiling, without isolation admission.
     HostCapped,
+    /// The route runs on the host on user trust; it is not yet a declared,
+    /// command-digest-scoped exception.
     HostTrust,
 }
 
@@ -551,9 +558,10 @@ mod tests {
         let lines = route_lines();
         assert_eq!(lines.len(), 12);
         for route in LAUNCH_ROUTES {
+            let prefix = format!("  admission     {}: ", route.id);
             let line = lines
                 .iter()
-                .find(|line| line.contains(route.id))
+                .find(|line| line.starts_with(&prefix))
                 .unwrap_or_else(|| panic!("missing route line for {}", route.id));
             assert!(line.contains(route.status.as_str()), "{line}");
         }
