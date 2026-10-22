@@ -1154,6 +1154,8 @@ mod tests {
 
     #[test]
     fn supervise_page_args_require_all_and_stay_in_range() {
+        use clap::Parser as _;
+
         for action in ["plan", "status"] {
             assert!(
                 crate::Cli::try_parse_from([
