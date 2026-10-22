@@ -1,13 +1,10 @@
 # thegn
 
 > **Status: public alpha** (`0.1.0-alpha.32`). **x86_64 Linux is the supported
-> platform.** macOS on Apple silicon has build/test coverage and a generated
-> `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
-> it as best-effort, not supported: its CI job is opt-in and the interactive
-> on-device checklist is unfinished. Windows source paths and targeted tests
-> exist, but no recorded native CI run or interactive rehearsal has passed and
-> no binary is published. Expect rough
-> edges; see [`CHANGELOG.md`](CHANGELOG.md) and
+> platform.** macOS on Apple silicon is best-effort: an unsigned release archive
+> and the flake are available, but CI is opt-in and the interactive on-device
+> checklist is unfinished. Windows is deferred and has no release binary.
+> Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
@@ -115,6 +112,9 @@ familiar IDE chords._
 
 ### Nix / home-manager (recommended)
 
+On x86_64 Linux, the flake is a supported install path alongside the release
+tarball. `nix profile install` works from any Git ref.
+
 ```nix
 # flake.nix inputs
 thegn.url = "github:blakeashleyjr/thegn";
@@ -168,7 +168,7 @@ home.packages = [
 Invoke that installed launcher as `thegn-batteries`. The derivation is
 build-tested on x86_64 Linux; a clean-host interactive rehearsal remains an
 entry criterion before this path is listed as verified on additional hosts.
-The Linux standalone installer also has an explicit `./install.sh --batteries`
+From a thegn source checkout, `./install.sh --batteries` also offers a Linux
 mode: it reuses host Alacritty or builds pinned Alacritty 0.17.0 under
 `~/.local/share/thegn/batteries`, verifies Nerd Fonts v3.5.0 FiraCode by
 SHA-256 into `~/.local/share/fonts/thegn-nerd-fonts`, and creates a writable
@@ -224,19 +224,48 @@ the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
 
 ### Prebuilt binary (no Nix)
 
-The next successful tagged-release workflow is configured to attach a `thegn`
-binary for **x86_64 Linux (gnu + musl)** and best-effort **Apple silicon
-(aarch64-apple-darwin)** to the [releases page][releases]. Download the archive,
-verify the `.sha256`, and drop `thegn` on your `PATH`. The current public alpha
-has not published a macOS or Windows binary.
+Release archives are available on the [releases page][releases] for
+**x86_64 Linux** (GNU or musl) and best-effort **Apple silicon**
+(`aarch64-apple-darwin`). On Linux x86_64, install the GNU or musl archive for
+your system. For example, with GitHub CLI installed and authenticated
+(`gh auth login`), this downloads the GNU archive and its checksum for the
+newest published release:
 
-**On macOS, prefer Nix or a local source build.** Homebrew metadata exists but
-the public tap is not advertised until its real-release rehearsal passes. The
-archives are deliberately unsigned, and
+```sh
+TAG="$(gh release list --repo blakeashleyjr/thegn --exclude-drafts --limit 100 --json tagName --jq '.[0].tagName')"
+TARGET=x86_64-unknown-linux-gnu
+ARCHIVE="thegn-${TAG}-${TARGET}.tar.gz"
+CHECKSUM="thegn-${TAG}-${TARGET}.sha256"
+gh release download "$TAG" --repo blakeashleyjr/thegn --pattern "$ARCHIVE" --pattern "$CHECKSUM"
+sha256sum -c "$CHECKSUM"
+gh attestation verify "$ARCHIVE" --repo blakeashleyjr/thegn
+tar -xzf "$ARCHIVE" thegn
+mkdir -p "$HOME/.local/bin"
+install -m 755 thegn "$HOME/.local/bin/thegn"
+```
+
+The musl build is statically linked. The GNU build needs glibc at least as new
+as the `ubuntu-latest` runner used to build it; users on older distributions
+should use the musl archive. The archive contains only `thegn` at its root, so
+run `thegn` (the flake package and `./install.sh` also provide the `tg` alias).
+Put `$HOME/.local/bin` on `PATH` if it is not already there. The `.sha256`
+sidecar checks the archive digest, and
+`gh attestation verify` checks its build provenance. You can also download the
+archive and sidecar in a browser and run the verification commands locally.
+Tarball users must also put `fzf`, `gum`, `yazi`, `delta`, and `gdu` on `PATH`
+for the panes that use them; the flake wraps these tools.
+
+`git` is required at runtime. `gh` and `ssh` are used as needed for GitHub and
+SSH integration where native support has gaps. Diff highlighting is built in;
+`lazygit` (the embedded Git UI) is optional.
+
+**On macOS, prefer Nix or a local source build.** Homebrew and AUR publication
+are pending owner setup and a clean-host rehearsal. The macOS archive is
+deliberately unsigned, and
 a tarball downloaded through a browser is quarantined by Gatekeeper — it needs
 `xattr -dr com.apple.quarantine ./thegn` before it will launch. Homebrew formula
-downloads, Nix store paths, and the locally generated `thegn.app` are not
-quarantined, so none of them hit that. The reasoning is in
+downloads, if published, Nix store paths, and the locally generated `thegn.app`
+are not quarantined, so none of them hit that. The reasoning is in
 [`RELEASING.md`](RELEASING.md), which also covers the release process and the
 crates.io / `cargo binstall` status.
 
@@ -245,13 +274,15 @@ crates.io / `cargo binstall` status.
 ### Standalone
 
 ```sh
-./install.sh    # builds thegn; installs tg, tg-tui, thegn + an owl app-launcher entry
+./install.sh    # from a thegn source checkout; not included in the release archive
 tg              # thegn in the current terminal
 tg --standalone # dedicated Alacritty window with the bundled profile (also: tg -s)
 tg-tui          # same as plain `tg` — always the current terminal
 ```
 
-`./install.sh` needs Rust/Cargo. `tg` and `tg-tui` run directly in the current
+`./install.sh` runs from a thegn source checkout and needs Rust/Cargo; it is not
+included in the release archive. It builds and installs `thegn`, `tg`, `tg-tui`
+and an owl app-launcher entry. `tg` and `tg-tui` run directly in the current
 terminal, whatever it is; `tg --standalone` (`-s`) opens thegn in its own
 Alacritty window using the bundled hermetic profile (`config/alacritty.toml`),
 so Alacritty is only needed for that path. The installer also registers thegn
@@ -266,8 +297,8 @@ gaps); `lazygit` is optional.
 thegn is a TUI, so on macOS the launcher entry is a generated `thegn.app` in
 `~/Applications` that opens a terminal emulator running thegn — Spotlight,
 Raycast, Alfred and the Dock all index it. `./install.sh` writes it
-automatically; for the Nix or Homebrew installs, which never run `install.sh`,
-generate it from a checkout:
+automatically; for Nix installs, or Homebrew if published, generate it from a
+checkout:
 
 ```sh
 just macos-app                                  # points at `thegn` on PATH
@@ -284,26 +315,20 @@ prebuilt `.app` would need Developer ID signing and notarization first. Re-run
 after moving or reinstalling the binary (the launcher falls back to searching
 the usual prefixes, but the baked path is what it prefers).
 
-**macOS and Windows are unvalidated in this release.** Neither has been run
-through a full interactive checklist. Windows has MSVC implementations and
-targeted IPC/Job-Object tests awaiting their first recorded native CI pass;
-macOS has local build/test evidence on Apple silicon, but its CI job has never
-been run and no binaries are published (see
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Treat both as work-in-progress:
+**macOS is best-effort; Windows is deferred.** On Apple silicon, the unsigned
+macOS release archive and flake are available, but CI is opt-in and the
+interactive on-device checklist is unfinished (see
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Windows has no release binary; source
+build notes below are for contributors, not a supported install path:
 
 - **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
   rustup + Homebrew deps) and offers to install what's missing, then builds.
   Nothing is installed without asking.
-- **Windows (native, no WSL):** with [rustup](https://rustup.rs) + the VS Build
-  Tools installed, `cargo install --path crates/thegn-host`. Run it inside
-  [Windows Terminal](https://aka.ms/terminal). Container sandboxing is a
-  Linux/WSL2 feature — native panes run host-side, scoped by Job Objects. See
-  CONTRIBUTING "Windows (native) notes" for details. An opt-in CI run is
-  configured to retain `thegn-x86_64-pc-windows-msvc` after a separate job
-  downloads and smokes it; until the first green run is recorded, that artifact
-  is not an available or supported install path.
+- **Windows (native, no WSL):** contributor build notes are in CONTRIBUTING
+  "Windows (native) notes". Windows is deferred and no release binary is
+  published.
 
-Reports (and fixes) from either platform are welcome — that is how they graduate.
+Reports from either platform are welcome.
 
 ## How it works
 
@@ -412,19 +437,21 @@ path**, so host-side git reads (sidebar, panel, PR) keep working.
 
 ## Channels
 
-The **stable** build — what you get from a release binary, `nix profile install`,
-or `./install.sh` — ships the shell described above. A set of experimental
+The **stable** build — what you get from a release tarball or the supported
+Linux x86_64 Nix flake — ships the shell described above. A source checkout can
+also build and install it with `./install.sh`. A set of experimental
 subsystems is compiled in but **clamped off** outside the dev channel:
 
 - remote worktrees over SSH and named non-local environments,
-- cloud execution providers,
-- the Observe dashboards and the placement engine,
-- non-GitHub issue trackers (GitHub PR/issue viewing stays available).
+- cloud execution providers and the managed pool,
+- the Observe dashboards,
+- the placement engine,
+- voice mode.
 
 Enable them with `THEGN_CHANNEL=dev`, or install the dev build
-(`nix run .#dev` / `nix profile install .#dev`, which lands as `thegn-dev`
-alongside a stable install). `thegn doctor` prints which channel you are on and
-what is clamped.
+(`nix run github:blakeashleyjr/thegn#dev` / `nix profile install
+github:blakeashleyjr/thegn#dev`, which lands as `thegn-dev` alongside a stable
+install). `thegn doctor` prints which channel you are on and what is clamped.
 
 ## Development
 
