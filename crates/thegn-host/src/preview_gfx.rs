@@ -570,3 +570,421 @@ mod tests {
         assert!(!admitted.iter().any(|bytes| bytes == &draw));
     }
 }
+
+#[cfg(test)]
+mod cross_surface_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[derive(Default)]
+    struct OuterKitty {
+        shown: BTreeSet<u32>,
+        log: Vec<String>,
+        global_delete: bool,
+    }
+
+    impl OuterKitty {
+        fn apply(&mut self, bytes: &[u8]) {
+            let mut rest = bytes;
+            while let Some(start) = rest.windows(3).position(|window| window == b"\x1b_G") {
+                rest = &rest[start + 3..];
+                let Some(end) = rest.windows(2).position(|window| window == b"\x1b\\") else {
+                    break;
+                };
+                let apc = &rest[..end];
+                rest = &rest[end + 2..];
+                let control_end = apc
+                    .iter()
+                    .position(|byte| *byte == b';')
+                    .unwrap_or(apc.len());
+                let control = std::str::from_utf8(&apc[..control_end])
+                    .expect("kitty control fields are ASCII");
+                let fields: Vec<(&str, &str)> = control
+                    .split(',')
+                    .filter_map(|field| field.split_once('='))
+                    .collect();
+                let value = |key: &str| {
+                    fields
+                        .iter()
+                        .find_map(|(name, value)| (*name == key).then_some(*value))
+                };
+                match value("a") {
+                    Some("T" | "p") => {
+                        if let Some(id) = value("i").and_then(|id| id.parse::<u32>().ok()) {
+                            self.shown.insert(id);
+                            self.log.push(format!("draw id {id}"));
+                        } else {
+                            // Kitty continuation chunks have no action field and are ignored.
+                            self.log.push("draw without image id".to_string());
+                        }
+                    }
+                    Some("d") if value("d") == Some("I") => {
+                        if let Some(id) = value("i").and_then(|id| id.parse::<u32>().ok()) {
+                            self.shown.remove(&id);
+                            self.log.push(format!("scoped delete id {id}"));
+                        } else {
+                            self.global_delete = true;
+                            self.shown.clear();
+                            self.log
+                                .push("GLOBAL DELETE: image delete missing id".to_string());
+                        }
+                    }
+                    Some("d") => {
+                        self.global_delete = true;
+                        self.shown.clear();
+                        self.log.push(format!(
+                            "GLOBAL DELETE: unsupported delete form {}",
+                            control
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Wire {
+        refuse: bool,
+        admitted: Vec<Vec<u8>>,
+    }
+
+    impl Wire {
+        fn submit(&mut self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+            if self.refuse {
+                Err(bytes)
+            } else {
+                self.admitted.push(bytes);
+                Ok(())
+            }
+        }
+
+        fn flush(&mut self, outer: &mut OuterKitty) {
+            for bytes in self.admitted.drain(..) {
+                outer.apply(&bytes);
+            }
+        }
+    }
+
+    fn raster() -> Raster {
+        Raster {
+            rgba: vec![1, 2, 3, 4],
+            w: 1,
+            h: 1,
+            kitty: None,
+        }
+    }
+
+    fn panel() -> Rect {
+        Rect {
+            x: 50,
+            y: 3,
+            cols: 30,
+            rows: 20,
+        }
+    }
+
+    fn relay(relay_state: &mut crate::kitty_relay::KittyRelay, child_apc: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        relay_state.feed_with_rect(child_apc, (8, 5), |piece| match piece {
+            crate::kitty_relay::Piece::GfxDisplay(display) => {
+                bytes.extend(crate::kitty_relay::cup((0, 0), (0, 0)));
+                bytes.extend(display);
+            }
+            crate::kitty_relay::Piece::GfxOther(other) => bytes.extend(other),
+            crate::kitty_relay::Piece::Emulator(_)
+            | crate::kitty_relay::Piece::GfxAnswer(_)
+            | crate::kitty_relay::Piece::Rejected => {}
+        });
+        bytes
+    }
+
+    fn corner_draw(relay_state: &mut crate::kitty_relay::KittyRelay, payload: &[u8]) -> Vec<u8> {
+        relay(
+            relay_state,
+            &[
+                b"\x1b_Ga=T,i=7,f=24,s=1,v=1;".as_slice(),
+                payload,
+                b"\x1b\\",
+            ]
+            .concat(),
+        )
+    }
+
+    fn record_step(outer: &OuterKitty, step: &str, preview: bool, corner: bool) {
+        let mut expected = BTreeSet::new();
+        if preview {
+            expected.insert(crate::graphics::PREVIEW_IMAGE_ID);
+        }
+        if corner {
+            expected.insert(crate::kitty_relay::CORNER_ID_BASE + 1);
+        }
+        assert_eq!(
+            outer.shown, expected,
+            "{step}: shown IDs differ; full history: {:?}; actual IDs: {:?}",
+            outer.log, outer.shown
+        );
+        assert!(
+            !outer.global_delete,
+            "{step}: global kitty delete observed; full history: {:?}; actual IDs: {:?}",
+            outer.log, outer.shown
+        );
+    }
+
+    fn refused_then_retry(
+        wire: &mut Wire,
+        outer: &mut OuterKitty,
+        mut retry: impl FnMut(&mut Wire),
+        step: &str,
+        preview: bool,
+        corner: bool,
+    ) {
+        wire.refuse = true;
+        let before = wire.admitted.len();
+        retry(wire);
+        assert_eq!(
+            wire.admitted.len(),
+            before,
+            "{step}: refused submission entered FIFO; history: {:?}; IDs: {:?}",
+            outer.log,
+            outer.shown
+        );
+        wire.refuse = false;
+        retry(wire);
+        wire.flush(outer);
+        record_step(outer, step, preview, corner);
+    }
+
+    #[test]
+    fn outer_model_flags_a_global_delete() {
+        let mut outer = OuterKit {
+            shown: [11, 22].into_iter().collect(),
+            ..OuterKit::default()
+        };
+        outer.apply(b"\x1b_Ga=d\x1b\\");
+        assert!(
+            outer.global_delete,
+            "global delete was not recorded; history: {:?}; IDs: {:?}",
+            outer.log, outer.shown
+        );
+        assert!(
+            outer.shown.is_empty(),
+            "global delete did not clear IDs; history: {:?}; IDs: {:?}",
+            outer.log,
+            outer.shown
+        );
+    }
+
+    #[test]
+    fn outer_model_tracks_scoped_deletes_and_chunked_draws() {
+        let rgba = vec![9; 300_000 * 4];
+        let chunked = crate::graphics::kitty_image(
+            &rgba,
+            300_000,
+            1,
+            crate::graphics::Placement {
+                origin_col: 0,
+                origin_row: 0,
+                cols: 1,
+                rows: 1,
+            },
+        )
+        .unwrap();
+        let apc_count = chunked
+            .windows(3)
+            .filter(|window| *window == b"\x1b_G")
+            .count();
+        assert!(
+            apc_count > 1,
+            "expected a chunked image, found {apc_count} APC"
+        );
+        let mut outer = OuterKitty::default();
+        outer.apply(&chunked);
+        assert_eq!(
+            outer.shown,
+            [crate::graphics::PREVIEW_IMAGE_ID].into_iter().collect()
+        );
+        assert_eq!(
+            outer.log,
+            [format!("draw id {}", crate::graphics::PREVIEW_IMAGE_ID)]
+        );
+        outer.apply(&crate::graphics::delete_preview());
+        assert!(
+            outer.shown.is_empty(),
+            "scoped preview delete left IDs; history: {:?}; IDs: {:?}",
+            outer.log,
+            outer.shown
+        );
+        assert!(!outer.global_delete, "history: {:?}", outer.log);
+    }
+
+    #[test]
+    fn steady_preview_survives_every_corner_lifecycle_under_refusal() {
+        let mut outer = OuterKitty::default();
+        let mut wire = Wire::default();
+        let mut preview = PreviewGfx::new();
+        preview.set("a.png".to_string(), raster());
+        let mut pending_preview = crate::preview_retry::PendingPreviewOob::default();
+        let draw = preview.frame(Some(panel()), Some("a.png"), false, true);
+        pending_preview.offer(draw, |bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "steady preview", true, false);
+
+        let mut corner = crate::preview_retry::PendingCornerOob::default();
+        let mut relay_state = crate::kitty_relay::KittyRelay::new();
+        let first_draw = corner_draw(&mut relay_state, b"AQID");
+        let mut first_offered = false;
+        refused_then_retry(
+            &mut wire,
+            &mut outer,
+            |wire| {
+                if first_offered {
+                    corner.retry(true, |bytes| wire.submit(bytes));
+                } else {
+                    first_offered = true;
+                    corner.offer_draw(first_draw.clone(), true, |bytes| wire.submit(bytes));
+                }
+            },
+            "corner draw",
+            true,
+            true,
+        );
+
+        let replacement = corner_draw(&mut relay_state, b"BAUG");
+        let mut replacement_offered = false;
+        refused_then_retry(
+            &mut wire,
+            &mut outer,
+            |wire| {
+                if replacement_offered {
+                    corner.retry(true, |bytes| wire.submit(bytes));
+                } else {
+                    replacement_offered = true;
+                    corner.offer_draw(replacement.clone(), true, |bytes| wire.submit(bytes));
+                }
+            },
+            "corner replacement",
+            true,
+            true,
+        );
+
+        corner.require_delete();
+        refused_then_retry(
+            &mut wire,
+            &mut outer,
+            |wire| corner.retry(true, |bytes| wire.submit(bytes)),
+            "corner geometry delete",
+            true,
+            false,
+        );
+
+        corner.offer_draw(replacement.clone(), true, |bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "corner restored before occlusion", true, true);
+        corner.occlude();
+        wire.refuse = true;
+        corner.retry(false, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        corner.retry(true, |bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "corner occlusion and clear", true, true);
+
+        corner.screen_cleared();
+        wire.refuse = true;
+        corner.retry(false, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        corner.retry(true, |bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "corner screen clear replay", true, true);
+
+        let child_delete = relay(&mut relay_state, b"\x1b_Ga=d,i=7;\x1b\\");
+        wire.refuse = true;
+        assert!(wire.submit(child_delete.clone()).is_err());
+        wire.refuse = false;
+        wire.submit(child_delete)
+            .unwrap_or_else(|_| panic!("wire unexpectedly refused child delete"));
+        wire.flush(&mut outer);
+        record_step(&outer, "corner child delete", true, false);
+
+        assert!(
+            preview
+                .frame(Some(panel()), Some("a.png"), false, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn steady_corner_survives_every_preview_lifecycle_under_refusal() {
+        let mut outer = OuterKitty::default();
+        let mut wire = Wire::default();
+        let mut relay_state = crate::kitty_relay::KittyRelay::new();
+        let corner_bytes = corner_draw(&mut relay_state, b"AQID");
+        wire.submit(corner_bytes)
+            .unwrap_or_else(|_| panic!("initial corner submission refused"));
+        wire.flush(&mut outer);
+        record_step(&outer, "steady corner", false, true);
+
+        let mut preview = PreviewGfx::new();
+        preview.set("a.png".to_string(), raster());
+        let mut pending = crate::preview_retry::PendingPreviewOob::default();
+        let initial = preview.frame(Some(panel()), Some("a.png"), false, true);
+        wire.refuse = true;
+        pending.offer(initial, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        pending.retry(|bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "preview draw", true, true);
+
+        preview.set(
+            "a.png".to_string(),
+            Raster {
+                rgba: vec![5, 6, 7, 8],
+                w: 1,
+                h: 1,
+                kitty: None,
+            },
+        );
+        let stale_replacement = preview.frame(Some(panel()), Some("a.png"), false, true);
+        wire.refuse = true;
+        pending.offer(stale_replacement, |bytes| wire.submit(bytes));
+        preview.set(
+            "a.png".to_string(),
+            Raster {
+                rgba: vec![9, 10, 11, 12],
+                w: 1,
+                h: 1,
+                kitty: None,
+            },
+        );
+        let latest_replacement = preview.frame(Some(panel()), Some("a.png"), false, true);
+        pending.offer(latest_replacement, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        pending.retry(|bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "same-path latest-wins replacement", true, true);
+
+        let dismissed = preview.frame(Some(panel()), None, false, true);
+        wire.refuse = true;
+        pending.offer(dismissed, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        pending.retry(|bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "preview dismiss", false, true);
+
+        preview.set("b.png".to_string(), raster());
+        let shown_again = preview.frame(Some(panel()), Some("b.png"), false, true);
+        wire.refuse = true;
+        pending.offer(shown_again, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        pending.retry(|bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "preview shown before occlusion", true, true);
+        let occluded = preview.frame(Some(panel()), Some("b.png"), true, true);
+        wire.refuse = true;
+        pending.offer(occluded, |bytes| wire.submit(bytes));
+        wire.refuse = false;
+        pending.retry(|bytes| wire.submit(bytes));
+        wire.flush(&mut outer);
+        record_step(&outer, "preview occlusion", false, true);
+    }
+}
