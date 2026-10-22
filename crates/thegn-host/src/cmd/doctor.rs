@@ -5968,7 +5968,18 @@ args = ["--verbose"]
             assert!(route["status"].as_str().is_some());
             assert!(route["path"].as_str().is_some());
         }
-        assert_eq!(routes[0]["status"], "handle");
-        assert_eq!(routes[1]["status"], "admitted-no-handle");
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (
+                    route["id"].as_str().expect("route id is a string"),
+                    route["status"].as_str().expect("route status is a string"),
+                ))
+                .collect::<Vec<_>>(),
+            crate::sandbox_admission::LAUNCH_ROUTES
+                .iter()
+                .map(|route| (route.id, route.status.as_str()))
+                .collect::<Vec<_>>()
+        );
     }
 }
