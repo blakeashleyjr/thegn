@@ -300,6 +300,140 @@ pub fn cacheable_log_entry(entry: &CiLogEntry) -> bool {
     !entry.head_sha.trim().is_empty()
 }
 
+/// Number of complete log lines retained before the first failure marker.
+pub const FAILURE_CONTEXT_LINES: usize = 20;
+
+const EARLIER_OMITTED: &str = "... earlier log lines omitted ...\n";
+const LATER_OMITTED: &str = "... later log lines omitted ...\n";
+
+/// Keep a bounded excerpt around the first recognizable failure line.
+///
+/// Without a failure marker, this keeps the newest complete lines. Omission
+/// markers are included when they fit, and the result always respects the byte
+/// budget without splitting a UTF-8 character.
+pub fn failure_excerpt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    let chunks: Vec<&str> = text.split_inclusive('\n').collect();
+    let anchor = chunks
+        .iter()
+        .position(|chunk| crate::ci::line_is_failure(chunk.trim_end_matches(['\r', '\n'])));
+
+    let Some(anchor) = anchor else {
+        let marker = if EARLIER_OMITTED.len() <= max_bytes {
+            EARLIER_OMITTED
+        } else {
+            ""
+        };
+        let content_budget = max_bytes - marker.len();
+        let (tail, _) = bounded_tail(text, usize::MAX, content_budget);
+        if !tail.is_empty() {
+            let mut excerpt = String::with_capacity(marker.len() + tail.len());
+            excerpt.push_str(marker);
+            excerpt.push_str(&tail);
+            return excerpt;
+        }
+
+        let last = chunks.last().copied().unwrap_or("");
+        let cut = floor_char_boundary(last, content_budget);
+        let mut excerpt = String::with_capacity(marker.len() + cut);
+        excerpt.push_str(marker);
+        excerpt.push_str(&last[..cut]);
+        return excerpt;
+    };
+
+    let mut start = anchor.saturating_sub(FAILURE_CONTEXT_LINES);
+    let has_later = anchor + 1 < chunks.len();
+    let mut context_bytes: usize = chunks[start..anchor].iter().map(|line| line.len()).sum();
+    let projected_markers = if EARLIER_OMITTED.len() <= max_bytes {
+        EARLIER_OMITTED.len()
+            + if has_later && LATER_OMITTED.len() <= max_bytes - EARLIER_OMITTED.len() {
+                LATER_OMITTED.len()
+            } else {
+                0
+            }
+    } else {
+        0
+    };
+    let needs_earlier =
+        start > 0 || (projected_markers > 0 && context_bytes > (max_bytes - projected_markers) / 4);
+    let mut keep_earlier = needs_earlier && EARLIER_OMITTED.len() <= max_bytes;
+    let mut marker_bytes = 0;
+    if keep_earlier {
+        marker_bytes += EARLIER_OMITTED.len();
+    }
+    let keep_later = has_later && LATER_OMITTED.len() <= max_bytes - marker_bytes;
+    if keep_later {
+        marker_bytes += LATER_OMITTED.len();
+    }
+    let content_budget = max_bytes - marker_bytes;
+
+    // Context gets at most one quarter of the content budget. If necessary,
+    // discard its oldest lines first and mark the resulting gap when possible.
+    let context_budget = content_budget / 4;
+    while context_bytes > context_budget && start < anchor {
+        context_bytes -= chunks[start].len();
+        start += 1;
+        keep_earlier = true;
+    }
+
+    let mut content = String::with_capacity(content_budget);
+    for line in &chunks[start..anchor] {
+        content.push_str(line);
+    }
+    let mut used = content.len();
+    let mut next = anchor;
+    while next < chunks.len() {
+        let line = chunks[next];
+        if line.len() <= content_budget - used {
+            content.push_str(line);
+            used += line.len();
+            next += 1;
+        } else if next == anchor {
+            let available = content_budget - used;
+            let cut = floor_char_boundary(line, available);
+            content.push_str(&line[..cut]);
+            next += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+    let omitted_later = next < chunks.len();
+
+    // A marker can only be emitted if its full bytes fit. Content was already
+    // budgeted with markers when possible; for a newly discovered context gap,
+    // emit it only if doing so still respects the cap.
+    let mut excerpt = String::with_capacity(max_bytes);
+    if keep_earlier
+        && excerpt.len()
+            + EARLIER_OMITTED.len()
+            + content.len()
+            + usize::from(omitted_later && keep_later) * LATER_OMITTED.len()
+            <= max_bytes
+    {
+        excerpt.push_str(EARLIER_OMITTED);
+    }
+    excerpt.push_str(&content);
+    if omitted_later && keep_later && excerpt.len() + LATER_OMITTED.len() <= max_bytes {
+        excerpt.push_str(LATER_OMITTED);
+    }
+    excerpt
+}
+
+fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
+    byte = byte.min(text.len());
+    while !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +508,87 @@ mod tests {
     fn zero_limits_are_not_unlimited() {
         assert_eq!(bounded_tail("one\n", 0, 100), (String::new(), true));
         assert_eq!(bounded_tail("one\n", 100, 0), (String::new(), true));
+    }
+
+    #[test]
+    fn failure_excerpt_windows_a_mid_log_failure() {
+        let mut lines = (0..3_000)
+            .map(|line| format!("ok step {line}\n"))
+            .collect::<String>();
+        lines.push_str("error: SYNTHETIC_MID failure\n");
+        lines.push_str(
+            &(3_000..6_000)
+                .map(|line| format!("ok step {line}\n"))
+                .collect::<String>(),
+        );
+
+        let excerpt = failure_excerpt(&lines, 16 * 1024);
+
+        assert!(excerpt.contains("SYNTHETIC_MID"));
+        assert!(excerpt.contains("ok step 2980\n"));
+        assert!(excerpt.contains("ok step 2999\n"));
+        assert!(excerpt.starts_with(EARLIER_OMITTED));
+        assert!(excerpt.ends_with(LATER_OMITTED));
+        assert!(excerpt.len() <= 16 * 1024);
+    }
+
+    #[test]
+    fn failure_excerpt_marker_at_start_end_and_absent() {
+        let at_start_log = format!("error: first\n{}", "ok after\n".repeat(100));
+        let at_start = failure_excerpt(&at_start_log, 128);
+        assert!(!at_start.starts_with(EARLIER_OMITTED));
+        assert!(at_start.starts_with("error: first\n"));
+        assert!(at_start.ends_with(LATER_OMITTED));
+
+        let at_end_log = format!("{}error: last\n", "old line\n".repeat(100));
+        let at_end = failure_excerpt(&at_end_log, 64);
+        assert!(at_end.starts_with(EARLIER_OMITTED));
+        assert!(at_end.contains("error: last\n"));
+        assert!(!at_end.ends_with(LATER_OMITTED));
+
+        let absent_log = format!("{}newest line\n", "old line\n".repeat(100));
+        let absent = failure_excerpt(&absent_log, 64);
+        assert!(absent.starts_with(EARLIER_OMITTED));
+        assert!(absent.ends_with("newest line\n"));
+
+        let tiny = failure_excerpt(&"ordinary line\n".repeat(20), 8);
+        assert!(tiny.len() <= 8);
+        assert!(!tiny.starts_with(EARLIER_OMITTED));
+
+        assert_eq!(failure_excerpt("short log\n", 64), "short log\n");
+        assert_eq!(failure_excerpt("anything\n", 0), "");
+
+        let mut early_anchor_log = (0..4)
+            .map(|line| format!("context {line:02} {}\n", "x".repeat(16)))
+            .collect::<String>();
+        early_anchor_log.push_str("error: early failure\n");
+        early_anchor_log.push_str(
+            &(5..20)
+                .map(|line| format!("later line {line}\n"))
+                .collect::<String>(),
+        );
+        let early_anchor = failure_excerpt(&early_anchor_log, 128);
+        assert!(early_anchor.starts_with(EARLIER_OMITTED));
+        assert!(early_anchor.contains("error: early failure\n"));
+        assert!(early_anchor.len() <= 128);
+    }
+
+    #[test]
+    fn failure_excerpt_never_splits_utf8_or_exceeds_the_budget() {
+        let text = format!("error: {}", "é".repeat(20_000));
+        for budget in (1..=64).chain([16 * 1024]) {
+            let excerpt = failure_excerpt(&text, budget);
+            assert!(
+                excerpt.len() <= budget,
+                "budget {budget}, got {}",
+                excerpt.len()
+            );
+            assert!(excerpt.is_char_boundary(excerpt.len()));
+            assert_eq!(
+                String::from_utf8(excerpt.clone().into_bytes()).unwrap(),
+                excerpt
+            );
+        }
     }
 
     #[test]

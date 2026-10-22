@@ -369,7 +369,13 @@ fn consider_candidate_with_forge(
     let sandbox = sandbox.expect("admitted isolation carries a sandbox spec");
     let template = agent.as_deref().expect("agent checked above");
     let item = crate::pr_driver::PrItem::from(&item);
-    let log_text = thegn_core::ci_log::redact(&entry.text);
+    let log_text = thegn_core::ci_log::failure_excerpt(
+        &thegn_core::ci_log::redact(&entry.text),
+        thegn_core::agent_task::input_max_bytes(
+            thegn_core::agent_task::TaskKind::PrCiFailure,
+            "log",
+        ),
+    );
     let log = Some(log_text.as_str());
     let prepared = crate::pr_driver::compose_with_log(
         &pq,
@@ -1283,6 +1289,29 @@ mod tests {
         assert!(prompt.contains(thegn_core::ci_log::REDACTION_MARKER));
         assert!(!prompt.contains("SYNTHETIC_PEM_BODY"));
         assert!(!prompt.contains("SYNTHETIC_TOKEN"));
+    }
+
+    #[test]
+    fn ci_prompt_log_evidence_is_a_window_around_the_first_failure() {
+        let fixture = Fixture::new();
+        let (mut handoff, prompt_path) =
+            handoff_with_prompt_capture(&fixture, &fixture.pr.head_ref_oid);
+        let mut log = (0..3_000)
+            .map(|line| format!("ok step {line}\n"))
+            .collect::<String>();
+        log.push_str("error: SYNTHETIC_MID failure\n");
+        log.push_str(
+            &(3_000..6_000)
+                .map(|line| format!("ok step {line}\n"))
+                .collect::<String>(),
+        );
+        handoff.entry.text = log;
+
+        consider(&handoff, false);
+
+        let prompt = std::fs::read_to_string(prompt_path).unwrap();
+        assert!(prompt.contains("SYNTHETIC_MID"));
+        assert!(prompt.contains("ok step 2980\n"));
     }
 
     #[test]

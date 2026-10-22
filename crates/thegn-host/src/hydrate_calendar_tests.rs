@@ -1492,3 +1492,98 @@ fn stale_calendar_cache_failure_does_not_stamp_the_account() {
     let sync = t.db.get_calendar_sync("work").unwrap().unwrap();
     assert_eq!(sync.last_error, "calendar cache write failed");
 }
+
+#[test]
+fn plugin_secret_sentinel_never_reaches_the_stored_error_logs_or_status() {
+    if !crate::platform::sound_process::test_support::UNIX {
+        // This fixture is a POSIX sh script and cannot run on non-Unix hosts.
+        return;
+    }
+
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
+
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    crate::platform::set_owner_executable(fixture.path()).unwrap();
+    let script = fixture.path().join("plugin.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"token=$CAL_SENTINEL_TOKEN arg=$1\" >&2\necho \"stdout junk $CAL_SENTINEL_TOKEN $1\"\nexit 3\n",
+    )
+    .unwrap();
+    crate::platform::set_owner_executable(&script).unwrap();
+
+    let env_sentinel = "cal-env-sentinel-7f3a";
+    let arg_sentinel = "--token=cal-arg-sentinel-91c2";
+    let cfg = CalendarConfig {
+        accounts: vec![CalendarAccount {
+            name: "sentinel".into(),
+            provider: CalendarProviderKind::Command,
+            command: vec![script.display().to_string(), arg_sentinel.into()],
+            env: std::collections::BTreeMap::from([(
+                "CAL_SENTINEL_TOKEN".into(),
+                env_sentinel.into(),
+            )]),
+            timeout_secs: 10,
+            ..CalendarAccount::default()
+        }],
+        ..CalendarConfig::default()
+    };
+    let t = TmpDb::new("plugin-secret-sentinel");
+    let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+    let writer = Capture(Arc::clone(&capture.0));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(Arc::clone(&writer.0)))
+        .finish();
+    let mut toasts = Vec::new();
+
+    tracing::subscriber::with_default(subscriber, || {
+        sync_accounts(
+            &t.db,
+            &cfg,
+            d(2026, 10, 1),
+            d(2026, 10, 31),
+            true,
+            &mut |message| toasts.push(message),
+        );
+    });
+
+    let sync =
+        t.db.get_calendar_sync("sentinel")
+            .unwrap()
+            .expect("command failure is recorded");
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let evidence = format!(
+        "stored error: {}; log: {log}; toasts: {toasts:?}",
+        sync.last_error
+    );
+    assert!(!sync.last_error.is_empty(), "{evidence}");
+    assert!(sync.last_error.contains("<redacted>"), "{evidence}");
+    assert!(log.contains("calendar sync failed"), "{evidence}");
+
+    for sentinel in [env_sentinel, arg_sentinel, "cal-arg-sentinel-91c2"] {
+        assert!(!sync.last_error.contains(sentinel), "{evidence}");
+        assert!(!log.contains(sentinel), "{evidence}");
+        assert!(
+            toasts.iter().all(|message| !message.contains(sentinel)),
+            "{evidence}"
+        );
+    }
+}

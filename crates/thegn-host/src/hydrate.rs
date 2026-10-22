@@ -3364,19 +3364,24 @@ pub(crate) fn build_panel(
     let mut foreign_ci_note = None;
     if let Ok(Some((json, cached_branch, fetched_at))) = db.get_ci_cache_entry(&cache_key) {
         foreign_ci_note = thegn_core::ci::foreign_cache_note(&cached_branch, &panel.branch);
-        if foreign_ci_note.is_none()
-            && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
-        {
-            cache.runs.retain(|run| {
-                let valid = thegn_svc::ci::validate_ci_id(&run.id).is_ok();
-                if !valid {
-                    discarded_cached_ci_rows += 1;
+        if foreign_ci_note.is_none() {
+            let current_ci_context = crate::ci_refresh::reader_cache_context(&loc, &app_cfg.ci);
+            match crate::ci_refresh::cached_runs_for_reader(&json, current_ci_context.as_deref()) {
+                Ok(Some(mut cache)) => {
+                    cache.runs.retain(|run| {
+                        let valid = thegn_svc::ci::validate_ci_id(&run.id).is_ok();
+                        if !valid {
+                            discarded_cached_ci_rows += 1;
+                        }
+                        valid
+                    });
+                    discarded_cached_ci_rows += cache.discarded_rows;
+                    panel.ci_runs = cache.runs;
+                    panel.ci_fetched_at = Some(fetched_at);
                 }
-                valid
-            });
-            discarded_cached_ci_rows += cache.discarded_rows;
-            panel.ci_runs = cache.runs;
-            panel.ci_fetched_at = Some(fetched_at);
+                Err(note) => foreign_ci_note = Some(note),
+                Ok(None) => {}
+            }
         }
     }
     panel.ci_note = crate::ci_refresh::note_for(&cache_key)
@@ -3415,6 +3420,9 @@ pub(crate) fn build_panel(
             .merge_queue
             .retain(|r| repo_paths.contains(&r.worktree));
     }
+    let (claims, claim_error) = crate::merge_ops::collect_claims(db, &panel.merge_queue);
+    panel.merge_claims = claims;
+    panel.merge_claim_error = claim_error;
 
     // The PR queue — same deal: a tiny table read every model build, feeding the
     // `PrQueue` section + statusbar badge. Scoped to THIS repo, because the queue
@@ -3438,6 +3446,7 @@ pub(crate) fn build_panel(
     panel.across = build_across(
         db,
         (!crate::panel::scope::across_all()).then_some(scope_repo_root.as_path()),
+        &app_cfg.ci,
     );
 
     // Hosts-as-resources: per-[host.*] display snapshots for the System ▸ Hosts
@@ -4622,8 +4631,9 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                     }
                     if let Ok(cached) = db.get_all_issue_cache(path) {
                         for (_provider, cache_json) in cached {
-                            let Ok(issues) =
-                                serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&cache_json)
+                            let Some(issues) =
+                                thegn_core::issue::IssueCacheEntry::parse(&cache_json)
+                                    .map(|entry| entry.issues)
                             else {
                                 continue;
                             };
@@ -4979,6 +4989,7 @@ fn pr_search_row(
         branch_hint: None,
         worktree_path: None,
         repo_root: None,
+        account: None,
     }
 }
 
@@ -5116,6 +5127,7 @@ pub(crate) fn spawn_my_work_refresh(
                         branch_hint: i.branch_hint,
                         worktree_path: None,
                         repo_root: None,
+                        account: i.account,
                     });
                 }
             }
@@ -5536,11 +5548,14 @@ pub(crate) fn retarget_diff_watcher(
 fn build_across(
     db: &thegn_core::db::Db,
     repo_root: Option<&std::path::Path>,
+    ci: &thegn_core::config::CiConfig,
 ) -> thegn_core::aggregate::Aggregation {
     use thegn_core::aggregate::{Aggregation, ci_failure_excerpts};
     let rr = repo_root.map(|r| r.to_string_lossy().into_owned());
     let mut excerpts = Vec::new();
-    for w in db.worktrees().unwrap_or_default() {
+    let rows = db.worktrees().unwrap_or_default();
+    let locations = thegn_core::remote::WorktreeLocations::from_rows(&rows);
+    for w in &rows {
         if let Some(rr) = &rr
             && w.repo_root != *rr
         {
@@ -5551,15 +5566,19 @@ fn build_across(
         } else {
             w.branch.clone()
         };
-        if let Ok(Some((json, _))) = db.get_ci_cache(&w.worktree)
-            && let Some(cache) = thegn_core::ci::decode_run_cache(&json)
-        {
-            let runs = cache
-                .runs
-                .into_iter()
-                .filter(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
-                .collect::<Vec<_>>();
-            excerpts.extend(ci_failure_excerpts(&w.worktree, &label, &runs));
+        if let Ok(Some((json, _))) = db.get_ci_cache(&w.worktree) {
+            let loc = locations.loc(std::path::Path::new(&w.worktree));
+            let current_context = crate::ci_refresh::reader_cache_context(&loc, ci);
+            if let Ok(Some(cache)) =
+                crate::ci_refresh::cached_runs_for_reader(&json, current_context.as_deref())
+            {
+                let runs = cache
+                    .runs
+                    .into_iter()
+                    .filter(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
+                    .collect::<Vec<_>>();
+                excerpts.extend(ci_failure_excerpts(&w.worktree, &label, &runs));
+            }
         }
     }
     Aggregation::from_excerpts(excerpts)

@@ -33,7 +33,7 @@ use thegn_core::outln;
 use thegn_core::pipeline_approval::{ApprovalState, state_for};
 use thegn_core::pipeline_run::{self, RowLiveness};
 use thegn_core::pipeline_supervise::{self, LaneFacts, SuperviseAction, ValidationRecord};
-use thegn_core::store::{NotificationStore as _, WorktreeAuxStore as _};
+use thegn_core::store::WorktreeAuxStore as _;
 use thegn_core::util::{git_ok, git_out};
 
 #[derive(clap::Subcommand, Clone)]
@@ -54,6 +54,12 @@ pub enum Action {
         /// default: a closed row is normally finished business.
         #[arg(long)]
         all: bool,
+        /// Rows per roster page with --all (newest first; default 2048, at most 4096).
+        #[arg(long, requires = "all", value_parser = clap::value_parser!(u64).range(1..=4096))]
+        limit: Option<u64>,
+        /// With --all: show rows older than this row id (the cursor a truncated page prints).
+        #[arg(long, requires = "all")]
+        before: Option<i64>,
         /// Emit the plan as JSON.
         #[arg(long)]
         json: bool,
@@ -67,6 +73,12 @@ pub enum Action {
         /// Include lanes whose row has reached a terminal status.
         #[arg(long)]
         all: bool,
+        /// Rows per roster page with --all (newest first; default 2048, at most 4096).
+        #[arg(long, requires = "all", value_parser = clap::value_parser!(u64).range(1..=4096))]
+        limit: Option<u64>,
+        /// With --all: show rows older than this row id (the cursor a truncated page prints).
+        #[arg(long, requires = "all")]
+        before: Option<i64>,
         /// Emit as JSON.
         #[arg(long)]
         json: bool,
@@ -89,8 +101,32 @@ pub enum Action {
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
-        Action::Plan { issue, all, json } => plan(cfg, issue.as_deref(), all, json),
-        Action::Status { issue, all, json } => status(cfg, issue.as_deref(), all, json),
+        Action::Plan {
+            issue,
+            all,
+            limit,
+            before,
+            json,
+        } => plan(
+            cfg,
+            issue.as_deref(),
+            all,
+            RosterPage::from_args(limit, before)?,
+            json,
+        ),
+        Action::Status {
+            issue,
+            all,
+            limit,
+            before,
+            json,
+        } => status(
+            cfg,
+            issue.as_deref(),
+            all,
+            RosterPage::from_args(limit, before)?,
+            json,
+        ),
         Action::Validations { row, digest, json } => validations(row, digest, json),
     }
 }
@@ -107,6 +143,33 @@ struct Lane {
 
 type GatheredRows = (Vec<AgentDispatch>, BTreeMap<i64, Vec<String>>, bool);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RosterPage {
+    limit: usize,
+    before: Option<i64>,
+}
+
+impl Default for RosterPage {
+    fn default() -> Self {
+        Self {
+            limit: Db::ROSTER_HISTORY_LIMIT,
+            before: None,
+        }
+    }
+}
+
+impl RosterPage {
+    fn from_args(limit: Option<u64>, before: Option<i64>) -> Result<Self> {
+        Ok(Self {
+            limit: limit
+                .map(usize::try_from)
+                .transpose()?
+                .unwrap_or(Db::ROSTER_HISTORY_LIMIT),
+            before,
+        })
+    }
+}
+
 /// Join the roster, git, and the two supervisor ledgers into the facts the
 /// planner consumes.
 ///
@@ -114,13 +177,33 @@ type GatheredRows = (Vec<AgentDispatch>, BTreeMap<i64, Vec<String>>, bool);
 /// --is-ancestor`); the expensive question — does this build? — is never asked
 /// here, because answering it is an *action* the planner has to authorize
 /// first.
-fn gather(cfg: &Config, db: &Db, issue: Option<&str>, all: bool) -> Result<Vec<Lane>> {
+fn gather(
+    cfg: &Config,
+    db: &Db,
+    issue: Option<&str>,
+    all: bool,
+    page: RosterPage,
+) -> Result<Vec<Lane>> {
     let now_ms = thegn_core::util::now_ms();
-    let (rows, children, truncated) =
-        gather_rows(db, all, Db::ROSTER_ACTIVE_LIMIT, Db::ROSTER_HISTORY_LIMIT)?;
-    if truncated {
+    let (rows, children, truncated) = gather_rows(
+        db,
+        all,
+        Db::ROSTER_ACTIVE_LIMIT,
+        Db::ROSTER_HISTORY_LIMIT,
+        page,
+    )?;
+    let last_id = rows.last().map(|row| row.id);
+    if all
+        && truncated
+        && let Some(last_id) = last_id
+    {
         thegn_core::msg::warn(&format!(
-            "supervise roster was truncated at {} active rows and {} newest done rows; use --all for the full roster",
+            "supervise --all shows the newest {} roster rows; older rows: rerun with `--all --before {}`",
+            page.limit, last_id
+        ));
+    } else if !all && truncated {
+        thegn_core::msg::warn(&format!(
+            "supervise roster was truncated at {} active rows and {} newest done rows; use --all to page through the whole roster",
             Db::ROSTER_ACTIVE_LIMIT,
             Db::ROSTER_HISTORY_LIMIT,
         ));
@@ -216,16 +299,12 @@ fn gather_rows(
     all: bool,
     active_limit: usize,
     history_limit: usize,
+    page: RosterPage,
 ) -> Result<GatheredRows> {
     if all {
-        let rows = db.list_dispatches()?;
-        let mut children: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-        for row in &rows {
-            if let (Some(parent), Some(stage)) = (row.parent_id, row.stage.as_deref()) {
-                children.entry(parent).or_default().push(stage.to_string());
-            }
-        }
-        return Ok((rows, children, false));
+        let (rows, truncated) = db.dispatch_history_page(page.before, page.limit)?;
+        let children = db.dispatch_child_stages()?;
+        return Ok((rows, children, truncated));
     }
 
     const ACTIVE: [AgentDispatchStatus; 5] = [
@@ -291,9 +370,9 @@ fn worktree_git_facts(cfg: &Config, worktree: &Path) -> WorktreeGit {
 
 // --- plan -------------------------------------------------------------------
 
-fn plan(cfg: &Config, issue: Option<&str>, all: bool, json: bool) -> Result<()> {
+fn plan(cfg: &Config, issue: Option<&str>, all: bool, page: RosterPage, json: bool) -> Result<()> {
     let db = Db::open()?;
-    let lanes = gather(cfg, &db, issue, all)?;
+    let lanes = gather(cfg, &db, issue, all, page)?;
     let facts: Vec<LaneFacts> = lanes.iter().map(|l| l.facts.clone()).collect();
     let actions = pipeline_supervise::plan(
         &facts,
@@ -414,9 +493,15 @@ fn action_json(lane: &Lane, action: &SuperviseAction) -> serde_json::Value {
 
 // --- status -----------------------------------------------------------------
 
-fn status(cfg: &Config, issue: Option<&str>, all: bool, json: bool) -> Result<()> {
+fn status(
+    cfg: &Config,
+    issue: Option<&str>,
+    all: bool,
+    page: RosterPage,
+    json: bool,
+) -> Result<()> {
     let db = Db::open()?;
-    let lanes = gather(cfg, &db, issue, all)?;
+    let lanes = gather(cfg, &db, issue, all, page)?;
     let facts: Vec<LaneFacts> = lanes.iter().map(|l| l.facts.clone()).collect();
     let actions = pipeline_supervise::plan(
         &facts,
@@ -568,9 +653,11 @@ fn short(sha: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test fixtures seed dispatch rows through the store trait.
     use thegn_core::config_pipeline::Requirement;
     use thegn_core::issue::AgentDispatchStatus;
     use thegn_core::pipeline_approval::Approval;
+    use thegn_core::store::NotificationStore as _;
     use unicode_width::UnicodeWidthStr;
 
     const HEAD: &str = "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901";
@@ -664,7 +751,8 @@ mod tests {
         expected.sort_unstable_by(|left, right| right.cmp(left));
         let expected = expected.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
 
-        let (limited, children, truncated) = gather_rows(&db, false, 10, 2).unwrap();
+        let (limited, children, truncated) =
+            gather_rows(&db, false, 10, 2, RosterPage::default()).unwrap();
         assert!(truncated);
         assert!(children.is_empty());
         assert_eq!(
@@ -672,7 +760,8 @@ mod tests {
             expected
         );
 
-        let (complete_window, children, truncated) = gather_rows(&db, false, 10, 10).unwrap();
+        let (complete_window, children, truncated) =
+            gather_rows(&db, false, 10, 10, RosterPage::default()).unwrap();
         assert!(!truncated);
         assert!(children.is_empty());
         assert_eq!(complete_window.len(), 5);
@@ -691,7 +780,8 @@ mod tests {
         insert_row(&db, "child-stage", Some(parent), AgentDispatchStatus::Done);
         insert_row(&db, "newest", None, AgentDispatchStatus::Done);
 
-        let (rows, children, truncated) = gather_rows(&db, false, 10, 1).unwrap();
+        let (rows, children, truncated) =
+            gather_rows(&db, false, 10, 1, RosterPage::default()).unwrap();
         assert!(truncated);
         assert_eq!(rows.len(), 1);
         assert_eq!(children[&parent], vec![String::from("child-stage")]);
@@ -947,5 +1037,162 @@ mod tests {
             revoked_at_ms: None,
         };
         assert!(state_for(Some(&a), HEAD, 1, 0).is_live());
+    }
+
+    #[test]
+    fn gather_rows_all_reads_one_keyset_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        insert_row(&db, "one", None, AgentDispatchStatus::Done);
+        insert_row(&db, "two", None, AgentDispatchStatus::Failed);
+        insert_row(&db, "three", None, AgentDispatchStatus::Running);
+        insert_row(&db, "four", None, AgentDispatchStatus::Done);
+        insert_row(&db, "five", None, AgentDispatchStatus::Failed);
+
+        let expected = db
+            .list_dispatches()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        let (first, _, first_truncated) = gather_rows(
+            &db,
+            true,
+            10,
+            10,
+            RosterPage {
+                limit: 2,
+                before: None,
+            },
+        )
+        .unwrap();
+        let first_ids = first.iter().map(|row| row.id).collect::<Vec<_>>();
+        assert!(first_truncated);
+        assert_eq!(first_ids.as_slice(), &expected[..2]);
+
+        let cursor = *first_ids.last().unwrap();
+        let (second, _, second_truncated) = gather_rows(
+            &db,
+            true,
+            10,
+            10,
+            RosterPage {
+                limit: 2,
+                before: Some(cursor),
+            },
+        )
+        .unwrap();
+        let second_ids = second.iter().map(|row| row.id).collect::<Vec<_>>();
+        assert!(second_truncated);
+        assert_eq!(second_ids.as_slice(), &expected[2..4]);
+
+        let cursor = *second_ids.last().unwrap();
+        let (third, _, third_truncated) = gather_rows(
+            &db,
+            true,
+            10,
+            10,
+            RosterPage {
+                limit: 2,
+                before: Some(cursor),
+            },
+        )
+        .unwrap();
+        let third_ids = third.iter().map(|row| row.id).collect::<Vec<_>>();
+        assert!(!third_truncated);
+        assert_eq!(third_ids.as_slice(), &expected[4..]);
+
+        let walked = first_ids
+            .into_iter()
+            .chain(second_ids)
+            .chain(third_ids)
+            .collect::<Vec<_>>();
+        assert_eq!(walked, expected);
+    }
+
+    #[test]
+    fn gather_rows_all_child_stages_cover_children_outside_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        let parent = insert_row(&db, "parent", None, AgentDispatchStatus::Done);
+        insert_row(&db, "child-stage", Some(parent), AgentDispatchStatus::Done);
+        let newest = insert_row(&db, "newest", None, AgentDispatchStatus::Done);
+
+        let (rows, children, truncated) = gather_rows(
+            &db,
+            true,
+            10,
+            10,
+            RosterPage {
+                limit: 1,
+                before: None,
+            },
+        )
+        .unwrap();
+        assert!(truncated);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, newest);
+        assert_eq!(children[&parent], vec![String::from("child-stage")]);
+    }
+
+    #[test]
+    fn gather_rows_all_refuses_an_unknown_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("sup.db")).unwrap();
+        insert_row(&db, "one", None, AgentDispatchStatus::Done);
+
+        let result = gather_rows(
+            &db,
+            true,
+            10,
+            10,
+            RosterPage {
+                limit: 2,
+                before: Some(9_999),
+            },
+        );
+        assert!(matches!(result, Err(error) if error.to_string().contains("--before cursor")));
+    }
+
+    #[test]
+    fn supervise_page_args_require_all_and_stay_in_range() {
+        use clap::Parser as _;
+
+        for action in ["plan", "status"] {
+            assert!(
+                crate::Cli::try_parse_from([
+                    "thegn",
+                    "supervise",
+                    action,
+                    "--all",
+                    "--limit",
+                    "5",
+                    "--before",
+                    "7",
+                ])
+                .is_ok()
+            );
+        }
+
+        for args in [
+            ["thegn", "supervise", "plan", "--limit", "5"].as_slice(),
+            ["thegn", "supervise", "status", "--before", "7"].as_slice(),
+            ["thegn", "supervise", "plan", "--all", "--limit", "0"].as_slice(),
+            ["thegn", "supervise", "status", "--all", "--limit", "4097"].as_slice(),
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn roster_page_defaults_to_the_history_limit() {
+        assert_eq!(RosterPage::default().limit, Db::ROSTER_HISTORY_LIMIT);
+        assert_eq!(
+            RosterPage::from_args(Some(5), Some(3)).unwrap(),
+            RosterPage {
+                limit: 5,
+                before: Some(3),
+            }
+        );
     }
 }

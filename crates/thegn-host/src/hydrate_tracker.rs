@@ -12,9 +12,38 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use termwiz::terminal::TerminalWaker;
+use thegn_core::issue::{IssueCacheEntry, IssueCachePartial};
 use thegn_core::store::{CacheStore, WorktreeAuxStore};
 
 const BUSY_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+fn partial_cache_entry(
+    last_good: Option<IssueCacheEntry>,
+    partial_rows: Vec<thegn_core::issue::Issue>,
+    account: &str,
+    reason: &str,
+    now_ms: i64,
+) -> IssueCacheEntry {
+    let (issues, showing_last_good) = match last_good.filter(|entry| !entry.issues.is_empty()) {
+        Some(entry) => {
+            let showing_last_good = match entry.partial.as_ref() {
+                Some(partial) => partial.showing_last_good,
+                None => Some(true),
+            };
+            (entry.issues, showing_last_good)
+        }
+        None => (partial_rows, Some(false)),
+    };
+    IssueCacheEntry {
+        issues,
+        partial: Some(IssueCachePartial {
+            account: account.to_owned(),
+            reason: reason.to_owned(),
+            checked_at_ms: now_ms,
+            showing_last_good,
+        }),
+    }
+}
 
 struct BusyRetry {
     pending: Mutex<Option<(PathBuf, Instant)>>,
@@ -348,6 +377,39 @@ fn run_once(request: RefreshRequest) {
                 thegn_core::connectivity::report_success();
                 issues
             }
+            Err(thegn_svc::issue::IssueError::PartialList { issues, reason }) => {
+                tracing::warn!(account = %account, provider, reason, "tracker issue list was partial");
+                failures.push((format!("{provider}/{account}"), reason.to_owned()));
+                let last_good = db
+                    .get_issue_cache(&repo_key, provider, &account)
+                    .ok()
+                    .flatten()
+                    .and_then(|(json, _)| IssueCacheEntry::parse(&json))
+                    .map(|mut entry| {
+                        entry.issues.retain(|issue| {
+                            thegn_svc::issue::validate_issue_identity(issue).is_ok()
+                        });
+                        entry
+                    });
+                let partial_rows = issues
+                    .into_iter()
+                    .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
+                    .collect();
+                let entry = partial_cache_entry(
+                    last_good,
+                    partial_rows,
+                    &account,
+                    reason,
+                    thegn_core::util::now_ms(),
+                );
+                if let Ok(json) = entry.to_json()
+                    && let Err(error) = db.put_issue_cache(&repo_key, provider, &account, &json)
+                {
+                    tracing::debug!(account = %account, provider, %error, "could not store partial issue cache entry");
+                }
+                changed = true;
+                continue;
+            }
             Err(e) => {
                 // The arm was silent, so a permanently-failing account (bad
                 // token, 400) showed as an empty tracker forever with no
@@ -370,7 +432,7 @@ fn run_once(request: RefreshRequest) {
             .get_issue_cache(&repo_key, provider, &account)
             .ok()
             .flatten()
-            .and_then(|(j, _)| serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&j).ok())
+            .and_then(|(j, _)| IssueCacheEntry::parse(&j).map(|entry| entry.issues))
             .unwrap_or_default()
             .into_iter()
             .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
@@ -632,9 +694,14 @@ pub(crate) fn populate_tracker(
     panel.tracker_load = load;
     if let Ok(cached) = cached {
         for (_provider, json) in cached {
-            if let Ok(mut issues) = serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&json) {
-                issues.retain(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok());
-                panel.tracker_issues.append(&mut issues);
+            if let Some(mut entry) = IssueCacheEntry::parse(&json) {
+                entry
+                    .issues
+                    .retain(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok());
+                panel.tracker_issues.append(&mut entry.issues);
+                if let Some(partial) = entry.partial {
+                    panel.tracker_partial.push(partial);
+                }
             }
         }
     }
@@ -651,9 +718,109 @@ pub(crate) fn populate_tracker(
 mod tests {
     use super::{
         BusyRetry, MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, format_refresh_report,
-        prepare_tracker_toast_message, record_tracker_failure, safe_report_text, tracker_failures,
-        tracker_load,
+        partial_cache_entry, populate_tracker, prepare_tracker_toast_message,
+        record_tracker_failure, safe_report_text, tracker_failures, tracker_load,
     };
+
+    #[test]
+    fn partial_refresh_keeps_last_good_rows_and_marks_partial() {
+        let last_good = thegn_core::issue::IssueCacheEntry {
+            issues: vec![thegn_core::issue::Issue::default(); 2],
+            partial: None,
+        };
+        let entry = partial_cache_entry(
+            Some(last_good.clone()),
+            vec![thegn_core::issue::Issue::default()],
+            "work",
+            "page cap",
+            7,
+        );
+        assert_eq!(entry.issues, last_good.issues);
+        assert_eq!(
+            entry.partial,
+            Some(thegn_core::issue::IssueCachePartial {
+                account: "work".into(),
+                reason: "page cap".into(),
+                checked_at_ms: 7,
+                showing_last_good: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn partial_refresh_without_last_good_keeps_partial_rows() {
+        let partial_rows = vec![thegn_core::issue::Issue::default()];
+        for last_good in [None, Some(thegn_core::issue::IssueCacheEntry::default())] {
+            let entry = partial_cache_entry(last_good, partial_rows.clone(), "work", "cap", 9);
+            assert_eq!(entry.issues, partial_rows);
+            assert!(entry.partial.is_some());
+        }
+    }
+
+    #[test]
+    fn repeated_partial_refresh_keeps_the_first_partial_snapshot() {
+        let first_partial = vec![thegn_core::issue::Issue {
+            id: "first".into(),
+            ..Default::default()
+        }];
+        let cached = partial_cache_entry(None, first_partial.clone(), "work", "cap", 9);
+        let refreshed = partial_cache_entry(
+            Some(cached),
+            vec![thegn_core::issue::Issue {
+                id: "newer".into(),
+                ..Default::default()
+            }],
+            "work",
+            "cap",
+            10,
+        );
+        assert_eq!(refreshed.issues, first_partial);
+        assert!(
+            refreshed
+                .partial
+                .as_ref()
+                .is_some_and(|partial| partial.showing_last_good == Some(false))
+        );
+    }
+
+    #[test]
+    fn partial_cache_populates_panel_partial_state() {
+        use std::path::Path;
+        use thegn_core::store::CacheStore;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let issue = thegn_core::issue::Issue {
+            id: "linear:ABC-1".into(),
+            number: "ABC-1".into(),
+            provider: "linear".into(),
+            url: "https://linear.example/ABC-1".into(),
+            ..Default::default()
+        };
+        let entry = thegn_core::issue::IssueCacheEntry {
+            issues: vec![issue.clone()],
+            partial: Some(thegn_core::issue::IssueCachePartial {
+                account: "work".into(),
+                reason: "page cap".into(),
+                checked_at_ms: 7,
+                showing_last_good: Some(false),
+            }),
+        };
+        db.put_issue_cache("fixture-repo", "linear", "work", &entry.to_json().unwrap())
+            .unwrap();
+        let mut panel = crate::panel::PanelData::default();
+        populate_tracker(
+            &db,
+            "fixture-repo",
+            Path::new("/fixture-worktree"),
+            &thegn_core::config::Config::default(),
+            &mut panel,
+        );
+        assert_eq!(panel.tracker_issues, vec![issue]);
+        assert_eq!(
+            panel.tracker_partial,
+            entry.partial.into_iter().collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn tracker_load_decides_pending_ready_failed() {
