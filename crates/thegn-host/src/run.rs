@@ -972,10 +972,9 @@ pub async fn main(
                     vec![(thegn_core::notification::Priority::Info, message)],
                     None,
                     &gc_refresh_tx,
-                ) {
-                    if let Err(error) = gc_waker.wake() {
-                        tracing::debug!(target: "thegn::sandbox", %error, "orphan GC terminal wake failed");
-                    }
+                ) && let Err(error) = gc_waker.wake()
+                {
+                    tracing::debug!(target: "thegn::sandbox", %error, "orphan GC terminal wake failed");
                 }
                 // Hand the list to the loop so the Sandbox section's orphan
                 // notice actually renders — the field existed but nothing
@@ -24511,10 +24510,13 @@ async fn event_loop<T: Terminal>(
                                                             &mut model,
                                                         );
                                                     } else {
-                                                        let message = "new-worktree: not inside a git repository";
+                                                        let message =
+                                                            "new-worktree: not inside a git repository";
                                                         thegn_core::msg::warn(message);
                                                         toasts.push(
-                                                            crate::toast::priority_color(thegn_core::notification::Priority::Alert),
+                                                            crate::toast::priority_color(
+                                                                thegn_core::notification::Priority::Alert,
+                                                            ),
                                                             message,
                                                             std::time::Instant::now(),
                                                             crate::toast::DEFAULT_TTL,

@@ -589,7 +589,7 @@ pub(crate) fn sweep_root(dir: &Path) -> Option<std::path::PathBuf> {
 /// no-op.
 pub fn spawn(cfg: Config, dir: std::path::PathBuf, notify: SweepNotify) {
     tokio::task::spawn_blocking(move || {
-        let report = sweep_from(&cfg, &dir, false).unwrap_or_else(SweepReport::default);
+        let report = sweep_from(&cfg, &dir, false).unwrap_or_default();
         let lines = report_lines(&report);
         for (priority, line) in &lines {
             match priority {
@@ -601,10 +601,9 @@ pub fn spawn(cfg: Config, dir: std::path::PathBuf, notify: SweepNotify) {
             lines,
             notify.report_empty.then_some(NOTHING_TO_SWEEP),
             &notify.refresh_tx,
-        ) {
-            if let Err(error) = notify.waker.wake() {
-                tracing::debug!(target: "thegn::merge_sweep", %error, "merge sweep terminal wake failed");
-            }
+        ) && let Err(error) = notify.waker.wake()
+        {
+            tracing::debug!(target: "thegn::merge_sweep", %error, "merge sweep terminal wake failed");
         }
     });
 }
@@ -2231,7 +2230,6 @@ mod tests {
 mod status_route_tests {
     use super::*;
     use crate::hydrate::RefreshKind;
-    use thegn_core::notification::Priority;
 
     #[test]
     fn report_lines_keep_every_existing_message_text() {
