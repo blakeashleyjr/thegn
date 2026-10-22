@@ -27,9 +27,8 @@ use crate::vpn::{OciRuntime, exec_in};
 mod tests;
 
 /// OCI runtimes to try when reaching a worktree's sandbox container. We don't
-/// record which one created it, so try the likely ones (mirrors
-/// `share::likely_runtimes`); a wrong runtime fails to find the container and is
-/// skipped.
+/// record which one created it, so try the likely ones; a wrong runtime fails
+/// to find the container and is skipped.
 fn likely_runtimes() -> Vec<OciRuntime> {
     vec![
         OciRuntime::podman(),
