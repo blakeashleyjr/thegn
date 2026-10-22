@@ -150,6 +150,39 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let mut rows = Vec::new();
+    if !ctx.model.panel.tracker_partial.is_empty() {
+        let accounts = ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .map(|partial| display_cell(&partial.account))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows_label = if ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .all(|partial| partial.showing_last_good == Some(true))
+        {
+            "showing the last complete list"
+        } else if ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .all(|partial| partial.showing_last_good == Some(false))
+        {
+            "showing the partial list"
+        } else {
+            "showing cached rows"
+        };
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            display_clip(&format!("partial results: {accounts} — {rows_label}"), cols),
+        )])));
+    }
     let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
     let shared = thegn_core::issue::ids_shared_across_accounts(
@@ -233,6 +266,39 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let mut rows = Vec::new();
+    if !ctx.model.panel.tracker_partial.is_empty() {
+        let accounts = ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .map(|partial| display_cell(&partial.account))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows_label = if ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .all(|partial| partial.showing_last_good == Some(true))
+        {
+            "showing the last complete list"
+        } else if ctx
+            .model
+            .panel
+            .tracker_partial
+            .iter()
+            .all(|partial| partial.showing_last_good == Some(false))
+        {
+            "showing the partial list"
+        } else {
+            "showing cached rows"
+        };
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            display_clip(&format!("partial results: {accounts} — {rows_label}"), cols),
+        )])));
+    }
     let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
     let shared = thegn_core::issue::ids_shared_across_accounts(
@@ -373,6 +439,17 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .map(|p| format!(" [{p}]"))
             .unwrap_or_default();
         format!("{sigils} {names}  {open} open / {total}{filter_tag}")
+    };
+    let provider_label = if data.tracker_partial.is_empty() {
+        provider_label
+    } else {
+        let accounts = data
+            .tracker_partial
+            .iter()
+            .map(|partial| display_cell(&partial.account))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{provider_label}  partial: {accounts}")
     };
 
     rows.push(PanelRow::plain(Line::segs(vec![
@@ -741,6 +818,117 @@ mod tests {
             .collect();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].hit, Some(PanelHit::Row(Section::Issues, 1)));
+    }
+
+    #[test]
+    fn partial_notice_names_the_account() {
+        let issue = issue("ABC-1", IssuePriority::High, IssueStatus::Todo, "");
+        let partial = thegn_core::issue::IssueCachePartial {
+            account: "work".into(),
+            reason: "page cap".into(),
+            checked_at_ms: 7,
+            showing_last_good: Some(false),
+        };
+        let render = |tracker_partial| {
+            let model = crate::chrome::FrameModel {
+                panel: crate::panel::PanelData {
+                    tracker_issues: vec![issue.clone()],
+                    tracker_partial,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let ui = crate::panel::PanelUi {
+                open: Section::Issues,
+                ..Default::default()
+            };
+            let ctx = SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 60,
+                rows: 20,
+            };
+            content(&ctx)
+        };
+        let partial_rows = render(vec![partial]);
+        let text = partial_rows
+            .iter()
+            .flat_map(|row| match &row.line {
+                Line::Segs(segs) => segs.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>(),
+                Line::Blank
+                | Line::Fill { .. }
+                | Line::Split { .. }
+                | Line::SplitMinLeft { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("partial results"));
+        assert!(text.contains("work"));
+        assert!(text.contains("showing the partial list"));
+        assert_eq!(
+            partial_rows
+                .iter()
+                .filter_map(|row| row.hit)
+                .collect::<Vec<_>>(),
+            vec![PanelHit::Row(Section::Issues, 0)]
+        );
+
+        let complete_rows = render(Vec::new());
+        assert!(!complete_rows.iter().any(|row| match &row.line {
+            Line::Segs(segs) => segs.iter().any(|seg| seg.text.contains("partial results")),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn partial_state_appears_in_issues_summary_and_full_header() {
+        let model = crate::chrome::FrameModel {
+            panel: crate::panel::PanelData {
+                tracker_issues: vec![issue("ABC-1", IssuePriority::High, IssueStatus::Todo, "")],
+                issues_configured: true,
+                tracker_partial: vec![thegn_core::issue::IssueCachePartial {
+                    account: "work".into(),
+                    reason: "page cap".into(),
+                    checked_at_ms: 7,
+                    showing_last_good: Some(true),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let summary = crate::panel::sections::summary(Section::Issues, &model)
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(summary.contains(" partial"));
+
+        let ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 150,
+            rows: 20,
+        };
+        let header = content(&ctx)
+            .iter()
+            .flat_map(|row| match &row.line {
+                Line::Segs(segs) => segs
+                    .iter()
+                    .map(|segment| segment.text.as_str())
+                    .collect::<Vec<_>>(),
+                Line::Blank
+                | Line::Fill { .. }
+                | Line::Split { .. }
+                | Line::SplitMinLeft { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(header.contains("partial: work"));
     }
 
     #[test]
