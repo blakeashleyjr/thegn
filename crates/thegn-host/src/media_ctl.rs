@@ -25,6 +25,19 @@ struct MediaOpChain {
 
 type MediaOpTail = Arc<Mutex<MediaOpChain>>;
 
+/// What application shutdown could stop before its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaShutdown {
+    pub(crate) unsettled_watchers: usize,
+    pub(crate) ops_settled: bool,
+}
+
+impl MediaShutdown {
+    pub(crate) fn is_settled(&self) -> bool {
+        self.unsettled_watchers == 0 && self.ops_settled
+    }
+}
+
 static MEDIA_OP_TAIL: LazyLock<MediaOpTail> =
     LazyLock::new(|| Arc::new(Mutex::new(MediaOpChain::default())));
 static MEDIA_OP_PENDING: LazyLock<Arc<AtomicUsize>> =
@@ -558,6 +571,65 @@ fn cancel_op_chain(tail: &MediaOpTail) {
     chain.drain = Some(joiner);
 }
 
+async fn shutdown_media_parts(
+    tail: &MediaOpTail,
+    in_flight: &[&Mutex<Option<tokio::task::JoinHandle<()>>>],
+    watchers: &crate::media_watch::WatcherRegistry,
+    deadline: tokio::time::Instant,
+) -> MediaShutdown {
+    shutdown_media_parts_with_watchers(tail, in_flight, watchers.shutdown_until(deadline), deadline)
+        .await
+}
+
+async fn shutdown_media_parts_with_watchers<F>(
+    tail: &MediaOpTail,
+    in_flight: &[&Mutex<Option<tokio::task::JoinHandle<()>>>],
+    watcher_shutdown: F,
+    deadline: tokio::time::Instant,
+) -> MediaShutdown
+where
+    F: Future<Output = usize>,
+{
+    cancel_op_chain(tail);
+    for slot in in_flight {
+        let handle = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+    let unsettled_watchers = watcher_shutdown.await;
+    let drain = tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain
+        .take();
+    let ops_settled = match drain {
+        Some(drain) => tokio::time::timeout_at(deadline, drain).await.is_ok(),
+        None => true,
+    };
+    MediaShutdown {
+        unsettled_watchers,
+        ops_settled,
+    }
+}
+
+pub(crate) async fn shutdown_media_until(deadline: tokio::time::Instant) -> MediaShutdown {
+    shutdown_media_parts_with_watchers(
+        &MEDIA_OP_TAIL,
+        &[
+            &MEDIA_PICK_IN_FLIGHT,
+            &MEDIA_QUEUE_IN_FLIGHT,
+            &MEDIA_SOURCES_IN_FLIGHT,
+        ],
+        crate::media_watch::shutdown_watchers_until(deadline),
+        deadline,
+    )
+    .await
+}
+
 /// Fire a transport op off-thread, then push the resulting snapshot so the badge/
 /// panel update immediately (the signal watcher would also catch it).
 pub(crate) fn spawn_media_op(
@@ -858,10 +930,10 @@ pub(crate) fn spawn_media_sources(
 mod tests {
     use super::{
         Latest, MediaGeneration, MediaOp, MediaOpChain, MediaOpOutcome, MediaOpTail, MediaPick,
-        MediaPreflightError, cancel_op_chain, chain_op, chain_op_with_outcome, delivery_from_read,
-        generation_is_current, loop_target, op_supported, pick_note, pick_palette,
-        queue_lease_check, record_refusal, replace_in_flight, shuffle_target, take_outcome,
-        within_media_budget,
+        MediaPreflightError, MediaShutdown, cancel_op_chain, chain_op, chain_op_with_outcome,
+        delivery_from_read, generation_is_current, loop_target, op_supported, pick_note,
+        pick_palette, queue_lease_check, record_refusal, replace_in_flight, shuffle_target,
+        shutdown_media_parts, take_outcome, within_media_budget,
     };
     use crate::panel::media::QueueItemLease;
     use std::sync::atomic::AtomicUsize;
@@ -883,6 +955,78 @@ mod tests {
                 Ok(()) | Err(_) => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_media_parts_cancels_ops_slots_and_watchers() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let tail = Arc::new(Mutex::new(MediaOpChain::default()));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let op_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_op_dropped = op_dropped.clone();
+        let (op_started_tx, op_started_rx) = tokio::sync::oneshot::channel();
+        assert!(chain_op(&tail, &pending, 8, async move {
+            let _guard = DropFlag(task_op_dropped);
+            op_started_tx.send(()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }));
+        op_started_rx.await.unwrap();
+
+        let slot_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_slot_dropped = slot_dropped.clone();
+        let (slot_started_tx, slot_started_rx) = tokio::sync::oneshot::channel();
+        let slot = Mutex::new(None);
+        replace_in_flight(
+            &slot,
+            tokio::spawn(async move {
+                let _guard = DropFlag(task_slot_dropped);
+                slot_started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }),
+        );
+        slot_started_rx.await.unwrap();
+
+        let watchers = crate::media_watch::WatcherRegistry::new();
+        let watcher_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_watcher_dropped = watcher_dropped.clone();
+        let (watcher_started_tx, watcher_started_rx) = tokio::sync::oneshot::channel();
+        drop(watchers.spawn_tracked(async move {
+            let _guard = DropFlag(task_watcher_dropped);
+            watcher_started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        watcher_started_rx.await.unwrap();
+
+        let report = shutdown_media_parts(
+            &tail,
+            &[&slot],
+            &watchers,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            report,
+            MediaShutdown {
+                unsettled_watchers: 0,
+                ops_settled: true,
+            }
+        );
+        assert!(report.is_settled());
+        assert!(op_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(watcher_dropped.load(std::sync::atomic::Ordering::Acquire));
+        for _ in 0..8 {
+            if slot_dropped.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(slot_dropped.load(std::sync::atomic::Ordering::Acquire));
     }
     type GatedOperation = (MediaOp, fn(&mut MediaCaps));
 
