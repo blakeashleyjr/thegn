@@ -323,10 +323,10 @@ fn planned_view_separates_confidentiality_from_integrity() {
 // ── real bwrap against the synthetic HOME ────────────────────────────────────
 
 /// Run `script` inside a real sealed bwrap over the fixture, returning
-/// (success, stdout). `None` when bwrap/userns is unavailable here.
-fn run_sealed(h: &Path, script: &str) -> Option<(bool, String)> {
+/// (success, stdout) or the missing prerequisite.
+fn run_sealed(h: &Path, script: &str) -> Result<(bool, String), &'static str> {
     if !thegn_core::util::have("bwrap") {
-        return None;
+        return Err("bwrap on PATH");
     }
     let mut mounts = sealed_home_allowlist(h);
     mounts.push(rw(&h.join("wt")));
@@ -337,15 +337,15 @@ fn run_sealed(h: &Path, script: &str) -> Option<(bool, String)> {
         .args(&argv[1..])
         .env("HOME", h)
         .output()
-        .ok()?;
+        .map_err(|_| "bwrap could not be spawned")?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    // userns denied (CI container) => not a product failure; skip.
+    // User namespaces denied by the environment are reported as unsupported.
     if !out.status.success()
         && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted")
     {
-        return None;
+        return Err("unprivileged user namespaces for bwrap");
     }
-    Some((out.status.success(), stdout))
+    Ok((out.status.success(), stdout))
 }
 
 #[test]
@@ -365,9 +365,12 @@ fn real_bwrap_sealed_cannot_read_canaries_but_worktree_and_git_work() {
            -c commit.gpgsign=false commit -q --allow-empty -m t && echo gitok",
         h = h.display()
     );
-    let Some((_, out)) = run_sealed(&h, &script) else {
-        // skipped: no usable bwrap here
-        return;
+    let (_, out) = match run_sealed(&h, &script) {
+        Ok(result) => result,
+        Err(prereq) => {
+            assert!(!thegn_core::testenv::require_or_skip(prereq, false));
+            return;
+        }
     };
     assert!(!out.contains(CANARY), "canary leaked: {out}");
     assert!(!h.join("wt/stolen").exists(), "canary copied into worktree");
@@ -394,8 +397,7 @@ fn real_bwrap_sealed_cannot_read_canaries_but_worktree_and_git_work() {
 
 #[test]
 fn user_gnupg_mount_never_reaches_a_sealed_argv() {
-    if !thegn_core::util::have("bwrap") {
-        // skipped: no usable bwrap here
+    if !thegn_core::testenv::require_or_skip("bwrap on PATH", thegn_core::util::have("bwrap")) {
         return;
     }
     let td = fixture();
@@ -421,7 +423,10 @@ fn user_gnupg_mount_never_reaches_a_sealed_argv() {
         SandboxProfile::Sealed,
         Placement::Local,
     ) else {
-        // skipped: no usable bwrap here
+        assert!(!thegn_core::testenv::require_or_skip(
+            "a resolvable sealed bwrap spec",
+            false,
+        ));
         return;
     };
     assert_eq!(spec.seal_home.as_deref(), h.to_str());
@@ -690,7 +695,10 @@ fn systemd_sealed_without_read_only_root_fails_closed() {
 
 #[test]
 fn sealed_systemd_allowlist_survives_auto_caches_off() {
-    if !thegn_core::util::have("systemd-run") {
+    if !thegn_core::testenv::require_or_skip(
+        "systemd-run on PATH",
+        thegn_core::util::have("systemd-run"),
+    ) {
         return;
     }
     let td = fixture();
@@ -712,6 +720,10 @@ fn sealed_systemd_allowlist_survives_auto_caches_off() {
         SandboxProfile::Sealed,
         Placement::Local,
     ) else {
+        assert!(!thegn_core::testenv::require_or_skip(
+            "a resolvable sealed systemd spec",
+            false,
+        ));
         return;
     };
     assert!(
