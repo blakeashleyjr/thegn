@@ -567,6 +567,12 @@ pub fn strip_soft_cap(argv: &[String]) -> &[String] {
 }
 
 /// Peel whichever exclusive CPU-cap prefix the pane wrapper emitted.
+///
+/// When it adds a cap, `cap_prefix` emits either the hard `systemd-run` prefix
+/// or the soft `nice` prefix (optionally preceded by `ionice`), never both, and
+/// does not add a prefix to an argv that already starts with `systemd-run`.
+/// Since `nice` and `ionice` exec their argument, peeling a soft prefix only
+/// reveals the real program and cannot erase a sandbox boundary.
 pub fn strip_cap(argv: &[String]) -> &[String] {
     strip_soft_cap(strip_pane_cap(argv))
 }
