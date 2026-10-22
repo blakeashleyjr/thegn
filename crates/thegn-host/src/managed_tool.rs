@@ -850,6 +850,20 @@ fn sha256_file(mut file: std::fs::File) -> Result<String> {
 
 fn verify_staged_binary(staging: &Path, bin_rel: &Path) -> Result<StagedBinary> {
     let expected = staging.join(bin_rel);
+    let staging_canon = std::fs::canonicalize(staging)
+        .with_context(|| format!("canonicalize staging directory {}", staging.display()))?;
+    let resolved = std::fs::canonicalize(&expected).with_context(|| {
+        format!(
+            "installer did not produce expected binary {}",
+            expected.display()
+        )
+    })?;
+    anyhow::ensure!(
+        resolved.starts_with(&staging_canon),
+        "installer binary {} resolves outside its staging directory: {}",
+        bin_rel.display(),
+        resolved.display()
+    );
     let mut link = expected.clone();
     for _ in 0..40 {
         let metadata = std::fs::symlink_metadata(&link)
@@ -869,20 +883,6 @@ fn verify_staged_binary(staging: &Path, bin_rel: &Path) -> Result<StagedBinary> 
             .context("installer binary symlink has no parent")?
             .join(target);
     }
-    let staging_canon = std::fs::canonicalize(staging)
-        .with_context(|| format!("canonicalize staging directory {}", staging.display()))?;
-    let resolved = std::fs::canonicalize(&expected).with_context(|| {
-        format!(
-            "installer did not produce expected binary {}",
-            expected.display()
-        )
-    })?;
-    anyhow::ensure!(
-        resolved.starts_with(&staging_canon),
-        "installer binary {} resolves outside its staging directory: {}",
-        bin_rel.display(),
-        resolved.display()
-    );
     let file = thegn_core::fsperm::open_regular_file_nofollow(&resolved)
         .with_context(|| format!("open staged binary {}", resolved.display()))?;
     let target_rel = resolved
