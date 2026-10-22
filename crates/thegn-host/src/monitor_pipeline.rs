@@ -443,7 +443,8 @@ struct GroupedWorktrees {
 /// attention lookups use the registered worktree path, so each group retains
 /// every spelling and its resolved local path. Resolution is performed once
 /// per distinct path by the hydration-thread caller; unresolvable paths keep
-/// their raw identity.
+/// their raw identity. Resolution may stall on a dead network mount, just as
+/// any stat there can.
 fn grouped_worktrees(
     dispatches: &[AgentDispatch],
     resolve: &dyn Fn(&str) -> Option<String>,
@@ -977,7 +978,7 @@ mod tests {
         let mut unresolved = d(3, Some("architect"), None, 300);
         unresolved.worktree_path = "/wt/y".into();
         let resolve = |path: &str| match path {
-            "/link/x" | "/real/x/." => Some("/real/x".into()),
+            "/link/x" | "/real/x/." => Some(String::from("/real/x")),
             _ => None,
         };
 
@@ -997,7 +998,7 @@ mod tests {
         canonical_spelling.worktree_path = "/real/x/.".into();
         canonical_spelling.status = AgentDispatchStatus::WaitingHuman;
         let resolve = |path: &str| match path {
-            "/link/x" | "/real/x/." => Some("/real/x".into()),
+            "/link/x" | "/real/x/." => Some(String::from("/real/x")),
             _ => None,
         };
 
