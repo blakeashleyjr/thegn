@@ -147,7 +147,7 @@ fn same_work(row: &AgentDispatch, req: &ClaimRequest) -> bool {
         (Some(row_artifact), Some(request_artifact)) => row_artifact == request_artifact,
         _ => norm(&row.chunk_path) == norm(&req.chunk_path),
     };
-    row.issue_id == req.issue_id
+    crate::pipeline_identity::same_issue(&row.issue_id, &req.issue_id)
         && row.stage.as_deref().map(str::trim) == Some(req.stage.trim())
         && row.worktree_path == req.worktree_path
         && same_assignment
@@ -531,5 +531,18 @@ mod tests {
         let got = occupying_statuses();
         assert_eq!(got.len(), 5, "{got:?}");
         assert!(got.iter().all(|s| s.is_active()));
+    }
+
+    #[test]
+    fn decide_refuses_an_unprefixed_alias_of_an_active_row() {
+        let rows = vec![row(1, "linear:THE-74", "code", "/wt/a", Some("a.md"))];
+        assert!(matches!(
+            decide(&rows, &req("THE-74", "code", "/wt/a", Some("a.md")), 4),
+            ClaimDecision::DuplicateOf { id: 1, .. }
+        ));
+        assert!(matches!(
+            decide(&rows, &req("jira:THE-74", "code", "/wt/a", Some("a.md")), 4),
+            ClaimDecision::Grant
+        ));
     }
 }

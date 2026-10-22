@@ -1007,10 +1007,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
 
     // 1. The stage lookup (also done in `open_preflight`, before `connect`).
     let stage = stage_or_bail(cfg, d.stage)?;
-    // 2. Absolute worktree path — the agent launches here.
-    let wt = crate::cmd::resolve_worktree(Some(d.worktree.to_string()))
-        .to_string_lossy()
-        .into_owned();
+    // 2. Canonical local worktree root — the agent launches here.
+    let (issue, wt) = super::dispatch::dispatch_identity(d.issue, d.worktree)?;
     let db = Db::open()?;
     // 3. Branch from live Git HEAD. Empty is acceptable for detached,
     //    unborn, or unavailable HEAD.
@@ -1050,7 +1048,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     let outcome = super::dispatch::claim_admitted_with_refresh_led(
         &db,
         NewDispatch {
-            issue_id: d.issue,
+            issue_id: &issue,
             worktree_path: &wt,
             agent_name: &agent_name,
             stage: Some(&stage.name),
@@ -1062,7 +1060,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         stage.concurrency,
         None,
         &wt,
-        d.issue,
+        &issue,
         d.chunk,
         None,
         proof,
@@ -1202,7 +1200,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                         "session": info.id,
                         "stage": stage.name,
                         "artifact": artifact,
-                        "issue": d.issue,
+                        "issue": issue,
                         "worktree": wt,
                         "branch": branch,
                     })
