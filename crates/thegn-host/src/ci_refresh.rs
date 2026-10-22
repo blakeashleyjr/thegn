@@ -502,7 +502,7 @@ pub(crate) fn put_ci_cache_with_context(
 
 pub(crate) fn daemon_ci_runs_limit(limit: usize, max_runs: usize) -> Result<usize, String> {
     match limit {
-        0 => Ok(max_runs.min(thegn_core::config_ci::MAX_CI_RUNS).max(1)),
+        0 => Ok(max_runs.clamp(1, thegn_core::config_ci::MAX_CI_RUNS)),
         1..=thegn_core::config_ci::MAX_CI_RUNS => Ok(limit),
         _ => Err(format!(
             "limit must be between 1 and {}",
@@ -917,16 +917,15 @@ fn refresh_ci_cache_for(
                     discarded_rows: result.discarded_rows,
                     context: context.clone().unwrap_or_default(),
                 }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
-                {
-                    if let Err(error) = put_ci_cache_with_context(
+                    && let Err(error) = put_ci_cache_with_context(
                         &db,
                         &key,
                         branch.as_deref().unwrap_or(""),
                         &json,
                         context.as_deref(),
-                    ) {
-                        tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
-                    }
+                    )
+                {
+                    tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
                 }
                 let mut ingest_budget = CallBudget {
                     remaining: MAX_LOG_INGEST_CALLS,
