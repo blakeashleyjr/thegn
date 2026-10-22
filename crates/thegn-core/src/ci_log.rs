@@ -67,7 +67,7 @@ impl CiLogEntry {
         fetched_at: i64,
     ) -> Self {
         let redacted_text = redact(text);
-        let (bounded, truncated) = bounded_tail(&redacted_text, max_lines, max_bytes);
+        let (bounded, truncated) = bounded_window(&redacted_text, max_lines, max_bytes);
         Self {
             worktree: worktree.into(),
             run_id: run_id.into(),
@@ -306,6 +306,153 @@ pub const FAILURE_CONTEXT_LINES: usize = 20;
 const EARLIER_OMITTED: &str = "... earlier log lines omitted ...\n";
 const LATER_OMITTED: &str = "... later log lines omitted ...\n";
 
+/// Whether a bounded log payload is a failure-anchored window rather than a
+/// plain newest-line tail.
+pub fn is_failure_window(text: &str) -> bool {
+    text.starts_with(EARLIER_OMITTED)
+        || text.ends_with(LATER_OMITTED)
+        || (!text.ends_with('\n') && text.lines().next().is_some_and(crate::ci::line_is_failure))
+}
+
+/// Keep a bounded window around the first failure line for stored and served
+/// logs. If the newest-line tail already contains that failure (or there is no
+/// failure), output is identical to [`bounded_tail`]. [`failure_excerpt`]
+/// remains the byte-only window used for prompts.
+pub fn bounded_window(text: &str, max_lines: usize, max_bytes: usize) -> (String, bool) {
+    let (tail, truncated) = bounded_tail(text, max_lines, max_bytes);
+    if !truncated || max_lines == 0 || max_bytes == 0 {
+        return (tail, truncated);
+    }
+
+    let chunks: Vec<&str> = text.split_inclusive('\n').collect();
+    let Some(anchor) = chunks
+        .iter()
+        .position(|chunk| crate::ci::line_is_failure(chunk.trim_end_matches(['\r', '\n'])))
+    else {
+        return (tail, truncated);
+    };
+
+    let tail_start = text.len() - tail.len();
+    let anchor_start: usize = chunks[..anchor].iter().map(|chunk| chunk.len()).sum();
+    if anchor_start >= tail_start {
+        return (tail, truncated);
+    }
+
+    (
+        build_bounded_window(&chunks, anchor, max_lines, max_bytes),
+        true,
+    )
+}
+
+fn build_bounded_window(
+    chunks: &[&str],
+    anchor: usize,
+    max_lines: usize,
+    max_bytes: usize,
+) -> String {
+    let context_lines = FAILURE_CONTEXT_LINES.min(max_lines.saturating_sub(1) / 4);
+    let context_start = anchor.saturating_sub(context_lines);
+    let has_earlier = anchor > 0;
+    let has_later = anchor + 1 < chunks.len();
+    let anchor_chunk = chunks[anchor];
+
+    let mut include_earlier = has_earlier
+        && max_lines > 1
+        && anchor_chunk.len() <= max_bytes.saturating_sub(EARLIER_OMITTED.len());
+    let earlier_bytes = if include_earlier {
+        EARLIER_OMITTED.len()
+    } else {
+        0
+    };
+    let anchor_budget = max_bytes - earlier_bytes;
+    let anchor_bytes = if anchor_chunk.len() <= anchor_budget {
+        anchor_chunk.len()
+    } else {
+        floor_char_boundary(anchor_chunk, anchor_budget)
+    };
+    let anchor_text = &anchor_chunk[..anchor_bytes];
+
+    if anchor_bytes < anchor_chunk.len() {
+        return anchor_text.to_owned();
+    }
+
+    let reserve_later = has_later
+        && max_lines > 1 + usize::from(include_earlier)
+        && anchor_bytes
+            <= max_bytes
+                .saturating_sub(earlier_bytes)
+                .saturating_sub(LATER_OMITTED.len());
+    let later_bytes = if reserve_later {
+        LATER_OMITTED.len()
+    } else {
+        0
+    };
+    let content_budget = max_bytes - earlier_bytes - later_bytes - anchor_bytes;
+    let line_budget = max_lines - 1 - usize::from(include_earlier) - usize::from(reserve_later);
+
+    let mut context = Vec::new();
+    let mut used_context_bytes = 0;
+    for chunk in chunks[context_start..anchor].iter().rev().take(line_budget) {
+        if used_context_bytes + chunk.len() > content_budget {
+            break;
+        }
+        used_context_bytes += chunk.len();
+        context.push(*chunk);
+    }
+    context.reverse();
+
+    if include_earlier && anchor.saturating_sub(context.len()) == 0 {
+        include_earlier = false;
+    }
+
+    let include_later = has_later
+        && max_lines > context.len() + 1 + usize::from(include_earlier)
+        && used_context_bytes + anchor_bytes
+            <= max_bytes
+                .saturating_sub(if include_earlier {
+                    EARLIER_OMITTED.len()
+                } else {
+                    0
+                })
+                .saturating_sub(LATER_OMITTED.len());
+    let later_bytes = if include_later {
+        LATER_OMITTED.len()
+    } else {
+        0
+    };
+
+    let mut out = String::new();
+    if include_earlier {
+        out.push_str(EARLIER_OMITTED);
+    }
+    for chunk in &context {
+        out.push_str(chunk);
+    }
+    out.push_str(anchor_text);
+
+    let earlier_bytes = if include_earlier {
+        EARLIER_OMITTED.len()
+    } else {
+        0
+    };
+    let mut used_bytes = earlier_bytes + used_context_bytes + anchor_bytes;
+    let used_lines = usize::from(include_earlier) + context.len() + 1;
+    let forward_lines = max_lines - used_lines - usize::from(include_later);
+    let mut next = anchor + 1;
+    for chunk in chunks.iter().skip(next).take(forward_lines) {
+        if used_bytes + chunk.len() > max_bytes - later_bytes {
+            break;
+        }
+        out.push_str(chunk);
+        used_bytes += chunk.len();
+        next += 1;
+    }
+    if include_later && next < chunks.len() {
+        out.push_str(LATER_OMITTED);
+    }
+    out
+}
+
 /// Keep a bounded excerpt around the first recognizable failure line.
 ///
 /// Without a failure marker, this keeps the newest complete lines. Omission
@@ -446,6 +593,155 @@ mod tests {
         let (out, truncated) = bounded_tail("éé\nlast\n", 10, 6);
         assert_eq!(out, "last\n");
         assert!(truncated);
+    }
+
+    #[test]
+    fn bounded_window_keeps_a_failure_older_than_the_tail() {
+        let mut text = (0..5_000)
+            .map(|line| format!("ok line {line}\n"))
+            .collect::<String>();
+        text = text.replacen("ok line 100\n", "error: boom\n", 1);
+
+        let (window, truncated) = bounded_window(&text, 2_000, 1 << 20);
+
+        assert!(window.contains("error: boom"));
+        assert!(window.starts_with(EARLIER_OMITTED));
+        assert!(window.ends_with(LATER_OMITTED));
+        assert!(window.lines().count() <= 2_000);
+        assert!(window.len() <= 1 << 20);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn entry_new_stores_the_first_failure_of_a_long_log() {
+        let mut text = (0..5_000)
+            .map(|line| format!("ok line {line}\n"))
+            .collect::<String>();
+        text = text.replacen("ok line 100\n", "error: boom\n", 1);
+
+        let entry = CiLogEntry::new("/wt", "run", "job", "tests", &text, 2_000, 1 << 20, 1);
+
+        assert!(entry.text.contains("error: boom"));
+        assert!(entry.truncated);
+    }
+
+    #[test]
+    fn bounded_window_at_start_omits_the_earlier_marker() {
+        let text = format!("error: first\n{}", "later line\n".repeat(100));
+
+        let (window, truncated) = bounded_window(&text, 10, 512);
+
+        assert!(window.starts_with("error: first\n"));
+        assert!(!window.starts_with(EARLIER_OMITTED));
+        assert!(window.ends_with(LATER_OMITTED));
+        assert!(truncated);
+    }
+
+    #[test]
+    fn bounded_window_marks_context_dropped_near_the_log_start() {
+        let text = format!(
+            "old line\n{}\nerror: failure\n{}",
+            "x".repeat(80),
+            "later\n".repeat(20)
+        );
+
+        let (window, truncated) = bounded_window(&text, 10, 100);
+
+        assert!(window.starts_with(EARLIER_OMITTED));
+        assert!(window.contains("error: failure\n"));
+        assert!(!window.contains(&"x".repeat(80)));
+        assert!(truncated);
+    }
+
+    #[test]
+    fn bounded_window_emits_only_a_cut_anchor_prefix() {
+        let anchor = "error: é€💥\n";
+        let text = format!("\n{anchor}\nlater\n");
+
+        let (window, truncated) = bounded_window(&text, 10, 9);
+
+        assert_eq!(window, &anchor[..9]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn failure_window_helper_distinguishes_windows_from_plain_tails() {
+        assert!(!is_failure_window("ordinary tail\n"));
+        assert!(is_failure_window(
+            "... earlier log lines omitted ...\nerror: old\n"
+        ));
+        assert!(is_failure_window(
+            "error: first\n... later log lines omitted ...\n"
+        ));
+    }
+
+    #[test]
+    fn bounded_window_respects_tiny_line_and_byte_limits() {
+        let anchor = "error: é€💥 failed\n";
+        let text = format!(
+            "{}context before\n{anchor}{}",
+            "old\n".repeat(30),
+            "later\n".repeat(30)
+        );
+        let limits = [(1, 1 << 20), (2, 1 << 20), (5, 64), (3, 16), (50, 40)];
+        let results = limits
+            .into_iter()
+            .map(|(max_lines, max_bytes)| {
+                let (window, _) = bounded_window(&text, max_lines, max_bytes);
+                let line_count = window.lines().count();
+                let contains_anchor = window.contains(anchor);
+                (
+                    max_lines,
+                    max_bytes,
+                    line_count,
+                    window.len(),
+                    contains_anchor,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for ((max_lines, max_bytes), (_, _, line_count, byte_count, contains_anchor)) in
+            limits.into_iter().zip(results.iter())
+        {
+            assert!(
+                *line_count <= max_lines && *byte_count <= max_bytes,
+                "all bounded-window results: {results:?}"
+            );
+            if anchor.len() <= max_bytes {
+                assert!(*contains_anchor, "all bounded-window results: {results:?}");
+            }
+        }
+    }
+
+    // Positive controls: these preserve the old payload byte-for-byte.
+    #[test]
+    fn bounded_window_equals_bounded_tail_without_a_failure() {
+        let text = (0..5_000)
+            .map(|line| format!("ordinary line {line}\n"))
+            .collect::<String>();
+        assert_eq!(
+            bounded_window(&text, 2_000, 1 << 20),
+            bounded_tail(&text, 2_000, 1 << 20)
+        );
+    }
+
+    #[test]
+    fn bounded_window_equals_bounded_tail_when_the_tail_has_the_failure() {
+        let text = format!("{}error: recent\n", "ordinary\n".repeat(100));
+        assert_eq!(
+            bounded_window(&text, 10, 1 << 20),
+            bounded_tail(&text, 10, 1 << 20)
+        );
+    }
+
+    #[test]
+    fn bounded_window_zero_limits_match_bounded_tail() {
+        for limits in [(0, 100), (100, 0)] {
+            assert_eq!(
+                bounded_window("error: failure\n", limits.0, limits.1),
+                (String::new(), true)
+            );
+        }
     }
 
     #[test]
