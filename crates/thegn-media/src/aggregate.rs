@@ -124,7 +124,8 @@ impl MediaBackend for Aggregate {
         Box::pin(async move { self.active_child()?.toggle_fullscreen().await })
     }
 
-    /// Union of every child's controllable players (for the picker).
+    /// Union of every child's controllable players (for the picker), retaining
+    /// one overflow name so the consumer can report truncation.
     fn players(&self) -> BoxFuture<'_, Result<Vec<String>, MediaError>> {
         Box::pin(async move {
             let players = join_all(self.children.iter().enumerate().map(|(i, c)| async move {
@@ -149,7 +150,7 @@ impl MediaBackend for Aggregate {
                     }
                 };
                 for p in source_players {
-                    if out.len() == crate::model::MAX_PLAYERS {
+                    if out.len() == crate::model::PLAYER_LIST_LIMIT {
                         break;
                     }
                     if seen.insert(p.clone()) {
@@ -589,7 +590,7 @@ mod tests {
         let first_players = (0..crate::model::MAX_PLAYERS + 5)
             .map(|index| format!("player-{index}"))
             .collect::<Vec<_>>();
-        let expected = first_players[..crate::model::MAX_PLAYERS].to_vec();
+        let expected = first_players[..crate::model::PLAYER_LIST_LIMIT].to_vec();
         let aggregate = Aggregate::new(
             vec![
                 players_backend(Ok(first_players), Ok(None)),
@@ -597,6 +598,24 @@ mod tests {
             ],
             Vec::new(),
         );
+        assert_eq!(aggregate.players().await, Ok(expected));
+    }
+
+    #[tokio::test]
+    async fn players_union_keeps_one_overflow_name() {
+        let first_players = (0..crate::model::MAX_PLAYERS)
+            .map(|index| format!("player-{index}"))
+            .collect::<Vec<_>>();
+        let mut expected = first_players.clone();
+        expected.push("extra".into());
+        let aggregate = Aggregate::new(
+            vec![
+                players_backend(Ok(first_players), Ok(None)),
+                players_backend(Ok(vec!["extra".into(), "more".into()]), Ok(None)),
+            ],
+            Vec::new(),
+        );
+
         assert_eq!(aggregate.players().await, Ok(expected));
     }
 
