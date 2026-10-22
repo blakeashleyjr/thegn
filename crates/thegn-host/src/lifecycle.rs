@@ -714,20 +714,43 @@ fn claimed_recycle_checkpoint(
     .then(|| spare.checkpoint_id.clone().unwrap_or_default())
 }
 
-/// Worktree-delete path: when the deleted worktree's sandbox is a CLAIMED pool
-/// spare with a fresh provisioned-base checkpoint, restore it in place and
-/// return it to the pool (`ready`) instead of destroying it — the next worktree
-/// claims it instantly. Returns whether it was recycled (the caller skips the
-/// destroy). The deleted worktree's row/binding is dropped by the delete flow
-/// itself (`forget_worktree_group`), so no explicit unbind is needed here. On a
-/// non-recyclable row or a failed restore the phantom `claimed` row is dropped
-/// so it can't linger after the caller destroys the sandbox.
-pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> bool {
+/// What the worktree-delete path does with a provider sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteRecycle {
+    /// A claimed spare was restored in place and returned to the pool.
+    Recycled,
+    /// Destroy the sandbox; `pool_spare` says whether its ledger row should be
+    /// dropped after the provider confirms the destroy.
+    Destroy { pool_spare: bool },
+}
+
+/// Worktree-delete path: restore a recyclable claimed spare in place, or defer
+/// a spare's ledger deletion until its provider sandbox has been destroyed.
+pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> DeleteRecycle {
     let Ok(db) = thegn_core::db::Db::open() else {
-        return false;
+        return DeleteRecycle::Destroy { pool_spare: false };
     };
-    let Ok(Some(spare)) = db.pool_spare_by_name(name) else {
-        return false; // not a pool spare: a derived per-worktree sandbox
+    delete_disposition(&db, cfg, env_name, name)
+}
+
+fn delete_disposition(
+    db: &thegn_core::db::Db,
+    cfg: &Config,
+    env_name: &str,
+    name: &str,
+) -> DeleteRecycle {
+    let spare = match db.pool_spare_by_name(name) {
+        Ok(Some(spare)) => spare,
+        Ok(None) => return DeleteRecycle::Destroy { pool_spare: false },
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::lifecycle",
+                %error,
+                spare = name,
+                "cannot read the pool ledger on delete; destroying without a ledger update"
+            );
+            return DeleteRecycle::Destroy { pool_spare: false };
+        }
     };
     // The row's own repo_path (recorded at mint time) keys the lock hash — the
     // worktree's rows/files are already being torn down concurrently.
@@ -735,12 +758,22 @@ pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> bo
     if claimed_recycle_checkpoint(&spare, env_name, &current_lock).is_some()
         && recycle_spare(cfg, env_name, &spare, &current_lock)
     {
-        return true;
+        return DeleteRecycle::Recycled;
     }
-    // best-effort: drop the stale claimed row so it never lingers as a phantom
-    // spare; the caller proceeds to destroy the sandbox itself.
-    let _ = db.delete_pool_spare(name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    false
+    DeleteRecycle::Destroy { pool_spare: true }
+}
+
+/// Forget a pool spare after its provider sandbox was successfully destroyed.
+pub fn forget_destroyed_spare(name: &str) {
+    let result = thegn_core::db::Db::open().and_then(|db| db.delete_pool_spare(name));
+    if let Err(error) = result {
+        tracing::warn!(
+            target: "thegn::lifecycle",
+            %error,
+            spare = name,
+            "destroyed spare's ledger row could not be dropped"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1111,6 +1144,33 @@ mod tests {
     }
 
     #[test]
+    fn pool_delete_unrecyclable_claimed_spare_keeps_its_row() {
+        let db = Db::open_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        db.insert_pool_spare("tg-spare-a", &repo_path, "sprites")
+            .unwrap();
+        db.set_pool_spare_ready("tg-spare-a", None, "").unwrap();
+        db.claim_pool_spare(&repo_path, "sprites", "/wt/x").unwrap();
+
+        let disposition = delete_disposition(&db, &Config::default(), "sprites", "tg-spare-a");
+
+        assert_eq!(disposition, DeleteRecycle::Destroy { pool_spare: true });
+        let spare = db.pool_spare_by_name("tg-spare-a").unwrap().unwrap();
+        assert_eq!(spare.state, "claimed");
+    }
+
+    #[test]
+    fn pool_delete_non_spare_is_plain_destroy() {
+        let db = Db::open_memory().unwrap();
+
+        assert_eq!(
+            delete_disposition(&db, &Config::default(), "sprites", "derived-sandbox"),
+            DeleteRecycle::Destroy { pool_spare: false }
+        );
+    }
+
+    #[test]
     fn pool_ledger_read_error_halts_reconcile() {
         assert!(
             spares_or_halt(
@@ -1358,8 +1418,9 @@ mod live_recycle {
         assert_eq!(spare_row(&name).state, "claimed");
 
         // Delete-path recycle: back to ready, same sprite, re-claimable.
-        assert!(
+        assert_eq!(
             recycle_claimed_on_delete(&cfg, "tglive", &name),
+            DeleteRecycle::Recycled,
             "claimed spare with fresh checkpoint recycles on delete"
         );
         let row = spare_row(&name);
