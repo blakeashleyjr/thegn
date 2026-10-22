@@ -163,10 +163,13 @@ the native-trust state of each enabled plugin. Use `thegn plugin list` and
 
 ## Capabilities and host calls
 
-A plugin only gets what its manifest declares and the host grants: surfaces
-require their capability (e.g. `surface:statusbar`), and `host.call`
-requests (invoking a host capability like `worktrees.list` by catalog id)
-are checked against the plugin's `scopes` — the same `read`/`write`/`git`/
+The manifest's capabilities and the plugin's `scopes` gate what the host does
+for it over the protocol; they do not contain the plugin process, which runs
+unsandboxed as your user. Surfaces require their capability (e.g.
+`surface:statusbar`), and
+`host.call` requests (invoking a host capability like `worktrees.list` by
+catalog id) are checked against the plugin's `scopes` — the same
+`read`/`write`/`git`/
 `merge_add`/`exec`/`admin` lattice as control-API tokens. `merge_add` is the
 narrow, worktree-bound remote-enqueue grant. `write`, `git`, `merge_add`, and `exec` are
 independent; `admin` implies all scopes. Undeclared means denied, and every
@@ -212,7 +215,8 @@ to the debug log at most 20 lines per second; a line is capped at 512 bytes,
 and excess lines are suppressed. thegn keeps the last 8 KiB and line counts
 internally; no command shows them yet.
 Plugin processes are _not sandboxed_ — treat a plugin like any program you
-choose to run.
+choose to run. `thegn plugin list` reports `containment: none` (including its
+`--json` `containment` field), and `thegn plugin check` reports the same.
 
 ## Writing one
 
