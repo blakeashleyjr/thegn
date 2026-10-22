@@ -22,6 +22,19 @@ use thegn_svc::plugin::LoadedPlugin;
 use thegn_svc::plugin::loader::{AdmittedPlugin, PluginDecision};
 
 const LIVE_HEALTH_UNAVAILABLE: &str = "no attached compositor";
+const CONTAINMENT: &str = "none";
+const CONTAINMENT_NOTE: &str = concat!(
+    "capabilities and scopes are protocol permissions, not containment: ",
+    "every plugin runs unsandboxed as your user"
+);
+
+fn containment_line() -> String {
+    format!("  containment: {CONTAINMENT} ({CONTAINMENT_NOTE})")
+}
+
+fn list_containment_note() -> String {
+    format!("note: {CONTAINMENT_NOTE}")
+}
 
 /// Stable plugin lifecycle vocabulary. The offline CLI can authoritatively
 /// identify only `DisabledByConfig`; the remaining live states are reserved
@@ -137,6 +150,7 @@ struct PluginListRow {
     enabled: bool,
     source: Option<String>,
     trust: &'static str,
+    containment: &'static str,
     gated_by: Vec<String>,
     status: String,
     source_digest: String,
@@ -180,6 +194,7 @@ fn list_row(admitted: &AdmittedPlugin) -> PluginListRow {
         enabled: plugin.spec.enabled,
         source: plugin.dir.as_ref().map(|dir| dir.display().to_string()),
         trust,
+        containment: CONTAINMENT,
         gated_by: plugin.spec.gated_by(),
         status,
         source_digest: admitted.source_digest.clone(),
@@ -248,13 +263,18 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
             return vec![
                 format!("plugin {id}: disabled (not negotiated)"),
                 native_line,
+                containment_line(),
             ];
         }
         PluginDecision::RefusedUntrusted(problem) => {
             match thegn_svc::plugin::loader::negotiate(&plugin.spec) {
                 Ok(negotiated) => (negotiated, Some(problem.problem.as_str())),
                 Err(_) => {
-                    return vec![format!("plugin {id}: {}", problem.problem), native_line];
+                    return vec![
+                        format!("plugin {id}: {}", problem.problem),
+                        native_line,
+                        containment_line(),
+                    ];
                 }
             }
         }
@@ -264,6 +284,7 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
                 .map(|problem| format!("plugin {id}: refused: {}", problem.problem))
                 .collect::<Vec<_>>();
             lines.push(native_line);
+            lines.push(containment_line());
             return lines;
         }
         PluginDecision::Admitted(negotiated) => (negotiated.clone(), None),
@@ -288,6 +309,7 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
         scopes
     )];
     lines.push(native_line);
+    lines.push(containment_line());
     lines.push(format!(
         "  capabilities: granted [{}]; missing [{}]",
         granted.join(","),
@@ -353,6 +375,7 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
                     human_health(&row.health),
                 );
             }
+            outln!("{}", list_containment_note());
             for problem in &admitted.set_problems {
                 outln!("set: {problem}");
             }
@@ -621,5 +644,55 @@ mod tests {
                 .iter()
                 .any(|line| line == &format!("plugin inspect: {listed}"))
         );
+    }
+
+    #[test]
+    fn containment_json_list_row_reports_none() {
+        let row = list_row(&admitted_plugin(inspected_plugin(
+            ExtensionPoint::PaletteAction,
+            &["surface:palette"],
+        )));
+        assert_eq!(serde_json::to_value(row).unwrap()["containment"], "none");
+    }
+
+    #[test]
+    fn containment_check_lines_state_protocol_permissions_once_per_plugin() {
+        let admitted = admitted_plugin(inspected_plugin(
+            ExtensionPoint::PaletteAction,
+            &["surface:palette"],
+        ));
+
+        let mut disabled_spec =
+            inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        disabled_spec.spec.enabled = false;
+        let disabled = admitted_plugin(disabled_spec);
+        assert!(matches!(&disabled.decision, PluginDecision::Disabled));
+
+        let mut refused_spec =
+            inspected_plugin(ExtensionPoint::PaletteAction, &["network:example.com"]);
+        refused_spec.spec.scopes.clear();
+        let refused = admitted_plugin(refused_spec);
+
+        let mut invalid_spec =
+            inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        invalid_spec.spec.manifest.api = ApiVersion::new(9, 0, 0);
+        let invalid = admitted_plugin(invalid_spec);
+
+        for plugin in [&admitted, &disabled, &refused, &invalid] {
+            let lines = inspection_lines(plugin);
+            let containment_lines = lines
+                .iter()
+                .filter(|line| line.starts_with("  containment: none"))
+                .collect::<Vec<_>>();
+            assert_eq!(containment_lines.len(), 1, "{lines:?}");
+            assert!(containment_lines[0].contains("protocol permissions"));
+        }
+    }
+
+    #[test]
+    fn containment_note_text_names_the_user_authority() {
+        assert!(CONTAINMENT_NOTE.contains("not containment"));
+        assert!(CONTAINMENT_NOTE.contains("as your user"));
+        assert_eq!(list_containment_note(), format!("note: {CONTAINMENT_NOTE}"));
     }
 }
