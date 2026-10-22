@@ -67,9 +67,10 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    release. Before provenance verification or validation, the package job compares
    every downloaded archive and checksum against the upload broker's digests and
    refuses any mismatch. It then verifies every downloaded archive against the
-   `release.yml` signer workflow and the signing run's `github.sha`,
-   then requires each attestation's run invocation URL to identify that same
-   workflow run. The upload job has already checked the tag against the admitted
+   `release.yml` signer workflow and the signing run's `github.sha`, then
+   `release.py verify-attestation` checks every attestation's repository, signer
+   workflow, source commit, GitHub-hosted runner, run and subject digest. The
+   upload job has already checked the tag against the admitted
    commit before creating the attestations. Downloaders can verify an archive
    with:
 
