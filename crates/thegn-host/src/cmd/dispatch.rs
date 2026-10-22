@@ -1431,11 +1431,6 @@ impl Default for HistoryPage {
 }
 
 impl HistoryPage {
-    #[allow(
-        clippy::unnecessary_fallible_conversions,
-        clippy::useless_conversion,
-        reason = "the u64 CLI value must convert safely on 32-bit targets"
-    )]
     fn from_args(limit: Option<u64>, before: Option<i64>) -> Result<Self> {
         Ok(Self {
             limit: limit
@@ -1509,10 +1504,10 @@ fn list(active: bool, page: HistoryPage, json: bool) -> Result<()> {
             vals.push(v);
         }
         super::emit_json(&vals)?;
-        if truncated {
-            let last_id = rows.last().expect("truncated page has a row").id;
+        if truncated && let Some(last) = rows.last() {
             thegn_core::msg::warn(&format!(
-                "dispatch list shows the newest {} rows of this page; older rows: `thegn dispatch list --before {last_id}`",
+                "dispatch list shows the newest {} rows of this page; older rows: `thegn dispatch list --before {}`",
+                last.id,
                 rows.len()
             ));
         }
@@ -1593,10 +1588,10 @@ fn list(active: bool, page: HistoryPage, json: bool) -> Result<()> {
              `thegn dispatch status <id>` before re-running anything."
         );
     }
-    if truncated {
-        let last_id = rows.last().expect("truncated page has a row").id;
+    if truncated && let Some(last) = rows.last() {
         thegn_core::msg::warn(&format!(
-            "dispatch list shows the newest {} rows of this page; older rows: `thegn dispatch list --before {last_id}`",
+            "dispatch list shows the newest {} rows of this page; older rows: `thegn dispatch list --before {}`",
+            last.id,
             rows.len()
         ));
     }
@@ -2692,7 +2687,7 @@ fn status(
 
 /// THE-88 — the DB-bound half of `dispatch status`. Tests exercise the
 /// digest composition through this entry point against a tempdir DB.
-pub(crate) fn read_status(
+fn read_status(
     db: &Db,
     row: Option<i64>,
     since_ms: Option<i64>,
@@ -2805,10 +2800,10 @@ pub(crate) fn read_status(
             }
         }
     }
-    if truncated {
-        let last_id = rows.last().expect("truncated page has a row").id;
+    if truncated && let Some(last) = rows.last() {
         thegn_core::msg::warn(&format!(
-            "dispatch status --all shows the newest {} rows; older rows: `thegn dispatch status --all --before {last_id}`",
+            "dispatch status --all shows the newest {} rows; older rows: `thegn dispatch status --all --before {}`",
+            last.id,
             rows.len()
         ));
     }
