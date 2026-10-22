@@ -214,8 +214,8 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             let deliveries = Arc::clone(&deliveries);
             workers.push(
+                // Unnamed: a short-lived test thread, not a long-lived named thread (qos ratchet).
                 std::thread::Builder::new()
-                    .name("thegn-test-rem".into())
                     .spawn(move || {
                         let db = Db::open_at(&path).unwrap();
                         barrier.wait();
