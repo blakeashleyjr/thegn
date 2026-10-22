@@ -794,6 +794,7 @@ fn drive_queue_with(
         let claim = std::cell::RefCell::new(claim);
         let write_error = std::cell::RefCell::new(None::<String>);
         let post_release = std::cell::RefCell::new(None::<PostRelease>);
+        let lifecycle_notes = std::cell::RefCell::new(Vec::<String>::new());
         let stop_drain = std::cell::Cell::new(false);
         let write_fields = |db: &Db, status: MqStatus, fields: &MergeStatusFields| {
             let result = if let Some(claim) = claim.borrow().as_ref() {
@@ -847,14 +848,16 @@ fn drive_queue_with(
             if claim.borrow().is_some() {
                 *post_release.borrow_mut() = Some(PostRelease::Apply(event));
             } else {
-                crate::merge_lifecycle::apply(
+                for note in crate::merge_lifecycle::apply_reported(
                     cfg,
                     db,
                     repo_root,
                     &item.worktree,
                     &item.branch,
                     event,
-                );
+                ) {
+                    lifecycle_notes.borrow_mut().push(note.text().to_owned());
+                }
             }
         };
         let fields = set(db, MqStatus::Folding, None, None);
@@ -986,14 +989,16 @@ fn drive_queue_with(
                     if claim.borrow().is_some() {
                         *post_release.borrow_mut() = Some(PostRelease::Landed(commit.clone()));
                     } else {
-                        crate::merge_lifecycle::apply_landed(
+                        for note in crate::merge_lifecycle::apply_landed_reported(
                             cfg,
                             db,
                             repo_root,
                             &item.worktree,
                             &item.branch,
                             &commit,
-                        );
+                        ) {
+                            lifecycle_notes.borrow_mut().push(note.text().to_owned());
+                        }
                     }
                     progress(&DriveStep {
                         fields: &fields,
@@ -1426,22 +1431,30 @@ fn drive_queue_with(
             let claim_lost = claim.lost();
             match claim.finish(db) {
                 Ok(()) => match post_release.borrow_mut().take() {
-                    Some(PostRelease::Apply(event)) => crate::merge_lifecycle::apply(
-                        cfg,
-                        db,
-                        repo_root,
-                        &item.worktree,
-                        &item.branch,
-                        event,
-                    ),
-                    Some(PostRelease::Landed(commit)) => crate::merge_lifecycle::apply_landed(
-                        cfg,
-                        db,
-                        repo_root,
-                        &item.worktree,
-                        &item.branch,
-                        &commit,
-                    ),
+                    Some(PostRelease::Apply(event)) => {
+                        for note in crate::merge_lifecycle::apply_reported(
+                            cfg,
+                            db,
+                            repo_root,
+                            &item.worktree,
+                            &item.branch,
+                            event,
+                        ) {
+                            lifecycle_notes.borrow_mut().push(note.text().to_owned());
+                        }
+                    }
+                    Some(PostRelease::Landed(commit)) => {
+                        for note in crate::merge_lifecycle::apply_landed_reported(
+                            cfg,
+                            db,
+                            repo_root,
+                            &item.worktree,
+                            &item.branch,
+                            &commit,
+                        ) {
+                            lifecycle_notes.borrow_mut().push(note.text().to_owned());
+                        }
+                    }
                     None => {}
                 },
                 Err(error) if !claim_lost => out.warnings.push(format!(
@@ -1461,6 +1474,7 @@ fn drive_queue_with(
                 }
             }
         }
+        out.warnings.extend(lifecycle_notes.into_inner());
         if stop_drain.get() {
             break 'items;
         }
@@ -2877,6 +2891,38 @@ mod tests {
                 db.observe_merge_claim(&worktree).unwrap().unwrap().phase,
                 "unclaimed"
             );
+        }
+
+        #[test]
+        fn lifecycle_note_refused_cleanup_reaches_drain_warnings() {
+            let (_fixture, root, feat_wt) = clean_repo("lifecycle-note-refused");
+            let db = Db::open_memory().unwrap();
+            let queued = item(&db, &feat_wt);
+            let destroy_claim = crate::worktree_lifecycle::try_scoped_destroy_path(&feat_wt)
+                .expect("test should own the first destroy claim");
+            let config = MergeQueueConfig {
+                organize_folders: true,
+                on_landed: thegn_core::config::OnLanded::Remove,
+                ..cfg("", 1)
+            };
+
+            let outcome = drive_queue(
+                &config,
+                &uncontained_config(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.landed, ["feat"]);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|warning| { warning.starts_with("merge cleanup: kept feat — ") })
+            );
+            drop(destroy_claim);
         }
     }
 }
