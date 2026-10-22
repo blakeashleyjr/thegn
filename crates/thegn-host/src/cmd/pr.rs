@@ -252,7 +252,8 @@ fn open(worktree: Option<String>) -> Result<()> {
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    let forge = forges().for_loc(&loc);
+    let registry = forges();
+    let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
         Ok(pr) => pr,
         Err(e) => msg::die(&format!(
@@ -450,7 +451,8 @@ fn comment(worktree: Option<String>, body: String) -> Result<()> {
 
 fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    let forge = forges().for_loc(&loc);
+    let registry = forges();
+    let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
         Ok(pr) => pr,
         Err(e) => msg::die(&format!(
