@@ -76,16 +76,16 @@ impl BridgeSupervisor {
     /// the resulting [`ExecSession`] channels. `rt` is the host runtime handle the
     /// session's driver task lives on. Best-effort: a failure leaves the per-op
     /// (CLI) git path as the fallback, same as [`connect`](Self::connect).
-    pub fn connect_native(
-        &self,
-        loc: &GitLoc,
-        workdir: &str,
-        host_path: &str,
-        provider: Provider,
-        sandbox_id: String,
-        bridge: &ResidentBridge,
-        rt: tokio::runtime::Handle,
-    ) {
+    pub(crate) fn connect_native(&self, args: NativeBridgeArgs<'_>) {
+        let NativeBridgeArgs {
+            loc,
+            workdir,
+            host_path,
+            provider,
+            sandbox_id,
+            bridge,
+            rt,
+        } = args;
         if bridge::bridge_key(loc).is_none() || self.is_connected(loc) {
             return;
         }
@@ -199,6 +199,16 @@ pub struct ResidentBridge {
     sha256: String,
 }
 
+pub(crate) struct NativeBridgeArgs<'a> {
+    pub(crate) loc: &'a GitLoc,
+    pub(crate) workdir: &'a str,
+    pub(crate) host_path: &'a str,
+    pub(crate) provider: Provider,
+    pub(crate) sandbox_id: String,
+    pub(crate) bridge: &'a ResidentBridge,
+    pub(crate) rt: tokio::runtime::Handle,
+}
+
 impl ResidentBridge {
     /// Construct a resident bridge reference from a lowercase SHA-256 digest.
     pub fn from_digest(hex: &str) -> Option<Self> {
@@ -227,10 +237,7 @@ impl ResidentBridge {
 /// Bind the remote path to the digest of the exact local executable bytes.
 pub fn resident_bridge_for(data: &[u8]) -> ResidentBridge {
     let sha256 = format!("{:x}", Sha256::digest(data));
-    ResidentBridge {
-        path: format!("{BRIDGE_ROOT}/{sha256}/thegn"),
-        sha256,
-    }
+    ResidentBridge::from_digest(&sha256).expect("SHA-256 digest is lowercase hex")
 }
 
 /// Return the content-addressed parent directory for a resident bridge.

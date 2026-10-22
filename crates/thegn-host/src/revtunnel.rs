@@ -157,6 +157,16 @@ pub struct ReverseTunnelSupervisor {
     global_permits: Arc<OnceLock<Arc<Semaphore>>>,
 }
 
+pub(crate) struct StartAllArgs<'a> {
+    pub(crate) handle: &'a Handle,
+    pub(crate) cfg: &'a thegn_core::config::Config,
+    pub(crate) env: &'a thegn_core::env::Environment,
+    pub(crate) sandbox_id: &'a str,
+    pub(crate) bridge: &'a crate::bridge_sup::ResidentBridge,
+    pub(crate) worktree: &'a str,
+    pub(crate) tunnels: Vec<(u16, String)>,
+}
+
 impl ReverseTunnelSupervisor {
     pub fn new() -> Self {
         Self::default()
@@ -265,16 +275,16 @@ impl ReverseTunnelSupervisor {
     /// instantaneous health at worktree-switch would leave the port unbound (e.g.
     /// the nix-cache `:8484` "could not connect") until the next switch. Only the
     /// durable gates apply: `exec != cli` and the provider has a native exec API.
-    pub fn start_all(
-        &self,
-        handle: &Handle,
-        cfg: &thegn_core::config::Config,
-        env: &thegn_core::env::Environment,
-        sandbox_id: &str,
-        bridge: &crate::bridge_sup::ResidentBridge,
-        worktree: &str,
-        tunnels: Vec<(u16, String)>,
-    ) {
+    pub(crate) fn start_all(&self, args: StartAllArgs<'_>) {
+        let StartAllArgs {
+            handle,
+            cfg,
+            env,
+            sandbox_id,
+            bridge,
+            worktree,
+            tunnels,
+        } = args;
         if tunnels.is_empty() {
             return;
         }
