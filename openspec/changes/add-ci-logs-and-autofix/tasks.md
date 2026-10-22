@@ -79,11 +79,13 @@
       (never grow the allowlists)
 - [x] 18. `docs/help/cli.md` documents `ci runs` / `ci logs` and cache
       behavior (as built)
-- [ ] 19. Smoke: `thegn ci log` cache-first behaviour; e2e only if a frame
-      changes (re-record with `just e2e-update`)
+- [x] 19. Smoke: `thegn ci log` cache-first behaviour; e2e only if a frame
+      changes (re-record with `just e2e-update`) (as built: `test/smoke.sh`
+      seeds one `ci_log_cache` row and checks `thegn ci log` serves it from the
+      cache with no provider, re-redacts it, and never labels a miss as cached;
+      no frame changed, so no e2e re-record)
 
-Remaining: task 19 (cache-first `thegn ci log` smoke) and task 20 (the pre-PR
-gate).
+Remaining: task 20 (the pre-PR gate).
 
 ## Final
 
