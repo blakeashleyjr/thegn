@@ -242,6 +242,22 @@ pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
             }
         }
     }
+    if record.account.is_empty() {
+        match read_in(&root, &record.name) {
+            Some(existing) if !existing.account.is_empty() => {
+                record.account = existing.account;
+            }
+            Some(_) => {}
+            None => {
+                if record_exists_in(&root, &record.name)? {
+                    anyhow::bail!(
+                        "vps registry: cannot preserve account for unreadable existing record {}",
+                        record.name
+                    );
+                }
+            }
+        }
+    }
     let bytes = serde_json::to_vec_pretty(&record)?;
     root.write_owner_only_atomic(&format!("{}.json", rec.name), &bytes)
         .with_context(|| format!("publish VPS registry record {}", rec.name))?;
@@ -1191,6 +1207,21 @@ mod tests {
         assert!(record.account.is_empty());
         let encoded = serde_json::to_value(rec("tg-a-x1", "ready")).unwrap();
         assert!(encoded.get("account").is_none());
+    }
+
+    #[test]
+    fn account_empty_rewrite_preserves_existing_stamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut stamped = rec("tg-a-x1", "ready");
+        stamped.account = account_fingerprint("hetzner", "api.example", "TOKEN_A");
+        write_at(dir, &stamped).unwrap();
+
+        let mut rewrite = rec("tg-a-x1", "ready");
+        rewrite.ip = "192.0.2.9".into();
+        write_at(dir, &rewrite).unwrap();
+
+        assert_eq!(read_at(dir, "tg-a-x1").unwrap().account, stamped.account);
     }
 
     #[test]

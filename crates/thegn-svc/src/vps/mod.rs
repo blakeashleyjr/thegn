@@ -529,6 +529,10 @@ struct ResolvedVpsSpec {
 /// root + the injected key; the pipeline resolves `$HOME` dynamically.
 pub const VPS_USER: &str = "root";
 
+fn may_write_resolve_cache(existing: Option<&registry::VpsRecord>, account: &str) -> bool {
+    !existing.is_some_and(|record| !record.account.is_empty() && record.account != account)
+}
+
 /// The async driver: REST lifecycle + ssh exec/files for one named instance.
 pub struct VpsProvider {
     spec: VpsSpec,
@@ -738,18 +742,32 @@ impl VpsProvider {
                 String::new()
             }
         };
-        if let Err(error) = registry::write(&registry::VpsRecord {
-            // best-effort: registry is a cache; write failure just means no resurrection row
-            name: name.to_string(),
-            provider: self.spec.kind.as_str().into(),
-            state: "ready".into(),
-            instance_id: inst.id,
-            ip: ip.clone(),
-            created_at: inst.created.unwrap_or_else(thegn_core::util::now),
-            owner: String::new(),
-            account,
-        }) {
-            tracing::debug!(target: "thegn::vps", %error, "registry cache write failed");
+        let existing = registry::read(name);
+        let can_write_cache = may_write_resolve_cache(existing.as_ref(), &account);
+        if can_write_cache
+            && let Err(error) = registry::write(&registry::VpsRecord {
+                // best-effort: registry is a cache; write failure just means no resurrection row
+                name: name.to_string(),
+                provider: self.spec.kind.as_str().into(),
+                state: "ready".into(),
+                instance_id: inst.id,
+                ip: ip.clone(),
+                created_at: inst.created.unwrap_or_else(thegn_core::util::now),
+                owner: String::new(),
+                account: account.clone(),
+            })
+        {
+            tracing::debug!(
+                target: "thegn::vps",
+                %error,
+                "registry cache write failed"
+            );
+        } else if !can_write_cache {
+            tracing::debug!(
+                target: "thegn::vps",
+                name,
+                "registry cache write skipped: record belongs to another provider account"
+            );
         }
         *self.ip.lock().unwrap() = Some(ip.clone());
         Ok(ip)
@@ -1358,6 +1376,27 @@ impl ProviderFiles for VpsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_cache_write_refuses_other_account() {
+        let mut existing = registry::VpsRecord {
+            name: "tg-account-cache".into(),
+            provider: "hetzner".into(),
+            state: "creating".into(),
+            instance_id: String::new(),
+            ip: String::new(),
+            created_at: 1,
+            owner: String::new(),
+            account: "acct1-other".into(),
+        };
+
+        assert!(!may_write_resolve_cache(Some(&existing), "acct1-current"));
+        assert!(!may_write_resolve_cache(Some(&existing), ""));
+        assert!(may_write_resolve_cache(Some(&existing), "acct1-other"));
+        existing.account.clear();
+        assert!(may_write_resolve_cache(Some(&existing), "acct1-current"));
+        assert!(may_write_resolve_cache(None, "acct1-current"));
+    }
 
     #[test]
     fn account_is_empty_without_a_credential_ref_and_stable_with_one() {
