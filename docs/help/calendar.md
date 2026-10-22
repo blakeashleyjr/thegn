@@ -212,6 +212,10 @@ An event thegn cannot read (for example, one with a missing start, an invalid or
 duplicated field, or an unknown time zone) is left out rather than guessed. For
 local calendars, subscribed calendar URLs, and CalDAV, thegn tells you once per
 calendar how many problems it found; the notice returns only when the count changes.
+Refused events are also counted by reason, without event details, such as
+`rejected: end precedes start (2)`. Reasons include empty UID, mixed all-day
+and timed endpoints, end before start, incompatible recurrence values and an
+unknown time zone.
 
 Accounts sync independently: up to four network accounts (subscribed links and
 CalDAV) are fetched at once, while command plugins run one at a time. Each
