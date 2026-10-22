@@ -34,7 +34,7 @@ use thegn_core::store::{
 use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage, PageMode};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::calendar_docs::CalendarViewError;
+use crate::calendar_docs::{CacheSkips, CalendarViewError};
 use crate::hydrate::RefreshKind;
 
 /// Days of slack either side of a month window.
@@ -382,8 +382,13 @@ pub(crate) fn expand_month(
             events: Some(calendar.by_date.into_iter().collect()),
             // An undecodable or malformed row costs only itself, but the month
             // says so rather than passing for the whole calendar.
-            error: (cached.skipped + calendar.skipped > 0)
-                .then_some(CalendarViewError::MalformedCache),
+            error: {
+                let skips = CacheSkips {
+                    expansion: calendar.skipped,
+                    ..cached.skips
+                };
+                (skips.total() > 0).then_some(CalendarViewError::MalformedCache(skips))
+            },
         },
         Err(error) => MonthView::failed(CalendarViewError::Expansion(error)),
     }
@@ -927,18 +932,19 @@ fn row_of(e: &CalEvent, href: Option<&str>) -> CalendarRow {
     }
 }
 
-/// Cached events overlapping a window, and how many rows could not be read.
+/// Cached events overlapping a window, with value-free skip counts.
 pub(crate) struct Cached {
     pub events: Vec<CalEvent>,
     pub skipped: usize,
+    pub skips: CacheSkips,
 }
 
 /// Read cached events overlapping a window.
 ///
 /// A query failure is an error, not an empty calendar. A row that fails to
-/// deserialize (a newer schema, a corrupt write) is skipped rather than
-/// losing the whole month, but counted, so the caller can say the view is
-/// incomplete instead of presenting it as complete.
+/// deserialize (a newer schema, a corrupt write) or fails event validation is
+/// skipped rather than losing the whole month, but categorized so the caller
+/// can say why the view is incomplete instead of presenting it as complete.
 ///
 /// Date-taking convenience for the cache-mechanics tests (row counts, deserialize
 /// failures). **UTC only** — production always goes through `load_cached_window`
@@ -964,12 +970,21 @@ fn load_cached_window(db: &Db, window: CalendarWindow) -> Result<Cached, Calenda
     let mut cached = Cached {
         events: Vec::with_capacity(rows.len()),
         skipped: 0,
+        skips: CacheSkips::default(),
     };
     for (_, json) in rows {
         match serde_json::from_str::<CalEvent>(&json) {
-            Ok(event) if validate_event(&event).is_ok() => cached.events.push(event),
-            Ok(_) => cached.skipped += 1,
-            Err(_) => cached.skipped += 1,
+            Ok(event) => match validate_event(&event) {
+                Ok(()) => cached.events.push(event),
+                Err(defect) => {
+                    cached.skipped += 1;
+                    cached.skips.rejected.bump(defect);
+                }
+            },
+            Err(_) => {
+                cached.skipped += 1;
+                cached.skips.undecodable += 1;
+            }
         }
     }
     Ok(cached)
@@ -1156,9 +1171,10 @@ pub(crate) fn spawn_reminder_check_with_generation(
                             "cached calendar reminders exceed the supported 28-day lead"
                         );
                     }
-                    match due.skipped {
-                        0 => ReminderOutcome::Complete,
-                        _ => ReminderOutcome::Incomplete(CalendarViewError::MalformedCache),
+                    if due.skipped == 0 {
+                        ReminderOutcome::Complete
+                    } else {
+                        ReminderOutcome::Incomplete(CalendarViewError::MalformedCache(due.skips))
                     }
                 }
                 Err(error) => ReminderOutcome::Failed(error),
@@ -1209,6 +1225,7 @@ fn reminders_configured(cfg: &CalendarConfig) -> bool {
 pub(crate) struct DueReminders {
     pub reminders: Vec<thegn_core::calendar::DueReminder>,
     pub skipped: usize,
+    pub skips: CacheSkips,
     pub unsupported_leads: usize,
 }
 
@@ -1228,6 +1245,7 @@ pub(crate) fn due_reminders(
         return Ok(DueReminders {
             reminders: Vec::new(),
             skipped: 0,
+            skips: CacheSkips::default(),
             unsupported_leads: 0,
         });
     }
@@ -1279,6 +1297,10 @@ pub(crate) fn due_reminders(
         // that would not decode: both mean "these reminders are everything the
         // cache could yield", not "the evaluation failed".
         skipped: cached.skipped + expanded.skipped,
+        skips: CacheSkips {
+            expansion: expanded.skipped,
+            ..cached.skips
+        },
         unsupported_leads,
     })
 }
