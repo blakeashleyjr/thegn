@@ -21,7 +21,7 @@
 //! delivers the same isolation while eliminating the risky one-time migration of
 //! every existing user's live data.
 
-use crate::util;
+use crate::{fsperm, util};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -76,6 +76,8 @@ pub enum RerootError {
     Selector(ProfileSelectorError),
     /// A required profile directory could not be created.
     Root { path: PathBuf, error: String },
+    /// A profile SSH key is not safe to use.
+    Key { path: PathBuf, error: String },
 }
 
 impl std::fmt::Display for RerootError {
@@ -85,6 +87,11 @@ impl std::fmt::Display for RerootError {
             Self::Root { path, error } => write!(
                 f,
                 "could not create profile directory {}: {error}; refusing to start the profile without its isolated roots",
+                path.display()
+            ),
+            Self::Key { path, error } => write!(
+                f,
+                "profile SSH key {} is not usable: {error}; make it an owner-only regular file (chmod 600) or remove it — refusing to start the profile so git does not run with an unprotected key",
                 path.display()
             ),
         }
@@ -400,7 +407,8 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), RerootError> {
     let paths = match profile_root(&base, &name) {
         // Named profile: reroot storage + advertise the name to children/config.
         Some(root) => {
-            prepare_profile_dirs(&root)?;
+            prepare_profile_dirs(&base, &name)?;
+            let ssh_key = profile_ssh_key(&root)?;
             let state = root.join("state");
             unsafe {
                 std::env::set_var("THEGN_DIR", &root);
@@ -410,7 +418,7 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), RerootError> {
                 // admits `THEGN_*`).
                 std::env::set_var("THEGN_PROFILE", &name);
             }
-            apply_credential_env(&root);
+            apply_credential_env(&root, ssh_key.as_deref());
             ProfilePaths { name, root }
         }
         // Default profile: leave every path exactly as today.
@@ -435,7 +443,10 @@ pub fn reroot(cli_profile: Option<&str>) -> Result<(), RerootError> {
 /// (`ssh/id`) — forcing `IdentitiesOnly=yes` at an absent key would break *all*
 /// ssh git ops for the profile. Config-dir vars are safe to inherit into panes
 /// (they name a dir, not a secret); the token vars are the ones we drop.
-pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<String>)> {
+pub fn credential_env(
+    root: &std::path::Path,
+    ssh_key: Option<&std::path::Path>,
+) -> Vec<(&'static str, Option<String>)> {
     let s = |p: PathBuf| Some(p.to_string_lossy().into_owned());
     let mut out = vec![
         ("GIT_CONFIG_GLOBAL", s(root.join("config/git/config"))),
@@ -446,8 +457,7 @@ pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<Strin
         ("GH_TOKEN", None),
         ("GITHUB_TOKEN", None),
     ];
-    let key = root.join("ssh/id");
-    if key.is_file() {
+    if let Some(key) = ssh_key {
         out.push((
             "GIT_SSH_COMMAND",
             Some(format!(
@@ -457,6 +467,49 @@ pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<Strin
         ));
     }
     out
+}
+
+/// Resolve and validate the optional profile SSH key before it is inherited by
+/// git. Symlinks are followed so users can point at a key in `~/.ssh`.
+pub(crate) fn profile_ssh_key(root: &std::path::Path) -> Result<Option<PathBuf>, RerootError> {
+    let key = root.join("ssh/id");
+    match std::fs::symlink_metadata(&key) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RerootError::Key {
+                path: key,
+                error: error.to_string(),
+            });
+        }
+        Ok(_) => {}
+    }
+    let metadata = std::fs::metadata(&key).map_err(|error| RerootError::Key {
+        path: key.clone(),
+        error: error.to_string(),
+    })?;
+    ssh_key_verdict(
+        metadata.is_file(),
+        fsperm::owned_by_current_user(&metadata),
+        fsperm::mode_bits_from_metadata(&metadata),
+    )
+    .map_err(|error| RerootError::Key {
+        path: key.clone(),
+        error: error.to_owned(),
+    })?;
+    Ok(Some(key))
+}
+
+fn ssh_key_verdict(is_file: bool, owned: bool, mode: Option<u32>) -> Result<(), &'static str> {
+    if !is_file {
+        return Err("not a regular file");
+    }
+    if !owned {
+        return Err("owned by another user");
+    }
+    if mode.is_some_and(|mode| mode & 0o077 != 0) {
+        return Err("readable or writable by group or others");
+    }
+    Ok(())
 }
 
 /// Return credential-shaped environment names selected by the THE-444 option
@@ -492,16 +545,27 @@ pub fn scrubbed_credential_vars<I: IntoIterator<Item = String>>(
 }
 
 /// Create every directory a named profile needs before changing process state.
-fn prepare_profile_dirs(root: &std::path::Path) -> Result<(), RerootError> {
-    for path in [
-        root.join("state"),
-        root.join("config/git"),
-        root.join("config/gh"),
-        root.join("gnupg"),
+fn prepare_profile_dirs(base: &std::path::Path, name: &str) -> Result<(), RerootError> {
+    std::fs::create_dir_all(base).map_err(|error| RerootError::Root {
+        path: base.to_path_buf(),
+        error: error.to_string(),
+    })?;
+    let profile = PathBuf::from("profiles").join(name);
+    // Each component is finalized to 0700 before it becomes an intermediate;
+    // this tightens owned directories created under a permissive umask (order
+    // is load-bearing: ensure_private_dir_beneath refuses a group-writable intermediate).
+    for rel in [
+        PathBuf::from("profiles"),
+        profile.clone(),
+        profile.join("state"),
+        profile.join("config"),
+        profile.join("config/git"),
+        profile.join("config/gh"),
+        profile.join("gnupg"),
     ] {
-        if let Err(error) = std::fs::create_dir_all(&path) {
+        if let Err(error) = fsperm::ensure_private_dir_beneath(base, &rel) {
             return Err(RerootError::Root {
-                path,
+                path: base.join(rel),
                 error: error.to_string(),
             });
         }
@@ -511,8 +575,8 @@ fn prepare_profile_dirs(root: &std::path::Path) -> Result<(), RerootError> {
 
 /// Apply profile paths and scrub ambient credentials from the process. Called
 /// from [`reroot`] after all profile roots exist (single-threaded startup).
-fn apply_credential_env(root: &std::path::Path) {
-    for (var, val) in credential_env(root) {
+fn apply_credential_env(root: &std::path::Path, ssh_key: Option<&std::path::Path>) {
+    for (var, val) in credential_env(root, ssh_key) {
         unsafe {
             match val {
                 Some(v) => std::env::set_var(var, v),
@@ -521,7 +585,7 @@ fn apply_credential_env(root: &std::path::Path) {
         }
     }
     let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
-    for name in scrubbed_credential_vars(names, root.join("ssh/id").is_file()) {
+    for name in scrubbed_credential_vars(names, ssh_key.is_some()) {
         unsafe {
             std::env::remove_var(name);
         }
@@ -1136,7 +1200,7 @@ mod tests {
     #[test]
     fn credential_env_pins_config_dirs_and_drops_tokens() {
         let root = std::path::Path::new("/home/x/.thegn/profiles/work");
-        let env = credential_env(root);
+        let env = credential_env(root, None);
         let find = |k: &str| {
             env.iter()
                 .find(|(v, _)| *v == k)
@@ -1281,7 +1345,8 @@ mod tests {
         let root = dir.path().join("profile with spaces");
         std::fs::create_dir_all(root.join("ssh")).unwrap();
         std::fs::write(root.join("ssh/id"), "key").unwrap();
-        let command = credential_env(&root)
+        let key = root.join("ssh/id");
+        let command = credential_env(&root, Some(&key))
             .into_iter()
             .find(|(name, _)| *name == "GIT_SSH_COMMAND")
             .and_then(|(_, value)| value)
@@ -1334,8 +1399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, "file").unwrap();
-        let root = blocked.join("profiles").join("work");
-        let error = match prepare_profile_dirs(&root) {
+        let error = match prepare_profile_dirs(&blocked, "work") {
             Err(error) => error,
             Ok(()) => panic!("profile directories unexpectedly created below a regular file"),
         };
@@ -1347,10 +1411,151 @@ mod tests {
     fn prepare_profile_dirs_creates_every_isolated_root() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("profiles/work");
-        prepare_profile_dirs(&root).unwrap();
+        prepare_profile_dirs(dir.path(), "work").unwrap();
         for subdir in ["state", "config/git", "config/gh", "gnupg"] {
             assert!(root.join(subdir).is_dir(), "missing {subdir}");
         }
+    }
+
+    #[test]
+    fn profile_private_dirs_are_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_profile_dirs(dir.path(), "work").unwrap();
+        for path in [
+            dir.path().join("profiles"),
+            dir.path().join("profiles/work"),
+            dir.path().join("profiles/work/state"),
+            dir.path().join("profiles/work/config"),
+            dir.path().join("profiles/work/config/git"),
+            dir.path().join("profiles/work/config/gh"),
+            dir.path().join("profiles/work/gnupg"),
+        ] {
+            if let Some(mode) = fsperm::mode_bits(&path).unwrap() {
+                assert_eq!(mode, 0o700, "{} must be owner-only", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn profile_private_dirs_refuse_a_symlinked_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("profiles/work/gnupg");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        if let Err(error) = fsperm::create_symlink(target.path(), &linked, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                // This platform does not permit creating the symlink fixture.
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+        assert!(matches!(
+            prepare_profile_dirs(dir.path(), "work"),
+            Err(RerootError::Root { .. })
+        ));
+        assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn profile_private_ssh_key_verdict_table() {
+        for (is_file, owned, mode, expected_ok) in [
+            (true, true, Some(0o600), true),
+            (true, true, Some(0o400), true),
+            (true, true, None, true),
+            (true, true, Some(0o640), false),
+            (true, true, Some(0o604), false),
+            (true, false, Some(0o600), false),
+            (false, true, Some(0o600), false),
+        ] {
+            assert_eq!(
+                ssh_key_verdict(is_file, owned, mode).is_ok(),
+                expected_ok,
+                "file={is_file} owned={owned} mode={mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_private_ssh_key_absent_regular_and_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("profile");
+        assert_eq!(profile_ssh_key(&root).unwrap(), None);
+
+        let key = root.join("ssh/id");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "private key").unwrap();
+        fsperm::restrict_to_owner(&key).unwrap();
+        assert_eq!(profile_ssh_key(&root).unwrap(), Some(key.clone()));
+
+        std::fs::remove_file(&key).unwrap();
+        std::fs::create_dir(&key).unwrap();
+        let error = match profile_ssh_key(&root) {
+            Err(error @ RerootError::Key { .. }) => error,
+            other => panic!("expected typed key refusal, got {other:?}"),
+        };
+        assert!(error.to_string().contains("chmod 600"));
+    }
+
+    #[test]
+    fn profile_private_ssh_key_follows_an_owner_only_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("profile");
+        let target = dir.path().join("outside/id");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "private key").unwrap();
+        fsperm::restrict_to_owner(&target).unwrap();
+        let key = root.join("ssh/id");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        if let Err(error) = fsperm::create_symlink(&target, &key, false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                // This platform does not permit creating the symlink fixture.
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+        assert_eq!(profile_ssh_key(&root).unwrap(), Some(key));
+    }
+
+    #[test]
+    fn profile_private_ssh_key_dangling_symlink_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("profile");
+        let target = dir.path().join("missing/id");
+        let key = root.join("ssh/id");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        if let Err(error) = fsperm::create_symlink(&target, &key, false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                // This platform does not permit creating the symlink fixture.
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+        assert!(matches!(
+            profile_ssh_key(&root),
+            Err(RerootError::Key { .. })
+        ));
+    }
+
+    #[test]
+    fn profile_private_credential_env_pins_only_the_verified_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("ssh")).unwrap();
+        std::fs::write(root.join("ssh/id"), "unverified key").unwrap();
+        assert!(
+            credential_env(root, None)
+                .into_iter()
+                .all(|(name, _)| name != "GIT_SSH_COMMAND")
+        );
     }
 
     #[test]
