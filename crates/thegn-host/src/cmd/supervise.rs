@@ -654,10 +654,10 @@ fn short(sha: &str) -> String {
 mod tests {
     use super::*;
     // Test fixtures seed dispatch rows through the store trait.
-    use thegn_core::store::NotificationStore as _;
     use thegn_core::config_pipeline::Requirement;
     use thegn_core::issue::AgentDispatchStatus;
     use thegn_core::pipeline_approval::Approval;
+    use thegn_core::store::NotificationStore as _;
     use unicode_width::UnicodeWidthStr;
 
     const HEAD: &str = "4babb0901f2c3d4e5f60718293a4b5c6d7e8f901";
