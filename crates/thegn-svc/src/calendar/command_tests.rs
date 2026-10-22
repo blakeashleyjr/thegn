@@ -1,8 +1,13 @@
 use super::*;
+use std::collections::BTreeMap;
 use thegn_core::calendar::admission::{AdmissionBudget, AdmissionMeter};
 use thegn_core::calendar::conformance::{FIXTURES, Verdict};
 
 fn sink() -> AdmittingSink {
+    sink_with(SecretScrub::default())
+}
+
+fn sink_with(scrub: SecretScrub) -> AdmittingSink {
     AdmittingSink {
         admitted: Admitted {
             meter: AdmissionMeter::isolated(AdmissionBudget::default()),
@@ -15,11 +20,40 @@ fn sink() -> AdmittingSink {
             cursor_conflict: false,
         },
         granted: Vec::new(),
+        scrub,
         junk: Vec::new(),
         error: None,
         saw_events: false,
         saw_manifest: false,
     }
+}
+
+fn plugin(argv: Vec<String>, env: &[(&str, &str)]) -> CommandBackend {
+    let account = CalendarAccount {
+        name: "scrub-test".into(),
+        provider: thegn_core::config_calendar::CalendarProviderKind::Command,
+        command: argv,
+        env: env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        ..CalendarAccount::default()
+    };
+    CommandBackend::new(
+        &account,
+        super::AccountAdmission::isolated(
+            AdmissionBudget::default(),
+            thegn_core::calendar::Tz::UTC,
+        ),
+    )
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 #[test]
@@ -143,6 +177,182 @@ fn repeated_identical_sync_token_is_accepted() {
     assert!(sink.line(r#"{"method":"events","params":{"sync_token":""}}"#));
     assert_eq!(sink.admitted.sync_token, "cursor");
     assert!(sink.error.is_none());
+}
+
+#[test]
+fn plugin_stderr_never_carries_an_env_secret() {
+    let backend = plugin(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo \"auth failed for $CAL_TOKEN\" >&2; exit 1".into(),
+        ],
+        &[("CAL_TOKEN", "tok-sentinel-7f3a91")],
+    );
+    let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+    let to = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+    let error = block_on(backend.list_events(from, to, "")).unwrap_err();
+    let display = format!("{error}");
+    let debug = format!("{error:?}");
+    for text in [&display, &debug] {
+        assert!(text.contains("auth failed for"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("tok-sentinel-7f3a91"), "{text}");
+    }
+}
+
+#[test]
+fn plugin_stderr_never_carries_an_argument_secret() {
+    let backend = plugin(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo \"bad key $0\" >&2; exit 2".into(),
+            "arg-sentinel-c41d".into(),
+        ],
+        &[],
+    );
+    let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+    let to = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+    let error = block_on(backend.list_events(from, to, "")).unwrap_err();
+    let display = format!("{error}");
+    let debug = format!("{error:?}");
+    for text in [&display, &debug] {
+        assert!(text.contains("bad key"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("arg-sentinel-c41d"), "{text}");
+    }
+}
+
+#[test]
+fn sink_scrubs_secrets_from_junk_lines() {
+    let env = BTreeMap::from([("K".to_string(), "tok-sentinel-7f3a91".to_string())]);
+    let argv = vec!["p".into(), "--token=arg-sentinel-c41d".into()];
+    let scrub = SecretScrub::for_account(&argv, &env);
+    let mut sink = sink_with(scrub);
+    assert!(sink.line("not json tok-sentinel-7f3a91 --token=arg-sentinel-c41d"));
+    assert!(sink.junk[0].contains("<redacted>"), "{}", sink.junk[0]);
+    assert!(!sink.junk[0].contains("tok-sentinel-7f3a91"));
+    assert!(!sink.junk[0].contains("arg-sentinel-c41d"));
+}
+
+#[test]
+fn sink_scrubs_secrets_from_plugin_log_messages() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+    struct Fields(BTreeMap<String, String>);
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+    impl Subscriber for Captured {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target().starts_with("thegn::calendar")
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    let captured = Captured::default();
+    let _guard = tracing::subscriber::set_default(captured.clone());
+    let env = BTreeMap::from([("K".to_string(), "tok-sentinel-7f3a91".to_string())]);
+    let argv = vec!["p".into(), "arg-sentinel-c41d".into()];
+    let mut sink = sink_with(SecretScrub::for_account(&argv, &env));
+    assert!(sink.line(
+        r#"{"method":"log","params":{"level":"warn","message":"token is tok-sentinel-7f3a91"}}"#
+    ));
+    let records = captured.0.lock().unwrap();
+    assert!(!records.is_empty());
+    assert!(records.iter().all(|record| {
+        record
+            .values()
+            .all(|value| !value.contains("tok-sentinel-7f3a91"))
+    }));
+    assert!(records.iter().any(|record| {
+        record
+            .get("message")
+            .is_some_and(|value| value.contains("<redacted>"))
+    }));
+}
+
+#[test]
+fn scrub_error_redacts_every_string_variant() {
+    let scrub = SecretScrub::for_account(
+        &[],
+        &BTreeMap::from([("K".to_string(), "tok-sentinel-7f3a91".to_string())]),
+    );
+    let errors = [
+        (CalendarError::Network("x tok-sentinel-7f3a91 y".into()), 0),
+        (CalendarError::Auth("x tok-sentinel-7f3a91 y".into()), 1),
+        (CalendarError::Api("x tok-sentinel-7f3a91 y".into()), 2),
+        (
+            CalendarError::Subprocess("x tok-sentinel-7f3a91 y".into()),
+            3,
+        ),
+        (CalendarError::Parse("x tok-sentinel-7f3a91 y".into()), 4),
+        (CalendarError::Io("x tok-sentinel-7f3a91 y".into()), 5),
+    ];
+    for (error, expected_variant) in errors {
+        let scrubbed = scrub.scrub_error(error);
+        let text = scrubbed.to_string();
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("tok-sentinel-7f3a91"), "{text}");
+        assert!(matches!(
+            (&scrubbed, expected_variant),
+            (CalendarError::Network(_), 0)
+                | (CalendarError::Auth(_), 1)
+                | (CalendarError::Api(_), 2)
+                | (CalendarError::Subprocess(_), 3)
+                | (CalendarError::Parse(_), 4)
+                | (CalendarError::Io(_), 5)
+        ));
+    }
+    assert!(matches!(
+        scrub.scrub_error(CalendarError::Timeout("t")),
+        CalendarError::Timeout("t")
+    ));
+    assert!(matches!(
+        scrub.scrub_error(CalendarError::NotConfigured),
+        CalendarError::NotConfigured
+    ));
+}
+
+// Positive control: ordinary stderr remains visible on main and after scrubbing.
+#[test]
+fn plugin_stderr_without_secrets_is_kept_verbatim() {
+    let backend = plugin(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo 'khal not found' >&2; exit 1".into(),
+        ],
+        &[("CAL_TOKEN", "tok-sentinel-7f3a91")],
+    );
+    let from = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+    let to = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+    let error = block_on(backend.list_events(from, to, "")).unwrap_err();
+    assert!(error.to_string().contains("khal not found"));
+    assert!(!error.to_string().contains("<redacted>"));
 }
 
 #[test]
