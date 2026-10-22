@@ -434,8 +434,29 @@ fn one_shot_status(plugin: &str, contribution: &str, start: OneShotStart) -> Str
 }
 
 /// Record this drain's raised alerts to the notification inbox, off-loop.
-/// Call after [`drain`] from the event loop (requires a tokio runtime).
+/// Call after [`drain`] from the event loop. One job per non-empty drain is
+/// sent to the shared DB writer, which counts queue overflow.
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
+    flush_alerts_with(state, |alerts| {
+        crate::db_task::persist(move |db| persist_alert_batch(db, alerts));
+    });
+}
+
+fn persist_alert_batch(db: &thegn_core::db::Db, alerts: Vec<(String, Alert)>) {
+    for (plugin, alert) in alerts {
+        if let Err(error) = crate::automation_events::emit(
+            db,
+            "plugin",
+            &plugin,
+            &format!("{}: {}", alert.source, alert.message),
+            "",
+        ) {
+            tracing::debug!(target: "thegn::plugin", plugin = %plugin, error = %error, "plugin alert persistence failed");
+        }
+    }
+}
+
+fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, Alert)>)) {
     if let Some(dispatcher) = &state.dispatcher {
         for (plugin, counts) in dispatcher.take_diagnostics() {
             if counts.rejected > 0
@@ -464,22 +485,7 @@ pub(crate) fn flush_alerts(state: &mut PluginsState) {
     if alerts.is_empty() {
         return;
     }
-    drop(tokio::task::spawn_blocking(move || {
-        let Ok(db) = thegn_core::db::Db::open() else {
-            return;
-        };
-        for (plugin, alert) in alerts {
-            if let Err(error) = crate::automation_events::emit(
-                &db,
-                "plugin",
-                &plugin,
-                &format!("{}: {}", alert.source, alert.message),
-                "",
-            ) {
-                tracing::debug!(target: "thegn::plugin", plugin = %plugin, error = %error, "plugin alert persistence failed");
-            }
-        }
-    }));
+    submit(alerts);
 }
 
 /// Apply up to [`MAX_PLUGIN_MESSAGES_PER_DRAIN`] queued message units, preserving
@@ -1555,6 +1561,60 @@ mod tests {
     use thegn_core::plugin_api::{
         ApiVersion, CadenceHint, ContributionId, PluginManifest, Span, StyleRole,
     };
+
+    #[test]
+    fn alert_flush_submits_one_batch_per_drain_without_a_runtime() {
+        let mut state = state_with(Vec::new());
+        state.pending_alerts.extend([
+            ("p".into(), Alert::new("source-a", "one")),
+            ("q".into(), Alert::new("source-b", "two")),
+            ("p".into(), Alert::new("source-c", "three")),
+        ]);
+        let mut captured = Vec::new();
+
+        flush_alerts_with(&mut state, |batch| captured.push(batch));
+
+        assert_eq!(captured.len(), 1, "one non-empty drain submits one job");
+        let messages: Vec<_> = captured[0]
+            .iter()
+            .map(|(plugin, alert)| (plugin.as_str(), alert.message.as_str()))
+            .collect();
+        assert_eq!(messages, [("p", "one"), ("q", "two"), ("p", "three")]);
+        assert!(state.pending_alerts.is_empty());
+    }
+
+    #[test]
+    fn alert_flush_submits_nothing_without_alerts() {
+        let mut state = state_with(Vec::new());
+        let mut submitted = false;
+
+        flush_alerts_with(&mut state, |_| submitted = true);
+
+        assert!(!submitted, "an empty drain submits no writer job");
+    }
+
+    #[test]
+    fn alert_flush_batch_writes_one_notification_per_alert() {
+        use thegn_core::store::NotificationStore;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        persist_alert_batch(
+            &db,
+            vec![
+                ("p".into(), Alert::new("p", "one")),
+                ("q".into(), Alert::new("q", "two")),
+            ],
+        );
+
+        let notifications = db.get_all_notifications(10).unwrap();
+        let messages: Vec<_> = notifications
+            .iter()
+            .map(|notification| notification.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 2, "each alert writes one notification");
+        assert!(messages.contains(&"p: one"));
+        assert!(messages.contains(&"q: two"));
+    }
 
     fn test_reply() -> (DispatchReply, std::sync::mpsc::Receiver<RpcResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
