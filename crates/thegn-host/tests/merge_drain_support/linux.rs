@@ -485,6 +485,52 @@ fn make_gate_fifo(root: &Path) {
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
 }
 
+struct GateReleaseGuard {
+    root: PathBuf,
+    armed: bool,
+}
+
+impl GateReleaseGuard {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GateReleaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let open = self.root.join("gate-open");
+        if let Err(error) = fs::write(&open, "open\n") {
+            tracing::debug!(path = %open.display(), %error, "could not mark race gate open during cleanup");
+        }
+
+        let fifo_path = self.root.join("gate-hold");
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo_path)
+        {
+            Ok(mut fifo) => {
+                if let Err(error) = fifo.write_all(b"continue\n") {
+                    tracing::debug!(path = %fifo_path.display(), %error, "could not release race gate during cleanup");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(path = %fifo_path.display(), %error, "could not open race gate FIFO during cleanup");
+            }
+        }
+    }
+}
+
 fn release_gate(root: &Path) {
     let path = root.join("gate-hold");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -939,6 +985,7 @@ fn race_two_cli_drains_have_one_owner() {
     let before_ref = f.git(&repo, &["rev-parse", "refs/heads/main"]);
     let root = f.root.path().to_path_buf();
     make_gate_fifo(&root);
+    let mut gate_release = GateReleaseGuard::new(&root);
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     assert!(owner.pid() > 0);
     wait_gate_count(&root, "start ", 1);
@@ -969,6 +1016,7 @@ fn race_two_cli_drains_have_one_owner() {
     assert_eq!(row_state(&f).phase, "unclaimed");
     assert_eq!(gate_count(&root, "start "), 1);
     assert_eq!(f.git(&repo, &["rev-parse", "refs/heads/main"]), before_ref);
+    gate_release.disarm();
     f.close();
 }
 
@@ -981,6 +1029,7 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     let root = f.root.path().to_path_buf();
     let worktree = f.held.to_string_lossy().into_owned();
     make_gate_fifo(&root);
+    let mut gate_release = GateReleaseGuard::new(&root);
     let before = row_state(&f);
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "start ", 1);
@@ -989,6 +1038,9 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     let crashed = row_state(&f);
     assert_eq!(crashed.status, "folding");
     assert_ne!(crashed.phase, "unclaimed");
+    // The gate runs in its own process group and outlives the killed drain.
+    release_gate(&root);
+    wait_gate_count(&root, "end ", 1);
     // Only the lease clock is simulated; claim generation, status, and owner
     // state were written by the killed CLI process itself.
     expire_lease(&f, &worktree);
@@ -1017,11 +1069,8 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
             })
     );
     assert_eq!(gate_count(&root, "start "), 2);
-    assert_eq!(
-        gate_count(&root, "end "),
-        1,
-        "SIGKILL ends the old gate group"
-    );
+    assert_eq!(gate_count(&root, "end "), 2);
+    gate_release.disarm();
     f.close();
 }
 
@@ -1035,6 +1084,7 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
     let repo = f.repo.clone();
     let worktree = f.held.to_string_lossy().into_owned();
     make_gate_fifo(&root);
+    let mut gate_release = GateReleaseGuard::new(&root);
     let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "start ", 1);
@@ -1058,6 +1108,9 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
     assert_eq!(target_after_recovery, result_oid);
     release_gate(&root);
     let former = f.finish_cli(owner);
+    // After release, A's claim CAS returns Moved; its retry sees the branch as
+    // an ancestor and returns UpToDate. The Landed write is fenced with
+    // MERGE_CLAIM_LOST, while the gate stays at two starts and the CLI exits 0.
     // The recovered claim fences writes without turning a handled stale owner
     // warning into a CLI failure; the JSON warning is the visible refusal.
     assert_eq!(former.status.code(), Some(0));
@@ -1084,5 +1137,6 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
     );
     assert_eq!(gate_count(&root, "start "), 2);
     assert_eq!(gate_count(&root, "end "), 2);
+    gate_release.disarm();
     f.close();
 }
