@@ -11,9 +11,12 @@
 //! Rebinds are generation-fenced outside the bind lock, and a failed rebind ends
 //! the watch so the host reconnects instead of trusting stale signal capability.
 //!
-//! All WinRT calls run inside `spawn_blocking` and return plain owned data
-//! (`String`/`bool`/`MediaState`), so no COM object crosses an `.await`. The
-//! pure enum/tick decoding lives in [`crate::smtc_decode`] (Linux-testable).
+//! WinRT calls run on the single `thegn-smtc` worker with a bounded queue and a
+//! per-op deadline (`MEDIA_OP_BUDGET`), and return plain owned data
+//! (`String`/`bool`/`MediaState`), so no COM object crosses an `.await`. A timed
+//! out call keeps the worker busy until the OS returns, so later calls are
+//! refused rather than stacking threads. The pure enum/tick decoding lives in
+//! [`crate::smtc_decode`] (Linux-testable).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +40,19 @@ use crate::smtc_decode::{
 };
 use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
+/// Mirrors the host's MAX_PENDING_MEDIA_OPS (crates/thegn-host/src/media_ctl.rs); the primary may retune.
+const SMTC_QUEUE_CAPACITY: usize = 8;
+const SMTC_OP_DEADLINE: std::time::Duration = crate::MEDIA_OP_BUDGET;
+static WORKER: std::sync::OnceLock<Result<crate::smtc_worker::OpWorker, MediaError>> =
+    std::sync::OnceLock::new();
+
+fn worker() -> Result<&'static crate::smtc_worker::OpWorker, MediaError> {
+    WORKER
+        .get_or_init(|| crate::smtc_worker::spawn("thegn-smtc", SMTC_QUEUE_CAPACITY))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 /// Stateless SMTC controller — the session manager is opened fresh per call
 /// (cheap, and avoids holding a COM object across `.await`).
 pub struct Smtc;
@@ -44,7 +60,7 @@ pub struct Smtc;
 impl Smtc {
     /// Probe that the session manager is obtainable; `None` ⇒ media inert.
     pub async fn connect() -> Option<Self> {
-        let ok = tokio::task::spawn_blocking(|| manager().is_ok())
+        let ok = run_blocking(|| Ok(manager().is_ok()))
             .await
             .unwrap_or(false);
         ok.then_some(Smtc)
@@ -542,16 +558,13 @@ fn snapshot_with_caps_blocking() -> Result<Option<MediaSnapshot>, MediaError> {
     }))
 }
 
-/// Run blocking COM work off the async runtime, flattening the join error.
+/// Run COM work on the single owned SMTC worker.
 async fn run_blocking<T, F>(f: F) -> Result<T, MediaError>
 where
     F: FnOnce() -> Result<T, MediaError> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(e) => Err(MediaError::Backend(format!("smtc task: {e}"))),
-    }
+    worker()?.run(SMTC_OP_DEADLINE, f).await
 }
 
 #[cfg(test)]
