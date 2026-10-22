@@ -484,20 +484,38 @@ fn consider_candidate_with_forge(
             item.number
         ));
     }
-    let fresh = provider
-        .pr_status(&loc, PrRef::Number(item.number))
-        .ok()
-        .filter(|pr| {
-            thegn_core::pr_queue::attest_pr_identity(
-                item.pr_url.as_deref(),
-                item.number,
-                &pr.url,
-                pr.number,
-            )
-            .is_ok()
-        });
+    let fresh = authorship.as_ref().and_then(|_| {
+        provider
+            .pr_status(&loc, PrRef::Number(item.number))
+            .ok()
+            .filter(|pr| {
+                thegn_core::pr_queue::attest_pr_identity(
+                    item.pr_url.as_deref(),
+                    item.number,
+                    &pr.url,
+                    pr.number,
+                )
+                .is_ok()
+            })
+    });
     let own = crate::pr_agent_lease::observe_own_head(&loc, &entry.head_sha, || {
-        fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
+        if authorship.is_some() {
+            fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
+        } else {
+            provider
+                .pr_status(&loc, PrRef::Number(item.number))
+                .ok()
+                .filter(|pr| {
+                    thegn_core::pr_queue::attest_pr_identity(
+                        item.pr_url.as_deref(),
+                        item.number,
+                        &pr.url,
+                        pr.number,
+                    )
+                    .is_ok()
+                })
+                .map(|pr| pr.head_ref_oid)
+        }
     });
     let validation = crate::pr_authorship::revalidate_after_agent(
         authorship.as_ref(),

@@ -928,20 +928,38 @@ pub(crate) fn drive_queue(
                     guard.cancel_flag(),
                 );
 
-                let fresh = forge
-                    .pr_status(&loc, PrRef::Number(item.number))
-                    .ok()
-                    .filter(|pr| {
-                        pr_queue::attest_pr_identity(
-                            item.pr_url.as_deref(),
-                            item.number,
-                            &pr.url,
-                            pr.number,
-                        )
-                        .is_ok()
-                    });
+                let fresh = authorship.as_ref().and_then(|_| {
+                    forge
+                        .pr_status(&loc, PrRef::Number(item.number))
+                        .ok()
+                        .filter(|pr| {
+                            pr_queue::attest_pr_identity(
+                                item.pr_url.as_deref(),
+                                item.number,
+                                &pr.url,
+                                pr.number,
+                            )
+                            .is_ok()
+                        })
+                });
                 let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
-                    fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
+                    if authorship.is_some() {
+                        fresh.as_ref().map(|pr| pr.head_ref_oid.clone())
+                    } else {
+                        forge
+                            .pr_status(&loc, PrRef::Number(item.number))
+                            .ok()
+                            .filter(|pr| {
+                                pr_queue::attest_pr_identity(
+                                    item.pr_url.as_deref(),
+                                    item.number,
+                                    &pr.url,
+                                    pr.number,
+                                )
+                                .is_ok()
+                            })
+                            .map(|pr| pr.head_ref_oid)
+                    }
                 });
                 match crate::pr_authorship::revalidate_after_agent(
                     authorship.as_ref(),
@@ -975,6 +993,7 @@ pub(crate) fn drive_queue(
                             Ok(false) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row", item.number)),
                             Err(error) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row ({error})", item.number)),
                         }
+                        step(PrqStatus::NeedsHuman.as_str(), reason, &mut progress);
                         out.warnings.push(format!("PR #{}: {reason}", item.number));
                         out.needs_human.push(item.number);
                     }
@@ -2335,9 +2354,10 @@ mod tests {
 
         // A failed-CI row with an existing attempt bypasses the zero-attempt CI rerun branch at
         // drive_queue's `if kind == PrCiFailure && attempts == 0` check and reaches DispatchAgent.
+        let full = uncontained_config();
         let out = drive_queue(
             &config,
-            &Config::default(),
+            &full,
             &forge,
             fixture.dir.path(),
             db,
