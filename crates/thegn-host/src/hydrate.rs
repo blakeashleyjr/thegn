@@ -3415,6 +3415,9 @@ pub(crate) fn build_panel(
             .merge_queue
             .retain(|r| repo_paths.contains(&r.worktree));
     }
+    let (claims, claim_error) = crate::merge_ops::collect_claims(db, &panel.merge_queue);
+    panel.merge_claims = claims;
+    panel.merge_claim_error = claim_error;
 
     // The PR queue — same deal: a tiny table read every model build, feeding the
     // `PrQueue` section + statusbar badge. Scoped to THIS repo, because the queue
