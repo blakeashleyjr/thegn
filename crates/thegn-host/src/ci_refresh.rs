@@ -744,8 +744,8 @@ pub(crate) fn on_ci_tick(
         force,
         generation.clone(),
     );
-    if let Some(run) = bar_detail.as_mut().and_then(|ov| ov.live_ci_repoll()) {
-        crate::actions::spawn_ci_detail(session, &full.ci, refresh_tx, waker, run, generation);
+    if let Some((run, origin)) = bar_detail.as_mut().and_then(|ov| ov.live_ci_repoll()) {
+        crate::actions::spawn_ci_detail(origin, &full.ci, refresh_tx, waker, run, generation);
     }
 }
 
