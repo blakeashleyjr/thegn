@@ -112,6 +112,179 @@ fn admission_for_decision(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteStatus {
+    /// The launch carries the opaque admission handle.
+    Handle,
+    /// The route passes `sandbox_admission::admit`, but the handle is not carried to the spawn.
+    AdmittedNoHandle,
+    /// Some spawns on the route carry the handle, and others do not.
+    Partial,
+    /// The route has a separate floor or sealed gate outside the handle.
+    OwnGate,
+    /// The route runs on the host under the shared resource ceiling, without isolation admission.
+    HostCapped,
+    /// The route runs on the host on user trust; it is not yet a declared,
+    /// command-digest-scoped exception.
+    HostTrust,
+}
+
+impl RouteStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Handle => "handle",
+            Self::AdmittedNoHandle => "admitted-no-handle",
+            Self::Partial => "partial",
+            Self::OwnGate => "own-gate",
+            Self::HostCapped => "host-capped",
+            Self::HostTrust => "host-trust",
+        }
+    }
+}
+
+pub(crate) struct LaunchRoute {
+    pub(crate) id: &'static str,
+    pub(crate) route: &'static str,
+    pub(crate) status: RouteStatus,
+    pub(crate) path: &'static str,
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the route anchor tests"))]
+    anchor: Option<(&'static str, &'static str)>,
+}
+
+pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
+    LaunchRoute {
+        id: "worktree-panes",
+        route: "Worktree shells, configured agents/tools, daemon opens",
+        status: RouteStatus::Handle,
+        path: "agent::prepare_sandbox_env returns a SandboxOutcome that must carry the admission",
+        anchor: Some((
+            "agent.rs",
+            "pub(crate) admission: crate::sandbox_admission::Admission,",
+        )),
+    },
+    LaunchRoute {
+        id: "terminal-tabs",
+        route: "Standalone terminal tabs",
+        status: RouteStatus::AdmittedNoHandle,
+        path: "panes::terminal_launch_spec admits wrapped, degraded and fallback shells; the handle is not carried",
+        anchor: Some((
+            "panes.rs",
+            "crate::sandbox_admission::admit(sb, actual, \"terminal\", false, warnings)",
+        )),
+    },
+    LaunchRoute {
+        id: "queue-agents",
+        route: "Queue/CI/review/merge agents",
+        status: RouteStatus::OwnGate,
+        path: "agent_run::agent_floor_gate (sandbox_floor::queue_agent_gate), outside the handle",
+        anchor: Some((
+            "agent_run.rs",
+            "queue_agent_gate(&effective, floor, on_miss, resolved, best)",
+        )),
+    },
+    LaunchRoute {
+        id: "autopilot",
+        route: "Autopilot",
+        status: RouteStatus::OwnGate,
+        path: "autopilot_driver::sealed_autopilot_sandbox forces a sealed, credential-free spec, outside the handle",
+        anchor: Some(("autopilot_driver.rs", "fn sealed_autopilot_sandbox(")),
+    },
+    LaunchRoute {
+        id: "tests-gates",
+        route: "Tests/discovery/gates/regeneration",
+        status: RouteStatus::HostCapped,
+        path: "host commands under the shared resource ceiling (integrate_gate)",
+        anchor: Some((
+            "integrate_gate.rs",
+            "thegn_core::sandbox_cpucap::wrap_background_argv(",
+        )),
+    },
+    LaunchRoute {
+        id: "host-hooks",
+        route: "Host lifecycle hooks/devcontainer initialize",
+        status: RouteStatus::HostTrust,
+        path: "user-approved host hooks (hook_run), resource-capped",
+        anchor: Some((
+            "hook_run.rs",
+            "thegn_core::sandbox_cpucap::wrap_background_argv(vec![",
+        )),
+    },
+    LaunchRoute {
+        id: "devcontainer",
+        route: "Container devcontainer lifecycle",
+        status: RouteStatus::Handle,
+        path: "admitted before devcontainer bring-up in agent::prepare_sandbox_env",
+        anchor: Some(("agent.rs", "Admit before bring-up so a")),
+    },
+    LaunchRoute {
+        id: "provider-native",
+        route: "Provider-native",
+        status: RouteStatus::Partial,
+        path: "pane opens carry the handle (SandboxOutcome); provider exec and transport calls do not",
+        anchor: None,
+    },
+    LaunchRoute {
+        id: "host-git",
+        route: "Host Git reads/mutations",
+        status: RouteStatus::HostTrust,
+        path: "local git helpers on the host",
+        anchor: None,
+    },
+    LaunchRoute {
+        id: "language-services",
+        route: "Language services",
+        status: RouteStatus::HostCapped,
+        path: "host language servers under the resource ceiling (lsp)",
+        anchor: Some((
+            "lsp.rs",
+            "let argv = thegn_core::sandbox_cpucap::wrap_background_argv(argv);",
+        )),
+    },
+    LaunchRoute {
+        id: "host-extensions",
+        route: "MCP/plugins/editors/viewer or arbitrary-command panes",
+        status: RouteStatus::HostTrust,
+        path: "user-configured host extensions (mcp_proxy upstream, plugins, editors)",
+        anchor: Some((
+            "mcp_proxy/upstream.rs",
+            "let wrapped = thegn_core::sandbox_cpucap::wrap_background_argv(argv.to_vec());",
+        )),
+    },
+];
+
+pub(crate) fn route_lines() -> Vec<String> {
+    let mut lines = Vec::with_capacity(LAUNCH_ROUTES.len() + 1);
+    lines.push(
+        "  admission     execution routes (THE-794): handle = carries the sandbox admission handle"
+            .to_string(),
+    );
+    lines.extend(LAUNCH_ROUTES.iter().map(|route| {
+        format!(
+            "  admission     {}: {} - {}",
+            route.id,
+            route.status.as_str(),
+            route.path
+        )
+    }));
+    lines
+}
+
+pub(crate) fn routes_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        LAUNCH_ROUTES
+            .iter()
+            .map(|route| {
+                serde_json::json!({
+                    "id": route.id,
+                    "route": route.route,
+                    "status": route.status.as_str(),
+                    "path": route.path,
+                })
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +472,98 @@ mod tests {
             matches!(result, CandidateAdmission::Admitted(admission) if admission.enforcement() == FloorEnforcement::NoFloor)
         );
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn launch_route_table_covers_the_audit_rows() {
+        const AUDIT_ROWS: [&str; 11] = [
+            "Worktree shells, configured agents/tools, daemon opens",
+            "Standalone terminal tabs",
+            "Queue/CI/review/merge agents",
+            "Autopilot",
+            "Tests/discovery/gates/regeneration",
+            "Host lifecycle hooks/devcontainer initialize",
+            "Container devcontainer lifecycle",
+            "Provider-native",
+            "Host Git reads/mutations",
+            "Language services",
+            "MCP/plugins/editors/viewer or arbitrary-command panes",
+        ];
+        assert_eq!(LAUNCH_ROUTES.len(), 11);
+        let mut ids = std::collections::HashSet::new();
+        for route in LAUNCH_ROUTES {
+            assert!(ids.insert(route.id), "duplicate route id {}", route.id);
+        }
+        assert_eq!(
+            LAUNCH_ROUTES
+                .iter()
+                .map(|route| route.route)
+                .collect::<Vec<_>>(),
+            AUDIT_ROWS
+        );
+    }
+
+    fn source(file: &str) -> &'static str {
+        match file {
+            "agent.rs" => include_str!("agent.rs"),
+            "panes.rs" => include_str!("panes.rs"),
+            "agent_run.rs" => include_str!("agent_run.rs"),
+            "autopilot_driver.rs" => include_str!("autopilot_driver.rs"),
+            "integrate_gate.rs" => include_str!("integrate_gate.rs"),
+            "hook_run.rs" => include_str!("hook_run.rs"),
+            "lsp.rs" => include_str!("lsp.rs"),
+            "mcp_proxy/upstream.rs" => include_str!("mcp_proxy/upstream.rs"),
+            unknown => panic!("unknown route anchor file {unknown}"),
+        }
+    }
+
+    #[test]
+    fn launch_route_anchors_are_present() {
+        for route in LAUNCH_ROUTES {
+            if let Some((file, text)) = route.anchor {
+                assert!(
+                    source(file).contains(text),
+                    "route {} anchor disappeared from {file}: {text}",
+                    route.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn launch_route_non_handle_files_do_not_admit() {
+        for route in LAUNCH_ROUTES {
+            if let Some((file, _)) = route.anchor {
+                match route.status {
+                    RouteStatus::OwnGate | RouteStatus::HostCapped | RouteStatus::HostTrust => {
+                        assert!(
+                            !source(file).contains("sandbox_admission::"),
+                            "route {} now calls sandbox_admission: update LAUNCH_ROUTES",
+                            route.id
+                        );
+                    }
+                    RouteStatus::Handle | RouteStatus::AdmittedNoHandle => assert!(
+                        source(file).contains("sandbox_admission::"),
+                        "route {} should call sandbox_admission",
+                        route.id
+                    ),
+                    RouteStatus::Partial => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn launch_route_lines_name_every_route() {
+        let lines = route_lines();
+        assert_eq!(lines.len(), 12);
+        for route in LAUNCH_ROUTES {
+            let prefix = format!("  admission     {}: ", route.id);
+            let line = lines
+                .iter()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("missing route line for {}", route.id));
+            assert!(line.contains(route.status.as_str()), "{line}");
+        }
     }
 }
