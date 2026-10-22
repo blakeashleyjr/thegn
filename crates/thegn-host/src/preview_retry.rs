@@ -828,4 +828,270 @@ mod tests {
             ]
         );
     }
+
+    struct CornerTrace {
+        slot: PendingCornerOob,
+        occluded: bool,
+        capacity: bool,
+        term: Option<Vec<u8>>,
+        latest: Option<Vec<u8>>,
+        log: Vec<String>,
+        submitted: Vec<Vec<u8>>,
+        check_after_submit: bool,
+    }
+
+    impl CornerTrace {
+        fn new() -> Self {
+            Self {
+                slot: PendingCornerOob::default(),
+                occluded: false,
+                capacity: true,
+                term: None,
+                latest: None,
+                log: Vec::new(),
+                submitted: Vec::new(),
+                check_after_submit: false,
+            }
+        }
+
+        fn submit(&mut self, draw: Option<Vec<u8>>, visible: bool, check_after_submit: bool) {
+            self.check_after_submit = check_after_submit;
+            let CornerTrace {
+                slot,
+                occluded,
+                capacity,
+                term,
+                log,
+                submitted,
+                ..
+            } = self;
+            let submit = |bytes: Vec<u8>| {
+                let is_delete = bytes == kitty_relay::delete_all();
+                if !is_delete {
+                    assert!(
+                        !*occluded,
+                        "draw submitted while occluded; bytes={bytes:?}; trace={log:?}"
+                    );
+                }
+                submitted.push(bytes.clone());
+                if !*capacity {
+                    return Err(bytes);
+                }
+                if is_delete {
+                    *term = None;
+                } else {
+                    *term = Some(bytes);
+                }
+                Ok(())
+            };
+            if let Some(bytes) = draw {
+                slot.offer_draw(bytes, visible, submit);
+            } else {
+                slot.retry(visible, submit);
+            }
+        }
+
+        fn set_occluded(&mut self, now: bool) {
+            self.log.push(format!("occluded={now}"));
+            self.check_after_submit = false;
+            if now && !self.occluded {
+                self.slot.occlude();
+            }
+            self.occluded = now;
+            self.check();
+        }
+
+        fn frame(&mut self, draw: Option<Vec<u8>>) {
+            self.log.push(if draw.is_some() {
+                "frame(draw)".to_owned()
+            } else {
+                "frame(empty)".to_owned()
+            });
+            if let Some(bytes) = &draw {
+                self.latest = Some(bytes.clone());
+            }
+            self.submit(draw, !self.occluded, true);
+            self.check();
+        }
+
+        fn capacity_retry(&mut self) {
+            self.log.push("capacity_retry".to_owned());
+            self.submit(None, !self.occluded, true);
+            self.check();
+        }
+
+        fn geometry_delete(&mut self) {
+            self.log.push("geometry_delete".to_owned());
+            self.latest = None;
+            self.check_after_submit = false;
+            self.slot.require_delete();
+            self.submit(None, false, false);
+            self.check();
+        }
+
+        fn child_delete(&mut self) {
+            self.log.push("child_delete".to_owned());
+            self.latest = None;
+            self.check_after_submit = false;
+            self.slot.require_delete();
+            self.submit(None, false, false);
+            self.check();
+        }
+
+        fn writer_transient(&mut self) {
+            self.log.push("writer_transient".to_owned());
+            self.check_after_submit = false;
+            self.term = None;
+            self.slot.screen_cleared();
+            self.check();
+        }
+
+        fn set_capacity(&mut self, ok: bool) {
+            self.log.push(format!("capacity={ok}"));
+            self.check_after_submit = false;
+            self.capacity = ok;
+            self.check();
+        }
+
+        fn check(&self) {
+            if self.check_after_submit && self.capacity && !self.occluded {
+                assert_eq!(
+                    self.term, self.latest,
+                    "visible terminal must show exactly the latest valid draw; trace={:?}",
+                    self.log
+                );
+            }
+            if self.check_after_submit && self.capacity && self.occluded {
+                assert_eq!(
+                    self.term, None,
+                    "hidden terminal must have no corner draw; trace={:?}",
+                    self.log
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rapid_occlude_clear_cycles_replay_only_the_latest_draw() {
+        let mut trace = CornerTrace::new();
+        trace.frame(Some(vec![1]));
+        trace.check();
+        for cycle in 1..=5 {
+            trace.set_occluded(true);
+            trace.frame(None);
+            trace.check();
+            if cycle == 2 || cycle == 4 {
+                trace.frame(Some(vec![cycle as u8 + 1]));
+                trace.check();
+            }
+            trace.set_occluded(false);
+            trace.frame(None);
+            trace.check();
+        }
+        assert_eq!(trace.term, Some(vec![5]), "trace={:?}", trace.log);
+    }
+
+    #[test]
+    fn resize_during_occlusion_forgets_the_old_draw() {
+        let mut trace = CornerTrace::new();
+        trace.frame(Some(vec![1]));
+        trace.set_occluded(true);
+        trace.frame(Some(vec![2]));
+        trace.geometry_delete();
+        trace.set_occluded(false);
+        trace.frame(None);
+        assert_eq!(trace.term, None, "trace={:?}", trace.log);
+    }
+
+    #[test]
+    fn child_delete_then_new_draw_while_occluded_shows_only_the_new_draw() {
+        let mut trace = CornerTrace::new();
+        trace.frame(Some(vec![1]));
+        trace.set_occluded(true);
+        trace.child_delete();
+        trace.frame(Some(vec![3]));
+        trace.set_occluded(false);
+        trace.frame(None);
+        assert_eq!(trace.term, Some(vec![3]), "trace={:?}", trace.log);
+    }
+
+    #[test]
+    fn writer_transient_while_occluded_keeps_the_corner_hidden() {
+        let mut trace = CornerTrace::new();
+        trace.frame(Some(vec![1]));
+        trace.set_occluded(true);
+        trace.frame(None);
+        trace.writer_transient();
+        trace.capacity_retry();
+        assert_eq!(trace.term, None, "trace={:?}", trace.log);
+        assert_eq!(
+            trace.submitted.last(),
+            Some(&kitty_relay::delete_all().to_vec()),
+            "trace={:?}",
+            trace.log
+        );
+        trace.set_occluded(false);
+        trace.frame(None);
+        assert_eq!(trace.term, Some(vec![1]), "trace={:?}", trace.log);
+    }
+
+    #[test]
+    fn refused_capacity_across_toggles_keeps_the_delete_first() {
+        let mut trace = CornerTrace::new();
+        trace.set_capacity(false);
+        trace.frame(Some(vec![1]));
+        trace.set_occluded(true);
+        trace.set_occluded(false);
+        trace.frame(Some(vec![2]));
+        let before_retry = trace.submitted.len();
+        trace.set_capacity(true);
+        trace.capacity_retry();
+        let after_retry = &trace.submitted[before_retry..];
+        assert_eq!(
+            after_retry.first(),
+            Some(&kitty_relay::delete_all().to_vec()),
+            "trace={:?}",
+            trace.log
+        );
+        assert_eq!(after_retry.last(), Some(&vec![2]), "trace={:?}", trace.log);
+        assert_eq!(trace.term, Some(vec![2]), "trace={:?}", trace.log);
+    }
+
+    fn next_trace_value(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn seeded_corner_traces_keep_the_occlusion_and_replay_invariants() {
+        for seed in 1_u64..=256 {
+            let mut state = seed;
+            let mut trace = CornerTrace::new();
+            for step in 0_u64..64 {
+                match next_trace_value(&mut state) % 17 {
+                    0..=2 => trace.frame(Some(vec![step as u8, seed as u8])),
+                    3..=4 => trace.frame(None),
+                    5..=6 => trace.capacity_retry(),
+                    7..=8 => trace.set_occluded(true),
+                    9..=10 => trace.set_occluded(false),
+                    11 => trace.geometry_delete(),
+                    12 => trace.child_delete(),
+                    13 => trace.writer_transient(),
+                    14 => trace.set_capacity(false),
+                    _ => trace.set_capacity(true),
+                }
+                trace.check();
+            }
+            trace.set_capacity(true);
+            trace.set_occluded(false);
+            trace.frame(None);
+            assert_eq!(
+                trace.term, trace.latest,
+                "seed={seed} final terminal differs from latest; trace={:?}",
+                trace.log
+            );
+        }
+    }
 }
