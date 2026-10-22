@@ -230,6 +230,8 @@ struct ServeTeardown {
 struct Shared {
     shutdown: AtomicBool,
     endpoint_conflict: AtomicBool,
+    /// Set when the last stop of a process share failed; the child may still be running.
+    stop_failed: AtomicBool,
     stop: Mutex<Option<thegn_svc::share::StopHandle>>,
     teardown: Mutex<Option<ServeTeardown>>,
 }
@@ -239,6 +241,7 @@ impl Shared {
         Arc::new(Shared {
             shutdown: AtomicBool::new(false),
             endpoint_conflict: AtomicBool::new(false),
+            stop_failed: AtomicBool::new(false),
             stop: Mutex::new(None),
             teardown: Mutex::new(None),
         })
@@ -258,16 +261,19 @@ struct ShareInstance {
 }
 
 impl ShareInstance {
-    fn kill(&self) {
-        self.kill_with(false);
+    fn kill(&self) -> Result<(), String> {
+        self.kill_with(false)
     }
 
     fn kill_now(&self) {
-        self.kill_with(true);
+        if let Err(error) = self.kill_with(true) {
+            tracing::debug!(%error, "share kill_now failed");
+        }
     }
 
-    fn kill_with(&self, immediate: bool) {
+    fn kill_with(&self, immediate: bool) -> Result<(), String> {
         self.shared.shutdown.store(true, Ordering::SeqCst);
+        let mut stop_result = Ok(());
         if let Some(handle) = self.shared.stop.lock().unwrap().as_ref() {
             let outcome = if immediate {
                 handle.stop_now()
@@ -277,6 +283,7 @@ impl ShareInstance {
             match outcome {
                 thegn_svc::share::StopOutcome::Failed(error) => {
                     tracing::warn!(%error, worktree = %self.worktree, port = self.port, "share child termination failed");
+                    stop_result = Err(error);
                 }
                 thegn_svc::share::StopOutcome::Terminated
                 | thegn_svc::share::StopOutcome::AlreadyExited => {}
@@ -345,6 +352,7 @@ impl ShareInstance {
                 }
             }
         }
+        stop_result
     }
 }
 
@@ -358,6 +366,24 @@ pub struct ShareSupervisor {
 pub(crate) struct StopShares {
     pub(crate) removed: Vec<(u16, u64)>,
     pub(crate) pending: Vec<(u16, u64)>,
+    pub(crate) failed: Vec<StopFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StopFailure {
+    pub(crate) port: u16,
+    pub(crate) generation: u64,
+    pub(crate) provider: &'static str,
+    pub(crate) error: String,
+}
+
+pub(crate) fn stop_failure_persist(worktree: &str, failure: &StopFailure) -> SharePersist {
+    SharePersist::MarkFailed {
+        worktree: worktree.to_owned(),
+        port: failure.port,
+        generation: failure.generation,
+        provider: failure.provider.to_owned(),
+    }
 }
 
 static NEXT_SHARE_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -450,15 +476,18 @@ impl ShareSupervisor {
         tx: &UnboundedSender<ShareEvent>,
         waker: &TerminalWaker,
     ) -> Result<(), String> {
-        // A FAILED instance must not block a retry: the failed supervisor
-        // thread is gone (it never emits `Down`), so without this eviction the
-        // port stayed "already sharing" for the rest of the session.
+        // A FAILED instance without an unconfirmed process stop must not block
+        // a retry: its supervisor thread is gone (it never emits `Down`).
         self.instances.retain(|i| {
             !(i.worktree == worktree
                 && i.port == port
                 && matches!(i.state, ShareState::Failed(_))
+                && !i.shared.stop_failed.load(Ordering::SeqCst)
                 && i.shared.teardown.lock().unwrap().is_none())
         });
+        if let Some(error) = self.stop_failed_refusal(worktree, port) {
+            return Err(error);
+        }
         if let Some(error) = self.sidecar_restart_refusal(worktree, port) {
             return Err(error);
         }
@@ -610,21 +639,34 @@ impl ShareSupervisor {
         self.stop_with(worktree, port, ShareInstance::kill)
     }
 
+    fn stop_failed_refusal(&self, worktree: &str, port: u16) -> Option<String> {
+        self.instances
+            .iter()
+            .any(|instance| {
+                instance.worktree == worktree
+                    && instance.port == port
+                    && instance.shared.stop_failed.load(Ordering::SeqCst)
+            })
+            .then(|| format!("share :{port} could not be stopped; stop it again before restarting"))
+    }
+
     fn stop_with(
         &mut self,
         worktree: &str,
         port: Option<u16>,
-        mut kill: impl FnMut(&ShareInstance),
+        mut kill: impl FnMut(&ShareInstance) -> Result<(), String>,
     ) -> StopShares {
         let mut stopped = StopShares {
             removed: Vec::new(),
             pending: Vec::new(),
+            failed: Vec::new(),
         };
         // A failed instance without teardown has no worker left to await.
         self.instances.retain(|i| {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
             if matched
                 && matches!(i.state, ShareState::Failed(_))
+                && !i.shared.stop_failed.load(Ordering::SeqCst)
                 && i.shared.teardown.lock().unwrap().is_none()
             {
                 stopped.removed.push((i.port, i.generation));
@@ -636,16 +678,31 @@ impl ShareSupervisor {
         for i in &mut self.instances {
             let matched = i.worktree == worktree && port.is_none_or(|p| p == i.port);
             if matched && !matches!(i.state, ShareState::Stopping) {
-                let teardown_pending = i.shared.teardown.lock().unwrap().is_some();
-                let pair = (i.port, i.generation);
-                if teardown_pending {
-                    stopped.pending.push(pair);
-                } else {
-                    stopped.removed.push(pair);
+                match kill(i) {
+                    Ok(()) => {
+                        i.shared.stop_failed.store(false, Ordering::SeqCst);
+                        let pair = (i.port, i.generation);
+                        if i.shared.teardown.lock().unwrap().is_some() {
+                            stopped.pending.push(pair);
+                        } else {
+                            stopped.removed.push(pair);
+                        }
+                        // Retain this generation until its worker acknowledges teardown.
+                        i.state = ShareState::Stopping;
+                    }
+                    Err(error) => {
+                        i.shared.stop_failed.store(true, Ordering::SeqCst);
+                        i.state = ShareState::Failed(format!(
+                            "could not be stopped: {error}; stop it again to retry"
+                        ));
+                        stopped.failed.push(StopFailure {
+                            port: i.port,
+                            generation: i.generation,
+                            provider: i.provider,
+                            error,
+                        });
+                    }
                 }
-                kill(i);
-                // Retain this generation until its worker acknowledges teardown.
-                i.state = ShareState::Stopping;
             }
         }
         stopped
@@ -951,7 +1008,7 @@ mod tests {
                 &startup_shared.shutdown,
             )
         });
-        instance.kill();
+        instance.kill().expect("no stop handle installed yet");
         let result = starter.join().expect("startup thread");
         assert!(result.is_err_and(|error| {
             error
@@ -1006,7 +1063,7 @@ mod tests {
             event_tx: None,
             event_waker: None,
         };
-        instance.kill();
+        instance.kill().expect("already reaped child is stopped");
         assert!(shared_for_assert.shutdown.load(Ordering::SeqCst));
         // The reaped flag protects against PID reuse; the svc test
         // `stop_handle_is_idempotent_and_never_signals_a_reaped_child` covers
@@ -1177,6 +1234,7 @@ mod tests {
         let stopped = sup.stop_with("/wt", Some(443), |instance| {
             assert!(instance.shared.teardown.lock().unwrap().is_some());
             retries += 1;
+            Ok(())
         });
         assert_eq!(retries, 1);
         assert!(stopped.removed.is_empty());
@@ -1527,5 +1585,139 @@ mod tests {
         });
 
         assert!(!sup.sidecar_teardown_pending("/wt", 443));
+    }
+
+    #[test]
+    fn stop_failure_keeps_a_visible_retryable_share() {
+        let mut sup = ShareSupervisor::new();
+        let generation = 91;
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(PublicEndpoint::parse_url("https://a.test").expect("valid URL")),
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        let stopped = sup.stop_with("/wt", Some(3000), |_| {
+            Err("Operation not permitted (os error 1)".into())
+        });
+
+        assert!(stopped.removed.is_empty());
+        assert!(stopped.pending.is_empty());
+        assert_eq!(
+            stopped.failed,
+            vec![StopFailure {
+                port: 3000,
+                generation,
+                provider: "bore",
+                error: "Operation not permitted (os error 1)".into(),
+            }]
+        );
+        assert_eq!(sup.instances.len(), 1);
+        assert!(matches!(
+            &sup.instances[0].state,
+            ShareState::Failed(message) if message.contains("could not be stopped")
+        ));
+        let views = sup.views("/wt");
+        assert_eq!(views.len(), 1);
+        assert!(views[0].failed);
+        assert!(
+            views[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Operation not permitted"))
+        );
+    }
+
+    #[test]
+    fn stop_failure_retry_kills_again_and_clears_the_marker() {
+        let mut sup = ShareSupervisor::new();
+        let shared = Shared::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 92,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(PublicEndpoint::parse_url("https://a.test").expect("valid URL")),
+            shared: shared.clone(),
+            event_tx: None,
+            event_waker: None,
+        });
+        let first = sup.stop_with("/wt", Some(3000), |_| Err("denied".into()));
+        assert_eq!(first.failed.len(), 1);
+
+        let mut retries = 0;
+        let retried = sup.stop_with("/wt", Some(3000), |_| {
+            retries += 1;
+            Ok(())
+        });
+
+        assert_eq!(retries, 1);
+        assert_eq!(retried.removed, vec![(3000, 92)]);
+        assert!(retried.failed.is_empty());
+        assert!(matches!(sup.instances[0].state, ShareState::Stopping));
+        assert!(!shared.stop_failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stop_failure_refuses_a_restart_on_that_port() {
+        let mut sup = ShareSupervisor::new();
+        let shared = Shared::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 93,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(PublicEndpoint::parse_url("https://a.test").expect("valid URL")),
+            shared: shared.clone(),
+            event_tx: None,
+            event_waker: None,
+        });
+        let failed = sup.stop_with("/wt", Some(3000), |_| Err("denied".into()));
+        assert_eq!(failed.failed.len(), 1);
+
+        assert!(
+            sup.stop_failed_refusal("/wt", 3000)
+                .is_some_and(|message| message.contains(":3000"))
+        );
+        assert!(sup.stop_failed_refusal("/wt", 3001).is_none());
+        let retried = sup.stop_with("/wt", Some(3000), |_| Ok(()));
+        assert_eq!(retried.removed, vec![(3000, 93)]);
+        assert!(sup.stop_failed_refusal("/wt", 3000).is_none());
+    }
+
+    #[test]
+    fn stop_failure_marks_the_saved_row_failed() {
+        let db = thegn_core::db::Db::open_memory().expect("in-memory database");
+        let failure = StopFailure {
+            port: 3000,
+            generation: 94,
+            provider: "bore",
+            error: "denied".into(),
+        };
+        apply_share_persist(
+            &db,
+            SharePersist::Upsert {
+                worktree: "/wt".into(),
+                port: failure.port,
+                generation: failure.generation,
+                provider: failure.provider.into(),
+                url: "https://a.test".into(),
+            },
+        );
+
+        apply_share_persist(&db, stop_failure_persist("/wt", &failure));
+
+        let rows = db.list_shares().expect("list saved shares");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "failed");
+        assert_eq!(rows[0].generation, failure.generation);
     }
 }
