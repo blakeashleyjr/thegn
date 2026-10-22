@@ -305,18 +305,27 @@ pub const POOL_TARGET_CEILING: usize = 8;
 /// 3. Otherwise off (`0`). (No provider-aware auto-default: idle spares consumed
 ///    provider quota — fatal on a low-limit account like machine0's 3-VM cap — and
 ///    the claim path never ran for a fresh worktree, so the spares were pure cost.)
+///
+/// A pool-target read error is returned to the caller, never replaced by the
+/// configured size.
 pub fn effective_pool_target(
     db: &thegn_core::db::Db,
     cfg: &Config,
     repo: &str,
     env: &str,
-) -> usize {
-    let target = if let Some(t) = db.pool_target(repo, env).ok().flatten() {
-        t.max(0) as usize
-    } else {
-        cfg.lifecycle.pool.size
+) -> anyhow::Result<usize> {
+    resolve_pool_target(db.pool_target(repo, env), cfg.lifecycle.pool.size)
+}
+
+fn resolve_pool_target(
+    read: anyhow::Result<Option<i64>>,
+    configured: usize,
+) -> anyhow::Result<usize> {
+    let target = match read? {
+        Some(target) => usize::try_from(target.max(0)).unwrap_or(usize::MAX),
+        None => configured,
     };
-    target.min(POOL_TARGET_CEILING)
+    Ok(target.min(POOL_TARGET_CEILING))
 }
 
 /// Immediately refill the pool after a claim consumed a spare: re-run the
@@ -388,7 +397,15 @@ where
         );
         return;
     };
-    let target = effective_pool_target(&db, cfg, &repo, env_name);
+    let target = match effective_pool_target(&db, cfg, &repo, env_name) {
+        Ok(target) => target,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "warm pool: cannot read the pool target for {repo} ({env_name}): {error:#}; no pool changes made"
+            ));
+            return;
+        }
+    };
     let max_idle = cfg.lifecycle.pool.max_idle_secs;
 
     let Some(spares) = spares_or_halt(db.pool_spares_for(&repo, env_name), &repo, env_name) else {
@@ -932,24 +949,48 @@ mod tests {
         };
 
         // No env table at all ⇒ off.
-        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
+        assert_eq!(
+            effective_pool_target(&db, &cfg, "/repo", "sprites").unwrap(),
+            0
+        );
         // Scale-to-zero + auto_provision ⇒ STILL off (no auto-default: idle spares
         // consumed quota and were never claimed).
         cfg.env.insert("sprites".into(), sprites(true));
-        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
+        assert_eq!(
+            effective_pool_target(&db, &cfg, "/repo", "sprites").unwrap(),
+            0
+        );
         // Without auto_provision ⇒ off too.
         cfg.env.insert("sprites".into(), sprites(false));
-        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 0);
+        assert_eq!(
+            effective_pool_target(&db, &cfg, "/repo", "sprites").unwrap(),
+            0
+        );
         // Explicit config size opts in…
         cfg.env.insert("sprites".into(), sprites(true));
         cfg.lifecycle.pool.size = 3;
-        assert_eq!(effective_pool_target(&db, &cfg, "/repo", "sprites"), 3);
+        assert_eq!(
+            effective_pool_target(&db, &cfg, "/repo", "sprites").unwrap(),
+            3
+        );
         // …and the ceiling clamps a runaway value.
         cfg.lifecycle.pool.size = 999;
         assert_eq!(
-            effective_pool_target(&db, &cfg, "/repo", "sprites"),
+            effective_pool_target(&db, &cfg, "/repo", "sprites").unwrap(),
             POOL_TARGET_CEILING
         );
+    }
+
+    #[test]
+    fn pool_target_read_error_never_falls_back_to_the_configured_size() {
+        assert!(resolve_pool_target(Err(anyhow::anyhow!("disk I/O error")), 3).is_err());
+        assert_eq!(resolve_pool_target(Ok(Some(0)), 3).unwrap(), 0);
+        assert_eq!(resolve_pool_target(Ok(None), 3).unwrap(), 3);
+        assert_eq!(
+            resolve_pool_target(Ok(Some(999)), 0).unwrap(),
+            POOL_TARGET_CEILING
+        );
+        assert_eq!(resolve_pool_target(Ok(Some(-5)), 3).unwrap(), 0);
     }
 
     /// A spare that never captured a checkpoint (or predates S1) is not
