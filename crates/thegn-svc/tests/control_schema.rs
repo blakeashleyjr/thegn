@@ -17,9 +17,9 @@ use thegn_svc::control::*;
 // wire type is a compile error here instead of silently shadowing one.
 use thegn_svc::control::http::{
     AgentSessionsQuery, AttachQuery, CalendarIngestBody, CalendarQuery, CommentBody, CommitBody,
-    DetachBody, DispatchStatusBody, EventsQuery, InputBody, IssueBody, IssueRepoQuery, IssuesQuery,
-    MergeBody, OpenWorktreeBody, PairBody, ResizeBody, SplitBody, StageBody, WaitBody,
-    WorktreeQuery,
+    DetachBody, DispatchStatusBody, DispatchesQuery, EventsQuery, InputBody, IssueBody,
+    IssueRepoQuery, IssuesQuery, MergeBody, OpenWorktreeBody, PairBody, ResizeBody, SplitBody,
+    StageBody, WaitBody, WorktreeQuery,
 };
 
 fn wire_schema() -> serde_json::Value {
@@ -84,6 +84,7 @@ fn wire_schema() -> serde_json::Value {
         IssueRepoQuery,
         CommentBody,
         DispatchStatusBody,
+        DispatchesQuery,
         WorktreeQuery,
         StageBody,
         CommitBody,
