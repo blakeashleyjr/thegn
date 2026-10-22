@@ -59,10 +59,14 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         "merge queue empty (this project · g = all)"
     };
     if rows.is_empty() {
-        return vec![
-            PanelRow::plain(Line::segs(vec![seg(d(), scope_tail)])),
-            mq_hint_row(),
-        ];
+        let mut out = Vec::new();
+        if let Some(notice) = claim_unavailable_notice(ctx.model.panel.merge_claim_error.as_deref())
+        {
+            out.push(notice);
+        }
+        out.push(PanelRow::plain(Line::segs(vec![seg(d(), scope_tail)])));
+        out.push(mq_hint_row());
+        return out;
     }
     if ctx.full() {
         return full_view(ctx, rows);
@@ -74,12 +78,21 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             "all projects (g = this project)",
         )])));
     }
+    if let Some(notice) = claim_unavailable_notice(ctx.model.panel.merge_claim_error.as_deref()) {
+        out.push(notice);
+    }
     for (i, r) in rows.iter().enumerate() {
         let mut left = vec![status_glyph(&r.status), seg(d(), format!(" {}", r.branch))];
         // Off-host branches get a host chip so the reader sees which rows live on
         // another machine (their tips are bundle-fetched into the target store).
         if let Some(host) = host_label(&r.location) {
             left.push(seg(hue(Hue::Blue), format!(" @{host}")));
+        }
+        if let Some(view) = claim_for_row(ctx, &r.worktree)
+            && let Some(chip) = row_claim_chip(Some(view), thegn_core::util::now_ms())
+        {
+            left.push(seg(g(), "  "));
+            left.push(chip);
         }
         // Blocked rows carry the reason recorded on the row. The gate branch
         // used to hardcode "breaks build" here, ignoring `error_detail` — so the
@@ -209,6 +222,13 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
     if let Some(host) = host_label(&r.location) {
         detail.push(vec![seg(g2(), "host  "), seg(hue(Hue::Blue), host)]);
     }
+    if let Some((label, tone)) = claim_detail_line(
+        claim_for_row(ctx, &r.worktree),
+        ctx.model.panel.merge_claim_error.as_deref(),
+        thegn_core::util::now_ms(),
+    ) {
+        detail.push(vec![seg(g2(), "claim  "), seg(hue(tone), label)]);
+    }
     if r.agent_attempts > 0 {
         detail.push(vec![seg(
             g2(),
@@ -248,6 +268,86 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
     ));
     out.push(mq_hint_row());
     out
+}
+
+fn claim_for_row<'a>(
+    ctx: &SectionCtx<'a>,
+    worktree: &str,
+) -> Option<&'a thegn_core::store::MergeClaimView> {
+    ctx.model
+        .panel
+        .merge_claims
+        .iter()
+        .find(|view| view.worktree == worktree)
+}
+
+fn claim_live(view: &thegn_core::store::MergeClaimView, now_ms: i64) -> bool {
+    view.phase != "unclaimed" && view.lease_until_ms.is_some_and(|until| until > now_ms)
+}
+
+fn row_claim_chip(view: Option<&thegn_core::store::MergeClaimView>, now_ms: i64) -> Option<Seg> {
+    view.filter(|view| claim_live(view, now_ms))
+        .map(|_| seg(hue(Hue::Blue), "claimed"))
+}
+
+fn claim_label(
+    view: Option<&thegn_core::store::MergeClaimView>,
+    now_ms: i64,
+) -> Option<(String, Hue)> {
+    let view = view.filter(|view| view.phase != "unclaimed")?;
+    let owner = view
+        .owner_hint
+        .as_deref()
+        .filter(|hint| !hint.is_empty())
+        .map(crate::merge_sweep::safe_display)
+        .unwrap_or_else(|| "unknown owner".to_owned());
+    let phase = crate::merge_sweep::safe_display(&view.phase);
+    match view.lease_until_ms {
+        Some(until) if until > now_ms => Some((
+            format!(
+                "claimed by {owner} · {phase} · lease {}s left",
+                until.saturating_sub(now_ms) / 1000
+            ),
+            Hue::Blue,
+        )),
+        Some(until) => Some((
+            format!(
+                "claim by {owner} expired {}s ago · recoverable",
+                now_ms.saturating_sub(until) / 1000
+            ),
+            Hue::Amber,
+        )),
+        None => Some((
+            format!("claim by {owner} · {phase} · lease unavailable"),
+            Hue::Amber,
+        )),
+    }
+}
+
+fn claim_detail_line(
+    view: Option<&thegn_core::store::MergeClaimView>,
+    error: Option<&str>,
+    now_ms: i64,
+) -> Option<(String, Hue)> {
+    if let Some(error) = error {
+        return Some((
+            format!(
+                "claim state unavailable: {}",
+                crate::merge_sweep::safe_display(error)
+            ),
+            Hue::Amber,
+        ));
+    }
+    claim_label(view, now_ms)
+}
+
+fn claim_unavailable_notice(error: Option<&str>) -> Option<PanelRow> {
+    error.map(|_| {
+        PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Amber),
+            "claim state unavailable",
+        )]))
+    })
 }
 
 /// The right-column countdown for a landed row under `on_landed = "expire"`:
@@ -441,5 +541,80 @@ mod expiry_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "queued");
         assert_eq!(rows[0].agent_attempts, 0);
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    fn claim(
+        phase: &str,
+        lease_until_ms: Option<i64>,
+        owner_hint: Option<&str>,
+    ) -> thegn_core::store::MergeClaimView {
+        thegn_core::store::MergeClaimView {
+            worktree: "/wt/a".to_owned(),
+            generation: 1,
+            phase: phase.to_owned(),
+            lease_until_ms,
+            owner_hint: owner_hint.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn claim_label_covers_unclaimed_live_expired_and_missing_hint() {
+        let now = 10_000;
+        assert_eq!(
+            claim_label(Some(&claim("unclaimed", None, None)), now),
+            None
+        );
+
+        let live = claim("claimed_no_child", Some(now + 60_000), Some("thegn pid 7"));
+        let (label, tone) = claim_label(Some(&live), now).unwrap();
+        assert_eq!(tone, Hue::Blue);
+        assert!(label.contains("claimed by thegn pid 7"), "{label}");
+        assert!(label.contains("60s left"), "{label}");
+
+        let expired = claim("settled", Some(now - 5_000), Some("drain-a"));
+        let (label, tone) = claim_label(Some(&expired), now).unwrap();
+        assert_eq!(tone, Hue::Amber);
+        assert!(label.contains("expired 5s ago"), "{label}");
+        assert!(label.contains("recoverable"), "{label}");
+
+        let missing_hint = claim("claimed_no_child", None, None);
+        let (label, _) = claim_label(Some(&missing_hint), now).unwrap();
+        assert!(label.contains("unknown owner"), "{label}");
+        assert!(label.contains("lease unavailable"), "{label}");
+    }
+
+    #[test]
+    fn full_view_says_claim_state_unavailable_on_a_read_error() {
+        let line = claim_detail_line(None, Some("boom"), 10_000).unwrap();
+        assert_eq!(line.1, Hue::Amber);
+        assert!(
+            line.0.contains("claim state unavailable: boom"),
+            "{}",
+            line.0
+        );
+        assert!(!line.0.contains("claimed by"), "{}", line.0);
+    }
+
+    #[test]
+    fn unavailable_claim_state_has_one_panel_notice_without_row_chip_text() {
+        let notice = claim_unavailable_notice(Some("boom")).unwrap();
+        let Line::Segs(segments) = notice.line else {
+            panic!("claim notice should be a text row");
+        };
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "claim state unavailable");
+        assert!(claim_unavailable_notice(None).is_none());
+    }
+
+    #[test]
+    fn normal_row_marks_a_live_claim() {
+        let live = claim("claimed_no_child", Some(70_000), Some("test-drain"));
+        let chip = row_claim_chip(Some(&live), 10_000).unwrap();
+        assert_eq!(chip.text, "claimed");
     }
 }
