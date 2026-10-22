@@ -1085,7 +1085,13 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                 continue;
             }
             let cached = db.get_ci_log(&key, &run.id, &job.id).ok().flatten();
-            if cached.as_ref().is_some_and(|old| old.head_sha == run.sha) {
+            if cached.as_ref().is_some_and(|old| {
+                thegn_core::ci_log::cached_log_is_evidence_for(
+                    old,
+                    &run.sha,
+                    job.finished_at.as_deref(),
+                )
+            }) {
                 if let Ok(mut memo) = ingest_memo().lock() {
                     memo.touch(job_key, now, cfg.poll_interval_secs, false);
                 }
@@ -1479,6 +1485,99 @@ mod tests {
                 .iter()
                 .any(|(_, job)| job == "job-rerun")
         );
+    }
+
+    #[test]
+    fn empty_head_cached_log_is_refetched() {
+        use thegn_core::store::CacheStore;
+
+        let temp = private_tempdir();
+        let key = thegn_core::remote::GitLoc::worktree_cache_key(temp.path());
+        let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+        db.put_ci_log(&thegn_core::ci_log::CiLogEntry {
+            worktree: key,
+            run_id: "run".into(),
+            job_id: "job-run".into(),
+            text: "old".into(),
+            fetched_at: 10,
+            ..Default::default()
+        })
+        .expect("seed cached log");
+
+        let provider = FakeCi::new(&[]).with_detail("run", "");
+        ingest_test(
+            &temp,
+            &provider,
+            &[ci_run("run", "")],
+            MAX_LOG_INGEST_CALLS,
+            10_000,
+        );
+
+        assert!(
+            provider
+                .log_calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call == &("run".into(), "job-run".into()))
+        );
+    }
+
+    #[test]
+    fn job_finished_after_capture_refetches_log() {
+        use thegn_core::store::CacheStore;
+
+        fn seed(temp: &tempfile::TempDir) {
+            use thegn_core::store::CacheStore;
+
+            let key = thegn_core::remote::GitLoc::worktree_cache_key(temp.path());
+            let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+            db.put_ci_log(&thegn_core::ci_log::CiLogEntry {
+                worktree: key,
+                run_id: "run".into(),
+                job_id: "job-run".into(),
+                text: "old".into(),
+                fetched_at: 100,
+                head_sha: "sha".into(),
+                ..Default::default()
+            })
+            .expect("seed cached log");
+        }
+
+        let temp = private_tempdir();
+        seed(&temp);
+        let mut provider = FakeCi::new(&[]).with_detail("run", "sha");
+        provider.details.get_mut("run").expect("detail").run.jobs[0].finished_at =
+            Some("2026-10-12T10:00:00Z".into());
+        ingest_test(
+            &temp,
+            &provider,
+            &[ci_run("run", "sha")],
+            MAX_LOG_INGEST_CALLS,
+            10_000,
+        );
+        assert!(
+            provider
+                .log_calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|call| call == &("run".into(), "job-run".into()))
+        );
+
+        let temp = private_tempdir();
+        seed(&temp);
+        let mut provider = FakeCi::new(&[]).with_detail("run", "sha");
+        provider.details.get_mut("run").expect("detail").run.jobs[0].finished_at =
+            Some("1970-01-01T00:01:00Z".into());
+        ingest_test(
+            &temp,
+            &provider,
+            &[ci_run("run", "sha")],
+            MAX_LOG_INGEST_CALLS,
+            10_001,
+        );
+        assert!(provider.log_calls.lock().expect("calls").is_empty());
     }
 
     #[test]
