@@ -916,6 +916,10 @@ pub async fn main(
     // thegn is closed (or idle) is collected at the next launch.
     crate::merge_sweep::spawn(cfg.clone(), std::env::current_dir().unwrap_or_default());
 
+    // Check registered repos for interrupted rename journals off-thread.
+    // This stats each repo and runs git only when a journal is present.
+    crate::handlers::worktree_rename::spawn_launch_sweep();
+
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
     {
