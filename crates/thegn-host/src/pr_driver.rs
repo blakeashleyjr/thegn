@@ -954,8 +954,8 @@ pub(crate) fn drive_queue(
 
                 match guard.finish(db, None) {
                     Ok(true) => {}
-                    Ok(false) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the agent was stopped and the next refresh re-evaluates the row", item.number)),
-                    Err(error) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the agent was stopped and the next refresh re-evaluates the row ({error})", item.number)),
+                    Ok(false) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row", item.number)),
+                    Err(error) => out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row ({error})", item.number)),
                 }
 
                 // The exit code decides nothing — the next refresh does, exactly
