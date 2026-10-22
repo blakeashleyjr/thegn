@@ -43,14 +43,36 @@ use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 /// Mirrors the host's MAX_PENDING_MEDIA_OPS (crates/thegn-host/src/media_ctl.rs); the primary may retune.
 const SMTC_QUEUE_CAPACITY: usize = 8;
 const SMTC_OP_DEADLINE: std::time::Duration = crate::MEDIA_OP_BUDGET;
-static WORKER: std::sync::OnceLock<Result<crate::smtc_worker::OpWorker, MediaError>> =
-    std::sync::OnceLock::new();
+// Failed thread creation is transient, so only a successfully-created worker
+// is cached. Serialize initialization to ensure concurrent first operations
+// never create more than one worker thread.
+static WORKER: std::sync::OnceLock<crate::smtc_worker::OpWorker> = std::sync::OnceLock::new();
+static WORKER_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn worker() -> Result<&'static crate::smtc_worker::OpWorker, MediaError> {
-    WORKER
-        .get_or_init(|| crate::smtc_worker::spawn("thegn-smtc", SMTC_QUEUE_CAPACITY))
-        .as_ref()
-        .map_err(Clone::clone)
+    if let Some(worker) = WORKER.get() {
+        return Ok(worker);
+    }
+
+    let _initializing = WORKER_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(worker) = WORKER.get() {
+        return Ok(worker);
+    }
+
+    let worker = crate::smtc_worker::spawn("thegn-smtc", SMTC_QUEUE_CAPACITY)?;
+    match WORKER.set(worker) {
+        Ok(()) => WORKER
+            .get()
+            .ok_or_else(|| MediaError::Backend("thegn-smtc worker initialization failed".into())),
+        Err(worker) => {
+            drop(worker);
+            WORKER.get().ok_or_else(|| {
+                MediaError::Backend("thegn-smtc worker initialization failed".into())
+            })
+        }
+    }
 }
 
 /// Stateless SMTC controller — the session manager is opened fresh per call
