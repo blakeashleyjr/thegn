@@ -24,8 +24,13 @@ pub const MAX_SOURCES: usize = 64;
 /// Maximum playlist rows retained at backend ingress; matches the count native
 /// MPRIS requests from `GetPlaylists`.
 pub const MAX_PLAYLISTS: usize = 100;
-/// Maximum player names retained at backend ingress and in the aggregate union.
+/// Maximum player names a consumer displays; ingress keeps one more
+/// ([`PLAYER_LIST_LIMIT`]).
 pub const MAX_PLAYERS: usize = MAX_SOURCES;
+/// Player names retained at ingress: the cap plus one overflow name, so a
+/// consumer that sees more than [`MAX_PLAYERS`] names knows the list was cut.
+/// Consumers display at most [`MAX_PLAYERS`].
+pub const PLAYER_LIST_LIMIT: usize = MAX_PLAYERS + 1;
 
 /// Transport state, normalized across backends (maps MPRIS `PlaybackStatus`,
 /// Windows SMTC `PlaybackStatus`, and mpv's `pause`/`idle` onto one axis).
