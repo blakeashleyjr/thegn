@@ -178,19 +178,17 @@ pub(crate) fn picker_seed(db: &thegn_core::db::Db) -> (Vec<String>, PickerExclus
     let mut out: Vec<String> = Vec::new();
     let mut seed_ids = HashSet::new();
     let mut push = |p: String| {
-        let id = thegn_core::util::file_identity(std::path::Path::new(&p));
+        let Some(id) = thegn_core::util::file_identity(std::path::Path::new(&p)) else {
+            return;
+        };
         if !exclusions.contains(&p)
-            && !id
-                .as_ref()
-                .is_some_and(|id| exclusions.excludes_identity(id))
+            && !exclusions.excludes_identity(&id)
             && !out.contains(&p)
-            && !id.as_ref().is_some_and(|id| seed_ids.contains(id))
+            && !seed_ids.contains(&id)
             && std::path::Path::new(&p).is_dir()
         {
-            if let Some(id) = id {
-                seed_ids.insert(id.clone());
-                exclusions.seed_ids.insert(p.clone(), id);
-            }
+            seed_ids.insert(id.clone());
+            exclusions.seed_ids.insert(p.clone(), id);
             out.push(p);
         }
     };
