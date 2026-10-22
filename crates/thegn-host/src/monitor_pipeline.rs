@@ -428,51 +428,167 @@ pub(crate) fn fmt_age_ms(delta_ms: i64) -> String {
     }
 }
 
+#[derive(Default)]
+struct WorktreeGroup {
+    spellings: std::collections::BTreeSet<String>,
+    resolved: Option<String>,
+}
+
+struct GroupedWorktrees {
+    by_key: std::collections::BTreeMap<String, WorktreeGroup>,
+    key_by_spelling: std::collections::BTreeMap<String, String>,
+}
+
+/// Legacy rows may name one worktree under several spellings. The sidebar and
+/// attention lookups use the registered worktree path, so each group retains
+/// every spelling and its resolved local path. Resolution is performed once
+/// per distinct path by the hydration-thread caller; unresolvable paths keep
+/// their raw identity. Resolution may stall on a dead network mount, just as
+/// any stat there can.
+fn grouped_worktrees(
+    dispatches: &[AgentDispatch],
+    resolve: &dyn Fn(&str) -> Option<String>,
+    include: impl Fn(&AgentDispatch) -> bool,
+) -> GroupedWorktrees {
+    let mut resolved_by_spelling = std::collections::BTreeMap::new();
+    let mut grouped = GroupedWorktrees {
+        by_key: std::collections::BTreeMap::new(),
+        key_by_spelling: std::collections::BTreeMap::new(),
+    };
+    for dispatch in dispatches.iter().filter(|dispatch| include(dispatch)) {
+        let path = &dispatch.worktree_path;
+        let resolved = resolved_by_spelling
+            .entry(path.clone())
+            .or_insert_with(|| resolve(path))
+            .clone();
+        let key = resolved.clone().unwrap_or_else(|| path.clone());
+        grouped.key_by_spelling.insert(path.clone(), key.clone());
+        let group = grouped.by_key.entry(key).or_default();
+        group.spellings.insert(path.clone());
+        if resolved.is_some() {
+            group.resolved = resolved;
+        }
+    }
+    grouped
+}
+
+fn resolved_worktree(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|resolved| resolved.to_string_lossy().into_owned())
+}
+
 /// The per-worktree stage badge the sidebar shows: the stage of each worktree's
-/// most recent **active** roster row.
+/// most recent **active** roster row. Legacy rows may name one worktree under
+/// several spellings, so the winner is reported under every spelling and the
+/// resolved path used by sidebar lookups.
 ///
 /// Active rather than most-recent-of-any: a finished row's stage is history, and
 /// a badge that keeps naming last week's `review` on an idle worktree is worse
-/// than none. Pure, so the hydration thread's fold and its test share one rule.
+/// than none. Resolution runs on the hydration thread; the fold itself remains
+/// a deterministic roster reduction.
 pub(crate) fn stage_badges(
     dispatches: &[AgentDispatch],
 ) -> std::collections::BTreeMap<String, String> {
+    stage_badges_with(dispatches, &resolved_worktree)
+}
+
+fn stage_badges_with(
+    dispatches: &[AgentDispatch],
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> std::collections::BTreeMap<String, String> {
+    let groups = grouped_worktrees(dispatches, resolve, |dispatch| {
+        dispatch.status.is_active()
+            && !dispatch.worktree_path.is_empty()
+            && dispatch
+                .stage
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|stage| !stage.is_empty())
+    });
     let mut out: std::collections::BTreeMap<String, ((i64, i64), String)> = Default::default();
     for d in dispatches {
-        if !d.status.is_active() || d.worktree_path.is_empty() {
-            continue;
-        }
         let Some(stage) = d.stage.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
             continue;
         };
+        if !d.status.is_active() || d.worktree_path.is_empty() {
+            continue;
+        }
+        let Some(group_key) = groups.key_by_spelling.get(&d.worktree_path) else {
+            continue;
+        };
         let key = (d.dispatched_at_ms, d.id);
-        match out.get_mut(&d.worktree_path) {
+        match out.get_mut(group_key) {
             Some(e) if e.0 >= key => {}
             Some(e) => *e = (key, display_label(stage)),
             None => {
-                out.insert(d.worktree_path.clone(), (key, display_label(stage)));
+                out.insert(group_key.clone(), (key, display_label(stage)));
             }
         }
     }
-    out.into_iter().map(|(k, (_, s))| (k, s)).collect()
+    let mut badges = std::collections::BTreeMap::new();
+    for (group_key, (_, stage)) in out {
+        let Some(group) = groups.by_key.get(&group_key) else {
+            continue;
+        };
+        for spelling in &group.spellings {
+            badges.insert(spelling.clone(), stage.clone());
+        }
+        if let Some(resolved) = &group.resolved {
+            badges.insert(resolved.clone(), stage);
+        }
+    }
+    badges
 }
 
 /// Worktrees whose most recent **active** roster row is parked on a human,
 /// mapped to that row's dispatch time in unix **seconds** — the shape
 /// [`thegn_core::attention::AttentionInputs::stage_blocked_since`] wants.
+/// Legacy rows may name one worktree under several spellings, so each group's
+/// maximum is reported under every spelling and the resolved path used by
+/// attention lookups.
 pub(crate) fn stage_blocked(
     dispatches: &[AgentDispatch],
 ) -> std::collections::BTreeMap<String, i64> {
+    stage_blocked_with(dispatches, &resolved_worktree)
+}
+
+fn stage_blocked_with(
+    dispatches: &[AgentDispatch],
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> std::collections::BTreeMap<String, i64> {
+    let groups = grouped_worktrees(dispatches, resolve, |dispatch| {
+        dispatch.status == AgentDispatchStatus::WaitingHuman && !dispatch.worktree_path.is_empty()
+    });
     let mut out: std::collections::BTreeMap<String, i64> = Default::default();
     for d in dispatches {
         if d.status != AgentDispatchStatus::WaitingHuman || d.worktree_path.is_empty() {
             continue;
         }
+        let Some(group_key) = groups.key_by_spelling.get(&d.worktree_path) else {
+            continue;
+        };
         let at = d.dispatched_at_ms / 1000;
-        let e = out.entry(d.worktree_path.clone()).or_insert(at);
+        let e = out.entry(group_key.clone()).or_insert(at);
         *e = (*e).max(at);
     }
-    out
+    let mut blocked = std::collections::BTreeMap::new();
+    for (group_key, at) in out {
+        let Some(group) = groups.by_key.get(&group_key) else {
+            continue;
+        };
+        for spelling in &group.spellings {
+            blocked.insert(spelling.clone(), at);
+        }
+        if let Some(resolved) = &group.resolved {
+            blocked.insert(resolved.clone(), at);
+        }
+    }
+    blocked
 }
 
 /// The roster changed under the loop (a pane exit stamped a row, a
@@ -851,6 +967,63 @@ mod tests {
         let m = stage_blocked(&[a, b, c]);
         assert_eq!(m.get("/wt/x").copied(), Some(9));
         assert!(!m.contains_key("/wt/y"), "only waiting_human rows block");
+    }
+
+    #[test]
+    fn stage_badges_fold_spellings_of_one_worktree() {
+        let mut alias = d(1, Some("code"), None, 100);
+        alias.worktree_path = "/link/x".into();
+        let mut canonical_spelling = d(2, Some("review"), None, 200);
+        canonical_spelling.worktree_path = "/real/x/.".into();
+        let mut unresolved = d(3, Some("architect"), None, 300);
+        unresolved.worktree_path = "/wt/y".into();
+        let resolve = |path: &str| match path {
+            "/link/x" | "/real/x/." => Some(String::from("/real/x")),
+            _ => None,
+        };
+
+        let badges = stage_badges_with(&[alias, canonical_spelling, unresolved], &resolve);
+        assert_eq!(badges.get("/link/x").map(String::as_str), Some("review"));
+        assert_eq!(badges.get("/real/x/.").map(String::as_str), Some("review"));
+        assert_eq!(badges.get("/real/x").map(String::as_str), Some("review"));
+        assert_eq!(badges.get("/wt/y").map(String::as_str), Some("architect"));
+    }
+
+    #[test]
+    fn stage_blocked_folds_spellings_of_one_worktree() {
+        let mut alias = d(1, Some("code"), None, 5_000);
+        alias.worktree_path = "/link/x".into();
+        alias.status = AgentDispatchStatus::WaitingHuman;
+        let mut canonical_spelling = d(2, Some("review"), None, 9_000);
+        canonical_spelling.worktree_path = "/real/x/.".into();
+        canonical_spelling.status = AgentDispatchStatus::WaitingHuman;
+        let resolve = |path: &str| match path {
+            "/link/x" | "/real/x/." => Some(String::from("/real/x")),
+            _ => None,
+        };
+
+        let blocked = stage_blocked_with(&[alias, canonical_spelling], &resolve);
+        assert_eq!(blocked.get("/link/x").copied(), Some(9));
+        assert_eq!(blocked.get("/real/x/.").copied(), Some(9));
+        assert_eq!(blocked.get("/real/x").copied(), Some(9));
+    }
+
+    #[test]
+    fn stage_badges_resolve_a_real_symlink_alias() {
+        let temp = thegn_core::testenv::symlinked_tempdir();
+        if temp.path() == temp.real_path() {
+            return;
+        }
+        let mut row = d(1, Some("code"), None, 100);
+        row.worktree_path = temp.path().display().to_string();
+
+        let badges = stage_badges(&[row]);
+        assert_eq!(
+            badges
+                .get(&temp.real_path().display().to_string())
+                .map(String::as_str),
+            Some("code")
+        );
     }
 
     #[test]
