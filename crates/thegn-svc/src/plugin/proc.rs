@@ -1383,13 +1383,13 @@ mod process_tree_deadline_tests {
         assert!(!run.outcome.drained);
         assert!(run.outcome.reaped);
         assert!(!run.truncated);
-        // The leader exits at about 100 ms, lowering the reader cutoff to
-        // leader exit + the 500 ms grace (about 600 ms from start). The
-        // 50 ms poll cap gives about 13 waits for the held pipe, plus EOF
+        // The leader exits once the holder has detached (typically tens of
+        // ms), lowering the reader cutoff to leader exit + the 500 ms grace.
+        // The 50 ms poll cap gives about 13 waits for the held pipe, plus EOF
         // events for stdout; 200 allows ample scheduling and event overhead.
         assert!(
             run.outcome.poll_calls < 200,
-            "poll calls: {}; reader cutoff is about leader exit (~100 ms) + {} ms grace (~600 ms from start)",
+            "poll calls: {}; reader cutoff is about leader exit once the holder has detached (typically tens of ms) + {} ms grace",
             run.outcome.poll_calls,
             READER_GRACE.as_millis()
         );
@@ -1455,11 +1455,11 @@ mod process_tree_deadline_tests {
             Duration::from_secs(10),
         )
         .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(
             Path::new(&marker).exists(),
             "escaped holder never detached (leader gave up waiting)"
         );
+        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(run.outcome.abandoned);
         assert!(!run.truncated);
         assert_readers_exit_within_margin();
