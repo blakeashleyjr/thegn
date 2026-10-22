@@ -88,9 +88,49 @@ impl SecretScrub {
     }
 
     fn scrub(&self, text: &str) -> String {
-        self.values.iter().fold(text.to_owned(), |scrubbed, value| {
-            scrubbed.replace(value, "<redacted>")
-        })
+        let mut scrubbed = String::with_capacity(text.len());
+        let mut offset = 0;
+        while offset < text.len() {
+            let remaining = &text[offset..];
+            if let Some(value) = self
+                .values
+                .iter()
+                .filter(|value| remaining.starts_with(value.as_str()))
+                .max_by_key(|value| value.len())
+            {
+                scrubbed.push_str("<redacted>");
+                offset += value.len();
+            } else {
+                let character = remaining.chars().next().expect("offset is before end");
+                scrubbed.push(character);
+                offset += character.len_utf8();
+            }
+        }
+        scrubbed
+    }
+
+    fn scrub_capped_stderr(&self, text: &str) -> String {
+        let scrubbed = self.scrub(text);
+        if text.len() < proc::MAX_STDERR - 4 {
+            return scrubbed;
+        }
+
+        let checked = scrubbed.strip_suffix('\u{fffd}').unwrap_or(&scrubbed);
+        for value in &self.values {
+            let value_bytes = value.as_bytes();
+            let checked_bytes = checked.as_bytes();
+            let max_prefix = value_bytes.len().min(checked_bytes.len());
+            for prefix_len in (1..=max_prefix).rev() {
+                if prefix_len < value_bytes.len()
+                    && value.is_char_boundary(prefix_len)
+                    && checked_bytes.ends_with(&value_bytes[..prefix_len])
+                    && let Some(prefix) = checked.get(..checked.len() - prefix_len)
+                {
+                    return format!("{prefix}<redacted>");
+                }
+            }
+        }
+        scrubbed
     }
 
     fn scrub_error(&self, error: CalendarError) -> CalendarError {
@@ -402,7 +442,7 @@ impl AdmittingSink {
                     .unwrap_or_default();
                 tracing::debug!(
                     target: "thegn::calendar::plugin",
-                    level = p.level.as_deref().unwrap_or("info"),
+                    level = self.scrub.scrub(p.level.as_deref().unwrap_or("info")),
                     message = self.scrub.scrub(p.message.as_deref().unwrap_or_default()),
                     "plugin log"
                 );
@@ -626,7 +666,7 @@ impl CommandBackend {
             PluginError::Exit { code, stderr } => CalendarError::Subprocess(
                 PluginError::Exit {
                     code,
-                    stderr: scrub.scrub(&stderr),
+                    stderr: scrub.scrub_capped_stderr(&stderr),
                 }
                 .to_string(),
             ),
