@@ -27,7 +27,7 @@ Its report shows `no database yet`, `not read` with the on-disk and build
 schema versions (older databases migrate on the next start; a newer database
 means this build is too old), or `unavailable` with an error. Host sections
 below may be incomplete when the database cannot be read. `doctor --json`
-reports this as `state_db`.
+reports this as `worktree_identity.state_db` (`ok` when read).
 
 The **Monitor collectors** block lists each system monitor collector and its
 discovered health. Collectors that are checked only while their panel is
