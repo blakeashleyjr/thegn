@@ -2150,7 +2150,12 @@ impl ControlApi for DaemonService {
                 );
                 entry.truncated |= raw_truncated;
                 entry.head_sha = identity.head_sha;
-                Ok::<_, anyhow::Error>((entry, identity.warnings))
+                let warnings = identity
+                    .warnings
+                    .iter()
+                    .map(|warning| thegn_svc::lsp::sanitize_for_terminal(warning))
+                    .collect();
+                Ok::<_, anyhow::Error>((entry, warnings))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?

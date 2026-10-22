@@ -485,7 +485,7 @@ fn log(
                 .map_err(|error| error.to_string());
             let identity = crate::ci_refresh::log_fill_identity(&detail, run_id, job_id);
             for warning in &identity.warnings {
-                msg::warn(&thegn_svc::lsp::sanitize_for_terminal(warning));
+                msg::warn(warning);
             }
             let raw = match provider.logs(&loc, run_id, job_id) {
                 Ok(raw) => raw,
