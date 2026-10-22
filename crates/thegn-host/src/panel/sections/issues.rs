@@ -835,6 +835,7 @@ mod tests {
         let model = crate::chrome::FrameModel {
             panel: crate::panel::PanelData {
                 tracker_issues: vec![issue("ABC-1", IssuePriority::High, IssueStatus::Todo, "")],
+                issues_configured: true,
                 tracker_partial: vec![thegn_core::issue::IssueCachePartial {
                     account: "work".into(),
                     reason: "page cap".into(),
