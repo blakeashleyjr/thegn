@@ -40,6 +40,30 @@ fn semantic_sweep_enters_the_installed_background_worker_hook() {
 }
 
 #[test]
+fn semantic_sweep_should_start_only_when_enabled_and_a_database_was_opened() {
+    let cases = [
+        (false, None, false),
+        (false, Some(std::path::Path::new("state.db")), false),
+        (true, None, false),
+        (true, Some(std::path::Path::new("state.db")), true),
+    ];
+
+    for (enabled, path, expected) in cases {
+        assert_eq!(
+            semantic_sweep_should_start(enabled, path),
+            expected,
+            "enabled={enabled}, path_present={}",
+            path.is_some()
+        );
+    }
+}
+
+#[test]
+fn semantic_sweep_is_not_enabled_by_default() {
+    assert!(!SEMANTIC_SWEEP_ENABLED.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
 fn semantic_sweep_pages_until_all_missing_file_rows_are_removed() {
     use crate::semantic::EntityKind;
     use crate::store::SemEntityRow;
