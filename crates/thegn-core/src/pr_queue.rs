@@ -588,6 +588,17 @@ pub struct PrAgentRowSnapshot {
     pub claim_lease_until_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrAgentLeaseView {
+    pub generation: i64,
+    pub lease_until_ms: i64,
+    pub owner_hint: Option<String>,
+}
+
+pub fn pr_agent_lease_live(view: Option<&PrAgentLeaseView>, now_ms: i64) -> bool {
+    view.is_some_and(|view| view.lease_until_ms >= now_ms)
+}
+
 pub fn decide_pr_agent_admission(
     row: &PrAgentRowSnapshot,
     request: &PrAgentAdmit<'_>,
