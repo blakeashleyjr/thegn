@@ -247,12 +247,12 @@ with an unknown head is printed but not cached. The CI panel's failed-job log
 windows and background log ingestion apply a stricter check: they reuse a
 cached window only for the run's current head and only if the job has not
 finished again since the log was fetched.
-The daemon/API `ci.logs` `tail_lines` argument can narrow `[ci] log_tail_lines`,
-but a larger value is clamped to that setting. A value of `0` is refused.
 If run detail is unavailable or the job is not listed, `ci logs` still prints
 the log without a job name or head, warns, and does not cache it. With `--json`,
 the warnings are in a `warnings` array (empty for a cached log); the control
 API's `ci.logs` reply carries the same field.
+The daemon/API `ci.logs` `tail_lines` argument can narrow `[ci] log_tail_lines`,
+but a larger value is clamped to that setting. A value of `0` is refused.
 
 When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
