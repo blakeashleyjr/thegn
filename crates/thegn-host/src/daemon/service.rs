@@ -2052,6 +2052,11 @@ impl ControlApi for DaemonService {
                 .map_err(|error| ControlError::InvalidArgument(error.to_string()))?;
             thegn_svc::ci::validate_ci_id(job_id)
                 .map_err(|error| ControlError::InvalidArgument(error.to_string()))?;
+            if tail_lines == Some(0) {
+                return Err(ControlError::InvalidArgument(
+                    "tail_lines must be at least 1".into(),
+                ));
+            }
             let path = if worktree.is_empty() {
                 std::env::current_dir().map_err(|e| ControlError::Internal(e.into()))?
             } else {
@@ -2086,16 +2091,11 @@ impl ControlApi for DaemonService {
                     && thegn_core::ci_log::cacheable_log_entry(entry)
             });
             if let Some(mut entry) = cached {
-                let redacted = thegn_core::ci_log::redact(&entry.text);
-                let (text, truncated) = thegn_core::ci_log::bounded_window(
-                    &redacted,
-                    tail_lines
-                        .unwrap_or(self.config.ci.log_tail_lines)
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                    self.config
-                        .ci
-                        .log_max_bytes
-                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                let (text, truncated) = thegn_core::ci_log::served_window(
+                    &entry.text,
+                    tail_lines,
+                    self.config.ci.log_tail_lines,
+                    self.config.ci.log_max_bytes,
                 );
                 entry.text = text;
                 entry.redacted = true;
@@ -2171,16 +2171,11 @@ impl ControlApi for DaemonService {
                     })
                     .await;
             }
-            let redacted_text = thegn_core::ci_log::redact(&entry.text);
-            let (text, truncated) = thegn_core::ci_log::bounded_window(
-                &redacted_text,
-                tail_lines
-                    .unwrap_or(self.config.ci.log_tail_lines)
-                    .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                self.config
-                    .ci
-                    .log_max_bytes
-                    .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+            let (text, truncated) = thegn_core::ci_log::served_window(
+                &entry.text,
+                tail_lines,
+                self.config.ci.log_tail_lines,
+                self.config.ci.log_max_bytes,
             );
             entry.text = text;
             entry.redacted = true;
@@ -3827,6 +3822,17 @@ mod tests {
                 .await;
             assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn ci_logs_rejects_zero_tail_lines_before_cache_or_provider_access() {
+        let (service, _) = service(0);
+
+        let result = service
+            .ci_logs("/does/not/need/to/exist", "1", "2", Some(0))
+            .await;
+
+        assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
     }
 
     /// Build a service with an in-memory DB and no live sessions — enough to
