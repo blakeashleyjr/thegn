@@ -9,65 +9,570 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.32] — 2026-10-22 (maintenance batch 69)
 
+### Added
+
+- Calendar reminders report skipped-event categories, and worktree aliases
+  resolve consistently across issue notifications and automation.
+- Stale media badges are cleared, and pane user-bus visibility can be hidden.
+- Pool halts and deletes keep their state visible and preserve the row on failure
+  (dev channel).
+
+### Changed
+
+- CI log excerpts honor configured limits on cached and served results; CI
+  details stay bound to their originating worktree. The workspace picker
+  avoids redundant directory checks.
+- Doctor reads state without creating or migrating the database and resolves
+  toolchain locations through its read-only handle.
+- Merge cleanup retries use bounded backoff, recover expired drain claims,
+  and report deferred cleanup rows once per retry window. Soft-cap refusals
+  identify the reason (dev channel).
+
+### Fixed
+
+- Control socket masks preserve inaccessible-node sources while refusing
+  mounts that would hide a bind or expose the privileged socket.
+- Terminal frames use the writer queue, keeping frame writes ordered and
+  bounded.
+
+### Security
+
+- Release archives require matching attestation identity. Managed tool
+  provenance reasons remain visible in doctor output.
+
 ## [0.1.0-alpha.31] — 2026-10-22 (maintenance batch 68)
+
+### Added
+
+- Dispatch history is available in bounded newest-first pages, and issue and
+  worktree aliases resolve consistently across pipeline views.
+- Calendar reminders, plugin alerts and media shutdown use coordinated,
+  bounded delivery and cleanup.
+
+### Changed
+
+- Results appear only for matching branches and provider contexts. Incomplete
+  details include a warning.
+- `thegn config show`, `get` and `explain` redact calendar credentials and
+  other sensitive values.
+
+### Security
+
+- Font configuration replacement uses an exclusive staged file, and release
+  archives with sparse members or truncated data are refused. Lost PR-agent
+  leases cancel the run; pool reconciliation stops on database read errors.
 
 ## [0.1.0-alpha.30] — 2026-10-22 (maintenance batch 67)
 
+### Added
+
+- Player lists report truncation; calendar validation reports rejected-event
+  categories; tracker notifications identify an issue's account.
+- Startup warnings and merge cleanup results are surfaced in the status line.
+
+### Changed
+
+- CI log payloads remain bounded, and attention ignores results from another
+  provider context. Dispatch history supports bounded paging.
+- Player and workspace discovery work is capped to keep large inventories from
+  stalling the interface.
+
+### Security
+
+- Managed tools require matching provenance records. VPS reservations count
+  only records for the same provider account, and unsafe execution or socket
+  probes fail closed.
+
 ## [0.1.0-alpha.29] — 2026-10-22 (maintenance batch 66)
+
+### Added
+
+- The Merge queue shows claim owners and lease state. Issue rows retain their
+  tracker account, and issue details indicate incomplete comment lists.
+
+### Changed
+
+- CI operations can be canceled with Ctrl-C; logs and media queues use bounded
+  pages and distinguish errors from empty results. CI log excerpts retain the
+  first failure within a bounded window; provider results use bounded pages
+  (dev channel).
+- Dispatch history and `supervise plan/status --all` support bounded paging.
+
+### Security
+
+- Terminal launches use opaque sandbox admission. VPS, Fly and warm-pool
+  operations refuse account mismatches or unreadable ledger data (dev channel);
+  share backends are limited to supported built-ins.
 
 ## [0.1.0-alpha.28] — 2026-10-21 (maintenance batch 65)
 
+### Added
+
+- `thegn doctor` reports sandbox execution routes and admission status.
+  `thegn merge list` shows claim owner and lease details.
+
+### Changed
+
+- Cached CI results and logs are trusted only for a matching provider, branch
+  and commit; expired PR-agent claims are reconciled before work resumes.
+- Issue rows preserve account identity, and media picker results distinguish
+  errors from empty lists.
+
+### Security
+
+- Remote bridge binaries, provider credentials, calendar plugin output and
+  managed VPS/Fly records are checked against recorded identity before use
+  (dev channel).
+
 ## [0.1.0-alpha.27] — 2026-10-21 (maintenance batch 64)
+
+### Added
+
+- The Overview monitor places its power panel only when readings are
+  available.
+
+### Changed
+
+- CI results are accepted only for the current branch and provider context;
+  pipeline issue aliases resolve consistently. Headless agent limitations are
+  reported.
+
+### Security
+
+- Remote worktree sync, projection mounts and provider execution use staged,
+  bounded operations (dev channel). Unsafe plugin surfaces and storage are
+  refused or reported explicitly.
 
 ## [0.1.0-alpha.26] — 2026-10-21 (maintenance batch 63)
 
+### Added
+
+- `thegn pr merge` and the panel verify the reviewed commit, refusing a
+  changed pull request. `session move` drops history by default;
+  `--include-history` opts in.
+
+### Changed
+
+- Calendar cancellation updates remove canceled occurrences. Playlist, player,
+  preview and CI results have explicit limits; provider results have explicit
+  limits (dev channel). Media and daemon work can be canceled cleanly.
+
+### Security
+
+- Font replacement refuses foreign-owned or hard-linked files. Daemon stop
+  reports listeners it could not verify and exits non-zero.
+
 ## [0.1.0-alpha.25] — 2026-10-21 (maintenance batch 62)
 
-- VPN sidecar reuse now checks the resolved tunnel configuration. An unlabelled
-  sidecar left running from before this upgrade is refused; stop that worktree's
+### Added
+
+- Agent handoffs return explicit outcomes.
+- Media queues expose bounded pages and watcher health; calendar page updates
+  are atomic and include diagnostics.
+
+### Changed
+
+- VPN sidecar reuse now checks the resolved tunnel configuration. An
+  unlabelled sidecar left running from before this upgrade is refused; stop
+  that worktree's
   sandbox so the sidecar can be recreated with the current configuration.
+- `thegn daemon stop` shuts down every verified listener and reports
+  survivors. Tracker search uses bounded pages with partial-result reporting.
+- Session moves mark active dispatches abandoned and discard source-local
+  paths. Corner previews replay after occlusion clears.
+
+### Security
+
+- Bundle ingestion, Mermaid output, SSH control sockets and plugin startup
+  validate private paths and bounded inputs before use.
 
 ## [0.1.0-alpha.24] — 2026-10-21 (maintenance batch 61)
 
+### Added
+
+- `thegn doctor` reports requested, resolved and enforced sandbox isolation.
+  Project configuration can use `repo_path` to select a checkout.
+
+### Changed
+
+- `thegn secret list` and audit report calendar tokens; `thegn secret migrate`
+  moves literal tokens to private file references.
+
+### Fixed
+
+- Failed hunk previews say “diff unavailable”; corner previews no longer
+  occlude themselves.
+
+### Security
+
+- Credential-free agents lose credential locator variables. Private plugin
+  state directories, signed Nix cache paths and validated sandbox settings are
+  enforced.
+
 ## [0.1.0-alpha.23] — 2026-10-21 (maintenance batch 60)
+
+### Added
+
+- CI reruns use explicit failed-or-canceled scopes; `thegn doctor` probes the
+  debug adapter. Linux users can run `install.sh --batteries` for a verified
+  font and user-local Alacritty.
+
+### Changed
+
+- Calendar tokens resolve through the secret store; ICS parameters retain
+  multiple values while rejecting conflicting singleton values.
+- Merge status and worktree-close failures are reported explicitly. Media
+  operations recheck player identity and reconcile failed loop changes.
+
+### Security
+
+- CI logs use a versioned redaction policy. Share credentials use a redacting
+  secret type, and the VPS SSH control socket uses a private identity-based
+  path.
 
 ## [0.1.0-alpha.22] — 2026-10-20 (maintenance batch 59)
 
+### Added
+
+- The default sandbox profile is `standard`; `hardened` and `guarded` remain
+  aliases. Repositories can opt into development shell injection with
+  `thegn repo trust` (dev channel).
+
+### Changed
+
+- Snapshot uploads use server-side encryption by default;
+  `[lifecycle.snapshot] server_side_encryption = false` opts out for
+  incompatible S3 endpoints. Calendar sync is bounded; remote transfers are
+  bounded (dev channel).
+
+### Security
+
+- Queue handoffs run without inherited credentials. Sealed profiles refuse
+  unsupported hardening; provider launches refuse isolation they cannot
+  enforce (dev channel). Containers and snapshots are verified by identity
+  before reuse or cleanup.
+
 ## [0.1.0-alpha.21] — 2026-10-20 (maintenance batch 58)
+
+### Added
+
+- Calendar transparent events appear as free and still trigger reminders.
+  Media backends report typed errors, and calendar accounts fetch
+  concurrently.
+
+### Changed
+
+- `thegn merge sweep` exits non-zero on refused or incomplete cleanup.
+  `thegn wt reopen <path>` restores a worktree suppressed by close; doctor
+  reports Git metadata exposure.
+- Compose and dotfile updates use pinned or staged inputs and preserve prior
+  state on failure.
+
+### Security
+
+- Daemon dispatch routes can require a capability. Note storage, plugin
+  environments and secret files enforce bounds; provider connections enforce
+  identity checks (dev channel).
 
 ## [0.1.0-alpha.20] — 2026-10-20 (maintenance batch 57)
 
+### Added
+
+- Refusal messages include a remediation hint. `thegn merge retry` and
+  queue-aware landing explain why a row is ineligible.
+
+### Changed
+
+- Compose selects a consistent replica and is recreated when its policy
+  changes. Issue lookups retain the selected tracker account; remote GitLab
+  calls are pinned to their host (dev channel).
+
+### Security
+
+- Merge operations refuse branch drift and histories that cannot be safely
+  replayed. Provider resources, snapshots and shares are bound to verified
+  identities (dev channel); secrets and sandbox launches use pinned tools and
+  bounded output.
+
 ## [0.1.0-alpha.19] — 2026-10-20 (maintenance batch 56)
+
+### Added
+
+- Remote worktree clones and projections are staged before publication (dev
+  channel), and share shutdown stops the child process group under one bounded
+  operation (dev channel).
+
+### Changed
+
+- Failed snapshots and parity captures report rollback or inconsistency.
+  Worktree projections are staged and published only after successful sync
+  (dev channel).
+
+### Security
+
+- OCI bind mounts are rechecked after container creation, and provider
+  provisioning checks egress before execution (dev channel). Remote account
+  homes, secrets and resources use private ownership records (dev channel).
 
 ## [0.1.0-alpha.18] — 2026-10-20 (maintenance batch 55)
 
+### Added
+
+- `thegn wt reopen <path>` restores a worktree after close suppression; doctor
+  reports sandbox access to shared Git metadata.
+
+### Changed
+
+- Merge updates reject unknown statuses and report partial cleanup. Strict
+  worktree and reflog reads no longer skip malformed records; hydration marks
+  unavailable reads clearly.
+- Plugin list and check use the same admitted plugin set, while media results
+  distinguish errors from empty lists.
+
+### Security
+
+- Sealed tunnels with VPN requests are refused until enforceable. Compose
+  containers are inspected and torn down if they escape isolation.
+
 ## [0.1.0-alpha.17] — 2026-10-19 (maintenance batch 54)
+
+### Added
+
+- `thegn merge retry` re-arms held rows; queue-aware landing accepts only a
+  ready row for the checked-out branch. Calendar overrides replace or cancel
+  generated occurrences.
+
+### Changed
+
+- Worktree close tears down SSH-placed sandboxes and reports failures
+  (dev channel). The new-worktree wizard resolves repository context from its
+  current model. `session move` validates input before changing sessions.
+
+### Security
+
+- S3 snapshot endpoints require HTTPS. Secret files use a no-follow directory
+  handle, and provider credentials and SSH key rotation use checked,
+  serialized updates (dev channel).
 
 ## [0.1.0-alpha.16] — 2026-10-19 (maintenance batch 53)
 
+### Added
+
+- Calendar sync refreshes today's events and the visible month.
+
+### Changed
+
+- Pipeline completion reports a verdict and gate result; unknown worktree
+  status blocks completion, resume and cleanup unless overridden. Plugin calls
+  use an allowlisted environment and one deadline.
+
+### Security
+
+- Remote SSH keys, parity manifests and callback origins are validated before
+  use. Failed machine inventory reads no longer permit resource creation.
+
 ## [0.1.0-alpha.15] — 2026-10-19 (maintenance batch 52)
+
+### Added
+
+- The monitor adds Containers, network-owner details, thermal cooling and CPU
+  core drill-down. Observe dashboards can label and hide targets (dev channel).
+
+### Changed
+
+- Memory, GPU and network monitor panels show denser histories. Extended
+  keyboard input is forwarded only to opted-in panes.
+
+### Security
+
+- Sandbox garbage collection runs only when sandboxing is enabled. Quitting
+  cancels in-app merge work, and cleanup refuses to act on hidden monitor
+  rows.
 
 ## [0.1.0-alpha.14] — 2026-10-18 (maintenance batch 51)
 
+### Added
+
+- Disk and Power monitor views show filesystem, worktree, rail and power-cap
+  details. Processes adds an identity-checked signal menu with confirmation.
+
+### Changed
+
+- Memory adds kernel history; container discovery and plugin reads are
+  bounded. GPU and monitor histories preserve missing readings as gaps.
+
+### Security
+
+- Share shutdown uses bounded, verified state (dev channel). Container cleanup
+  and network-owner attribution use bounded, verified state.
+
 ## [0.1.0-alpha.13] — 2026-10-18 (maintenance batch 50)
+
+### Added
+
+- Disk, Memory, Thermal, Network, Power and GPU monitor tabs show denser
+  histories, Wi-Fi details, power rails and GPU engine activity.
+- Processes adds `=` to adjust priority and Linux `I` for I/O priority; both
+  require confirmation. Doctor explains denied monitor collectors.
+
+### Changed
+
+- Power monitoring works without a battery; container statistics are
+  collected on demand. Reverse tunnels retry transient errors and enforce
+  connection and lifetime limits (dev channel).
+
+### Security
+
+- Plugin contributions and retained data are bounded. One-shot plugin
+  processes stop when their deadline expires.
 
 ## [0.1.0-alpha.12] — 2026-10-18 (maintenance batch 49)
 
+### Added
+
+- GPU and Network are monitor tabs with engine, memory, interface and
+  throughput histories. Containers gains bounded resource statistics; network
+  monitoring adds TCP state and latency summaries.
+
+### Changed
+
+- Disk and Power monitor panels show device, filesystem, battery and power-cap
+  histories on labeled scales.
+
+### Security
+
+- Plugin calls have bounded queues, concurrency limits and deadlines.
+  Network-tunnel admission enforces resource limits (dev channel); container
+  scans enforce resource limits.
+
 ## [0.1.0-alpha.11] — 2026-10-18 (maintenance batch 48)
+
+### Added
+
+- The Processes panel includes task, thread, state and owner summaries.
+
+### Changed
+
+- Memory, Disk, GPU and Network views retain bounded histories. Linux
+  monitoring avoids refreshing unused system information. Sandbox fallback
+  clears its loading indicator and avoids repeated failed backend attempts.
+
+### Security
+
+- Plugin stderr is bounded, and daemon shutdown waits for session actors to
+  stop within a deadline.
 
 ## [0.1.0-alpha.10] — 2026-10-18 (maintenance batch 47)
 
+### Added
+
+- The monitor adds CPU and Memory views, a filterable Processes table and
+  AMD GPU readings. The masthead can use NVML, with `nvidia-smi` fallback.
+  Doctor reports UDisks2 SMART health when available.
+
+### Changed
+
+- Linux process monitoring uses a native `/proc` reader with a fallback.
+  Process filters support owner, age, CPU, memory and PID terms.
+
+### Security
+
+- Resident plugin stderr is bounded.
+
 ## [0.1.0-alpha.9] — 2026-10-18 (maintenance batch 46)
+
+### Added
+
+- CPU, Memory and Thermal monitor views are available, with process filtering
+  and configurable table columns. Linux systems can report CPU topology,
+  filesystems, GPU devices and power-cap readings.
+
+### Changed
+
+- Linux base monitoring reports hardware temperatures; GPU discovery
+  recognizes integrated graphics and avoids duplicate devices. Adding a host
+  reports database-write failures.
+
+### Security
+
+- Process priority changes are identity-bound and never escalate privileges.
 
 ## [0.1.0-alpha.8] — 2026-10-17 (maintenance batch 45)
 
+### Added
+
+- Linux monitoring now includes CPU interrupts and scheduling, thermal zones,
+  CPU topology, memory, network and process readings.
+
+### Changed
+
+- Sandbox startup and Podman event monitoring clean up child processes on
+  fallback or shutdown. Worktree scans refresh only when fetched refs change;
+  preview preparation uses background work.
+
+### Fixed
+
+- The sidebar retains its last known change counts when refresh fails.
+
 ## [0.1.0-alpha.7] — 2026-10-17 (maintenance batch 44)
+
+### Added
+
+- Linux monitoring adds memory health, network traffic, disk activity,
+  container inventory and battery or power-supply readings.
+
+### Changed
+
+- Process signals are tied to process start identity. Preview
+  graphics and log drains use bounded background work.
 
 ## [0.1.0-alpha.6] — 2026-10-17 (maintenance batch 43)
 
+### Added
+
+- Linux monitoring now reports CPU frequency, hardware sensors, cgroup
+  resource use and supported AMD GPU metrics.
+
+### Changed
+
+- Calendar, weather and usage pollers reuse HTTP clients. GitHub requests back
+  off after server errors, and worktree operations refuse to reopen a row
+  while deletion is pending.
+
 ## [0.1.0-alpha.5] — 2026-10-16 (maintenance batch 42)
 
+### Added
+
+- Plugin environment values can reference secrets through the token resolver.
+
+### Changed
+
+- Merge conflict reuse is isolated in thegn's state. Removing a worktree
+  prunes its read notifications and issue links. Diff watching excludes
+  pipeline metadata while keeping those files tracked.
+
 ## [0.1.0-alpha.4] — 2026-10-16 (maintenance batch 41)
+
+### Added
+
+- GPU monitoring recognizes integrated graphics and avoids duplicate devices.
+
+### Fixed
+
+- The monitor corrects disk, CPU-frequency, memory and network readings,
+  including duplicate mount and interface accounting. Podman container
+  statistics support current field names and are sampled only when needed.
+
+### Changed
+
+- Internal thegn metadata is excluded from file watching and ignored by Git.
+  Git filter operations use a managed long-lived process rather than starting
+  a process for each filtered file.
+
+### Security
+
+- Process signals are checked against process identity before delivery, so a
+  stale process listing cannot signal a different process that reused its ID.
 
 ## [0.1.0-alpha.3] — 2026-10-16 (maintenance batch 40)
 
@@ -1160,6 +1665,13 @@ validate` error rather than a silent blank.
   already shell-quoted during substitution — the agent received a prompt with
   literal quote characters wrapped around it. Placeholders must be written
   **bare**; `thegn config validate` now reports the mistake.
+
+### Fixed — worktree deletion and terminal graphics
+
+- **Worktree deletion now updates the sidebar immediately and restores the row
+  if deletion fails.**
+- **Terminal graphics transfers stay intact.** Kitty image chunks are no longer
+  combined or emitted partially, preventing incomplete images in panes.
 
 ## [0.1.0-alpha.2] — 2026-08-20
 
