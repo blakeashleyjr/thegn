@@ -582,7 +582,10 @@ fn stricter_agent_gate(
 /// merge queue re-attempts the fold), because an agent can exit non-zero having
 /// committed a good fix, or exit zero having done nothing.
 #[cfg(unix)]
-pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
+pub(crate) fn run_outcome_cancellable(
+    task: &AgentTaskRun<'_>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> AgentRunVerdict {
     use std::process::{Command, Stdio};
     use thegn_core::util;
 
@@ -717,11 +720,10 @@ pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
     }
 
     // Own group/job; bounded, drained, and reaped by `bounded::run_bounded`.
-    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let result = bounded::run_bounded(
         &mut cmd,
         bounded::effective_timeout(task.timeout_secs),
-        &NEVER,
+        cancel,
     );
     // Remove the ephemeral prompt after the bounded runner has reaped the child,
     // on every outcome (exit, failure, timeout, or cancellation).
@@ -772,13 +774,14 @@ pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
     bounded::verdict(&result.outcome, task.sandbox.is_some())
 }
 
-/// Run the agent to completion and report whether it exited zero.
+/// Run the agent to completion and preserve whether it started, exited, or was interrupted.
 ///
 /// **The exit code is advisory.** Callers decide by re-checking the world (the
 /// merge queue re-attempts the fold), because an agent can exit non-zero having
 /// committed a good fix, or exit zero having done nothing.
-pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
-    run_outcome(task).exited_zero()
+pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
+    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    run_outcome_cancellable(task, &NEVER)
 }
 
 /// Bounded, drained, fully reaped execution of one agent process group (unix).
@@ -1453,7 +1456,10 @@ fn credential_shaped(key: &str) -> bool {
 /// through `$SHELL -lc`, neither of which maps onto pwsh/cmd. Port the quoting
 /// before enabling this path on Windows.
 #[cfg(not(unix))]
-pub(crate) fn run_outcome(task: &AgentTaskRun<'_>) -> AgentRunVerdict {
+pub(crate) fn run_outcome_cancellable(
+    task: &AgentTaskRun<'_>,
+    _cancel: &std::sync::atomic::AtomicBool,
+) -> AgentRunVerdict {
     tracing::warn!(
         target: "thegn::agent",
         kind = %task.kind,
@@ -2045,6 +2051,37 @@ mod tests {
             AgentRunVerdict::Interrupted(_)
         ));
         assert_eq!(std::fs::read_dir(task_dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_run_stops_when_the_cancel_flag_is_raised() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let v = vars();
+        let t = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            command_template: "sleep 30",
+            timeout_secs: 60,
+            ..task(TaskKind::MergeConflict, &v)
+        };
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                cancel.store(true, Ordering::Release);
+            });
+            let started = Instant::now();
+            let verdict = run_outcome_cancellable(&t, &cancel);
+            let elapsed = started.elapsed();
+            assert_eq!(verdict, AgentRunVerdict::Interrupted("cancelled".into()));
+            assert!(
+                elapsed < std::time::Duration::from_secs(20),
+                "cancel took {elapsed:?}"
+            );
+        });
     }
 
     #[cfg(unix)]

@@ -32,6 +32,14 @@ impl PrAgentGuard {
         db: &Db,
         request: &PrAgentAdmit<'_>,
     ) -> anyhow::Result<Result<Self, PrAgentRefusal>> {
+        Self::admit_with_renew_every(db, request, RENEW_EVERY)
+    }
+
+    fn admit_with_renew_every(
+        db: &Db,
+        request: &PrAgentAdmit<'_>,
+        renew_every: Duration,
+    ) -> anyhow::Result<Result<Self, PrAgentRefusal>> {
         let lease = match db.admit_pr_agent(request)? {
             thegn_core::pr_queue::PrAgentAdmission::Admitted(lease) => lease,
             thegn_core::pr_queue::PrAgentAdmission::Refused(refusal) => return Ok(Err(refusal)),
@@ -53,7 +61,7 @@ impl PrAgentGuard {
                     }
                 };
                 loop {
-                    match stop_rx.recv_timeout(RENEW_EVERY) {
+                    match stop_rx.recv_timeout(renew_every) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let mut current = thread_lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -76,6 +84,14 @@ impl PrAgentGuard {
             heartbeat,
             lost,
         }))
+    }
+
+    pub(crate) fn cancel_flag(&self) -> &AtomicBool {
+        &self.lost
+    }
+
+    pub(crate) fn lease_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
     }
 
     pub(crate) fn record_own_head(
@@ -272,6 +288,89 @@ mod tests {
         };
         assert!(!old.finish(&db, None).unwrap());
         assert!(other.release_pr_agent(&new, None).unwrap());
+    }
+
+    #[test]
+    fn lost_lease_raises_the_guard_cancel_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr-agent.db");
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            1,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/1",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let request = PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-a",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = PrAgentGuard::admit_with_renew_every(&db, &request, Duration::from_millis(20))
+            .unwrap()
+            .unwrap();
+        assert!(!guard.lease_lost());
+        let copy = guard.lease.lock().unwrap().clone();
+        assert!(
+            Db::open_at(&path)
+                .unwrap()
+                .release_pr_agent(&copy, None)
+                .unwrap()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !guard.cancel_flag().load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(guard.cancel_flag().load(Ordering::Acquire));
+        assert!(!guard.finish(&db, None).unwrap());
+    }
+
+    #[test]
+    fn live_lease_keeps_the_guard_cancel_flag_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr-agent.db");
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            1,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/1",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let request = PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-a",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = PrAgentGuard::admit_with_renew_every(&db, &request, Duration::from_millis(20))
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!guard.cancel_flag().load(Ordering::Acquire));
+        assert!(guard.finish(&db, None).unwrap());
     }
 
     #[expect(
