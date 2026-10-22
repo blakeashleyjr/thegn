@@ -131,6 +131,7 @@ struct Inner {
 
 pub(crate) struct FrameWriter {
     inner: Arc<Inner>,
+    wake: Arc<dyn Fn(&'static str) + Send + Sync>,
     /// The owned writer worker, including in sync mode.
     handle: Option<std::thread::JoinHandle<()>>,
     sync: bool,
@@ -172,7 +173,7 @@ impl FrameWriter {
     fn spawn_with(
         sync: bool,
         worker_frames: bool,
-        wake: impl Fn(&'static str) + Send + 'static,
+        wake: impl Fn(&'static str) + Send + Sync + 'static,
         sink: impl FnMut(&[u8]) -> std::io::Result<()> + Send + 'static,
     ) -> Self {
         let inner = Arc::new(Inner {
@@ -205,14 +206,17 @@ impl FrameWriter {
             oob_pressure_logged: AtomicBool::new(false),
         });
         let worker_inner = Arc::clone(&inner);
+        let wake: Arc<dyn Fn(&'static str) + Send + Sync> = Arc::new(wake);
+        let worker_wake = Arc::clone(&wake);
         let handle = Some(
             std::thread::Builder::new()
                 .name("thegn-writer".into())
-                .spawn(move || writer_main(&worker_inner, wake, sink))
+                .spawn(move || writer_main(&worker_inner, worker_wake, sink))
                 .expect("spawn writer thread"),
         );
         FrameWriter {
             inner,
+            wake,
             handle,
             sync,
         }
@@ -411,6 +415,7 @@ impl FrameWriter {
                 abandon_queued_messages(&mut q);
                 drop(q);
                 self.inner.done_cv.notify_all();
+                (self.wake)("synchronous writer deadline expired");
                 return;
             }
             let (next, _) = self
@@ -635,7 +640,7 @@ fn note_clipboard(q: &mut Q, id: u64, outcome: Option<ClipboardOutcome>) {
 
 fn writer_main(
     inner: &Inner,
-    wake: impl Fn(&'static str),
+    wake: Arc<dyn Fn(&'static str) + Send + Sync>,
     mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
 ) {
     loop {
@@ -972,6 +977,7 @@ mod tests {
                 oob_retry: AtomicBool::new(false),
                 oob_pressure_logged: AtomicBool::new(false),
             }),
+            wake: Arc::new(|_| {}),
             handle: None,
             sync: false,
         }
@@ -1065,12 +1071,13 @@ mod tests {
         let bytes = termwiz_test_frame_bytes();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
         let writer = Arc::new(FrameWriter::spawn_with(
             true,
             true,
-            |_| {},
+            move |reason| wake_tx.send(reason).unwrap(),
             move |sink_bytes| {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -1092,6 +1099,13 @@ mod tests {
         assert!(accepted);
         assert!(elapsed < SYNC_WRITE_BOUND + std::time::Duration::from_millis(150));
         assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
+        assert_eq!(
+            wake_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .unwrap(),
+            "synchronous writer deadline expired",
+            "sync timeout must wake the idle event loop so Fatal is observed"
+        );
         assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
         release_tx.send(()).unwrap();
         drop(writer);
@@ -1973,6 +1987,7 @@ mod tests {
         });
         let writer = FrameWriter {
             inner: Arc::clone(&inner),
+            wake: Arc::new(|_| {}),
             handle: Some(handle),
             sync: false,
         };
