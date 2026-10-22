@@ -1005,7 +1005,7 @@ pub(crate) fn run_pr_view_action(
                 thegn_core::forge::model::MergeMethod::Rebase => "Merging PR (rebase)…",
             },
         ),
-        A::Approve => ("pr approve", "Approving PR…"),
+        A::Approve { .. } => ("pr approve", "Approving PR…"),
         A::Rerun => ("pr rerun-checks", "Re-running failed checks…"),
         A::Comment { .. } => ("pr comment", "Posting comment…"),
         A::Review { .. } => ("pr review", "Submitting review…"),
@@ -1023,7 +1023,7 @@ pub(crate) fn run_pr_view_action(
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let cur = PrRef::Current;
-        let res: Result<(), ForgeError> = match action {
+        let (res, action_status): (Result<(), ForgeError>, Option<String>) = match action {
             A::Merge {
                 method,
                 number,
@@ -1047,24 +1047,67 @@ pub(crate) fn run_pr_view_action(
                 if let Err(error) = tx.send(RefreshKind::PrActionStatus(status)) {
                     tracing::debug!(%error, "PR merge outcome status was not delivered");
                 }
-                match outcome_text {
-                    Ok(text) => {
-                        thegn_core::msg::info(&text);
-                        Ok(())
-                    }
-                    Err(text) => Err(ForgeError::Other(text)),
+                (
+                    match outcome_text {
+                        Ok(text) => {
+                            thegn_core::msg::info(&text);
+                            Ok(())
+                        }
+                        Err(text) => Err(ForgeError::Other(text)),
+                    },
+                    None,
+                )
+            }
+            A::Approve {
+                number,
+                expected_head,
+            } => {
+                let result = crate::cmd::pr::review_reviewed_head(
+                    forge,
+                    &loc,
+                    &crate::cmd::pr::ReviewedPr {
+                        number,
+                        head: &expected_head,
+                    },
+                    thegn_core::forge::model::ReviewState::Approve,
+                    None,
+                );
+                match result {
+                    Ok(()) => (Ok(()), Some(format!("PR #{number} approved"))),
+                    Err(error) => (Err(error), None),
                 }
             }
-            A::Approve => forge.submit_review(
-                &loc,
-                cur,
-                thegn_core::forge::model::ReviewState::Approve,
-                None,
-            ),
-            A::Rerun => forge.rerun_failed(&loc, cur).map(|_| ()),
-            A::Comment { body } => forge.comment(&loc, cur, &body),
-            A::Review { state, body } => forge.submit_review(&loc, cur, state, Some(&body)),
-            A::Reply { thread_id, body } => forge.reply_thread(&loc, &thread_id, &body),
+            A::Rerun => match forge.rerun_failed(&loc, cur) {
+                Ok(0) => (Ok(()), Some("no failed checks to re-run".into())),
+                Ok(count) => (
+                    Ok(()),
+                    Some(format!("re-ran {count} failed workflow run(s)")),
+                ),
+                Err(error) => (Err(error), None),
+            },
+            A::Comment { body } => (forge.comment(&loc, cur, &body), None),
+            A::Review {
+                state,
+                body,
+                number,
+                expected_head,
+            } => {
+                let result = crate::cmd::pr::review_reviewed_head(
+                    forge,
+                    &loc,
+                    &crate::cmd::pr::ReviewedPr {
+                        number,
+                        head: &expected_head,
+                    },
+                    state,
+                    Some(&body),
+                );
+                match result {
+                    Ok(()) => (Ok(()), Some(format!("review submitted on PR #{number}"))),
+                    Err(error) => (Err(error), None),
+                }
+            }
+            A::Reply { thread_id, body } => (forge.reply_thread(&loc, &thread_id, &body), None),
             A::LineComment {
                 owner,
                 repo,
@@ -1073,22 +1116,35 @@ pub(crate) fn run_pr_view_action(
                 path,
                 line,
                 body,
-            } => forge.add_line_comment(
-                &loc,
-                LineComment {
-                    repo: &RepoRef { owner, repo },
-                    number,
-                    commit_id: &commit_id,
-                    path: &path,
-                    line,
-                    body: &body,
-                },
+            } => (
+                forge.add_line_comment(
+                    &loc,
+                    LineComment {
+                        repo: &RepoRef { owner, repo },
+                        number,
+                        commit_id: &commit_id,
+                        path: &path,
+                        line,
+                        body: &body,
+                    },
+                ),
+                None,
             ),
-            A::Handoff(_) => Ok(()),
-            A::OpenUrl(_) => Ok(()),
+            A::Handoff(_) => (Ok(()), None),
+            A::OpenUrl(_) => (Ok(()), None),
         };
-        if let Err(e) = res {
-            thegn_core::msg::warn(&format!("{label} failed: {}", e.describe()));
+        let status = match res {
+            Ok(()) => action_status,
+            Err(error) => {
+                let status = format!("{label} failed: {}", error.describe());
+                thegn_core::msg::warn(&status);
+                matches!(label, "pr approve" | "pr review" | "pr rerun-checks").then_some(status)
+            }
+        };
+        if let Some(status) = status
+            && let Err(error) = tx.send(RefreshKind::PrActionStatus(status))
+        {
+            tracing::debug!(%error, "PR action status was not delivered");
         }
         if tx.send(RefreshKind::Pr).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -1209,6 +1265,18 @@ pub(crate) fn pr_merge_request(
     })
 }
 
+pub(crate) fn pr_review_target(
+    panel: &crate::panel::PanelData,
+) -> std::result::Result<(u64, String), &'static str> {
+    let Some(pr) = panel.pr.as_ref() else {
+        return Err("PR head unknown; refresh the panel before approving");
+    };
+    if pr.number == 0 || panel.pr_head_oid.is_empty() {
+        return Err("PR head unknown; refresh the panel before approving");
+    }
+    Ok((pr.number, panel.pr_head_oid.clone()))
+}
+
 pub(crate) fn run_pr_create(
     session: &Session,
     refresh_tx: &UnboundedSender<RefreshKind>,
@@ -1280,13 +1348,19 @@ pub(crate) fn panel_pr_action_key(key: char, ctx: &mut PanelPrActionCtx<'_>) -> 
             ctx.model.status = "confirm PR merge".into();
         }
         'M' => ctx.model.status = "No pull request to merge".into(),
-        'A' if has_pr => run_pr_view_action(
-            ctx.session,
-            ctx.refresh_tx,
-            ctx.waker,
-            ctx.model,
-            A::Approve,
-        ),
+        'A' if has_pr => match pr_review_target(&ctx.model.panel) {
+            Ok((number, expected_head)) => run_pr_view_action(
+                ctx.session,
+                ctx.refresh_tx,
+                ctx.waker,
+                ctx.model,
+                A::Approve {
+                    number,
+                    expected_head,
+                },
+            ),
+            Err(reason) => ctx.model.status = reason.into(),
+        },
         'A' => ctx.model.status = "No pull request to approve".into(),
         'r' => {
             if let Some(status) = pr_rerun_refusal(&ctx.model.panel) {
@@ -2413,6 +2487,63 @@ mod tests {
             pr_merge_request(&panel, thegn_core::forge::model::MergeMethod::Squash),
             Err(refusal)
         );
+    }
+
+    #[test]
+    fn pr_review_request_pins_panel_number_and_head() {
+        let panel = crate::panel::PanelData {
+            pr: Some(crate::panel::PrSummary {
+                number: 17,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/17".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            pr_head_oid: "0123456789abcdef0123456789abcdef01234567".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_review_target(&panel),
+            Ok((17, "0123456789abcdef0123456789abcdef01234567".into()))
+        );
+        let zero_number = crate::panel::PanelData {
+            pr: Some(crate::panel::PrSummary {
+                number: 0,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/17".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            pr_head_oid: "0123456789abcdef0123456789abcdef01234567".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_review_target(&zero_number),
+            Err("PR head unknown; refresh the panel before approving")
+        );
+    }
+
+    #[test]
+    fn pr_review_request_without_head_is_refused() {
+        let refusal = "PR head unknown; refresh the panel before approving";
+        assert_eq!(
+            pr_review_target(&crate::panel::PanelData::default()),
+            Err(refusal)
+        );
+        let panel = crate::panel::PanelData {
+            pr: Some(crate::panel::PrSummary {
+                number: 17,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/repo/pull/17".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(pr_review_target(&panel), Err(refusal));
     }
 
     #[test]
