@@ -721,7 +721,13 @@ fn render_log_output(text: &str, truncated: bool, tail_lines: usize) -> String {
     let sanitized = thegn_svc::lsp::sanitize_for_terminal(text);
     let mut output = String::new();
     if truncated {
-        output.push_str(&format!("… (showing last {tail_lines} lines)\n"));
+        if thegn_core::ci_log::is_failure_window(text) {
+            output.push_str(&format!(
+                "… (showing a window around the first failure, at most {tail_lines} lines)\n"
+            ));
+        } else {
+            output.push_str(&format!("… (showing last {tail_lines} lines)\n"));
+        }
     }
     let log = thegn_core::ci::CiLog {
         text: text.to_string(),
@@ -792,6 +798,21 @@ mod tests {
         );
         assert!(rendered.contains("ordinary failure\n"));
         assert!(rendered.contains("split control starts\n[2J remains text"));
+    }
+
+    #[test]
+    fn human_log_output_labels_tails_and_failure_windows() {
+        let tail = render_log_output("ordinary tail\n", true, 20);
+        assert!(tail.starts_with("… (showing last 20 lines)\n"));
+
+        let window = render_log_output(
+            "... earlier log lines omitted ...\nerror: boom\n... later log lines omitted ...\n",
+            true,
+            20,
+        );
+        assert!(
+            window.starts_with("… (showing a window around the first failure, at most 20 lines)\n")
+        );
     }
 
     #[test]

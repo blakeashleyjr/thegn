@@ -262,7 +262,8 @@ there is one. At Half and Full width, the detail follows the highlighted run.
 
 `v` (or Enter) opens the run's detail popup. The **f** action is available
 inside that popup, not as a panel key. The drill reads bounded, redacted
-job-log tails from the CI cache first and labels their source, age, truncation,
+job-log windows (newest lines, or a window around the first failure) from the CI
+cache first and labels their source, age, truncation,
 and redaction state while a missing or stale entry is fetched off-loop. In
 `suggest` mode, the same **f** action is available from the actionable
 notification when its evidence-ready message appears. The cache policy is controlled by
@@ -276,8 +277,8 @@ and canceled jobs together, while **R** is refused because GitLab has no full re
 
 The daemon serves a cached CI run list only while it is younger than
 `[ci] ttl_secs` and recorded for the worktree's current branch; otherwise it
-asks the provider. Cached job-log tails written under an older redaction policy
-are redacted and bounded again when read.
+asks the provider. Cached job logs written under an older redaction policy are
+redacted and bounded into a window again when read.
 
 ### merge — the local merge queue
 

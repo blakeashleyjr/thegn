@@ -233,16 +233,17 @@ secrets, or CI logs. With autopilot disabled it reports the disabled state and
 an empty/bounded journal view. (`notify list --json`
 is NDJSON and `doctor --json` is a single object — both historical.)
 
-`thegn ci logs <run-id> <job-id> --worktree <path>` prints the bounded,
-redacted cached job-log tail. It reads the cache first and uses the daemon's
-blocking provider lane for a miss; `ci log` remains a compatibility alias.
+`thegn ci logs <run-id> <job-id> --worktree <path>` prints a redacted,
+bounded window of the cached job log (newest lines, or a window around the
+first failure). It reads the cache first and uses the daemon's blocking provider
+lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
 `ci logs` reuses a cached log only when it has a recorded head commit; a log
 with an unknown head is printed but not cached. The CI panel's failed-job log
-tails and background log ingestion apply a stricter check: they reuse a cached
-tail only for the run's current head and only if the job has not finished again
-since the tail was fetched.
+windows and background log ingestion apply a stricter check: they reuse a
+cached window only for the run's current head and only if the job has not
+finished again since the log was fetched.
 
 When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
