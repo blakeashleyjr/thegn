@@ -581,8 +581,9 @@ impl IpcListener {
             IpcEndpoint::Unix(sock) => {
                 #[cfg(unix)]
                 {
-                    // A connectable socket ⇒ a live daemon; a stale file
-                    // (bind would fail with AddrInUse) is unlinked. The whole
+                    // An accepting socket or one with a full backlog is a
+                    // live daemon; only a refused socket is unlinked. Any
+                    // other probe result is a startup error. The whole
                     // probe→unlink→bind sequence runs under the advisory bind
                     // lock (see [`bind_lock`]) on a blocking thread — two
                     // racing binders could otherwise BOTH probe-fail the same
@@ -675,7 +676,7 @@ impl IpcListener {
                                         io::ErrorKind::ConnectionRefused,
                                         "no live listener",
                                     )),
-                                    Err(error) => return Err(error),
+                                    Err(error) => Err(error),
                                 };
                                 match require_live_endpoint(
                                     e,
