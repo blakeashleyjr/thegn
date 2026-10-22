@@ -195,8 +195,33 @@ pub const BRIDGE_ROOT: &str = "/var/tmp/thegn-bridge";
 /// Verified resident bridge executable installed for exact local bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidentBridge {
-    pub path: String,
-    pub sha256: String,
+    path: String,
+    sha256: String,
+}
+
+impl ResidentBridge {
+    /// Construct a resident bridge reference from a lowercase SHA-256 digest.
+    pub fn from_digest(hex: &str) -> Option<Self> {
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        Some(Self {
+            path: format!("{BRIDGE_ROOT}/{hex}/thegn"),
+            sha256: hex.to_string(),
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
 }
 
 /// Bind the remote path to the digest of the exact local executable bytes.
@@ -210,7 +235,7 @@ pub fn resident_bridge_for(data: &[u8]) -> ResidentBridge {
 
 /// Return the content-addressed parent directory for a resident bridge.
 pub fn resident_bridge_dir(bridge: &ResidentBridge) -> String {
-    format!("{BRIDGE_ROOT}/{}", bridge.sha256)
+    format!("{BRIDGE_ROOT}/{}", bridge.sha256())
 }
 
 const VERIFY_EXEC: &str = r#"p=$1; want=$2; shift 2; got=$(sha256sum -- "$p" 2>/dev/null) || { echo 'thegn: cannot hash the resident bridge' >&2; exit 126; }; [ "${got%% *}" = "$want" ] || { echo 'thegn: resident bridge digest mismatch' >&2; exit 126; }; exec "$p" "$@""#;
@@ -222,8 +247,8 @@ pub fn verified_exec_argv(bridge: &ResidentBridge, args: &[String]) -> Vec<Strin
         "-c".to_string(),
         VERIFY_EXEC.to_string(),
         "thegn-bridge".to_string(),
-        bridge.path.clone(),
-        bridge.sha256.clone(),
+        bridge.path().to_string(),
+        bridge.sha256().to_string(),
     ];
     argv.extend_from_slice(args);
     argv
@@ -273,7 +298,7 @@ pub fn bridge_command(placement: &Placement, bridge: Option<&ResidentBridge>) ->
             // Vendor CLI quoting is provider-specific; its launch re-check is deferred.
             let bridge = bridge?;
             let mut argv = p.control_prefix.clone();
-            argv.push(bridge.path.clone());
+            argv.push(bridge.path().to_string());
             argv.push("bridge".to_string());
             Some(argv_command(&argv))
         }
@@ -577,7 +602,7 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args.last().unwrap(), "bridge");
-        assert!(args.contains(&bridge.path));
+        assert!(args.iter().any(|arg| arg == bridge.path()));
 
         // local: no bridge
         assert!(bridge_command(&Placement::Local, None).is_none());
@@ -587,19 +612,36 @@ mod tests {
     fn resident_bridge_path_is_content_addressed_outside_the_worktree() {
         let bridge = resident_bridge_for(b"abc");
         assert_eq!(
-            bridge.sha256,
+            bridge.sha256(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            bridge.path,
+            bridge.path(),
             "/var/tmp/thegn-bridge/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad/thegn"
         );
-        assert!(!bridge.path.starts_with("/workspace"));
-        assert_ne!(bridge.path, resident_bridge_for(b"different").path);
+        assert!(!bridge.path().starts_with("/workspace"));
+        assert_ne!(bridge.path(), resident_bridge_for(b"different").path());
         assert_eq!(
             resident_bridge_dir(&bridge),
-            format!("{BRIDGE_ROOT}/{}", bridge.sha256)
+            format!("{BRIDGE_ROOT}/{}", bridge.sha256())
         );
+    }
+
+    #[test]
+    fn resident_bridge_from_digest_rejects_invalid_hex() {
+        let invalid_char = "g".repeat(64);
+        let uppercase = "A".repeat(64);
+        let short = "a".repeat(63);
+        for invalid in ["", "abc", &invalid_char, &uppercase, &short] {
+            assert!(
+                ResidentBridge::from_digest(invalid).is_none(),
+                "{invalid:?}"
+            );
+        }
+        let valid = "0123456789abcdef".repeat(4);
+        let bridge = ResidentBridge::from_digest(&valid).expect("valid lowercase SHA-256");
+        assert_eq!(bridge.sha256(), valid);
+        assert_eq!(bridge.path(), format!("{BRIDGE_ROOT}/{valid}/thegn"));
     }
 
     #[test]
@@ -610,7 +652,7 @@ mod tests {
         assert_eq!(&argv[..2], &["/bin/sh", "-c"]);
         assert_eq!(
             &argv[3..6],
-            &["thegn-bridge", bridge.path.as_str(), bridge.sha256.as_str()]
+            &["thegn-bridge", bridge.path(), bridge.sha256()]
         );
         assert_eq!(&argv[6..], args.as_slice());
     }
@@ -654,7 +696,13 @@ mod tests {
         argv[4] = script.to_string_lossy().into_owned();
         let mut command = std::process::Command::new(&argv[0]);
         command.args(&argv[1..]);
-        let success = command.output().unwrap();
+        let mut success = command.output().unwrap();
+        if success.status.code() == Some(126)
+            && !String::from_utf8_lossy(&success.stderr).contains("digest mismatch")
+        {
+            // A sibling test process can briefly hold the executable open across fork/exec.
+            success = command.output().unwrap();
+        }
         assert!(success.status.success());
         assert_eq!(success.stdout, b"ok\n");
 
@@ -684,7 +732,7 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert!(args.contains(&bridge.path));
+        assert!(args.iter().any(|arg| arg == bridge.path()));
         assert_eq!(args.last().map(String::as_str), Some("bridge"));
     }
 

@@ -147,7 +147,7 @@ fn tunnel_exec_argv(
     port: u16,
     deadlines: &TunnelDeadlineSecs,
 ) -> Vec<String> {
-    let argv = bridge_argv(bridge.path.clone(), port, deadlines);
+    let argv = bridge_argv(bridge.path().to_string(), port, deadlines);
     crate::bridge_sup::verified_exec_argv(bridge, &argv[1..])
 }
 
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(&argv[..2], &["/bin/sh", "-c"]);
         assert_eq!(
             &argv[3..6],
-            &["thegn-bridge", bridge.path.as_str(), bridge.sha256.as_str()]
+            &["thegn-bridge", bridge.path(), bridge.sha256()]
         );
         assert_eq!(&argv[6..], &["bridge-revtunnel", "8383"]);
     }

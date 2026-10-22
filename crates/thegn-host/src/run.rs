@@ -2027,7 +2027,9 @@ fn connect_worktree_bridge(
         //    reverse_forwards` spec → bind a sandbox port → a host target.
         //  • the embedded host nix cache (below).
         // No-op when not a provider / nothing configured.
-        if let thegn_core::placement::Placement::Provider(p) = &env.placement {
+        if let (thegn_core::placement::Placement::Provider(p), Some(bridge)) =
+            (&env.placement, bridge.as_ref())
+        {
             let mut tunnels: Vec<(u16, String)> = Vec::new();
             // Embedded host nix cache: bind the cache port in the sandbox → the
             // host's ephemeral cache server, so the sprite's `extra-substituters =
@@ -2054,7 +2056,7 @@ fn connect_worktree_bridge(
                 &cfg,
                 &env,
                 &p.id,
-                bridge.as_ref().expect("provider bridge was installed"),
+                bridge,
                 &wt.to_string_lossy(),
                 tunnels,
             );
