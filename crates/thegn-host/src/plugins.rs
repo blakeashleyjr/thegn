@@ -1952,7 +1952,10 @@ mod tests {
         };
 
         assert_eq!(host.run_one_shot(plugin), OneShotStart::Overloaded);
-        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio_mpsc::error::TryRecvError::Empty)
+        ));
         drop(tickets);
     }
 
