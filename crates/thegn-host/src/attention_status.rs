@@ -106,14 +106,15 @@ fn observe_attention_edges(rows: &[thegn_core::osc_attention::SessionAttention])
     }
 }
 
-/// Compute `status.attention` / `attention_ranks` / `workspace_attention` for
-/// every registered + live worktree. All inputs are cheap DB/snapshot reads;
-/// the branching lives in `thegn_core::attention::score`.
+/// CI config + worktree locations the scorer needs to check a cached run's provider context.
 pub(crate) struct CiReader<'a> {
     pub cfg: &'a thegn_core::config::CiConfig,
     pub locations: &'a thegn_core::remote::WorktreeLocations,
 }
 
+/// Compute `status.attention` / `attention_ranks` / `workspace_attention` for
+/// every registered + live worktree. All inputs are cheap DB/snapshot reads;
+/// the branching lives in `thegn_core::attention::score`.
 pub(crate) fn collect_attention_with_ci(
     session: &crate::session::Session,
     db: &thegn_core::db::Db,
@@ -352,21 +353,20 @@ fn collect_attention_inner(
         // Latest cached CI run (newest first in the cache), last-known-good.
         let (mut ci_failing, mut ci_running) = (false, false);
         let (mut ci_episode, mut ci_since) = (0u64, None);
-        let cache = if let Ok(Some((json, _))) = db.get_ci_cache(path) {
-            match ci {
+        let cache = db
+            .get_ci_cache(path)
+            .ok()
+            .flatten()
+            .and_then(|(json, _)| match ci {
                 Some(ci) => {
                     let loc = ci.locations.loc(std::path::Path::new(path));
                     let current = crate::ci_refresh::reader_cache_context(&loc, ci.cfg);
-                    match crate::ci_refresh::cached_runs_for_reader(&json, current.as_deref()) {
-                        Ok(cache) => cache,
-                        Err(_) => None,
-                    }
+                    crate::ci_refresh::cached_runs_for_reader(&json, current.as_deref())
+                        .ok()
+                        .flatten()
                 }
                 None => thegn_core::ci::decode_run_cache(&json),
-            }
-        } else {
-            None
-        };
+            });
         if let Some(cache) = cache
             && let Some(latest) = cache
                 .runs
