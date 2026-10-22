@@ -6,6 +6,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import stat
 import sys
 import tarfile
 import tempfile
@@ -762,6 +764,277 @@ class TrustedDigestTests(unittest.TestCase):
                 )
         self.assertEqual(2, raised.exception.code)
         self.assertIn(names[0], stderr.getvalue())
+
+
+class StagedPayloadTests(unittest.TestCase):
+    setUp = ReleaseRendererTests.setUp
+    make_asset = ReleaseRendererTests.make_asset
+    write_tar_asset = ReleaseRendererTests.write_tar_asset
+
+    target = "x86_64-unknown-linux-gnu"
+
+    def archive_and_trusted(self) -> tuple[Path, str, dict[str, str]]:
+        archive, _ = self.make_asset(self.target)
+        archive_name, _ = release._asset_names(self.manifest, self.tag, self.target)
+        return archive, archive_name, {archive_name: release._sha256(archive)}
+
+    def stage(self, trusted: dict[str, str] | None = None) -> tuple[Path, dict[str, str]]:
+        archive, archive_name, original_trusted = self.archive_and_trusted()
+        parent = self.temp / "package"
+        parent.mkdir(exist_ok=True)
+        output = parent / "stage"
+        staged = release.stage_archive(
+            self.manifest,
+            self.tag,
+            self.assets,
+            self.target,
+            output,
+            original_trusted if trusted is None else trusted,
+        )
+        return output, staged
+
+    def test_stage_writes_only_root_files_with_digests(self) -> None:
+        archive, _, trusted = self.archive_and_trusted()
+        parent = self.temp / "package"
+        parent.mkdir()
+        output = parent / "stage"
+        staged = release.stage_archive(
+            self.manifest, self.tag, self.assets, self.target, output, trusted
+        )
+        names = list(self.manifest["archive"]["root_files"])
+        self.assertEqual(set(names), {path.name for path in output.iterdir()})
+        with tarfile.open(archive, "r:gz") as source:
+            contents = {member.name: source.extractfile(member).read() for member in source}
+        for name in names:
+            self.assertEqual(contents[name], (output / name).read_bytes())
+            self.assertEqual(hashlib.sha256(contents[name]).hexdigest(), staged[name])
+            expected_mode = 0o755 if name == "thegn" else 0o644
+            self.assertEqual(expected_mode, stat.S_IMODE((output / name).stat().st_mode))
+        self.assertEqual([], list(parent.glob(".stage-*")))
+
+    def test_stage_cleans_temp_dir_when_handoff_fails(self) -> None:
+        _, _, trusted = self.archive_and_trusted()
+        parent = self.temp / "package"
+        parent.mkdir()
+        output = parent / "stage"
+        with mock.patch.object(release.os, "rename", side_effect=OSError("boom")):
+            with self.assertRaisesRegex(release.ReleaseError, "cannot stage release archive"):
+                release.stage_archive(
+                    self.manifest, self.tag, self.assets, self.target, output, trusted
+                )
+        self.assertFalse(output.exists())
+        self.assertEqual([], list(parent.glob(".stage-*")))
+
+    def test_stage_refuses_existing_output_dir(self) -> None:
+        _, _, trusted = self.archive_and_trusted()
+        parent = self.temp / "package"
+        parent.mkdir()
+        for kind in ("directory", "dangling-symlink"):
+            with self.subTest(kind=kind):
+                output = parent / kind
+                if kind == "directory":
+                    output.mkdir()
+                else:
+                    output.symlink_to(parent / "missing")
+                before = sorted(path.name for path in parent.iterdir())
+                with self.assertRaisesRegex(release.ReleaseError, "already exists"):
+                    release.stage_archive(
+                        self.manifest, self.tag, self.assets, self.target, output, trusted
+                    )
+                self.assertEqual(before, sorted(path.name for path in parent.iterdir()))
+
+    def test_stage_refuses_archive_not_matching_trusted_digest(self) -> None:
+        archive, archive_name, trusted = self.archive_and_trusted()
+        archive.write_bytes(archive.read_bytes() + b"changed")
+        checksum_name = release._asset_names(self.manifest, self.tag, self.target)[1]
+        (self.assets / checksum_name).write_text(
+            f"{release._sha256(archive)}  {archive_name}\n", encoding="utf-8"
+        )
+        parent = self.temp / "package"
+        parent.mkdir()
+        output = parent / "stage"
+        with self.assertRaisesRegex(release.ReleaseError, archive_name):
+            release.stage_archive(
+                self.manifest, self.tag, self.assets, self.target, output, trusted
+            )
+        self.assertFalse(output.exists())
+        self.assertEqual([], list(parent.glob(".stage-*")))
+
+    def test_stage_refuses_invalid_layout_without_residue(self) -> None:
+        archive, archive_name, _ = self.archive_and_trusted()
+        target_config = self.manifest["targets"][self.target]
+        required = list(self.manifest["archive"]["root_files"])
+        required[0] = target_config.get("binary", self.manifest["project"]["binary"])
+        with tarfile.open(archive, "w:gz") as output:
+            for name in required:
+                content = f"fixture:{name}\n".encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                info.mode = 0o755 if name == "thegn" else 0o644
+                output.addfile(info, io.BytesIO(content))
+            content = b"extra"
+            info = tarfile.TarInfo("extra")
+            info.size = len(content)
+            info.mode = 0o644
+            output.addfile(info, io.BytesIO(content))
+        trusted = {archive_name: release._sha256(archive)}
+        parent = self.temp / "package"
+        parent.mkdir()
+        output = parent / "stage"
+        with self.assertRaisesRegex(release.ReleaseError, "unexpected"):
+            release.stage_archive(
+                self.manifest, self.tag, self.assets, self.target, output, trusted
+            )
+        self.assertFalse(output.exists())
+        self.assertEqual([], list(parent.glob(".stage-*")))
+
+    def test_stage_never_uses_tar_extraction(self) -> None:
+        _, _, trusted = self.archive_and_trusted()
+        parent = self.temp / "package"
+        parent.mkdir()
+        with (
+            mock.patch.object(tarfile.TarFile, "extract", side_effect=AssertionError),
+            mock.patch.object(tarfile.TarFile, "extractall", side_effect=AssertionError),
+        ):
+            release.stage_archive(
+                self.manifest, self.tag, self.assets, self.target, parent / "stage", trusted
+            )
+
+    def test_stage_refuses_a_non_unix_target(self) -> None:
+        parent = self.temp / "package"
+        parent.mkdir()
+        with self.assertRaisesRegex(release.ReleaseError, "supports unix targets only"):
+            release.stage_archive(
+                self.manifest,
+                self.tag,
+                self.assets,
+                "x86_64-pc-windows-msvc",
+                parent / "stage",
+                {},
+            )
+
+    def make_payload(self) -> Path:
+        payload = self.temp / "payload"
+        binary = payload / "usr/bin/thegn"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes((self.temp / "package/stage/thegn").read_bytes())
+        (binary.parent / "tg").symlink_to("/usr/bin/thegn")
+        licenses = payload / "usr/share/licenses/thegn"
+        licenses.mkdir(parents=True)
+        for name in ("LICENSE-MIT", "LICENSE-APACHE"):
+            (licenses / name).write_bytes((self.temp / "package/stage" / name).read_bytes())
+        return payload
+
+    def staged_payload(self) -> tuple[Path, dict[str, str]]:
+        return self.stage()
+
+    def test_payload_accepts_matching_tree(self) -> None:
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
+        release.verify_package_payload(digests, payload, "deb")
+
+    def test_payload_rejects_replaced_binary(self) -> None:
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
+        (payload / "usr/bin/thegn").write_bytes(b"replaced")
+        with self.assertRaisesRegex(release.ReleaseError, "deb payload bytes differ at usr/bin/thegn"):
+            release.verify_package_payload(digests, payload, "deb")
+
+    def test_payload_rejects_symlinked_binary(self) -> None:
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
+        binary = payload / "usr/bin/thegn"
+        binary.unlink()
+        binary.symlink_to("/bin/sh")
+        with self.assertRaisesRegex(release.ReleaseError, "invalid entry usr/bin/thegn"):
+            release.verify_package_payload(digests, payload, "deb")
+
+    def test_payload_rejects_extra_file(self) -> None:
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
+        extra = payload / "usr/share/doc/thegn/x"
+        extra.parent.mkdir(parents=True)
+        extra.write_text("extra", encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "unexpected entry usr/share/doc/thegn/x"):
+            release.verify_package_payload(digests, payload, "deb")
+
+    def test_payload_rejects_wrong_alias_target(self) -> None:
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
+        alias = payload / "usr/bin/tg"
+        alias.unlink()
+        alias.symlink_to("/bin/sh")
+        with self.assertRaisesRegex(release.ReleaseError, "invalid entry usr/bin/tg"):
+            release.verify_package_payload(digests, payload, "rpm")
+
+    def test_payload_rejects_missing_license(self) -> None:
+        _, digests = self.staged_payload()
+        payload = self.make_payload()
+        (payload / "usr/share/licenses/thegn/LICENSE-MIT").unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "missing entry"):
+            release.verify_package_payload(digests, payload, "rpm")
+
+    def test_staged_digest_loader_rejects_malformed_input(self) -> None:
+        names = ("thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md")
+        valid = {name: "a" * 64 for name in names}
+        cases = (
+            ("array", [], "JSON object"),
+            ("missing", {name: digest for name, digest in valid.items() if name != "thegn"}, "exactly"),
+            ("extra", {**valid, "extra": "a" * 64}, "exactly"),
+            ("uppercase", {**valid, "thegn": "A" * 64}, "lowercase 64-hex"),
+        )
+        for label, value, message in cases:
+            with self.subTest(case=label):
+                path = self.temp / f"{label}.json"
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    release.load_staged_digests(path)
+        target = self.temp / "staged-target.json"
+        target.write_text(json.dumps(valid), encoding="utf-8")
+        link = self.temp / "staged-link.json"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(release.ReleaseError, "not a regular file"):
+            release.load_staged_digests(link)
+
+    def test_stage_and_verify_payload_cli_exit_nonzero_on_refusal(self) -> None:
+        archive, archive_name, trusted = self.archive_and_trusted()
+        wrong = dict(trusted)
+        wrong[archive_name] = "0" * 64
+        digests = self.temp / "trusted.json"
+        digests.write_text(json.dumps(wrong), encoding="utf-8")
+        parent = self.temp / "package"
+        parent.mkdir()
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit) as raised:
+            with contextlib.redirect_stderr(stderr):
+                release.main(
+                    [
+                        "stage", "--tag", self.tag, "--assets-dir", str(self.assets),
+                        "--target", self.target, "--trusted-digests", str(digests),
+                        "--output-dir", str(parent / "stage"), "--digests-out", str(self.temp / "digests.json"),
+                    ]
+                )
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn(archive_name, stderr.getvalue())
+        self.assertFalse((parent / "stage").exists())
+        self.assertFalse((self.temp / "digests.json").exists())
+
+        _, staged = self.stage()
+        payload = self.make_payload()
+        (payload / "usr/bin/thegn").write_bytes(b"tampered")
+        staged_path = self.temp / "staged.json"
+        staged_path.write_text(json.dumps(staged), encoding="utf-8")
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit) as raised:
+            with contextlib.redirect_stderr(stderr):
+                release.main(
+                    [
+                        "verify-payload", "--tag", self.tag, "--staged-digests", str(staged_path),
+                        "--payload-root", str(payload), "--label", "deb",
+                    ]
+                )
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("deb payload bytes differ at usr/bin/thegn", stderr.getvalue())
 
 
 if __name__ == "__main__":

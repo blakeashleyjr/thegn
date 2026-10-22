@@ -1116,6 +1116,55 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertNotEqual(0, run_case(wrong).returncode)
             self.assertNotEqual(0, run_case(None).returncode)
 
+    def test_package_stages_archive_without_system_tar(self) -> None:
+        package_steps = read_workflow("release.yml")["jobs"]["package"]["steps"]
+        by_name = {step.get("name"): step for step in package_steps}
+        resolve = by_name["Resolve release tag"]["run"]
+        self.assertNotIn("package/stage", resolve)
+        digest_index = next(
+            index for index, step in enumerate(package_steps)
+            if step.get("name") == "Verify assets against the upload broker's digests"
+        )
+        for step in package_steps[digest_index + 1 :]:
+            script = step.get("run", "")
+            with self.subTest(step=step.get("name")):
+                self.assertNotRegex(script, r"\btar\s+-x")
+        build = by_name["Build standalone deb and rpm packages"]["run"]
+        stage_at = build.index("packaging/release.py stage")
+        nfpm_at = build.index("nixpkgs#nfpm")
+        self.assertLess(stage_at, nfpm_at)
+        self.assertIn('--trusted-digests "$PACKAGE_ROOT/trusted-digests.json"', build)
+        self.assertIn('--output-dir "$PACKAGE_ROOT/package/stage"', build)
+
+    def test_package_verifies_payload_before_upload(self) -> None:
+        steps = read_workflow("release.yml")["jobs"]["package"]["steps"]
+        names = [step.get("name") for step in steps]
+        build_at = names.index("Build standalone deb and rpm packages")
+        verify_at = names.index("Verify packaged payload against staged bytes")
+        metadata_at = names.index("Stage rendered metadata")
+        upload_at = names.index("Upload packages and rendered metadata")
+        self.assertLess(build_at, verify_at)
+        self.assertLess(verify_at, metadata_at)
+        self.assertLess(metadata_at, upload_at)
+        verify = steps[verify_at]["run"]
+        self.assertEqual(2, verify.count("packaging/release.py verify-payload"))
+        self.assertIn("--label deb", verify)
+        self.assertIn("--label rpm", verify)
+        self.assertIn('"$PACKAGE_ROOT/payload/deb"', verify)
+        self.assertIn('"$PACKAGE_ROOT/payload/rpm"', verify)
+        self.assertIn('cd "$PACKAGE_ROOT/payload/rpm"', verify)
+        self.assertNotIn('cd "$PACKAGE_ROOT/release-assets"', verify)
+        for command in (
+            "nixpkgs#dpkg",
+            "nixpkgs#rpm",
+            "nixpkgs#cpio",
+            '"$dpkg_store/bin/dpkg-deb" -x',
+            '"$rpm_store/bin/rpm2cpio"',
+            '"$cpio_store/bin/cpio" -idm --no-absolute-filenames --quiet',
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, verify)
+
 
 if __name__ == "__main__":
     unittest.main()
