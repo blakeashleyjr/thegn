@@ -46,10 +46,11 @@ use mcp::Mcp0Client;
 use thegn_core::remote::SshTarget;
 
 const VM_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(360);
+const VM_READY_POLL: std::time::Duration = std::time::Duration::from_secs(4);
 /// A lock holder is inside one create; bound contenders by the VM readiness budget.
 const CREATE_LOCK_WAIT: std::time::Duration = VM_READY_BUDGET;
 /// Poll at the same cadence as VM readiness checks.
-const CREATE_LOCK_POLL: std::time::Duration = std::time::Duration::from_secs(4);
+const CREATE_LOCK_POLL: std::time::Duration = VM_READY_POLL;
 
 async fn acquire_create_lock(
     lock: std::fs::File,
@@ -486,7 +487,7 @@ impl Machine0Provider {
                     VM_READY_BUDGET.as_secs(),
                 ));
             }
-            tokio::time::sleep(CREATE_LOCK_POLL).await;
+            tokio::time::sleep(VM_READY_POLL).await;
         }
     }
 
@@ -513,7 +514,7 @@ impl Machine0Provider {
                     BUDGET.as_secs(),
                 ));
             }
-            tokio::time::sleep(CREATE_LOCK_POLL).await;
+            tokio::time::sleep(VM_READY_POLL).await;
         }
     }
 
@@ -2352,10 +2353,7 @@ mod tests {
         )
         .unwrap();
         let result = acquire_create_lock(third, std::time::Duration::ZERO).await;
-        assert!(
-            matches!(result, Err(_)),
-            "the returned file must hold the lock"
-        );
+        assert!(result.is_err(), "the returned file must hold the lock");
         drop(acquired);
     }
 }
