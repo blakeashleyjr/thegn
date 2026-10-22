@@ -238,6 +238,9 @@ redacted cached job-log tail. It reads the cache first and uses the daemon's
 blocking provider lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
 `truncated`, and `redacted` metadata.
+A cached job log is reused only when its head matches the run's current head
+and the job has not finished again since the log was fetched; a log with an
+unknown head is printed but not cached.
 
 When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
@@ -253,6 +256,8 @@ scripts can continue to consume the command's graceful-degradation result.
 Only `thegn ci runs --branch <current branch>` refreshes the cached runs shown
 in the CI panel; other branches and the all-branch listing leave that cache
 alone.
+`ci runs --limit` accepts 1 to 200 runs; the daemon's `ci.runs` control route
+rejects a limit above 200.
 
 `thegn host discover` is the inbound tailnet path: it lists the machines
 your tailscale client already knows (from `tailscale status --json`) as
@@ -279,6 +284,14 @@ agents. No language server is needed — the index is built from the git
 file listing on first use, capped by `[semantic] index_max_files` (an
 oversized worktree maps _partially_ and says so). The same map is a
 read-scope MCP tool (`semantic.map`) on `thegn mcp serve`.
+
+`thegn mcp install <name>` installs a declared `[mcp_servers.<name>]` source.
+npm and cargo installers run inside bubblewrap with a read-only host root, the
+host home and temporary directories hidden, and only the staging and install
+directories writable; network access remains available. If bubblewrap with
+user namespaces is unusable, or on a non-Linux platform, installation is
+refused unless `--unsafe-host-install` is given at an interactive terminal;
+that runs the installer uncontained and prints a warning.
 
 Exit codes:
 
