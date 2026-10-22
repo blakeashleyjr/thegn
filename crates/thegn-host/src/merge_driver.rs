@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use thegn_core::attention::MqStatus;
 use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
@@ -122,6 +123,11 @@ struct CandidateDrift {
     reason: String,
 }
 
+#[derive(Debug)]
+struct CandidateUnreadable {
+    reason: String,
+}
+
 impl std::fmt::Display for CandidateDrift {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.reason)
@@ -129,6 +135,60 @@ impl std::fmt::Display for CandidateDrift {
 }
 
 impl std::error::Error for CandidateDrift {}
+
+impl std::fmt::Display for CandidateUnreadable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for CandidateUnreadable {}
+
+fn local_git_text(dir: &Path, args: &[&str]) -> Result<String, thegn_core::git_run::GitTextError> {
+    let cancel = AtomicBool::new(false);
+    thegn_core::git_run::git_run(
+        dir,
+        args,
+        &thegn_core::git_run::GitPolicy::read(thegn_core::remote::GITLOC_READ_DEADLINE),
+        &cancel,
+    )
+    .into_text()
+    .map(|text| text.trim().to_string())
+}
+
+fn read_absent(error: &thegn_core::git_run::GitTextError) -> bool {
+    matches!(
+        error,
+        thegn_core::git_run::GitTextError::Failed(thegn_core::git_run::GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
+    )
+}
+
+fn classify_oid(
+    result: Result<String, thegn_core::git_run::GitTextError>,
+) -> Result<Option<String>, String> {
+    match result {
+        Ok(text)
+            if (text.len() == 40 || text.len() == 64)
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) =>
+        {
+            Ok(Some(text))
+        }
+        Ok(_) => Err("git returned a malformed object id".into()),
+        Err(error) if read_absent(&error) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn unreadable_detail(reason: &str) -> String {
+    format!(
+        "candidate unreadable: {reason}; held without spending an attempt, retry the row once Git is readable"
+    )
+}
 
 fn candidate_drift(
     candidate: Option<&MergeCandidate>,
@@ -283,10 +343,20 @@ pub(crate) fn drive_queue(
                             }));
                         }
                         let adopted_tip = adopted.and_then(Result::ok);
-                        let live_tip = util::git_out(
+                        let live_tip = match classify_oid(local_git_text(
                             repo_root,
                             &["rev-parse", "--verify", "-q", &candidate.branch_ref],
-                        );
+                        )) {
+                            Ok(tip) => tip,
+                            Err(reason) => {
+                                return Err(anyhow::Error::new(CandidateUnreadable {
+                                    reason: format!(
+                                        "queued branch tip {}: {reason}",
+                                        candidate.branch_ref
+                                    ),
+                                }));
+                            }
+                        };
                         let fast_forward = held
                             && !fixer_adopted
                             && live_tip.as_deref().is_some_and(|tip| {
@@ -317,10 +387,22 @@ pub(crate) fn drive_queue(
                         }
                     }
                     let ref_name = format!("refs/heads/{branch}");
-                    if let Some(oid) = util::git_out(repo_root, &["rev-parse", &ref_name]) {
-                        expected_oids.borrow_mut().insert(key, oid);
-                    } else {
-                        expected_oids.borrow_mut().remove(&key);
+                    match classify_oid(local_git_text(repo_root, &["rev-parse", &ref_name])) {
+                        Ok(Some(oid)) => {
+                            expected_oids.borrow_mut().insert(key, oid);
+                        }
+                        Ok(None) => {
+                            expected_oids.borrow_mut().remove(&key);
+                        }
+                        Err(reason) => {
+                            expected_oids.borrow_mut().remove(&key);
+                            tracing::warn!(
+                                target: "thegn::merge",
+                                branch,
+                                %reason,
+                                "queued branch OID unreadable; fixer dispatch will be held"
+                            );
+                        }
                     }
                 }
                 integrate::attempt_land(cfg, repo_root, branch, location)
@@ -365,17 +447,35 @@ pub(crate) fn drive_queue(
                     Ok(Some(_)) => {
                         let verified = verify_fixer_checkout(repo_root, worktree, branch, None)
                             .and_then(|()| {
-                                let head =
-                                    util::git_out(Path::new(worktree), &["rev-parse", "HEAD"])
-                                        .ok_or_else(|| {
-                                            "worktree HEAD is unavailable".to_string()
-                                        })?;
+                                let head = match classify_oid(local_git_text(
+                                    Path::new(worktree),
+                                    &["rev-parse", "HEAD"],
+                                )) {
+                                    Ok(Some(head)) => head,
+                                    Ok(None) => {
+                                        return Err("worktree HEAD is unavailable".to_string());
+                                    }
+                                    Err(reason) => {
+                                        return Err(format!(
+                                            "worktree HEAD is unavailable: {reason}"
+                                        ));
+                                    }
+                                };
                                 let branch_ref = format!("refs/heads/{branch}");
-                                let tip = util::git_out(
+                                let tip = match classify_oid(local_git_text(
                                     repo_root,
                                     &["rev-parse", "--verify", "-q", &branch_ref],
-                                )
-                                .ok_or_else(|| "queued branch tip is unavailable".to_string())?;
+                                )) {
+                                    Ok(Some(tip)) => tip,
+                                    Ok(None) => {
+                                        return Err("queued branch tip is unavailable".to_string());
+                                    }
+                                    Err(reason) => {
+                                        return Err(format!(
+                                            "queued branch tip is unavailable: {reason}"
+                                        ));
+                                    }
+                                };
                                 if head != tip {
                                     return Err(format!(
                                         "worktree HEAD {head} differs from branch tip {tip}"
@@ -421,8 +521,12 @@ fn verify_fixer_checkout(
     if path != canonical_worktree {
         return Err("worktree path uses a non-canonical alias".into());
     }
-    let top_level = util::git_out(path, &["rev-parse", "--show-toplevel"])
-        .ok_or_else(|| "path is not a Git worktree".to_string())?;
+    let top_level = local_git_text(path, &["rev-parse", "--show-toplevel"])
+        .map_err(|error| format!("path is not a Git worktree: {error}"))?;
+    // GitPolicy::read permits empty stdout, so this explicit empty check is load-bearing.
+    if top_level.is_empty() {
+        return Err("path is not a Git worktree".into());
+    }
     let canonical_top_level = PathBuf::from(top_level)
         .canonicalize()
         .map_err(|error| format!("cannot resolve Git worktree root: {error}"))?;
@@ -441,25 +545,33 @@ fn verify_fixer_checkout(
     if actual_common != expected_common {
         return Err("worktree belongs to a different Git repository".into());
     }
-    let registered =
-        util::git_out(repo_root, &["worktree", "list", "--porcelain"]).is_some_and(|list| {
-            list.lines().any(|line| {
-                line.strip_prefix("worktree ")
-                    == Some(canonical_worktree.to_string_lossy().as_ref())
-            })
-        });
+    let listing = local_git_text(repo_root, &["worktree", "list", "--porcelain"])
+        .map_err(|error| format!("could not list the queued repository's worktrees: {error}"))?;
+    let registered = listing.lines().any(|line| {
+        line.strip_prefix("worktree ") == Some(canonical_worktree.to_string_lossy().as_ref())
+    });
     if !registered {
         return Err("path is not a registered worktree of the queued repository".into());
     }
-    let actual_ref = util::git_out(&canonical_worktree, &["symbolic-ref", "-q", "HEAD"])
-        .ok_or_else(|| "worktree HEAD is detached or unavailable".to_string())?;
+    let actual_ref = match local_git_text(&canonical_worktree, &["symbolic-ref", "-q", "HEAD"]) {
+        Ok(actual_ref) if !actual_ref.is_empty() => actual_ref,
+        Ok(_) => return Err("worktree HEAD is detached or unavailable".into()),
+        Err(error) if read_absent(&error) => {
+            return Err("worktree HEAD is detached or unavailable".into());
+        }
+        Err(error) => return Err(format!("worktree HEAD is unavailable: {error}")),
+    };
     let expected_ref = format!("refs/heads/{branch}");
     if actual_ref != expected_ref {
         return Err(format!("expected {expected_ref}, found {actual_ref}"));
     }
     if let Some(expected_oid) = expected_oid {
-        let actual_oid = util::git_out(&canonical_worktree, &["rev-parse", "HEAD"])
-            .ok_or_else(|| "worktree HEAD is unavailable".to_string())?;
+        let actual_oid =
+            match classify_oid(local_git_text(&canonical_worktree, &["rev-parse", "HEAD"])) {
+                Ok(Some(actual_oid)) => actual_oid,
+                Ok(None) => return Err("worktree HEAD is unavailable".into()),
+                Err(reason) => return Err(format!("worktree HEAD is unavailable: {reason}")),
+            };
         if actual_oid != expected_oid {
             return Err("worktree HEAD moved since the queued candidate was folded".into());
         }
@@ -806,6 +918,20 @@ fn drive_queue_with(
                             "identity drift: {}; re-enqueue with `thegn merge add` to adopt the new tip",
                             drift.reason
                         );
+                        let fields = set(db, MqStatus::AgentBlocked, None, Some(&detail));
+                        stop_on_write_error!('attempt);
+                        progress(&DriveStep {
+                            fields: &fields,
+                            worktree: &item.worktree,
+                            branch: &item.branch,
+                            status: MqStatus::AgentBlocked.as_str(),
+                            detail: &detail,
+                        });
+                        out.agent_blocked.push(item.branch.clone());
+                        break;
+                    }
+                    if let Some(unreadable) = e.downcast_ref::<CandidateUnreadable>() {
+                        let detail = unreadable_detail(&unreadable.reason);
                         let fields = set(db, MqStatus::AgentBlocked, None, Some(&detail));
                         stop_on_write_error!('attempt);
                         progress(&DriveStep {
@@ -2752,5 +2878,195 @@ mod tests {
                 "unclaimed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_read_tests {
+    use super::{
+        CandidateUnreadable, Config, DriveActions, Failure, MergeQueueConfig, QueueItem,
+        classify_oid, drive_queue_with, local_git_text, unreadable_detail,
+    };
+    use thegn_core::git_run::{GitOutcome, GitTextError};
+
+    #[test]
+    fn classify_oid_keeps_exit_one_as_absent_and_everything_else_as_failure() {
+        let absent = Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail: String::new(),
+        }));
+        assert!(matches!(classify_oid(absent), Ok(None)));
+
+        let stderr_failure = Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail: "fatal: x".into(),
+        }));
+        assert!(
+            classify_oid(stderr_failure)
+                .unwrap_err()
+                .contains("fatal: x")
+        );
+
+        let exit_failure = Err(GitTextError::Failed(GitOutcome::Exit {
+            code: Some(128),
+            stderr_tail: "fatal: repository failure".into(),
+        }));
+        assert!(classify_oid(exit_failure).is_err());
+        assert!(
+            classify_oid(Err(GitTextError::Failed(GitOutcome::Timeout)))
+                .unwrap_err()
+                .contains("timed out")
+        );
+
+        assert!(matches!(classify_oid(Ok("a".repeat(40))), Ok(Some(_))));
+        assert!(matches!(classify_oid(Ok("b".repeat(64))), Ok(Some(_))));
+        for malformed in [String::new(), "HEAD".into(), "A".repeat(40)] {
+            assert!(
+                classify_oid(Ok(malformed))
+                    .unwrap_err()
+                    .contains("malformed object id")
+            );
+        }
+    }
+
+    #[test]
+    fn queued_tip_read_in_a_non_repository_is_a_failure_not_absence() {
+        // This fixture relies on /tmp being outside the checked-out repository so
+        // Git's upward repository discovery cannot find the outer worktree.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let result = classify_oid(local_git_text(
+            dir.path(),
+            &["rev-parse", "--verify", "-q", "refs/heads/feat"],
+        ));
+        assert!(result.is_err(), "non-repository read was treated as absent");
+        assert!(
+            result
+                .unwrap_err()
+                .to_lowercase()
+                .contains("not a git repository")
+        );
+    }
+
+    #[test]
+    fn queued_tip_read_distinguishes_present_and_absent_refs() {
+        // Positive control: Git's clean exit-1 answer for a missing verified ref remains absence.
+        #[expect(clippy::disallowed_methods, reason = "create an isolated Git fixture")]
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let status = thegn_core::util::git_cmd(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed with {status}");
+        }
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "t@e"]);
+        git(dir.path(), &["config", "user.name", "t"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+
+        let present = classify_oid(local_git_text(
+            dir.path(),
+            &["rev-parse", "--verify", "-q", "refs/heads/main"],
+        ));
+        assert!(matches!(present, Ok(Some(oid)) if oid.len() == 40 || oid.len() == 64));
+        assert!(matches!(
+            classify_oid(local_git_text(
+                dir.path(),
+                &["rev-parse", "--verify", "-q", "refs/heads/nope"],
+            )),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn unreadable_queued_tip_holds_row_without_attempt_or_fixer() {
+        use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+
+        #[expect(clippy::disallowed_methods, reason = "create an isolated Git fixture")]
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let status = thegn_core::util::git_cmd(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed with {status}");
+        }
+
+        let repo = tempfile::tempdir_in("/tmp").unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        db.put_worktree("feat", &repo_path, &repo_path, "feat", None, None)
+            .unwrap();
+        db.enqueue_merge(&repo_path, "feat", "main").unwrap();
+        let queued = QueueItem {
+            worktree: repo_path.clone(),
+            branch: "feat".into(),
+            location: String::new(),
+        };
+
+        let outcome = drive_queue_with(
+            &MergeQueueConfig {
+                organize_folders: false,
+                ..MergeQueueConfig::default()
+            },
+            &Config::default(),
+            repo.path(),
+            &db,
+            vec![queued],
+            |_| {},
+            DriveActions {
+                attempt: |_: &str,
+                          _: &thegn_core::remote::GitLoc,
+                          _: bool|
+                 -> anyhow::Result<super::AttemptOutcome> {
+                    Err(anyhow::Error::new(CandidateUnreadable {
+                        reason: "queued branch tip refs/heads/feat: Git command timed out".into(),
+                    }))
+                },
+                floor: |_: &str| panic!("unreadable candidate must not dispatch a fixer"),
+                runner: |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| {
+                    panic!("unreadable candidate must not run a fixer")
+                },
+            },
+        );
+
+        assert_eq!(outcome.agent_blocked, ["feat"]);
+        assert!(outcome.landed.is_empty());
+        assert!(outcome.needs_human.is_empty());
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.status, "agent_blocked");
+        assert_eq!(row.agent_attempts, 0);
+        let detail = row.error_detail.unwrap();
+        assert!(detail.contains("candidate unreadable"));
+        assert!(!detail.contains("identity drift"));
+        assert!(!detail.contains("re-enqueue"));
+    }
+
+    #[test]
+    fn unreadable_detail_is_not_identity_drift() {
+        let detail = unreadable_detail("Git command timed out");
+        assert!(detail.contains("candidate unreadable"));
+        assert!(detail.contains("Git command timed out"));
+        assert!(!detail.contains("identity drift"));
+        assert!(!detail.contains("re-enqueue"));
     }
 }
