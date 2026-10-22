@@ -918,7 +918,7 @@ pub async fn main(
 
     // Check registered repos for interrupted rename journals off-thread.
     // This stats each repo and runs git only when a journal is present.
-    crate::handlers::worktree_rename::spawn_launch_sweep();
+    crate::handlers::worktree_rename::spawn_launch_sweep(refresh_tx.clone(), waker.clone());
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
