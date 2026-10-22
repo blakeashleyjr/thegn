@@ -23,6 +23,8 @@
 //!   message currently being written. This admits one maximum-size kitty APC
 //!   or preview image on an empty queue. `submit_oob` warns and drops on queue
 //!   pressure; `try_submit_oob` returns refused bytes to retry-capable callers.
+//!   Host clipboard copies use the typed clipboard queue and share its four-set
+//!   count, with the same 4 MiB byte budget as OOB.
 //! - A transient write error (EIO/EINTR/EAGAIN — see `frame_write`) sets a
 //!   status the loop converts to a full-repaint retry, exactly like the old
 //!   synchronous path; [`RETRY_MAX`](crate::frame_write::RETRY_MAX)
@@ -347,18 +349,36 @@ impl FrameWriter {
                 return Err(bytes);
             }
         };
-        if q.shutdown
-            || matches!(q.status, WriterStatus::Fatal(_))
-            || q.clipboard_queued >= 4
-            || q.clipboard_bytes + bytes.len() > 4 * crate::queries::clipboard::MAX_WIRE
-        {
+        let target = match admit_clipboard(&mut q, bytes, 4 * crate::queries::clipboard::MAX_WIRE) {
+            Ok(target) => target,
+            Err(bytes) => return Err(bytes),
+        };
+        drop(q);
+        self.inner.cv.notify_one();
+        if self.sync {
+            self.wait_for_sync_write(target);
+        }
+        Ok(())
+    }
+
+    /// Admit thegn's own terminal clipboard copies. Host copies share the
+    /// four-set clipboard count with pane sets and have a 4 MiB byte budget;
+    /// pane sets retain their smaller `4 * MAX_WIRE` budget against these same
+    /// counters, so a large host copy in flight makes later pane sets wait for
+    /// capacity and use their existing latest-wins retry.
+    pub(crate) fn try_submit_host_clipboard(&self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if bytes.len() > OOB_QUEUE_BYTES {
             return Err(bytes);
         }
-        q.clipboard_queued += 1;
-        q.clipboard_bytes += bytes.len();
-        q.submitted_seq = q.submitted_seq.saturating_add(1);
-        let target = q.submitted_seq;
-        q.msgs.push_back(Msg::Clipboard(bytes, target));
+        self.inner.clipboard_retry.store(true, Ordering::SeqCst);
+        let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        let target = match admit_clipboard(&mut q, bytes, OOB_QUEUE_BYTES) {
+            Ok(target) => target,
+            Err(bytes) => return Err(bytes),
+        };
         drop(q);
         self.inner.cv.notify_one();
         if self.sync {
@@ -440,6 +460,22 @@ impl FrameWriter {
             q.metrics.record(stamp, started, finished, success);
         }
     }
+}
+
+fn admit_clipboard(q: &mut Q, bytes: Vec<u8>, byte_budget: usize) -> Result<u64, Vec<u8>> {
+    if q.shutdown
+        || matches!(q.status, WriterStatus::Fatal(_))
+        || q.clipboard_queued >= 4
+        || q.clipboard_bytes + bytes.len() > byte_budget
+    {
+        return Err(bytes);
+    }
+    q.clipboard_queued += 1;
+    q.clipboard_bytes += bytes.len();
+    q.submitted_seq = q.submitted_seq.saturating_add(1);
+    let target = q.submitted_seq;
+    q.msgs.push_back(Msg::Clipboard(bytes, target));
+    Ok(target)
 }
 
 impl Drop for FrameWriter {
@@ -2026,5 +2062,101 @@ mod tests {
         assert!(released);
         assert!(!oob_capacity_wake_requested(&writer.inner, released));
         assert!(writer.inner.oob_retry.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn host_clipboard_copy_is_a_typed_clipboard_message() {
+        let writer = test_writer();
+        let bytes = crate::copymode::osc52("hi");
+        assert!(writer.try_submit_host_clipboard(bytes.clone()).is_ok());
+        let mut q = writer.inner.q.lock().unwrap();
+        assert!(matches!(pop_message(&mut q), Some(Msg::Clipboard(queued, _)) if queued == bytes));
+        assert_eq!(q.oob_in_flight, 0);
+        assert_eq!(q.clipboard_queued, 1);
+    }
+
+    #[test]
+    fn failed_host_copy_reports_uncertain_without_payload() {
+        let writer = test_writer_with_worker_frames(false);
+        let payload = b"SECRET-PAYLOAD".to_vec();
+        assert!(writer.try_submit_host_clipboard(payload.clone()).is_ok());
+        let clipboard = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, clipboard, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::Uncertain)
+        );
+        assert!(
+            !clipboard_outcome_status(ClipboardOutcome::Uncertain)
+                .as_bytes()
+                .windows(payload.len())
+                .any(|window| window == payload.as_slice())
+        );
+    }
+
+    #[test]
+    fn abandoned_host_copy_reports_not_written() {
+        let writer = test_writer();
+        assert!(writer.try_submit_host_clipboard(vec![b'C']).is_ok());
+        abandon_queued_messages(&mut writer.inner.q.lock().unwrap());
+        assert_eq!(
+            writer.take_clipboard_outcome(),
+            Some(ClipboardOutcome::NotWritten)
+        );
+    }
+
+    #[test]
+    fn newer_committed_host_copy_supersedes_an_older_failure() {
+        let writer = test_writer_with_worker_frames(false);
+        assert!(writer.try_submit_host_clipboard(vec![b'A']).is_ok());
+        assert!(writer.try_submit_host_clipboard(vec![b'B']).is_ok());
+        let older = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(
+            write_message(&writer.inner, older, |_| {
+                Err(std::io::ErrorKind::Interrupted.into())
+            })
+            .0
+        );
+        let newer = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(!write_message(&writer.inner, newer, |_| Ok(())).0);
+        assert_eq!(writer.take_clipboard_outcome(), None);
+    }
+
+    #[test]
+    fn refused_host_copy_arms_the_clipboard_wake_and_is_admitted_after_release() {
+        let writer = test_writer();
+        for byte in 0..4 {
+            assert!(writer.try_submit_host_clipboard(vec![byte]).is_ok());
+        }
+        let refused = vec![5];
+        assert_eq!(
+            writer.try_submit_host_clipboard(refused.clone()),
+            Err(refused)
+        );
+        assert!(writer.inner.clipboard_retry.load(Ordering::SeqCst));
+
+        let active = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        let (errored, _, released_clipboard) = write_message(&writer.inner, active, |_| Ok(()));
+        assert!(!errored);
+        assert!(released_clipboard);
+        assert!(writer.try_submit_host_clipboard(vec![5]).is_ok());
+    }
+
+    #[test]
+    fn host_copy_budget_admits_a_copy_too_large_for_pane_sets() {
+        let writer = test_writer();
+        let large_copy = vec![b'x'; 1024 * 1024];
+        assert!(writer.try_submit_host_clipboard(large_copy.clone()).is_ok());
+        assert!(writer.try_submit_clipboard(large_copy, || {}).is_err());
+        assert!(
+            writer
+                .try_submit_host_clipboard(vec![b'x'; OOB_QUEUE_BYTES + 1])
+                .is_err()
+        );
     }
 }

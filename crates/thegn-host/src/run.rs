@@ -8847,7 +8847,7 @@ async fn event_loop<T: Terminal>(
                 SidebarOutcome::CopyText(text) => {
                     // OSC-52 to the outer terminal's clipboard (item 27).
                     pending_clipboard_oob.offer(crate::copymode::osc52(&text), |bytes| {
-                        writer.try_submit_oob(bytes)
+                        writer.try_submit_host_clipboard(bytes)
                     });
                     model.status = format!("Copied: {text}");
                     dirty = true;
@@ -9232,7 +9232,7 @@ async fn event_loop<T: Terminal>(
                 replay.is_some(),
             );
         pending_corner_oob.retry(corner_visible, |bytes| writer.try_submit_oob(bytes));
-        pending_clipboard_oob.retry(|bytes| writer.try_submit_oob(bytes));
+        pending_clipboard_oob.retry(|bytes| writer.try_submit_host_clipboard(bytes));
         pending_bell.retry(|bytes| writer.try_submit_oob(bytes));
         if let Some(bytes) = pending_clipboard_oob.take_oversized() {
             model.status = crate::preview_retry::oversized_copy_status(bytes);
@@ -18081,7 +18081,7 @@ async fn event_loop<T: Terminal>(
                                     // ignore OSC52. Belt and braces.
                                     pending_clipboard_oob
                                         .offer(crate::copymode::osc52(&text), |bytes| {
-                                            writer.try_submit_oob(bytes)
+                                            writer.try_submit_host_clipboard(bytes)
                                         });
                                     let copy_result = crate::clipboard::copy(&text);
                                     // Also land in the default register (persisted),
@@ -22320,7 +22320,7 @@ async fn event_loop<T: Terminal>(
                                             {
                                                 pending_clipboard_oob
                                                     .offer(crate::copymode::osc52(&url), |bytes| {
-                                                        writer.try_submit_oob(bytes)
+                                                        writer.try_submit_host_clipboard(bytes)
                                                     });
                                                 model.status = match crate::clipboard::copy(&url) {
                                                     Ok(()) => "Copying link to clipboard…".into(),
@@ -22367,7 +22367,7 @@ async fn event_loop<T: Terminal>(
                                             {
                                                 pending_clipboard_oob
                                                     .offer(crate::copymode::osc52(&url), |bytes| {
-                                                        writer.try_submit_oob(bytes)
+                                                        writer.try_submit_host_clipboard(bytes)
                                                     });
                                                 model.status = match crate::clipboard::copy(&url) {
                                                     Ok(()) => "Copying link to clipboard…".into(),
@@ -22681,7 +22681,7 @@ async fn event_loop<T: Terminal>(
                                 Some(sha) => {
                                     pending_clipboard_oob
                                         .offer(crate::copymode::osc52(&sha), |bytes| {
-                                            writer.try_submit_oob(bytes)
+                                            writer.try_submit_host_clipboard(bytes)
                                         });
                                     model.status = format!("Copied {sha}");
                                 }
@@ -23882,7 +23882,7 @@ async fn event_loop<T: Terminal>(
                                 Some(text) => {
                                     pending_clipboard_oob
                                         .offer(crate::copymode::osc52(&text), |bytes| {
-                                            writer.try_submit_oob(bytes)
+                                            writer.try_submit_host_clipboard(bytes)
                                         });
                                     model.status = crate::panel::sections::logs::copy_status(
                                         1,
@@ -23906,7 +23906,7 @@ async fn event_loop<T: Terminal>(
                                 let text = lines.join("\n");
                                 pending_clipboard_oob
                                     .offer(crate::copymode::osc52(&text), |bytes| {
-                                        writer.try_submit_oob(bytes)
+                                        writer.try_submit_host_clipboard(bytes)
                                     });
                                 model.status = crate::panel::sections::logs::copy_status(
                                     lines.len(),
@@ -27108,7 +27108,7 @@ async fn event_loop<T: Terminal>(
                                     if !text.trim().is_empty() {
                                         pending_clipboard_oob
                                             .offer(crate::copymode::osc52(&text), |bytes| {
-                                                writer.try_submit_oob(bytes)
+                                                writer.try_submit_host_clipboard(bytes)
                                             });
                                         let copy_result = crate::clipboard::copy(&text);
                                         store_yank(
