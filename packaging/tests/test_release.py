@@ -1232,5 +1232,187 @@ class ReleaseAssetManifestTests(unittest.TestCase):
                 self.assertIn("invalid release tag", stderr.getvalue())
 
 
+class ArchiveLimitBoundaryTests(unittest.TestCase):
+    REQUIRED = ["thegn", "LICENSE-MIT", "LICENSE-APACHE", "README.md"]
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.temp = Path(self.temporary.name)
+
+    def write_tar(self, entries, *, fmt=tarfile.GNU_FORMAT) -> Path:
+        path = self.temp / "archive.tar.gz"
+        with tarfile.open(path, "w:gz", format=fmt) as archive:
+            for name, content, mode in entries:
+                info = tarfile.TarInfo(name)
+                info.mode = mode
+                if name.endswith("/"):
+                    info.type = tarfile.DIRTYPE
+                    archive.addfile(info)
+                else:
+                    info.size = len(content)
+                    archive.addfile(info, io.BytesIO(content))
+        return path
+
+    def write_zip(self, entries, *, deflate=False) -> Path:
+        path = self.temp / "archive.zip"
+        compression = zipfile.ZIP_DEFLATED if deflate else zipfile.ZIP_STORED
+        with zipfile.ZipFile(path, "w", compression=compression) as archive:
+            for name, content, mode in entries:
+                info = zipfile.ZipInfo(name)
+                if name.endswith("/"):
+                    info.external_attr = (stat.S_IFDIR | 0o755) << 16
+                    archive.writestr(info, b"")
+                else:
+                    info.external_attr = (stat.S_IFREG | mode) << 16
+                    info.compress_type = compression
+                    archive.writestr(info, content)
+        return path
+
+    def root_entries(self, content=lambda name: f"fixture:{name}\n".encode()) -> list[tuple[str, bytes, int]]:
+        return [
+            (name, content(name), 0o755 if name == "thegn" else 0o644)
+            for name in self.REQUIRED
+        ]
+
+    def validate(self, path: Path, platform: str) -> None:
+        release._validate_archive_layout(path, platform, self.REQUIRED)
+
+    def test_sparse_tar_member_is_refused(self) -> None:
+        sparse_path = self.temp / "sparse.tar.gz"
+        sparse_entries = self.root_entries()
+        sparse_entries[-1] = ("README.md", b"sparse", 0o644)
+        with tarfile.open(sparse_path, "w:gz", format=tarfile.GNU_FORMAT) as archive:
+            for name, content, mode in sparse_entries:
+                info = tarfile.TarInfo(name)
+                info.mode = mode
+                info.size = len(content)
+                if name == "README.md":
+                    info.type = tarfile.GNUTYPE_SPARSE
+                archive.addfile(info, io.BytesIO(content))
+        with self.assertRaisesRegex(release.ReleaseError, "is a sparse file"):
+            self.validate(sparse_path, "unix")
+
+        pax_path = self.temp / "sparse-pax.tar.gz"
+        pax_entries = self.root_entries()
+        with tarfile.open(pax_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+            for name, content, mode in pax_entries:
+                info = tarfile.TarInfo(name)
+                info.mode = mode
+                info.size = len(content)
+                if name == "thegn":
+                    info.pax_headers = {"GNU.sparse.major": "1"}
+                archive.addfile(info, io.BytesIO(content))
+        with self.assertRaisesRegex(release.ReleaseError, "is a sparse file"):
+            self.validate(pax_path, "unix")
+
+    def test_truncated_archive_is_a_typed_release_error(self) -> None:
+        entries = self.root_entries(lambda name: os.urandom(200_000))
+        tar_path = self.write_tar(entries)
+        tar_bytes = tar_path.read_bytes()
+        tar_path.write_bytes(tar_bytes[: len(tar_bytes) // 2])
+        with self.assertRaisesRegex(release.ReleaseError, "cannot inspect release archive"):
+            self.validate(tar_path, "unix")
+
+        # positive control: also passes at 13958491c0 (BadZipFile was already caught).
+        zip_path = self.write_zip(entries)
+        zip_bytes = zip_path.read_bytes()
+        zip_path.write_bytes(zip_bytes[: len(zip_bytes) // 2])
+        with self.assertRaisesRegex(release.ReleaseError, "cannot inspect release archive"):
+            self.validate(zip_path, "windows")
+
+    def test_member_count_limit_boundary(self) -> None:
+        entries = self.root_entries() + [("./", b"", 0o755), ("./", b"", 0o755)]
+        # positive control: the over-limit assertion also passes at 13958491c0.
+        for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
+            with self.subTest(platform=platform):
+                path = writer(entries)
+                with mock.patch.object(release, "MAX_MEMBERS", 6):
+                    self.assertIsNone(self.validate(path, platform))
+                with mock.patch.object(release, "MAX_MEMBERS", 5):
+                    with self.assertRaisesRegex(release.ReleaseError, "exceeds 5 members"):
+                        self.validate(path, platform)
+
+    def test_path_length_limit_boundary(self) -> None:
+        entries = self.root_entries()
+        for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
+            with self.subTest(platform=platform):
+                path = writer(entries)
+                with mock.patch.object(release, "MAX_PATH_CHARS", 14):
+                    self.assertIsNone(self.validate(path, platform))
+                with mock.patch.object(release, "MAX_PATH_CHARS", 13):
+                    with self.assertRaisesRegex(release.ReleaseError, "overlong path"):
+                        self.validate(path, platform)
+
+    def test_member_size_limit_boundary(self) -> None:
+        entries = self.root_entries(lambda name: b"x" * (1000 if name == "README.md" else 5))
+        for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
+            with self.subTest(platform=platform):
+                path = writer(entries)
+                with mock.patch.object(release, "MAX_MEMBER_BYTES", 1000):
+                    self.assertIsNone(self.validate(path, platform))
+                with mock.patch.object(release, "MAX_MEMBER_BYTES", 999):
+                    with self.assertRaisesRegex(release.ReleaseError, "member exceeds 999 bytes"):
+                        self.validate(path, platform)
+
+    def test_expanded_size_limit_boundary(self) -> None:
+        entries = self.root_entries()
+        expanded = sum(len(content) for _, content, _ in entries)
+        for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
+            with self.subTest(platform=platform):
+                path = writer(entries)
+                with mock.patch.object(release, "MAX_EXPANDED_BYTES", expanded):
+                    self.assertIsNone(self.validate(path, platform))
+                with mock.patch.object(release, "MAX_EXPANDED_BYTES", expanded - 1):
+                    with self.assertRaisesRegex(
+                        release.ReleaseError, f"exceeds {expanded - 1} expanded bytes"
+                    ):
+                        self.validate(path, platform)
+
+    def test_compression_ratio_limit_boundary(self) -> None:
+        entries = self.root_entries(
+            lambda name: b"\0" * 200_000 if name == "README.md" else f"fixture:{name}\n".encode()
+        )
+        for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
+            with self.subTest(platform=platform):
+                path = writer(entries, **({"deflate": True} if platform == "windows" else {}))
+                compressed = path.stat().st_size
+                expanded = sum(len(content) for _, content, _ in entries)
+                ok = -(-expanded // compressed)
+                self.assertGreaterEqual(ok, 2, f"expanded={expanded}, compressed={compressed}")
+                with mock.patch.object(release, "MAX_COMPRESSION_RATIO", ok):
+                    self.assertIsNone(self.validate(path, platform))
+                with mock.patch.object(release, "MAX_COMPRESSION_RATIO", ok - 1):
+                    with self.assertRaisesRegex(release.ReleaseError, "exceeds compression ratio"):
+                        self.validate(path, platform)
+
+    def test_archive_byte_limit_boundary(self) -> None:
+        for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
+            with self.subTest(platform=platform):
+                path = writer(self.root_entries())
+                size = path.stat().st_size
+                expected = hashlib.sha256(path.read_bytes()).hexdigest()
+                with mock.patch.object(release, "MAX_ARCHIVE_BYTES", size):
+                    self.assertEqual(expected, release._sha256(path))
+                    with path.open("rb") as handle:
+                        self.assertEqual(expected, release._hash_open_file(handle, path))
+                with mock.patch.object(release, "MAX_ARCHIVE_BYTES", size - 1):
+                    with self.assertRaisesRegex(release.ReleaseError, f"exceeds {size - 1} bytes"):
+                        release._sha256(path)
+                    with path.open("rb") as handle:
+                        with self.assertRaisesRegex(
+                            release.ReleaseError, f"exceeds {size - 1} bytes"
+                        ):
+                            release._hash_open_file(handle, path)
+
+    def test_nested_path_is_refused_by_the_root_only_schema(self) -> None:
+        entries = self.root_entries() + [("sub/thegn", b"nested", 0o755)]
+        # positive control: the depth-1 schema also rejects this at 13958491c0.
+        for platform, writer in (("unix", self.write_tar), ("windows", self.write_zip)):
+            with self.subTest(platform=platform):
+                with self.assertRaisesRegex(release.ReleaseError, "unexpected member"):
+                    self.validate(writer(entries), platform)
+
+
 if __name__ == "__main__":
     unittest.main()
