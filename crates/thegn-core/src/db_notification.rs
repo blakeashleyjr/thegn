@@ -681,6 +681,29 @@ impl Db {
         statuses: &[crate::issue::AgentDispatchStatus],
         limit: usize,
     ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
+        self.dispatches_with_status_ordered(statuses, limit, false)
+    }
+
+    /// List the newest rows matching the requested statuses, plus whether
+    /// additional matches were omitted. The status index keeps this bounded
+    /// query independent of terminal roster history.
+    ///
+    /// When limit is zero, the query still fetches one matching row to report
+    /// whether the empty page is truncated.
+    pub fn newest_dispatches_with_status(
+        &self,
+        statuses: &[crate::issue::AgentDispatchStatus],
+        limit: usize,
+    ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
+        self.dispatches_with_status_ordered(statuses, limit, true)
+    }
+
+    fn dispatches_with_status_ordered(
+        &self,
+        statuses: &[crate::issue::AgentDispatchStatus],
+        limit: usize,
+        newest_first: bool,
+    ) -> Result<(Vec<crate::issue::AgentDispatch>, bool)> {
         if statuses.is_empty() {
             return Ok((Vec::new(), false));
         }
@@ -694,10 +717,15 @@ impl Db {
             .collect::<Vec<_>>()
             .join(", ");
         let limit_placeholder = statuses.len() + 1;
+        let ordering = if newest_first {
+            "dispatched_at_ms DESC, id DESC"
+        } else {
+            "dispatched_at_ms ASC, id ASC"
+        };
         let sql = format!(
             "SELECT {DISPATCH_COLS} FROM agent_dispatches \
              WHERE status IN ({placeholders}) \
-             ORDER BY dispatched_at_ms ASC, id ASC LIMIT ?{limit_placeholder}"
+             ORDER BY {ordering} LIMIT ?{limit_placeholder}"
         );
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut values = status_params
@@ -713,6 +741,26 @@ impl Db {
         let truncated = rows.len() > limit;
         rows.truncate(limit);
         Ok((rows, truncated))
+    }
+
+    /// Return child stage names for the whole roster. This narrow query is
+    /// deliberately unbounded: child stages decide whether a lane may advance,
+    /// so they must never be inferred from a bounded dispatch window.
+    pub fn dispatch_child_stages(&self) -> Result<std::collections::BTreeMap<i64, Vec<String>>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT parent_id, stage FROM agent_dispatches \
+             WHERE parent_id IS NOT NULL AND stage IS NOT NULL ORDER BY id",
+        )?;
+        let mut children = std::collections::BTreeMap::<i64, Vec<String>>::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for child in rows {
+            let (parent, stage) = child?;
+            children.entry(parent).or_default().push(stage);
+        }
+        Ok(children)
     }
 
     /// Pipeline rows for either spelling of a worktree path, newest first.
@@ -1213,5 +1261,82 @@ mod tests {
         let (empty, truncated) = db.list_dispatch_roster_window(0, 0).unwrap();
         assert!(empty.is_empty());
         assert!(!truncated);
+    }
+
+    #[test]
+    fn newest_dispatches_with_status_returns_newest_first_and_flags_truncation() {
+        use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+
+        let db = Db::open_memory().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    issue_id: "THE-1182",
+                    worktree_path: "/wt/history",
+                    agent_name: "codex",
+                    stage: Some("code"),
+                    parent_id: None,
+                    session_id: None,
+                    artifact_path: None,
+                    chunk_path: None,
+                })
+                .unwrap();
+            db.update_dispatch_status(id, S::Done).unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE id=?2",
+                    rusqlite::params![i64::from(index), id],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        let (newest, truncated) = db.newest_dispatches_with_status(&[S::Done], 2).unwrap();
+        assert!(truncated);
+        assert_eq!(
+            newest.iter().map(|row| row.id).collect::<Vec<_>>(),
+            ids[1..].iter().rev().copied().collect::<Vec<_>>()
+        );
+        let (empty, truncated) = db.newest_dispatches_with_status(&[], 2).unwrap();
+        assert!(empty.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn dispatch_child_stages_maps_every_parent() {
+        use crate::issue::NewDispatch;
+
+        let db = Db::open_memory().unwrap();
+        let parent = db
+            .put_agent_dispatch(NewDispatch {
+                issue_id: "THE-1182",
+                worktree_path: "/wt/parent",
+                agent_name: "codex",
+                stage: Some("parent"),
+                parent_id: None,
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        for stage in ["test", "review"] {
+            db.put_agent_dispatch(NewDispatch {
+                issue_id: "THE-1182",
+                worktree_path: "/wt/child",
+                agent_name: "codex",
+                stage: Some(stage),
+                parent_id: Some(parent),
+                session_id: None,
+                artifact_path: None,
+                chunk_path: None,
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.dispatch_child_stages().unwrap()[&parent],
+            vec![String::from("test"), String::from("review")]
+        );
     }
 }

@@ -248,6 +248,7 @@ pub mod pipeline_chunk;
 pub mod pipeline_claim;
 pub mod pipeline_exit;
 pub mod pipeline_gate_attest;
+pub mod pipeline_identity;
 pub mod pipeline_launch_digest;
 pub mod pipeline_merge_admission;
 pub mod pipeline_reap;

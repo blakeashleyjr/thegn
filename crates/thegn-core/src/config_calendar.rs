@@ -425,9 +425,29 @@ impl std::fmt::Debug for CalendarAccount {
             )
             .field("allow_private_network", &self.allow_private_network)
             .field("calendar_ids", &self.calendar_ids)
-            .field("command", &self.command)
+            // Plugin env values and arguments routinely carry tokens.
+            .field(
+                "command",
+                &self
+                    .command
+                    .iter()
+                    .take(1)
+                    .map(String::as_str)
+                    .chain(std::iter::repeat_n(
+                        "<redacted>",
+                        self.command.len().saturating_sub(1),
+                    ))
+                    .collect::<Vec<_>>(),
+            )
             .field("cwd", &self.cwd)
-            .field("env", &self.env)
+            .field(
+                "env",
+                &self
+                    .env
+                    .keys()
+                    .map(|key| (key.as_str(), "<redacted>"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
             .field("capabilities", &self.capabilities)
             .field("timeout_secs", &self.timeout_secs)
             .finish()

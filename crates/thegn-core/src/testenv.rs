@@ -293,10 +293,70 @@ impl Default for IsolatedState {
     }
 }
 
+/// Environment variable that makes security-test prerequisites mandatory.
+pub const REQUIRE_SECURITY_TESTS_ENV: &str = "THEGN_REQUIRE_SECURITY_TESTS";
+
+/// Outcome of checking whether a security-test prerequisite is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipVerdict {
+    /// The prerequisite is available and the test should run.
+    Run,
+    /// The prerequisite is unavailable, but the test may be skipped.
+    Unsupported,
+    /// The prerequisite is unavailable despite security tests being required.
+    MissingRequired,
+}
+
+/// Determines the security-test outcome from the required and available flags.
+pub fn skip_verdict(required: bool, available: bool) -> SkipVerdict {
+    match (required, available) {
+        (_, true) => SkipVerdict::Run,
+        (true, false) => SkipVerdict::MissingRequired,
+        (false, false) => SkipVerdict::Unsupported,
+    }
+}
+
+/// Runs or skips a security test, writing an unsupported diagnostic to `out`.
+///
+/// Panics when the prerequisite is unavailable and security tests are required.
+pub fn require_or_skip_in(
+    required: bool,
+    prereq: &str,
+    available: bool,
+    out: &mut dyn std::io::Write,
+) -> bool {
+    match skip_verdict(required, available) {
+        SkipVerdict::Run => true,
+        SkipVerdict::Unsupported => {
+            match std::io::Write::write_fmt(out, format_args!("UNSUPPORTED: {prereq}\n")) {
+                Ok(()) => false,
+                Err(error) => {
+                    panic!("could not write security test prerequisite diagnostic: {error}")
+                }
+            }
+        }
+        SkipVerdict::MissingRequired => {
+            panic!(
+                "required security prerequisite missing: {prereq} ({REQUIRE_SECURITY_TESTS_ENV}=1)"
+            )
+        }
+    }
+}
+
+/// Runs a security test when its prerequisite is available, or reports a skip.
+///
+/// Use as `if !require_or_skip("<prerequisite>", <probe>) { return; }` in a
+/// security-sensitive test. `just security-e2e` sets the required-test variable.
+pub fn require_or_skip(prereq: &str, available: bool) -> bool {
+    let required = std::env::var(REQUIRE_SECURITY_TESTS_ENV).as_deref() == Ok("1");
+    require_or_skip_in(required, prereq, available, &mut std::io::stderr().lock())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        IsolatedState, ambient_roots_from, is_real_state_path, state_env_for, symlinked_tempdir,
+        IsolatedState, SkipVerdict, ambient_roots_from, is_real_state_path, require_or_skip_in,
+        skip_verdict, state_env_for, symlinked_tempdir,
     };
     use crate::sandbox_backend::HostOs;
     use std::ffi::OsStr;
@@ -449,5 +509,51 @@ mod tests {
         assert!(state.state_home().starts_with(state.root()));
         assert!(state.config_home().starts_with(state.root()));
         assert!(state.thegn_dir().starts_with(state.root()));
+    }
+
+    #[test]
+    fn skip_verdict_covers_every_combination() {
+        let cases = [
+            (false, false, SkipVerdict::Unsupported),
+            (false, true, SkipVerdict::Run),
+            (true, false, SkipVerdict::MissingRequired),
+            (true, true, SkipVerdict::Run),
+        ];
+        for (required, available, expected) in cases {
+            assert_eq!(skip_verdict(required, available), expected);
+        }
+    }
+
+    #[test]
+    fn require_or_skip_in_reports_unsupported_and_skips_when_not_required() {
+        let mut output = Vec::new();
+        assert!(!require_or_skip_in(
+            false,
+            "fake-prereq",
+            false,
+            &mut output
+        ));
+        assert_eq!(output, b"UNSUPPORTED: fake-prereq\n");
+    }
+
+    #[test]
+    fn require_or_skip_in_runs_silently_when_available() {
+        for required in [false, true] {
+            let mut output = Vec::new();
+            assert!(require_or_skip_in(
+                required,
+                "fake-prereq",
+                true,
+                &mut output
+            ));
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "required security prerequisite missing: fake-prereq")]
+    fn require_or_skip_in_panics_when_required_and_missing() {
+        let mut output = Vec::new();
+        require_or_skip_in(true, "fake-prereq", false, &mut output);
     }
 }

@@ -2959,8 +2959,9 @@ fn enqueue_git_op(
         // nothing observable outlives a panic here — the panic becomes an error
         // result, which is what the UI is already built to render.
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let worktree_key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::gitmut::execute(op, &loc, override_gpg)
+            crate::gitmut::execute_at(op, &loc, &worktree_key, override_gpg)
         }))
         .unwrap_or_else(|_| {
             tracing::error!(
@@ -16125,6 +16126,11 @@ async fn event_loop<T: Terminal>(
                 wire.push(clear);
                 wire_renderer.invalidate();
                 preview_gfx.invalidate();
+                // A cleared screen loses the corner image too; replay its last draw
+                // after this frame's cells.
+                if corner.is_some() && corner_kitty {
+                    pending_corner_oob.screen_cleared();
+                }
                 full_repaint = false;
                 last_resync = std::time::Instant::now();
             } else if resync_now {

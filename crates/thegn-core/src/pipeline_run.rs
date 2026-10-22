@@ -24,11 +24,7 @@
 /// [`artifact_path`] for why — and an empty result falls back to `issue` so a
 /// path component never disappears.
 pub fn issue_key(issue_id: &str) -> String {
-    let raw = match issue_id.split_once(':') {
-        Some((_, after)) if !after.is_empty() => after,
-        // No colon, or nothing after it (`"linear:"`) — use the whole string.
-        _ => issue_id,
-    };
+    let raw = crate::pipeline_identity::split_issue_id(issue_id).1;
     sanitize(raw, "issue")
 }
 

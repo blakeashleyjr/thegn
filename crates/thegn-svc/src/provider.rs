@@ -1908,6 +1908,52 @@ pub enum ExecFrame {
 /// Matches the host daemon adapter's unknown-exit sentinel.
 pub const EXEC_EXIT_STATUS_UNKNOWN: i32 = 254;
 
+/// Bounded output collected from one-shot exec frames.
+pub(crate) struct ExecCollected {
+    pub(crate) code: Option<i32>,
+    pub(crate) output: Vec<u8>,
+    pub(crate) dropped: u64,
+}
+
+/// Drain one-shot exec frames while retaining only the last `cap` stdout bytes.
+pub(crate) async fn collect_exec_output(
+    frames: &mut tokio::sync::mpsc::Receiver<ExecFrame>,
+    cap: usize,
+) -> ExecCollected {
+    let mut output = std::collections::VecDeque::new();
+    let mut code = None;
+    let mut dropped = 0_u64;
+    while let Some(frame) = frames.recv().await {
+        match frame {
+            ExecFrame::Stdout(bytes) if cap == 0 => {
+                dropped = dropped.saturating_add(bytes.len() as u64);
+            }
+            ExecFrame::Stdout(bytes) if bytes.len() >= cap => {
+                dropped = dropped
+                    .saturating_add(output.len() as u64)
+                    .saturating_add((bytes.len() - cap) as u64);
+                output.clear();
+                output.extend(&bytes[bytes.len() - cap..]);
+            }
+            ExecFrame::Stdout(bytes) => {
+                let excess = output.len().saturating_add(bytes.len()).saturating_sub(cap);
+                output.drain(..excess);
+                dropped = dropped.saturating_add(excess as u64);
+                output.extend(bytes);
+            }
+            ExecFrame::Exit(exit_code) => {
+                code = Some(exit_code);
+                break;
+            }
+        }
+    }
+    ExecCollected {
+        code,
+        output: output.into_iter().collect(),
+        dropped,
+    }
+}
+
 /// One client→server control message for a native exec session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecControl {
@@ -2250,24 +2296,18 @@ impl SpritesProvider {
             cwd: cwd.map(str::to_string),
         };
         let mut sess = self.open_exec(id, &spec).await?;
-        let mut out: Vec<u8> = Vec::new();
-        let mut exit_code = None;
-        while let Some(frame) = sess.frames.recv().await {
-            match frame {
-                ExecFrame::Stdout(b) => out.extend_from_slice(&b),
-                ExecFrame::Exit(c) => {
-                    exit_code = Some(c);
-                    break;
-                }
-            }
-        }
+        let collected =
+            collect_exec_output(&mut sess.frames, crate::vps::ssh_shim::EXEC_OUTPUT_CAP).await;
         if let Err(error) = sess.control.send(ExecControl::Close).await {
             tracing::debug!(target: "thegn::provider", %error, "best-effort exec close failed");
         }
-        let Some(code) = exit_code else {
+        let Some(code) = collected.code else {
             return Err(anyhow!("exec stream ended without an exit status"));
         };
-        Ok((code, String::from_utf8_lossy(&out).into_owned()))
+        Ok((
+            code,
+            crate::vps::ssh_shim::render_capped_output(&collected.output, collected.dropped),
+        ))
     }
 
     /// Run the WSS handshake (bearer auth) and spawn the bridge task. `tty`
@@ -2986,21 +3026,19 @@ impl Provider {
                     cwd: cwd.map(str::to_string),
                 };
                 let mut session = home.open_exec(id, spec).await?;
-                let mut out = Vec::new();
-                let mut exit_code = None;
-                while let Some(frame) = session.frames.recv().await {
-                    match frame {
-                        ExecFrame::Stdout(b) => out.extend(b),
-                        ExecFrame::Exit(c) => {
-                            exit_code = Some(c);
-                            break;
-                        }
-                    }
-                }
-                let Some(code) = exit_code else {
+                let collected =
+                    collect_exec_output(&mut session.frames, crate::vps::ssh_shim::EXEC_OUTPUT_CAP)
+                        .await;
+                let Some(code) = collected.code else {
                     return Err(anyhow!("exec stream ended without an exit status"));
                 };
-                Ok((code, String::from_utf8_lossy(&out).into_owned()))
+                Ok((
+                    code,
+                    crate::vps::ssh_shim::render_capped_output(
+                        &collected.output,
+                        collected.dropped,
+                    ),
+                ))
             }
         }
     }
@@ -4774,5 +4812,53 @@ mod tests {
         );
         provider.download_dir("id", "/", temp.path()).await.unwrap();
         assert!(!temp.path().join("file").exists());
+    }
+
+    #[tokio::test]
+    async fn collect_exec_output_keeps_the_tail_and_counts_dropped_bytes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sender = tokio::spawn(async move {
+            tx.send(ExecFrame::Stdout(b"0123".to_vec())).await.unwrap();
+            tx.send(ExecFrame::Stdout(b"456789".to_vec()))
+                .await
+                .unwrap();
+            tx.send(ExecFrame::Exit(3)).await.unwrap();
+        });
+
+        let collected = collect_exec_output(&mut rx, 4).await;
+        sender.await.unwrap();
+        assert_eq!(collected.code, Some(3));
+        assert_eq!(collected.output, b"6789");
+        assert_eq!(collected.dropped, 6);
+        assert!(collected.output.len() <= 4);
+    }
+
+    #[tokio::test]
+    async fn collect_exec_output_without_exit_reports_none() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sender = tokio::spawn(async move {
+            tx.send(ExecFrame::Stdout(b"kept".to_vec())).await.unwrap();
+        });
+
+        let collected = collect_exec_output(&mut rx, 8).await;
+        sender.await.unwrap();
+        assert_eq!(collected.code, None);
+        assert_eq!(collected.output, b"kept");
+        assert_eq!(collected.dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn collect_exec_output_stops_at_exit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sender = tokio::spawn(async move {
+            tx.send(ExecFrame::Exit(0)).await.unwrap();
+            tx.send(ExecFrame::Stdout(b"late".to_vec())).await.unwrap();
+        });
+
+        let collected = collect_exec_output(&mut rx, 8).await;
+        sender.await.unwrap();
+        assert_eq!(collected.code, Some(0));
+        assert_eq!(collected.output, b"");
+        assert_eq!(rx.try_recv().unwrap(), ExecFrame::Stdout(b"late".to_vec()));
     }
 }

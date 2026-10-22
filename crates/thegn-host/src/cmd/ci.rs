@@ -6,8 +6,8 @@
 //! (HTTP/CLI), so each verb spins a current-thread tokio runtime and blocks on a
 //! single future — no concurrency, just a bridge from the sync clap dispatch.
 //!
-//! `runs` also warms the `ci_runs_cache` the native host paints from, exactly as
-//! `pr status` warms `pr_cache`.
+//! `runs --branch <current branch>` also warms the `ci_runs_cache` the native
+//! host paints from; other branches and the all-branch listing never overwrite it.
 
 use anyhow::{Result, bail};
 use thegn_core::ci::{self, CiJob, CiRun, CiState, RerunScope};
@@ -156,6 +156,10 @@ fn dur(start: Option<&str>, finish: Option<&str>) -> String {
     }
 }
 
+fn shared_cache_branch<'a>(requested: Option<&'a str>, current: Option<&str>) -> Option<&'a str> {
+    requested.filter(|branch| current == Some(*branch))
+}
+
 fn runs(
     cfg: &Config,
     worktree: Option<String>,
@@ -188,6 +192,12 @@ fn runs(
     };
     let limit = limit.unwrap_or(cfg.ci.max_runs.min(MAX_CI_RUNS));
     let branch_q = branch.as_deref();
+    let current_branch = if branch_q.is_some() {
+        crate::worktree_snapshot::current_branch(&wt)
+    } else {
+        None
+    };
+    let cache_branch = shared_cache_branch(branch_q, current_branch.as_deref());
     match client.runs(&loc, branch_q, limit) {
         Ok(result) => {
             let runs = result.runs;
@@ -205,13 +215,15 @@ fn runs(
                     }));
                 }
                 // Still warm the cache the native panel reads — same fetch.
-                if let Ok(db) = Db::open() {
+                if let Some(cache_branch) = cache_branch
+                    && let Ok(db) = Db::open()
+                {
                     let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
                         runs: runs.clone(),
                         discarded_rows: result.discarded_rows,
                     })
                     .unwrap_or_default();
-                    let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
                 return super::emit_json(&runs);
             }
@@ -221,6 +233,7 @@ fn runs(
             }
             // Warm the cache the native panel reads.
             if result.discarded_rows == 0
+                && let Some(cache_branch) = cache_branch
                 && let Ok(db) = Db::open()
             {
                 let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
@@ -228,7 +241,7 @@ fn runs(
                     discarded_rows: result.discarded_rows,
                 })
                 .unwrap_or_default();
-                let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             for r in &runs {
                 outln!(
@@ -631,6 +644,14 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runs_warms_the_shared_cache_only_for_the_current_branch() {
+        assert_eq!(shared_cache_branch(Some("b"), Some("a")), None);
+        assert_eq!(shared_cache_branch(Some("a"), Some("a")), Some("a"));
+        assert_eq!(shared_cache_branch(None, Some("a")), None);
+        assert_eq!(shared_cache_branch(Some("a"), None), None);
+    }
 
     #[test]
     fn detected_repository_names_are_inert_in_human_output() {

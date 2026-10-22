@@ -633,6 +633,7 @@ impl HostContract {
         }
 
         let mut accepted_ids = HashSet::new();
+        let mut accepted_surfaces: HashSet<String> = HashSet::new();
         for contrib in &manifest.contributions {
             let support = self.support_for(&contrib.extension_point);
             let reason = if !self
@@ -667,6 +668,13 @@ impl HostContract {
                 ))
             } else if accepted_ids.contains(contrib.id.as_str()) {
                 Some(format!("duplicate contribution id {}", contrib.id.as_str()))
+            } else if let Some(surface) = &contrib.surface
+                && accepted_surfaces.contains(surface.as_str())
+            {
+                Some(format!(
+                    "duplicate surface {} (already declared by another contribution of this plugin)",
+                    surface.as_str()
+                ))
             } else {
                 None
             };
@@ -678,6 +686,9 @@ impl HostContract {
                 });
             } else {
                 accepted_ids.insert(contrib.id.as_str().to_string());
+                if let Some(surface) = &contrib.surface {
+                    accepted_surfaces.insert(surface.as_str().to_string());
+                }
                 neg.accepted_contributions.push(contrib.clone());
             }
         }
@@ -3876,6 +3887,57 @@ timeout_secs = 5
                 .reason
                 .contains("duplicate contribution id support-test.row")
         );
+    }
+
+    #[test]
+    fn negotiation_rejects_a_later_contribution_on_a_duplicate_surface() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            vec![Capability::new("surface", "statusbar")],
+            PluginMode::Resident,
+        );
+        let mut duplicate = spec.manifest.contributions[0].clone();
+        duplicate.id = ContributionId::new("support-test.second");
+        duplicate.label = "Second".into();
+        spec.manifest.contributions.push(duplicate);
+
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert_eq!(negotiated.accepted_contributions.len(), 1);
+        assert_eq!(negotiated.rejected_contributions.len(), 1);
+        assert_eq!(
+            negotiated.rejected_contributions[0]
+                .contribution
+                .id
+                .as_str(),
+            "support-test.second"
+        );
+        assert!(
+            negotiated.rejected_contributions[0]
+                .reason
+                .contains("duplicate surface support-test.surface")
+        );
+    }
+
+    #[test]
+    fn negotiation_accepts_distinct_surfaces_and_surfaceless_contributions() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            vec![Capability::new("surface", "statusbar")],
+            PluginMode::Resident,
+        );
+        let mut distinct = spec.manifest.contributions[0].clone();
+        distinct.id = ContributionId::new("support-test.distinct");
+        distinct.surface = Some(SurfaceId::new("support-test.other-surface"));
+        let mut surfaceless = distinct.clone();
+        surfaceless.id = ContributionId::new("support-test.surfaceless");
+        surfaceless.surface = None;
+        spec.manifest.contributions.extend([distinct, surfaceless]);
+
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert_eq!(negotiated.accepted_contributions.len(), 3);
+        assert!(negotiated.rejected_contributions.is_empty());
     }
 
     #[test]

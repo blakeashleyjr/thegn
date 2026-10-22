@@ -338,6 +338,7 @@ fn admit_terminal(
         TerminalOutcome::Wrapped(class) => class,
     };
     crate::sandbox_admission::admit(sb, actual, "terminal", false, warnings)
+        .map(|_admission| ())
         .map_err(|error| error.context(format!("requested terminal sandbox `{requested}`")))
 }
 

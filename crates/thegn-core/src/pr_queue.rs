@@ -588,6 +588,17 @@ pub struct PrAgentRowSnapshot {
     pub claim_lease_until_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrAgentLeaseView {
+    pub generation: i64,
+    pub lease_until_ms: i64,
+    pub owner_hint: Option<String>,
+}
+
+pub fn pr_agent_lease_live(view: Option<&PrAgentLeaseView>, now_ms: i64) -> bool {
+    view.is_some_and(|view| view.lease_until_ms >= now_ms)
+}
+
 pub fn decide_pr_agent_admission(
     row: &PrAgentRowSnapshot,
     request: &PrAgentAdmit<'_>,
@@ -630,6 +641,31 @@ pub fn decide_pr_agent_admission(
         });
     }
     Ok(())
+}
+
+/// Attribute a post-run head only when local and forge observations agree and
+/// typed ancestry proves it descends from the admitted head. Unknown provenance
+/// is never attributed: teammate pushes, no push, local-only commits, force
+/// pushes, and unknown ancestry all return `None`.
+pub fn own_agent_head(
+    admitted: &str,
+    local_head: Option<&str>,
+    remote_head: Option<&str>,
+    local_descends: Option<bool>,
+) -> Option<String> {
+    let (Some(local), Some(remote)) = (local_head, remote_head) else {
+        return None;
+    };
+    let full_oid = |oid: &str| {
+        matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    (!admitted.is_empty()
+        && local == remote
+        && full_oid(local)
+        && full_oid(remote)
+        && local != admitted
+        && local_descends == Some(true))
+    .then(|| remote.to_owned())
 }
 
 impl fmt::Display for AgentAdmissionRefusal {
@@ -1659,6 +1695,33 @@ mod tests {
             },
         ] {
             assert!(attest_queue_row(&snapshot, Some(&changed)).is_err());
+        }
+    }
+
+    #[test]
+    fn own_agent_head_requires_a_pushed_descendant_equal_to_the_forge_head() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let c = "c".repeat(64);
+        assert_eq!(
+            own_agent_head(&a, Some(&b), Some(&b), Some(true)),
+            Some(b.clone())
+        );
+        assert_eq!(
+            own_agent_head(&a, Some(&c), Some(&c), Some(true)),
+            Some(c.clone())
+        );
+        for candidate in [
+            own_agent_head(&a, Some(&b), Some(&c), Some(true)),
+            own_agent_head(&a, Some(&b), None, Some(true)),
+            own_agent_head(&a, Some(&a), Some(&a), Some(true)),
+            own_agent_head(&a, Some(&b), Some(&b), Some(false)),
+            own_agent_head(&a, Some(&b), Some(&b), None),
+            own_agent_head(&a, Some("z".repeat(40).as_str()), Some(&b), Some(true)),
+            own_agent_head(&a, Some(&"b".repeat(39)), Some(&"b".repeat(39)), Some(true)),
+            own_agent_head("", Some(&b), Some(&b), Some(true)),
+        ] {
+            assert_eq!(candidate, None);
         }
     }
 }

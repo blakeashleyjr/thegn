@@ -75,6 +75,22 @@ impl PrAgentGuard {
         }))
     }
 
+    pub(crate) fn record_own_head(
+        &self,
+        db: &Db,
+        admitted: &str,
+        own: &str,
+    ) -> anyhow::Result<bool> {
+        if self.lost.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        db.record_pr_agent_head(&lease, admitted, own)
+    }
+
     pub(crate) fn attempt(&self) -> u32 {
         self.lease
             .lock()
@@ -113,6 +129,37 @@ impl PrAgentGuard {
 impl Drop for PrAgentGuard {
     fn drop(&mut self) {
         self.stop_heartbeat();
+    }
+}
+
+pub(crate) fn observe_own_head(
+    loc: &thegn_core::remote::GitLoc,
+    admitted: &str,
+    remote_head: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let thegn_core::remote::GitLoc::Local(path) = loc else {
+        return None;
+    };
+    let local = loc.git_out(&["rev-parse", "HEAD"])?;
+    if local == admitted {
+        return None;
+    }
+    let descends = thegn_core::util::git_is_ancestor(path, admitted, &local);
+    if descends != Some(true) {
+        return None;
+    }
+    thegn_core::pr_queue::own_agent_head(admitted, Some(&local), remote_head().as_deref(), descends)
+}
+
+pub(crate) fn own_head_record_warning(number: u64, result: anyhow::Result<bool>) -> Option<String> {
+    match result {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "PR #{number}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push"
+        )),
+        Err(error) => Some(format!(
+            "PR #{number}: the agent's push could not be recorded under its lease; the next refresh treats it as a foreign push ({error})"
+        )),
     }
 }
 
@@ -205,5 +252,148 @@ mod tests {
         };
         assert!(!old.finish(&db, None).unwrap());
         assert!(other.release_pr_agent(&new, None).unwrap());
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture runs isolated local git commands"
+    )]
+    #[test]
+    fn observe_own_head_attributes_only_a_pushed_descendant() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        git_fixture_repo(dir.path());
+        let run = |args: &[&str]| {
+            let status = thegn_core::util::git_cmd(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "git {args:?} failed in {}",
+                dir.path().display()
+            );
+        };
+        let head = || {
+            thegn_core::util::git_cmd(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout
+        };
+        let admitted = String::from_utf8(head()).unwrap().trim().to_owned();
+        std::fs::write(dir.path().join("tracked"), "agent change\n").unwrap();
+        run(&["add", "tracked"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-m", "agent"]);
+        let pushed = String::from_utf8(head()).unwrap().trim().to_owned();
+        let loc = thegn_core::remote::GitLoc::Local(dir.path().to_path_buf());
+        assert_eq!(
+            observe_own_head(&loc, &admitted, || Some(pushed.clone())),
+            Some(pushed.clone())
+        );
+        assert_eq!(
+            observe_own_head(&loc, &admitted, || Some(admitted.clone())),
+            None
+        );
+        assert_eq!(observe_own_head(&loc, &admitted, || None), None);
+        assert_eq!(
+            observe_own_head(&loc, &admitted, || Some("f".repeat(40))),
+            None
+        );
+        let remote = thegn_core::remote::GitLoc::from_db(
+            dir.path().to_str().unwrap(),
+            Some(r#"{"host":"example.invalid","port":22,"path":"/repo"}"#),
+        );
+        assert!(matches!(&remote, thegn_core::remote::GitLoc::Remote { .. }));
+        let called = Cell::new(false);
+        assert_eq!(
+            observe_own_head(&remote, &admitted, || {
+                called.set(true);
+                None
+            }),
+            None
+        );
+        assert!(!called.get());
+
+        run(&["reset", "--hard", &admitted]);
+        let called = Cell::new(false);
+        assert_eq!(
+            observe_own_head(&loc, &admitted, || {
+                called.set(true);
+                Some(pushed)
+            }),
+            None
+        );
+        assert!(!called.get());
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture runs isolated local git commands"
+    )]
+    fn git_fixture_repo(dir: &std::path::Path) {
+        thegn_core::fsperm::restrict_dir_to_owner(dir).unwrap();
+        let run = |args: &[&str]| {
+            let status = thegn_core::util::git_cmd(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&["-c", "commit.gpgsign=false", "init"]);
+        run(&["config", "user.email", "test@example.invalid"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("tracked"), "base\n").unwrap();
+        run(&["add", "tracked"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-m", "base"]);
+    }
+
+    #[test]
+    fn record_own_head_is_fenced_to_the_live_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("lease.db")).unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            1,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/1",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let request = PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-a",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = PrAgentGuard::admit(&db, &request).unwrap().unwrap();
+        assert!(guard.record_own_head(&db, "head-a", "head-b").unwrap());
+        let lease = guard
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(guard.finish(&db, None).unwrap());
+        assert!(!db.record_pr_agent_head(&lease, "head-b", "head-c").unwrap());
+    }
+
+    #[test]
+    fn own_head_database_error_becomes_a_driver_warning() {
+        let warning =
+            own_head_record_warning(7, Err(anyhow::anyhow!("injected database failure"))).unwrap();
+        assert!(warning.contains("could not be recorded under its lease"));
+        assert!(warning.contains("injected database failure"));
     }
 }

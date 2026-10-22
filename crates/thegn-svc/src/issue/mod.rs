@@ -29,10 +29,8 @@ use thegn_core::seam::{ErrorClass, SeamError};
 
 /// Four account reads bound network fan-out without serializing normal configs.
 /// `buffered` is load-bearing: unlike `buffer_unordered`, it preserves config
-/// order while reads overlap. The plugin issue backend's `list_issues` calls
-/// blocking `self.op`, so it yields no overlap and gets no benefit from this;
-/// Tokio's timeout also cannot pre-empt synchronous blocking on a current-thread
-/// runtime.
+/// order while reads overlap. Every backend, including the plugin bridge,
+/// awaits without blocking the executor, so reads overlap up to this bound.
 const MAX_CONCURRENT_ACCOUNTS: usize = 4;
 /// One total budget for an issue read across every configured account.
 const FANOUT_DEADLINE: Duration = Duration::from_secs(30);
@@ -2936,5 +2934,354 @@ mod tests {
                 "tracker returned a different issue than the ref"
             ))
         ));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    enum MatrixMode {
+        Rows(Vec<Issue>),
+        Fail,
+        Hang,
+    }
+
+    struct MatrixBackend {
+        mode: MatrixMode,
+        started: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    struct MatrixInFlightGuard(Arc<AtomicUsize>);
+
+    impl Drop for MatrixInFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl MatrixBackend {
+        fn new(
+            mode: MatrixMode,
+            started: Arc<AtomicUsize>,
+            in_flight: Arc<AtomicUsize>,
+            max_in_flight: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                mode,
+                started,
+                in_flight,
+                max_in_flight,
+            }
+        }
+
+        fn read(&self, limit: usize) -> BoxFuture<'_, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+                let _guard = MatrixInFlightGuard(Arc::clone(&self.in_flight));
+                match &self.mode {
+                    MatrixMode::Rows(rows) => {
+                        for _ in 0..3 {
+                            tokio::task::yield_now().await;
+                        }
+                        let mut rows = rows.clone();
+                        if limit > 0 {
+                            rows.truncate(limit);
+                        }
+                        Ok(rows)
+                    }
+                    MatrixMode::Fail => Err(IssueError::Api("matrix failure".into())),
+                    MatrixMode::Hang => {
+                        std::future::pending::<Result<Vec<Issue>, IssueError>>().await
+                    }
+                }
+            })
+        }
+    }
+
+    impl IssueBackend for MatrixBackend {
+        fn provider_id(&self) -> &str {
+            "linear"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            self.read(filter.limit)
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("not used".into())) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            self.read(limit)
+        }
+    }
+
+    fn matrix_router(
+        modes: Vec<(&str, MatrixMode)>,
+    ) -> (
+        IssueRouter,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let started = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        for (account, mode) in modes {
+            router
+                .push_backend(
+                    account.into(),
+                    Box::new(MatrixBackend::new(
+                        mode,
+                        Arc::clone(&started),
+                        Arc::clone(&in_flight),
+                        Arc::clone(&max_in_flight),
+                    )),
+                )
+                .unwrap();
+        }
+        (router, started, in_flight, max_in_flight)
+    }
+
+    fn matrix_rows(prefix: &str, count: usize) -> Vec<Issue> {
+        (0..count)
+            .map(|index| fixed_issue(&format!("{prefix}-{index}")))
+            .collect()
+    }
+
+    fn matrix_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    fn mixed_matrix_router() -> IssueRouter {
+        let (router, _, _, _) = matrix_router(vec![
+            ("fail", MatrixMode::Fail),
+            ("hang", MatrixMode::Hang),
+            ("big", MatrixMode::Rows(matrix_rows("big", 300))),
+            (
+                "small",
+                MatrixMode::Rows(vec![fixed_issue("big-0"), fixed_issue("small-1")]),
+            ),
+        ]);
+        router
+    }
+
+    fn issue_numbers(issues: &[Issue]) -> Vec<String> {
+        issues.iter().map(|issue| issue.number.clone()).collect()
+    }
+
+    #[test]
+    fn fanout_matrix_concurrency_never_exceeds_the_account_bound() {
+        let modes = ["a", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, account)| {
+                (
+                    account,
+                    MatrixMode::Rows(vec![fixed_issue(&format!("row-{index}"))]),
+                )
+            })
+            .collect();
+        let (router, _, _, max_in_flight) = matrix_router(modes);
+        let runtime = matrix_runtime();
+        let listed = runtime
+            .block_on(router.list_issues(&IssueFilter::default()))
+            .unwrap();
+        assert_eq!(listed.len(), 6);
+        let list_max = max_in_flight.load(Ordering::SeqCst);
+        assert!(list_max >= 2, "list did not overlap; max={list_max}");
+        assert!(
+            list_max <= MAX_CONCURRENT_ACCOUNTS,
+            "list exceeded bound; max={list_max}"
+        );
+
+        max_in_flight.store(0, Ordering::SeqCst);
+        let searched = runtime.block_on(router.search("q", 0)).unwrap();
+        assert_eq!(searched.len(), 6);
+        let search_max = max_in_flight.load(Ordering::SeqCst);
+        assert!(search_max >= 2, "search did not overlap; max={search_max}");
+        assert!(
+            search_max <= MAX_CONCURRENT_ACCOUNTS,
+            "search exceeded bound; max={search_max}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fanout_matrix_dropping_the_router_future_cancels_in_flight_accounts() {
+        let modes = ["a", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|account| (account, MatrixMode::Hang))
+            .collect();
+        let (router, started, in_flight, _) = matrix_router(modes);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.list_issues(&IssueFilter::default()),
+        )
+        .await;
+        assert!(result.is_err(), "outer timeout should cancel the fan-out");
+        assert_eq!(started.load(Ordering::SeqCst), MAX_CONCURRENT_ACCOUNTS);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fanout_matrix_mixed_accounts_keep_healthy_rows_with_limit_zero() {
+        let router = mixed_matrix_router();
+        let listed = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.list_issues(&IssueFilter {
+                limit: 0,
+                ..IssueFilter::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(listed.len(), 301);
+        assert_eq!(
+            issue_numbers(&listed[..4]),
+            [
+                "big-0".to_string(),
+                "big-1".to_string(),
+                "small-1".to_string(),
+                "big-2".to_string()
+            ]
+        );
+        assert_eq!(
+            issue_numbers(&listed)
+                .iter()
+                .filter(|number| *number == "big-0")
+                .count(),
+            1
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|issue| issue.account.as_deref() != Some("fail"))
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|issue| issue.account.as_deref() != Some("hang"))
+        );
+
+        let searched = tokio::time::timeout(Duration::from_secs(60), router.search("q", 0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(searched.len(), 301);
+        assert_eq!(
+            issue_numbers(&searched[..4]),
+            [
+                "big-0".to_string(),
+                "big-1".to_string(),
+                "small-1".to_string(),
+                "big-2".to_string()
+            ]
+        );
+        assert_eq!(
+            issue_numbers(&searched)
+                .iter()
+                .filter(|number| *number == "big-0")
+                .count(),
+            1
+        );
+        assert!(
+            searched
+                .iter()
+                .all(|issue| issue.account.as_deref() != Some("fail"))
+        );
+        assert!(
+            searched
+                .iter()
+                .all(|issue| issue.account.as_deref() != Some("hang"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fanout_matrix_exact_limit_across_mixed_accounts() {
+        let router = mixed_matrix_router();
+        let expected = [
+            "big-0".to_string(),
+            "big-1".to_string(),
+            "small-1".to_string(),
+            "big-2".to_string(),
+        ];
+        let listed = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.list_issues(&IssueFilter {
+                limit: 4,
+                ..IssueFilter::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(issue_numbers(&listed), expected);
+        let searched = tokio::time::timeout(Duration::from_secs(60), router.search("q", 4))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue_numbers(&searched), expected);
+    }
+
+    #[test]
+    fn fanout_matrix_partial_and_failing_accounts_do_not_hide_each_other() {
+        let (mut router, _, _, _) = matrix_router(vec![("fail", MatrixMode::Fail)]);
+        router
+            .push_backend("partial".into(), Box::new(PartialListBackend))
+            .unwrap();
+        router
+            .push_backend(
+                "healthy-rows".into(),
+                Box::new(MatrixBackend::new(
+                    MatrixMode::Rows(vec![fixed_issue("healthy-0"), fixed_issue("healthy-1")]),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                )),
+            )
+            .unwrap();
+        let runtime = matrix_runtime();
+        let listed = runtime
+            .block_on(router.list_issues(&IssueFilter::default()))
+            .unwrap();
+        let numbers = issue_numbers(&listed);
+        assert!(numbers.contains(&"healthy-0".to_string()));
+        assert!(numbers.contains(&"healthy-1".to_string()));
+        assert!(numbers.contains(&"1".to_string()));
+        assert_eq!(numbers.len(), 3);
     }
 }
