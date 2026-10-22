@@ -237,6 +237,48 @@ fn sink_scrubs_secrets_from_junk_lines() {
 }
 
 #[test]
+fn capped_stderr_redacts_a_secret_prefix_at_the_limit() {
+    let secret = "sentinel-secret-value";
+    let prefix_len = secret.len() / 2;
+    let prefix = &secret[..prefix_len];
+    let scrub = SecretScrub::for_account(
+        &[],
+        &BTreeMap::from([("K".to_string(), secret.to_string())]),
+    );
+    let stderr = format!("{}{}", "x".repeat(proc::MAX_STDERR - prefix.len()), prefix);
+    assert_eq!(stderr.len(), proc::MAX_STDERR);
+
+    let scrubbed = scrub.scrub_capped_stderr(&stderr);
+    assert!(scrubbed.ends_with("<redacted>"), "{scrubbed:?}");
+    assert!(!scrubbed.ends_with(prefix), "{scrubbed:?}");
+
+    let lossy_tail = format!(
+        "{}{}\u{fffd}",
+        "x".repeat(proc::MAX_STDERR - prefix.len() - '\u{fffd}'.len_utf8()),
+        prefix
+    );
+    assert_eq!(lossy_tail.len(), proc::MAX_STDERR);
+    assert!(
+        scrub
+            .scrub_capped_stderr(&lossy_tail)
+            .ends_with("<redacted>"),
+        "{lossy_tail:?}"
+    );
+}
+
+#[test]
+fn scrub_does_not_rewrite_inserted_redaction_markers() {
+    let scrub = SecretScrub::for_account(
+        &[],
+        &BTreeMap::from([
+            ("A".to_string(), "a".to_string()),
+            ("B".to_string(), "ed".to_string()),
+        ]),
+    );
+    assert_eq!(scrub.scrub("a"), "<redacted>");
+}
+
+#[test]
 fn sink_scrubs_secrets_from_plugin_log_messages() {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
@@ -278,9 +320,9 @@ fn sink_scrubs_secrets_from_plugin_log_messages() {
     let env = BTreeMap::from([("K".to_string(), "tok-sentinel-7f3a91".to_string())]);
     let argv = vec!["p".into(), "arg-sentinel-c41d".into()];
     let mut sink = sink_with(SecretScrub::for_account(&argv, &env));
-    assert!(sink.line(
-        r#"{"method":"log","params":{"level":"warn","message":"token is tok-sentinel-7f3a91"}}"#
-    ));
+    assert!(
+        sink.line(r#"{"method":"log","params":{"level":"tok-sentinel-7f3a91","message":"clean"}}"#)
+    );
     let records = captured.0.lock().unwrap();
     assert!(!records.is_empty());
     assert!(records.iter().all(|record| {
@@ -290,8 +332,13 @@ fn sink_scrubs_secrets_from_plugin_log_messages() {
     }));
     assert!(records.iter().any(|record| {
         record
-            .get("message")
+            .get("level")
             .is_some_and(|value| value.contains("<redacted>"))
+    }));
+    assert!(records.iter().any(|record| {
+        record
+            .get("message")
+            .is_some_and(|value| value.contains("clean"))
     }));
 }
 
