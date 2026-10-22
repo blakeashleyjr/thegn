@@ -3192,9 +3192,7 @@ pub fn ensure_remote_bridge(
     env_name: &str,
     binary: &Path,
 ) -> Option<crate::bridge_sup::ResidentBridge> {
-    let Some((provider, id, _)) = provider_sync_target(cfg, env_name) else {
-        return None;
-    };
+    let (provider, id, _) = provider_sync_target(cfg, env_name)?;
     let data = match std::fs::read(binary) {
         Ok(d) => d,
         Err(e) => {

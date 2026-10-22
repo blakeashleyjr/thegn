@@ -2051,15 +2051,15 @@ fn connect_worktree_bridge(
                     tunnels.push(t);
                 }
             }
-            rsup.start_all(
-                &tokio::runtime::Handle::current(),
-                &cfg,
-                &env,
-                &p.id,
+            rsup.start_all(crate::revtunnel::StartAllArgs {
+                handle: &tokio::runtime::Handle::current(),
+                cfg: &cfg,
+                env: &env,
+                sandbox_id: &p.id,
                 bridge,
-                &wt.to_string_lossy(),
+                worktree: &wt.to_string_lossy(),
                 tunnels,
-            );
+            });
         }
         // CLI-free control plane: for an exec_api provider (and exec != cli),
         // start the bridge over the native exec API instead of the vendor CLI.
@@ -2067,15 +2067,15 @@ fn connect_worktree_bridge(
             && let Some(provider) = crate::agent::native_bridge_provider(&cfg, &env)
             && let Some(bridge) = bridge.as_ref()
         {
-            sup.connect_native(
-                &loc,
-                &loc.path(),
-                &wt.to_string_lossy(),
+            sup.connect_native(crate::bridge_sup::NativeBridgeArgs {
+                loc: &loc,
+                workdir: &loc.path(),
+                host_path: &wt.to_string_lossy(),
                 provider,
-                p.id.clone(),
+                sandbox_id: p.id.clone(),
                 bridge,
-                tokio::runtime::Handle::current(),
-            );
+                rt: tokio::runtime::Handle::current(),
+            });
             return;
         }
         if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement, bridge.as_ref()) {
