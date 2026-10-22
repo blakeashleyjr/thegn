@@ -790,10 +790,7 @@ mod tests {
         git(path, &["config", "commit.gpgsign", "false"]);
         std::fs::write(path.join("base.txt"), "base\n").unwrap();
         git(path, &["add", "-A"]);
-        git(
-            path,
-            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
-        );
+        git(path, &["commit", "-q", "-m", "base"]);
     }
 
     fn local_candidate_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Db, Config) {
