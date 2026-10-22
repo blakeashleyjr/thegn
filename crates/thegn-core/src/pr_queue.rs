@@ -599,6 +599,21 @@ pub fn pr_agent_lease_live(view: Option<&PrAgentLeaseView>, now_ms: i64) -> bool
     view.is_some_and(|view| view.lease_until_ms >= now_ms)
 }
 
+pub fn pr_agent_lease_expired(view: Option<&PrAgentLeaseView>, now_ms: i64) -> bool {
+    view.is_some_and(|view| view.lease_until_ms < now_ms)
+}
+
+pub fn expired_pr_agent_detail(view: &PrAgentLeaseView) -> String {
+    let held = view
+        .owner_hint
+        .as_deref()
+        .map_or_else(String::new, |hint| format!(", held by {hint}"));
+    format!(
+        "the previous PR agent (lease generation {}{}) lost its lease without reporting an outcome; its attempt stays spent",
+        view.generation, held
+    )
+}
+
 pub fn decide_pr_agent_admission(
     row: &PrAgentRowSnapshot,
     request: &PrAgentAdmit<'_>,
@@ -1723,5 +1738,21 @@ mod tests {
         ] {
             assert_eq!(candidate, None);
         }
+    }
+
+    #[test]
+    fn expired_pr_agent_detail_names_the_generation_and_holder() {
+        let view = PrAgentLeaseView {
+            generation: 7,
+            lease_until_ms: 99,
+            owner_hint: Some("thegn pid 42".into()),
+        };
+        let detail = expired_pr_agent_detail(&view);
+        assert!(detail.contains("lease generation 7, held by thegn pid 42"));
+        assert!(detail.contains("lost its lease without reporting an outcome"));
+        assert!(detail.contains("attempt stays spent"));
+        assert!(!pr_agent_lease_expired(Some(&view), 99));
+        assert!(pr_agent_lease_expired(Some(&view), 100));
+        assert!(!pr_agent_lease_expired(None, 100));
     }
 }
