@@ -1037,5 +1037,176 @@ class StagedPayloadTests(unittest.TestCase):
         self.assertIn("deb payload bytes differ at usr/bin/thegn", stderr.getvalue())
 
 
+class ReleaseAssetManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.temp = Path(self.temporary.name)
+        self.tag = f"v{release.workspace_version()}"
+        self.asset = "thegn_0.1.0-amd64.deb"
+        self.content = b"package bytes"
+        self.digest = hashlib.sha256(self.content).hexdigest()
+
+    def write_manifest(self, assets: list[dict[str, object]], **overrides: object) -> Path:
+        value: dict[str, object] = {
+            "schema_version": 1,
+            "tag": self.tag,
+            "commit": "fixture-commit",
+            "tag_object": "fixture-tag-object",
+            "workflow_sha": "fixture-workflow-sha",
+            "run_id": "fixture-run-id",
+            "assets": assets,
+        }
+        value.update(overrides)
+        path = self.temp / "manifest.json"
+        path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
+
+    def valid_asset(self, **overrides: object) -> dict[str, object]:
+        value: dict[str, object] = {"name": self.asset, "sha256": self.digest, "size": len(self.content)}
+        value.update(overrides)
+        return value
+
+    def test_load_release_manifest_accepts_the_producer_shape(self) -> None:
+        path = self.write_manifest([self.valid_asset()])
+        self.assertEqual({self.asset: (self.digest, len(self.content))}, release.load_release_manifest(path, self.tag))
+        output = self.temp / "round-trip.json"
+        value = {
+            "schema_version": 1,
+            "tag": self.tag,
+            "commit": "fixture-commit",
+            "tag_object": "fixture-tag-object",
+            "workflow_sha": "fixture-workflow-sha",
+            "run_id": "fixture-run-id",
+            "assets": [self.valid_asset()],
+        }
+        release.write_release_manifest(output, self.temp / "assets", value)
+        self.assertEqual({self.asset: (self.digest, len(self.content))}, release.load_release_manifest(output, self.tag))
+
+    def test_load_release_manifest_rejects_wrong_tag(self) -> None:
+        path = self.write_manifest([self.valid_asset()], tag="v0.0.0")
+        with self.assertRaisesRegex(release.ReleaseError, "does not match requested tag"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_duplicate_asset_name(self) -> None:
+        path = self.write_manifest([self.valid_asset(), self.valid_asset()])
+        with self.assertRaisesRegex(release.ReleaseError, "duplicate asset name"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_duplicate_json_key(self) -> None:
+        path = self.write_manifest([self.valid_asset()])
+        content = path.read_text(encoding="utf-8")
+        tag_pair = f'  "tag": "{self.tag}",\n'
+        self.assertIn(tag_pair, content)
+        path.write_text(content.replace(tag_pair, tag_pair + tag_pair, 1), encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "duplicate JSON key"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_converts_json_recursion_error_to_release_error(self) -> None:
+        path = self.write_manifest([self.valid_asset()])
+        with mock.patch.object(release.json, "loads", side_effect=RecursionError("maximum recursion depth exceeded")):
+            with self.assertRaisesRegex(release.ReleaseError, "cannot read release manifest"):
+                release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_uppercase_or_short_sha256(self) -> None:
+        for digest in ("A" * 64, "a" * 63):
+            with self.subTest(digest=digest):
+                path = self.write_manifest([self.valid_asset(sha256=digest)])
+                with self.assertRaisesRegex(release.ReleaseError, "sha256"):
+                    release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_bool_or_negative_size(self) -> None:
+        for size in (True, -1):
+            with self.subTest(size=size):
+                path = self.write_manifest([self.valid_asset(size=size)])
+                with self.assertRaisesRegex(release.ReleaseError, "size"):
+                    release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_extra_top_level_key(self) -> None:
+        path = self.write_manifest([self.valid_asset()], extra="field")
+        with self.assertRaisesRegex(release.ReleaseError, "exactly the producer fields"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_extra_asset_key(self) -> None:
+        path = self.write_manifest([self.valid_asset(extra="field")])
+        with self.assertRaisesRegex(release.ReleaseError, "exactly name, sha256, and size"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_schema_version_2(self) -> None:
+        path = self.write_manifest([self.valid_asset()], schema_version=2)
+        with self.assertRaisesRegex(release.ReleaseError, "schema_version"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_a_symlinked_manifest(self) -> None:
+        target = self.write_manifest([self.valid_asset()])
+        linked = self.temp / "linked.json"
+        linked.symlink_to(target)
+        with self.assertRaisesRegex(release.ReleaseError, "regular file"):
+            release.load_release_manifest(linked, self.tag)
+
+    def test_load_release_manifest_rejects_an_oversized_manifest(self) -> None:
+        path = self.temp / "large.json"
+        path.write_bytes(b" " * (release.MAX_TRUSTED_DIGESTS_BYTES + 1))
+        with self.assertRaisesRegex(release.ReleaseError, "exceed"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_load_release_manifest_rejects_empty_assets(self) -> None:
+        path = self.write_manifest([])
+        with self.assertRaisesRegex(release.ReleaseError, "non-empty"):
+            release.load_release_manifest(path, self.tag)
+
+    def test_verify_release_asset_files_accepts_matching_bytes(self) -> None:
+        path = self.temp / self.asset
+        path.write_bytes(self.content)
+        self.assertEqual({self.asset: self.digest}, release.verify_release_asset_files({self.asset: (self.digest, len(self.content))}, [path]))
+
+    def test_verify_release_asset_files_rejects_digest_mismatch(self) -> None:
+        path = self.temp / self.asset
+        path.write_bytes(self.content)
+        with self.assertRaisesRegex(release.ReleaseError, "does not match"):
+            release.verify_release_asset_files({self.asset: ("0" * 64, len(self.content))}, [path])
+
+    def test_verify_release_asset_files_rejects_size_mismatch(self) -> None:
+        path = self.temp / self.asset
+        path.write_bytes(self.content)
+        with self.assertRaisesRegex(release.ReleaseError, "size does not match"):
+            release.verify_release_asset_files({self.asset: (self.digest, len(self.content) + 1)}, [path])
+
+    def test_verify_release_asset_files_rejects_unknown_name(self) -> None:
+        path = self.temp / self.asset
+        path.write_bytes(self.content)
+        with self.assertRaisesRegex(release.ReleaseError, "not in the release manifest"):
+            release.verify_release_asset_files({}, [path])
+
+    def test_verify_release_asset_files_rejects_a_symlinked_asset(self) -> None:
+        target = self.temp / "target"
+        target.write_bytes(self.content)
+        linked = self.temp / self.asset
+        linked.symlink_to(target)
+        with self.assertRaisesRegex(release.ReleaseError, "not a regular file"):
+            release.verify_release_asset_files({self.asset: (self.digest, len(self.content))}, [linked])
+
+    def test_verify_release_asset_files_rejects_a_name_given_twice(self) -> None:
+        path = self.temp / self.asset
+        path.write_bytes(self.content)
+        with self.assertRaisesRegex(release.ReleaseError, "more than once"):
+            release.verify_release_asset_files({self.asset: (self.digest, len(self.content))}, [path, path])
+
+    def test_verify_assets_cli_reports_each_match_and_exits_2_on_mismatch(self) -> None:
+        manifest = self.write_manifest([self.valid_asset()])
+        asset = self.temp / self.asset
+        asset.write_bytes(self.content)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            release.main(["verify-assets", "--tag", self.tag, "--release-manifest", str(manifest), "--asset", str(asset)])
+        self.assertIn(f"{self.asset}: matches the release manifest", stdout.getvalue())
+        asset.write_bytes(b"package byteX")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            release.main(["verify-assets", "--tag", self.tag, "--release-manifest", str(manifest), "--asset", str(asset)])
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("does not match the release manifest", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

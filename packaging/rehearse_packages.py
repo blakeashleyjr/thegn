@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -27,6 +28,14 @@ DEFAULT_STEP_TIMEOUT_S = 1800  # primary sets this from the per-step durations t
 OUTPUT_TAIL_BYTES = 4096
 DEB_NAME = re.compile(r"^thegn_(?P<version>[0-9A-Za-z.+~-]+)_amd64\.deb$")
 RPM_NAME = re.compile(r"^thegn-(?P<version>[0-9A-Za-z.+~-]+)-1\.x86_64\.rpm$")
+
+_RELEASE_PATH = Path(__file__).resolve().with_name("release.py")
+_RELEASE_SPEC = importlib.util.spec_from_file_location("thegn_release_for_rehearsal", _RELEASE_PATH)
+if _RELEASE_SPEC is None or _RELEASE_SPEC.loader is None:
+    raise RuntimeError(f"cannot load release verifier library at {_RELEASE_PATH}")
+release = importlib.util.module_from_spec(_RELEASE_SPEC)
+sys.modules[_RELEASE_SPEC.name] = release
+_RELEASE_SPEC.loader.exec_module(release)
 
 
 class RehearsalError(ValueError):
@@ -81,6 +90,7 @@ class Evidence:
     json_path: Path | None = None
     markdown_path: Path | None = None
     interrupted: bool = False
+    release_manifest_sha256: str | None = None
 
 
 def _validate_package(value: str | Path | None, kind: str) -> Package | None:
@@ -126,6 +136,52 @@ def _validated_packages(args: argparse.Namespace) -> tuple[list[Package], str]:
     if len(set(versions)) != 1:
         raise RehearsalError("deb and rpm packages must have the same version")
     return [p for p in (new_deb, previous_deb, new_rpm, previous_rpm) if p is not None], versions[0]
+
+
+def _verify_against_manifests(args: argparse.Namespace, packages: list[Package], version: str) -> str | None:
+    release_manifest = args.release_manifest
+    previous_manifest = args.previous_release_manifest
+    previous_packages = [package for package in packages if package.version != version]
+    if previous_manifest is not None and not previous_packages:
+        raise RehearsalError("--previous-release-manifest requires previous packages")
+    previous_versions = {package.version for package in previous_packages}
+    if len(previous_versions) > 1:
+        raise RehearsalError("previous deb and rpm packages must have the same version")
+    if release_manifest is None and not args.dry_run:
+        raise RehearsalError(
+            f"--release-manifest is required: download thegn-v{version}-manifest.json with the packages "
+            "and verify its attestation first"
+        )
+    try:
+        manifest_digest = None
+        if release_manifest is not None:
+            digest_before = release._hash_payload_file(release_manifest)
+            entries = release.load_release_manifest(release_manifest, f"v{version}")
+            manifest_digest = release._hash_payload_file(release_manifest)
+            if manifest_digest != digest_before:
+                raise RehearsalError(f"release manifest changed while being verified: {release_manifest}")
+            current_packages = [package for package in packages if package.version == version]
+            verified = release.verify_release_asset_files(entries, [package.path for package in current_packages])
+            for package in current_packages:
+                if verified[package.basename] != package.sha256:
+                    raise RehearsalError(f"{package.basename} changed after package validation")
+        if previous_packages:
+            if previous_manifest is None and not args.dry_run:
+                raise RehearsalError("--previous-release-manifest is required when rehearsing an upgrade leg")
+            if previous_manifest is not None:
+                previous_version = next(iter(previous_versions))
+                digest_before = release._hash_payload_file(previous_manifest)
+                entries = release.load_release_manifest(previous_manifest, f"v{previous_version}")
+                digest_after = release._hash_payload_file(previous_manifest)
+                if digest_after != digest_before:
+                    raise RehearsalError(f"previous release manifest changed while being verified: {previous_manifest}")
+                verified = release.verify_release_asset_files(entries, [package.path for package in previous_packages])
+                for package in previous_packages:
+                    if verified[package.basename] != package.sha256:
+                        raise RehearsalError(f"{package.basename} changed after package validation")
+        return manifest_digest
+    except release.ReleaseError as error:
+        raise RehearsalError(str(error)) from error
 
 
 def _exec_step(runtime: str, container: str, name: str, script: str) -> Step:
@@ -318,6 +374,7 @@ def _write_evidence(evidence: Evidence, directory: Path, version: str) -> None:
         "runtime": evidence.runtime,
         "runtime_version": evidence.runtime_version,
         "packages": [{"basename": package.basename, "version": package.version, "sha256": package.sha256} for package in evidence.packages],
+        "release_manifest_sha256": evidence.release_manifest_sha256,
         "passed": evidence.passed,
         "interrupted": evidence.interrupted,
         "legs": [{"image": leg.image, "image_digests": leg.image_digests, "passed": leg.passed, "steps": leg.results} for leg in evidence.legs],
@@ -344,6 +401,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpm")
     parser.add_argument("--previous-deb")
     parser.add_argument("--previous-rpm")
+    parser.add_argument("--release-manifest", type=Path)
+    parser.add_argument("--previous-release-manifest", type=Path)
     parser.add_argument("--runtime", choices=("podman", "docker"))
     parser.add_argument("--deb-image", action="append", dest="deb_images")
     parser.add_argument("--rpm-image", action="append", dest="rpm_images")
@@ -360,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     args.rpm_images = args.rpm_images or list(RPM_IMAGES)
     try:
         packages, version = _validated_packages(args)
+        manifest_digest = _verify_against_manifests(args, packages, version)
         if not args.dry_run and args.evidence_dir is None:
             raise RehearsalError("--evidence-dir is required unless --dry-run is used")
         if args.step_timeout <= 0:
@@ -379,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(shlex.join(command))
             return 0
         evidence = run_rehearsal(args, _run, packages)
+        evidence.release_manifest_sha256 = manifest_digest
         _write_evidence(evidence, args.evidence_dir, version)
         print(f"evidence: {evidence.json_path}")
         print(f"summary: {evidence.markdown_path}")
