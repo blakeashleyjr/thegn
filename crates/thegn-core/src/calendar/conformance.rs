@@ -133,6 +133,63 @@ pub const FIXTURES: &[Fixture] = &[
             Verdict::Reject,
         )),
     },
+    Fixture {
+        name: "extreme_all_day_span",
+        ics: Some((
+            "UID:matrix-extreme-span\r\nDTSTART;VALUE=DATE:00010101\r\nDTEND;VALUE=DATE:99991231\r\nSUMMARY:Span",
+            Verdict::Admit,
+        )),
+        json: Some((
+            r#"{"uid":"matrix-extreme-span","title":"Span","start":{"kind":"date","date":"0001-01-01"},"end":{"kind":"date","date":"9999-12-31"}}"#,
+            Verdict::Admit,
+        )),
+    },
+    Fixture {
+        name: "extreme_far_past_start",
+        ics: Some((
+            "UID:matrix-far-past\r\nDTSTART:00010101T000000Z\r\nDTEND:20260815T000000Z\r\nSUMMARY:Far past",
+            Verdict::Admit,
+        )),
+        json: Some((
+            r#"{"uid":"matrix-far-past","title":"Far past","start":{"kind":"instant","at":"0001-01-01T00:00:00Z"},"end":{"kind":"instant","at":"2026-08-15T00:00:00Z"}}"#,
+            Verdict::Admit,
+        )),
+    },
+    Fixture {
+        name: "extreme_far_future_end",
+        ics: Some((
+            "UID:matrix-far-future\r\nDTSTART:20260814T090000Z\r\nDTEND:99991231T235959Z\r\nSUMMARY:Far future",
+            Verdict::Admit,
+        )),
+        json: Some((
+            r#"{"uid":"matrix-far-future","title":"Far future","start":{"kind":"instant","at":"2026-08-14T09:00:00Z"},"end":{"kind":"instant","at":"9999-12-31T23:59:59Z"}}"#,
+            Verdict::Admit,
+        )),
+    },
+    Fixture {
+        name: "duration_past_max_date",
+        ics: Some((
+            "UID:matrix-duration-past-max\r\nDTSTART:20260814T090000Z\r\nDURATION:P15000000W\r\nSUMMARY:Past maximum date",
+            Verdict::Reject,
+        )),
+        json: None,
+    },
+    Fixture {
+        name: "duration_overflows_seconds",
+        ics: Some((
+            "UID:matrix-duration-overflow\r\nDTSTART:20260814T090000Z\r\nDURATION:PT9223372036854775807S\r\nSUMMARY:Overflow",
+            Verdict::Reject,
+        )),
+        json: None,
+    },
+    Fixture {
+        name: "duration_at_timedelta_limit",
+        ics: Some((
+            "UID:matrix-duration-limit\r\nDTSTART:20260814T090000Z\r\nDURATION:PT9223372036854775S\r\nSUMMARY:TimeDelta limit",
+            Verdict::Reject,
+        )),
+        json: None,
+    },
 ];
 
 /// Wrap VEVENT properties in a minimal complete calendar document.
