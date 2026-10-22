@@ -634,6 +634,22 @@ fn expired_recoverable(view: &thegn_core::store::MergeClaimView, now_ms: i64) ->
         && view.lease_until_ms.is_some_and(|until| until < now_ms)
 }
 
+/// Recovery uses a claimable status because core validates this field before
+/// its expired-claim admission branch, which ignores it. `queued` cannot admit
+/// an unclaimed in-progress row because that branch also checks the row status.
+const EXPIRED_RECOVERY_EXPECTED_STATUS: &str = "queued";
+
+/// Only statuses written by the drain under its claim are recoverable here:
+/// an expired claim on `folding` or `verifying` means its owner died mid-drain.
+/// `landed` is terminal, while `agent_running` may still have a live fixer
+/// writing the worktree, so both retain the existing fail-closed warning.
+fn recoverable_in_progress_status(status: &str) -> bool {
+    matches!(
+        thegn_core::attention::MqStatus::parse(status),
+        Some(thegn_core::attention::MqStatus::Folding | thegn_core::attention::MqStatus::Verifying)
+    )
+}
+
 fn drive_queue_with(
     cfg: &MergeQueueConfig,
     full: &Config,
@@ -732,7 +748,7 @@ fn drive_queue_with(
             ));
             continue;
         }
-        if !matches!(
+        let recovering: bool = if !matches!(
             fresh.status.as_str(),
             "queued"
                 | "deferred"
@@ -745,7 +761,12 @@ fn drive_queue_with(
             let active_claim = db.observe_merge_claim(&item.worktree);
             let now_ms = util::now_ms();
             let recoverable = match active_claim {
-                Ok(Some(view)) if expired_recoverable(&view, now_ms) => true,
+                Ok(Some(view))
+                    if recoverable_in_progress_status(&fresh.status)
+                        && expired_recoverable(&view, now_ms) =>
+                {
+                    true
+                }
                 Ok(Some(view))
                     if view.phase != "unclaimed"
                         && view.lease_until_ms.is_some_and(|until| until > now_ms) =>
@@ -776,17 +797,31 @@ fn drive_queue_with(
             if !recoverable {
                 continue;
             }
-        }
+            recoverable
+        } else {
+            false
+        };
+        let expected_status = if recovering {
+            EXPIRED_RECOVERY_EXPECTED_STATUS
+        } else {
+            fresh.status.as_str()
+        };
         let admission = if unregistered {
             claim::RowClaim::admit_unregistered(
                 db,
                 &item,
                 &claim_repo,
-                &fresh.status,
+                expected_status,
                 &fresh.target_branch,
             )
         } else {
-            claim::RowClaim::admit(db, &item, &claim_repo, &fresh.status, &fresh.target_branch)
+            claim::RowClaim::admit(
+                db,
+                &item,
+                &claim_repo,
+                expected_status,
+                &fresh.target_branch,
+            )
         };
         let claim = match admission {
             Ok(claim::Admission::Claimed(claim)) => Some(claim),
