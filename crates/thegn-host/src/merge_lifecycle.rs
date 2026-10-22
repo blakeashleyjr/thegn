@@ -188,7 +188,9 @@ pub(crate) fn apply(
     branch: &str,
     event: LifecycleEvent,
 ) {
-    apply_inner(cfg, db, repo_root, worktree, branch, event, None);
+    for note in apply_reported(cfg, db, repo_root, worktree, branch, event) {
+        note.emit();
+    }
 }
 
 /// An actual committed outcome, unlike an `UpToDate` or generic lifecycle event.
@@ -200,6 +202,51 @@ pub(crate) fn apply_landed(
     branch: &str,
     commit: &str,
 ) {
+    for note in apply_landed_reported(cfg, db, repo_root, worktree, branch, commit) {
+        note.emit();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LifecycleNote {
+    Info(String),
+    Warn(String),
+}
+
+impl LifecycleNote {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Info(text) | Self::Warn(text) => text,
+        }
+    }
+
+    pub(crate) fn emit(&self) {
+        match self {
+            Self::Info(text) => thegn_core::msg::info(text),
+            Self::Warn(text) => thegn_core::msg::warn(text),
+        }
+    }
+}
+
+pub(crate) fn apply_reported(
+    cfg: &MergeQueueConfig,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    event: LifecycleEvent,
+) -> Vec<LifecycleNote> {
+    apply_inner(cfg, db, repo_root, worktree, branch, event, None)
+}
+
+pub(crate) fn apply_landed_reported(
+    cfg: &MergeQueueConfig,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    commit: &str,
+) -> Vec<LifecycleNote> {
     apply_inner(
         cfg,
         db,
@@ -208,7 +255,7 @@ pub(crate) fn apply_landed(
         branch,
         LifecycleEvent::Landed,
         Some(commit),
-    );
+    )
 }
 
 fn apply_inner(
@@ -219,20 +266,21 @@ fn apply_inner(
     branch: &str,
     event: LifecycleEvent,
     commit: Option<&str>,
-) {
+) -> Vec<LifecycleNote> {
+    let mut notes = Vec::new();
     // The home / main checkout is a fixed anchor — never file or remove it.
     if Path::new(worktree) == repo_root {
-        return;
+        return notes;
     }
     let result = match decide(cfg, event) {
         LifecycleAction::Noop => Ok(()),
         LifecycleAction::FileInto(folder) => file_into(db, repo_root, worktree, branch, &folder),
         LifecycleAction::RemoveWorktree { delete_branch } => {
             let Some(commit) = commit else {
-                thegn_core::msg::warn(
-                    "merge cleanup: retained worktree; no committed outcome supplied",
-                );
-                return;
+                notes.push(LifecycleNote::Warn(
+                    "merge cleanup: retained worktree; no committed outcome supplied".into(),
+                ));
+                return notes;
             };
             let target = crate::integrate::resolve_target(cfg, repo_root);
             let outcome = remove_landed(
@@ -253,49 +301,56 @@ fn apply_inner(
                     ..
                 } => {
                     if discarded_build_state {
-                        thegn_core::msg::info(&format!(
+                        notes.push(LifecycleNote::Info(format!(
                             "merge cleanup: swept {} (discarded build state)",
                             crate::merge_sweep::safe_display(branch)
-                        ));
+                        )));
                     }
                     if discarded_tool_state {
-                        thegn_core::msg::info(&format!(
+                        notes.push(LifecycleNote::Info(format!(
                             "merge cleanup: swept {} (discarded seeded tool state)",
                             crate::merge_sweep::safe_display(branch)
-                        ));
+                        )));
                     }
                     if branch_held {
-                        thegn_core::msg::info(&format!(
+                        notes.push(LifecycleNote::Info(format!(
                             "merge cleanup: removed {}; branch kept for explicit cleanup",
                             crate::merge_sweep::safe_display(branch)
-                        ));
+                        )));
                     }
                     for error in bookkeeping_errors {
-                        thegn_core::msg::warn(&crate::merge_sweep::safe_display(&error));
+                        notes.push(LifecycleNote::Warn(crate::merge_sweep::safe_display(
+                            &error,
+                        )));
                     }
                 }
-                CleanupOutcome::KeptDirty => thegn_core::msg::warn(&format!(
+                CleanupOutcome::KeptDirty => notes.push(LifecycleNote::Warn(format!(
                     "merge cleanup: kept {} — edited since landing",
                     crate::merge_sweep::safe_display(branch)
-                )),
-                CleanupOutcome::KeptChanged => thegn_core::msg::warn(&format!(
+                ))),
+                CleanupOutcome::KeptChanged => notes.push(LifecycleNote::Warn(format!(
                     "merge cleanup: kept {} — changed during cleanup",
                     crate::merge_sweep::safe_display(branch)
-                )),
-                CleanupOutcome::Refused { class, reason } => thegn_core::msg::warn(&format!(
-                    "merge cleanup: kept {} — {}: {}",
-                    crate::merge_sweep::safe_display(branch),
-                    class.label(),
-                    crate::merge_sweep::safe_display(&reason)
-                )),
+                ))),
+                CleanupOutcome::Refused { class, reason } => {
+                    notes.push(LifecycleNote::Warn(format!(
+                        "merge cleanup: kept {} — {}: {}",
+                        crate::merge_sweep::safe_display(branch),
+                        class.label(),
+                        crate::merge_sweep::safe_display(&reason)
+                    )))
+                }
             }
             Ok(())
         }
         LifecycleAction::Unfile => unfile(cfg, db, repo_root, worktree),
     };
     if let Err(error) = result {
-        thegn_core::msg::warn(&format!("merge lifecycle bookkeeping unavailable: {error}"));
+        notes.push(LifecycleNote::Warn(format!(
+            "merge lifecycle bookkeeping unavailable: {error}"
+        )));
     }
+    notes
 }
 
 /// Checked execution for the one-shot `thegn land` path. Unlike the queue's
@@ -1942,5 +1997,76 @@ mod tests {
         assert_eq!(folder_of(&db, &root_s, &feat_s), None);
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn lifecycle_note_refused_cleanup_is_returned() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "note-refused");
+        let feat_s = feat.to_string_lossy().to_string();
+        db.enqueue_merge(&feat_s, "feat", "main").unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&feat)
+            .expect("test should own the first destroy claim");
+
+        let notes =
+            apply_landed_reported(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+
+        assert_eq!(
+            notes,
+            [LifecycleNote::Warn(
+                "merge cleanup: kept feat — cleanup already in progress: cleanup is already in progress"
+                    .into()
+            )]
+        );
+        drop(claim);
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(%error, "test cleanup");
+        }
+    }
+
+    #[test]
+    fn lifecycle_note_branch_held_removal_is_returned() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "note-branch-held");
+        let feat_s = feat.to_string_lossy().to_string();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+
+        let notes =
+            apply_landed_reported(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+
+        assert!(notes.contains(&LifecycleNote::Info(
+            "merge cleanup: removed feat; branch kept for explicit cleanup".into()
+        )));
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
+    }
+
+    #[test]
+    fn lifecycle_note_disabled_folders_returns_nothing() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "note-disabled");
+        let feat_s = feat.to_string_lossy().to_string();
+        let config = MergeQueueConfig {
+            organize_folders: false,
+            ..cfg(OnLanded::Remove)
+        };
+
+        let notes = apply_landed_reported(&config, &db, &root, &feat_s, "feat", "commit");
+
+        assert!(notes.is_empty());
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            tracing::debug!(%error, "test cleanup");
+        }
+        if let Err(error) = std::fs::remove_dir_all(&feat) {
+            tracing::debug!(%error, "test cleanup");
+        }
     }
 }
