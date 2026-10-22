@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use std::io::Write;
 use thegn_core::config::{Config, StructuralDiff};
 use thegn_core::diff_highlight;
+use thegn_core::git_run::{GitOutcome, GitTextError};
 use thegn_core::remote::GitLoc;
 
 use crate::cmd::resolve_worktree;
@@ -27,20 +28,7 @@ pub fn run(
     // Validate an explicitly-resolvable base ref up front. A typo'd `--base`
     // must NOT silently diff against HEAD: exit non-zero so scripts/CI notice
     // the mistake instead of trusting an empty/HEAD-only diff.
-    if !loc.git_ok(&[
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        &format!("{base}^{{commit}}"),
-    ]) {
-        bail!("unknown base ref '{base}'");
-    }
-    // Diff against the merge-base so we capture the branch's full delta; fall
-    // back to HEAD (uncommitted-only) if no merge-base exists (unrelated
-    // histories — the base is valid, there's just no common ancestor).
-    let target = loc
-        .git_out(&["merge-base", &base, "HEAD"])
-        .unwrap_or_else(|| "HEAD".to_string());
+    let target = resolve_target(&loc, &base)?;
 
     // Structural (difftastic) read-only view. The `--structural` flag forces it;
     // otherwise `[git] structural_diff` may select it. Never for `--stat` (a
@@ -115,6 +103,37 @@ pub fn run(
     Ok(())
 }
 
+fn resolve_target(loc: &GitLoc, base: &str) -> Result<String> {
+    match loc.git_text(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{base}^{{commit}}"),
+    ]) {
+        Ok(_) => {}
+        Err(error) if git_exit_is_one(&error) => bail!("unknown base ref '{base}'"),
+        Err(error) => bail!("could not check base ref '{base}': {error}"),
+    }
+
+    // No common ancestor (exit 1) means the base is valid but unrelated.
+    match loc.git_text(&["merge-base", base, "HEAD"]) {
+        Ok(oid) if !oid.is_empty() => Ok(oid),
+        Ok(_) => bail!("git merge-base returned an empty object id"),
+        Err(error) if git_exit_is_one(&error) => Ok("HEAD".to_string()),
+        Err(error) => bail!("git merge-base failed: {error}"),
+    }
+}
+
+fn git_exit_is_one(error: &GitTextError) -> bool {
+    matches!(
+        error,
+        GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail,
+        }) if stderr_tail.is_empty()
+    )
+}
+
 /// The repo's default branch (origin/HEAD, else main/master, else HEAD), probed
 /// through the location so it works for remote worktrees too. Shared with the
 /// in-app diff viewer (`diff_view`).
@@ -138,4 +157,153 @@ pub(crate) fn default_branch(loc: &GitLoc) -> String {
         }
     }
     "HEAD".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_target;
+    use std::path::Path;
+    use thegn_core::remote::GitLoc;
+
+    #[expect(clippy::disallowed_methods, reason = "test fixture git command")]
+    fn git(dir: &Path, args: &[&str]) {
+        let output = thegn_core::util::git_cmd(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+            ])
+            .args(args)
+            .output()
+            .expect("git fixture command starts");
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn committed_repo(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("fixture"), "first\n").expect("write fixture");
+        git(dir, &["add", "fixture"]);
+        git(dir, &["commit", "-q", "-m", "initial"]);
+    }
+
+    fn failing_provider(wrapper_dir: &Path, path: &Path, needle: &str, exit_code: u8) -> GitLoc {
+        let wrapper = wrapper_dir.join("git-wrapper.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "case \"$3\" in *'{needle}'*) echo 'ssh: connect to host fixture: Connection refused' >&2; exit {exit_code};; esac\nexec \"$@\"\n"
+            ),
+        )
+        .expect("write provider wrapper");
+        GitLoc::Provider {
+            control_prefix: vec!["sh".into(), wrapper.to_string_lossy().into_owned()],
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    #[test]
+    fn transport_failure_is_not_an_unknown_base() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path());
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let location = failing_provider(
+            wrapper_dir.path(),
+            repo.path(),
+            "rev-parse --verify --quiet",
+            255,
+        );
+
+        let result = resolve_target(&location, "main");
+        assert!(matches!(result, Err(error)
+            if !error.to_string().starts_with("unknown base ref")
+                && error.to_string().contains("Connection refused")));
+    }
+
+    #[test]
+    fn merge_base_failure_is_not_head() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path());
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "merge-base", 255);
+
+        let result = resolve_target(&location, "main");
+        assert!(matches!(result, Err(error)
+            if error.to_string().contains("merge-base")
+                && error.to_string().contains("Connection refused")));
+    }
+
+    #[test]
+    fn unrelated_history_falls_back_to_head() {
+        let repo = tempfile::tempdir().expect("local repo");
+        committed_repo(repo.path());
+        git(repo.path(), &["checkout", "--orphan", "other"]);
+        std::fs::write(repo.path().join("other"), "second\n").expect("write orphan file");
+        git(repo.path(), &["add", "other"]);
+        git(repo.path(), &["commit", "-q", "-m", "orphan"]);
+
+        let result = resolve_target(&GitLoc::Local(repo.path().to_path_buf()), "main")
+            .expect("unrelated valid base uses HEAD");
+        assert_eq!(result, "HEAD");
+    }
+
+    #[test]
+    fn base_probe_exit_one_with_stderr_is_not_unknown_base() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path());
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let location = failing_provider(
+            wrapper_dir.path(),
+            repo.path(),
+            "rev-parse --verify --quiet",
+            1,
+        );
+
+        let result = resolve_target(&location, "main");
+        assert!(matches!(result, Err(error)
+            if !error.to_string().starts_with("unknown base ref")
+                && error.to_string().contains("Connection refused")));
+    }
+
+    #[test]
+    fn merge_base_exit_one_with_stderr_is_not_head() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path());
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "merge-base", 1);
+
+        let result = resolve_target(&location, "main");
+        assert!(matches!(result, Err(error)
+            if error.to_string().contains("merge-base")
+                && error.to_string().contains("Connection refused")));
+    }
+
+    #[test]
+    fn unknown_base_is_reported() {
+        let repo = tempfile::tempdir().expect("local repo");
+        committed_repo(repo.path());
+
+        let result = resolve_target(&GitLoc::Local(repo.path().to_path_buf()), "nope");
+        assert!(matches!(result, Err(error)
+            if error.to_string() == "unknown base ref 'nope'"));
+    }
 }
