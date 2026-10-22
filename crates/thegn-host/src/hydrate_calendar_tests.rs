@@ -1664,6 +1664,7 @@ fn calendar_token_resolution_audits_each_account_without_values() {
     let file_sentinel = "cal-file-sentinel-b72c";
     std::fs::write(&token_path, file_sentinel).unwrap();
     let literal_sentinel = "cal-lit-sentinel-a41f";
+    let literal_ref = format!("literal:{}", thegn_core::redact::PLACEHOLDER);
     let cfg = calendar_audit_config(literal_sentinel, &format!("file:{}", token_path.display()));
     let (capture, subscriber) = calendar_audit_subscriber();
 
@@ -1689,10 +1690,10 @@ fn calendar_token_resolution_audits_each_account_without_values() {
         .collect();
     assert_eq!(lines.len(), 2, "capture: {log}");
     assert_eq!(alpha.len(), 1, "capture: {log}");
-    assert!(alpha[0].contains("backend=literal"), "capture: {log}");
-    assert!(alpha[0].contains("literal:<redacted>"), "capture: {log}");
+    assert!(alpha[0].contains("backend=\"literal\""), "capture: {log}");
+    assert!(alpha[0].contains(&literal_ref), "capture: {log}");
     assert_eq!(beta.len(), 1, "capture: {log}");
-    assert!(beta[0].contains("backend=file"), "capture: {log}");
+    assert!(beta[0].contains("backend=\"file\""), "capture: {log}");
     assert!(
         beta[0].contains(&format!("file:{}", token_path.display())),
         "capture: {log}"
@@ -1710,6 +1711,7 @@ fn calendar_token_reload_rebinds_audit_events_to_their_own_accounts() {
     let file_sentinel = "cal-file-sentinel-b72c";
     std::fs::write(&token_path, file_sentinel).unwrap();
     let literal_sentinel = "cal-lit-sentinel-a41f";
+    let literal_ref = format!("literal:{}", thegn_core::redact::PLACEHOLDER);
     let initial =
         calendar_audit_config(literal_sentinel, &format!("file:{}", token_path.display()));
     let reloaded =
@@ -1750,17 +1752,17 @@ fn calendar_token_reload_rebinds_audit_events_to_their_own_accounts() {
     let evidence = format!("initial capture: {first_log}; reloaded capture: {log}");
     assert_eq!(lines.len(), 2, "{evidence}");
     assert_eq!(alpha.len(), 1, "{evidence}");
-    assert!(alpha[0].contains("backend=file"), "{evidence}");
+    assert!(alpha[0].contains("backend=\"file\""), "{evidence}");
     assert!(
         alpha[0].contains(&format!("file:{}", token_path.display())),
         "{evidence}"
     );
     assert_eq!(beta.len(), 1, "{evidence}");
-    assert!(beta[0].contains("backend=literal"), "{evidence}");
-    assert!(beta[0].contains("literal:<redacted>"), "{evidence}");
+    assert!(beta[0].contains("backend=\"literal\""), "{evidence}");
+    assert!(beta[0].contains(&literal_ref), "{evidence}");
     assert!(
         lines.iter().all(|line| {
-            !(line.contains("consumer=calendar:alpha") && line.contains("literal:<redacted>"))
+            !(line.contains("consumer=calendar:alpha") && line.contains(&literal_ref))
                 && !(line.contains("consumer=calendar:beta")
                     && line.contains(&format!("file:{}", token_path.display())))
         }),
