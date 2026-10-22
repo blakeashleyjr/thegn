@@ -1218,8 +1218,12 @@ pub(crate) fn status(
     let path = worktree.to_string_lossy();
     let loc = GitLoc::from_db(
         &path,
-        db.and_then(|db| thegn_core::store::WorkspaceStore::location_for(db, &path).ok().flatten())
-            .as_deref(),
+        db.and_then(|db| {
+            thegn_core::store::WorkspaceStore::location_for(db, &path)
+                .ok()
+                .flatten()
+        })
+        .as_deref(),
     );
     if loc.is_remote() {
         let Some(cached) = read_remote_cache(&worktree.to_string_lossy(), &loc) else {
