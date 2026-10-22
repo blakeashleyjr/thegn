@@ -277,7 +277,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let out_a = temp.path().join("child-a.out");
         let out_b = temp.path().join("child-b.out");
-        let mut child_a = Command::new(&exe)
+        let child_a = Command::new(&exe)
             .args([
                 "--exact",
                 "handlers::calendar::tests::raise_reminder_on_delivers_once_across_processes",
@@ -289,7 +289,7 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut child_b = match Command::new(exe)
+        let child_b = match Command::new(exe)
             .args([
                 "--exact",
                 "handlers::calendar::tests::raise_reminder_on_delivers_once_across_processes",
