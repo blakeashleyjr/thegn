@@ -551,6 +551,27 @@ pub const CATALOG: &[Slot] = &[
         "row",
         SourceKind::Reserved(Reserved::DispatchRow),
     ),
+    // --all pages the roster (THE-259 slice f).
+    slot(
+        "supervise plan",
+        "limit",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "supervise plan",
+        "before",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot(
+        "supervise status",
+        "limit",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "supervise status",
+        "before",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
     // `--chunk <path>` records the chunk file a row dispatches under (THE-86
     // chunk 3) — a path under the worktree, like `parent_artifact`, so the
     // engine's filesystem completion is the intended behavior.
