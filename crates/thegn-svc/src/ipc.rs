@@ -374,6 +374,10 @@ fn bind_lock(sock: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(unix)]
+/// Upper bound for control socket lock contention. The host's
+/// `SCOPE_PROBE_TIMEOUT` planner budget is 5 s; honest contention is measured
+/// in milliseconds, so this bound leaves room for startup work without an
+/// unbounded wait.
 const BIND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(unix)]
@@ -912,6 +916,20 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn open_lock_holder(path: &Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(unix)]
     fn private_tempdir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1389,20 +1407,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bind_lock_fails_closed_while_another_holder_keeps_it() {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
         let dir = private_tempdir();
         prepare_control_directory(dir.path(), false).unwrap();
         let sock = dir.path().join("held.sock");
         assert_socket_path_fits(&sock);
-        let holder = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(sock.with_extension("sock.lock"))
-            .unwrap();
+        let holder = open_lock_holder(&sock.with_extension("sock.lock"));
         holder.lock().unwrap();
 
         let started = std::time::Instant::now();
@@ -1416,20 +1425,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bind_lock_acquires_once_the_holder_releases() {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
         let dir = private_tempdir();
         prepare_control_directory(dir.path(), false).unwrap();
         let sock = dir.path().join("held.sock");
         assert_socket_path_fits(&sock);
-        let holder = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(sock.with_extension("sock.lock"))
-            .unwrap();
+        let holder = open_lock_holder(&sock.with_extension("sock.lock"));
         holder.lock().unwrap();
         drop(holder);
 
@@ -1439,34 +1439,38 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bind_lock_waits_out_a_brief_holder() {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
         let dir = private_tempdir();
         prepare_control_directory(dir.path(), false).unwrap();
         let sock = dir.path().join("held.sock");
         assert_socket_path_fits(&sock);
         let lock_path = sock.with_extension("sock.lock");
         let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let holder_thread = std::thread::spawn(move || {
-            let holder = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(lock_path)
-                .unwrap();
+            let holder = open_lock_holder(&lock_path);
             holder.lock().unwrap();
             locked_sender.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            release_receiver.recv().unwrap();
             drop(holder);
         });
         locked_receiver.recv().unwrap();
 
-        let started = std::time::Instant::now();
-        assert!(bind_lock_with_wait(&sock, std::time::Duration::from_secs(2)).is_ok());
-        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        let (binding_sender, binding_receiver) = std::sync::mpsc::channel();
+        let binding_sock = sock.clone();
+        let binder_thread = std::thread::spawn(move || {
+            binding_sender.send(()).unwrap();
+            bind_lock_with_wait(&binding_sock, std::time::Duration::from_secs(2))
+        });
+        binding_receiver.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let binder_waited_for_holder = !binder_thread.is_finished();
+        release_sender.send(()).unwrap();
+        assert!(binder_thread.join().unwrap().is_ok());
         holder_thread.join().unwrap();
+        assert!(
+            binder_waited_for_holder,
+            "binder finished while the lock was held"
+        );
     }
 
     #[cfg(unix)]
