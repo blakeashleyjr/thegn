@@ -5,11 +5,10 @@
 //! headers do not, so the live `ui.cursor` walks only actionable rows and the
 //! Enter handler can index the same `work::sort_rows` order.
 
+use crate::seg::{Line, seg, sp};
 use thegn_core::pipeline_report::{display_cell, display_clip};
 use thegn_core::work::{WorkGroup, WorkKind, WorkRow};
 use unicode_width::UnicodeWidthStr;
-
-use crate::seg::{Line, seg, sp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EnterTarget {
@@ -142,21 +141,12 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let link_mark = if row.is_linked() { "◈ " } else { "" };
         let repo = display_cell(&short_repo(&row.repo));
         let number = display_cell(&row.number);
-        let account_tag = if row
-            .issue_id
-            .as_deref()
-            .is_some_and(|id| shared.contains(id))
-        {
-            format!(
-                " ({})",
-                row.account
-                    .as_deref()
-                    .map(|account| display_clip(account, 16))
-                    .unwrap_or_else(|| "?".to_string())
-            )
-        } else {
-            String::new()
-        };
+        let account_tag = super::issues::account_tag(
+            row.issue_id
+                .as_deref()
+                .is_some_and(|id| shared.contains(id)),
+            row.account.as_deref(),
+        );
         let repo_part = if row.repo.is_empty() {
             String::new()
         } else {
@@ -370,15 +360,22 @@ mod spec {
             width: crate::layout::PanelWidth::Half,
             ..Default::default()
         };
-        let rendered = format!(
-            "{:?}",
-            content(&SectionCtx {
-                model: &model,
-                ui: &ui,
-                cols: 75,
-                rows: 24,
+        let rows = content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 75,
+            rows: 24,
+        });
+        let rendered = rows
+            .iter()
+            .filter_map(|row| match &row.line {
+                Line::Segs(segs) => {
+                    Some(segs.iter().map(|seg| seg.text.as_str()).collect::<String>())
+                }
+                _ => None,
             })
-        );
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("(work)"), "{rendered}");
         assert!(rendered.contains("(home)"), "{rendered}");
 
@@ -389,15 +386,22 @@ mod spec {
             },
             ..Default::default()
         };
-        let rendered = format!(
-            "{:?}",
-            content(&SectionCtx {
-                model: &single,
-                ui: &ui,
-                cols: 75,
-                rows: 24,
+        let rows = content(&SectionCtx {
+            model: &single,
+            ui: &ui,
+            cols: 75,
+            rows: 24,
+        });
+        let rendered = rows
+            .iter()
+            .filter_map(|row| match &row.line {
+                Line::Segs(segs) => {
+                    Some(segs.iter().map(|seg| seg.text.as_str()).collect::<String>())
+                }
+                _ => None,
             })
-        );
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!rendered.contains("(work)"), "{rendered}");
     }
 
