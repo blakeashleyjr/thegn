@@ -528,6 +528,8 @@ warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable). The
 target update runs in the background: `warm pool: updating target…` appears
 while it is queued, followed by the result, and raising the target stops at
 eight spares for the workspace's environment.
+If the spare ledger cannot be read, reconciliation warns and makes no pool
+changes rather than treating the pool as empty.
 Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
 A repo's `env =` setting is only a hint; if that environment would weaken
@@ -595,6 +597,9 @@ VPS and Fly ledger records carry a credential-free fingerprint of the provider
 kind, API authority, and configured (or default) token variable name, never the
 token itself. A name recorded under another account is refused; the VPS reaper
 quarantines that record and does not delete it.
+The Fly reaper also quarantines records for another account without revoking or
+destroying them. If it cannot determine the current account, it quarantines
+every record before making provider calls.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or

@@ -155,6 +155,10 @@ Share tunnels (`thegn_svc::share`) are not a seam: `ShareProvider` is a sealed
 internal dispatcher over the built-in bore/frp/tailscale/iroh backends, and
 share-provider plugins are intentionally unsupported (THE-329).
 
+VPN sidecars (`thegn_svc::vpn`) are likewise not a seam: `VpnProvider` is an
+internal dispatcher over the built-in tailscale, headscale, WireGuard, OpenVPN,
+NetBird, ZeroTier and custom providers. VPN-provider plugins are unsupported.
+
 **Gate:** `test/forge-leak-ratchet.txt` (4 impl files), `kind_coverage` per
 seam, `test/async-trait-ratchet.txt` (**empty and stays empty** — clippy's
 `-D warnings` catches a bare `async fn` in a public trait, and the allow
