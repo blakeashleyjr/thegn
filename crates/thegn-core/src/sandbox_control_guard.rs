@@ -184,7 +184,7 @@ fn normalize(mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlExposure, MaskPlan, exposure, normalize, plan};
+    use super::{ControlExposure, MaskPlan, exposure, in_sandbox_paths, normalize, plan};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
