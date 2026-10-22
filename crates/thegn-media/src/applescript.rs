@@ -28,7 +28,7 @@ impl AppleScript {
 
     /// Read one app; `Ok(None)` when it isn't running or is stopped.
     async fn read_one(&self, app: &str) -> Result<Option<String>, MediaError> {
-        let line = osascript(&read_script(app)).await?;
+        let line = osascript(&crate::applescript_parse::read_script(app)).await?;
         Ok(if line.is_empty() { None } else { Some(line) })
     }
 
@@ -58,6 +58,10 @@ impl AppleScript {
         } else {
             music_body
         };
+        self.control_app(app, body).await
+    }
+
+    async fn control_app(&self, app: &str, body: &str) -> Result<(), MediaError> {
         osascript(&format!(
             "if application \"{app}\" is running then\ntell application \"{app}\"\n{body}\nend tell\nend if"
         ))
@@ -103,17 +107,9 @@ impl MediaBackend for AppleScript {
     }
     fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
-            // Spotify only has on/off; Music has off/one/all.
-            let spotify = match mode {
-                LoopMode::None => "set repeating to false",
-                _ => "set repeating to true",
-            };
-            let music = match mode {
-                LoopMode::None => "set song repeat to off",
-                LoopMode::Track => "set song repeat to one",
-                LoopMode::Playlist => "set song repeat to all",
-            };
-            self.control(spotify, music).await
+            let (app, _) = self.active_app().await?.ok_or(MediaError::NoPlayer)?;
+            let body = crate::applescript_parse::loop_body(app, mode)?;
+            self.control_app(app, body).await
         })
     }
     fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
@@ -205,37 +201,4 @@ async fn osascript(script: &str) -> Result<String, MediaError> {
             String::from_utf8_lossy(&out.stderr).trim().to_string(),
         ))
     }
-}
-
-/// The read snippet for one app: emits the unit-separated line consumed by
-/// [`crate::applescript_parse`], or `""` when not running / stopped.
-fn read_script(app: &str) -> String {
-    // Spotify reports `duration` in ms and uses `shuffling`/`repeating`; Music
-    // reports `duration` in seconds and uses `shuffle enabled`/`song repeat`.
-    let (duration_expr, shuffle_expr, repeat_expr) = if app == "Spotify" {
-        (
-            "((duration of t) / 1000)",
-            "(shuffling as text)",
-            "(repeating as text)",
-        )
-    } else {
-        (
-            "(duration of t)",
-            "(shuffle enabled as text)",
-            "(song repeat as text)",
-        )
-    };
-    format!(
-        "if application \"{app}\" is running then\n\
-         tell application \"{app}\"\n\
-         if player state is stopped then\n\
-         return \"\"\n\
-         end if\n\
-         set sep to (ASCII character 31)\n\
-         set t to current track\n\
-         return \"{app}\" & sep & (player state as text) & sep & (name of t) & sep & (artist of t) & sep & (album of t) & sep & {duration_expr} & sep & (player position) & sep & {shuffle_expr} & sep & {repeat_expr} & sep & (sound volume as text)\n\
-         end tell\n\
-         end if\n\
-         return \"\""
-    )
 }
