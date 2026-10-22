@@ -2221,6 +2221,7 @@ mod tests {
                 ip: "192.0.2.1".into(),
                 created_at: 1,
                 owner: String::new(),
+                account: String::new(),
             },
         )
         .unwrap();
