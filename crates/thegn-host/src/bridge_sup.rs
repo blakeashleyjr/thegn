@@ -289,9 +289,31 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
     None
 }
 
+fn ssh_self_bridge(control_prefix: &[String]) -> bool {
+    control_prefix.len() == 4
+        && matches!(control_prefix[1].as_str(), "vps-ssh" | "machine0-ssh")
+        && control_prefix[3] == "--"
+}
+
+fn provider_bridge_argv(control_prefix: &[String], bridge: &ResidentBridge) -> Option<Vec<String>> {
+    if control_prefix.is_empty() {
+        return None;
+    }
+    let verified = verified_exec_argv(bridge, &["bridge".to_string()]);
+    let mut argv = control_prefix.to_vec();
+    if ssh_self_bridge(control_prefix) {
+        argv.push(thegn_core::util::sh_join(&verified));
+    } else {
+        argv.extend(verified);
+    }
+    Some(argv)
+}
+
 /// Build the transport command that runs `thegn bridge` *inside* the env for a
-/// placement, or `None` when no bridge applies (local / k8s-for-now). The agent
-/// reads framed requests on stdin and writes responses/notifications on stdout.
+/// placement, or `None` when no bridge applies (local / k8s-for-now). Provider
+/// launches re-hash the resident bridge before exec; ssh self-bridges receive
+/// that wrapper as one shell-quoted word. The agent reads framed requests on
+/// stdin and writes responses/notifications on stdout.
 pub fn bridge_command(placement: &Placement, bridge: Option<&ResidentBridge>) -> Option<Command> {
     match placement {
         Placement::Ssh(t) => {
@@ -302,12 +324,8 @@ pub fn bridge_command(placement: &Placement, bridge: Option<&ResidentBridge>) ->
             Some(argv_command(&argv))
         }
         Placement::Provider(p) => {
-            // Vendor CLI quoting is provider-specific; its launch re-check is deferred.
             let bridge = bridge?;
-            let mut argv = p.control_prefix.clone();
-            argv.push(bridge.path().to_string());
-            argv.push("bridge".to_string());
-            Some(argv_command(&argv))
+            provider_bridge_argv(&p.control_prefix, bridge).map(|argv| argv_command(&argv))
         }
         Placement::Local | Placement::K8s(_) => None,
     }
@@ -741,6 +759,141 @@ mod tests {
             .collect();
         assert!(args.iter().any(|arg| arg == bridge.path()));
         assert_eq!(args.last().map(String::as_str), Some("bridge"));
+    }
+
+    #[test]
+    fn provider_bridge_argv_wraps_the_helper_in_the_digest_check() {
+        let prefix = vec![
+            "sprite".to_string(),
+            "exec".to_string(),
+            "-s".to_string(),
+            "s1".to_string(),
+            "--".to_string(),
+        ];
+        let bridge = resident_bridge_for(b"provider bridge");
+        let mut expected = prefix.clone();
+        expected.extend(verified_exec_argv(&bridge, &["bridge".to_string()]));
+
+        assert_eq!(provider_bridge_argv(&prefix, &bridge), Some(expected));
+    }
+
+    #[test]
+    fn provider_bridge_argv_quotes_one_word_for_ssh_self_bridges() {
+        let bridge = resident_bridge_for(b"provider bridge");
+        let verified = verified_exec_argv(&bridge, &["bridge".to_string()]);
+        for kind in ["vps-ssh", "machine0-ssh"] {
+            let prefix = vec![
+                "/opt/thegn".to_string(),
+                kind.to_string(),
+                "tg-a-1".to_string(),
+                "--".to_string(),
+            ];
+            let argv = provider_bridge_argv(&prefix, &bridge).expect("ssh bridge argv");
+
+            assert_eq!(argv.len(), 5);
+            assert_eq!(&argv[..4], prefix.as_slice());
+            assert_eq!(argv.last(), Some(&thegn_core::util::sh_join(&verified)));
+        }
+    }
+
+    #[test]
+    fn provider_bridge_command_refuses_an_empty_control_prefix() {
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "sprites".into(),
+            id: "s1".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![],
+            up_command: vec![],
+            down_command: vec![],
+        });
+        let bridge = resident_bridge_for(b"provider bridge");
+
+        assert!(bridge_command(&provider, Some(&bridge)).is_none());
+    }
+
+    #[test]
+    fn provider_bridge_command_runs_the_digest_wrapper() {
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "sprites".into(),
+            id: "s1".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![
+                "sprite".into(),
+                "exec".into(),
+                "-s".into(),
+                "s1".into(),
+                "--".into(),
+            ],
+            up_command: vec![],
+            down_command: vec![],
+        });
+        let bridge = resident_bridge_for(b"provider bridge");
+        let command = bridge_command(&provider, Some(&bridge)).expect("provider command");
+        let program = command.get_program().to_string_lossy();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(program, "sprite");
+        assert!(args.iter().any(|arg| arg == "-c"));
+        assert!(args.iter().any(|arg| arg == bridge.sha256()));
+        assert_eq!(args.last().map(String::as_str), Some("bridge"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "exercise the shell-quoted provider verification wrapper locally"
+    )]
+    fn provider_bridge_ssh_word_runs_only_matching_bytes() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let probe = std::process::Command::new("sha256sum")
+            .arg("--version")
+            .output();
+        if !probe.is_ok_and(|result| result.status.success()) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bridge.sh");
+        let bytes = b"#!/bin/sh\nprintf '%s\\n' \"$1\"\n";
+        std::fs::write(&script, bytes).unwrap();
+        let chmod = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "chmod 0700 -- \"$1\"",
+                "chmod-bridge",
+                script.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            chmod.success(),
+            "local shell could not mark the bridge executable"
+        );
+        let bridge = resident_bridge_for(bytes);
+        let mut verified = verified_exec_argv(&bridge, &["ok".to_string()]);
+        verified[4] = script.to_string_lossy().into_owned();
+        // Positive control for sh_join: the remote login shell re-parses this one word.
+        let word = thegn_core::util::sh_join(&verified);
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", word.as_str()]);
+        let mut success = command.output().unwrap();
+        if success.status.code() == Some(126)
+            && !String::from_utf8_lossy(&success.stderr).contains("digest mismatch")
+        {
+            success = command.output().unwrap();
+        }
+        assert!(success.status.success());
+        assert_eq!(success.stdout, b"ok\n");
+
+        let altered = b"#!/bin/sh\nprintf 'evil\\n'\n";
+        std::fs::write(&script, altered).unwrap();
+        let refused = command.output().unwrap();
+        assert_eq!(refused.status.code(), Some(126));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("digest mismatch"));
     }
 
     #[test]
