@@ -914,16 +914,19 @@ pub(crate) fn drive_queue(
                 };
                 step(PrqStatus::AgentRunning.as_str(), &note, &mut progress);
 
-                crate::agent_run::run(&crate::agent_run::AgentTaskRun {
-                    kind,
-                    worktree: wt,
-                    prompt: &prompt,
-                    command_template: template,
-                    vars: &vars,
-                    timeout_secs: cfg.agent_timeout_secs,
-                    sandbox,
-                    credential_free: true,
-                });
+                crate::agent_run::run_outcome_cancellable(
+                    &crate::agent_run::AgentTaskRun {
+                        kind,
+                        worktree: wt,
+                        prompt: &prompt,
+                        command_template: template,
+                        vars: &vars,
+                        timeout_secs: cfg.agent_timeout_secs,
+                        sandbox,
+                        credential_free: true,
+                    },
+                    guard.cancel_flag(),
+                );
 
                 let own = crate::pr_agent_lease::observe_own_head(&loc, &head, || {
                     forge
@@ -951,8 +954,8 @@ pub(crate) fn drive_queue(
 
                 match guard.finish(db, None) {
                     Ok(true) => {}
-                    Ok(false) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the next refresh re-evaluates the row", item.number)),
-                    Err(error) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the next refresh re-evaluates the row ({error})", item.number)),
+                    Ok(false) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the agent was stopped and the next refresh re-evaluates the row", item.number)),
+                    Err(error) => out.warnings.push(format!("PR #{}: agent lease was lost while the agent ran; the agent was stopped and the next refresh re-evaluates the row ({error})", item.number)),
                 }
 
                 // The exit code decides nothing — the next refresh does, exactly

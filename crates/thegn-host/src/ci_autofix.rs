@@ -464,16 +464,26 @@ fn consider_candidate_with_forge(
         }
     };
     tracing::debug!(target: "thegn::ci_autofix", pr = item.number, attempt = guard.attempt(), "CI autofix agent admitted under PR lease");
-    let exited_zero = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
-        kind: thegn_core::agent_task::TaskKind::PrCiFailure,
-        worktree,
-        prompt: &prompt,
-        command_template: template,
-        vars: &vars,
-        timeout_secs: pq.agent_timeout_secs,
-        sandbox,
-        credential_free: true,
-    });
+    let exited_zero = crate::agent_run::run_outcome_cancellable(
+        &crate::agent_run::AgentTaskRun {
+            kind: thegn_core::agent_task::TaskKind::PrCiFailure,
+            worktree,
+            prompt: &prompt,
+            command_template: template,
+            vars: &vars,
+            timeout_secs: pq.agent_timeout_secs,
+            sandbox,
+            credential_free: true,
+        },
+        guard.cancel_flag(),
+    )
+    .exited_zero();
+    if guard.lease_lost() {
+        notify(format!(
+            "CI autofix for PR #{} stopped: its PR-agent lease was lost; the next refresh re-evaluates the row",
+            item.number
+        ));
+    }
     let own = crate::pr_agent_lease::observe_own_head(&loc, &entry.head_sha, || {
         provider
             .pr_status(&loc, PrRef::Number(item.number))
