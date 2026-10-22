@@ -369,6 +369,7 @@ fn run_once(request: RefreshRequest) {
         .into_iter()
         .collect();
     let mut changed = false;
+    let shared = shared_issue_ids(&per_provider);
     for (account, provider, result) in per_provider {
         let issues = match result {
             Ok(issues) => {
@@ -438,12 +439,14 @@ fn run_once(request: RefreshRequest) {
             .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
             .collect();
         for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked) {
+            let msg = account_qualified(msg, &source_ref, &shared, &account);
             let _ = crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
         // Overdue is re-derived (not diffed) each refresh; the store-side
         // emit-once (`put_notification_once`) keeps it to one row per
         // (issue, due date).
         for (source_ref, msg) in overdue_notifications(&issues, &linked, thegn_core::util::now()) {
+            let msg = account_qualified(msg, &source_ref, &shared, &account);
             let _ =
                 crate::automation_events::emit_once(&db, "overdue", &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
@@ -671,6 +674,52 @@ pub(crate) fn overdue_notifications(
         .collect()
 }
 
+type ProviderIssueResultRow<'a> = (
+    String,
+    &'a str,
+    Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
+);
+
+pub(crate) fn shared_issue_ids(
+    per_provider: &[ProviderIssueResultRow<'_>],
+) -> std::collections::HashSet<String> {
+    let rows = per_provider.iter().flat_map(|(_, _, result)| {
+        let issues = match result {
+            Ok(issues) | Err(thegn_svc::issue::IssueError::PartialList { issues, .. }) => {
+                issues.as_slice()
+            }
+            Err(_) => &[],
+        };
+        issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue.account.as_deref()))
+    });
+    thegn_core::issue::ids_shared_across_accounts(rows)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn account_qualified(
+    message: String,
+    source_ref: &str,
+    shared: &std::collections::HashSet<String>,
+    account: &str,
+) -> String {
+    if shared.contains(source_ref) {
+        format!("{message} ({account})")
+    } else {
+        message
+    }
+}
+
+pub(crate) fn move_on_merge_failure_message(id: &str, error: &str) -> String {
+    format!(
+        "could not move {id} to Done on merge: {}",
+        safe_report_text(error)
+    )
+}
+
 /// Load the tracker caches into the panel model (hydration-thread side, DB
 /// only — the background refresh keeps the cache warm). Loads every cached
 /// provider for this repo and concatenates, so multiple trackers (e.g.
@@ -717,10 +766,109 @@ pub(crate) fn populate_tracker(
 #[cfg(test)]
 mod tests {
     use super::{
-        BusyRetry, MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, format_refresh_report,
+        BusyRetry, MAX_REPORT_ENTRY_CHARS, RefreshCoalescer, RefreshGuard, account_qualified,
+        format_refresh_report, move_on_merge_failure_message, overdue_notifications,
         partial_cache_entry, populate_tracker, prepare_tracker_toast_message,
-        record_tracker_failure, safe_report_text, tracker_failures, tracker_load,
+        record_tracker_failure, safe_report_text, shared_issue_ids, tracker_failures, tracker_load,
     };
+
+    #[test]
+    fn shared_issue_ids_covers_ok_and_partial_accounts() {
+        use thegn_core::issue::Issue;
+        use thegn_svc::issue::IssueError;
+
+        let per_provider = vec![
+            (
+                "work".to_owned(),
+                "linear",
+                Ok(vec![
+                    Issue {
+                        id: "linear:ENG-1".into(),
+                        account: Some("work".into()),
+                        ..Default::default()
+                    },
+                    Issue {
+                        id: "linear:ENG-2".into(),
+                        ..Default::default()
+                    },
+                ]),
+            ),
+            (
+                "home".to_owned(),
+                "linear",
+                Err(IssueError::PartialList {
+                    issues: vec![Issue {
+                        id: "linear:ENG-1".into(),
+                        account: Some("home".into()),
+                        ..Default::default()
+                    }],
+                    reason: "page cap",
+                }),
+            ),
+            ("x".to_owned(), "linear", Err(IssueError::NotConfigured)),
+        ];
+
+        assert_eq!(
+            shared_issue_ids(&per_provider),
+            std::collections::HashSet::from(["linear:ENG-1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn account_qualified_tags_only_shared_ids() {
+        let shared = std::collections::HashSet::from(["linear:ENG-1".to_owned()]);
+        assert_eq!(
+            account_qualified(
+                "ENG-1 overdue (was due 2026-10-01)".into(),
+                "linear:ENG-1",
+                &shared,
+                "work"
+            ),
+            "ENG-1 overdue (was due 2026-10-01) (work)"
+        );
+        assert_eq!(
+            account_qualified(
+                "ENG-2 overdue (was due 2026-10-01)".into(),
+                "linear:ENG-2",
+                &shared,
+                "work"
+            ),
+            "ENG-2 overdue (was due 2026-10-01)"
+        );
+    }
+
+    #[test]
+    fn two_accounts_overdue_rows_stay_distinct() {
+        use thegn_core::issue::Issue;
+
+        let linked = std::collections::HashSet::from(["linear:ENG-1".to_owned()]);
+        let shared = linked.clone();
+        let messages = ["work", "home"].map(|account| {
+            let issues = [Issue {
+                id: "linear:ENG-1".into(),
+                number: "ENG-1".into(),
+                account: Some(account.into()),
+                due_at_ms: Some(0),
+                ..Default::default()
+            }];
+            let (_, message) = overdue_notifications(&issues, &linked, 1)
+                .into_iter()
+                .next()
+                .unwrap();
+            account_qualified(message, "linear:ENG-1", &shared, account)
+        });
+
+        assert_ne!(messages[0], messages[1]);
+    }
+
+    #[test]
+    fn move_on_merge_failure_message_names_issue_and_redacts() {
+        let message = move_on_merge_failure_message("linear:ENG-1", "auth failed\u{1b}evil");
+
+        assert!(message.contains("linear:ENG-1"));
+        assert!(message.contains("Done on merge"));
+        assert!(!message.contains('\u{1b}'));
+    }
 
     #[test]
     fn partial_refresh_keeps_last_good_rows_and_marks_partial() {
