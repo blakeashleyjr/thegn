@@ -412,10 +412,12 @@ class WorkflowPolicyTests(unittest.TestCase):
             result = run_case(foreign_run=True)
             self.assertNotEqual(0, result.returncode)
             self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("not bound to this workflow run", result.stderr)
 
             result = run_case(self_hosted=True)
             self.assertNotEqual(0, result.returncode)
             self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("untrusted runner", result.stderr)
 
             result = run_case(fail="", empty=True)
             self.assertNotEqual(0, result.returncode)
@@ -1308,10 +1310,12 @@ class WorkflowPolicyTests(unittest.TestCase):
             result = run_case(foreign_run=True)
             self.assertNotEqual(0, result.returncode)
             self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("not bound to this workflow run", result.stderr)
 
             result = run_case(self_hosted=True)
             self.assertNotEqual(0, result.returncode)
             self.assertIn("not bound to this workflow run", result.stdout)
+            self.assertIn("untrusted runner", result.stderr)
 
 
 if __name__ == "__main__":
