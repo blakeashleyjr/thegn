@@ -153,8 +153,8 @@ impl MediaBackend for Admitted {
             let names = self.0.players().await?;
             Ok(names
                 .into_iter()
-                .take(model::MAX_PLAYERS)
                 .filter(|name| model::is_valid_opaque_id(name))
+                .take(model::PLAYER_LIST_LIMIT)
                 .collect())
         })
     }
@@ -361,7 +361,24 @@ mod tests {
             playlists.last().map(|playlist| playlist.id.clone()),
             Some(format!("pl-{}", model::MAX_PLAYLISTS - 1))
         );
-        assert_eq!(admitted.players().await.unwrap().len(), model::MAX_PLAYERS);
+        assert_eq!(
+            admitted.players().await.unwrap().len(),
+            model::PLAYER_LIST_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn players_filter_invalid_names_before_the_cap() {
+        let names = std::iter::once(String::new())
+            .chain(std::iter::once("bad\u{7}".to_owned()))
+            .chain((0..model::MAX_PLAYERS + 3).map(|index| format!("player-{index}")))
+            .collect();
+        let (admitted, _) = fake_with_players(Ok(names));
+
+        let players = admitted.players().await.unwrap();
+        assert_eq!(players.len(), model::PLAYER_LIST_LIMIT);
+        assert_eq!(players.first().map(String::as_str), Some("player-0"));
+        assert!(players.iter().all(|name| model::is_valid_opaque_id(name)));
     }
 
     #[tokio::test]
