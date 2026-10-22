@@ -349,37 +349,53 @@ fn show_text(cfg: &Config, json: bool) -> Result<String> {
     // so the typed `Config`'s field order — which the maps in serde_json /
     // toml::Value would sort alphabetically — is preserved.
     let mut doc: toml_edit::DocumentMut = toml::to_string_pretty(cfg)?.parse()?;
-    redact_toml_table(doc.as_table_mut());
+    redact_toml_table(doc.as_table_mut(), &mut Vec::new());
     Ok(doc.to_string())
 }
 
-/// The same policy as [`thegn_core::redact::redact_json`] (strings and arrays
-/// of strings under a sensitive key become the placeholder; tables recurse),
-/// using the canonical `is_sensitive` predicate.
-fn redact_toml_table(table: &mut toml_edit::Table) {
+/// The same key-name and structural calendar-account policy as
+/// [`thegn_core::redact::redact_json`] (strings and arrays under a sensitive
+/// key become the placeholder; tables recurse), using the canonical predicates.
+fn redact_toml_table(table: &mut toml_edit::Table, path: &mut Vec<String>) {
     for (key, item) in table.iter_mut() {
-        redact_toml_item(item, thegn_core::redact::is_sensitive(key.get()));
+        path.push(key.get().to_owned());
+        redact_toml_item(item, thegn_core::redact::is_sensitive(key.get()), path);
+        path.pop();
     }
 }
 
-fn redact_toml_item(item: &mut toml_edit::Item, masked: bool) {
+fn redact_toml_item(item: &mut toml_edit::Item, masked: bool, path: &mut Vec<String>) {
     match item {
-        toml_edit::Item::Table(t) => redact_toml_table(t),
-        toml_edit::Item::ArrayOfTables(a) => a.iter_mut().for_each(redact_toml_table),
-        toml_edit::Item::Value(v) => redact_toml_value(v, masked),
+        toml_edit::Item::Table(table) => redact_toml_table(table, path),
+        toml_edit::Item::ArrayOfTables(tables) => {
+            for (index, table) in tables.iter_mut().enumerate() {
+                path.push(index.to_string());
+                redact_toml_table(table, path);
+                path.pop();
+            }
+        }
+        toml_edit::Item::Value(value) => redact_toml_value(value, masked, path),
         toml_edit::Item::None => {}
     }
 }
 
-fn redact_toml_value(value: &mut toml_edit::Value, masked: bool) {
+fn redact_toml_value(value: &mut toml_edit::Value, masked: bool, path: &mut Vec<String>) {
     match value {
-        toml_edit::Value::String(_) if masked => {
+        toml_edit::Value::String(_) if masked || thegn_core::redact::is_sensitive_path(path) => {
             *value = toml_edit::Value::from(thegn_core::redact::PLACEHOLDER);
         }
-        toml_edit::Value::Array(a) => a.iter_mut().for_each(|v| redact_toml_value(v, masked)),
-        toml_edit::Value::InlineTable(t) => {
-            for (key, v) in t.iter_mut() {
-                redact_toml_value(v, thegn_core::redact::is_sensitive(key.get()));
+        toml_edit::Value::Array(array) => {
+            for (index, value) in array.iter_mut().enumerate() {
+                path.push(index.to_string());
+                redact_toml_value(value, masked, path);
+                path.pop();
+            }
+        }
+        toml_edit::Value::InlineTable(table) => {
+            for (key, value) in table.iter_mut() {
+                path.push(key.get().to_owned());
+                redact_toml_value(value, thegn_core::redact::is_sensitive(key.get()), path);
+                path.pop();
             }
         }
         _ => {}
@@ -392,9 +408,17 @@ fn redact_toml_value(value: &mut toml_edit::Value, masked: bool) {
 /// A sensitive PARENT segment counts too (`api_keys.0`, `issue_accounts.0.token`
 /// style paths): indexing into a secret container must not unmask it.
 fn redact_at(key: &str, value: serde_json::Value) -> serde_json::Value {
-    let last = sensitive_segment(key).unwrap_or_else(|| key.rsplit('.').next().unwrap_or(key));
+    let segments: Vec<&str> = key.split('.').collect();
+    let last = sensitive_segment(key).unwrap_or_else(|| segments.last().copied().unwrap_or(key));
     let mut wrapped = serde_json::json!({ last: value });
-    thegn_core::redact::redact_json(&mut wrapped);
+    if sensitive_segment(key).is_some() {
+        thegn_core::redact::redact_json(&mut wrapped);
+    } else {
+        thegn_core::redact::redact_json_at(
+            &segments[..segments.len().saturating_sub(1)],
+            &mut wrapped,
+        );
+    }
     wrapped
         .get_mut(last)
         .map(serde_json::Value::take)
@@ -406,9 +430,14 @@ fn sensitive_segment(key: &str) -> Option<&str> {
     key.split('.').find(|s| thegn_core::redact::is_sensitive(s))
 }
 
+fn path_is_secret(key: &str) -> bool {
+    sensitive_segment(key).is_some()
+        || thegn_core::redact::is_sensitive_path(&key.split('.').collect::<Vec<_>>())
+}
+
 /// A value for echoing back to the user, masked when `key` is secret-bearing.
 fn shown_value(key: &str, value: &str) -> String {
-    if sensitive_segment(key).is_some() {
+    if path_is_secret(key) {
         thegn_core::redact::PLACEHOLDER.to_string()
     } else {
         value.to_string()
@@ -467,7 +496,7 @@ fn get_text(cfg: &Config, key: &str) -> Option<String> {
             Some(render_config_value(v))
         }
         Some(v) => {
-            if sensitive_segment(&canonical).is_some() {
+            if path_is_secret(&canonical) {
                 Some(render_config_value(v))
             } else {
                 cfg.get_dotted(&canonical)
@@ -475,7 +504,7 @@ fn get_text(cfg: &Config, key: &str) -> Option<String> {
             }
         }
         None => {
-            if sensitive_segment(&canonical).is_some() {
+            if path_is_secret(&canonical) {
                 None
             } else {
                 cfg.get_dotted(&canonical)
@@ -1146,6 +1175,108 @@ binary_cache_key = "cache.example.test-1:PUBLICKEY"
                 shown.contains("env:THEGN_B42_SHOW_FIXTURE"),
                 "{label}: {shown}"
             );
+        }
+    }
+
+    const CALENDAR_SENTINELS: &[&str] = &[
+        "cal-url-sentinel-7a1",
+        "cal-user-sentinel-3c2",
+        "cal-argv-sentinel-9d4",
+        "cal-env-sentinel-5e8",
+    ];
+
+    const CALENDAR_SENTINEL_TOML: &str = r#"
+[[calendar.accounts]]
+name = "work"
+provider = "ics_url"
+url = "https://cal.example.test/feed.ics?sig=cal-url-sentinel-7a1"
+username = "cal-user-sentinel-3c2"
+cwd = "/srv/khal"
+command = ["khal-thegn", "--auth", "cal-argv-sentinel-9d4"]
+env = { KHAL_AUTH = "cal-env-sentinel-5e8" }
+"#;
+
+    fn calendar_sentinel_config() -> Config {
+        toml::from_str(CALENDAR_SENTINEL_TOML).expect("calendar sentinel config parses")
+    }
+
+    fn assert_calendar_output_clean(label: &str, output: &str) {
+        for sentinel in CALENDAR_SENTINELS {
+            assert!(
+                !output.contains(sentinel),
+                "{label} leaked {sentinel}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_calendar_show_masks_account_credentials() {
+        let cfg = calendar_sentinel_config();
+        let toml_output = show_text(&cfg, false).expect("TOML output");
+        let json_output = show_text(&cfg, true).expect("JSON output");
+        for (label, output) in [("TOML", &toml_output), ("JSON", &json_output)] {
+            assert_calendar_output_clean(label, output);
+            assert!(output.contains("khal-thegn"), "{label}: {output}");
+            assert!(output.contains("KHAL_AUTH"), "{label}: {output}");
+            assert!(output.contains("work"), "{label}: {output}");
+            assert!(output.contains("/srv/khal"), "{label}: {output}");
+        }
+        toml_output.parse::<toml::Table>().expect("valid TOML");
+    }
+
+    #[test]
+    fn config_calendar_get_masks_account_credentials() {
+        let cfg = calendar_sentinel_config();
+        for key in [
+            "calendar",
+            "calendar.accounts",
+            "calendar.accounts.0",
+            "calendar.accounts.0.url",
+            "calendar.accounts.0.username",
+            "calendar.accounts.0.command",
+            "calendar.accounts.0.command.2",
+            "calendar.accounts.0.env",
+            "calendar.accounts.0.env.KHAL_AUTH",
+        ] {
+            let serialized = redacted_value_at(&cfg, key).expect(key).to_string();
+            assert_calendar_output_clean(&format!("get --json {key}"), &serialized);
+            if let Some(output) = get_text(&cfg, key) {
+                assert_calendar_output_clean(&format!("get {key}"), &output);
+            }
+        }
+        assert_eq!(
+            get_text(&cfg, "calendar.accounts.0.command.0").as_deref(),
+            Some("khal-thegn")
+        );
+        assert_eq!(
+            get_text(&cfg, "calendar.accounts.0.name").as_deref(),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn config_calendar_explain_masks_account_credentials() {
+        use thegn_core::config::ProcessEnv;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, CALENDAR_SENTINEL_TOML).expect("write config");
+        for key in [
+            "calendar.accounts.0.url",
+            "calendar.accounts.0",
+            "calendar.accounts",
+            "calendar",
+        ] {
+            let mut origin =
+                thegn_core::config_resolve::explain(&ProcessEnv, &[], Some(path.clone()), key)
+                    .expect("explain");
+            let raw = format!("{} {:?}", origin.value, origin.trace);
+            assert!(
+                raw.contains(CALENDAR_SENTINELS[0]) || raw.contains(CALENDAR_SENTINELS[2]),
+                "{key}: expected raw sentinel precondition"
+            );
+            redact_origin(&mut origin);
+            assert_calendar_output_clean(key, &format!("{} {:?}", origin.value, origin.trace));
         }
     }
 }
