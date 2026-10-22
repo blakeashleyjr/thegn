@@ -1022,6 +1022,25 @@ mod tests {
         assert!(!collapsed.contains("The lease is not yet checked by mutations."));
     }
 
+    #[test]
+    fn pipeline_skill_states_the_recovery_trust_model() {
+        let pipeline = EMBEDDED_MANIFEST
+            .iter()
+            .find(|entry| entry.name == "pipeline")
+            .expect("pipeline skill is embedded")
+            .document;
+        let section = pipeline
+            .split("## 8.")
+            .nth(1)
+            .and_then(|section| section.split("## 9.").next())
+            .expect("finisher section is bounded by section 9");
+        let collapsed = section.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(collapsed.contains("UNTRUSTED-RECOVERY-JSON"));
+        assert!(collapsed.contains("not an execution boundary"));
+        assert!(!collapsed.contains("last screen"));
+    }
+
     fn source(name: &str) -> SkillSource {
         SkillSource::user(format!("fixture/{name}/SKILL.md"))
     }
