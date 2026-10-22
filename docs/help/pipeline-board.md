@@ -179,5 +179,5 @@ refusals as failed preconditions.
 `dispatch claim`, `dispatch put` and `session open --stage --issue` require the
 path of an existing local git worktree root; missing paths and worktree
 subdirectories are refused. Issue ids are stored trimmed, with a lowercased
-provider prefix. Duplicate, sibling and lease checks match ids case-insensitively
-when providers match or either id has no provider prefix.
+provider prefix. Duplicate, sibling and lease checks match ids
+case-insensitively when providers match or either id has no provider prefix.
