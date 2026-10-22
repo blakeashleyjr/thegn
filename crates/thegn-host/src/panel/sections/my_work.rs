@@ -7,6 +7,7 @@
 
 use thegn_core::pipeline_report::{display_cell, display_clip};
 use thegn_core::work::{WorkGroup, WorkKind, WorkRow};
+use unicode_width::UnicodeWidthStr;
 
 use crate::seg::{Line, seg, sp};
 
@@ -84,6 +85,16 @@ pub fn ordered_rows(panel: &crate::panel::PanelData) -> Vec<WorkRow> {
 pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let cols = ctx.cols;
     let rows_data = ordered_rows(&ctx.model.panel);
+    let shared = thegn_core::issue::ids_shared_across_accounts(
+        rows_data
+            .iter()
+            .filter(|row| row.kind == WorkKind::Issue)
+            .filter_map(|row| {
+                row.issue_id
+                    .as_deref()
+                    .map(|id| (id, row.account.as_deref()))
+            }),
+    );
 
     if rows_data.is_empty() {
         return empty_rows(ctx);
@@ -131,13 +142,32 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         let link_mark = if row.is_linked() { "◈ " } else { "" };
         let repo = display_cell(&short_repo(&row.repo));
         let number = display_cell(&row.number);
+        let account_tag = if row
+            .issue_id
+            .as_deref()
+            .is_some_and(|id| shared.contains(id))
+        {
+            format!(
+                " ({})",
+                row.account
+                    .as_deref()
+                    .map(|account| display_clip(account, 16))
+                    .unwrap_or_else(|| "?".to_string())
+            )
+        } else {
+            String::new()
+        };
         let repo_part = if row.repo.is_empty() {
             String::new()
         } else {
             format!("{repo} ")
         };
-        let prefix_len =
-            2 + link_mark.len() + repo_part.chars().count() + number.chars().count() + 1;
+        let prefix_len = 2
+            + link_mark.len()
+            + repo_part.chars().count()
+            + number.chars().count()
+            + UnicodeWidthStr::width(account_tag.as_str())
+            + 1;
         let title = display_clip(&row.title, cols.saturating_sub(prefix_len));
 
         let mut segs = vec![seg(kind_hue(row.kind), sigil), seg(g(), " ".to_string())];
@@ -148,6 +178,7 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             segs.push(seg(g2(), repo_part));
         }
         segs.push(seg(d(), number));
+        segs.push(seg(g2(), account_tag));
         segs.push(seg(g(), " ".to_string()));
         segs.push(seg(t(), title));
 
@@ -315,6 +346,59 @@ mod spec {
             text.contains('\u{fffd}'),
             "hostile cells are visibly replaced: {text:?}"
         );
+    }
+
+    #[test]
+    fn account_tag_distinguishes_same_key_rows() {
+        let shared = |account: &str| WorkRow {
+            kind: WorkKind::Issue,
+            group: WorkGroup::Assigned,
+            number: "ENG-1".into(),
+            issue_id: Some("linear:ENG-1".into()),
+            account: Some(account.into()),
+            ..Default::default()
+        };
+        let model = crate::chrome::FrameModel {
+            panel: PanelData {
+                my_work: vec![shared("work"), shared("home")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = crate::panel::PanelUi {
+            open: Section::Mine,
+            width: crate::layout::PanelWidth::Half,
+            ..Default::default()
+        };
+        let rendered = format!(
+            "{:?}",
+            content(&SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 75,
+                rows: 24,
+            })
+        );
+        assert!(rendered.contains("(work)"), "{rendered}");
+        assert!(rendered.contains("(home)"), "{rendered}");
+
+        let single = crate::chrome::FrameModel {
+            panel: PanelData {
+                my_work: vec![shared("work")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rendered = format!(
+            "{:?}",
+            content(&SectionCtx {
+                model: &single,
+                ui: &ui,
+                cols: 75,
+                rows: 24,
+            })
+        );
+        assert!(!rendered.contains("(work)"), "{rendered}");
     }
 
     #[test]

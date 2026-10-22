@@ -4979,6 +4979,7 @@ fn pr_search_row(
         branch_hint: None,
         worktree_path: None,
         repo_root: None,
+        account: None,
     }
 }
 
@@ -5116,6 +5117,7 @@ pub(crate) fn spawn_my_work_refresh(
                         branch_hint: i.branch_hint,
                         worktree_path: None,
                         repo_root: None,
+                        account: i.account,
                     });
                 }
             }

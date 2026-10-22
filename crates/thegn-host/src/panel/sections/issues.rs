@@ -139,6 +139,11 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut rows = Vec::new();
     let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
+    let shared = thegn_core::issue::ids_shared_across_accounts(
+        data.tracker_issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
+    );
 
     for (i, issue) in issues.iter().enumerate() {
         let linked = data.tracker_links.contains(&issue.id);
@@ -155,12 +160,27 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         // Budget: 1 glyph + 1 space + number + 1 space + title
         let number_part = display_cell(&issue.number);
         let number_width = UnicodeWidthStr::width(number_part.as_str());
+        let account_tag = shared.contains(issue.id.as_str()).then(|| {
+            format!(
+                " ({})",
+                issue
+                    .account
+                    .as_deref()
+                    .map(|account| display_clip(account, 16))
+                    .unwrap_or_else(|| "?".to_string())
+            )
+        });
+        let account_width = account_tag
+            .as_deref()
+            .map(UnicodeWidthStr::width)
+            .unwrap_or(0);
         let budget = cols
             .saturating_sub(1) // glyph
             .saturating_sub(1) // space
             .saturating_sub(number_width)
+            .saturating_sub(account_width)
             .saturating_sub(1) // space
-            .saturating_sub(link_mark.len());
+            .saturating_sub(UnicodeWidthStr::width(link_mark));
         let title = display_clip(&issue.title, budget);
 
         let row = PanelRow::plain(Line::segs(vec![
@@ -175,6 +195,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(g(), " "),
             seg(g2(), link_mark.to_string()),
             seg(d(), number_part.clone()),
+            seg(g2(), account_tag.unwrap_or_default()),
             seg(g(), " "),
             seg(t(), title),
         ]))
@@ -213,6 +234,11 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut rows = Vec::new();
     let cursor = ctx.ui.cursor;
     let data = &ctx.model.panel;
+    let shared = thegn_core::issue::ids_shared_across_accounts(
+        data.tracker_issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
+    );
 
     for (i, issue) in issues.iter().enumerate() {
         let linked = data.tracker_links.contains(&issue.id);
@@ -220,10 +246,29 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 
         // Line 1: status glyph (⊘ if blocked) + number + title
         let blocked = !issue.blocked_by.is_empty();
-        let number = display_clip(&issue.number, cols.saturating_sub(3));
-        let title_budget = cols.saturating_sub(UnicodeWidthStr::width(number.as_str()) + 3);
-        let title = display_clip(&issue.title, title_budget);
+        let account_tag = shared.contains(issue.id.as_str()).then(|| {
+            format!(
+                " ({})",
+                issue
+                    .account
+                    .as_deref()
+                    .map(|account| display_clip(account, 16))
+                    .unwrap_or_else(|| "?".to_string())
+            )
+        });
+        let account_width = account_tag
+            .as_deref()
+            .map(UnicodeWidthStr::width)
+            .unwrap_or(0);
         let linked_str = if linked { " ◈" } else { "" };
+        let number = display_clip(&issue.number, cols.saturating_sub(account_width + 3));
+        let title_budget = cols.saturating_sub(
+            UnicodeWidthStr::width(number.as_str())
+                + account_width
+                + UnicodeWidthStr::width(linked_str)
+                + 3,
+        );
+        let title = display_clip(&issue.title, title_budget);
 
         let line1 = Line::segs(vec![
             seg(
@@ -240,6 +285,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             ),
             seg(g(), " "),
             seg(d(), number),
+            seg(g2(), account_tag.unwrap_or_default()),
             seg(g2(), linked_str.to_string()),
             seg(g(), " "),
             seg(t(), title),
@@ -305,6 +351,11 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let cols = ctx.cols;
     let mut rows = Vec::new();
     let issues = sorted_issues(ctx);
+    let shared = thegn_core::issue::ids_shared_across_accounts(
+        data.tracker_issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue.account.as_deref())),
+    );
 
     // Header bar
     let provider_label = if !data.issues_configured {
@@ -369,14 +420,29 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let sel_mark = if i == cursor { "▶ " } else { "  " };
             let link_mark = if linked { "◈" } else { " " };
             let number = display_clip(&issue.number, 10);
-            let num_w = UnicodeWidthStr::width(number.as_str()) + 1;
-            let title_w = list_w.saturating_sub(2 + num_w + 1 + 1);
+            let account_tag = shared.contains(issue.id.as_str()).then(|| {
+                format!(
+                    " ({})",
+                    issue
+                        .account
+                        .as_deref()
+                        .map(|account| display_clip(account, 16))
+                        .unwrap_or_else(|| "?".to_string())
+                )
+            });
+            let account_width = account_tag
+                .as_deref()
+                .map(UnicodeWidthStr::width)
+                .unwrap_or(0);
+            let num_w = UnicodeWidthStr::width(number.as_str()) + account_width + 1;
+            let title_w = list_w.saturating_sub(2 + 1 + num_w + 1 + 2);
             (
                 vec![
                     seg(if i == cursor { t() } else { g() }, sel_mark.to_string()),
                     seg(status_hue(issue.status), issue.status.glyph().to_string()),
                     seg(g(), " "),
                     seg(d(), number),
+                    seg(g2(), account_tag.unwrap_or_default()),
                     seg(g(), " "),
                     seg(
                         if i == cursor { t() } else { g2() },
@@ -460,6 +526,13 @@ fn issue_detail_segs(issue: &Issue, links: &[String], w: usize) -> Vec<Vec<Seg>>
         out.push(vec![
             seg(g2(), "branch  ".to_string()),
             seg(f(), display_clip(branch, w.saturating_sub(8))),
+        ]);
+    }
+
+    if let Some(account) = &issue.account {
+        out.push(vec![
+            seg(g2(), "account  ".to_string()),
+            seg(f(), display_clip(account, w.saturating_sub(9))),
         ]);
     }
 
@@ -824,5 +897,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn account_tag_marks_only_ids_shared_across_accounts() {
+        let mut work = issue("linear:ENG-1", IssuePriority::High, IssueStatus::Todo, "");
+        work.number = "ENG-1".into();
+        work.account = Some("work".into());
+        let mut home = work.clone();
+        home.account = Some("home".into());
+        let mut solo = issue("linear:ENG-2", IssuePriority::High, IssueStatus::Todo, "");
+        solo.number = "ENG-2".into();
+        solo.account = Some("work".into());
+        let model = crate::chrome::FrameModel {
+            panel: panel_with(vec![work, home, solo]),
+            ..Default::default()
+        };
+        for (width, cols) in [
+            (crate::layout::PanelWidth::Normal, 60),
+            (crate::layout::PanelWidth::Half, 75),
+            (crate::layout::PanelWidth::Full, 150),
+        ] {
+            let ui = crate::panel::PanelUi {
+                open: Section::Issues,
+                width,
+                ..Default::default()
+            };
+            let rendered = content(&SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols,
+                rows: 24,
+            });
+            let lines = rendered
+                .iter()
+                .flat_map(|row| match &row.line {
+                    Line::Segs(segs) => {
+                        vec![segs.iter().map(|seg| seg.text.as_str()).collect::<String>()]
+                    }
+                    Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => vec![
+                        l.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                        r.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                    ],
+                    Line::Blank | Line::Fill { .. } => Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let text = lines.join("\n");
+            assert!(text.contains("(work)"), "{text}");
+            assert!(text.contains("(home)"), "{text}");
+            for line in &lines {
+                assert!(UnicodeWidthStr::width(line.as_str()) <= cols, "{line:?}");
+            }
+            let solo_line = lines.iter().find(|line| line.contains("ENG-2"));
+            assert!(
+                !solo_line.is_some_and(|line| line.contains("(work)")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_detail_line_shows_the_account() {
+        let mut issue = issue("linear:ENG-1", IssuePriority::High, IssueStatus::Todo, "");
+        issue.account = Some("work".into());
+        let model = crate::chrome::FrameModel {
+            panel: panel_with(vec![issue]),
+            ..Default::default()
+        };
+        let ui = crate::panel::PanelUi {
+            open: Section::Issues,
+            width: crate::layout::PanelWidth::Full,
+            ..Default::default()
+        };
+        let rendered = content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 150,
+            rows: 24,
+        });
+        let text = format!("{rendered:?}");
+        assert!(text.contains("account"), "{text}");
+        assert!(text.contains("work"), "{text}");
     }
 }

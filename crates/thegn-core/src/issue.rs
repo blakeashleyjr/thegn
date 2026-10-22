@@ -130,6 +130,27 @@ impl std::fmt::Display for IssueRefError {
 
 impl std::error::Error for IssueRefError {}
 
+/// Issue identity is (account, id) (THE-1226); views use this to label ids
+/// that two accounts share.
+pub fn ids_shared_across_accounts<'a, I>(rows: I) -> std::collections::HashSet<&'a str>
+where
+    I: IntoIterator<Item = (&'a str, Option<&'a str>)>,
+{
+    let mut first_account: std::collections::HashMap<&'a str, Option<&'a str>> =
+        std::collections::HashMap::new();
+    let mut shared = std::collections::HashSet::new();
+    for (id, account) in rows {
+        if let Some(first) = first_account.get(id)
+            && *first != account
+        {
+            shared.insert(id);
+        } else {
+            first_account.insert(id, account);
+        }
+    }
+    shared
+}
+
 /// Workflow state of an issue.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1389,5 +1410,18 @@ mod spec {
         assert_ne!(q, sp);
         assert_ne!(sp, r);
         assert_ne!(q, r);
+    }
+
+    #[test]
+    fn account_shared_ids_need_two_distinct_accounts() {
+        let shared = ids_shared_across_accounts([
+            ("linear:A", Some("w")),
+            ("linear:A", Some("h")),
+            ("linear:B", Some("w")),
+            ("linear:B", Some("w")),
+            ("linear:C", None),
+            ("linear:C", Some("w")),
+        ]);
+        assert_eq!(shared, ["linear:A", "linear:C"].into_iter().collect());
     }
 }
