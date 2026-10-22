@@ -44,7 +44,8 @@ globally. The launcher creates
 `$XDG_CONFIG_HOME/thegn/alacritty.toml` (defaulting to
 `~/.config/thegn/alacritty.toml`) from the shipped profile only when the file is
 absent, then preserves that user-owned copy. `THEGN_ALACRITTY_CONFIG` points the
-font picker at the same file.
+font picker at the same file. The picker leaves the config untouched if another
+user owns it or it has extra hard links, and explains why.
 
 Run `thegn doctor` in that window to verify the terminal and resolved
 capabilities. The derivation is build-tested on x86_64 Linux; clean-host
