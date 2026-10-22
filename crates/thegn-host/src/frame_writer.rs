@@ -7,10 +7,10 @@
 //! render + graphics + bell), submits them to a **bounded, 2-deep** queue, and
 //! moves on; the writer thread does the blocking I/O.
 //!
-//! Ordering: ONE FIFO carries worker-managed frames and out-of-band writes
+//! Ordering: ONE FIFO carries frames from both renderers and out-of-band writes
 //! (OSC passthrough, kitty deletes, the muse marker), so those writes cannot
-//! interleave mid-sequence. The termwiz debug renderer still writes directly
-//! from the render loop and needs a separate migration to this FIFO.
+//! interleave mid-sequence. Termwiz frames are encoded on the loop and written
+//! here with the other frames.
 //!
 //! Backpressure/correctness rules:
 //! - Frames are diffs against the loop's `front` surface: a frame, once
@@ -33,9 +33,8 @@
 //! `THEGN_SYNC_WRITER=1` keeps FIFO writes on the owned worker but makes each
 //! admission wait on the caller until completion or the bounded deadline. A
 //! timeout sets Fatal and abandons queued bytes. `want_sync` also enables this
-//! mode for the termwiz debug renderer, so its FIFO OOB and clipboard writes
-//! can block the render loop for up to three seconds; its frames still write
-//! outside this worker in `run.rs`.
+//! mode for the termwiz debug renderer, whose frames, OOB writes and clipboard
+//! writes then share the same bounded FIFO.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -119,8 +118,8 @@ struct DeferredWrite {
 
 struct Inner {
     q: Mutex<Q>,
-    /// Termwiz paints frames directly, so its OOB writes have no worker frame
-    /// boundary to wait for before being dropped after failure.
+    /// Whether frames are worker-managed, which determines when failed OOB
+    /// writes may be dropped after failure.
     worker_frames: bool,
     cv: Condvar,
     done_cv: Condvar,
@@ -219,11 +218,9 @@ impl FrameWriter {
         }
     }
 
-    /// Resolve sync mode: the termwiz debug renderer writes through the
-    /// BufferedTerminal (not us), and `THEGN_SYNC_WRITER=1` makes worker-backed
-    /// writes ordered and caller-blocking up to `SYNC_WRITE_BOUND`; timeout is
-    /// Fatal and drops queued messages. Termwiz frames themselves remain on
-    /// the render loop until the run-loop lane moves them.
+    /// Resolve sync mode: the termwiz debug renderer and `THEGN_SYNC_WRITER=1`
+    /// make worker-backed writes ordered and caller-blocking up to
+    /// `SYNC_WRITE_BOUND`; timeout is Fatal and drops queued messages.
     pub(crate) fn want_sync(use_termwiz_renderer: bool) -> bool {
         use_termwiz_renderer || std::env::var_os("THEGN_SYNC_WRITER").is_some_and(|v| v == "1")
     }
@@ -439,20 +436,6 @@ impl FrameWriter {
         let mut metrics = std::mem::take(&mut q.metrics);
         metrics.deferred_rollups = self.inner.metrics_deferrals.swap(0, Ordering::Relaxed);
         Some(metrics)
-    }
-
-    /// The termwiz debug renderer writes synchronously outside this writer.
-    pub(crate) fn record_external_frame(
-        &self,
-        stamp: Option<FrameStamp>,
-        started: Instant,
-        finished: Instant,
-        success: bool,
-    ) {
-        if let Some(stamp) = stamp {
-            let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
-            q.metrics.record(stamp, started, finished, success);
-        }
     }
 }
 
@@ -1014,6 +997,19 @@ mod tests {
         )
     }
 
+    fn termwiz_test_frame_bytes() -> Vec<u8> {
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        crate::frame_write::TermwizFrames::with_caps(caps)
+            .render(
+                &[termwiz::surface::Change::Text("termwiz-frame".into())],
+                80,
+                24,
+            )
+            .unwrap()
+    }
+
     #[test]
     fn sync_submit_returns_within_bound_on_a_never_returning_sink() {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1058,6 +1054,67 @@ mod tests {
             }
         }
         assert_eq!(*log.lock().unwrap(), vec![vec![1], vec![2], vec![3]]);
+        drop(writer);
+    }
+
+    // The writer worker is the only sink caller. The started channel proves it
+    // has taken the frame before the sync deadline begins; the held gate keeps
+    // that write in flight until the main test thread releases it after Fatal.
+    #[test]
+    fn termwiz_frame_on_a_never_writable_sink_returns_within_the_bound() {
+        let bytes = termwiz_test_frame_bytes();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let writer = Arc::new(FrameWriter::spawn_with(
+            true,
+            true,
+            |_| {},
+            move |sink_bytes| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                sink_log.lock().unwrap().push(sink_bytes.to_vec());
+                Ok(())
+            },
+        ));
+        let submit_writer = Arc::clone(&writer);
+        let frame_bytes = bytes.clone();
+        let submit = std::thread::spawn(move || {
+            let started = Instant::now();
+            let accepted = submit_writer.submit_frame(frame_bytes, None);
+            (accepted, started.elapsed())
+        });
+        started_rx
+            .recv_timeout(SYNC_WRITE_BOUND + std::time::Duration::from_secs(1))
+            .unwrap();
+        let (accepted, elapsed) = submit.join().unwrap();
+        assert!(accepted);
+        assert!(elapsed < SYNC_WRITE_BOUND + std::time::Duration::from_millis(150));
+        assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
+        assert_eq!(writer.try_submit_oob(vec![2]), Err(vec![2]));
+        release_tx.send(()).unwrap();
+        drop(writer);
+        assert_eq!(*log.lock().unwrap(), vec![bytes]);
+    }
+
+    // One worker consumes the frame and then the OOB message from the same
+    // FIFO. Sync submission waits for each completion, so the log is stable at
+    // the assertion and demonstrates frame-before-OOB ordering.
+    #[test]
+    fn termwiz_frame_and_oob_keep_fifo_order_in_sync_mode() {
+        let bytes = termwiz_test_frame_bytes();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let writer = FrameWriter::spawn_with(true, true, |_| {}, {
+            let log = Arc::clone(&log);
+            move |bytes| {
+                log.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            }
+        });
+        assert!(writer.submit_frame(bytes.clone(), None));
+        assert_eq!(writer.try_submit_oob(vec![9]), Ok(()));
+        assert_eq!(*log.lock().unwrap(), vec![bytes, vec![9]]);
         drop(writer);
     }
 
