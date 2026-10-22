@@ -1013,3 +1013,7 @@ mod conformance_tests;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "secret_sentinel_tests.rs"]
+mod secret_sentinel_tests;
