@@ -275,12 +275,30 @@ pub struct IssuePatch {
 }
 
 /// Extended detail record fetched for a single issue (includes comments).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueDetail {
     #[serde(flatten)]
     pub issue: Issue,
     #[serde(default)]
     pub comments: Vec<IssueComment>,
+    /// False when the provider returned only part of the issue's comments
+    /// (for example one page); an absent field reads as complete.
+    #[serde(default = "default_comments_complete")]
+    pub comments_complete: bool,
+}
+
+fn default_comments_complete() -> bool {
+    true
+}
+
+impl Default for IssueDetail {
+    fn default() -> Self {
+        Self {
+            issue: Issue::default(),
+            comments: Vec::new(),
+            comments_complete: true,
+        }
+    }
 }
 
 /// One comment on an issue.
@@ -910,10 +928,49 @@ mod spec {
                 body: "LGTM".into(),
                 created_at_ms: 1_000,
             }],
+            comments_complete: true,
         };
         let json = serde_json::to_string(&d).unwrap();
         let back: IssueDetail = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
+    }
+
+    #[test]
+    fn issue_detail_without_comments_complete_reads_as_complete() {
+        let mut json = serde_json::to_value(IssueDetail {
+            issue: Issue {
+                id: "github:7".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            json.as_object_mut()
+                .unwrap()
+                .remove("comments_complete")
+                .is_some()
+        );
+
+        let detail: IssueDetail = serde_json::from_value(json).unwrap();
+        assert!(detail.comments_complete);
+    }
+
+    #[test]
+    fn issue_detail_partial_comments_round_trip() {
+        let detail = IssueDetail {
+            comments_complete: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["comments_complete"], false);
+        let decoded: IssueDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, detail);
+    }
+
+    #[test]
+    fn issue_detail_default_is_complete() {
+        assert!(IssueDetail::default().comments_complete);
     }
 
     #[test]
