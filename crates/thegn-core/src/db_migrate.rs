@@ -1916,6 +1916,41 @@ pub(crate) fn verify_v92_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v93: the roster order index (THE-259): every roster reader orders by dispatched_at_ms DESC, id DESC.
+pub(crate) fn migrate_v93(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_dispatches_dispatched
+             ON agent_dispatches(dispatched_at_ms, id);",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v93_schema(conn: &Connection) -> Result<()> {
+    let index_name = "idx_agent_dispatches_dispatched";
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?1",
+            [index_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table.as_deref() != Some("agent_dispatches") {
+        bail!(
+            "schema v93 migration did not add idx_agent_dispatches_dispatched to agent_dispatches"
+        );
+    }
+    let mut stmt = conn.prepare(&format!("PRAGMA index_info('{index_name}')"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().map(String::as_str).collect::<Vec<_>>() != ["dispatched_at_ms", "id"] {
+        bail!(
+            "schema v93 index idx_agent_dispatches_dispatched has columns {columns:?}, expected [\"dispatched_at_ms\", \"id\"]; drop or rename the colliding index"
+        );
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2933,6 +2968,84 @@ mod tests {
         let without_notifications = Connection::open_in_memory().unwrap();
         super::migrate_v92(&without_notifications).unwrap();
         super::verify_v92_schema(&without_notifications).unwrap();
+    }
+
+    #[test]
+    fn v93_adds_the_dispatch_order_index_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v93_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_dispatches (
+                 id INTEGER PRIMARY KEY,
+                 dispatched_at_ms INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        assert!(super::verify_v93_schema(&conn).is_err());
+        super::migrate_v93(&conn).unwrap();
+        super::migrate_v93(&conn).unwrap();
+        super::verify_v93_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_agent_dispatches_dispatched;
+             CREATE INDEX idx_agent_dispatches_dispatched ON agent_dispatches(id);",
+        )
+        .unwrap();
+        let error = super::verify_v93_schema(&conn).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "schema v93 index idx_agent_dispatches_dispatched has columns [\"id\"], expected [\"dispatched_at_ms\", \"id\"]; drop or rename the colliding index"
+        );
+    }
+
+    #[test]
+    fn v93_upgrades_a_large_v92_roster_and_keeps_page_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v92.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP INDEX idx_agent_dispatches_dispatched;
+                     PRAGMA user_version=92;
+                     WITH RECURSIVE n(i) AS (
+                         SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000
+                     )
+                     INSERT INTO agent_dispatches(
+                         issue_id, worktree_path, agent_name, dispatched_at_ms, status
+                     )
+                     SELECT 'THE-' || i, '/wt/large', 'codex', i % 997, 'done' FROM n;",
+                )
+                .unwrap();
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        super::verify_v93_schema(db.conn()).unwrap();
+        let version: i64 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+
+        let expected = db
+            .list_dispatches()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        let mut before = None;
+        loop {
+            let (page, truncated) = db.dispatch_history_page(before, 4096).unwrap();
+            before = page.last().map(|row| row.id);
+            actual.extend(page.into_iter().map(|row| row.id));
+            if !truncated {
+                assert_eq!(actual.len(), 20_000, "final page must be complete");
+                break;
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]
