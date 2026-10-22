@@ -534,6 +534,7 @@ pub struct VpsProvider {
     spec: VpsSpec,
     client: reqwest::Client,
     owner: Option<String>,
+    credential_ref: Option<String>,
     /// Resolved public IP, cached per provider instance (registry, then API).
     ip: Mutex<Option<String>>,
 }
@@ -544,6 +545,7 @@ impl VpsProvider {
             spec,
             client: crate::provider::provider_http_client(),
             owner: None,
+            credential_ref: None,
             ip: Mutex::new(None),
         }
     }
@@ -559,6 +561,23 @@ impl VpsProvider {
 
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
+    }
+
+    pub fn with_credential_ref(mut self, credential_ref: &str) -> Self {
+        self.credential_ref = Some(credential_ref.to_owned());
+        self
+    }
+
+    pub fn account(&self) -> Result<String> {
+        let Some(credential_ref) = self.credential_ref.as_deref() else {
+            return Ok(String::new());
+        };
+        let authority = crate::provider::authority_key(&self.spec.validated_api_base()?)?;
+        Ok(registry::account_fingerprint(
+            self.spec.kind.as_str(),
+            &authority,
+            credential_ref,
+        ))
     }
 
     fn shaper(&self) -> &'static dyn VpsShaper {
@@ -712,6 +731,13 @@ impl VpsProvider {
         let ip = inst
             .ip
             .ok_or_else(|| anyhow!("vps: instance {name} has no public IPv4 yet"))?;
+        let account = match self.account() {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::debug!(target: "thegn::vps", %error, "registry cache account unavailable");
+                String::new()
+            }
+        };
         if let Err(error) = registry::write(&registry::VpsRecord {
             // best-effort: registry is a cache; write failure just means no resurrection row
             name: name.to_string(),
@@ -721,6 +747,7 @@ impl VpsProvider {
             ip: ip.clone(),
             created_at: inst.created.unwrap_or_else(thegn_core::util::now),
             owner: String::new(),
+            account,
         }) {
             tracing::debug!(target: "thegn::vps", %error, "registry cache write failed");
         }
@@ -1077,6 +1104,7 @@ impl RemoteProvider for VpsProvider {
             let name = self.spec.name.clone();
             let base = self.spec.validated_api_base()?;
             let user_data = cloudinit::user_data(&self.spec.pubkey, !resolved.is_snapshot);
+            let account = self.account()?;
             // Reserve capacity and publish the intent before key setup or any
             // server request. File locking and ledger I/O stay off the runtime.
             let intent = registry::VpsRecord {
@@ -1087,6 +1115,7 @@ impl RemoteProvider for VpsProvider {
                 ip: String::new(),
                 created_at: thegn_core::util::now(),
                 owner: self.owner.clone().unwrap_or_default(),
+                account: account.clone(),
             };
             let cap = self.spec.max_instances();
             let reservation_name = name.clone();
@@ -1105,6 +1134,9 @@ impl RemoteProvider for VpsProvider {
                     ));
                 }
                 Err(error @ registry::ReserveError::OwnedByOther { .. }) => {
+                    return Err(anyhow!(error));
+                }
+                Err(error @ registry::ReserveError::OtherAccount { .. }) => {
                     return Err(anyhow!(error));
                 }
                 Err(registry::ReserveError::Store(error)) => {
@@ -1169,6 +1201,7 @@ impl RemoteProvider for VpsProvider {
                 ip: ip.clone(),
                 created_at,
                 owner: self.owner.clone().unwrap_or_default(),
+                account,
             })?;
             if !ip.is_empty() {
                 *self.ip.lock().unwrap() = Some(ip.clone());
@@ -1325,6 +1358,33 @@ impl ProviderFiles for VpsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_is_empty_without_a_credential_ref_and_stable_with_one() {
+        let spec = VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base: String::new(),
+            token: "secret-token-value".into(),
+            name: "tg-account-test".into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/tmp/test-key".into(),
+            pubkey: String::new(),
+            skip_ready_wait: true,
+        };
+        let without_ref = VpsProvider::new(spec.clone());
+        let first = VpsProvider::new(spec.clone()).with_credential_ref("HCLOUD_TOKEN");
+        let same = VpsProvider::new(spec.clone()).with_credential_ref("HCLOUD_TOKEN");
+        let rotated_ref = VpsProvider::new(spec).with_credential_ref("HCLOUD_TOKEN_WORK");
+
+        assert!(without_ref.account().unwrap().is_empty());
+        assert_eq!(first.account().unwrap(), same.account().unwrap());
+        assert_ne!(first.account().unwrap(), rotated_ref.account().unwrap());
+        assert!(!first.account().unwrap().contains("secret-token-value"));
+    }
 
     fn hetzner_page(ids: &[i64], page: u32, has_next: bool, total: u64) -> serde_json::Value {
         let next_page = if has_next {
@@ -1738,6 +1798,7 @@ mod tests {
             ip: String::new(),
             created_at: 1,
             owner: String::new(),
+            account: String::new(),
         })
         .unwrap();
         let spec_key_path = std::path::Path::new("/tmp/nonexistent-managed-key");
@@ -1788,6 +1849,7 @@ mod tests {
             ip: "192.0.2.1".into(),
             created_at: 1,
             owner: registry::worktree_owner(b"/worktree/owner-a"),
+            account: String::new(),
         })
         .unwrap();
         let provider = VpsProvider::new(VpsSpec {
