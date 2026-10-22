@@ -24,6 +24,7 @@ use chrono::NaiveDate;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use thegn_core::calendar::ics::{IcsDiagnostic, IcsReport};
+use thegn_core::calendar::validate::EventDefect;
 use thegn_core::calendar::{
     AdmissionBudget, AdmissionError, AdmissionLease, AdmissionMeter, AdmissionPool, CalEvent,
     CalendarWindow,
@@ -267,8 +268,6 @@ pub struct EventPage {
     diagnostics: PageDiagnostics,
     lease: AdmissionLease,
 }
-
-use thegn_core::calendar::validate::EventDefect;
 
 /// Value-free counts of parser diagnostics accumulated while building a page.
 /// Counts are diagnostic records, not events: one event may contribute more
