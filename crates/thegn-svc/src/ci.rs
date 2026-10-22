@@ -150,27 +150,71 @@ pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
     provider_for_cancellable(loc, cfg, Arc::new(AtomicBool::new(false)))
 }
 
+/// Pick the provider and its cache identity from one origin snapshot.
+pub fn provider_and_context_for(
+    loc: &GitLoc,
+    cfg: &CiConfig,
+) -> Option<(CiClient, Option<String>)> {
+    provider_and_context_for_cancellable(loc, cfg, Arc::new(AtomicBool::new(false)))
+}
+
 /// Pick a CI provider whose subprocesses observe the caller-owned cancellation flag.
 pub fn provider_for_cancellable(
     loc: &GitLoc,
     cfg: &CiConfig,
     cancel: Arc<AtomicBool>,
 ) -> Option<CiClient> {
+    provider_and_context_for_cancellable(loc, cfg, cancel).map(|(client, _)| client)
+}
+
+/// Pick a cancellable provider and context from the same origin snapshot.
+pub fn provider_and_context_for_cancellable(
+    loc: &GitLoc,
+    cfg: &CiConfig,
+    cancel: Arc<AtomicBool>,
+) -> Option<(CiClient, Option<String>)> {
     if cfg.provider == CiProviderKind::None {
         return None;
     }
     let origin = origin_url(loc);
     let system = resolve_system_from_origin(loc, cfg, origin.as_deref())?;
+    let context = origin
+        .as_deref()
+        .and_then(|origin| cache_context_for(system, origin));
     if system == CiSystem::GithubActions {
         // Keep the exact origin snapshot used for provider selection. The
         // authenticated gh call must not re-read a possibly changed remote.
         let remote = origin.as_deref().and_then(parse_github_remote)?;
-        return Some(Box::new(GithubCi {
-            remote: Some(remote),
-            cancel,
-        }));
+        return Some((
+            Box::new(GithubCi {
+                remote: Some(remote),
+                cancel,
+            }),
+            context,
+        ));
     }
-    client_for_system_with_config_and_cancel(system, cfg, cancel)
+    client_for_system_with_config_and_cancel(system, cfg, cancel).map(|client| (client, context))
+}
+
+/// Stable, account-free cache context for a parsed provider origin.
+pub fn cache_context_for(system: CiSystem, origin: &str) -> Option<String> {
+    match system {
+        CiSystem::GithubActions => parse_github_remote(origin)
+            .map(|remote| format!("github:{}/{}", remote.host, remote.repository)),
+        CiSystem::GitlabCi => parse_gitlab_remote(origin)
+            .map(|remote| format!("gitlab:{}/{}", remote.host, remote.project)),
+        _ => None,
+    }
+}
+
+/// Resolve the current provider context for a cache reader.
+pub fn cache_context(loc: &GitLoc, cfg: &CiConfig) -> Option<String> {
+    if cfg.provider == CiProviderKind::None {
+        return None;
+    }
+    let origin = origin_url(loc)?;
+    let system = resolve_system_from_origin(loc, cfg, Some(&origin))?;
+    cache_context_for(system, &origin)
 }
 
 /// The system → client factory (pure; `provider_for` adds remote/file sniffing).
@@ -2227,6 +2271,36 @@ fn warn_unknown_gitlab_state(status: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_context_names_system_host_and_project() {
+        let github_https = cache_context_for(CiSystem::GithubActions, "https://github.com/o/r.git");
+        assert_eq!(github_https.as_deref(), Some("github:github.com/o/r"));
+        assert_eq!(
+            cache_context_for(CiSystem::GithubActions, "git@github.com:o/r.git"),
+            github_https
+        );
+        assert_eq!(
+            cache_context_for(
+                CiSystem::GitlabCi,
+                "https://gitlab.example.com:8443/g/sub/p.git"
+            )
+            .as_deref(),
+            Some("gitlab:gitlab.example.com:8443/g/sub/p")
+        );
+        assert_eq!(
+            cache_context_for(CiSystem::GithubActions, "https://user:pw@github.com/o/r"),
+            None
+        );
+        assert_eq!(
+            cache_context_for(CiSystem::GithubActions, "https://github.com.evil.test/o/r"),
+            None
+        );
+        assert_eq!(
+            cache_context_for(CiSystem::Drone, "https://github.com/o/r"),
+            None
+        );
+    }
 
     #[test]
     fn log_collector_matches_collect_log_for_any_chunking() {
