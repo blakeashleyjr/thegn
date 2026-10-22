@@ -1691,10 +1691,10 @@ SQL
   dry_stale_target_before="$(find "$DRY_STALE_TARGET_ROOT" -mindepth 1 -print | sort)"
   dry_stale_db_before="$(sha256sum "$DRY_STALE_TARGET_DB")"
   set +e
-  # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
+  # shellcheck disable=SC2034 # read by diagnostics and `check` bodies through `eval`
   dry_stale_human="$(move_cli "$DRY_STALE" session move "$DRY_STALE_WT" --to-profile target --dry-run 2>&1)"
   dry_stale_human_rc=$?
-  # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
+  # shellcheck disable=SC2034 # read by diagnostics and `check` bodies through `eval`
   dry_stale_json="$(move_cli "$DRY_STALE" session move "$DRY_STALE_WT" --to-profile target --dry-run --json 2>&1)"
   dry_stale_json_rc=$?
   set -e
