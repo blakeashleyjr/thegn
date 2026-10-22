@@ -94,6 +94,59 @@ fn calendar_account_debug_redacts_url_userinfo_and_token() {
 }
 
 #[test]
+fn calendar_account_debug_redacts_command_env_values_and_arguments() {
+    let account = CalendarAccount {
+        command: vec![
+            "khal-thegn".into(),
+            "--token".into(),
+            "argv-sentinel-7f3".into(),
+        ],
+        env: BTreeMap::from([("KHAL_TOKEN".to_string(), "env-sentinel-9c1".to_string())]),
+        ..account("plugin", CalendarProviderKind::Command)
+    };
+
+    let debug = format!("{account:?}");
+    assert!(!debug.contains("argv-sentinel-7f3"), "{debug}");
+    assert!(!debug.contains("env-sentinel-9c1"), "{debug}");
+    assert!(debug.contains("khal-thegn"), "{debug}");
+    assert!(debug.contains("KHAL_TOKEN"), "{debug}");
+}
+
+#[test]
+fn calendar_config_debug_redacts_every_account_secret() {
+    let command = CalendarAccount {
+        command: vec![
+            "khal-thegn".into(),
+            "--token".into(),
+            "argv-sentinel-7f3".into(),
+        ],
+        env: BTreeMap::from([("KHAL_TOKEN".to_string(), "env-sentinel-9c1".to_string())]),
+        ..account("plugin", CalendarProviderKind::Command)
+    };
+    let remote = CalendarAccount {
+        url: "https://calendar.example/feed?sig=url-sentinel-2b8".into(),
+        username: "user-sentinel-5d0".into(),
+        token: "token-sentinel-4e6".into(),
+        ..account("remote", CalendarProviderKind::IcsUrl)
+    };
+    let cfg = CalendarConfig {
+        accounts: vec![remote, command],
+        ..Default::default()
+    };
+
+    let debug = format!("{cfg:?}");
+    for sentinel in [
+        "url-sentinel-2b8",
+        "user-sentinel-5d0",
+        "token-sentinel-4e6",
+        "argv-sentinel-7f3",
+        "env-sentinel-9c1",
+    ] {
+        assert!(!debug.contains(sentinel), "{sentinel} leaked in {debug}");
+    }
+}
+
+#[test]
 fn a_misconfigured_refresh_interval_can_never_spin() {
     // THE guard: 0 and 1 must both resolve to the floor, in the accessor, so
     // every caller inherits it rather than each remembering to clamp.
