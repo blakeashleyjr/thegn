@@ -142,10 +142,29 @@ fn bridge_argv(bridge_path: String, port: u16, deadlines: &TunnelDeadlineSecs) -
     argv
 }
 
+fn tunnel_exec_argv(
+    bridge: &crate::bridge_sup::ResidentBridge,
+    port: u16,
+    deadlines: &TunnelDeadlineSecs,
+) -> Vec<String> {
+    let argv = bridge_argv(bridge.path().to_string(), port, deadlines);
+    crate::bridge_sup::verified_exec_argv(bridge, &argv[1..])
+}
+
 #[derive(Clone, Default)]
 pub struct ReverseTunnelSupervisor {
     tasks: Tasks,
     global_permits: Arc<OnceLock<Arc<Semaphore>>>,
+}
+
+pub(crate) struct StartAllArgs<'a> {
+    pub(crate) handle: &'a Handle,
+    pub(crate) cfg: &'a thegn_core::config::Config,
+    pub(crate) env: &'a thegn_core::env::Environment,
+    pub(crate) sandbox_id: &'a str,
+    pub(crate) bridge: &'a crate::bridge_sup::ResidentBridge,
+    pub(crate) worktree: &'a str,
+    pub(crate) tunnels: Vec<(u16, String)>,
 }
 
 impl ReverseTunnelSupervisor {
@@ -169,7 +188,7 @@ impl ReverseTunnelSupervisor {
     }
 
     /// Start a reverse tunnel for `worktree`: bind `sandbox_port` inside the
-    /// sandbox (via the resident bridge at `bridge_path`) and forward every
+    /// sandbox (via the verified resident bridge) and forward every
     /// connection to the host `host_target` (`host:port`, e.g. the host nix
     /// cache). Idempotent per `(worktree, sandbox_port)`. `handle` is the
     /// tokio runtime to spawn the pump on (callers run inside `spawn_blocking`,
@@ -181,7 +200,7 @@ impl ReverseTunnelSupervisor {
         worktree: &str,
         provider: Provider,
         sandbox_id: String,
-        bridge_path: String,
+        bridge: crate::bridge_sup::ResidentBridge,
         sandbox_port: u16,
         host_target: String,
         limits: TunnelRunLimits,
@@ -196,7 +215,7 @@ impl ReverseTunnelSupervisor {
         }
         let task = handle.spawn(async move {
             let spec = ExecSpec {
-                argv: bridge_argv(bridge_path, sandbox_port, &limits.deadline_secs),
+                argv: tunnel_exec_argv(&bridge, sandbox_port, &limits.deadline_secs),
                 tty: false,
                 cols: 0,
                 rows: 0,
@@ -256,20 +275,21 @@ impl ReverseTunnelSupervisor {
     /// instantaneous health at worktree-switch would leave the port unbound (e.g.
     /// the nix-cache `:8484` "could not connect") until the next switch. Only the
     /// durable gates apply: `exec != cli` and the provider has a native exec API.
-    pub fn start_all(
-        &self,
-        handle: &Handle,
-        cfg: &thegn_core::config::Config,
-        env: &thegn_core::env::Environment,
-        sandbox_id: &str,
-        worktree: &str,
-        tunnels: Vec<(u16, String)>,
-    ) {
+    pub(crate) fn start_all(&self, args: StartAllArgs<'_>) {
+        let StartAllArgs {
+            handle,
+            cfg,
+            env,
+            sandbox_id,
+            bridge,
+            worktree,
+            tunnels,
+        } = args;
         if tunnels.is_empty() {
             return;
         }
-        // Reverse tunnels ride the resident musl bridge pushed to `/workspace/.tg/thegn`
-        // (`agent::ensure_remote_bridge`). With no local bridge binary configured
+        // Reverse tunnels ride the verified resident musl bridge installed by
+        // `agent::ensure_remote_bridge`. With no local bridge binary configured
         // (`THEGN_BRIDGE_BINARY` / a `thegn-musl` next to the exe) that push is skipped,
         // so `bridge-revtunnel` would exec a missing binary and the port never binds —
         // surfacing in-sandbox as `:8484 could not connect`. Warn once and skip rather
@@ -307,7 +327,7 @@ impl ReverseTunnelSupervisor {
                 worktree,
                 provider,
                 sandbox_id.to_string(),
-                crate::bridge_sup::remote_thegn(),
+                bridge.clone(),
                 sandbox_port,
                 host_target,
                 TunnelRunLimits {
@@ -337,6 +357,19 @@ impl ReverseTunnelSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_exec_argv_runs_through_the_verify_wrapper() {
+        let bridge = crate::bridge_sup::resident_bridge_for(b"tunnel bridge");
+        let deadlines = thegn_core::config::ForwardConfig::default().tunnel_deadlines();
+        let argv = tunnel_exec_argv(&bridge, 8383, &deadlines);
+        assert_eq!(&argv[..2], &["/bin/sh", "-c"]);
+        assert_eq!(
+            &argv[3..6],
+            &["thegn-bridge", bridge.path(), bridge.sha256()]
+        );
+        assert_eq!(&argv[6..], &["bridge-revtunnel", "8383"]);
+    }
 
     #[test]
     fn backoff_grows_on_fast_failure_and_resets_when_healthy() {
