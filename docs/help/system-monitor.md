@@ -111,8 +111,9 @@ and `spc` pause on every tab.
 
 Overview is the default landing tab. It summarizes CPU and per-core activity,
 load and pressure, memory health, network rates, disk activity, thermal state,
-power when a battery is present, and process/container counts. Panels appear
-when their source has a reading; absent readings use the terminal absent mark.
+power when there is a battery reading or a detected power supply, and
+process/container counts. Panels appear when their source has a reading; absent
+readings use the terminal absent mark.
 
 ## CPU
 
