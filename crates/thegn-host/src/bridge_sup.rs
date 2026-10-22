@@ -14,6 +14,8 @@ use std::io::{self, Read, Write};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use sha2::{Digest, Sha256};
+
 use thegn_core::placement::Placement;
 use thegn_core::remote::GitLoc;
 use thegn_svc::bridge::{self, BridgeClient};
@@ -81,12 +83,13 @@ impl BridgeSupervisor {
         host_path: &str,
         provider: Provider,
         sandbox_id: String,
+        bridge: &ResidentBridge,
         rt: tokio::runtime::Handle,
     ) {
         if bridge::bridge_key(loc).is_none() || self.is_connected(loc) {
             return;
         }
-        match open_bridge_native(&provider, &sandbox_id, &rt) {
+        match open_bridge_native(&provider, &sandbox_id, bridge, &rt) {
             Ok(client) => self.connect_client(loc, workdir, host_path, Arc::new(client)),
             Err(e) => thegn_core::msg::warn(&format!("native bridge connect failed: {e}")),
         }
@@ -186,11 +189,44 @@ pub(crate) fn automatic_cleanup_resources_absent(path: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Default in-env path the static-musl `thegn` is pushed to (8-B.3). The push
-/// (`agent::ensure_remote_bridge`) installs the binary here before connect; if no
-/// local binary is configured the connect spawn-fails gracefully (per-op fallback).
-pub fn remote_thegn() -> String {
-    "/workspace/.tg/thegn".to_string()
+/// Provider-private root for content-addressed resident bridge installs.
+pub const BRIDGE_ROOT: &str = "/var/tmp/thegn-bridge";
+
+/// Verified resident bridge executable installed for exact local bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentBridge {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Bind the remote path to the digest of the exact local executable bytes.
+pub fn resident_bridge_for(data: &[u8]) -> ResidentBridge {
+    let sha256 = format!("{:x}", Sha256::digest(data));
+    ResidentBridge {
+        path: format!("{BRIDGE_ROOT}/{sha256}/thegn"),
+        sha256,
+    }
+}
+
+/// Return the content-addressed parent directory for a resident bridge.
+pub fn resident_bridge_dir(bridge: &ResidentBridge) -> String {
+    format!("{BRIDGE_ROOT}/{}", bridge.sha256)
+}
+
+const VERIFY_EXEC: &str = r#"p=$1; want=$2; shift 2; got=$(sha256sum -- "$p" 2>/dev/null) || { echo 'thegn: cannot hash the resident bridge' >&2; exit 126; }; [ "${got%% *}" = "$want" ] || { echo 'thegn: resident bridge digest mismatch' >&2; exit 126; }; exec "$p" "$@""#;
+
+/// Run a native executable only after its current bytes match the install digest.
+pub fn verified_exec_argv(bridge: &ResidentBridge, args: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        VERIFY_EXEC.to_string(),
+        "thegn-bridge".to_string(),
+        bridge.path.clone(),
+        bridge.sha256.clone(),
+    ];
+    argv.extend_from_slice(args);
+    argv
 }
 
 /// The local static-musl `thegn` to push into a remote env, or `None` to skip
@@ -224,7 +260,7 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
 /// Build the transport command that runs `thegn bridge` *inside* the env for a
 /// placement, or `None` when no bridge applies (local / k8s-for-now). The agent
 /// reads framed requests on stdin and writes responses/notifications on stdout.
-pub fn bridge_command(placement: &Placement) -> Option<Command> {
+pub fn bridge_command(placement: &Placement, bridge: Option<&ResidentBridge>) -> Option<Command> {
     match placement {
         Placement::Ssh(t) => {
             // ssh <ctrlmaster opts> <host> -- thegn bridge (remote has thegn).
@@ -234,9 +270,10 @@ pub fn bridge_command(placement: &Placement) -> Option<Command> {
             Some(argv_command(&argv))
         }
         Placement::Provider(p) => {
-            // <control_prefix> <remote thegn> bridge.
+            // Vendor CLI quoting is provider-specific; its launch re-check is deferred.
+            let bridge = bridge?;
             let mut argv = p.control_prefix.clone();
-            argv.push(remote_thegn());
+            argv.push(bridge.path.clone());
             argv.push("bridge".to_string());
             Some(argv_command(&argv))
         }
@@ -257,10 +294,11 @@ fn argv_command(argv: &[String]) -> Command {
 fn open_bridge_native(
     provider: &Provider,
     sandbox_id: &str,
+    bridge: &ResidentBridge,
     rt: &tokio::runtime::Handle,
 ) -> anyhow::Result<BridgeClient> {
     let spec = ExecSpec {
-        argv: vec![remote_thegn(), "bridge".to_string()],
+        argv: verified_exec_argv(bridge, &["bridge".to_string()]),
         tty: false,
         cols: 0,
         rows: 0,
@@ -507,7 +545,7 @@ mod tests {
             false,
             TransportKind::Ssh,
         ));
-        let c = bridge_command(&ssh).expect("ssh cmd");
+        let c = bridge_command(&ssh, None).expect("ssh cmd");
         assert_eq!(c.get_program(), "ssh");
         let args: Vec<String> = c
             .get_args()
@@ -531,16 +569,123 @@ mod tests {
             up_command: vec![],
             down_command: vec![],
         });
-        let c = bridge_command(&prov).expect("provider cmd");
+        let bridge = resident_bridge_for(b"provider bridge");
+        let c = bridge_command(&prov, Some(&bridge)).expect("provider cmd");
         assert_eq!(c.get_program(), "sprite");
         let args: Vec<String> = c
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args.last().unwrap(), "bridge");
+        assert!(args.contains(&bridge.path));
 
         // local: no bridge
-        assert!(bridge_command(&Placement::Local).is_none());
+        assert!(bridge_command(&Placement::Local, None).is_none());
+    }
+
+    #[test]
+    fn resident_bridge_path_is_content_addressed_outside_the_worktree() {
+        let bridge = resident_bridge_for(b"abc");
+        assert_eq!(
+            bridge.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            bridge.path,
+            "/var/tmp/thegn-bridge/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad/thegn"
+        );
+        assert!(!bridge.path.starts_with("/workspace"));
+        assert_ne!(bridge.path, resident_bridge_for(b"different").path);
+        assert_eq!(
+            resident_bridge_dir(&bridge),
+            format!("{BRIDGE_ROOT}/{}", bridge.sha256)
+        );
+    }
+
+    #[test]
+    fn verified_exec_argv_checks_the_digest_before_exec() {
+        let bridge = resident_bridge_for(b"abc");
+        let args = vec!["bridge-revtunnel".to_string(), "8383".to_string()];
+        let argv = verified_exec_argv(&bridge, &args);
+        assert_eq!(&argv[..2], &["/bin/sh", "-c"]);
+        assert_eq!(
+            &argv[3..6],
+            &["thegn-bridge", bridge.path.as_str(), bridge.sha256.as_str()]
+        );
+        assert_eq!(&argv[6..], args.as_slice());
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "exercise the local shell verification wrapper"
+    )]
+    fn verified_exec_wrapper_refuses_mismatched_bytes() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            // This host has no local POSIX shell to exercise the wrapper.
+            return;
+        }
+        let probe = std::process::Command::new("sha256sum")
+            .arg("--version")
+            .output();
+        if !probe.is_ok_and(|result| result.status.success()) {
+            // This host has no sha256sum implementation for the wrapper.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bridge.sh");
+        let bytes = b"#!/bin/sh\nprintf '%s\\n' \"$1\"\n";
+        std::fs::write(&script, bytes).unwrap();
+        let chmod = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "chmod 0700 -- \"$1\"",
+                "chmod-bridge",
+                script.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            chmod.success(),
+            "local shell could not mark the bridge executable"
+        );
+        let bridge = resident_bridge_for(bytes);
+        let mut argv = verified_exec_argv(&bridge, &["ok".to_string()]);
+        argv[4] = script.to_string_lossy().into_owned();
+        let mut command = std::process::Command::new(&argv[0]);
+        command.args(&argv[1..]);
+        let success = command.output().unwrap();
+        assert!(success.status.success());
+        assert_eq!(success.stdout, b"ok\n");
+
+        let altered = b"#!/bin/sh\nprintf 'evil\\n'\n";
+        std::fs::write(&script, altered).unwrap();
+        let mut command = std::process::Command::new(&argv[0]);
+        command.args(&argv[1..]);
+        let refused = command.output().unwrap();
+        assert_eq!(refused.status.code(), Some(126));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("digest mismatch"));
+    }
+
+    #[test]
+    fn bridge_command_provider_requires_a_verified_bridge() {
+        let provider = Placement::Provider(ProviderPlacement {
+            provider: "sprites".into(),
+            id: "s1".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec!["sprite".into(), "exec".into(), "--".into()],
+            up_command: vec![],
+            down_command: vec![],
+        });
+        assert!(bridge_command(&provider, None).is_none());
+        let bridge = resident_bridge_for(b"verified");
+        let command = bridge_command(&provider, Some(&bridge)).expect("verified provider command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&bridge.path));
+        assert_eq!(args.last().map(String::as_str), Some("bridge"));
     }
 
     #[test]
