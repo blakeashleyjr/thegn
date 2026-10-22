@@ -183,7 +183,7 @@ fn runs(
     // Host-path cache key — matches the panel's reader (never `loc.path()`).
     let cache_key = GitLoc::worktree_cache_key(&wt);
     let loc = GitLoc::for_worktree(&wt);
-    let Some(client) = provider_for(&loc, &cfg.ci) else {
+    let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg.ci) else {
         if json_out {
             return super::emit_json(&Vec::<CiRun>::new());
         }
@@ -221,6 +221,7 @@ fn runs(
                     let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
                         runs: runs.clone(),
                         discarded_rows: result.discarded_rows,
+                        context: context.clone().unwrap_or_default(),
                     })
                     .unwrap_or_default();
                     let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
@@ -239,6 +240,7 @@ fn runs(
                 let json = serde_json::to_string(&thegn_core::ci::CiRunCache {
                     runs: runs.clone(),
                     discarded_rows: result.discarded_rows,
+                    context: context.clone().unwrap_or_default(),
                 })
                 .unwrap_or_default();
                 let _ = db.put_ci_cache(&cache_key, cache_branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth

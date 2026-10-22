@@ -452,6 +452,28 @@ pub(crate) fn cache_row_current(
         }
 }
 
+pub(crate) fn context_row_current(cached_context: &str, current_context: Option<&str>) -> bool {
+    match current_context {
+        None => true,
+        Some(context) => thegn_core::ci::cache_context_matches(cached_context, Some(context)),
+    }
+}
+
+pub(crate) fn logs_need_purge(old: Option<&str>, new: Option<&str>) -> bool {
+    matches!((old, new), (Some(old), Some(new)) if old != new)
+}
+
+pub(crate) fn daemon_ci_runs_limit(limit: usize, max_runs: usize) -> Result<usize, String> {
+    match limit {
+        0 => Ok(max_runs.min(thegn_core::config_ci::MAX_CI_RUNS).max(1)),
+        1..=thegn_core::config_ci::MAX_CI_RUNS => Ok(limit),
+        _ => Err(format!(
+            "limit must be between 1 and {}",
+            thegn_core::config_ci::MAX_CI_RUNS
+        )),
+    }
+}
+
 /// Resolve the local cache identity through gix regardless of the configured
 /// read backend. This is used on the refresh tick and when writing local rows,
 /// so neither path spawns a process and both agree for unborn or ambiguous refs.
@@ -465,25 +487,35 @@ fn local_ci_cache_branch(loc: &thegn_core::remote::GitLoc) -> Option<String> {
 
 fn cached_ci_row_is_current(
     loc: &thegn_core::remote::GitLoc,
+    cfg: &thegn_core::config::CiConfig,
     cached: Option<&(String, String, i64)>,
     now: i64,
-    ttl_secs: u64,
 ) -> bool {
     let current_branch = if cached
-        .is_some_and(|(_, _, fetched_at)| ci_cache_is_fresh(Some(*fetched_at), now, ttl_secs))
+        .is_some_and(|(_, _, fetched_at)| ci_cache_is_fresh(Some(*fetched_at), now, cfg.ttl_secs))
     {
         local_ci_cache_branch(loc)
     } else {
         None
     };
-    cached.is_some_and(|(_, branch, fetched_at)| {
-        cache_row_current(
-            Some(*fetched_at),
-            Some(branch),
-            current_branch.as_deref(),
-            now,
-            ttl_secs,
-        )
+    cached.is_some_and(|(json, branch, fetched_at)| {
+        let age_is_fresh = ci_cache_is_fresh(Some(*fetched_at), now, cfg.ttl_secs);
+        let current_context = if age_is_fresh && !loc.is_remote() {
+            thegn_svc::ci::cache_context(loc, cfg)
+        } else {
+            None
+        };
+        age_is_fresh
+            && cache_row_current(
+                Some(*fetched_at),
+                Some(branch),
+                current_branch.as_deref(),
+                now,
+                cfg.ttl_secs,
+            )
+            && thegn_core::ci::decode_run_cache(json).is_some_and(|decoded| {
+                context_row_current(&decoded.context, current_context.as_deref())
+            })
     })
 }
 
@@ -796,7 +828,7 @@ fn refresh_ci_cache_for(
     let now = thegn_core::util::now();
     if !force {
         let cached = db.get_ci_cache_entry(&key).ok().flatten();
-        let row_is_current = cached_ci_row_is_current(loc, cached.as_ref(), now, cfg.ttl_secs);
+        let row_is_current = cached_ci_row_is_current(loc, cfg, cached.as_ref(), now);
         if row_is_current || backoff_active(&key, now) {
             return false;
         }
@@ -804,7 +836,8 @@ fn refresh_ci_cache_for(
     if cancel.load(Ordering::Relaxed) {
         return false;
     }
-    let Some(client) = thegn_svc::ci::provider_for_cancellable(loc, cfg, Arc::clone(&cancel))
+    let Some((client, context)) =
+        thegn_svc::ci::provider_and_context_for_cancellable(loc, cfg, Arc::clone(&cancel))
     else {
         return false;
     };
@@ -842,9 +875,19 @@ fn refresh_ci_cache_for(
                     return false;
                 }
                 thegn_core::connectivity::report_success();
+                if let Ok(Some((old_json, _, _))) = db.get_ci_cache_entry(&key) {
+                    let old_context =
+                        thegn_core::ci::decode_run_cache(&old_json).map(|cache| cache.context);
+                    if logs_need_purge(old_context.as_deref(), context.as_deref())
+                        && let Err(error) = db.retain_ci_logs(&key, &[])
+                    {
+                        tracing::debug!(target: "thegn::ci", %error, "could not purge cached CI logs after provider context change");
+                    }
+                }
                 if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
                     runs: runs.clone(),
                     discarded_rows: result.discarded_rows,
+                    context: context.clone().unwrap_or_default(),
                 }) && crate::hydrate_schedule::generation_is_current(generation.as_ref())
                     && let Err(error) =
                         db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json)
@@ -1676,6 +1719,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_context_switch_makes_a_fresh_row_stale() {
+        assert!(!context_row_current(
+            "github:github.com/o/a",
+            Some("github:github.com/o/b")
+        ));
+        assert!(context_row_current(
+            "github:github.com/o/a",
+            Some("github:github.com/o/a")
+        ));
+        assert!(!context_row_current("", Some("github:github.com/o/a")));
+    }
+
+    #[test]
+    fn unknown_current_context_keeps_branch_and_age_rule() {
+        assert!(context_row_current("anything", None));
+    }
+
+    #[test]
+    fn context_change_purges_cached_logs() {
+        for (old, new, expected) in [
+            (Some("a"), Some("b"), true),
+            (Some(""), Some("b"), true),
+            (Some("a"), Some("a"), false),
+            (None, Some("b"), false),
+            (Some("a"), None, false),
+        ] {
+            assert_eq!(logs_need_purge(old, new), expected);
+        }
+    }
+
+    #[test]
+    fn daemon_ci_runs_limit_refuses_over_the_cli_cap() {
+        assert_eq!(daemon_ci_runs_limit(0, 250), Ok(200));
+        assert_eq!(daemon_ci_runs_limit(0, 0), Ok(1));
+        assert_eq!(daemon_ci_runs_limit(1, 200), Ok(1));
+        assert_eq!(daemon_ci_runs_limit(200, 200), Ok(200));
+        assert_eq!(
+            daemon_ci_runs_limit(201, 200),
+            Err("limit must be between 1 and 200".into())
+        );
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "test fixture: create an isolated unborn Git worktree"
@@ -1705,9 +1791,12 @@ mod tests {
         let cached = db.get_ci_cache_entry(&key).expect("read cache row");
         assert!(cached_ci_row_is_current(
             &loc,
+            &thegn_core::config::CiConfig {
+                ttl_secs: 30,
+                ..Default::default()
+            },
             cached.as_ref(),
-            thegn_core::util::now(),
-            30
+            thegn_core::util::now()
         ));
     }
 
