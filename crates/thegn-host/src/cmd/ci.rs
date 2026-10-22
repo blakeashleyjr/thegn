@@ -445,15 +445,11 @@ fn log(
     let entry = if let Some(mut entry) = cached {
         // Cache rows have already been redacted and bounded. Re-apply the
         // configured policy so a later config change cannot widen a response.
-        let redacted = thegn_core::ci_log::redact(&entry.text);
-        let (text, truncated) = thegn_core::ci_log::bounded_window(
-            &redacted,
-            cfg.ci
-                .log_tail_lines
-                .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-            cfg.ci
-                .log_max_bytes
-                .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+        let (text, truncated) = thegn_core::ci_log::served_window(
+            &entry.text,
+            None,
+            cfg.ci.log_tail_lines,
+            cfg.ci.log_max_bytes,
         );
         entry.text = text;
         entry.redacted = true;
