@@ -806,7 +806,7 @@ mod tests {
     fn provider_bridge_ssh_exec_command_gets_one_quoted_word() {
         let bridge = resident_bridge_for(b"provider bridge");
         let verified = verified_exec_argv(&bridge, &["bridge".to_string()]);
-        let prefixes = [
+        let prefixes: [Vec<String>; 3] = [
             vec!["ssh".into(), "box".into(), "--".into()],
             vec![
                 "/usr/bin/ssh".into(),
@@ -863,7 +863,7 @@ mod tests {
     fn provider_bridge_ssh_exec_lookalikes_keep_separate_args() {
         let bridge = resident_bridge_for(b"provider bridge");
         let verified = verified_exec_argv(&bridge, &["bridge".to_string()]);
-        let prefixes = [
+        let prefixes: [Vec<String>; 7] = [
             vec!["daytona".into(), "ssh".into(), "box".into(), "--".into()],
             vec!["autossh".into(), "box".into(), "--".into()],
             vec!["ssh-wrapper".into(), "box".into(), "--".into()],
