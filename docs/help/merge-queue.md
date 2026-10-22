@@ -176,6 +176,9 @@ else. A week is how long you have to notice.
 - The sweep runs at startup and after each land. There is no timer, so
   something that comes due while thegn is closed is collected at the next
   launch rather than at the stroke of the deadline.
+  Sweep results appear in the status line; an empty startup sweep is silent.
+  **Sweep merged** from the palette reports `merge queue: nothing to sweep`
+  when there is nothing to do.
 
 Set `merged_ttl_secs = 0` to keep merged worktrees indefinitely (the same
 as `on_landed = "move"`), or `on_landed = "remove"` to delete immediately
