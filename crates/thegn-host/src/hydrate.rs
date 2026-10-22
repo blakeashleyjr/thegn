@@ -4523,10 +4523,24 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                         ..Default::default()
                     };
                     for id in &linked {
-                        if let Ok(Err(e)) =
-                            thegn_svc::issue::block_on_tracker(router.update_issue(id, &patch))
-                        {
-                            tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
+                        match thegn_svc::issue::block_on_tracker(router.update_issue(id, &patch)) {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) | Err(e) => {
+                                tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
+                                let message = crate::hydrate_tracker::move_on_merge_failure_message(
+                                    id,
+                                    &e.to_string(),
+                                );
+                                if let Err(error) = crate::automation_events::emit_once(
+                                    &db,
+                                    "automation_failed",
+                                    id,
+                                    &message,
+                                    &wt,
+                                ) {
+                                    tracing::debug!(target: "thegn::issues", issue = %id, %error, "could not persist move-on-merge failure notification");
+                                }
+                            }
                         }
                     }
                 }
