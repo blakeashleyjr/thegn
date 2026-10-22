@@ -552,7 +552,8 @@ fn prepare_profile_dirs(base: &std::path::Path, name: &str) -> Result<(), Reroot
     })?;
     let profile = PathBuf::from("profiles").join(name);
     // Each component is finalized to 0700 before it becomes an intermediate;
-    // this tightens owned directories created under a permissive umask.
+    // this tightens owned directories created under a permissive umask (order
+    // is load-bearing: ensure_private_dir_beneath refuses a group-writable intermediate).
     for rel in [
         PathBuf::from("profiles"),
         profile.clone(),
@@ -1519,6 +1520,29 @@ mod tests {
             panic!("could not create symlink fixture: {error}");
         }
         assert_eq!(profile_ssh_key(&root).unwrap(), Some(key));
+    }
+
+    #[test]
+    fn profile_private_ssh_key_dangling_symlink_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("profile");
+        let target = dir.path().join("missing/id");
+        let key = root.join("ssh/id");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        if let Err(error) = fsperm::create_symlink(&target, &key, false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                // This platform does not permit creating the symlink fixture.
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+        assert!(matches!(
+            profile_ssh_key(&root),
+            Err(RerootError::Key { .. })
+        ));
     }
 
     #[test]

@@ -1100,7 +1100,8 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # that key. The profile git/gh/gnupg directories are mounted read-only in
 # sandboxes; a pane that must write them (for example `gh auth login` or GnuPG
 # signing) needs an explicit `[sandbox] mounts` grant. Startup refuses when the
-# profile state or credential directories cannot be created.
+# profile state or credential directories cannot be created. Startup also
+# refuses if `ssh/id` exists but is not an owner-only (chmod 600) regular file.
 #
 # CAVEAT: the firewall is only as strong as the loosest sandbox setting —
 # `[sandbox] file_access = "all"`, `network = "host"`, or SSH agent forwarding
