@@ -995,50 +995,53 @@ fn plan_iroh(spec: &ShareSpec, i: &IrohShareConfig) -> SharePlan {
 
 // ── sidecar-serve seam (tailscale; smoke-tested) ─────────────────────────────
 
-/// OCI runtimes to try when driving a worktree's VPN sidecar. We don't track
-/// which one started it, so try the likely ones; a wrong runtime fails to find
-/// the container and is skipped (mirrors `vpn::deregister`).
-fn likely_runtimes() -> Vec<OciRuntime> {
-    vec![
-        OciRuntime::podman(),
-        OciRuntime::docker(),
-        OciRuntime::new(vec!["sudo".into(), "-n".into(), "podman".into()]),
-    ]
-}
-
 /// Bring a tailscale serve/funnel up inside the worktree's VPN `sidecar` and
 /// return the resulting public URL (derived from the node's MagicDNS name).
 /// Errors with guidance if no sidecar with tailscale is reachable.
 pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<PublicEndpoint> {
-    for rt in likely_runtimes() {
-        match exec_in(&rt, sidecar, &serve.up_argv) {
-            Ok((true, _)) => {
-                let dns = serve_dns_name(&rt, sidecar)?;
-                let suffix = if serve.port == 443 {
-                    String::new()
-                } else {
-                    format!(":{}", serve.port)
-                };
-                let url = format!("{}://{dns}{suffix}", serve.scheme);
-                return PublicEndpoint::parse_url(&url)
-                    .ok_or_else(|| anyhow::anyhow!("share: invalid tailscale public URL"));
-            }
-            _ => continue,
+    let recorded = crate::vpn::recorded_sidecar(sidecar)?;
+    serve_up_with(&recorded, serve, |runtime, target, argv| {
+        exec_in(runtime, target, argv)
+    })
+}
+
+fn serve_up_with(
+    recorded: &crate::vpn::RecordedSidecar,
+    serve: &ServePlan,
+    mut exec: impl FnMut(&OciRuntime, &str, &[String]) -> Result<(bool, String)>,
+) -> Result<PublicEndpoint> {
+    let guidance = "share: tailscale ingress needs an active VPN sidecar with tailscale (set [sandbox.vpn] provider = \"tailscale\" on this worktree)";
+    match exec(&recorded.runtime, &recorded.id, &serve.up_argv) {
+        Ok((true, _)) => {
+            let dns = serve_dns_name(&recorded.runtime, &recorded.id, &mut exec)
+                .with_context(|| guidance)?;
+            let suffix = if serve.port == 443 {
+                String::new()
+            } else {
+                format!(":{}", serve.port)
+            };
+            let url = format!("{}://{dns}{suffix}", serve.scheme);
+            PublicEndpoint::parse_url(&url)
+                .ok_or_else(|| anyhow::anyhow!("share: invalid tailscale public URL"))
         }
+        Ok((false, output)) => bail!(
+            "{guidance}: tailscale serve command failed: {}",
+            output.trim()
+        ),
+        Err(error) => Err(error).with_context(|| guidance),
     }
-    bail!(
-        "share: tailscale ingress needs an active VPN sidecar with tailscale \
-         (set [sandbox.vpn] provider = \"tailscale\" on this worktree)"
-    )
 }
 
 /// Tear a tailscale serve/funnel down and verify it is absent in status JSON.
 /// Status uses `{"TCP":{"443":{"HTTPS":true}},"Web":{"host.ts.net:443":{..}},"AllowFunnel":{"host.ts.net:443":true}}`.
 /// A failed down command is accepted only when readable status confirms the port is absent.
 pub fn serve_down(sidecar: &str, serve: &ServePlan) -> Result<()> {
-    serve_down_with(&likely_runtimes(), serve, |rt, argv| {
-        exec_in(rt, sidecar, argv)
-    })
+    let recorded = crate::vpn::recorded_sidecar(sidecar).context("share: teardown unverified")?;
+    serve_down_with(
+        std::slice::from_ref(&recorded.runtime),
+        serve,
+        |rt, argv| exec_in(rt, &recorded.id, argv),
+    )
 }
 
 fn serve_down_with(
@@ -1106,13 +1109,17 @@ fn serve_status_has_port(json: &str, port: u16) -> Result<bool> {
 }
 
 /// Read the node's MagicDNS name from `tailscale status --json` in the sidecar.
-fn serve_dns_name(rt: &OciRuntime, sidecar: &str) -> Result<String> {
+fn serve_dns_name(
+    rt: &OciRuntime,
+    target: &str,
+    exec: &mut impl FnMut(&OciRuntime, &str, &[String]) -> Result<(bool, String)>,
+) -> Result<String> {
     let argv = vec![
         "tailscale".to_string(),
         "status".to_string(),
         "--json".to_string(),
     ];
-    let (ok, out) = exec_in(rt, sidecar, &argv)?;
+    let (ok, out) = exec(rt, target, &argv)?;
     if !ok {
         bail!("share: could not read tailscale status in sidecar");
     }
