@@ -83,7 +83,11 @@ thegn re-attests the row identity, PR head, and bound checkout. A merge is pinne
 to the head it evaluated; if the head moved, the row returns to watching with
 `head moved from <old> to <new> before the merge; refreshing`. A forge that
 cannot pin the head refuses the merge. Drain counts merged, merge requested
-(waiting for forge confirmation), and auto-merge armed separately.
+(waiting for forge confirmation), and auto-merge armed separately. If a later
+poll confirms a requested merge at the same head, the row records `merged
+(confirmed on a later poll)` and the drain counts it as merged. A merge at a
+different head, or one not requested by thegn, is recorded as merged on the
+forge but is not counted as a thegn merge.
 
 ## The agent
 

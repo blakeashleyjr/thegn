@@ -286,7 +286,9 @@ worktree's current context. A different or unknown cached context shows
 including for remote worktrees, the cached display is kept. CI autofix gives
 the PR-queue agent a redacted log excerpt starting 20 lines before the first
 recognised failure, or the newest lines if none is found; omitted lines are
-marked.
+marked. Sidebar attention follows the same provider-context rule: a cached CI
+failure from another context does not mark a worktree for attention, while an
+unknown current context keeps the cached failure.
 
 ### merge — the local merge queue
 
@@ -323,7 +325,11 @@ When issue numbers are shared across tracker accounts, each row shows its
 account in parentheses, including in My Work and the palette. If a tracker
 listing stops early, an amber `partial results: <accounts> — ...` line names
 the accounts and says whether the last complete list, partial list or cached
-rows are shown.
+rows are shown. Notifications for a shared issue number also name the
+account, and overdue notices for two accounts stay separate. With
+`[issues] move_on_merge` enabled, a linked issue that cannot move to Done when
+its PR merges raises an `automation_failed` inbox notification with the error
+redacted; the same issue and error are reported once.
 
 {{keys:issues}}
 

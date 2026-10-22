@@ -35,7 +35,8 @@ clipboard. Anything copied also lands in the default register (`"`). A copy larg
 the 4 MiB out-of-band limit is refused and reported in the status line.
 If a program in a pane sets the clipboard and the terminal write fails or is
 abandoned, the status line reports whether the terminal write failed or the
-writer stopped before sending; it never shows the copied text.
+writer stopped before sending; it never shows the copied text. Thegn
+initiated copies report failed or abandoned OSC 52 writes the same way.
 The panel's Logs `y` and `Y` use the same system-clipboard and OSC 52 paths.
 
 Selections are anchored to their **content**, not the screen: scroll the
