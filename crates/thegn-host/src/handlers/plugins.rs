@@ -425,6 +425,10 @@ fn one_shot_status(plugin: &str, contribution: &str, start: OneShotStart) -> Str
     match start {
         OneShotStart::Started => format!("Plugin {plugin}: running {contribution}"),
         OneShotStart::Busy => format!("Plugin {plugin}: {contribution} is already running"),
+        OneShotStart::Overloaded => format!(
+            "Plugin {plugin}: {contribution} not started: too many plugin runs in flight ({} max)",
+            crate::plugins::MAX_INFLIGHT_ONE_SHOTS
+        ),
         OneShotStart::Failed => format!("Plugin {plugin}: could not start {contribution}"),
     }
 }
@@ -2811,6 +2815,13 @@ mod tests {
         assert_eq!(
             one_shot_status("one-shot", "one-shot.hello", OneShotStart::Failed),
             "Plugin one-shot: could not start one-shot.hello"
+        );
+        assert_eq!(
+            one_shot_status("one-shot", "one-shot.hello", OneShotStart::Overloaded),
+            format!(
+                "Plugin one-shot: one-shot.hello not started: too many plugin runs in flight ({} max)",
+                crate::plugins::MAX_INFLIGHT_ONE_SHOTS
+            )
         );
         let mut state = state_with(vec![spec(
             "acts",
