@@ -850,6 +850,25 @@ fn sha256_file(mut file: std::fs::File) -> Result<String> {
 
 fn verify_staged_binary(staging: &Path, bin_rel: &Path) -> Result<StagedBinary> {
     let expected = staging.join(bin_rel);
+    let mut link = expected.clone();
+    for _ in 0..40 {
+        let metadata = std::fs::symlink_metadata(&link)
+            .with_context(|| format!("inspect installer binary {}", bin_rel.display()))?;
+        if !metadata.file_type().is_symlink() {
+            break;
+        }
+        let target = std::fs::read_link(&link)
+            .with_context(|| format!("read installer binary symlink {}", bin_rel.display()))?;
+        anyhow::ensure!(
+            !target.is_absolute(),
+            "installer binary {} is an absolute symlink; refusing",
+            bin_rel.display()
+        );
+        link = link
+            .parent()
+            .context("installer binary symlink has no parent")?
+            .join(target);
+    }
     let staging_canon = std::fs::canonicalize(staging)
         .with_context(|| format!("canonicalize staging directory {}", staging.display()))?;
     let resolved = std::fs::canonicalize(&expected).with_context(|| {
@@ -2543,12 +2562,7 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         let inner = [OsString::from("/bin/echo"), OsString::from("installer")];
-        let expected = if usable_bwrap().is_some() {
-            InstallerContainment::Bwrap
-        } else {
-            InstallerContainment::HostUnsafe
-        };
-        let (_command, containment) = installer_command(
+        let (command, containment) = installer_command(
             "/bin/echo",
             &inner,
             &staging,
@@ -2558,6 +2572,36 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(containment, expected);
+        let command_uses_bwrap = command.get_program().to_string_lossy().ends_with("bwrap");
+        assert_eq!(
+            containment == InstallerContainment::Bwrap,
+            command_uses_bwrap
+        );
+    }
+
+    #[test]
+    fn installer_verify_refuses_absolute_in_staging_symlink() {
+        let staging = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::create_dir_all(staging.path().join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(staging.path().join("node_modules/.bin")).unwrap();
+        let target = staging.path().join("node_modules/pkg/cli.js");
+        std::fs::write(&target, b"#!cli").unwrap();
+        let link = staging.path().join("node_modules/.bin/x");
+        match thegn_core::fsperm::create_symlink(&target, &link, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("create absolute in-staging symlink: {error}"),
+        }
+        let result = verify_staged_binary(staging.path(), Path::new("node_modules/.bin/x"));
+        assert!(matches!(result, Err(error) if error.to_string().contains(
+            "installer binary node_modules/.bin/x is an absolute symlink; refusing"
+        )));
     }
 }
