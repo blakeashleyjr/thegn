@@ -14,6 +14,7 @@
 
 use anyhow::Result;
 
+use thegn_core::git_run::GitTextError;
 use thegn_core::rebase_todo::{TodoAction, TodoEntry};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
@@ -429,8 +430,11 @@ fn record_mark(
     open_db: &impl Fn() -> Result<thegn_core::db::Db>,
 ) -> std::result::Result<(), String> {
     let head = loc
-        .git_out(&["rev-parse", "HEAD"])
-        .ok_or_else(|| "could not read HEAD for undo mark".to_string())?;
+        .git_text(&["rev-parse", "HEAD"])
+        .map_err(|error| format!("could not read HEAD for undo mark: {error}"))?;
+    if head.is_empty() {
+        return Err("could not read HEAD for undo mark: Git returned an empty object id".into());
+    }
     let db = open_db().map_err(|error| format!("could not open undo mark database: {error:#}"))?;
     add_mark(&db, worktree_key, &head)
 }
@@ -675,10 +679,10 @@ fn execute_at_with_db(
                         || msg.contains("no configured push destination")
                         || msg.contains("set-upstream")
                     {
-                        let branch = loc
-                            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-                            .unwrap_or_default();
-                        GitOpResult::NoUpstream { branch }
+                        no_upstream_result(
+                            loc.git_text(&["rev-parse", "--abbrev-ref", "HEAD"]),
+                            &msg,
+                        )
                     } else {
                         GitOpResult::Err(first_line_str(&msg))
                     }
@@ -874,9 +878,53 @@ fn first_line_str(s: &str) -> String {
     s.lines().next().unwrap_or("git error").to_string()
 }
 
+fn no_upstream_result(
+    branch: std::result::Result<String, GitTextError>,
+    push_error: &str,
+) -> GitOpResult {
+    match branch {
+        Ok(branch) if !branch.is_empty() && branch != "HEAD" => GitOpResult::NoUpstream { branch },
+        Ok(_) | Err(_) => GitOpResult::Err(first_line_str(push_error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undo_mark_head_read_failure_carries_git_reason() {
+        let non_repo = tempfile::tempdir().expect("non-repository dir");
+        let db_dir = tempfile::tempdir().expect("database dir");
+        let db_path = db_dir.path().join("marks.db");
+        let result = record_mark(
+            &GitLoc::Local(non_repo.path().to_path_buf()),
+            "key",
+            &|| thegn_core::db::Db::open_at(&db_path),
+        );
+
+        assert!(matches!(result, Err(message)
+            if message.contains("could not read HEAD for undo mark")
+                && message.contains("not a git repository")));
+    }
+
+    #[test]
+    fn no_upstream_needs_a_named_branch() {
+        assert!(matches!(
+            no_upstream_result(Ok("feat".into()), "fatal: no upstream\nmore detail"),
+            GitOpResult::NoUpstream { branch } if branch == "feat"
+        ));
+        for branch in [Ok("HEAD".to_string()), Ok(String::new())] {
+            assert!(matches!(
+                no_upstream_result(branch, "fatal: no upstream\nmore detail"),
+                GitOpResult::Err(message) if message == "fatal: no upstream"
+            ));
+        }
+        assert!(matches!(
+            no_upstream_result(Err(GitTextError::InvalidUtf8), "fatal: no upstream\nmore detail"),
+            GitOpResult::Err(message) if message == "fatal: no upstream"
+        ));
+    }
 
     #[test]
     fn undo_marks_are_keyed_by_host_worktree_not_sandbox_path() {

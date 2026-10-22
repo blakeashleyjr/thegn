@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use thegn_core::config::{Config, SubmoduleMode, WorktreeMode};
+use thegn_core::git_run::{GitOutcome, GitTextError};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::RepoTrustStore;
 
@@ -17,8 +18,14 @@ struct AuthorityMetadata {
 }
 
 fn authority_blob(loc: &GitLoc) -> Result<Option<String>, String> {
-    let Some(oid) = loc.git_out(&["rev-parse", "--verify", "--quiet", "HEAD:.gitmodules"]) else {
-        return Ok(None);
+    let oid = match loc.git_text(&["rev-parse", "--verify", "--quiet", "HEAD:.gitmodules"]) {
+        Ok(oid) => oid,
+        Err(error) if probe_absent(&error) => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "submodule metadata unavailable at the execution authority: {error}"
+            ));
+        }
     };
     let valid = matches!(oid.len(), 40 | 64)
         && oid
@@ -30,6 +37,13 @@ fn authority_blob(loc: &GitLoc) -> Result<Option<String>, String> {
     Ok(Some(oid))
 }
 
+fn probe_absent(error: &GitTextError) -> bool {
+    matches!(
+        error,
+        GitTextError::Failed(GitOutcome::Exit { code: Some(1), .. })
+    )
+}
+
 fn authority_check(loc: &GitLoc, approved: &Option<String>) -> Result<(), String> {
     let changed = || {
         "submodules not initialized: .gitmodules changed at the execution authority after approval; retry"
@@ -38,11 +52,12 @@ fn authority_check(loc: &GitLoc, approved: &Option<String>) -> Result<(), String
     if authority_blob(loc)?.as_ref() != approved.as_ref() {
         return Err(changed());
     }
-    if loc
-        .git_out(&["hash-object", "--", ".gitmodules"])
-        .as_deref()
-        != approved.as_deref()
-    {
+    let current = loc
+        .git_text(&["hash-object", "--", ".gitmodules"])
+        .map_err(|error| {
+            format!("submodule metadata unavailable at the execution authority: {error}")
+        })?;
+    if Some(current.as_str()) != approved.as_deref() {
         return Err(changed());
     }
     Ok(())
@@ -54,21 +69,27 @@ fn authority_metadata(
 ) -> Result<Option<AuthorityMetadata>, String> {
     if let Some(location) = loc.filter(|location| location.is_remote()) {
         let Some(blob) = authority_blob(location)? else {
-            if location
-                .git_out(&["rev-parse", "--verify", "HEAD"])
-                .is_some()
-            {
-                return Ok(None);
+            match location.git_text(&["rev-parse", "--verify", "HEAD"]) {
+                Ok(_) => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "submodule metadata unavailable at the execution authority: {error}"
+                    ));
+                }
             }
-            return Err("submodule metadata unavailable at the execution authority".into());
         };
-        // `git_out` treats empty stdout as unavailable; an empty committed
-        // .gitmodules therefore fails closed here.
+        // An empty committed .gitmodules is invalid metadata and fails closed.
         let text = location
-            .git_out(&["cat-file", "blob", &blob])
-            .ok_or_else(|| {
-                "submodule metadata unavailable at the execution authority".to_string()
+            .git_text(&["cat-file", "blob", &blob])
+            .map_err(|error| {
+                format!("submodule metadata unavailable at the execution authority: {error}")
             })?;
+        if text.is_empty() {
+            return Err(
+                "submodule metadata unavailable at the execution authority: committed .gitmodules is empty"
+                    .into(),
+            );
+        }
         return Ok(Some(AuthorityMetadata {
             text,
             blob: Some(blob),
@@ -255,6 +276,21 @@ mod tests {
         }
     }
 
+    fn failing_provider(wrapper_dir: &Path, path: &Path, needle: &str) -> GitLoc {
+        let wrapper = wrapper_dir.join("git-wrapper.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "case \"$3\" in *'{needle}'*) echo 'ssh: connect to host fixture: Connection refused' >&2; exit 255;; esac\nexec \"$@\"\n"
+            ),
+        )
+        .expect("write provider wrapper");
+        GitLoc::Provider {
+            control_prefix: vec!["sh".into(), wrapper.to_string_lossy().into_owned()],
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+
     fn committed_repo(dir: &Path, modules: Option<&str>) {
         git(dir, &["init", "-q"]);
         if let Some(contents) = modules {
@@ -357,5 +393,59 @@ mod tests {
             .expect("changed metadata probe succeeds")
             .expect("changed fixture has metadata");
         assert_ne!(approved_blob, current_blob);
+    }
+
+    #[test]
+    fn submodule_authority_transport_failure_is_not_absent() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path(), Some(MODULES_A));
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "HEAD:.gitmodules");
+
+        let result = authority_metadata(repo.path(), Some(&location));
+        assert!(matches!(result, Err(message)
+            if message.contains("execution authority")
+                && message.contains("Connection refused")));
+    }
+
+    #[test]
+    fn submodule_authority_hash_failure_reports_git_reason() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path(), Some(MODULES_A));
+        let approved = authority_blob(&provider(repo.path()))
+            .expect("metadata probe succeeds")
+            .expect("fixture has metadata");
+        let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+        let location = failing_provider(wrapper_dir.path(), repo.path(), "hash-object");
+
+        let result = authority_check(&location, &Some(approved));
+        assert!(matches!(result, Err(message) if message.contains("Connection refused")));
+    }
+
+    #[test]
+    fn submodule_authority_absent_metadata_is_still_none() {
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path(), None);
+
+        let result = authority_metadata(repo.path(), Some(&provider(repo.path())))
+            .expect("exit 1 means absent metadata");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn submodule_authority_empty_committed_metadata_is_refused() {
+        let repo = tempfile::tempdir().expect("provider repo");
+        committed_repo(repo.path(), Some(""));
+
+        let result = authority_metadata(repo.path(), Some(&provider(repo.path())));
+        assert!(matches!(result, Err(message)
+            if message.contains("execution authority")
+                && message.contains("empty")));
     }
 }
