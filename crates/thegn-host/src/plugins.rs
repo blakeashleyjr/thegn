@@ -922,7 +922,7 @@ fn start_poll_worker(
             failed_poll_starts.remove(&job.plugin);
         }
         Err(error) => {
-            tracing::warn!(target: "thegn::plugin", plugin = %job.plugin, error = %error, "scheduled one-shot thread failed to start");
+            tracing::warn!(target: "thegn::plugin", plugin = %job.plugin, error = %error, "one-shot poll thread failed to start");
             report_poll_start_failure(failed_poll_starts, &job.plugin, &error, tx, waker);
         }
     }
@@ -2672,7 +2672,8 @@ mod tests {
             Some(PluginMsg::OneShot { plugin, run: Ok(_) }) if plugin == "b-fast"
         );
         let fast_marker_exists = marker.exists();
-        let slow_was_blocked = !release.exists();
+        let slow_not_completed_before_release =
+            matches!(rx.try_recv(), Err(tokio_mpsc::error::TryRecvError::Empty));
         std::fs::write(&release, "go").unwrap();
         let slow_completed = matches!(
             recv_within(&mut rx, Duration::from_secs(10)),
@@ -2691,8 +2692,8 @@ mod tests {
             "b-fast did not create its completion marker"
         );
         assert!(
-            slow_was_blocked,
-            "the slow plugin was released before b-fast completed"
+            slow_not_completed_before_release,
+            "a-slow completed before the release file was created"
         );
         assert!(slow_completed, "a-slow did not finish after release");
     }
