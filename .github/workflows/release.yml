@@ -511,7 +511,7 @@ jobs:
           echo "TAG=$REQUESTED_TAG" >> "$GITHUB_ENV"
           echo "PACKAGE_ROOT=$package_root" >> "$GITHUB_ENV"
           mkdir -p "$package_root/assets" "$package_root/rendered" \
-            "$package_root/package/stage" "$package_root/release-assets"
+            "$package_root/package" "$package_root/release-assets"
       - name: Download this tag's source assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -574,10 +574,13 @@ jobs:
       - name: Build standalone deb and rpm packages
         run: |
           set -euo pipefail
-          tar -xzf \
-            "$PACKAGE_ROOT/assets/thegn-$TAG-x86_64-unknown-linux-gnu.tar.gz" \
-            -C "$PACKAGE_ROOT/package/stage" --no-same-owner -- \
-            thegn LICENSE-MIT LICENSE-APACHE README.md
+          python3 packaging/release.py stage \
+            --tag "$TAG" \
+            --assets-dir "$PACKAGE_ROOT/assets" \
+            --target x86_64-unknown-linux-gnu \
+            --trusted-digests "$PACKAGE_ROOT/trusted-digests.json" \
+            --output-dir "$PACKAGE_ROOT/package/stage" \
+            --digests-out "$PACKAGE_ROOT/stage-digests.json"
           # validate already proved this tag is exactly v<workspace version>.
           version="${TAG#v}"
           nfpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#nfpm)"
@@ -594,6 +597,31 @@ jobs:
               --packager rpm \
               --target "$PACKAGE_ROOT/release-assets/thegn-${version}-1.x86_64.rpm"
           )
+      - name: Verify packaged payload against staged bytes
+        run: |
+          set -euo pipefail
+          dpkg_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#dpkg)"
+          rpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#rpm)"
+          cpio_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#cpio)"
+          version="${TAG#v}"
+          mkdir -p "$PACKAGE_ROOT/payload/deb" "$PACKAGE_ROOT/payload/rpm"
+          "$dpkg_store/bin/dpkg-deb" -x \
+            "$PACKAGE_ROOT/release-assets/thegn_${version}_amd64.deb" \
+            "$PACKAGE_ROOT/payload/deb"
+          "$rpm_store/bin/rpm2cpio" \
+            "$PACKAGE_ROOT/release-assets/thegn-${version}-1.x86_64.rpm" \
+            | (cd "$PACKAGE_ROOT/payload/rpm" && \
+              "$cpio_store/bin/cpio" -idm --no-absolute-filenames --quiet)
+          python3 packaging/release.py verify-payload \
+            --tag "$TAG" \
+            --staged-digests "$PACKAGE_ROOT/stage-digests.json" \
+            --payload-root "$PACKAGE_ROOT/payload/deb" \
+            --label deb
+          python3 packaging/release.py verify-payload \
+            --tag "$TAG" \
+            --staged-digests "$PACKAGE_ROOT/stage-digests.json" \
+            --payload-root "$PACKAGE_ROOT/payload/rpm" \
+            --label rpm
       - name: Stage rendered metadata
         run: |
           set -euo pipefail
