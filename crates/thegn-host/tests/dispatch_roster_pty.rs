@@ -108,10 +108,9 @@ fn run_in_pty(root: &Path, runtime: &Path, args: &[&str]) -> Vec<u8> {
             Ok(None) => {
                 let kill_result = child.kill();
                 let waited = child.wait().expect("wait for timed-out CLI");
-                while !reader_done.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(5));
+                if reader_done.load(Ordering::Acquire) {
+                    reader_thread.join().expect("join timed-out PTY reader");
                 }
-                reader_thread.join().expect("join timed-out PTY reader");
                 panic!(
                     "CLI timed out (exit code {}); kill result: {kill_result:?}; output: {}",
                     waited.exit_code(),
@@ -121,12 +120,11 @@ fn run_in_pty(root: &Path, runtime: &Path, args: &[&str]) -> Vec<u8> {
             Err(error) => {
                 let kill_result = child.kill();
                 let wait_result = child.wait();
-                while !reader_done.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(5));
+                if reader_done.load(Ordering::Acquire) {
+                    reader_thread
+                        .join()
+                        .expect("join PTY reader after poll failure");
                 }
-                reader_thread
-                    .join()
-                    .expect("join PTY reader after poll failure");
                 panic!(
                     "could not poll CLI: {error}; kill: {kill_result:?}; wait: {wait_result:?}; output: {}",
                     pty_output(&captured)
@@ -215,7 +213,7 @@ fn hostile_roster_json_output_emits_no_control_sequence() {
         &["dispatch", "status", "--json"][..],
         &["dispatch", "status", &id_text, "--json"][..],
     ] {
-        let output = run_in_pty(state.root(), runtime.path(), &args);
+        let output = run_in_pty(state.root(), runtime.path(), args);
         assert_terminal_safe(&args.join(" "), &output);
     }
 }
@@ -328,7 +326,7 @@ fn hostile_roster_human_output_emits_no_control_sequence() {
         &["dispatch", "status"][..],
         &["dispatch", "status", &id_text][..],
     ] {
-        let output = run_in_pty(state.root(), runtime.path(), &args);
+        let output = run_in_pty(state.root(), runtime.path(), args);
         assert_terminal_safe(&args.join(" "), &output);
         if args.len() == 3 {
             let text = String::from_utf8_lossy(&output);

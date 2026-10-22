@@ -95,7 +95,7 @@ pub fn display_cell(s: &str) -> String {
 
 /// Escape control and Unicode format characters in a compact JSON document
 /// produced by serde_json. The returned document parses to the same value;
-/// terminal-sensitive characters are represented with lowercase `\\u` escapes
+/// terminal-sensitive characters are represented with lowercase `\u` escapes
 /// so they are never sent raw to a terminal.
 pub fn json_terminal_safe(json: &str) -> std::borrow::Cow<'_, str> {
     let mut output = None::<String>;
