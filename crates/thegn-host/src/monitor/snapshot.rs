@@ -425,10 +425,10 @@ mod tests {
                     "fixture palette must be the dark default"
                 );
                 assert_ne!(panel, dim);
+                // Power is covered by its label-colour test; this fixture does not seed power-supply graphs.
                 for tab in [
                     MonitorTab::Thermal,
                     MonitorTab::Network,
-                    MonitorTab::Power,
                     MonitorTab::Overview,
                     MonitorTab::Cpu,
                 ] {
