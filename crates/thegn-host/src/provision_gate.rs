@@ -247,12 +247,12 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
         return false;
     }
     // Already bound to a spare ⇒ nothing to claim; a re-materialize (restart,
-    // tab reopen) must keep using it, not stack a second bind.
-    if db
-        .as_ref()
-        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten())
-        .is_some()
-    {
+    // tab reopen) must keep using it, not stack a second bind. An unreadable
+    // binding never claims: a bound worktree would stack a second spare.
+    if !matches!(
+        db.as_ref().map(|db| db.worktree_provider_sandbox(worktree)),
+        Some(Ok(None))
+    ) {
         return false;
     }
     // Claim ONLY when the worktree actually needs provisioning (its sandbox is
