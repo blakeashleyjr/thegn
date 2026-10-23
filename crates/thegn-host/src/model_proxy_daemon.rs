@@ -1303,10 +1303,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "spawn a short-lived child to verify supervisor reaping"
-    )]
     fn reap_spawned_child_clears_an_exited_child() {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
