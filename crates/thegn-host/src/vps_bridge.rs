@@ -14,7 +14,8 @@ use thegn_svc::vps::{registry, ssh_shim};
 /// API (which re-persists the record — the stale-IP self-heal).
 fn resolve_ip(cfg: &Config, name: &str) -> Result<String> {
     registry::checked_name(name).context("vps-ssh: invalid instance name")?;
-    if let Some(rec) = registry::read(name)
+    if let Some(rec) = registry::read_checked(name)
+        .context("vps-ssh: the ledger record is unreadable; refusing to guess its address")?
         && rec.state == "ready"
         && !rec.ip.is_empty()
     {
@@ -50,7 +51,8 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
 
     let name = registry::checked_name(name).context("vps-ssh: invalid instance name")?;
     let ip = resolve_ip(cfg, name)?;
-    let provider_name = registry::read(name)
+    let provider_name = registry::read_checked(name)
+        .context("vps-ssh: the ledger record is unreadable; refusing to guess its provider")?
         .map(|record| record.provider)
         .unwrap_or_else(|| "hetzner".to_string());
     let key = thegn_core::managed_ssh::read_unique_instance(&provider_name, name)?
@@ -104,5 +106,16 @@ mod tests {
         let error = resolve_ip(&Config::default(), "../x").unwrap_err();
         assert!(error.to_string().contains("invalid instance name"));
         assert!(format!("{error:#}").contains("invalid provider name"));
+    }
+
+    #[test]
+    fn resolve_ip_refuses_an_unreadable_ledger_record() {
+        let _state = crate::testenv::IsolatedState::new();
+        let d = thegn_svc::vps::registry::dir();
+        thegn_core::fsperm::ensure_private_dir(&d).unwrap();
+        std::fs::write(d.join("tg-corrupt.json"), b"not json").unwrap();
+
+        let error = resolve_ip(&Config::default(), "tg-corrupt").unwrap_err();
+        assert!(format!("{error:#}").contains("unreadable"));
     }
 }

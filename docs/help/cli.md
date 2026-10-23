@@ -302,6 +302,16 @@ Host aliases use lowercase letters, digits, and hyphens, start and end with a
 letter or digit, and are limited to 128 bytes. If a new host's default alias is
 already used by another host, thegn adds a short digest of the host authority.
 
+`thegn forward list` and `thegn forward stop` report an error if they cannot
+read recorded state, instead of showing an empty result. `thegn forward stop
+<port>` also says when no forward was recorded for that container port and
+nothing was removed.
+
+On the dev channel, `thegn host rm <name>` refuses without removing anything
+if it cannot read the host's placement tenants, and `thegn placement list`
+reports an error if it cannot read recorded state instead of showing an empty
+result.
+
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
 in-degree, under a line budget (`--budget`, default `[semantic]

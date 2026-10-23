@@ -8,11 +8,11 @@ use crate::attention::MqStatus;
 use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use crate::store::{
-    MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX, MergeAttemptResult,
-    MergeCandidate, MergeClaim, MergeClaimActive, MergeClaimPhase, MergeClaimRequest,
-    MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
-    MergeOutcomeObservation, MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome,
-    MergeStatusFields, WorktreeAuxStore,
+    MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
+    MERGE_QUEUE_EVENTS_PER_WORKTREE, MergeAttemptResult, MergeCandidate, MergeClaim,
+    MergeClaimActive, MergeClaimPhase, MergeClaimRequest, MergeClaimView, MergeEnqueueIdentity,
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
+    MergeQueueEvent, MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields, WorktreeAuxStore,
 };
 use crate::util;
 use anyhow::Result;
@@ -286,6 +286,32 @@ fn ensure_unclaimed(conn: &Connection, worktree: &str) -> Result<()> {
     if claimed {
         return Err(anyhow::Error::new(MergeClaimActive));
     }
+    Ok(())
+}
+
+fn record_merge_event(conn: &Connection, event: &MergeQueueEvent) -> Result<()> {
+    conn.execute(
+        "INSERT INTO merge_queue_events \
+         (worktree,operation,outcome,old_status,new_status,row_updated_at,candidate_oid,result_oid,actor,at_ms) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            event.worktree,
+            event.operation,
+            event.outcome,
+            event.old_status,
+            event.new_status,
+            event.row_updated_at,
+            event.candidate_oid,
+            event.result_oid,
+            event.actor,
+            event.at_ms,
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM merge_queue_events WHERE worktree=?1 AND id NOT IN \
+         (SELECT id FROM merge_queue_events WHERE worktree=?1 ORDER BY id DESC LIMIT ?2)",
+        params![event.worktree, MERGE_QUEUE_EVENTS_PER_WORKTREE as i64],
+    )?;
     Ok(())
 }
 
@@ -1020,24 +1046,78 @@ impl WorktreeAuxStore for Db {
     }
 
     fn retry_held_merge_entry(&self, worktree: &str) -> Result<MergeRetryOutcome> {
-        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<String>)> = tx
+        let base = self.conn();
+        let tx = if base.is_autocommit() {
+            Some(Transaction::new_unchecked(
+                base,
+                TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
+        let conn: &Connection = tx.as_deref().unwrap_or(base);
+        let row: Option<MergeRowSnapshot> = conn
             .query_row(
-                "SELECT status, claim_owner FROM merge_queue WHERE worktree=?1",
+                "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
+                 FROM merge_queue WHERE worktree=?1",
                 [worktree],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((status, claim_owner)) = row else {
-            tx.commit()?;
+        let Some((status, claim_owner, updated_at, candidate_oid, result_oid)) = row else {
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
             return Ok(MergeRetryOutcome::NotQueued);
         };
         if claim_owner.is_some() {
-            tx.commit()?;
+            record_merge_event(
+                conn,
+                &MergeQueueEvent {
+                    worktree: worktree.to_string(),
+                    operation: "retry".into(),
+                    outcome: "claimed".into(),
+                    old_status: status,
+                    new_status: None,
+                    row_updated_at: updated_at,
+                    candidate_oid,
+                    result_oid,
+                    actor: format!("thegn pid {}", std::process::id()),
+                    at_ms: util::now_ms(),
+                },
+            )?;
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
             return Ok(MergeRetryOutcome::Claimed);
         }
         if !MqStatus::parse(&status).is_some_and(MqStatus::is_held) {
-            tx.commit()?;
+            record_merge_event(
+                conn,
+                &MergeQueueEvent {
+                    worktree: worktree.to_string(),
+                    operation: "retry".into(),
+                    outcome: "not_retryable".into(),
+                    old_status: status.clone(),
+                    new_status: None,
+                    row_updated_at: updated_at,
+                    candidate_oid,
+                    result_oid,
+                    actor: format!("thegn pid {}", std::process::id()),
+                    at_ms: util::now_ms(),
+                },
+            )?;
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
             return Ok(MergeRetryOutcome::NotRetryable { status });
         }
 
@@ -1052,28 +1132,135 @@ impl WorktreeAuxStore for Db {
              result_oid=NULL, conflict_paths=NULL, error_detail=NULL \
              WHERE worktree=?1 AND claim_owner IS NULL AND status IN ({held})"
         );
-        let changed = tx.execute(&sql, params![worktree, util::now()])?;
+        let changed = conn.execute(&sql, params![worktree, util::now()])?;
         let outcome = if changed == 1 {
             MergeRetryOutcome::Rearmed
         } else {
-            MergeRetryOutcome::NotRetryable { status }
+            MergeRetryOutcome::NotRetryable {
+                status: status.clone(),
+            }
         };
-        tx.commit()?;
+        record_merge_event(
+            conn,
+            &MergeQueueEvent {
+                worktree: worktree.to_string(),
+                operation: "retry".into(),
+                outcome: if changed == 1 {
+                    "rearmed"
+                } else {
+                    "not_retryable"
+                }
+                .into(),
+                old_status: status,
+                new_status: (changed == 1).then(|| "queued".into()),
+                row_updated_at: updated_at,
+                candidate_oid,
+                result_oid,
+                actor: format!("thegn pid {}", std::process::id()),
+                at_ms: util::now_ms(),
+            },
+        )?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(outcome)
     }
 
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
-    /// elsewhere, or the worktree is removed).
+    /// elsewhere, or the worktree is removed). When called inside a caller's
+    /// transaction, the row deletion and event join it and commit or roll back together.
     fn remove_merge_entry(&self, worktree: &str) -> Result<()> {
-        let conn = self.conn();
-        let changed = conn.execute(
-            "DELETE FROM merge_queue WHERE worktree=?1 AND claim_owner IS NULL",
-            params![worktree],
-        )?;
-        if changed == 0 {
-            ensure_unclaimed(conn, worktree)?;
+        self.remove_merge_entry_as(worktree, &format!("thegn pid {}", std::process::id()))
+    }
+
+    fn remove_merge_entry_as(&self, worktree: &str, actor: &str) -> Result<()> {
+        let base = self.conn();
+        let tx = if base.is_autocommit() {
+            Some(Transaction::new_unchecked(
+                base,
+                TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
+        let conn: &Connection = tx.as_deref().unwrap_or(base);
+        let row: Option<MergeRowSnapshot> = conn
+            .query_row(
+                "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
+                 FROM merge_queue WHERE worktree=?1",
+                [worktree],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, claim_owner, updated_at, candidate_oid, result_oid)) = row else {
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
+            return Ok(());
+        };
+        let event = MergeQueueEvent {
+            worktree: worktree.to_string(),
+            operation: "remove".into(),
+            outcome: if claim_owner.is_some() {
+                "claimed"
+            } else {
+                "deleted"
+            }
+            .into(),
+            old_status: status,
+            new_status: None,
+            row_updated_at: updated_at,
+            candidate_oid,
+            result_oid,
+            actor: actor.to_string(),
+            at_ms: util::now_ms(),
+        };
+        if claim_owner.is_some() {
+            record_merge_event(conn, &event)?;
+            if let Some(tx) = tx {
+                tx.commit()?;
+            }
+            return Err(anyhow::Error::new(MergeClaimActive));
+        }
+        conn.execute("DELETE FROM merge_queue WHERE worktree=?1", [worktree])?;
+        record_merge_event(conn, &event)?;
+        if let Some(tx) = tx {
+            tx.commit()?;
         }
         Ok(())
+    }
+
+    fn merge_queue_events(&self, worktree: &str, limit: usize) -> Result<Vec<MergeQueueEvent>> {
+        let mut statement = self.conn().prepare(
+            "SELECT worktree,operation,outcome,old_status,new_status,row_updated_at,\
+                    candidate_oid,result_oid,actor,at_ms \
+             FROM merge_queue_events WHERE worktree=?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let events = statement
+            .query_map(params![worktree, limit as i64], |row| {
+                Ok(MergeQueueEvent {
+                    worktree: row.get(0)?,
+                    operation: row.get(1)?,
+                    outcome: row.get(2)?,
+                    old_status: row.get(3)?,
+                    new_status: row.get(4)?,
+                    row_updated_at: row.get(5)?,
+                    candidate_oid: row.get(6)?,
+                    result_oid: row.get(7)?,
+                    actor: row.get(8)?,
+                    at_ms: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(events)
     }
 
     fn hold_merge_cleanup(&self, row: &MergeQueueRow) -> Result<bool> {
@@ -1678,6 +1865,39 @@ impl WorktreeAuxStore for Db {
         Ok(changed == 1)
     }
 
+    fn refund_pr_agent_attempt(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        status: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            crate::pr_queue::PrqStatus::parse(status).is_some(),
+            "unknown PR-queue status {status:?}"
+        );
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE pr_queue SET agent_attempts=agent_attempts-1,
+               agent_claim_owner=NULL,agent_claim_lease_until_ms=NULL,agent_claim_owner_hint=NULL,
+               status=CASE WHEN status='agent_running' THEN ?3 ELSE status END,
+               detail=CASE WHEN status='agent_running' THEN ?4 ELSE detail END, updated_at=?5
+             WHERE key=?1 AND agent_claim_owner=?2 AND agent_claim_generation=?6
+               AND agent_claim_lease_until_ms>=?7 AND agent_attempts=?8 AND agent_attempts>0",
+            params![
+                lease.key,
+                lease.owner_token,
+                status,
+                detail,
+                util::now(),
+                lease.generation,
+                util::now_ms(),
+                lease.attempt,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     fn record_pr_agent_head(
         &self,
         lease: &crate::pr_queue::PrAgentLease,
@@ -2018,3 +2238,6 @@ impl WorktreeAuxStore for Db {
         Ok(n)
     }
 }
+
+/// `(status, claim_owner, updated_at, candidate_oid, result_oid)` of one merge-queue row.
+type MergeRowSnapshot = (String, Option<String>, i64, Option<String>, Option<String>);

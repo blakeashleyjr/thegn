@@ -1732,9 +1732,9 @@ pub fn provider_proxy_target(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let selected_env = env_selection_or_refuse(worktree, "provider proxy target", read)?;
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -1885,9 +1885,9 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let selected_env = env_selection_or_refuse(worktree, "native exec", read)?;
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -1997,9 +1997,11 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let Some(selected_env) = env_selection_or_refuse(worktree, "provision check", read) else {
+        return false;
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -2127,9 +2129,13 @@ pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let Some(selected_env) = env_selection_or_refuse(worktree, "native exec cooldown clear", read)
+    else {
+        clear_configured_provider_cooldowns(cfg);
+        return;
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -2188,9 +2194,12 @@ pub fn provision_worktree(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let selected_env = match provision_selection(cfg, read)? {
+        ProvisionSelection::Resolve(selected_env) => selected_env,
+        ProvisionSelection::Skip => return Ok(false),
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -2207,6 +2216,166 @@ pub fn provision_worktree(
     // spare (and clear the splash) under this run — see `provision_gate`.
     let _live = crate::provision_gate::worktree_live_guard(worktree);
     provision_provider_env(cfg, worktree, &environment.name, progress)
+}
+
+/// The env selection for a provider exec/proxy/cooldown decision. `None` when
+/// it cannot be read: the caller refuses instead of resolving the default env.
+fn env_selection_or_refuse(
+    worktree: &str,
+    what: &str,
+    read: anyhow::Result<Option<String>>,
+) -> Option<Option<String>> {
+    match read {
+        Ok(selected) => Some(selected),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::provider",
+                worktree,
+                error = %format!("{error:#}"),
+                "{what} refused: the environment selection could not be read"
+            );
+            None
+        }
+    }
+}
+
+/// The env selection for provisioning: a failed read is an error naming the cause.
+enum ProvisionSelection {
+    Resolve(Option<String>),
+    Skip,
+}
+
+fn provision_selection(
+    cfg: &Config,
+    read: anyhow::Result<Option<String>>,
+) -> anyhow::Result<ProvisionSelection> {
+    match read {
+        Ok(selected) => Ok(ProvisionSelection::Resolve(selected)),
+        Err(_) if !cfg.env.values().any(|env| {
+            env.placement == thegn_core::config::PlacementMode::Provider
+        }) => Ok(ProvisionSelection::Skip),
+        Err(error) => Err(error).context(
+            "provisioning refused: the environment selection could not be read (the default environment is never used instead)",
+        ),
+    }
+}
+
+/// Retry cannot identify the selected provider while the DB read is failing.
+/// Clear configured provider cooldowns so the retry can proceed once selection
+/// becomes readable again.
+fn clear_configured_provider_cooldowns(cfg: &Config) {
+    for env in cfg
+        .env
+        .values()
+        .filter(|env| env.placement == thegn_core::config::PlacementMode::Provider)
+    {
+        native_exec_report(&env.provider.provider, true);
+    }
+}
+
+#[cfg(test)]
+mod env_selection_tests {
+    use super::{
+        ProvisionSelection, clear_configured_provider_cooldowns, env_selection_or_refuse,
+        native_exec_healthy, native_exec_report, provision_selection,
+    };
+    use thegn_core::config::{Config, EnvConfig, PlacementMode};
+
+    #[test]
+    fn env_selection_or_refuse_refuses_an_unreadable_selection() {
+        assert_eq!(
+            env_selection_or_refuse(
+                "/wt",
+                "native exec",
+                Err(anyhow::anyhow!("database is locked")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn env_selection_or_refuse_passes_a_read_through() {
+        assert_eq!(
+            env_selection_or_refuse("/wt", "native exec", Ok(Some("box".into()))),
+            Some(Some("box".into()))
+        );
+        assert_eq!(
+            env_selection_or_refuse("/wt", "native exec", Ok(None)),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn provision_selection_errors_on_an_unreadable_selection() {
+        let cfg = Config {
+            env: std::collections::BTreeMap::from([(
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    ..EnvConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let result = provision_selection(&cfg, Err(anyhow::anyhow!("database is locked")));
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("selection read must be refused"),
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("provisioning refused"));
+        assert!(message.contains("database is locked"));
+    }
+
+    #[test]
+    fn provision_selection_passes_a_read_through() {
+        let cfg = Config::default();
+        assert!(matches!(
+            provision_selection(&cfg, Ok(None)).unwrap(),
+            ProvisionSelection::Resolve(None)
+        ));
+        assert_eq!(
+            match provision_selection(&cfg, Ok(Some("box".into()))).unwrap() {
+                ProvisionSelection::Resolve(selected) => selected,
+                ProvisionSelection::Skip => panic!("successful read must be resolved"),
+            },
+            Some("box".into())
+        );
+    }
+
+    #[test]
+    fn provision_selection_allows_unreadable_selection_without_provider_envs() {
+        let cfg = Config::default();
+        assert!(
+            matches!(
+                provision_selection(&cfg, Err(anyhow::anyhow!("database is locked"))),
+                Ok(ProvisionSelection::Skip)
+            ),
+            "a local-only config must skip provisioning so a plain shell can launch"
+        );
+    }
+
+    #[test]
+    fn clear_configured_provider_cooldowns_clears_the_retry_cooldown() {
+        let cfg = Config {
+            env: std::collections::BTreeMap::from([(
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    provider: thegn_core::config::EnvProviderConfig {
+                        provider: "env-selection-test-provider".into(),
+                        ..thegn_core::config::EnvProviderConfig::default()
+                    },
+                    ..EnvConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        native_exec_report("env-selection-test-provider", false);
+        assert!(!native_exec_healthy("env-selection-test-provider"));
+        clear_configured_provider_cooldowns(&cfg);
+        assert!(native_exec_healthy("env-selection-test-provider"));
+    }
 }
 
 /// Make a sandbox/remote env "just work" like local, by reproducing the repo's
@@ -4027,6 +4196,7 @@ pub fn launch_spec_full(
         Err(error) => {
             launch_state_gate(
                 cfg,
+                worktree,
                 choice,
                 "the state database could not be opened, so this worktree's saved sandbox override, selected environment and credential-overlay gate cannot be checked",
                 &error,
@@ -4054,6 +4224,7 @@ pub fn launch_spec_full(
                 Err(error) => {
                     launch_state_gate(
                         cfg,
+                        worktree,
                         choice,
                         "this worktree's saved sandbox override could not be read",
                         &error,
@@ -4072,6 +4243,7 @@ pub fn launch_spec_full(
         Some(Err(error)) => {
             launch_state_gate(
                 cfg,
+                worktree,
                 choice,
                 "this worktree's repository root could not be read",
                 &error,
@@ -4094,6 +4266,7 @@ pub fn launch_spec_full(
             Err(error) => {
                 launch_state_gate(
                     cfg,
+                    worktree,
                     choice,
                     "this worktree's selected execution environment could not be read",
                     &error,
@@ -4186,6 +4359,7 @@ pub fn launch_spec_full(
             Ok(None) => {}
             Err(error) => launch_state_gate(
                 cfg,
+                worktree,
                 choice,
                 "the workspace slug for the credential-overlay gate could not be read",
                 &error,
@@ -4206,6 +4380,7 @@ pub fn launch_spec_full(
         if let Err(error) = std::fs::create_dir_all(dir) {
             dotfiles_launch_gate(
                 cfg,
+                worktree,
                 choice,
                 anyhow::Error::new(error).context(format!("cannot create {dir}")),
             )?;
@@ -4220,6 +4395,7 @@ pub fn launch_spec_full(
             }) {
                 dotfiles_launch_gate(
                     cfg,
+                    worktree,
                     choice,
                     anyhow::Error::new(error)
                         .context(format!("bundle dotfiles into {}", home.display())),
@@ -4564,8 +4740,19 @@ pub(crate) fn credential_overlay_gate(
 
 pub(crate) fn dotfiles_launch_gate(
     cfg: &Config,
+    worktree: &str,
     choice: &str,
     failure: anyhow::Error,
+) -> anyhow::Result<()> {
+    dotfiles_launch_gate_with_notice(cfg, worktree, choice, failure, crate::launch_notice::post)
+}
+
+pub(crate) fn dotfiles_launch_gate_with_notice(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    failure: anyhow::Error,
+    notify: impl FnOnce(&str, &str),
 ) -> anyhow::Result<()> {
     if is_configured_entry(cfg, choice) {
         let detail = format!("{failure:#}");
@@ -4573,7 +4760,9 @@ pub(crate) fn dotfiles_launch_gate(
             "refusing to launch `{choice}`: its bundle HOME could not be prepared: {detail}"
         )));
     }
-    thegn_core::msg::warn(&format!("{failure:#}; the shell launches without it"));
+    let text = format!("{failure:#}; the shell launches without it");
+    thegn_core::msg::warn(&text);
+    notify(worktree, &text);
     Ok(())
 }
 
@@ -4586,14 +4775,35 @@ fn is_configured_entry(cfg: &Config, choice: &str) -> bool {
 
 pub(crate) fn launch_state_gate(
     cfg: &Config,
+    worktree: &str,
     choice: &str,
     what: &str,
     error: &anyhow::Error,
 ) -> anyhow::Result<()> {
+    launch_state_gate_with_notice(
+        cfg,
+        worktree,
+        choice,
+        what,
+        error,
+        crate::launch_notice::post,
+    )
+}
+
+pub(crate) fn launch_state_gate_with_notice(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    what: &str,
+    error: &anyhow::Error,
+    notify: impl FnOnce(&str, &str),
+) -> anyhow::Result<()> {
     if is_configured_entry(cfg, choice) {
         anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");
     }
-    thegn_core::msg::warn(&format!("{what}: {error:#}; the shell launches without it"));
+    let text = format!("{what}: {error:#}; the shell launches without it");
+    thegn_core::msg::warn(&text);
+    notify(worktree, &text);
     Ok(())
 }
 

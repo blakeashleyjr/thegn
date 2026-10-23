@@ -420,7 +420,7 @@ pub(crate) fn clear_selected_landed(db: &Db, selected: &[MergeQueueRow]) -> anyh
         let mut removed = 0;
         for row in selected {
             if row.status == "landed" && current.iter().any(|now| now == row) {
-                db.remove_merge_entry(&row.worktree)?;
+                db.remove_merge_entry_as(&row.worktree, "thegn sweep")?;
                 current.retain(|now| now.worktree != row.worktree);
                 removed += 1;
             }
@@ -2433,7 +2433,7 @@ mod tests {
     /// they were already collected at landing.
     #[test]
     fn only_expire_mode_sweeps() {
-        let root = std::env::temp_dir();
+        let root = tempfile::tempdir().unwrap();
         for mode in [
             OnLanded::Off,
             OnLanded::Move,
@@ -2444,7 +2444,7 @@ mod tests {
             cfg.merge_queue.on_landed = mode;
             for force in [false, true] {
                 assert!(
-                    sweep(&cfg, &root, force).is_empty(),
+                    sweep(&cfg, root.path(), force).is_empty(),
                     "{mode:?} (force={force}) must not sweep"
                 );
             }

@@ -1576,6 +1576,104 @@ impl RootedDir {
             Ok(())
         }
     }
+
+    /// Return whether `path` still names the directory held by this handle.
+    /// The final path component is inspected without following a symlink.
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "stat device and inode fields vary in width across Unix targets"
+    )]
+    pub fn same_dir_as(&self, path: &Path) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use nix::sys::stat::{fstat, lstat};
+
+            let held = fstat(&self.fd).map_err(nix_io_error)?;
+            let named = match lstat(path) {
+                Ok(stat) => stat,
+                Err(nix::errno::Errno::ENOENT) => return Ok(false),
+                Err(error) => return Err(nix_io_error(error)),
+            };
+            Ok(held.st_dev as u64 == named.st_dev as u64
+                && held.st_ino as u64 == named.st_ino as u64)
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Ok(false);
+            }
+            Ok(std::fs::canonicalize(path)? == std::fs::canonicalize(&self.path)?)
+        }
+    }
+
+    /// Rename one child to another without replacing an existing destination.
+    ///
+    /// The portable fallback checks that the destination is absent before
+    /// renaming, but that check and rename are not atomic.
+    pub fn rename_child_noreplace(&self, from: &str, to: &str) -> std::io::Result<()> {
+        let from_path = single_component(from)?;
+        let to_path = single_component(to)?;
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            use nix::fcntl::{RenameFlags, renameat2};
+
+            match renameat2(
+                &self.fd,
+                from_path,
+                &self.fd,
+                to_path,
+                RenameFlags::RENAME_NOREPLACE,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(nix::errno::Errno::EEXIST) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "rename destination already exists",
+                    ));
+                }
+                Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS) => {}
+                Err(error) => return Err(nix_io_error(error)),
+            }
+        }
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{AtFlags, renameat};
+            use nix::sys::stat::fstatat;
+
+            match fstatat(&self.fd, to_path, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "rename destination already exists",
+                    ));
+                }
+                Err(nix::errno::Errno::ENOENT) => {}
+                Err(error) => return Err(nix_io_error(error)),
+            }
+            renameat(&self.fd, from_path, &self.fd, to_path).map_err(nix_io_error)
+        }
+        #[cfg(not(unix))]
+        {
+            let from_path = self.path.join(from_path);
+            let to_path = self.path.join(to_path);
+            match std::fs::symlink_metadata(&to_path) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "rename destination already exists",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            std::fs::rename(from_path, to_path)
+        }
+    }
 }
 
 fn invalid_private_name() -> std::io::Error {
@@ -3099,5 +3197,75 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"new");
         assert_eq!(mode_bits(&file).unwrap(), Some(0o640));
+    }
+
+    #[test]
+    fn rooted_dir_same_dir_as_detects_a_swapped_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let rooted = open_rooted_dir(&root).unwrap();
+
+        assert!(rooted.same_dir_as(&root).unwrap());
+        std::fs::rename(&root, &moved).unwrap();
+        if let Err(error) = create_symlink(&outside, &root, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create swapped root symlink fixture: {error}");
+        }
+        assert!(!rooted.same_dir_as(&root).unwrap());
+        assert!(rooted.same_dir_as(&moved).unwrap());
+    }
+
+    #[test]
+    fn rooted_dir_rename_child_noreplace_refuses_an_existing_child() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("stage")).unwrap();
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("keep"), b"existing").unwrap();
+        let rooted = open_rooted_dir(temp.path()).unwrap();
+
+        let result = rooted.rename_child_noreplace("stage", "dest");
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(temp.path().join("stage").is_dir());
+        assert_eq!(std::fs::read(dest.join("keep")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn rooted_dir_rename_child_stays_in_the_pinned_dir_after_a_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let moved = temp.path().join("moved");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(root.join("stage")).unwrap();
+        let rooted = open_rooted_dir(&root).unwrap();
+
+        std::fs::rename(&root, &moved).unwrap();
+        if let Err(error) = create_symlink(&outside, &root, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create swapped root symlink fixture: {error}");
+        }
+        rooted.rename_child_noreplace("stage", "dest").unwrap();
+
+        assert!(moved.join("dest").is_dir());
+        assert!(!outside.join("dest").exists());
     }
 }

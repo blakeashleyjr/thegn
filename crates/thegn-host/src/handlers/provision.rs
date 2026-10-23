@@ -867,7 +867,10 @@ pub(crate) fn adjust_pool_target(
     if !loc.is_remote() {
         return "warm pool: only for provider (remote) workspaces".into();
     }
-    let (_, repo, env) = crate::lifecycle::pool_context(db, cfg, wt, &loc);
+    let (_, repo, env) = match crate::lifecycle::pool_context(db, cfg, wt, &loc) {
+        Ok(context) => context,
+        Err(error) => return format!("{error:#}"),
+    };
     let cur = match crate::lifecycle::effective_pool_target(db, cfg, &repo, &env) {
         Ok(cur) => cur,
         Err(error) => return format!("warm pool: cannot read the current target: {error:#}"),

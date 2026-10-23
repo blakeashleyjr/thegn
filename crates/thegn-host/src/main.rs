@@ -52,6 +52,8 @@ mod completions_health;
 mod compositor;
 mod fold_cancel;
 mod gate_capture;
+#[cfg(test)]
+mod tmp_root_ratchet_tests;
 // THE-505 process-source capture, wired through `config_startup`.
 mod config_capture;
 mod config_source;
@@ -123,6 +125,7 @@ mod keymap;
 mod keymap_merge;
 mod keymap_specs;
 mod kitty_relay;
+mod launch_notice;
 mod layer;
 mod layout;
 mod layout_spec;

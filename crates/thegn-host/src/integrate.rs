@@ -2945,7 +2945,7 @@ fn attempt_land_admitted(
             && !branch_tip.eq_ignore_ascii_case(expected)
         {
             return Ok(AttemptOutcome::GateError {
-                reason: "branch moved after the queue verified it; run `thegn merge drain` to verify the new commits".into(),
+                reason: "branch moved after the queue verified it; re-enqueue it with `thegn merge add` so the queue verifies the new commits".into(),
                 log: format!("expected {expected}, found {branch_tip}"),
                 phase: GatePhase::Preparation,
                 class: GateErrorClass::SourceMoved,
@@ -6498,21 +6498,26 @@ mod tests {
         let verified = repo.out(&["rev-parse", "b1~1"]);
         let before = repo.out(&["rev-parse", "main"]);
 
+        let outcome = attempt_land_pinned(
+            &cfg(""),
+            &repo.dir,
+            "b1",
+            &GitLoc::Local(repo.dir.clone()),
+            &verified,
+        )
+        .unwrap();
         assert!(matches!(
-            attempt_land_pinned(
-                &cfg(""),
-                &repo.dir,
-                "b1",
-                &GitLoc::Local(repo.dir.clone()),
-                &verified,
-            )
-            .unwrap(),
+            &outcome,
             AttemptOutcome::GateError {
                 class: GateErrorClass::SourceMoved,
                 phase: GatePhase::Preparation,
                 ..
             }
         ));
+        if let AttemptOutcome::GateError { reason, .. } = &outcome {
+            assert!(reason.contains("thegn merge add"));
+            assert!(!reason.contains("thegn merge drain"));
+        }
         assert_eq!(repo.out(&["rev-parse", "main"]), before);
     }
 

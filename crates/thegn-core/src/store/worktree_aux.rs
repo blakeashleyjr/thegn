@@ -30,6 +30,30 @@ pub enum MergeRetryOutcome {
     Claimed,
 }
 
+/// Rows kept per worktree in `merge_queue_events`; older rows are pruned in the writing transaction.
+pub const MERGE_QUEUE_EVENTS_PER_WORKTREE: usize = 200;
+
+/// One operator or lifecycle transition on a merge-queue row. `operation` is "retry" or
+/// "remove" (`thegn merge clear` removes row by row and is recorded as "remove"); `outcome`
+/// is "rearmed", "not_retryable", "claimed" or "deleted"; `new_status` is "queued" for a
+/// re-arm and None otherwise; `row_updated_at` is the row's `updated_at` before the
+/// transition (its version). Operator removals use the process actor (`thegn pid N`);
+/// automatic cleanup uses a distinct actor such as `thegn close` (or `thegn sweep`), so
+/// lifecycle work is distinguishable from `merge rm` / `clear`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeQueueEvent {
+    pub worktree: String,
+    pub operation: String,
+    pub outcome: String,
+    pub old_status: String,
+    pub new_status: Option<String>,
+    pub row_updated_at: i64,
+    pub candidate_oid: Option<String>,
+    pub result_oid: Option<String>,
+    pub actor: String,
+    pub at_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeClaimPhase {
     ClaimedNoChild,
@@ -402,8 +426,16 @@ pub trait WorktreeAuxStore {
     fn retry_held_merge_entry(&self, worktree: &str) -> Result<MergeRetryOutcome>;
 
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
-    /// elsewhere, or the worktree is removed).
+    /// elsewhere, or the worktree is removed). Joins a caller's transaction when
+    /// one is already open, so the deletion and event commit or roll back together.
     fn remove_merge_entry(&self, worktree: &str) -> Result<()>;
+
+    /// Drop a worktree's merge-queue row while recording the supplied lifecycle actor.
+    /// Joins a caller's transaction when one is already open.
+    fn remove_merge_entry_as(&self, worktree: &str, actor: &str) -> Result<()>;
+
+    /// Read an operator-event history newest first, limited to at most `limit` rows.
+    fn merge_queue_events(&self, worktree: &str, limit: usize) -> Result<Vec<MergeQueueEvent>>;
 
     /// Install only the fixed branch-retained cleanup marker if every decoded
     /// field still matches this landed observation. Preserve timestamps and
@@ -541,6 +573,15 @@ pub trait WorktreeAuxStore {
         &self,
         lease: &crate::pr_queue::PrAgentLease,
         finished: Option<(&str, &str)>,
+    ) -> Result<bool>;
+    /// Give back the attempt this lease's admission spent and hold the row, in one write fenced on
+    /// the live lease (owner, generation, unexpired) and on the attempt count the admission
+    /// produced. Returns false (and changes nothing) for a stale, expired or already-refunded lease.
+    fn refund_pr_agent_attempt(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        status: &str,
+        detail: &str,
     ) -> Result<bool>;
     /// Record the head an admitted agent produced, fenced on the live lease
     /// generation and on the admitted head still being the row's last head.

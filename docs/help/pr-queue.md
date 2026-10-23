@@ -188,6 +188,10 @@ repo other people push to:
   head on the forge, so an agent cannot top up its own budget or trip
   `pause_on_foreign_push`. Anything it cannot verify (a remote worktree, a
   teammate's push) still counts as someone else's.
+- **An agent that never starts** (sandbox entry refused, a broken command
+  template, an unwritable prompt) does not spend an attempt: the row is held
+  `needs_human` with the reason, for the PR queue and CI autofix alike, like the
+  merge queue.
 
 ## Watching
 

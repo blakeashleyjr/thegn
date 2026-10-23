@@ -703,7 +703,11 @@ impl VpsProvider {
                 && let Some(instance) = inventory.iter().find(|instance| instance.name == name)
             {
                 let listed_id = instance.id.clone();
-                if let Some(mut record) = registry::read(name) {
+                if let Some(mut record) = registry::read_checked(name).with_context(|| {
+                    format!(
+                        "vps destroy {name}: provider still lists an instance of this name under vendor id {listed_id}, and the ledger record cannot be read to retarget it; keeping it and SSH custody"
+                    )
+                })? {
                     record.instance_id.clone_from(&listed_id);
                     registry::write(&record)
                         .context("vps: retarget registry record to listed instance")?;
@@ -740,17 +744,19 @@ impl VpsProvider {
         if let Some(id) = matching_ssh_key(keys, &self.spec.pubkey) {
             return Ok(id);
         }
-        // Name the registered key by its material fingerprint, not a fixed
+        // Name the registered key by the SHA-256 of the decoded key, not a fixed
         // "thegn-managed": vendor key names must be unique, so a fixed name
         // would 409 the moment the managed key material differs from an
         // already-registered same-named key (key rotation, or a stale key from a
-        // reinstall). Keyed by fingerprint, distinct material ⇒ distinct name,
-        // and identical material is already served by the `same_pubkey` fast path.
-        let fp = thegn_core::util::short_hash(self.spec.pubkey.trim(), 8);
+        // reinstall). Keyed by SHA-256 of the decoded key, distinct material ⇒
+        // distinct name. `matching_ssh_key` reuses identical material under any
+        // name, including keys registered with the earlier FNV naming scheme.
+        let name = thegn_core::managed_ssh::vendor_key_name(self.spec.pubkey.trim())
+            .context("vps: the managed public key is not a valid OpenSSH key")?;
         let created = self
             .post_json(
                 &shaper.ssh_keys_url(base),
-                &shaper.ssh_key_body(&format!("thegn-managed-{fp}"), self.spec.pubkey.trim()),
+                &shaper.ssh_key_body(&name, self.spec.pubkey.trim()),
             )
             .await?;
         shaper
@@ -764,12 +770,17 @@ impl VpsProvider {
         if let Some(ip) = self.ip.lock().unwrap().clone().filter(|i| !i.is_empty()) {
             return Ok(ip);
         }
-        if let Some(rec) = registry::read(name)
+        let existing = registry::read_checked(name).with_context(|| {
+            format!(
+                "vps: the ledger record for {name} is unreadable; refusing to resolve or rewrite it"
+            )
+        })?;
+        if let Some(rec) = existing.as_ref()
             && rec.state == "ready"
             && !rec.ip.is_empty()
         {
             *self.ip.lock().unwrap() = Some(rec.ip.clone());
-            return Ok(rec.ip);
+            return Ok(rec.ip.clone());
         }
         let inst = self
             .find_by_name(name)
@@ -785,7 +796,6 @@ impl VpsProvider {
                 String::new()
             }
         };
-        let existing = registry::read(name);
         let can_write_cache = may_write_resolve_cache(existing.as_ref(), &account);
         if can_write_cache
             && let Err(error) = registry::write(&registry::VpsRecord {
@@ -1289,7 +1299,13 @@ impl RemoteProvider for VpsProvider {
             thegn_core::managed_ssh::read(self.spec.kind.as_str(), &custody_account, id)
                 .context("vps: validate managed SSH custody before destroy")?;
             // Resolve name → vendor instance id (registry first, then the API).
-            let instance_id = match registry::read(id).filter(|r| !r.instance_id.is_empty()) {
+            let record = registry::read_checked(id).with_context(|| {
+                format!(
+                    "vps destroy {id}: the ledger record is unreadable; fix or remove it under {} and retry (keeping SSH custody)",
+                    registry::dir().display()
+                )
+            })?;
+            let instance_id = match record.filter(|r| !r.instance_id.is_empty()) {
                 Some(r) => Some(r.instance_id),
                 None => self
                     .find_by_name(id)

@@ -2039,6 +2039,58 @@ pub(crate) fn verify_v95_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v96: append-only audit records for merge-queue operator transitions.
+pub(crate) fn migrate_v96(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS merge_queue_events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             worktree TEXT NOT NULL,
+             operation TEXT NOT NULL,
+             outcome TEXT NOT NULL,
+             old_status TEXT NOT NULL,
+             new_status TEXT,
+             row_updated_at INTEGER NOT NULL,
+             candidate_oid TEXT,
+             result_oid TEXT,
+             actor TEXT NOT NULL,
+             at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_merge_queue_events_worktree
+             ON merge_queue_events(worktree, id);",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v96_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "id",
+        "worktree",
+        "operation",
+        "outcome",
+        "old_status",
+        "new_status",
+        "row_updated_at",
+        "candidate_oid",
+        "result_oid",
+        "actor",
+        "at_ms",
+    ] {
+        if !has_column(conn, "merge_queue_events", column) {
+            bail!("schema v96 migration did not add merge_queue_events.{column}");
+        }
+    }
+    let mut statement = conn.prepare("PRAGMA index_info('idx_merge_queue_events_worktree')")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().map(String::as_str).collect::<Vec<_>>() != ["worktree", "id"] {
+        bail!(
+            "schema v96 migration did not add index idx_merge_queue_events_worktree on worktree,id"
+        );
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3345,6 +3397,50 @@ mod tests {
         )
         .unwrap();
         assert!(super::verify_v95_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn v96_adds_merge_queue_events_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v96_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v96_schema(&conn).is_err());
+        super::migrate_v96(&conn).unwrap();
+        super::migrate_v96(&conn).unwrap();
+        super::verify_v96_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_merge_queue_events_worktree;\nDROP TABLE merge_queue_events;",
+        )
+        .unwrap();
+        assert!(super::verify_v96_schema(&conn).is_err());
+        super::migrate_v96(&conn).unwrap();
+        super::verify_v96_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v96_upgrades_a_real_v95_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v95.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.enqueue_merge("/private/v96-worktree", "feature", "main")
+                .unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP INDEX idx_merge_queue_events_worktree;\n\
+                     DROP TABLE merge_queue_events;\n\
+                     PRAGMA user_version=95;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 96);
+        assert_eq!(upgraded.list_merge_queue().unwrap().len(), 1);
+        super::verify_v96_schema(upgraded.conn()).unwrap();
     }
 
     #[test]
