@@ -615,21 +615,23 @@ fn scope_wt(p: &str, worktree: &str) -> String {
     format!("account:{p}:wt:{worktree}")
 }
 
-/// The active account *name* for `provider`, by precedence. `None` ⇒ no
-/// selection (the CLI uses its own default home).
-pub fn active_name(
+/// The active account name for `provider`, by precedence, with every pointer
+/// read checked: a failed read is an error, never a fall-through to a broader
+/// scope (that would select another account's credentials).
+pub fn active_name_checked(
     cfg: &Config,
     db: &Db,
     worktree: &str,
     slug: Option<&str>,
     provider_id: &str,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context as _;
+
     if let Some(n) = db
         .get_ui_state(&scope_wt(provider_id, worktree), "active")
-        .ok()
-        .flatten()
+        .with_context(|| format!("read the {provider_id} account pinned to worktree {worktree}"))?
     {
-        return Some(n);
+        return Ok(Some(n));
     }
     if let Some(slug) = slug {
         // THE-515: the trusted overlay is selected by the one refusing
@@ -637,22 +639,37 @@ pub fn active_name(
         // binding lands. A refused overlay REFUSES: no workspace pointer and
         // no global account stand in for the block the user pinned.
         match cfg.workspace_overlay_for_tab_slug(db, slug) {
-            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => return None,
+            crate::workspace_overlay::WorkspaceOverlay::Refused(_) => return Ok(None),
             overlay => {
                 if let Some(n) = overlay.overlay().and_then(|w| w.accounts.get(provider_id)) {
-                    return Some(n.clone());
+                    return Ok(Some(n.clone()));
                 }
             }
         }
         if let Some(n) = db
             .get_ui_state(&scope_ws(provider_id, slug), "active")
-            .ok()
-            .flatten()
+            .with_context(|| format!("read the {provider_id} account pinned to workspace {slug}"))?
         {
-            return Some(n);
+            return Ok(Some(n));
         }
     }
     db.get_ui_state(&scope_global(provider_id), "active")
+        .with_context(|| format!("read the global {provider_id} account"))
+}
+
+/// The active account *name* for `provider`, by precedence. `None` ⇒ no
+/// selection (the CLI uses its own default home). Lenient: a failed read is
+/// `None` (no selection), never a broader scope's account; launch decisions
+/// that must not guess use [`active_name_checked`].
+pub fn active_name(
+    cfg: &Config,
+    db: &Db,
+    worktree: &str,
+    slug: Option<&str>,
+    provider_id: &str,
+) -> Option<String> {
+    // best-effort: display-only lenient read; launch decisions use active_name_checked
+    active_name_checked(cfg, db, worktree, slug, provider_id)
         .ok()
         .flatten()
 }
@@ -1406,6 +1423,48 @@ mod tests {
             active_name(&cfg, &db, "/elsewhere", Some(""), "codex").as_deref(),
             Some("ws-default")
         );
+    }
+
+    #[test]
+    fn active_name_checked_propagates_an_unreadable_pointer() {
+        let db = Db::open_memory().unwrap();
+        let cfg = Config::default();
+        set_active(&db, Bind::Global, "/wt", None, "codex", "g").unwrap();
+        db.conn().execute_batch("DROP TABLE ui_state").unwrap();
+
+        assert!(active_name_checked(&cfg, &db, "/wt", None, "codex").is_err());
+    }
+
+    #[test]
+    fn active_name_checked_matches_active_name_on_a_readable_db() {
+        let db = Db::open_memory().unwrap();
+        let cfg = Config::default();
+        set_active(&db, Bind::Global, "/wt", None, "codex", "g").unwrap();
+        set_active(&db, Bind::Worktree, "/wt", None, "codex", "p").unwrap();
+
+        for (worktree, expected) in [
+            ("/wt", Some("p")),
+            ("/other", Some("g")),
+            ("/empty", Some("g")),
+        ] {
+            let checked = active_name_checked(&cfg, &db, worktree, None, "codex").unwrap();
+            assert_eq!(checked.as_deref(), expected);
+            assert_eq!(checked, active_name(&cfg, &db, worktree, None, "codex"));
+        }
+        let empty_db = Db::open_memory().unwrap();
+        let checked = active_name_checked(&cfg, &empty_db, "/wt", None, "codex").unwrap();
+        assert_eq!(checked, None);
+        assert_eq!(checked, active_name(&cfg, &empty_db, "/wt", None, "codex"));
+    }
+
+    #[test]
+    fn active_name_is_none_when_the_pointer_store_is_unreadable() {
+        let db = Db::open_memory().unwrap();
+        let cfg = Config::default();
+        set_active(&db, Bind::Global, "/wt", None, "codex", "g").unwrap();
+        db.conn().execute_batch("DROP TABLE ui_state").unwrap();
+
+        assert_eq!(active_name(&cfg, &db, "/wt", None, "codex"), None);
     }
 
     #[test]
