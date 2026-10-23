@@ -1245,12 +1245,13 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
         anyhow::bail!("{msg}");
     }
-    crate::merge_ops::ready_land_precheck(&guard_db, &wt_s)?;
+    let admission = crate::merge_ops::ready_land_precheck(&guard_db, &wt_s)?;
     let guard = crate::platform::InterruptGuard::install();
     let _scope = crate::fold_cancel::scope(move || guard.fired());
     // Share the fold/gate/CAS core with `thegn land`; this queue-aware path
     // additionally records the outcome on the worktree's merge-queue row.
-    let (branch, target, outcome) = super::land::land_branch(cfg, &wt)?;
+    let (branch, target, outcome) =
+        super::land::land_branch_pinned(cfg, &wt, Some(&admission.candidate_oid))?;
     let db = Db::open()?;
     // Apply the sidebar-folder lifecycle for this worktree once we know its fate.
     let lifecycle = |event: LifecycleEvent| {
@@ -1274,12 +1275,16 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             old_oid,
             resyncs,
         } => {
-            if let Err(error) = db.update_merge_status(
-                &wt_s,
-                thegn_core::attention::MqStatus::Landed.as_str(),
-                Some(&commit),
-                None,
-                None,
+            if let Err(error) = crate::merge_ops::record_ready_land(
+                &db,
+                &admission,
+                &crate::merge_ops::ReadyLandRecord {
+                    branch: &branch,
+                    repo_root: &root,
+                    target_branch: &target,
+                    result_oid: &commit,
+                    up_to_date: false,
+                },
             ) {
                 anyhow::bail!(
                     "ref advanced, bookkeeping failed: target {target}, old OID {old_oid}, new OID {commit}; verify the target ref and rerun `thegn merge drain` to reconcile. DB error: {error}"
@@ -1297,13 +1302,21 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate { commit } => {
-            db.update_merge_status(
-                &wt_s,
-                thegn_core::attention::MqStatus::Landed.as_str(),
-                Some(&commit),
-                Some("already merged"),
-                None,
-            )?;
+            if let Err(error) = crate::merge_ops::record_ready_land(
+                &db,
+                &admission,
+                &crate::merge_ops::ReadyLandRecord {
+                    branch: &branch,
+                    repo_root: &root,
+                    target_branch: &target,
+                    result_oid: &commit,
+                    up_to_date: true,
+                },
+            ) {
+                anyhow::bail!(
+                    "ref advanced, bookkeeping failed: target {target}, old OID {commit}, new OID {commit}; verify the target ref and rerun `thegn merge drain` to reconcile. DB error: {error}"
+                );
+            }
             lifecycle(LifecycleEvent::Landed);
             outln!("{branch} already merged.");
         }
