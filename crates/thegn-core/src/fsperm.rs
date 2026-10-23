@@ -263,6 +263,27 @@ pub fn make_executable_for_test(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub fn set_mode_for_test(
+    #[cfg(unix)] path: &Path,
+    #[cfg(unix)] mode: u32,
+    #[cfg(not(unix))] _path: &Path,
+    #[cfg(not(unix))] _mode: u32,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file modes are unavailable on this platform",
+        ))
+    }
+}
+
 /// Create a new file without replacement, restrict it to the owning user, and
 /// durably write `bytes`. Unix supplies mode 0600 at creation; other platforms
 /// apply their owner-only permission mechanism before content is written.
@@ -2407,5 +2428,18 @@ mod tests {
 
         assert!(pinned.open_or_create_regular_nofollow("link").is_err());
         assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn set_mode_for_test_round_trips_mode_bits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mode-test");
+        std::fs::write(&path, b"fixture").unwrap();
+        match set_mode_for_test(&path, 0o640) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("could not set fixture mode: {error}"),
+        }
+        assert_eq!(mode_bits(&path).unwrap(), Some(0o640));
     }
 }
