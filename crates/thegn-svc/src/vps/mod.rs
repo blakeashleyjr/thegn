@@ -705,7 +705,7 @@ impl VpsProvider {
                 let listed_id = instance.id.clone();
                 if let Some(mut record) = registry::read_checked(name).with_context(|| {
                     format!(
-                        "vps destroy {name}: cannot read the ledger record; keeping it and SSH custody"
+                        "vps destroy {name}: provider still lists an instance of this name under vendor id {listed_id}, and the ledger record cannot be read to retarget it; keeping it and SSH custody"
                     )
                 })? {
                     record.instance_id.clone_from(&listed_id);
@@ -765,14 +765,14 @@ impl VpsProvider {
     /// Resolve the instance's public IP: cache → registry → API (then persist).
     pub async fn resolve_ip(&self, name: &str) -> Result<String> {
         registry::checked_name(name)?;
+        if let Some(ip) = self.ip.lock().unwrap().clone().filter(|i| !i.is_empty()) {
+            return Ok(ip);
+        }
         let existing = registry::read_checked(name).with_context(|| {
             format!(
                 "vps: the ledger record for {name} is unreadable; refusing to resolve or rewrite it"
             )
         })?;
-        if let Some(ip) = self.ip.lock().unwrap().clone().filter(|i| !i.is_empty()) {
-            return Ok(ip);
-        }
         if let Some(rec) = existing.as_ref()
             && rec.state == "ready"
             && !rec.ip.is_empty()

@@ -377,8 +377,6 @@ impl FlyProvider {
     /// Resolve the sandbox's public IPv4: cache → ledger → the app's IP via API.
     pub async fn resolve_ip(&self, name: &str) -> Result<String> {
         registry::checked_name(name)?;
-        let record = registry::read_checked(name)
-            .with_context(|| format!("fly: the ledger record for {name} is unreadable"))?;
         if let Some(ip) = self
             .ips
             .lock()
@@ -389,6 +387,8 @@ impl FlyProvider {
         {
             return Ok(ip);
         }
+        let record = registry::read_checked(name)
+            .with_context(|| format!("fly: the ledger record for {name} is unreadable"))?;
         if let Some(rec) = record
             .filter(|r| r.provider == LEDGER_PROVIDER && r.state == "ready" && !r.ip.is_empty())
         {
