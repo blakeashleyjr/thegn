@@ -502,6 +502,12 @@ pub struct SpritesProvider {
     client: reqwest::Client,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SpritesListPage {
+    names: Vec<String>,
+    next: Option<String>,
+}
+
 /// Whether a non-OK control-plane HTTP status is worth retrying: transient
 /// server/overload conditions (any 5xx, 429 Too Many Requests, 408 Request
 /// Timeout) can clear on a retry; other 4xx are the caller's fault and won't
@@ -584,6 +590,18 @@ impl SpritesProvider {
         Ok(format!("{}/sprites", self.base()?))
     }
 
+    fn sprites_list_url(&self, token: Option<&str>) -> Result<String> {
+        let url = self.sprites_url()?;
+        let Some(token) = token else {
+            return Ok(url);
+        };
+        let mut url = reqwest::Url::parse(&url)
+            .map_err(|error| anyhow!("sprites: invalid list URL: {error}"))?;
+        url.query_pairs_mut()
+            .append_pair("continuation_token", token);
+        Ok(url.to_string())
+    }
+
     fn sprite_name_url(&self, name: &str) -> Result<String> {
         Ok(format!("{}/sprites/{name}", self.base()?))
     }
@@ -602,27 +620,34 @@ impl SpritesProvider {
             .map(str::to_string)
     }
 
-    /// Parse a complete list response (an array, or `{ "sprites": [...] }`).
-    fn parse_list(v: &serde_json::Value) -> Result<Vec<String>> {
-        if let Some(has_more) = v.get("has_more") {
-            let Some(has_more) = has_more.as_bool() else {
+    /// Parse one list page (an array, or `{ "sprites": [...] }`).
+    fn parse_list_page(v: &serde_json::Value) -> Result<SpritesListPage> {
+        let next = match v.get("has_more") {
+            None | Some(serde_json::Value::Bool(false)) => None,
+            Some(serde_json::Value::Bool(true)) => {
+                let token = v
+                    .get("next_continuation_token")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("sprites: GET /sprites returned a partial inventory (has_more without next_continuation_token)")
+                    })?;
+                Some(token.to_string())
+            }
+            Some(_) => {
                 return Err(anyhow!(
                     "sprites: GET /sprites returned a partial inventory (invalid has_more)"
                 ));
-            };
-            if has_more {
-                return Err(anyhow!(
-                    "sprites: GET /sprites returned a partial inventory (has_more); refusing to treat it as complete"
-                ));
             }
-        }
+        };
         let arr = v
             .as_array()
             .or_else(|| v.get("sprites").and_then(serde_json::Value::as_array))
             .ok_or_else(|| {
                 anyhow!("sprites: GET /sprites returned an unrecognised list envelope")
             })?;
-        arr.iter()
+        let names = arr
+            .iter()
             .enumerate()
             .map(|(index, sprite)| {
                 Self::parse_name(sprite)
@@ -631,7 +656,46 @@ impl SpritesProvider {
                         anyhow!("sprites: GET /sprites element {index} has no sprite name")
                     })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SpritesListPage { names, next })
+    }
+
+    async fn get_list_page(&self, url: &str) -> Result<serde_json::Value> {
+        let mut last: Option<String> = None;
+        for attempt in 0..CONTROL_ATTEMPTS {
+            match self
+                .client
+                .get(url)
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return response_json(resp, "sprites", "GET /sprites").await;
+                    }
+                    last = Some(status.to_string());
+                    if !transient_status(status) {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    last = Some(error.to_string());
+                    if !transient_err(&error) {
+                        break;
+                    }
+                }
+            }
+            if attempt + 1 < CONTROL_ATTEMPTS {
+                tokio::time::sleep(CONTROL_BACKOFF).await;
+            }
+        }
+        Err(anyhow!(
+            "sprites list failed ({})",
+            last.unwrap_or_else(|| "no response".into())
+        ))
     }
 
     /// The exec handle for a sprite: the `sprite` CLI exec bridge (PTY-capable).
@@ -754,44 +818,52 @@ impl RemoteProvider for SpritesProvider {
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move {
             let _permit = CONTROL_GATE.acquire(&self.authority()?).await?;
-            // Bounded + retried like `create`: `ensure_exists` calls this first, so an
-            // untimed list would strand provisioning on a stalled control plane.
-            let mut last: Option<String> = None;
-            for attempt in 0..CONTROL_ATTEMPTS {
-                match self
-                    .client
-                    .get(self.sprites_url()?)
-                    .bearer_auth(&self.token)
-                    .timeout(CONTROL_TIMEOUT)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            let body = response_json(resp, "sprites", "GET /sprites").await?;
-                            return Self::parse_list(&body);
-                        }
-                        last = Some(status.to_string());
-                        if !transient_status(status) {
-                            break;
-                        }
+            let listing = async {
+                let mut names = Vec::new();
+                let mut seen_names = std::collections::HashSet::new();
+                let mut seen_tokens = std::collections::HashSet::new();
+                let mut token: Option<String> = None;
+                let mut pages: u32 = 0;
+                loop {
+                    if pages >= crate::vps::MAX_INVENTORY_PAGES {
+                        return Err(anyhow!(
+                            "sprites list exceeded the page limit; refusing a partial list"
+                        ));
                     }
-                    Err(e) => {
-                        last = Some(e.to_string());
-                        if !transient_err(&e) {
-                            break;
-                        }
+                    pages += 1;
+                    let url = self.sprites_list_url(token.as_deref())?;
+                    let body = self.get_list_page(&url).await?;
+                    let page = Self::parse_list_page(&body)?;
+                    if names.len().saturating_add(page.names.len()) > crate::vps::MAX_INVENTORY_ROWS
+                    {
+                        return Err(anyhow!(
+                            "sprites list exceeded the row limit; refusing a partial list"
+                        ));
                     }
+                    for name in page.names {
+                        if !seen_names.insert(name.clone()) {
+                            return Err(anyhow!(
+                                "sprites list returned duplicate sprite name {name}"
+                            ));
+                        }
+                        names.push(name);
+                    }
+                    let Some(next) = page.next else {
+                        return Ok(names);
+                    };
+                    if !seen_tokens.insert(next.clone()) {
+                        return Err(anyhow!(
+                            "sprites list returned a repeated continuation token"
+                        ));
+                    }
+                    token = Some(next);
                 }
-                if attempt + 1 < CONTROL_ATTEMPTS {
-                    tokio::time::sleep(CONTROL_BACKOFF).await;
-                }
-            }
-            Err(anyhow!(
-                "sprites list failed ({})",
-                last.unwrap_or_else(|| "no response".into())
-            ))
+            };
+            tokio::time::timeout(crate::vps::INVENTORY_BUDGET, listing)
+                .await
+                .map_err(|_| {
+                    anyhow!("sprites list exceeded the 120 second budget; refusing a partial list")
+                })?
         })
     }
 }
@@ -1129,12 +1201,28 @@ impl SpritesProvider {
 
     /// Parse a complete checkpoint list (an array, or `{ "checkpoints": [...] }`).
     fn parse_checkpoint_list(v: &serde_json::Value) -> Result<Vec<CheckpointInfo>> {
-        let arr = v
-            .as_array()
-            .or_else(|| v.get("checkpoints").and_then(serde_json::Value::as_array))
-            .ok_or_else(|| {
+        let arr = if let Some(checkpoints) = v.get("checkpoints") {
+            match v.get("has_more") {
+                None | Some(serde_json::Value::Bool(false)) => {}
+                Some(serde_json::Value::Bool(true)) => {
+                    return Err(anyhow!(
+                        "sprites: GET /checkpoints returned a partial checkpoint inventory (has_more)"
+                    ));
+                }
+                Some(_) => {
+                    return Err(anyhow!(
+                        "sprites: GET /checkpoints returned invalid has_more"
+                    ));
+                }
+            }
+            checkpoints.as_array().ok_or_else(|| {
                 anyhow!("sprites: GET /checkpoints returned an unrecognised list envelope")
-            })?;
+            })?
+        } else {
+            v.as_array().ok_or_else(|| {
+                anyhow!("sprites: GET /checkpoints returned an unrecognised list envelope")
+            })?
+        };
         arr.iter()
             .enumerate()
             .map(|(index, checkpoint)| {
@@ -3074,6 +3162,41 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
+    async fn paged_list_server(
+        bodies: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request_lines = Vec::with_capacity(bodies.len());
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "request ended before headers completed");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request_text = String::from_utf8_lossy(&request);
+                let request_line = request_text
+                    .lines()
+                    .next()
+                    .expect("HTTP request must contain a request line");
+                request_lines.push(request_line.to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            request_lines
+        });
+        (format!("http://{address}"), server)
+    }
+
     #[test]
     fn sprites_default_base_and_urls() {
         let p = sprites();
@@ -3478,23 +3601,27 @@ mod tests {
     #[test]
     fn sprites_parse_list_array_and_envelope() {
         let arr = serde_json::json!([{"name": "a"}, {"name": "b"}]);
-        assert_eq!(SpritesProvider::parse_list(&arr).unwrap(), vec!["a", "b"]);
+        let parsed = SpritesProvider::parse_list_page(&arr).unwrap();
+        assert_eq!(parsed.names, vec!["a", "b"]);
+        assert_eq!(parsed.next, None);
         let env = serde_json::json!({"sprites": [{"name": "c"}]});
-        assert_eq!(SpritesProvider::parse_list(&env).unwrap(), vec!["c"]);
-        assert!(SpritesProvider::parse_list(&serde_json::json!([{"id": "no-name"}])).is_err());
-        assert!(SpritesProvider::parse_list(&serde_json::json!({})).is_err());
+        let parsed = SpritesProvider::parse_list_page(&env).unwrap();
+        assert_eq!(parsed.names, vec!["c"]);
+        assert_eq!(parsed.next, None);
+        assert!(SpritesProvider::parse_list_page(&serde_json::json!([{"id": "no-name"}])).is_err());
+        assert!(SpritesProvider::parse_list_page(&serde_json::json!({})).is_err());
     }
 
     #[test]
     fn sprites_parse_list_is_strict() {
-        assert!(SpritesProvider::parse_list(&serde_json::json!({})).is_err());
-        let partial = SpritesProvider::parse_list(&serde_json::json!({
+        assert!(SpritesProvider::parse_list_page(&serde_json::json!({})).is_err());
+        let partial = SpritesProvider::parse_list_page(&serde_json::json!({
             "sprites": [{"name": "a"}],
             "has_more": true
         }));
         assert!(partial.unwrap_err().to_string().contains("has_more"));
         assert!(
-            SpritesProvider::parse_list(&serde_json::json!({
+            SpritesProvider::parse_list_page(&serde_json::json!({
                 "sprites": [],
                 "has_more": "no"
             }))
@@ -3506,10 +3633,69 @@ mod tests {
             "has_more": false
         });
         assert_eq!(
-            SpritesProvider::parse_list(&real_shape).unwrap(),
+            SpritesProvider::parse_list_page(&real_shape).unwrap().names,
             vec!["tgtest1"]
         );
-        assert!(SpritesProvider::parse_list(&serde_json::json!([{"id": "no-name"}])).is_err());
+        assert!(SpritesProvider::parse_list_page(&serde_json::json!([{"id": "no-name"}])).is_err());
+    }
+
+    #[test]
+    fn sprites_list_page_refuses_has_more_without_a_token() {
+        let result = SpritesProvider::parse_list_page(&serde_json::json!({
+            "sprites": [],
+            "has_more": true
+        }));
+        assert!(result.unwrap_err().to_string().contains("has_more"));
+    }
+
+    #[tokio::test]
+    async fn sprites_list_follows_continuation_pages() {
+        let (base, server) = paged_list_server(vec![
+            r#"{"sprites":[{"name":"a"}],"has_more":true,"next_continuation_token":"t1"}"#.into(),
+            r#"{"sprites":[{"name":"b"}],"has_more":false}"#.into(),
+        ])
+        .await;
+        let names = SpritesProvider::new(&base, "tok", "x")
+            .list()
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["a", "b"]);
+        let requests = server.await.unwrap();
+        let second = requests
+            .iter()
+            .position(|line| line.contains("continuation_token="))
+            .expect("second page request must carry its continuation token");
+        assert!(requests[second].contains("continuation_token=t1"));
+        assert!(!requests[0].contains('?'));
+    }
+
+    #[tokio::test]
+    async fn sprites_list_refuses_a_repeated_continuation_token() {
+        let (base, server) = paged_list_server(vec![
+            r#"{"sprites":[{"name":"a"}],"has_more":true,"next_continuation_token":"t1"}"#.into(),
+            r#"{"sprites":[{"name":"b"}],"has_more":true,"next_continuation_token":"t1"}"#.into(),
+        ])
+        .await;
+        let result = SpritesProvider::new(&base, "tok", "x").list().await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("repeated continuation token")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sprites_list_refuses_a_duplicate_name_across_pages() {
+        let (base, server) = paged_list_server(vec![
+            r#"{"sprites":[{"name":"a"}],"has_more":true,"next_continuation_token":"t1"}"#.into(),
+            r#"{"sprites":[{"name":"a"}],"has_more":false}"#.into(),
+        ])
+        .await;
+        let result = SpritesProvider::new(&base, "tok", "x").list().await;
+        assert!(result.unwrap_err().to_string().contains("duplicate"));
+        server.await.unwrap();
     }
 
     #[test]
@@ -4512,6 +4698,37 @@ mod tests {
         );
         assert!(SpritesProvider::parse_checkpoint_list(&serde_json::json!([{"x": 1}])).is_err());
         assert!(SpritesProvider::parse_checkpoint_list(&serde_json::json!([{"id": ""}])).is_err());
+    }
+
+    #[test]
+    fn sprites_checkpoint_list_refuses_has_more() {
+        assert!(
+            SpritesProvider::parse_checkpoint_list(&serde_json::json!({
+                "checkpoints": [{"id": "cp-1"}],
+                "has_more": true
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("has_more")
+        );
+        assert!(
+            SpritesProvider::parse_checkpoint_list(&serde_json::json!({
+                "checkpoints": [],
+                "has_more": "no"
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid has_more")
+        );
+        assert_eq!(
+            SpritesProvider::parse_checkpoint_list(&serde_json::json!({
+                "checkpoints": [{"id": "cp-1"}],
+                "has_more": false
+            }))
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[tokio::test]
