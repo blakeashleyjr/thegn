@@ -901,12 +901,11 @@ pub(crate) fn destroy_one_checked(
         };
     // Remote/provider worktrees are never tombstoned: their local path is not
     // authoritative, and a later worktree at that path must not be dropped.
-    let is_remote = db
-        .and_then(|d| d.location_for(&worktree.to_string_lossy()).ok().flatten())
-        .is_some_and(|loc| {
-            let loc = loc.trim();
-            !loc.is_empty() && loc != "local"
-        });
+    let location = match destroy_location(db, worktree) {
+        Ok(location) => location,
+        Err(error) => return (false, error),
+    };
+    let is_remote = location.is_remote();
     if let Err(error) = guard() {
         return (false, error);
     }
@@ -939,7 +938,7 @@ pub(crate) fn destroy_one_checked(
 
     let teardown = match automatic_teardown {
         Some(teardown) => teardown(),
-        None => teardown_runtime(cfg, repo_root, worktree, db),
+        None => teardown_runtime(cfg, repo_root, worktree, &location, db),
     };
     if let Err(error) = teardown {
         return (false, error);
@@ -988,7 +987,7 @@ pub(crate) fn destroy_one_checked(
             delete_branch,
         ) {
             Ok(()) => {
-                thegn_core::worktree::purge_worktree_files(worktree);
+                thegn_core::worktree::purge_worktree_files(&location);
                 !worktree.exists()
             }
             Err(why) => {
@@ -1029,13 +1028,15 @@ pub(crate) fn destroy_one_checked(
 }
 
 /// Tear down every runtime resource that was attached to the worktree while
-/// its DB row and selected environment are still available. These operations
-/// are deliberately off-loop because provider and projection teardown may do
-/// network, mount, or container work.
+/// its DB row and selected environment are still available. The caller has
+/// already resolved the worktree location. These operations are deliberately
+/// off-loop because provider and projection teardown may do network, mount,
+/// or container work.
 fn teardown_runtime(
     cfg: &Config,
     repo_root: &Path,
     worktree: &Path,
+    loc: &thegn_core::remote::GitLoc,
     db: Option<&Db>,
 ) -> Result<(), String> {
     #[cfg(test)]
@@ -1048,8 +1049,7 @@ fn teardown_runtime(
             db.effective_env_checked(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
         }),
     })?;
-    let loc = thegn_core::remote::GitLoc::for_worktree(worktree);
-    let env = cfg.resolve_env(repo_root, &loc, worktree, selected.as_deref());
+    let env = cfg.resolve_env(repo_root, loc, worktree, selected.as_deref());
     let path = worktree.to_string_lossy().into_owned();
     let mut failures = Vec::new();
 
@@ -1088,7 +1088,7 @@ fn teardown_runtime(
     crate::agent::deproject(&path);
     crate::agent::checkpoint_on_close(&path);
     crate::bridge_sup::disconnect_path(&path);
-    crate::close_teardown::sandbox_teardown(cfg, &env, &loc, &path);
+    crate::close_teardown::sandbox_teardown(cfg, &env, loc, &path);
     crate::placement_flow::release(&path);
 
     if failures.is_empty() {
@@ -1106,6 +1106,41 @@ fn teardown_selection(read: anyhow::Result<Option<String>>) -> Result<Option<Str
         Err(error) => Err(format!(
             "the environment selection could not be read ({error:#}); runtime teardown refused so another environment's sandbox is never torn down — retry when the state database is readable"
         )),
+    }
+}
+
+/// Resolve the worktree location once before teardown or removal. A failed
+/// read or unrecognised recorded location refuses deletion: guessing local
+/// could tombstone a remote path, target the wrong runtime, and skip its purge.
+fn destroy_location(
+    db: Option<&Db>,
+    worktree: &Path,
+) -> Result<thegn_core::remote::GitLoc, String> {
+    let path = worktree.to_string_lossy();
+    let read = match db {
+        Some(db) => db.location_for(&path),
+        None => Db::open().and_then(|db| db.location_for(&path)),
+    };
+    match read {
+        Err(error) => Err(format!(
+            "cannot read where {} lives ({error:#}); nothing was removed — retry once the state database is readable",
+            worktree.display()
+        )),
+        Ok(location) => {
+            let loc = thegn_core::remote::GitLoc::from_db(&path, location.as_deref());
+            if location.as_deref().is_some_and(|recorded| {
+                let recorded = recorded.trim();
+                !recorded.is_empty() && recorded != "local"
+            }) && !loc.is_remote()
+            {
+                Err(format!(
+                    "unrecognised worktree location recorded for {}; nothing was removed",
+                    worktree.display()
+                ))
+            } else {
+                Ok(loc)
+            }
+        }
     }
 }
 
@@ -2651,6 +2686,149 @@ mod tests {
             teardown_selection(Ok(Some("box".into()))),
             Ok(Some("box".into()))
         );
+    }
+
+    #[test]
+    fn destroy_location_refuses_when_the_database_cannot_be_opened() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+
+        let result = destroy_location(None, Path::new("/wt/x"));
+        assert!(matches!(result, Err(message)
+            if message.contains("nothing was removed") && message.contains("/wt/x")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (success, message) = destroy_one_checked(
+            &Config::default(),
+            &root,
+            &worktree,
+            "feature",
+            "repo",
+            false,
+            false,
+            HookExecutionMode::Force,
+            None,
+            &|| Err("guard must not run before location resolution".into()),
+            None,
+            None,
+        );
+        assert!(!success);
+        assert!(message.contains("cannot read where"));
+        assert!(message.contains("nothing was removed"));
+        assert!(worktree.exists());
+    }
+
+    #[test]
+    fn destroy_location_refuses_an_unrecognised_recorded_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        db.put_worktree("tab", "/repo", "/wt/x", "feat", Some("garbage"), None)
+            .unwrap();
+
+        let result = destroy_location(Some(&db), Path::new("/wt/x"));
+        assert!(matches!(result, Err(message)
+            if message.contains("unrecognised worktree location")));
+    }
+
+    #[test]
+    fn destroy_location_resolves_recorded_and_absent_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("t.db")).unwrap();
+
+        assert!(matches!(
+            destroy_location(Some(&db), Path::new("/wt/none")),
+            Ok(thegn_core::remote::GitLoc::Local(_))
+        ));
+        db.put_worktree("local", "/repo", "/wt/local", "feat", Some("local"), None)
+            .unwrap();
+        assert!(matches!(
+            destroy_location(Some(&db), Path::new("/wt/local")),
+            Ok(thegn_core::remote::GitLoc::Local(_))
+        ));
+
+        let control_prefix = vec!["sprite".to_string(), "exec".to_string()];
+        let recorded =
+            thegn_core::remote::GitLoc::provider_db_string(&control_prefix, "/workspace");
+        db.put_worktree(
+            "provider",
+            "/repo",
+            "/wt/provider",
+            "feat",
+            Some(&recorded),
+            None,
+        )
+        .unwrap();
+        let location = destroy_location(Some(&db), Path::new("/wt/provider")).unwrap();
+        assert!(location.is_remote());
+        assert_eq!(location.path(), "/workspace");
+    }
+
+    #[test]
+    fn destroy_one_refuses_before_removal_when_the_location_is_unrecognised() {
+        let _state = crate::testenv::IsolatedState::new();
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("repo");
+        let worktree = base.path().join("feature");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "test"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("file"), "base\n").unwrap();
+        git(&root, &["add", "file"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let db = Db::open().unwrap();
+        db.put_worktree(
+            "feature",
+            root.to_str().unwrap(),
+            worktree.to_str().unwrap(),
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+        let hook_marker = base.path().join("pre-destroy-ran");
+        let mut cfg = Config::default();
+        cfg.hooks.pre_destroy = vec![thegn_core::hooks::HookEntry::Spec(
+            thegn_core::hooks::HookEntrySpec {
+                command: format!("touch {}", hook_marker.display()),
+                wait: Some(true),
+                timeout_secs: Some(5),
+                on_failure: Some(thegn_core::hooks::HookFailure::Warn),
+            },
+        )];
+
+        let (success, message) = destroy_one(
+            &cfg,
+            &root,
+            &worktree,
+            "feature",
+            "repo",
+            false,
+            false,
+            HookExecutionMode::Force,
+            Some(&db),
+        );
+
+        assert!(!success);
+        assert!(message.contains("unrecognised worktree location"));
+        assert!(worktree.exists());
+        assert!(!hook_marker.exists(), "pre-destroy hook ran before refusal");
     }
 }
 
