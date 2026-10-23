@@ -274,6 +274,20 @@ impl NotifyState {
         }
     }
 
+    /// Send status-line text to the event loop from an off-loop producer.
+    pub(crate) fn emit_status(&self, text: &str) {
+        if let Some(tx) = self.toast_tx.lock().unwrap().as_ref()
+            && tx
+                .send(crate::hydrate::RefreshKind::PrActionStatus(
+                    text.to_string(),
+                ))
+                .is_ok()
+            && let Err(error) = self.waker.wake()
+        {
+            tracing::debug!(target: "thegn::notify", %error, "best-effort status-line waker pulse failed");
+        }
+    }
+
     /// Update the focused/visible worktree path (drives `suppress_focused`).
     pub fn set_focused_worktree(&self, worktree: String) {
         *self.focused_worktree.lock().unwrap() = worktree;
