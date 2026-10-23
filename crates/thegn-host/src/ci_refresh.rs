@@ -18,7 +18,7 @@ use thegn_core::store::WorkspaceStore;
 
 /// One request's aggregate cap across active and background worktrees, including run lists.
 const MAX_LOG_INGEST_CALLS: usize = 32;
-/// One request's aggregate cap across active and background worktrees, including run lists.
+/// Log bytes ingested by one refresh request (active worktree plus the background sweep).
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
 /// One request's aggregate cap across active and background worktrees, including run lists.
 const MAX_LOG_INGEST_WALL: Duration = Duration::from_secs(120);
@@ -1016,9 +1016,9 @@ fn run_ci_refresh_request(request: &RefreshRequest) {
 /// every worktree gets a turn even when several are stale.
 static SWEEP_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Refresh at most ONE stale background worktree's CI cache (the ttl guard
-/// decides staleness), starting from the rotating cursor. Blocking; must run
-/// on the bg lane.
+/// Refresh at most ONE stale background worktree's CI cache, or none when the
+/// request's budget is exhausted (the ttl guard decides staleness), starting
+/// from the rotating cursor. Blocking; must run on the bg lane.
 fn sweep_one_background(
     session: &crate::session::Session,
     active: &std::path::Path,
