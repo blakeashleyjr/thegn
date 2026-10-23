@@ -234,7 +234,7 @@ pub(crate) const LAUNCH_ROUTES: &[LaunchRoute] = &[
         path: "host language servers under the resource ceiling (lsp)",
         anchor: Some((
             "lsp.rs",
-            "let argv = thegn_core::sandbox_cpucap::wrap_background_argv(argv);",
+            "let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(argv);",
         )),
     },
     LaunchRoute {
