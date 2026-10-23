@@ -2820,3 +2820,45 @@ fn compose_guard_protects_host_credentials_sockets_state_runtime_and_extra_paths
         );
     }
 }
+
+#[test]
+fn launch_state_gate_refuses_a_configured_agent() {
+    let agent_cfg = cfg_with(&[("codex", "codex")], &[]);
+    let error = anyhow::anyhow!("disk I/O error");
+    let result = launch_state_gate(&agent_cfg, "codex", "saved override unreadable", &error);
+    let Err(error) = result else {
+        panic!("configured agent must be refused");
+    };
+    let detail = format!("{error:#}");
+    assert!(detail.contains("refusing to launch `codex`"), "{detail}");
+    assert!(detail.contains("saved override unreadable"), "{detail}");
+    assert!(detail.contains("disk I/O error"), "{detail}");
+
+    let tool_cfg = cfg_with(&[], &[("lazygit", "lazygit")]);
+    let error = anyhow::anyhow!("disk I/O error");
+    let result = launch_state_gate(&tool_cfg, "lazygit", "saved override unreadable", &error);
+    let Err(error) = result else {
+        panic!("configured tool must be refused");
+    };
+    let detail = format!("{error:#}");
+    assert!(detail.contains("refusing to launch `lazygit`"), "{detail}");
+    assert!(detail.contains("saved override unreadable"), "{detail}");
+    assert!(detail.contains("disk I/O error"), "{detail}");
+}
+
+#[test]
+fn launch_state_gate_lets_a_shell_launch_with_a_warning() {
+    let cfg = cfg_with(&[("codex", "codex")], &[]);
+    let error = anyhow::anyhow!("disk I/O error");
+    assert!(launch_state_gate(&cfg, "shell", "saved override unreadable", &error).is_ok());
+}
+
+#[test]
+fn repo_slug_checked_is_none_without_a_directory_name() {
+    let db = Db::open_memory().unwrap();
+    assert_eq!(repo_slug_checked(&db, Path::new("/")).unwrap(), None);
+    assert_eq!(
+        repo_slug_checked(&db, Path::new("/tmp/x/foo")).unwrap(),
+        Some("foo".to_string())
+    );
+}
