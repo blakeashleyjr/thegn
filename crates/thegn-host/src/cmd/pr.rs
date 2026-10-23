@@ -362,8 +362,7 @@ pub(crate) fn merge_reviewed_head(
 }
 
 /// Re-attest the displayed PR number and head before submitting a review.
-/// The re-read narrows but does not close the window between the read and the
-/// forge accepting the review; a commit-pinned review API call is a later slice.
+/// The review is pinned to the displayed head, so a later push cannot receive it.
 pub(crate) fn review_reviewed_head(
     forge: &dyn Forge,
     loc: &GitLoc,
@@ -396,7 +395,7 @@ pub(crate) fn review_reviewed_head(
             reviewed.number
         )));
     }
-    forge.submit_review(loc, pr, state, body)
+    forge.submit_review(loc, pr, state, body, Some(reviewed.head))
 }
 
 pub(crate) fn merge_outcome_text(
@@ -602,11 +601,11 @@ mod tests {
             pr: PrRef,
             state: ReviewState,
             body: Option<&str>,
+            expected_head: Option<&str>,
         ) -> std::result::Result<(), ForgeError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("review {pr:?} {state:?} {body:?}"));
+            self.calls.lock().unwrap().push(format!(
+                "review {pr:?} {state:?} {body:?} {expected_head:?}"
+            ));
             self.result.lock().unwrap().clone()
         }
     }
@@ -639,8 +638,33 @@ mod tests {
         );
         assert_eq!(
             forge.calls(),
-            vec!["status Number(7)", "review Number(7) Approve None"]
+            vec![
+                "status Number(7)",
+                "review Number(7) Approve None Some(\"0123456789abcdef0123456789abcdef01234567\")"
+            ]
         );
+    }
+
+    #[test]
+    fn review_reviewed_head_pins_the_reviewed_head_for_every_state() {
+        for (state, body) in [
+            (ReviewState::Approve, None),
+            (ReviewState::RequestChanges, Some("please revise")),
+            (ReviewState::Comment, Some("note")),
+        ] {
+            let forge = FakeForge::new(Ok(()), Ok(status(7, "OPEN", reviewed(7).head)));
+            assert!(review_reviewed_head(&forge, &loc(), &reviewed(7), state, body).is_ok());
+            assert_eq!(
+                forge.calls(),
+                vec![
+                    "status Number(7)".to_owned(),
+                    format!(
+                        "review Number(7) {state:?} {body:?} Some(\"{}\")",
+                        reviewed(7).head
+                    )
+                ]
+            );
+        }
     }
 
     #[test]

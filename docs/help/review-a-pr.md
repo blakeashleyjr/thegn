@@ -23,9 +23,10 @@ actions: [pr-open, pr-create]
    feedback, and top-level comments. Stale, loading, unsupported, and absent
    snapshots are labeled rather than attached to local lines.
 4. Act from the panel's _pr_ section: `A` re-reads the PR before approving the
-   head the panel shows; if the PR moved since, nothing is submitted and the
-   status line says so — refresh and review again. `o` opens the PR in your
-   browser. `M` opens a merge-method menu (squash is the default) and lists
+   head the panel shows, and GitHub records the approval against that head
+   commit so a later push cannot receive it; if the PR moved since, nothing is
+   submitted and the status line says so — refresh and review again. `o` opens
+   the PR in your browser. `M` opens a merge-method menu (squash is the default) and lists
    blockers; `c` comments when a PR exists and asks before creating one
    otherwise. `r` needs a PR and re-runs only the failed workflow runs pinned to
    that PR's head commit. Enter on an OPEN PRS row opens that PR read-only;
