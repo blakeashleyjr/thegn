@@ -159,6 +159,21 @@ pub struct MergeFinalOutcome<'a> {
     pub error_detail: Option<&'a str>,
 }
 
+/// Result of removing one PR-queue row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrRemoval {
+    Removed,
+    Missing,
+    AgentRunning,
+}
+
+/// Result of clearing a repository's PR queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrClearOutcome {
+    pub removed: usize,
+    pub kept_running: Vec<u64>,
+}
+
 /// Branch identity captured by a deliberate local merge-queue enqueue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeCandidate {
@@ -547,11 +562,11 @@ pub trait WorktreeAuxStore {
         head: &str,
     ) -> Result<bool>;
 
-    /// Drop one queued pull request.
-    fn remove_pr_entry(&self, key: &str) -> Result<()>;
+    /// Drop one queued pull request unless a live PR-agent lease holds it.
+    fn remove_pr_entry(&self, key: &str) -> Result<PrRemoval>;
 
-    /// Drop every queued pull request for a repo. Returns how many went.
-    fn clear_pr_queue(&self, repo_root: &str) -> Result<usize>;
+    /// Drop every queued pull request without a live PR-agent lease.
+    fn clear_pr_queue(&self, repo_root: &str) -> Result<PrClearOutcome>;
 
     /// Every queued pull request, oldest-queued first.
     fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>>;

@@ -91,6 +91,6 @@ pub use worktree_aux::{
     MergeAttemptResult, MergeCandidate, MergeClaim, MergeClaimActive, MergeClaimPhase,
     MergeClaimRequest, MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
     MergeOutcomeObservation, MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome,
-    MergeStatusFields, WorktreeAuxStore,
+    MergeStatusFields, PrClearOutcome, PrRemoval, WorktreeAuxStore,
 };
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

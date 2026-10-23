@@ -211,16 +211,24 @@ fn resolve_keys(p: &ProviderEntry) -> Vec<String> {
 
 /// Resolves one SecretRef string (`env:VAR` / `file:PATH`) to its value. A raw
 /// literal is rejected at config-validate time and ignored here; keyring refs
-/// are not resolvable from the daemon process.
+/// are not resolvable from the daemon process. `file:PATH` is checked for owner,
+/// mode, link count, and size before it is read.
 pub fn resolve_ref(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if let Some(var) = raw.strip_prefix("env:") {
         std::env::var(var.trim()).ok().filter(|v| !v.is_empty())
     } else if let Some(path) = raw.strip_prefix("file:") {
-        std::fs::read_to_string(path.trim())
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|v| !v.is_empty())
+        match thegn_core::fsperm::read_owner_only_secret_file(
+            std::path::Path::new(path.trim()),
+            thegn_core::config::FILE_SECRET_REF_MAX_BYTES,
+        ) {
+            Ok(value) => Some(value).filter(|v| !v.is_empty()),
+            Err(thegn_core::fsperm::SecretFileError::NotFound) => None,
+            Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
+                tracing::warn!(target: "thegn::proxy", %reason, "file secret refused");
+                None
+            }
+        }
     } else {
         None
     }
@@ -230,6 +238,47 @@ pub fn resolve_ref(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use thegn_core::config_model_proxy::{ProviderEntry, RouteBackend};
+
+    #[test]
+    fn resolve_ref_reads_an_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(&path, "  key-1\n").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&path).unwrap();
+        assert_eq!(
+            resolve_ref(&format!("file:{}", path.display())).as_deref(),
+            Some("key-1")
+        );
+        assert_eq!(resolve_ref("file:/no/such/tg/file"), None);
+    }
+
+    #[test]
+    fn resolve_ref_refuses_a_hard_linked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let alias = dir.path().join("alias");
+        std::fs::write(&path, "k\n").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&path).unwrap();
+        match std::fs::hard_link(&path, &alias) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("could not create hard link fixture: {error}"),
+        }
+        assert_eq!(resolve_ref(&format!("file:{}", path.display())), None);
+    }
+
+    #[test]
+    fn resolve_ref_refuses_an_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(
+            &path,
+            vec![b'x'; thegn_core::config::FILE_SECRET_REF_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        thegn_core::fsperm::restrict_to_owner(&path).unwrap();
+        assert_eq!(resolve_ref(&format!("file:{}", path.display())), None);
+    }
 
     fn base_cfg() -> ModelProxyConfig {
         ModelProxyConfig {

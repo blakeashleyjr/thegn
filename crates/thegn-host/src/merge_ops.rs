@@ -15,11 +15,12 @@ use thegn_core::db::{Db, MergeQueueRow};
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::models::WorktreeRow;
 use thegn_core::remote::GitLoc;
-#[cfg(test)]
-use thegn_core::store::MergeClaimRequest;
 use thegn_core::store::{
-    MergeCandidate, MergeClaimView, MergeEnqueueIdentity, WorkspaceStore, WorktreeAuxStore,
+    MergeCandidate, MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
+    MergeOutcomeObservation, MergeOutcomeWrite, WorkspaceStore, WorktreeAuxStore,
 };
+#[cfg(test)]
+use thegn_core::store::{MergeClaimRequest, MergeStatusFields};
 use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend, PlumbingOps};
 
@@ -344,8 +345,28 @@ pub(crate) fn ready_land_check(
     Ok(())
 }
 
+/// What a queue-aware land verified before folding.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadyLandAdmission {
+    /// Canonical worktree key of the queue row.
+    pub(crate) worktree: String,
+    /// The candidate OID the queue verified; the fold must land exactly this commit.
+    pub(crate) candidate_oid: String,
+    /// Pre-fold snapshot for the compare-and-swap outcome write.
+    pub(crate) observed: MergeOutcomeObservation,
+}
+
+/// The verified outcome details to persist after a queue-aware land.
+pub(crate) struct ReadyLandRecord<'a> {
+    pub(crate) branch: &'a str,
+    pub(crate) repo_root: &'a Path,
+    pub(crate) target_branch: &'a str,
+    pub(crate) result_oid: &'a str,
+    pub(crate) up_to_date: bool,
+}
+
 /// Verify that a worktree's local queue row is ready for queue-aware landing.
-pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<()> {
+pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<ReadyLandAdmission> {
     let canonical = canonical_worktree(Path::new(worktree));
     let canonical_s = canonical.to_string_lossy().into_owned();
     let row = db
@@ -378,7 +399,48 @@ pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<()> {
         candidate.as_ref(),
         live_tip.as_deref(),
     )
-    .map_err(anyhow::Error::from)
+    .map_err(anyhow::Error::from)?;
+    let candidate = candidate.ok_or_else(|| anyhow::Error::new(LandRefusal::NoCandidate))?;
+    let observed = db.observe_merge_outcome(&canonical_s)?;
+    Ok(ReadyLandAdmission {
+        worktree: canonical_s,
+        candidate_oid: candidate.candidate_oid,
+        observed,
+    })
+}
+
+pub(crate) fn record_ready_land(
+    db: &Db,
+    admission: &ReadyLandAdmission,
+    record: &ReadyLandRecord<'_>,
+) -> Result<()> {
+    let repo_root = record
+        .repo_root
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("repository root is not valid UTF-8"))?;
+    let outcome = MergeFinalOutcome {
+        worktree: &admission.worktree,
+        branch: record.branch,
+        repo_root,
+        target_branch: record.target_branch,
+        location: "",
+        status: MergeFinalStatus::Landed,
+        result_oid: Some(record.result_oid),
+        conflict_paths: None,
+        error_detail: record.up_to_date.then_some("already merged"),
+    };
+    match db.persist_merge_outcome(&admission.observed, &outcome)? {
+        MergeOutcomeWrite::Written => Ok(()),
+        MergeOutcomeWrite::RegistryChanged => {
+            anyhow::bail!("worktree registry changed during the land; queue row not updated")
+        }
+        MergeOutcomeWrite::QueueChanged => {
+            anyhow::bail!("merge queue row changed during the land; queue row not updated")
+        }
+        MergeOutcomeWrite::Claimed => {
+            anyhow::bail!("merge row was claimed by a drain during the land; queue row not updated")
+        }
+    }
 }
 
 /// The repo root for a worktree, with an error that names the actual problem.
@@ -1074,6 +1136,157 @@ mod tests {
             error.downcast_ref::<LandRefusal>(),
             Some(LandRefusal::CandidateMoved { current: found, .. }) if found == &current
         ));
+    }
+
+    #[test]
+    fn ready_land_precheck_returns_the_verified_candidate() {
+        let (_temp, _repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
+        db.update_merge_status(&worktree_s, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+
+        let admission = ready_land_precheck(&db, &worktree_s).unwrap();
+        assert_eq!(admission.candidate_oid, branch_tip(&worktree));
+        assert_eq!(admission.worktree, worktree_s);
+    }
+
+    #[test]
+    fn record_ready_land_refuses_a_row_changed_after_admission() {
+        let (_temp, repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let repo_canonical = repo.canonicalize().unwrap();
+        enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
+        db.update_merge_status(&worktree_s, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+        let admission = ready_land_precheck(&db, &worktree_s).unwrap();
+        db.replace_merge_status(
+            &worktree_s,
+            "queued",
+            &MergeStatusFields {
+                result_oid: None,
+                conflict_paths: None,
+                error_detail: None,
+            },
+        )
+        .unwrap();
+
+        let error = record_ready_land(
+            &db,
+            &admission,
+            &ReadyLandRecord {
+                branch: "feat",
+                repo_root: &repo_canonical,
+                target_branch: "main",
+                result_oid: &"a".repeat(40),
+                up_to_date: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed during the land"));
+        let row = db
+            .list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == worktree_s)
+            .unwrap();
+        assert_eq!(row.status, "queued");
+        assert!(row.result_oid.is_none());
+    }
+
+    #[test]
+    fn record_ready_land_refuses_a_row_claimed_after_admission() {
+        let (_temp, repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let repo_canonical = repo.canonicalize().unwrap();
+        let repo_canonical_s = repo_canonical.to_string_lossy().into_owned();
+        db.put_worktree("feat", &repo_canonical_s, &worktree_s, "feat", None, None)
+            .unwrap();
+        enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
+        db.update_merge_status(&worktree_s, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+        let admission = ready_land_precheck(&db, &worktree_s).unwrap();
+        assert!(
+            db.admit_merge_claim(&MergeClaimRequest {
+                worktree: worktree_s.clone(),
+                branch: "feat".into(),
+                repo_root: repo_canonical_s,
+                target_branch: "main".into(),
+                location: String::new(),
+                expected_status: "ready".into(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: Some("test-drain".into()),
+            })
+            .unwrap()
+            .is_some()
+        );
+
+        let error = record_ready_land(
+            &db,
+            &admission,
+            &ReadyLandRecord {
+                branch: "feat",
+                repo_root: &repo_canonical,
+                target_branch: "main",
+                result_oid: &"a".repeat(40),
+                up_to_date: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("claimed by a drain"));
+        let row = db
+            .list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == worktree_s)
+            .unwrap();
+        assert_ne!(row.status, "landed");
+    }
+
+    #[test]
+    fn record_ready_land_writes_landed_when_unchanged() {
+        let (_temp, repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let repo_canonical = repo.canonicalize().unwrap();
+        enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
+        db.update_merge_status(&worktree_s, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+        let admission = ready_land_precheck(&db, &worktree_s).unwrap();
+        let result_oid = "a".repeat(40);
+
+        record_ready_land(
+            &db,
+            &admission,
+            &ReadyLandRecord {
+                branch: "feat",
+                repo_root: &repo_canonical,
+                target_branch: "main",
+                result_oid: &result_oid,
+                up_to_date: true,
+            },
+        )
+        .unwrap();
+        let row = db
+            .list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == worktree_s)
+            .unwrap();
+        assert_eq!(row.status, "landed");
+        assert_eq!(row.result_oid.as_deref(), Some(result_oid.as_str()));
+        assert_eq!(row.error_detail.as_deref(), Some("already merged"));
     }
 
     #[test]

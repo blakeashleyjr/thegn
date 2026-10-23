@@ -1340,7 +1340,10 @@ fn pr_queue_enqueue_update_list_and_remove() {
         "checkout changes require explicit rebind"
     );
 
-    db.remove_pr_entry(&k).unwrap();
+    assert_eq!(
+        db.remove_pr_entry(&k).unwrap(),
+        crate::store::PrRemoval::Removed
+    );
     assert_eq!(db.list_pr_queue().unwrap().len(), 2);
 }
 
@@ -1440,12 +1443,16 @@ fn clear_pr_queue_is_scoped_to_one_repo() {
     db.enqueue_pr("/other", 3, None, "c", "main", "github")
         .unwrap();
 
-    assert_eq!(db.clear_pr_queue("/repo").unwrap(), 2);
+    let cleared = db.clear_pr_queue("/repo").unwrap();
+    assert_eq!(cleared.removed, 2);
+    assert!(cleared.kept_running.is_empty());
     let left = db.list_pr_queue().unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].repo_root, "/other");
     // Clearing an empty repo is a no-op, not an error.
-    assert_eq!(db.clear_pr_queue("/repo").unwrap(), 0);
+    let cleared = db.clear_pr_queue("/repo").unwrap();
+    assert_eq!(cleared.removed, 0);
+    assert!(cleared.kept_running.is_empty());
 }
 
 #[test]

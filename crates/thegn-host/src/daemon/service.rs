@@ -108,7 +108,7 @@ pub(crate) struct DaemonService {
     /// bookkeeping consumes it.
     pub idle_tx: mpsc::UnboundedSender<IdleTransition>,
     /// Signals the daemon run loop to exit gracefully.
-    pub shutdown: Arc<tokio::sync::Notify>,
+    pub shutdown: tokio_util::sync::CancellationToken,
     /// The daemon's config. The merge verbs resolve `[merge_queue]` PER REPO
     /// from it (a daemon serves many repos, so a single `MergeQueueConfig`
     /// snapshot was already the wrong shape — it could not honor a
@@ -2007,25 +2007,26 @@ impl ControlApi for DaemonService {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
                 match thegn_svc::ci::provider_and_context_for(&loc, &cfg) {
                     Some((client, context)) => (
-                        client
-                            .runs(&loc, provider_branch.as_deref(), requested)
-                            .map_err(|error| anyhow::anyhow!("CI provider: {error}"))
-                            .map_err(|error| format!("{error:#}")),
+                        Some(
+                            client
+                                .runs(&loc, provider_branch.as_deref(), requested)
+                                .map_err(|error| anyhow::anyhow!("CI provider: {error}"))
+                                .map_err(|error| format!("{error:#}")),
+                        ),
                         context,
                     ),
-                    None => (Err("no CI provider for this worktree".to_string()), None),
+                    None => (None, None),
                 }
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?;
             let (fetched, provider_context) = fetched;
-            let reply = crate::ci_refresh::daemon_runs_after_provider(
+            let reply = crate::ci_refresh::daemon_runs_outcome(
                 fetched,
                 last_good,
                 thegn_core::util::now(),
                 requested,
-            )
-            .map_err(|message| ControlError::Internal(anyhow::Error::msg(message)))?;
+            )?;
             if reply.write_cache
                 && let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
                     runs: reply.runs.clone(),
@@ -2151,8 +2152,9 @@ impl ControlApi for DaemonService {
             let job_for_provider = job_id_owned.clone();
             let (mut entry, warnings) = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
-                let client = thegn_svc::ci::provider_for(&loc, &cfg)
-                    .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
+                let Some(client) = thegn_svc::ci::provider_for(&loc, &cfg) else {
+                    return Ok(None);
+                };
                 let detail = client
                     .run_detail(&loc, &run_for_provider)
                     .map_err(|error| error.to_string());
@@ -2184,11 +2186,12 @@ impl ControlApi for DaemonService {
                     .iter()
                     .map(|warning| thegn_svc::lsp::sanitize_for_terminal(warning))
                     .collect();
-                Ok::<_, anyhow::Error>((entry, warnings))
+                Ok::<_, anyhow::Error>(Some((entry, warnings)))
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
-            .map_err(ControlError::Internal)?;
+            .map_err(ControlError::Internal)?
+            .ok_or_else(crate::ci_refresh::daemon_no_provider_error)?;
 
             if self.config.ci.log_cache_runs > 0 && thegn_core::ci_log::cacheable_log_entry(&entry)
             {
@@ -3131,7 +3134,7 @@ impl ControlApi for DaemonService {
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.shutdown_sessions().await;
-            self.shutdown.notify_waiters();
+            self.shutdown.cancel();
         })
     }
 }
@@ -3969,7 +3972,7 @@ mod tests {
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
             idle_tx,
-            shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             config: Arc::new(config),
             profile_root: std::env::temp_dir().join(format!(
                 "tg-daemon-service-{}-{}",

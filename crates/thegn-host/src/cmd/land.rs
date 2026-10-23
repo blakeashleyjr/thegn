@@ -44,14 +44,23 @@ fn gate_error_message(
     )
 }
 
+/// Fold `worktree`'s current branch via the shared land helper without queue pinning.
+pub(crate) fn land_branch(
+    cfg: &Config,
+    worktree: &Path,
+) -> Result<(String, String, AttemptOutcome)> {
+    land_branch_pinned(cfg, worktree, None)
+}
+
 /// Fold `worktree`'s current branch onto the repo target via the fold-actor's
 /// CAS land, forcing the land regardless of the configured `auto_land`. Returns
 /// `(branch, target, outcome)`. Queue bookkeeping is intentionally left to the
 /// caller because this helper is also used by `thegn merge land` and the TUI.
 /// This shared helper must not install process-wide signal handlers.
-pub(crate) fn land_branch(
+pub(crate) fn land_branch_pinned(
     cfg: &Config,
     worktree: &Path,
+    expected_tip: Option<&str>,
 ) -> Result<(String, String, AttemptOutcome)> {
     let root = integrate::main_checkout(worktree).context("not inside a git repository")?;
     let branch = match crate::merge_ops::branch_of(worktree) {
@@ -71,7 +80,10 @@ pub(crate) fn land_branch(
     // `thegn land` lands the branch checked out in `worktree`; its loc tells
     // attempt_land whether that worktree is on this host (no ingest) or remote.
     let branch_loc = thegn_core::remote::GitLoc::for_worktree(worktree);
-    let outcome = integrate::attempt_land(&mq, &root, &branch, &branch_loc)?;
+    let outcome = match expected_tip {
+        Some(tip) => integrate::attempt_land_pinned(&mq, &root, &branch, &branch_loc, tip)?,
+        None => integrate::attempt_land(&mq, &root, &branch, &branch_loc)?,
+    };
     Ok((branch, target, outcome))
 }
 

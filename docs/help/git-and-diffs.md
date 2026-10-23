@@ -116,6 +116,8 @@ The worktree's file tree; `/` filters it (directories stay while any
 descendant matches; Esc clears), `↵` previews a file inline, `o` pages it
 in bat, `O` opens your editor, `y` reveals it in yazi. An unknown binary
 previews as a hex dump of its first 4096 bytes.
+The local files list uses NUL-separated Git output, so names containing
+newlines or quotes remain intact as individual paths.
 
 Inside the git-family sections (changes/commits/branches/stash — not
 files), `?` shows that section's own key cheatsheet only after entering row

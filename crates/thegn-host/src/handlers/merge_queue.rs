@@ -1327,10 +1327,15 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         Ok(db) => db,
         Err(error) => return DriveMsg::Failed(format!("land: {error}")),
     };
-    if let Err(error) = crate::merge_ops::ready_land_precheck(db_ref, wt) {
-        return DriveMsg::Failed(format!("land: {error}"));
-    }
-    let (branch, target, outcome) = match crate::cmd::land::land_branch(cfg, Path::new(wt)) {
+    let admission = match crate::merge_ops::ready_land_precheck(db_ref, wt) {
+        Ok(admission) => admission,
+        Err(error) => return DriveMsg::Failed(format!("land: {error}")),
+    };
+    let (branch, target, outcome) = match crate::cmd::land::land_branch_pinned(
+        cfg,
+        Path::new(wt),
+        Some(&admission.candidate_oid),
+    ) {
         Ok(r) => r,
         Err(e) => return DriveMsg::Failed(format!("land: {e}")),
     };
@@ -1387,13 +1392,23 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                     );
                 }
             }
-            let mut out = landed_outcome_after_record(
-                record(MqStatus::Landed, Some(&commit), None, None),
-                &branch,
-                &target,
-                &old_oid,
-                &commit,
-            );
+            let write = integrate::main_checkout(Path::new(wt))
+                .ok_or_else(|| "repository root unavailable after land".to_owned())
+                .and_then(|root| {
+                    crate::merge_ops::record_ready_land(
+                        db_ref,
+                        &admission,
+                        &crate::merge_ops::ReadyLandRecord {
+                            branch: &branch,
+                            repo_root: &root,
+                            target_branch: &target,
+                            result_oid: &commit,
+                            up_to_date: false,
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            let mut out = landed_outcome_after_record(write, &branch, &target, &old_oid, &commit);
             if !out.bookkeeping_failed.is_empty() {
                 return DriveMsg::Done(out);
             }
@@ -1414,12 +1429,22 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
             DriveMsg::Done(out)
         }
         AttemptOutcome::UpToDate { commit } => {
-            let write = record(
-                MqStatus::Landed,
-                Some(&commit),
-                Some("already merged"),
-                None,
-            );
+            let write = integrate::main_checkout(Path::new(wt))
+                .ok_or_else(|| "repository root unavailable after land".to_owned())
+                .and_then(|root| {
+                    crate::merge_ops::record_ready_land(
+                        db_ref,
+                        &admission,
+                        &crate::merge_ops::ReadyLandRecord {
+                            branch: &branch,
+                            repo_root: &root,
+                            target_branch: &target,
+                            result_oid: &commit,
+                            up_to_date: true,
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+                });
             let notes = if write.is_ok() {
                 lifecycle(LifecycleEvent::Landed, &branch)
             } else {

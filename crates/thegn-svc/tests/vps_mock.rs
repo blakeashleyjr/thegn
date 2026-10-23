@@ -11,7 +11,10 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 
 use thegn_svc::provider::RemoteProvider;
@@ -30,16 +33,19 @@ fn start_mock() -> (String, Arc<Mutex<Vec<Recorded>>>) {
     let port = listener.local_addr().unwrap().port();
     let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
     let rec = recorded.clone();
+    let instance_present = Arc::new(AtomicBool::new(true));
+    let server_instance_present = instance_present.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let rec = rec.clone();
-            thread::spawn(move || handle(stream, rec));
+            let instance_present = server_instance_present.clone();
+            thread::spawn(move || handle(stream, rec, instance_present));
         }
     });
     (format!("http://127.0.0.1:{port}/v1"), recorded)
 }
 
-fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
+fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, instance_present: Arc<AtomicBool>) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -91,9 +97,16 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
             r#"{"server":{"id":101,"name":"tg-mock-1","status":"initializing","created":"2026-07-01T12:00:00+00:00"}}"#.to_string()
         }
         (m, p) if m == "GET" && p.starts_with("/v1/servers?") => {
-            r#"{"servers":[{"id":101,"name":"tg-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{"ipv4":{"ip":"203.0.113.9"}},"labels":{"managed-by":"thegn","tg-host":"h1"}}],"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}}"#.to_string()
+            if instance_present.load(Ordering::Acquire) {
+                r#"{"servers":[{"id":101,"name":"tg-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{"ipv4":{"ip":"203.0.113.9"}},"labels":{"managed-by":"thegn","tg-host":"h1"}}],"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":1}}}"#.to_string()
+            } else {
+                r#"{"servers":[],"meta":{"pagination":{"page":1,"per_page":50,"previous_page":null,"next_page":null,"last_page":1,"total_entries":0}}}"#.to_string()
+            }
         }
-        ("DELETE", "/v1/servers/101") => r#"{}"#.to_string(),
+        ("DELETE", "/v1/servers/101") => {
+            instance_present.store(false, Ordering::Release);
+            r#"{}"#.to_string()
+        }
         _ => {
             let _ = writer.write_all( // best-effort: client may have disconnected
                 b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
@@ -278,10 +291,16 @@ fn create_list_destroy_round_trip_with_ledger() {
 
     // --- destroy: DELETE by the vendor id from the ledger; ledger cleared.
     rt.block_on(p.destroy("tg-mock-1")).expect("destroy");
-    let last = recorded.lock().unwrap().last().unwrap().clone();
-    assert_eq!(
-        (last.method.as_str(), last.path.as_str()),
-        ("DELETE", "/v1/servers/101")
+    // destroy re-lists the inventory after the DELETE to prove the instance is gone.
+    let requests = recorded.lock().unwrap().clone();
+    let delete_at = requests
+        .iter()
+        .rposition(|r| r.method == "DELETE" && r.path == "/v1/servers/101")
+        .expect("destroy sent DELETE /v1/servers/101");
+    assert!(
+        requests[delete_at + 1..].iter().any(|r| r.method == "GET"),
+        "destroy confirmed absence with a list after the DELETE: {:?}",
+        &requests[delete_at..]
     );
     assert!(
         registry::read("tg-mock-1").is_none(),
