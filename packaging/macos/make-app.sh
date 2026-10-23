@@ -97,8 +97,8 @@ while (($#)); do
 done
 
 # These values are embedded in bundle filenames, plist XML, and generated shell.
-# The restricted grammars make those interpolations literal and prevent a key
-# from introducing shell syntax into the generated `export KEY=...` command.
+# The restricted key grammar is re-checked by launch.sh's load_env; values stay
+# data and are never sourced as shell code.
 if [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ || $name == . || $name == .. ]]; then
   echo "make-app.sh: --name must be 1-64 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit" >&2
   exit 2
@@ -271,6 +271,7 @@ load_env() {
   local kv key
   [ -f "$THEGN_RES/env" ] && [ ! -L "$THEGN_RES/env" ] || { alert "launcher environment file missing: $THEGN_RES/env"; return 1; }
   while IFS= read -r -d '' kv; do
+    [[ $kv == *=* ]] || { alert "invalid launcher environment entry in $THEGN_RES/env"; return 1; }
     key="${kv%%=*}"
     [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { alert "invalid launcher environment entry in $THEGN_RES/env"; return 1; }
     export "$key=${kv#*=}"
