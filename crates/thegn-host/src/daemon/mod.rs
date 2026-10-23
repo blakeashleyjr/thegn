@@ -914,6 +914,7 @@ async fn run(
     socket_override: Option<PathBuf>,
     serve: Option<ServeOpts>,
 ) -> Result<()> {
+    let shutdown_signal = crate::platform::register_shutdown_signal();
     // The daemon is its own process: it writes its OWN file (`thegn-daemon.log`,
     // via `Role::Daemon`) so it never shares one rotation state machine with the
     // compositor, and it honors `[log]` + `THEGN_LOG_*` like the host. It loads
@@ -1135,7 +1136,7 @@ async fn run(
 
     let (events, _) = broadcast::channel::<Arc<EventFrame>>(1024);
     let (idle_tx, idle_rx) = mpsc::unbounded_channel::<IdleTransition>();
-    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let svc = Arc::new(DaemonService {
         daemon_id: daemon_id.clone(),
         sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1181,7 +1182,7 @@ async fn run(
     // SIGTERM/SIGINT (console-close on Windows) → the same graceful-shutdown
     // path as the shutdown RPC, so `kill <daemon>` still deregisters and
     // unlinks the socket.
-    crate::platform::spawn_shutdown_notifier(shutdown.clone());
+    crate::platform::spawn_shutdown_notifier(shutdown.clone(), shutdown_signal);
     // Heartbeat (registry freshness for discovery).
     tokio::spawn(heartbeat_loop(db.clone(), daemon_id.clone()));
     // Lease bookkeeping: idle/busy transitions + expiry reaping.
@@ -1292,7 +1293,7 @@ async fn run(
         let shutdown_tcp = shutdown.clone();
         tokio::spawn(async move {
             if let Err(e) = axum::serve(tcp, tcp_app)
-                .with_graceful_shutdown(async move { shutdown_tcp.notified().await })
+                .with_graceful_shutdown(shutdown_tcp.cancelled_owned())
                 .await
             {
                 tracing::warn!(target: "thegn::daemon", error = %e, "control-plane TCP server exited");
@@ -1345,12 +1346,11 @@ async fn run(
     }
 
     tracing::info!(target: "thegn::daemon", %daemon_id, "pane daemon serving on {}", ep.display());
-    let shutdown_wait = shutdown.clone();
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
     )
-    .with_graceful_shutdown(async move { shutdown_wait.notified().await });
+    .with_graceful_shutdown(shutdown.cancelled_owned());
     let result = serve.await;
 
     // Signal and idle-exit paths notify the listener directly; this final
@@ -1497,7 +1497,7 @@ async fn lease_loop(svc: Arc<DaemonService>, mut idle_rx: mpsc::UnboundedReceive
 /// cadence, capped at the idle window) — this is a janitor, not a hot path.
 async fn idle_exit_loop(
     svc: Arc<DaemonService>,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: tokio_util::sync::CancellationToken,
     idle_exit: std::time::Duration,
 ) {
     let cadence = idle_exit.min(std::time::Duration::from_secs(10));
@@ -1515,7 +1515,7 @@ async fn idle_exit_loop(
         let since = *idle_since.get_or_insert_with(std::time::Instant::now);
         if since.elapsed() >= idle_exit {
             tracing::info!(target: "thegn::daemon", "idle for {:?}; exiting", idle_exit);
-            shutdown.notify_waiters();
+            shutdown.cancel();
             return;
         }
     }
@@ -1524,6 +1524,23 @@ async fn idle_exit_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn daemon_shutdown_token_latches_before_graceful_shutdown_is_built() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind graceful-shutdown test listener");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+
+        let graceful = axum::serve(listener, axum::Router::new())
+            .with_graceful_shutdown(shutdown.cancelled_owned());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), graceful).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "a shutdown canceled before the graceful future is built must still stop serving"
+        );
+    }
 
     #[cfg(unix)]
     fn connect_test_app(scope: Option<String>, legacy: bool) -> axum::Router {
