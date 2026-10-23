@@ -2702,7 +2702,7 @@ impl Db {
         if !self.conn.is_autocommit() {
             return f(self);
         }
-        let previous_ms: u64 = self
+        let previous_ms: i64 = self
             .conn
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
         self.conn.busy_timeout(std::time::Duration::ZERO)?;
@@ -2710,8 +2710,9 @@ impl Db {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         );
-        self.conn
-            .busy_timeout(std::time::Duration::from_millis(previous_ms))?;
+        self.conn.busy_timeout(std::time::Duration::from_millis(
+            u64::try_from(previous_ms).unwrap_or(5000),
+        ))?;
         let tx = begun?;
         let out = f(self)?;
         tx.commit()?;

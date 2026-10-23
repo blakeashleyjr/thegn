@@ -3181,7 +3181,7 @@ mod tests {
             "known",
             "an existing slug is a plain read"
         );
-        let timeout_ms: u64 = db
+        let timeout_ms: i64 = db
             .conn()
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
