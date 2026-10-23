@@ -727,7 +727,8 @@
             for package_names in "${thegn}:thegn:tg" "${thegnDev}:thegn-dev:tg-dev"; do
               IFS=: read -r package primary_name alias_name <<< "$package_names"
               for name in "$primary_name" "$alias_name"; do
-                bash_completion="$package/share/bash-completion/completions/$name"
+                # installShellCompletion names bash completions <cmd>.bash (bash-completion loads that name).
+                bash_completion="$package/share/bash-completion/completions/$name.bash"
                 zsh_completion="$package/share/zsh/site-functions/_$name"
                 fish_completion="$package/share/fish/vendor_completions.d/$name.fish"
                 test -s "$bash_completion"
@@ -740,12 +741,12 @@
               done
             done
             for name in thegn tg; do
-              test ! -e "${thegnDev}/share/bash-completion/completions/$name"
+              test ! -e "${thegnDev}/share/bash-completion/completions/$name.bash"
               test ! -e "${thegnDev}/share/zsh/site-functions/_$name"
               test ! -e "${thegnDev}/share/fish/vendor_completions.d/$name.fish"
             done
             for name in thegn-dev tg-dev; do
-              test ! -e "${thegn}/share/bash-completion/completions/$name"
+              test ! -e "${thegn}/share/bash-completion/completions/$name.bash"
               test ! -e "${thegn}/share/zsh/site-functions/_$name"
               test ! -e "${thegn}/share/fish/vendor_completions.d/$name.fish"
             done
