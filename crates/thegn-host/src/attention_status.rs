@@ -124,7 +124,7 @@ pub(crate) fn collect_attention_with_ci(
     status: &mut crate::sidebar::SidebarStatus,
     ci: &CiReader<'_>,
 ) {
-    collect_attention_inner(session, db, status, Some(ci));
+    collect_attention_inner(session, db, status, Some(ci), thegn_core::util::now());
 }
 
 #[cfg(test)]
@@ -133,7 +133,7 @@ pub(crate) fn collect_attention(
     db: &thegn_core::db::Db,
     status: &mut crate::sidebar::SidebarStatus,
 ) {
-    collect_attention_inner(session, db, status, None);
+    collect_attention_inner(session, db, status, None, thegn_core::util::now());
 }
 
 fn collect_attention_inner(
@@ -141,6 +141,7 @@ fn collect_attention_inner(
     db: &thegn_core::db::Db,
     status: &mut crate::sidebar::SidebarStatus,
     ci: Option<&CiReader<'_>>,
+    now: i64,
 ) {
     // Worktree universe: registered rows, overlaid with live session groups
     // (which may be unpersisted). `(is_home, position)` is the fresh-sort
@@ -251,7 +252,14 @@ fn collect_attention_inner(
     // path and never mark a worktree).
     let mut unread: BTreeMap<String, Vec<UnreadNote>> = BTreeMap::new();
     for n in db.get_unread_notifications().unwrap_or_default() {
-        if n.worktree_path.is_empty() {
+        if n.worktree_path.is_empty()
+            || thegn_core::attention::note_is_stale(
+                &n.kind,
+                n.created_at_ms,
+                now,
+                thegn_core::attention::FAILURE_ATTENTION_TTL_SECS,
+            )
+        {
             continue;
         }
         unread.entry(n.worktree_path).or_default().push(UnreadNote {
@@ -548,7 +556,7 @@ pub(crate) const SCORED_KINDS: [NotificationKind; 6] = [
 mod tests {
     use super::*;
     use crate::session::{GroupKind, Session, WorktreeGroup};
-    use thegn_core::store::WorkspaceStore;
+    use thegn_core::store::{NotificationStore, WorkspaceStore};
 
     fn hand(session: &str, since: i64) -> thegn_core::osc_attention::SessionAttention {
         thegn_core::osc_attention::SessionAttention {
@@ -572,6 +580,26 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn stale_process_failed_does_not_need_you() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/fail", "/repo", "/wt/fail", "topic", None, None)
+            .unwrap();
+        db.put_notification("process_failed", "make", "failed", "/wt/fail")
+            .unwrap();
+        let session = session_with(&[("app/fail", "/wt/fail")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        let now = thegn_core::util::now() + 8 * 24 * 3600;
+
+        collect_attention_inner(&session, &db, &mut status, None, now);
+
+        assert_ne!(
+            status.attention["/wt/fail"].tier,
+            thegn_core::attention::AttentionTier::Failure,
+            "an unread process failure older than seven days must not keep Needs-you active"
+        );
     }
 
     #[expect(

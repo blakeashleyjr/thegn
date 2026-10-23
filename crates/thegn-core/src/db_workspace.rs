@@ -557,6 +557,10 @@ impl WorkspaceStore for Db {
     fn del_worktree(&self, wt: &str) -> Result<()> {
         self.conn()
             .execute("DELETE FROM worktrees WHERE worktree=?1", params![wt])?;
+        self.conn().execute(
+            "UPDATE notifications SET read=1 WHERE worktree_path=?1 AND read=0",
+            params![wt],
+        )?;
         delete_worktree_cache_rows(self, wt)?;
         // And the per-worktree status caches + queue row. Every delete path
         // (interactive close, the registry reap for a dir removed outside
@@ -605,6 +609,10 @@ impl WorkspaceStore for Db {
         };
         for wt in &worktrees {
             delete_worktree_cache_rows(self, wt)?;
+            self.conn().execute(
+                "UPDATE notifications SET read=1 WHERE worktree_path=?1 AND read=0",
+                params![wt],
+            )?;
         }
         self.conn().execute(
             "DELETE FROM worktrees WHERE repo_path=?1",
@@ -2735,6 +2743,28 @@ mod tests {
         db.transaction(|db| db.del_worktree("/wt/a")).unwrap();
 
         assert!(db.worktree_record("/wt/a").unwrap().is_none());
+    }
+
+    #[test]
+    fn del_worktree_retires_its_notifications() {
+        use crate::store::NotificationStore;
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/a", "feat", None, None)
+            .unwrap();
+        let id = db
+            .put_notification("process_failed", "make", "failed", "/wt/a")
+            .unwrap();
+
+        db.del_worktree("/wt/a").unwrap();
+
+        assert!(
+            db.get_all_notifications(10)
+                .unwrap()
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .read
+        );
     }
 
     /// The LOC cache had no cascade at all, which is how a live DB came to hold
