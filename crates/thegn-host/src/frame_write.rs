@@ -101,6 +101,27 @@ pub(crate) fn enter_alt_screen<T: Terminal>(term: &mut T) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Release the termwiz terminal after the explicit bounded teardown path.
+///
+/// When the raw restore owns teardown, termwiz cleanup and `UnixTerminal::drop`
+/// would write and flush synchronously without a bound. The process is exiting,
+/// so forget the buffer and let process exit release its tty descriptors and
+/// SIGWINCH registration. If no raw restore was captured, preserve termwiz's
+/// cleanup behaviour as the only available restoration path.
+pub(crate) fn release_terminal<T: Terminal>(mut buf: BufferedTerminal<T>, raw_restore_owned: bool) {
+    if raw_restore_owned {
+        std::mem::forget(buf);
+        return;
+    }
+
+    if let Err(error) = buf.terminal().exit_alternate_screen() {
+        tracing::debug!(target: "thegn::shutdown", %error, "termwiz alternate-screen cleanup failed");
+    }
+    if let Err(error) = buf.terminal().set_cooked_mode() {
+        tracing::debug!(target: "thegn::shutdown", %error, "termwiz cooked-mode cleanup failed");
+    }
+}
+
 /// After a frame is flushed, emit the muse sync `ready` marker — but only once
 /// the event queue is fully drained (both the in-memory queue AND the terminal's
 /// own read buffer). Emitting mid-batch (e.g. 51 `a` chars each causing a render)
