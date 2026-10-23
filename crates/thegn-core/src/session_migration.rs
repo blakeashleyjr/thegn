@@ -309,7 +309,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 fn json_nesting_depth(value: &str) -> usize {
-    let mut depth = 0;
+    let mut depth: usize = 0;
     let mut maximum = 0;
     let mut in_string = false;
     let mut escaped = false;
