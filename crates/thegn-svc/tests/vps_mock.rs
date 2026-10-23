@@ -291,10 +291,16 @@ fn create_list_destroy_round_trip_with_ledger() {
 
     // --- destroy: DELETE by the vendor id from the ledger; ledger cleared.
     rt.block_on(p.destroy("tg-mock-1")).expect("destroy");
-    let last = recorded.lock().unwrap().last().unwrap().clone();
-    assert_eq!(
-        (last.method.as_str(), last.path.as_str()),
-        ("DELETE", "/v1/servers/101")
+    // destroy re-lists the inventory after the DELETE to prove the instance is gone.
+    let requests = recorded.lock().unwrap().clone();
+    let delete_at = requests
+        .iter()
+        .rposition(|r| r.method == "DELETE" && r.path == "/v1/servers/101")
+        .expect("destroy sent DELETE /v1/servers/101");
+    assert!(
+        requests[delete_at + 1..].iter().any(|r| r.method == "GET"),
+        "destroy confirmed absence with a list after the DELETE: {:?}",
+        &requests[delete_at..]
     );
     assert!(
         registry::read("tg-mock-1").is_none(),
