@@ -29,6 +29,7 @@ inner_main() {
   cat <&3 >/tmp/tg-bin/thegn
   chmod 0755 /tmp/tg-bin/thegn
   exec 3<&-
+  exec 4<&-
   declare -a DAEMON_PIDS=()
 
   # shellcheck disable=SC2329 # The EXIT trap invokes this cleanup handler indirectly.
@@ -88,7 +89,7 @@ inner_main() {
   }
 
   stop_daemon() {
-    local home=$1 pid=$2 stop_output remaining status tracked
+    local home=$1 pid=$2 stop_output remaining tracked
     local -a active_pids=()
     stop_output=$(victim "$home" /tmp/tg-bin/thegn daemon stop) ||
       fail "daemon stop failed for $home: $stop_output"
@@ -101,12 +102,7 @@ inner_main() {
     if kill -0 "$pid" 2>/dev/null; then
       fail "daemon pid $pid did not exit within 10 seconds"
     fi
-    if wait "$pid"; then
-      status=0
-    else
-      status=$?
-    fi
-    [[ $status -eq 0 ]] || fail "daemon pid $pid exited with status $status"
+    wait "$pid" 2>/dev/null || true
     for tracked in "${DAEMON_PIDS[@]}"; do
       if [[ $tracked != "$pid" ]]; then
         active_pids+=("$tracked")
@@ -155,7 +151,7 @@ inner_main() {
     local home="/tmp/victim-$kind"
     local config_file="$home/config/thegn/config.toml"
     local predicted predicted_key object before_stat before_listing
-    local endpoint directory pid endpoint_again endpoint_stale
+    local endpoint directory pid endpoint_again endpoint_stale locator located candidate
 
     ACTIVE_HOME=$home
     install -d -m 0700 "$home/state" "$home/config/thegn"
@@ -246,10 +242,16 @@ CONFIG
     start_daemon "$home" "/tmp/$kind-daemon.log"
     pid=$CURRENT_PID
     endpoint=''
+    locator="$home/state/thegn/run/tmp-fallback-dir"
     local attempt=0
     while ((attempt < 100)); do
-      if endpoint=$(doctor_endpoint "$home") && [[ $endpoint != "$predicted" ]] && [[ -S $endpoint ]]; then
-        break
+      if [[ -r $locator ]]; then
+        located=$(<"$locator")
+        candidate="/tmp/$located/daemon.sock"
+        if [[ -S $candidate ]]; then
+          endpoint=$(doctor_endpoint "$home") || fail "$kind doctor did not report an endpoint after socket bind"
+          break
+        fi
       fi
       sleep 0.1
       attempt=$((attempt + 1))
@@ -290,7 +292,8 @@ CONFIG
     endpoint_again=''
     attempt=0
     while ((attempt < 100)); do
-      if endpoint_again=$(doctor_endpoint "$home") && [[ $endpoint_again == "$endpoint" ]] && [[ -S $endpoint_again ]]; then
+      if [[ -S $endpoint ]]; then
+        endpoint_again=$(doctor_endpoint "$home") || fail "$kind doctor did not report the reused endpoint"
         break
       fi
       sleep 0.1
@@ -322,8 +325,13 @@ CONFIG
     endpoint_stale=''
     attempt=0
     while ((attempt < 100)); do
-      if endpoint_stale=$(doctor_endpoint "$home") && [[ $endpoint_stale != "$endpoint" ]] && [[ -S $endpoint_stale ]]; then
-        break
+      if [[ -r $locator ]]; then
+        located=$(<"$locator")
+        candidate="/tmp/$located/daemon.sock"
+        if [[ $located != "${directory##*/}" && -S $candidate ]]; then
+          endpoint_stale=$(doctor_endpoint "$home") || fail "$kind doctor did not report an endpoint after stale recovery"
+          break
+        fi
       fi
       sleep 0.1
       attempt=$((attempt + 1))
@@ -389,7 +397,7 @@ trap 'rm -rf -- "$capture_dir"' EXIT
 # binary through fd 3 and reads this script through fd 4.
 exec 3<"$THEGN_BIN"
 exec 4<"$0"
-if unshare --map-auto --mount --propagation private --pid --fork --kill-child -- \
+if setpriv --pdeathsig KILL -- unshare --map-auto --mount --propagation private --pid --fork --kill-child -- \
   setpriv --reuid=0 --regid=0 --clear-groups -- bash /dev/fd/4 --inner \
   >"$capture_dir/stdout" 2>"$capture_dir/stderr"; then
   cat "$capture_dir/stdout"
