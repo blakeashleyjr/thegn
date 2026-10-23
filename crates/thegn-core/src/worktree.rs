@@ -815,10 +815,11 @@ pub fn add_checked_with_state(
 /// The local directory has already been removed by Git before this is called;
 /// deleting it again would introduce a pathname-reuse race in which unrelated
 /// replacement data could be recursively removed. The shared base image and
-/// warm volumes stay. Call before the DB's `worktrees.location` row is
-/// forgotten, otherwise the remote target cannot be resolved.
-pub fn purge_worktree_files(path: &Path) {
-    crate::remote::GitLoc::for_worktree(path).remove_remote_dir();
+/// warm volumes stay. The caller resolves `loc` before the DB row is forgotten
+/// and before local removal; a location read after removal can no longer
+/// refuse anything.
+pub fn purge_worktree_files(loc: &crate::remote::GitLoc) {
+    loc.remove_remote_dir();
 }
 
 /// Remove a worktree and optionally delete its branch. Returns whether the

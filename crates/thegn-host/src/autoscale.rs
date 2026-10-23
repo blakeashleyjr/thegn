@@ -53,9 +53,9 @@ fn lane_provider_config(cfg: &Config, t: &ManagedTemplate) -> EnvProviderConfig 
 }
 
 /// Create + register one engine host from `template`. Returns the host NAME
-/// (a `[host.<name>]`-shaped def persisted to the DB). On create failure the
-/// lane is cooled down (escalating, capped) and the error propagates so the
-/// broker walks the next lane on the next decision.
+/// (a `[host.<name>]`-shaped def persisted to the DB). On create or
+/// post-create registration failure the lane is cooled down (escalating,
+/// capped) and the error propagates.
 pub(crate) fn provision_managed(
     cfg: &Config,
     db: &Db,
@@ -87,28 +87,42 @@ pub(crate) fn provision_managed(
         cool_lane(db, template, &format!("create failed: {e}"), cfg);
         return Err(e).context(format!("autoscale create ({})", template.lane_key()));
     }
-    let ip = crate::agent::block_on_provider(|| async { provider.resolve_ip(&name).await })
-        .context("resolve fresh host ip")?;
+    let registration = (|| -> Result<String> {
+        let ip = crate::agent::block_on_provider(|| async { provider.resolve_ip(&name).await })
+            .context("resolve fresh host ip")?;
 
-    // Register: a DB host def (merged into the config catalog on next load;
-    // `db_host_binding` synthesizes a binding for THIS process) + the
-    // authoritative capacity spec from the template.
-    let hc = engine_host_config(&name, &ip)?;
-    db.put_host_def(&name, &hc, unix_now())
-        .context("persist engine host def")?;
-    db.capacity_put(&HostCapacityRow {
-        host: HostId::named(&name),
-        ownership: HostOwnership::Managed,
-        spec: template.spec(),
-        overcommit_cpu_pct: 0, // 0 ⇒ resolved config overcommit applies
-        overcommit_mem_pct: 0,
-        provider: template.provider.trim().to_string(),
-        template: template.size.trim().to_string(),
-        created_at: Some(unix_now()),
-        measured: None,
-        updated_at: unix_now(),
-    })
-    .context("persist engine host capacity")?;
+        // Register the host def (merged into the config catalog on next load)
+        // and the authoritative capacity spec from the template.
+        let hc = engine_host_config(&name, &ip)?;
+        db.put_host_def(&name, &hc, unix_now())
+            .context("persist engine host def")?;
+        db.capacity_put(&HostCapacityRow {
+            host: HostId::named(&name),
+            ownership: HostOwnership::Managed,
+            spec: template.spec(),
+            overcommit_cpu_pct: 0, // 0 ⇒ resolved config overcommit applies
+            overcommit_mem_pct: 0,
+            provider: template.provider.trim().to_string(),
+            template: template.size.trim().to_string(),
+            created_at: Some(unix_now()),
+            measured: None,
+            updated_at: unix_now(),
+        })
+        .context("persist engine host capacity")?;
+        Ok(ip)
+    })();
+    let ip = match registration {
+        Ok(ip) => ip,
+        Err(error) => {
+            cool_lane(
+                db,
+                template,
+                &format!("post-create failure: {error:#}"),
+                cfg,
+            );
+            return Err(error);
+        }
+    };
     // A successful create clears the lane's marker (explicit fail-back).
     let _ = db.health_clear(&template.lane_key()); // best-effort: cache write: the successful create already reported; the marker clear is bookkeeping
     // Fixed-cost meter: an engine host bills from create to destroy. Rate
@@ -186,15 +200,22 @@ fn engine_host_config(name: &str, ip: &str) -> Result<HostConfig> {
     })
 }
 
-/// Binding for an engine host def persisted this session (the loaded Config
-/// predates `put_host_def`, so synthesize from the DB row).
-pub(crate) fn db_host_binding(name: &str) -> Option<HostBinding> {
-    let db = Db::open().ok()?;
-    let defs = db.host_defs().ok()?;
-    let (_, hc) = defs.into_iter().find(|(n, _)| n == name)?;
+/// The def + binding for an engine host persisted this session (the loaded
+/// Config predates `put_host_def`, so synthesize from the DB row). A failed
+/// read is an error, never "no such host".
+pub(crate) fn db_host_def(
+    db: &Db,
+    name: &str,
+) -> anyhow::Result<Option<(HostConfig, HostBinding)>> {
+    let defs = db
+        .host_defs()
+        .with_context(|| format!("read the engine host def for {name}"))?;
+    let Some((_, hc)) = defs.into_iter().find(|(n, _)| n == name) else {
+        return Ok(None);
+    };
     let mut c = Config::default();
-    c.host.insert(name.to_string(), hc);
-    c.host_binding(name)
+    c.host.insert(name.to_string(), hc.clone());
+    Ok(c.host_binding(name).map(|binding| (hc, binding)))
 }
 
 /// Stamp a lane cooldown (escalating per consecutive failure, capped).
@@ -281,7 +302,15 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
     };
     let pc = lane_provider_config(cfg, &template);
     let Some(provider) = crate::provider_factory::vps_provider_for(&pc, name) else {
-        return; // token gone: leave it; the reaper's lifetime ceiling backstops
+        report_scale_down_blocked(
+            name,
+            &scale_down_blocked_message(
+                name,
+                &row.provider,
+                "its provider could not be built: the API token is unresolved or the VPS ledger record is unreadable",
+            ),
+        );
+        return;
     };
     match crate::agent::block_on_provider(|| async {
         use thegn_svc::provider::RemoteProvider;
@@ -291,10 +320,56 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
             let _ = db.stop_compute_meter(name, unix_now() * 1000); // best-effort: ledger bookkeeping after a successful destroy
             let _ = db.capacity_delete(host); // best-effort: cache bookkeeping after a successful destroy
             let _ = db.host_delete(host); // best-effort: cache bookkeeping after a successful destroy
+            rearm_scale_down_report(name);
             thegn_core::msg::info(&format!("placement: scaled down idle host {name}"));
         }
-        Err(e) => thegn_core::msg::warn(&format!("placement: scale-down of {name}: {e}")),
+        Err(e) => report_scale_down_blocked(
+            name,
+            &scale_down_blocked_message(name, &row.provider, &format!("the destroy failed ({e})")),
+        ),
     }
+}
+
+fn scale_down_blocked_message(name: &str, provider: &str, why: &str) -> String {
+    format!(
+        "placement: idle engine host {name} ({provider}) was not scaled down: {why}; it keeps running and billing until this is fixed"
+    )
+}
+
+static SCALE_DOWN_REPORTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn report_scale_down_blocked_with(
+    name: &str,
+    text: &str,
+    tui_active: bool,
+    toast: impl FnOnce(&str),
+) {
+    thegn_core::msg::warn(text);
+    let newly_reported = tui_active
+        && SCALE_DOWN_REPORTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned());
+    if newly_reported {
+        toast(text);
+    }
+}
+
+fn report_scale_down_blocked(name: &str, text: &str) {
+    report_scale_down_blocked_with(name, text, thegn_core::msg::tui_active(), |text| {
+        if let Some(notify) = crate::notify::global() {
+            notify.emit_status(text);
+            notify.emit_toast(text, thegn_core::notification::Priority::Notice);
+        }
+    });
+}
+
+fn rearm_scale_down_report(name: &str) {
+    SCALE_DOWN_REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name);
 }
 
 fn auto_host_name(size: &str, nonce: [u8; 8]) -> String {
@@ -664,6 +739,73 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.len() <= 63);
         assert!(thegn_svc::vps::registry::checked_name(&first).is_ok());
+    }
+
+    #[test]
+    fn db_host_def_finds_a_def_persisted_after_config_load() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let name = "tg-auto-cx32-0000000000000001";
+        let hc = HostConfig {
+            reach: HostReach::Local,
+            ..HostConfig::default()
+        };
+        db.put_host_def(name, &hc, 1).unwrap();
+
+        let found = db_host_def(&db, name).unwrap();
+        assert!(matches!(found, Some((_, binding)) if binding.id == HostId::named(name)));
+    }
+
+    #[test]
+    fn db_host_def_is_none_for_an_unknown_name() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+
+        assert!(
+            db_host_def(&db, "tg-auto-cx32-0000000000000001")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scale_down_blocked_message_names_the_host_and_the_cost() {
+        let cause = "its provider could not be built: the API token is unresolved or the VPS ledger record is unreadable";
+        let text = scale_down_blocked_message("tg-auto-test-message", "hetzner", cause);
+        assert!(text.contains("tg-auto-test-message"));
+        assert!(text.contains("(hetzner)"));
+        assert!(text.contains("was not scaled down"));
+        assert!(text.contains(cause));
+        assert!(!text.contains("see the warning above"));
+        assert!(text.contains("keeps running and billing"));
+    }
+
+    #[test]
+    fn scale_down_report_toasts_once_per_host_while_the_tui_runs() {
+        let name = "tg-auto-test-once";
+        let mut toasts: u32 = 0;
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        assert_eq!(toasts, 1);
+        rearm_scale_down_report(name);
+    }
+
+    #[test]
+    fn scale_down_report_never_toasts_without_the_tui() {
+        let mut toasts: u32 = 0;
+        report_scale_down_blocked_with("tg-auto-test-no-tui", "t", false, |_| toasts += 1);
+        assert_eq!(toasts, 0);
+    }
+
+    #[test]
+    fn scale_down_success_rearms_the_report() {
+        let name = "tg-auto-test-rearm";
+        let mut toasts: u32 = 0;
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        rearm_scale_down_report(name);
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        assert_eq!(toasts, 2);
+        rearm_scale_down_report(name);
     }
 
     #[test]

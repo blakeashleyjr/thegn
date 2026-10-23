@@ -1768,6 +1768,36 @@ pub fn provider_proxy_target(
     Some((provider, id, workdir, provider_kind, custody_account))
 }
 
+/// Builds the `sprite-proxy` refusal message after [`provider_proxy_target`]
+/// returned `None`. This is a second, best-effort read of the selection, not a
+/// diagnosis of the refusal's own cause: a state-database or environment-
+/// selection read failure is named as such (the refusal itself only reaches
+/// tracing, which has no sink in a ProxyCommand child); otherwise the generic
+/// reasons stand.
+pub(crate) fn provider_proxy_refusal(worktree: &str) -> String {
+    let read = Db::open().and_then(|db| {
+        let repo_root: PathBuf = db
+            .repo_root_for(worktree)?
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| repo::main_worktree(Path::new(worktree)))
+            .unwrap_or_else(|| PathBuf::from(worktree));
+        db.effective_env_checked(worktree, &repo_root.to_string_lossy())
+    });
+    proxy_refusal_reason(worktree, read)
+}
+
+fn proxy_refusal_reason(worktree: &str, read: anyhow::Result<Option<String>>) -> String {
+    match read {
+        Err(error) => format!(
+            "sprite-proxy: {worktree}: the environment selection could not be read ({error:#}); refusing rather than resolving the default environment"
+        ),
+        Ok(_) => format!(
+            "sprite-proxy: {worktree} has no provider proxy target: it is not a provider env, its API token is unset, or its warm-pool binding or custody record could not be read"
+        ),
+    }
+}
+
 pub(crate) use crate::agent_ssh::{
     SPRITE_SSHD_PORT, SpriteSshCustody, generate_managed_keypair_at, managed_ssh_keypair,
     mosh_setup_script, sprite_ssh_argv, sprite_ssh_argv_for_custody, sprite_ssh_connect,
@@ -1842,7 +1872,26 @@ pub(crate) fn detect_host_agents() -> Vec<String> {
 }
 
 pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
+    native_exec_for(cfg, worktree, None).into_option()
+}
+
+pub(crate) fn native_shell_exec_for_pane(cfg: &Config, worktree: &str) -> PaneNativeExec {
     native_exec_for(cfg, worktree, None)
+}
+
+pub(crate) enum PaneNativeExec {
+    Ready(Box<NativeShell>),
+    Unavailable,
+    AccountReadRefused(String),
+}
+
+impl PaneNativeExec {
+    fn into_option(self) -> Option<NativeShell> {
+        match self {
+            Self::Ready(native) => Some(*native),
+            Self::Unavailable | Self::AccountReadRefused(_) => None,
+        }
+    }
 }
 
 /// Like [`native_shell_exec`] but runs the AGENT `choice`'s command in the sandbox
@@ -1852,12 +1901,18 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
 /// choice (use [`native_shell_exec`]) or a non-native-exec env. The agent inherits
 /// the same in-sprite env as the shell (host secrets + proxy routing when set), so
 /// e.g. the managed pi snippet's `$HOME/.thegn/pi` resolves to the sprite home.
-pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<NativeShell> {
+pub(crate) fn native_agent_exec_for_pane(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+) -> PaneNativeExec {
     if choice.is_empty() || choice == SHELL || choice == "clean-shell" {
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     // Only real agents (not tools) route through here.
-    cfg.agent_command(choice)?;
+    if cfg.agent_command(choice).is_none() {
+        return PaneNativeExec::Unavailable;
+    }
     // A grant the harness cannot take refuses the AGENT pane (THE-440) — the
     // caller falls back to a plain login shell, which runs no agent under the
     // wrong policy. Visible, never silent.
@@ -1866,7 +1921,7 @@ pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<N
         Err(why) => {
             tracing::warn!(target: "thegn::agent", agent = %choice, "{why}");
             thegn_core::msg::warn(&format!("{why}; no agent pane was started"));
-            return None;
+            return PaneNativeExec::Unavailable;
         }
     };
     native_exec_for(cfg, worktree, Some(cmd))
@@ -1875,7 +1930,7 @@ pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<N
 /// Shared body: build a [`NativeShell`] for a native-exec provider worktree. With
 /// `agent_cmd = None` the inner command is the login shell; with `Some(cmd)` it's
 /// that agent command (run via the same `cd workdir; <cmd>` wrapper).
-fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> Option<NativeShell> {
+fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> PaneNativeExec {
     use thegn_core::config::ProviderExecMode;
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
@@ -1887,7 +1942,10 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         .unwrap_or_else(|| PathBuf::from(worktree));
     let read =
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
-    let selected_env = env_selection_or_refuse(worktree, "native exec", read)?;
+    let selected_env = match env_selection_or_refuse(worktree, "native exec", read) {
+        Some(selected_env) => selected_env,
+        None => return PaneNativeExec::Unavailable,
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -1895,9 +1953,12 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         selected_env.as_deref(),
     );
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
-        return None;
+        return PaneNativeExec::Unavailable;
     };
-    let pc = &cfg.env.get(&environment.name)?.provider;
+    let Some(env_cfg) = cfg.env.get(&environment.name) else {
+        return PaneNativeExec::Unavailable;
+    };
+    let pc = &env_cfg.provider;
     if let Some(request) =
         thegn_core::sandbox_floor::provider_explicit_request(&environment.sandbox)
     {
@@ -1907,19 +1968,21 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
             request = %request.describe(),
             "provider pane refused: explicit isolation request"
         );
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     if pc.exec == ProviderExecMode::Cli || !thegn_svc::provider::exec_api_by_name(&pc.provider) {
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     // Auto backs off to the CLI pane during a provider's failure cooldown; api
     // always tries native.
     if pc.exec == ProviderExecMode::Auto && !native_exec_healthy(&pc.provider) {
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     // Token missing ⇒ no provider built ⇒ fall back to the CLI path (which has
     // its own behavior when unconfigured); don't silently spawn a dead session.
-    let provider = provider_for(pc)?;
+    let Some(provider) = provider_for(pc) else {
+        return PaneNativeExec::Unavailable;
+    };
     // The host's absolute $SHELL path won't exist in the sandbox, so use the
     // basename form (in_oci = true), honoring an explicit env shell override.
     let sb_shell = environment.sandbox.shell.trim().to_string();
@@ -1931,10 +1994,15 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         None => shell_inner_override(&sb_shell),
     };
     // Point each agent CLI at the ACTIVE account's uploaded credential home.
+    let exports = match crate::agent_configs::account_exports_or_refuse(
+        crate::agent_configs::account_pane_env_exports(cfg, worktree),
+    ) {
+        Ok(exports) => exports,
+        Err(reason) => return PaneNativeExec::AccountReadRefused(reason),
+    };
     let inner = format!(
-        "{}{}{inner}",
-        crate::remote_enqueue_auth::source_prefix(worktree),
-        crate::agent_configs::account_pane_env_exports(cfg, worktree)
+        "{}{exports}{inner}",
+        crate::remote_enqueue_auth::source_prefix(worktree)
     );
     // Carry the host's passthrough secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) into
     // the provider exec so the in-sprite shell + any agent it spawns (pi, claude
@@ -1964,21 +2032,21 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "native exec refused: warm-pool sandbox binding unreadable");
-            return None;
+            return PaneNativeExec::Unavailable;
         }
     };
     // Resolve the pane cwd against the sandbox's cached `$HOME` (the workspace lives
     // under the login user's home — see `provider_workdir`), so `cd {workdir}` lands
     // in the repo and not a nonexistent `/workspace`.
     let workdir = crate::provider_workdir::resolve(pc, &sandbox_id);
-    Some(NativeShell {
+    PaneNativeExec::Ready(Box::new(NativeShell {
         provider,
         provider_name: pc.provider.clone(),
         sandbox_id,
         inner,
         workdir,
         env,
-    })
+    }))
 }
 
 /// Whether `worktree`'s provider env still needs its one-time provisioning: a
@@ -2277,7 +2345,7 @@ fn clear_configured_provider_cooldowns(cfg: &Config) {
 mod env_selection_tests {
     use super::{
         ProvisionSelection, clear_configured_provider_cooldowns, env_selection_or_refuse,
-        native_exec_healthy, native_exec_report, provision_selection,
+        native_exec_healthy, native_exec_report, provision_selection, proxy_refusal_reason,
     };
     use thegn_core::config::{Config, EnvConfig, PlacementMode};
 
@@ -2376,6 +2444,20 @@ mod env_selection_tests {
         clear_configured_provider_cooldowns(&cfg);
         assert!(native_exec_healthy("env-selection-test-provider"));
     }
+
+    #[test]
+    fn proxy_refusal_reason_names_an_unreadable_selection() {
+        let message = proxy_refusal_reason("/wt", Err(anyhow::anyhow!("database is locked")));
+        assert!(message.contains("could not be read"));
+        assert!(message.contains("database is locked"));
+        assert!(!message.contains("not a provider env"));
+    }
+
+    #[test]
+    fn proxy_refusal_reason_keeps_the_generic_reason() {
+        assert!(proxy_refusal_reason("/wt", Ok(None)).contains("not a provider env"));
+        assert!(proxy_refusal_reason("/wt", Ok(Some("box".into()))).contains("not a provider env"));
+    }
 }
 
 /// Make a sandbox/remote env "just work" like local, by reproducing the repo's
@@ -2468,6 +2550,15 @@ pub fn provision_provider_env_named(
     // marker short-circuit below makes its run a no-op. The marker alone only
     // guards SEQUENTIAL re-runs — it is written at the END of the pipeline.
     let _gate = crate::provision_gate::sandbox_lock(&id);
+
+    // A hibernated worktree resumes by overlaying its snapshot on the fresh
+    // clone. Read it before any sandbox create: an unreadable record must
+    // refuse here rather than provision an empty clone over the snapshot.
+    let snapshot_restore = if name_override.is_none() {
+        crate::hibernator::begin_restore(worktree, pc.hibernate_enabled())?
+    } else {
+        None
+    };
 
     // Recreate-if-missing: the sandbox may have been cleaned up out-of-band (TTL,
     // manual delete, provider GC). `ensure_exists` recreates it before we read the
@@ -2669,6 +2760,9 @@ pub fn provision_provider_env_named(
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|b| !b.is_empty() && b != "HEAD")
     };
+    if snapshot_restore.is_some() {
+        crate::hibernator::mark_restoring(worktree);
+    }
     let opts = PlanOpts {
         workdir: workdir.clone(),
         origin: local_origin(&repo_root),
@@ -2741,9 +2835,7 @@ pub fn provision_provider_env_named(
             .then(|| worktree.to_string()),
         // A hibernated worktree resumes by overlaying its snapshot on the
         // fresh clone; the row flips to `restoring` here (deleted on success).
-        snapshot_restore: (name_override.is_none())
-            .then(|| crate::hibernator::begin_restore(worktree))
-            .flatten(),
+        snapshot_restore,
         // Host-cache loopback substituter for nix.conf — but only when the resident
         // musl bridge that carries the `:8484` tunnel is pushable; otherwise the port
         // is dead and nix wastes minutes timing out before falling back to source.
@@ -4219,7 +4311,7 @@ pub fn launch_spec_full(
             {
                 let _ = db.set_worktree_agent(worktree, choice); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
-            match db.worktree_sandbox(worktree) {
+            match thegn_core::db::retry_transient(|| db.worktree_sandbox(worktree)) {
                 Ok(saved) => saved,
                 Err(error) => {
                     launch_state_gate(
@@ -4238,7 +4330,10 @@ pub fn launch_spec_full(
 
     // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
     // DB (carries remote worktrees with no local cwd), else climb from the path.
-    let recorded_root = match db.as_ref().map(|db| db.repo_root_for(worktree)) {
+    let recorded_root = match db
+        .as_ref()
+        .map(|db| thegn_core::db::retry_transient(|| db.repo_root_for(worktree)))
+    {
         Some(Ok(root)) => root,
         Some(Err(error)) => {
             launch_state_gate(
@@ -4261,7 +4356,9 @@ pub fn launch_spec_full(
     // The selected execution environment: the worktree's own `env_name`, else
     // its workspace's. `resolve_env` falls through to the repo/global default.
     let selected_env = match db.as_ref() {
-        Some(db) => match db.effective_env_checked(worktree, &repo_root.to_string_lossy()) {
+        Some(db) => match thegn_core::db::retry_transient(|| {
+            db.effective_env_checked(worktree, &repo_root.to_string_lossy())
+        }) {
             Ok(selected) => selected,
             Err(error) => {
                 launch_state_gate(
@@ -4354,7 +4451,7 @@ pub fn launch_spec_full(
     if !loc.is_remote()
         && let Some(db) = db.as_ref()
     {
-        match repo_slug_checked(db, &repo_root) {
+        match thegn_core::db::retry_transient(|| repo_slug_checked(db, &repo_root)) {
             Ok(Some(slug)) => credential_overlay_gate(cfg, db, &slug, choice)?,
             Ok(None) => {}
             Err(error) => launch_state_gate(
@@ -4458,22 +4555,45 @@ pub fn launch_spec_full(
     // the host store isn't mounted). See [`devenv`].
     let devshell = (!loc.is_remote() && !outcome.is_remote)
         .then(|| {
+            if db.is_none() && !cfg.env.is_empty() {
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    worktree,
+                    "devshell injection skipped: the state database could not be opened"
+                );
+                return false;
+            }
             let approvals = db
                 .as_ref()
                 .map(|db| {
                     crate::handlers::repo_trust::approvals_for(db, &repo_root.to_string_lossy())
                 })
                 .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
-            crate::handlers::repo_trust::effective_environment_for_worktree(
+            match crate::handlers::repo_trust::effective_environment_for_worktree(
                 cfg,
                 db.as_ref(),
                 &repo_root,
                 Path::new(worktree),
                 None,
                 &approvals,
-            )
-            .sandbox
-            .inject_devshell
+            ) {
+                Ok(environment) => environment.sandbox.inject_devshell,
+                Err(error) => {
+                    crate::launch_notice::post(
+                        worktree,
+                        &format!(
+                            "devshell injection skipped: the environment could not be resolved: {error:#}"
+                        ),
+                    );
+                    tracing::warn!(
+                        target: "thegn::sandbox",
+                        worktree,
+                        error = %format!("{error:#}"),
+                        "devshell injection skipped: the environment could not be resolved"
+                    );
+                    false
+                }
+            }
         })
         .filter(|enabled| *enabled)
         .and_then(|_| devenv::cached(&repo_root));
