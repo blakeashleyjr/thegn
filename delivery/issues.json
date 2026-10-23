@@ -38,13 +38,6 @@
       ]
     },
     {
-      "issue": "THE-93",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "make-sidebar-mode-visible"
-      ]
-    },
-    {
       "issue": "THE-97",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
