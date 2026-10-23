@@ -9,6 +9,46 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.36] — 2026-10-23 (maintenance batch 73)
 
+### Changed
+
+- When an active drain holds merge-queue rows, `thegn merge add`, `merge rm`,
+  `merge retry` and `merge land` refuse them; `merge clear` removes unclaimed
+  rows, names the rows it keeps and exits with an error. The control API returns
+  a conflict response. A row queued by an older thegn without a worktree identity is
+  held until `thegn merge add` re-enqueues it. `thegn ci runs --json` returns a
+  `no-provider` error object when no provider is configured; `[]` means a
+  configured provider returned no runs.
+- Reused merge gates use a stable target per repository. An explicit
+  `[merge_queue] gate_target_dir` is split per repository; isolated gates use
+  private targets. `thegn doctor` warns about `[disk] shared_target_dir` and
+  `gate_target_dir`. In the share panel, `o` explains when a share has no
+  browser link, and `↵` copies its endpoint.
+- On the dev channel, machine0 inventory lists reject unrecognised shapes,
+  unidentifiable rows and duplicates. Machine0 readiness, status and SSH-auth
+  waits, and Fly's sshd probe, count in-flight requests against their total
+  time budget. A failing local `tar` or `git` producer fails a host transfer
+  instead of sending a partial stream.
+
+### Fixed
+
+- A late event from a replaced resident plugin process no longer stops the new
+  process or schedules an extra restart. The files panel reads local Git paths
+  as NUL-separated records, preserving names with embedded newlines.
+- Quitting no longer waits on an unbounded terminal flush, and the crash-path
+  terminal restore cannot block.
+
+### Security
+
+- Sandbox mount guards protect thegn's control-socket directories and state
+  `run/` directory: bwrap hides them, systemd makes them inaccessible or
+  refuses the affected profile, and container backends refuse mounts that
+  expose a control directory or writable mounts covering `run/`. Read-only
+  `$HOME` mounts remain allowed; `all` and `host` profiles expose the host by
+  design.
+- Thegn's info, warning and error output, including the final error line,
+  replaces control and invisible formatting characters so hostile names or
+  messages cannot inject terminal escape sequences.
+
 ## [0.1.0-alpha.35] — 2026-10-23 (maintenance batch 72)
 
 ### Added
