@@ -26,6 +26,7 @@
 
 pub mod attest;
 pub mod mcp;
+mod pending;
 
 use std::future::Future;
 use std::io::Read;
@@ -320,7 +321,7 @@ impl Machine0Provider {
         let v = self.mcp.call_tool(name, args).await?;
         if let Some(err) = v.get("error").and_then(Value::as_str) {
             let msg = v.get("message").and_then(Value::as_str).unwrap_or(err);
-            return Err(anyhow!("machine0 {name}: {err}: {msg}"));
+            return Err(mcp::DefiniteRefusal::new(format!("machine0 {name}: {err}: {msg}")).into());
         }
         Ok(v)
     }
@@ -419,8 +420,45 @@ impl Machine0Provider {
             if r.is_empty() { DEFAULT_REGION } else { r }
         };
         let args = vm_create_args(name, image, &size, region, &key_id);
-        self.call(tool::VM_CREATE, args).await?;
+        tokio::task::spawn_blocking({
+            let name = name.to_string();
+            move || pending::record_at(&crate::vps::registry::dir(), &name)
+        })
+        .await
+        .context("machine0: pending create record worker failed")??;
 
+        if let Err(error) = self.call(tool::VM_CREATE, args).await {
+            if mcp::is_definite_refusal(&error) {
+                let registry = crate::vps::registry::dir();
+                let name = name.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    retire_pending_after_create_error_at(&registry, &name, true)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(removal_error)) => tracing::warn!(
+                        %removal_error,
+                        "machine0: failed to remove refused pending create record"
+                    ),
+                    Err(join_error) => tracing::warn!(
+                        %join_error,
+                        "machine0: pending create refusal cleanup worker failed"
+                    ),
+                }
+                return Err(error);
+            }
+            return Err(error).with_context(|| pending_outcome_unknown(name));
+        }
+        let vm = self
+            .await_created_vm(name)
+            .await
+            .with_context(|| pending_outcome_unknown(name))?;
+        self.remove_pending_record(name).await;
+        Ok(vm)
+    }
+
+    async fn await_created_vm(&self, name: &str) -> Result<Machine0Vm> {
         after_vm_create(thegn_core::util::thegn_dir(), name.to_string(), async {
             if self.spec.skip_ready_wait {
                 return Ok(self.vm_by_name(name).await?.unwrap_or(Machine0Vm {
@@ -442,6 +480,30 @@ impl Machine0Provider {
             Ok(vm)
         })
         .await
+    }
+
+    async fn adopt(&self, name: &str) -> Result<Machine0Vm> {
+        let vm = self
+            .await_created_vm(name)
+            .await
+            .with_context(|| pending_outcome_unknown(name))?;
+        self.remove_pending_record(name).await;
+        Ok(vm)
+    }
+
+    async fn remove_pending_record(&self, name: &str) {
+        let root = crate::vps::registry::dir();
+        let name = name.to_string();
+        match tokio::task::spawn_blocking(move || pending::remove_at(&root, &name)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                // best-effort: readiness succeeded, so a stale record only over-counts until destroy.
+                tracing::warn!(%error, "machine0: failed to remove ready pending create record");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "machine0: pending create removal worker failed");
+            }
+        }
     }
 
     /// The ssh user for a VM: the configured `ssh_user`, else the VM's own
@@ -888,17 +950,12 @@ impl Machine0Provider {
         self.ensure_provisioned(name).await
     }
 
-    async fn retire_local_state(&self, name: &str) {
+    async fn retire_local_state(&self, name: &str) -> Result<()> {
         let root = thegn_core::util::thegn_dir();
         let name = name.to_string();
         match tokio::task::spawn_blocking(move || retire_local_state_in(&root, &name)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "machine0: failed to retire local VM state (attestation / known_hosts pin)")
-            }
-            Err(error) => {
-                tracing::warn!(%error, "machine0: local VM state retirement worker failed")
-            }
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -908,10 +965,15 @@ fn retire_local_state_in(thegn_root: &Path, name: &str) -> Result<()> {
         .context("machine0: failed to remove the local provisioning attestation");
     let pin_result = crate::vps::registry::remove_known_hosts_pin_at(&thegn_root.join("vps"), name)
         .context("machine0: failed to remove the local known_hosts pin");
+    let pending_result = pending::remove_at(&thegn_root.join("vps"), name)
+        .context("machine0: failed to remove the local pending create record");
 
     match attestation_result {
         Err(error) => Err(error),
-        Ok(()) => pin_result,
+        Ok(()) => match pin_result {
+            Err(error) => Err(error),
+            Ok(()) => pending_result,
+        },
     }
 }
 
@@ -929,25 +991,101 @@ async fn after_vm_create<T>(
     ready.await
 }
 
-/// Refuse creation when the live VM count is unknown or already at the cap.
+#[derive(Debug)]
+struct PendingOutcomeUnknown(String);
+
+impl std::fmt::Display for PendingOutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PendingOutcomeUnknown {}
+
+fn pending_outcome_unknown(name: &str) -> PendingOutcomeUnknown {
+    PendingOutcomeUnknown(format!(
+        "machine0: the create outcome for {name} is still unknown (pending reservation); retry later, or destroy {name} to retire the reservation"
+    ))
+}
+
+fn retire_pending_after_create_error_at(
+    registry: &Path,
+    name: &str,
+    definite_refusal: bool,
+) -> Result<()> {
+    if definite_refusal {
+        pending::remove_at(registry, name)
+    } else {
+        Ok(())
+    }
+}
+
+/// Refuse creation when live or pending capacity is unknown or already at the cap.
 /// Provider error text is intentionally excluded because it may contain a
 /// credential or endpoint.
-fn admit_create(listed: Result<usize>, max: usize) -> Result<()> {
-    let managed = match listed {
-        Ok(managed) => managed,
+fn admit_create(
+    listed: Result<Vec<String>>,
+    pending_names: Result<Vec<String>>,
+    name: &str,
+    max: usize,
+) -> Result<pending::Admission> {
+    let listed = match listed {
+        Ok(listed) => listed,
         Err(_) => {
             return Err(anyhow!(
                 "machine0: cannot count existing VMs before create (provider/API list error); refusing to create past max_instances"
             ));
         }
     };
-    if managed >= max {
+    let pending_names = pending_names.map_err(|_| {
+        anyhow!("machine0: cannot read pending create reservations; refusing to create past max_instances")
+    })?;
+    if listed.iter().any(|listed_name| listed_name == name) {
+        if pending_names
+            .iter()
+            .any(|pending_name| pending_name == name)
+        {
+            return Ok(pending::Admission::Adopt);
+        }
         return Err(anyhow!(
-            "machine0: {managed} VMs already exist (max_instances = {max}); destroy one or raise \
-             `[env.<name>.provider] max_instances`"
+            "machine0: a VM named {name} already exists but this machine has no pending create for it; refusing to create a duplicate (destroy it or pick another sandbox name)"
         ));
     }
-    Ok(())
+    if pending_names
+        .iter()
+        .any(|pending_name| pending_name == name)
+    {
+        return Ok(pending::Admission::Unresolved);
+    }
+    let pending_unlisted = pending_names
+        .iter()
+        .filter(|pending_name| {
+            !listed
+                .iter()
+                .any(|listed_name| listed_name == *pending_name)
+        })
+        .collect::<Vec<_>>();
+    let occupied: usize = listed.len() + pending_unlisted.len();
+    if occupied >= max {
+        if pending_unlisted.is_empty() {
+            return Err(anyhow!(
+                "machine0: {} VMs already exist (max_instances = {max}); destroy one or raise \
+                 `[env.<name>.provider] max_instances`",
+                listed.len()
+            ));
+        }
+        let pending_display = pending_unlisted
+            .iter()
+            .map(|pending_name| pending_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "machine0: {} VMs exist and {} creates are pending ({pending_display}) (max_instances = {max}); destroy one or raise `[env.<name>.provider] max_instances`",
+            listed.len(),
+            pending_unlisted.len()
+        ));
+    }
+    Ok(pending::Admission::Create)
 }
 
 impl RemoteProvider for Machine0Provider {
@@ -958,12 +1096,24 @@ impl RemoteProvider for Machine0Provider {
                 return Err(anyhow!("machine0: the sandbox name is empty"));
             }
             let create_guard = create_lock().await?;
-            // Spend guardrail: unknown inventory and a reached cap both refuse.
-            admit_create(
-                self.list().await.map(|v| v.len()),
+            let pending_names =
+                tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
+                    .await
+                    .context("machine0: pending create listing worker failed")?;
+            let admission = admit_create(
+                self.list().await,
+                pending_names,
+                &name,
                 self.spec.max_instances(),
             )?;
-            let spawned = self.spawn(&name, &self.spec.image).await;
+            let spawned = match admission {
+                pending::Admission::Create => self.spawn(&name, &self.spec.image).await,
+                pending::Admission::Adopt => self.adopt(&name).await,
+                pending::Admission::Unresolved => match self.vm_by_name(&name).await {
+                    Ok(Some(_)) => self.adopt(&name).await,
+                    Ok(None) | Err(_) => Err(pending_outcome_unknown(&name).into()),
+                },
+            };
             drop(create_guard);
             let vm = spawned?;
             // NixOS flake apply (no-op unless `provision_flake` is set). Attestation-gated
@@ -992,7 +1142,7 @@ impl RemoteProvider for Machine0Provider {
             thegn_core::managed_ssh::read("machine0", &custody_account, id)
                 .context("machine0: validate managed SSH custody before destroy")?;
             let Some(vm) = self.vm_by_name_for_destroy(id).await? else {
-                self.retire_local_state(id).await;
+                self.retire_local_state(id).await?;
                 thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                     .context("machine0: retire managed SSH custody")?;
                 return Ok(()); // already gone
@@ -1000,12 +1150,12 @@ impl RemoteProvider for Machine0Provider {
             *self.endpoint.lock().unwrap() = None;
             match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
                 Ok(_) => {
-                    self.retire_local_state(id).await;
+                    self.retire_local_state(id).await?;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                         .context("machine0: retire managed SSH custody")
                 }
                 Err(e) if is_not_found(&e.to_string()) => {
-                    self.retire_local_state(id).await;
+                    self.retire_local_state(id).await?;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                         .context("machine0: retire managed SSH custody")
                 }
@@ -1859,15 +2009,43 @@ mod tests {
                 false,
                 true,
             ),
-            ("empty list", Ok(0), true, false),
-            ("under cap", Ok(4), true, false),
-            ("at cap", Ok(5), false, false),
-            ("over cap", Ok(6), false, false),
+            ("empty list", Ok(vec![]), true, false),
+            (
+                "under cap",
+                Ok(vec!["a", "b", "c", "d"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()),
+                true,
+                false,
+            ),
+            (
+                "at cap",
+                Ok(vec!["a", "b", "c", "d", "e"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()),
+                false,
+                false,
+            ),
+            (
+                "over cap",
+                Ok(vec!["a", "b", "c", "d", "e", "f"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()),
+                false,
+                false,
+            ),
         ];
 
         for (case_name, listed, admits, expect_list_error) in cases {
-            let result = admit_create(listed, 5);
-            assert_eq!(result.is_ok(), admits, "{case_name}");
+            let result = admit_create(listed, Ok(vec![]), "new", 5);
+            assert_eq!(
+                matches!(result.as_ref(), Ok(pending::Admission::Create)),
+                admits,
+                "{case_name}"
+            );
             if expect_list_error {
                 match result {
                     Err(error) => {
@@ -1875,12 +2053,107 @@ mod tests {
                         assert!(message.contains("provider/API list error"));
                         assert!(!message.contains(secret_error));
                     }
-                    Ok(()) => panic!("list error must refuse creation"),
+                    Ok(_) => panic!("list error must refuse creation"),
                 }
             }
         }
 
-        assert!(admit_create(parse_vm_list(&json!({ "data": [] })).map(|v| v.len()), 5).is_err());
+        assert!(admit_create(parse_vm_list(&json!({ "data": [] })), Ok(vec![]), "new", 5).is_err());
+    }
+
+    #[test]
+    fn pending_creates_count_against_the_cap() {
+        let listed = || {
+            Ok(vec!["a", "b", "c"]
+                .into_iter()
+                .map(str::to_string)
+                .collect())
+        };
+        let pending_names = || Ok(vec!["d", "e"].into_iter().map(str::to_string).collect());
+        let error = admit_create(listed(), pending_names(), "f", 5).unwrap_err();
+        assert!(error.to_string().contains("d, e"));
+        assert_eq!(
+            admit_create(listed(), pending_names(), "f", 6).unwrap(),
+            pending::Admission::Create
+        );
+        assert_eq!(
+            admit_create(
+                Ok(vec!["a", "d"].into_iter().map(str::to_string).collect()),
+                Ok(vec!["d".to_string()]),
+                "f",
+                3,
+            )
+            .unwrap(),
+            pending::Admission::Create
+        );
+    }
+
+    #[test]
+    fn a_pending_create_for_this_name_adopts_the_listed_vm() {
+        assert_eq!(
+            admit_create(
+                Ok(vec!["dev".to_string()]),
+                Ok(vec!["dev".to_string()]),
+                "dev",
+                1,
+            )
+            .unwrap(),
+            pending::Admission::Adopt
+        );
+    }
+
+    #[test]
+    fn an_unlisted_pending_create_is_unresolved_not_created_again() {
+        assert_eq!(
+            admit_create(Ok(vec![]), Ok(vec!["dev".to_string()]), "dev", 5,).unwrap(),
+            pending::Admission::Unresolved
+        );
+        let refusal: anyhow::Error = pending_outcome_unknown("dev").into();
+        assert!(refusal.downcast_ref::<PendingOutcomeUnknown>().is_some());
+        assert!(refusal.to_string().contains("retry later, or destroy dev"));
+    }
+
+    #[test]
+    fn definite_create_refusal_retires_the_reservation_but_ambiguous_error_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("vps");
+        pending::record_at(&registry, "definite").unwrap();
+        let refusal = mcp::DefiniteRefusal::new("machine0 vm_create: invalid image".to_string());
+        let refusal: anyhow::Error = refusal.into();
+        assert!(mcp::is_definite_refusal(&refusal));
+        retire_pending_after_create_error_at(
+            &registry,
+            "definite",
+            mcp::is_definite_refusal(&refusal),
+        )
+        .unwrap();
+        assert!(pending::names_at(&registry).unwrap().is_empty());
+
+        pending::record_at(&registry, "ambiguous").unwrap();
+        let ambiguous = anyhow!("machine0 vm_create: transport timeout");
+        assert!(!mcp::is_definite_refusal(&ambiguous));
+        retire_pending_after_create_error_at(
+            &registry,
+            "ambiguous",
+            mcp::is_definite_refusal(&ambiguous),
+        )
+        .unwrap();
+        assert_eq!(
+            pending::names_at(&registry).unwrap(),
+            vec!["ambiguous".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unreserved_same_name_vm_is_refused_not_duplicated() {
+        let error = admit_create(Ok(vec!["dev".to_string()]), Ok(vec![]), "dev", 5).unwrap_err();
+        assert!(error.to_string().contains("refusing to create a duplicate"));
+    }
+
+    #[test]
+    fn an_unreadable_pending_store_refuses_creation() {
+        let error = admit_create(Ok(vec![]), Err(anyhow!("boom")), "dev", 5).unwrap_err();
+        assert!(error.to_string().contains("pending create reservations"));
     }
 
     #[test]
@@ -2450,6 +2723,69 @@ mod tests {
         assert!(attest::load_in(root.path(), "dev").is_none());
         assert!(!known_hosts.join("dev").exists());
         assert!(known_hosts.join("other").exists());
+    }
+
+    #[test]
+    fn retire_local_state_retires_the_pending_create() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("vps");
+        pending::record_at(&registry, "dev").unwrap();
+        pending::record_at(&registry, "other").unwrap();
+
+        retire_local_state_in(root.path(), "dev").unwrap();
+
+        assert_eq!(
+            pending::names_at(&registry).unwrap(),
+            vec!["other".to_string()]
+        );
+    }
+
+    #[test]
+    fn concurrent_creates_with_lost_responses_never_exceed_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("vps");
+        let visible = std::sync::Mutex::new(Vec::<String>::new());
+        let created = std::sync::atomic::AtomicUsize::new(0);
+
+        // Each thread holds the same OS file lock through admission and record publication.
+        // The vendor list stays empty to model eight lost create responses and delayed visibility.
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let registry = registry.clone();
+                let visible = &visible;
+                let created = &created;
+                scope.spawn(move || {
+                    let lock = crate::vps::registry::open_lock_at(
+                        &registry,
+                        crate::vps::registry::MACHINE0_CREATE_LOCK,
+                    )
+                    .unwrap();
+                    lock.lock().unwrap();
+                    let listed = visible
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if matches!(
+                        admit_create(
+                            Ok(listed),
+                            pending::names_at(&registry),
+                            &format!("vm-{index}"),
+                            3,
+                        ),
+                        Ok(pending::Admission::Create)
+                    ) {
+                        pending::record_at(&registry, &format!("vm-{index}")).unwrap();
+                        created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            created.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "pending reservations must cap lost-response creates at three"
+        );
     }
 
     #[test]

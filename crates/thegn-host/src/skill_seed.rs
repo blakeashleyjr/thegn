@@ -1019,19 +1019,17 @@ pub fn seed_persisted_worktrees(cfg: &Config) {
         return;
     }
     let cfg = cfg.clone();
-    let _ = std::thread::Builder::new()
-        .name("thegn-skillseed".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            if let Ok(db) = thegn_core::db::Db::open() {
-                use thegn_core::store::WorkspaceStore;
-                for worktree in db.worktrees().unwrap_or_default() {
-                    if worktree.location.is_empty() {
-                        let _ = seed(&cfg, Path::new(&worktree.worktree), SeedPhase::Startup); // best-effort: startup reconciliation is diagnostic-only
-                    }
+    let _ = thegn_core::thread_name::try_spawn_named("thegn-skillseed", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        if let Ok(db) = thegn_core::db::Db::open() {
+            use thegn_core::store::WorkspaceStore;
+            for worktree in db.worktrees().unwrap_or_default() {
+                if worktree.location.is_empty() {
+                    let _ = seed(&cfg, Path::new(&worktree.worktree), SeedPhase::Startup); // best-effort: startup reconciliation is diagnostic-only
                 }
             }
-        }); // best-effort: a failed background spawn only skips reconciliation
+        }
+    }); // best-effort: a failed background spawn only skips reconciliation
 }
 
 /// Metadata projection shared by the CLI and control route.

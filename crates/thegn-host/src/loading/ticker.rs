@@ -74,20 +74,18 @@ impl SplashTicker {
             let running = self.running.clone();
             let tick = self.tick.clone();
             let period = self.period;
-            std::thread::Builder::new()
-                .name("thegn-splash".into())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(period);
-                        if !active.load(Ordering::Relaxed) {
-                            running.store(false, Ordering::Release);
-                            return;
-                        }
-                        tick();
+            thegn_core::thread_name::try_spawn_named("thegn-splash", move || {
+                loop {
+                    std::thread::sleep(period);
+                    if !active.load(Ordering::Relaxed) {
+                        running.store(false, Ordering::Release);
+                        return;
                     }
-                })
-                .map(|_| ())
-                .unwrap_or_else(|_| self.running.store(false, Ordering::Release));
+                    tick();
+                }
+            })
+            .map(|_| ())
+            .unwrap_or_else(|_| self.running.store(false, Ordering::Release));
         }
     }
 }

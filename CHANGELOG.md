@@ -7,7 +7,53 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.38] — 2026-10-23 (maintenance batch 75)
+
 ## [0.1.0-alpha.37] — 2026-10-23 (maintenance batch 74)
+
+### Changed
+
+- `thegn pr queue rm` refuses to remove a row while its PR agent is running;
+  `clear` removes other rows, names the kept PRs and exits with an error.
+  The PR-queue section's `x` and `c` actions report the same result. `thegn
+session move` drops pane working directories outside the moved worktree, so
+  those panes start in the worktree root. The daemon's `ci.runs` (and `ci.logs`
+  when nothing is cached) refuse a worktree with no CI provider with a
+  `no-provider:` failed-precondition error. CI autofix acts on the one active
+  PR-queue row for the failing worktree and holds with a notification when
+  several active rows share it.
+
+### Fixed
+
+- `thegn merge land` and the merge-queue section's `l` fold exactly the commit
+  the queue verified; a branch that moved since is refused before anything is
+  folded. A workspace clone refuses a destination directory that already
+  exists when it is promoted, and staging left by crashed clones is reclaimed
+  at startup. MPD controls the server does not permit for the connection are
+  no longer sent, and a burst of player-change notifications is read once. A
+  keyring write or delete that does not answer in time is treated as a
+  retryable unknown outcome instead of a denial. The pane daemon exits and
+  removes its socket when SIGTERM arrives right after it starts.
+- VPS destroys retire their record only after the instance is absent from the
+  provider inventory, and machine0 destroys refuse when the VM lookup is
+  unclear instead of treating the VM as already gone (dev channel).
+
+### Security
+
+- Configured agents and tools are refused when the state database cannot be
+  opened at launch; a plain shell still starts. PDF and Mermaid previews do
+  not run a renderer found inside the previewed repository. `file:` secret
+  references in the push inbox, share and issue tokens, the embedded git UI
+  and the proxy go through the same owner-only check (and size cap) as other
+  `file:` secrets. A managed account home that another account's legacy name
+  also matches (`work` vs
+  `Work`) is refused instead of being reused. The macOS launcher passes
+  `--env` values as data, never as shell code (macOS).
+- Provider close-time downloads stay within held directory handles; unreadable
+  warm-pool bindings refuse instead of targeting a derived sandbox; Sprites
+  sshd setup refuses a symlinked `authorized_keys`, ignores commented-out
+  copies of the key, and refuses an unparsable managed key before custody
+  (dev channel).
 
 ## [0.1.0-alpha.36] — 2026-10-23 (maintenance batch 73)
 
@@ -2029,7 +2075,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.37...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.38...HEAD
+[0.1.0-alpha.38]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.37...v0.1.0-alpha.38
 [0.1.0-alpha.37]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.36...v0.1.0-alpha.37
 [0.1.0-alpha.36]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.35...v0.1.0-alpha.36
 [0.1.0-alpha.35]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.34...v0.1.0-alpha.35

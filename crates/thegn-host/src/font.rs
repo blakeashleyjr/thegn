@@ -318,30 +318,28 @@ impl DiscoveryOwner {
         }
         let generation = self.generation;
         let cancel = Arc::clone(&self.cancel);
-        let spawned = std::thread::Builder::new()
-            .name("thegn-font-disc".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                // A panic must still deliver a result, or `in_flight` would stay
-                // set and every later request would coalesce into nothing.
-                let discovery =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| discover(&cancel)))
-                        .unwrap_or_else(|_| {
-                            Discovery::bare(
-                                DiscoveryStatus::Unavailable("discovery panicked".into()),
-                                Vec::new(),
-                            )
-                        });
-                if tx
-                    .send(DiscoveryResult {
-                        generation,
-                        discovery,
-                    })
-                    .is_ok()
-                {
-                    let _ = waker.wake(); // best-effort: waker pulse: a nudge must never fail the worker
-                }
-            });
+        let spawned = thegn_core::thread_name::try_spawn_named("thegn-font-disc", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            // A panic must still deliver a result, or `in_flight` would stay
+            // set and every later request would coalesce into nothing.
+            let discovery =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| discover(&cancel)))
+                    .unwrap_or_else(|_| {
+                        Discovery::bare(
+                            DiscoveryStatus::Unavailable("discovery panicked".into()),
+                            Vec::new(),
+                        )
+                    });
+            if tx
+                .send(DiscoveryResult {
+                    generation,
+                    discovery,
+                })
+                .is_ok()
+            {
+                let _ = waker.wake(); // best-effort: waker pulse: a nudge must never fail the worker
+            }
+        });
         if spawned.is_err() {
             self.in_flight = false;
             return Request::Failed;

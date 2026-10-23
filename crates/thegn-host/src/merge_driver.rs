@@ -237,6 +237,28 @@ fn candidate_drift(
     }
 }
 
+/// The commit the drain must land: the verified live tip of a row with a recorded candidate.
+fn verified_land_pin(
+    candidate: Option<&MergeCandidate>,
+    verified_tip: Option<&str>,
+) -> Option<String> {
+    candidate.and(verified_tip).map(str::to_owned)
+}
+
+/// Land `branch`, pinned to `verified_tip` when the drain verified one.
+fn land_verified(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    branch: &str,
+    location: &thegn_core::remote::GitLoc,
+    verified_tip: Option<&str>,
+) -> anyhow::Result<AttemptOutcome> {
+    match verified_tip {
+        Some(tip) => integrate::attempt_land_pinned(cfg, repo_root, branch, location, tip),
+        None => integrate::attempt_land(cfg, repo_root, branch, location),
+    }
+}
+
 fn conflict_detail(
     paths: &[String],
     conflicts: &[thegn_core::submodule::SubmoduleConflict],
@@ -342,6 +364,7 @@ pub(crate) fn drive_queue(
         progress,
         DriveActions {
             attempt: |branch: &str, location: &thegn_core::remote::GitLoc, held: bool| {
+                let mut verified_tip: Option<String> = None;
                 if let thegn_core::remote::GitLoc::Local(worktree) = location {
                     let key = worktree.to_string_lossy().into_owned();
                     let candidate = db.merge_candidate(&key)?;
@@ -435,6 +458,7 @@ pub(crate) fn drive_queue(
                         ) {
                             return Err(anyhow::Error::new(CandidateDrift { reason }));
                         }
+                        verified_tip = verified_land_pin(Some(candidate), live_tip.as_deref());
                     }
                     let ref_name = format!("refs/heads/{branch}");
                     match classify_oid(local_git_text(repo_root, &["rev-parse", &ref_name])) {
@@ -455,7 +479,11 @@ pub(crate) fn drive_queue(
                         }
                     }
                 }
-                integrate::attempt_land(cfg, repo_root, branch, location)
+                #[cfg(test)]
+                {
+                    typed_read_tests::run_drain_land_test_hook();
+                }
+                land_verified(cfg, repo_root, branch, location, verified_tip.as_deref())
             },
             floor: |worktree: &str| {
                 if let Some(reason) = crate::agent_run::headless_unsupported() {
@@ -551,6 +579,16 @@ pub(crate) fn drive_queue(
     )
 }
 
+/// Whether a `git worktree list --porcelain -z` listing registers exactly `worktree` (THE-376 slice d). A malformed
+/// listing is an error, never "not registered".
+fn listing_registers(listing: &str, worktree: &Path) -> Result<bool, String> {
+    let entries = util::parse_worktree_branches(listing)
+        .ok_or_else(|| "the queued repository's worktree list is malformed".to_string())?;
+    Ok(entries
+        .iter()
+        .any(|(path, _branch)| Path::new(path) == worktree))
+}
+
 /// Confirm the queued local checkout still names the same registered Git
 /// repository, branch, and candidate commit before dispatching a fixer.
 fn verify_fixer_checkout(
@@ -595,11 +633,16 @@ fn verify_fixer_checkout(
     if actual_common != expected_common {
         return Err("worktree belongs to a different Git repository".into());
     }
-    let listing = local_git_text(repo_root, &["worktree", "list", "--porcelain"])
-        .map_err(|error| format!("could not list the queued repository's worktrees: {error}"))?;
-    let registered = listing.lines().any(|line| {
-        line.strip_prefix("worktree ") == Some(canonical_worktree.to_string_lossy().as_ref())
-    });
+    let cancel = AtomicBool::new(false);
+    let listing = thegn_core::git_run::git_run(
+        repo_root,
+        &util::WORKTREE_LIST_Z,
+        &thegn_core::git_run::GitPolicy::read(thegn_core::remote::GITLOC_READ_DEADLINE),
+        &cancel,
+    )
+    .into_text()
+    .map_err(|error| format!("could not list the queued repository's worktrees: {error}"))?;
+    let registered = listing_registers(&listing, &canonical_worktree)?;
     if !registered {
         return Err("path is not a registered worktree of the queued repository".into());
     }
@@ -1727,6 +1770,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixer_registration_ignores_a_newline_forged_record() {
+        let oid = "a".repeat(40);
+        let listing = format!(
+            "worktree /r\0HEAD {oid}\0branch refs/heads/main\0\0\
+             worktree /tmp/a\nworktree /tmp/target\0HEAD {oid}\0detached\0\0"
+        );
+        assert_eq!(
+            listing_registers(&listing, Path::new("/tmp/target")),
+            Ok(false)
+        );
+        assert_eq!(
+            listing_registers(&listing, Path::new("/tmp/a\nworktree /tmp/target")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn fixer_registration_refuses_a_malformed_listing() {
+        let error = listing_registers(
+            "worktree /r\0HEAD 0000000000000000000000000000000000000000\0detached\0",
+            Path::new("/r"),
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed"));
+    }
+
     fn uncontained_config() -> Config {
         Config {
             sandbox: thegn_core::config::SandboxConfig {
@@ -2200,6 +2270,25 @@ mod tests {
             let alias = feat_wt.with_file_name("feature-alias");
             std::os::unix::fs::symlink(&feat_wt, &alias).unwrap();
             assert!(verify_fixer_checkout(&root, alias.to_str().unwrap(), "feat", None).is_err());
+        }
+
+        #[test]
+        fn fixer_registration_accepts_a_registered_newline_worktree() {
+            let (_fixture, root, _feat_wt) = conflicting_repo("nl-reg");
+            let nl = root.parent().unwrap().join("nl\nwt");
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "nlb",
+                    nl.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            verify_fixer_checkout(&root, nl.to_str().unwrap(), "nlb", None).unwrap();
         }
 
         #[test]
@@ -3340,11 +3429,29 @@ mod tests {
 
 #[cfg(test)]
 mod typed_read_tests {
+    use std::cell::RefCell;
+
     use super::{
-        CandidateUnreadable, Config, DriveActions, Failure, MergeQueueConfig, QueueItem,
-        classify_oid, drive_queue_with, local_git_text, unreadable_detail,
+        CandidateUnreadable, Config, DriveActions, Failure, MergeCandidate, MergeQueueConfig,
+        QueueItem, classify_oid, drive_queue, drive_queue_with, local_git_text, unreadable_detail,
+        verified_land_pin,
     };
     use thegn_core::git_run::{GitOutcome, GitTextError};
+
+    thread_local! {
+        static DRAIN_LAND_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    fn set_drain_land_test_hook(hook: impl FnOnce() + 'static) {
+        DRAIN_LAND_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_drain_land_test_hook() {
+        let hook = DRAIN_LAND_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 
     #[test]
     fn classify_oid_keeps_exit_one_as_absent_and_everything_else_as_failure() {
@@ -3525,5 +3632,153 @@ mod typed_read_tests {
         assert!(detail.contains("Git command timed out"));
         assert!(!detail.contains("identity drift"));
         assert!(!detail.contains("re-enqueue"));
+    }
+
+    #[test]
+    fn drain_land_pin_is_the_verified_tip_of_a_candidate_row() {
+        let candidate = MergeCandidate {
+            branch_ref: "refs/heads/feat".into(),
+            candidate_oid: "a".repeat(40),
+        };
+        let verified_tip = "b".repeat(40);
+        assert_eq!(
+            verified_land_pin(Some(&candidate), Some(&verified_tip)),
+            Some(verified_tip)
+        );
+    }
+
+    #[test]
+    fn drain_land_pin_is_none_without_a_candidate() {
+        let candidate = MergeCandidate {
+            branch_ref: "refs/heads/feat".into(),
+            candidate_oid: "a".repeat(40),
+        };
+        let verified_tip = "b".repeat(40);
+        assert_eq!(verified_land_pin(None, Some(&verified_tip)), None);
+        assert_eq!(verified_land_pin(Some(&candidate), None), None);
+    }
+
+    #[test]
+    fn drain_passes_verified_tip_when_branch_moves_before_landing() {
+        use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+
+        #[expect(clippy::disallowed_methods, reason = "create an isolated Git fixture")]
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let status = thegn_core::util::git_cmd(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed with {status}");
+        }
+
+        let tmp_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = tempfile::tempdir_in(tmp_root).unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "t@e"]);
+        git(dir.path(), &["config", "user.name", "t"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+        git(dir.path(), &["checkout", "-q", "-b", "feat"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "first feature commit",
+            ],
+        );
+
+        let main_before = local_git_text(dir.path(), &["rev-parse", "refs/heads/main"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let worktree = dir.path().to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("feat", &worktree, &worktree, "feat", None, None)
+            .unwrap();
+        db.enqueue_merge_candidate_with_identity(
+            &worktree,
+            "feat",
+            "main",
+            &MergeCandidate {
+                branch_ref: "refs/heads/feat".into(),
+                candidate_oid: local_git_text(dir.path(), &["rev-parse", "refs/heads/feat"])
+                    .unwrap()
+                    .trim()
+                    .to_owned(),
+            },
+            &crate::merge_ops::local_enqueue_identity(dir.path()).unwrap(),
+        )
+        .unwrap();
+
+        // This runs after drive_queue verifies the queued candidate and just
+        // before it calls the production land path, reproducing a concurrent
+        // branch advance at the boundary the pin protects.
+        let hook_dir = dir.path().to_path_buf();
+        set_drain_land_test_hook(move || {
+            git(
+                &hook_dir,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "second feature commit",
+                ],
+            );
+        });
+
+        let outcome = drive_queue(
+            &MergeQueueConfig {
+                target_branch: "main".into(),
+                organize_folders: false,
+                ..MergeQueueConfig::default()
+            },
+            &Config::default(),
+            dir.path(),
+            &db,
+            vec![QueueItem {
+                worktree,
+                branch: "feat".into(),
+                location: String::new(),
+            }],
+            |_| {},
+        );
+        assert!(
+            outcome.gate_error == ["feat"],
+            "expected moved branch to be refused, got {outcome:?}"
+        );
+        let expected_class = if thegn_core::sandbox_backend::host_os()
+            == thegn_core::sandbox_backend::HostOs::Windows
+        {
+            "preparation"
+        } else {
+            "source_moved"
+        };
+        assert_eq!(outcome.gate_verdicts[0].class, expected_class);
+        let main_after = local_git_text(dir.path(), &["rev-parse", "refs/heads/main"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert_eq!(main_after, main_before, "refused landing changed main");
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.status, "gate_error");
     }
 }

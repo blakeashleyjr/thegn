@@ -79,19 +79,17 @@ pub fn tick(cfg: &Config) {
         }
         *last = Some(Instant::now());
     }
-    let spawned = std::thread::Builder::new()
-        .name("thegn-fly-reap".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            struct FlightGuard;
-            impl Drop for FlightGuard {
-                fn drop(&mut self) {
-                    IN_FLIGHT.store(false, Ordering::Release);
-                }
+    let spawned = thegn_core::thread_name::try_spawn_named("thegn-fly-reap", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        struct FlightGuard;
+        impl Drop for FlightGuard {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, Ordering::Release);
             }
-            let _guard = FlightGuard;
-            reap(&envs);
-        });
+        }
+        let _guard = FlightGuard;
+        reap(&envs);
+    });
     if let Err(error) = spawned {
         IN_FLIGHT.store(false, Ordering::Release);
         tracing::warn!(target: "thegn::lifecycle", %error, "fly reaper thread could not start");

@@ -512,6 +512,12 @@ pub trait WorktreeAuxStore {
         last_head_oid: Option<&str>,
     ) -> Result<()>;
 
+    /// Record a refresh note on a queued PR without touching its status, blocker
+    /// or head. A failed forge fetch is a fact about the network, never a verdict
+    /// about the PR, so it must not rewrite a hold another writer set. Fenced by a
+    /// live PR-agent lease exactly like [`Self::update_pr_status`].
+    fn update_pr_detail(&self, key: &str, detail: &str) -> Result<()>;
+
     /// Record agent-dispatch cycles spent on a PR, so the budget belongs to the
     /// pull request rather than to one drain. A live PR-agent lease fences this
     /// write; the lease holder updates attempts only through its fenced release,

@@ -133,3 +133,58 @@ fn lease_liveness_matches_admission_boundary() {
     assert!(!pr_agent_lease_live(Some(&view), view.lease_until_ms + 1));
     assert!(!pr_agent_lease_live(None, view.lease_until_ms));
 }
+
+#[test]
+fn update_pr_detail_keeps_status_blocker_and_head() {
+    let db = Db::open_memory().unwrap();
+    let key = enqueue(&db, 5);
+
+    db.update_pr_status(
+        &key,
+        PrqStatus::NeedsHuman.as_str(),
+        Some("ci"),
+        Some("held"),
+        Some("head-a"),
+    )
+    .unwrap();
+    db.update_pr_detail(&key, "PR #5: offline — retrying in 30s")
+        .unwrap();
+
+    let row = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == key)
+        .unwrap();
+    assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+    assert_eq!(row.blocker.as_deref(), Some("ci"));
+    assert_eq!(row.last_head_oid.as_deref(), Some("head-a"));
+    assert_eq!(
+        row.detail.as_deref(),
+        Some("PR #5: offline — retrying in 30s")
+    );
+}
+
+#[test]
+fn update_pr_detail_is_fenced_by_a_live_lease() {
+    let db = Db::open_memory().unwrap();
+    let key = enqueue(&db, 6);
+    let _lease = admitted(&db, &key);
+    let before = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == key)
+        .unwrap();
+
+    db.update_pr_detail(&key, "late note").unwrap();
+
+    let after = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == key)
+        .unwrap();
+    assert_eq!(after.detail, before.detail);
+    assert_eq!(after.status, before.status);
+}

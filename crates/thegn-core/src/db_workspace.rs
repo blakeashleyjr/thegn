@@ -1023,6 +1023,13 @@ impl WorkspaceStore for Db {
             .or_else(|| self.workspace_env(repo_path).ok().flatten())
     }
 
+    fn effective_env_checked(&self, wt: &str, repo_path: &str) -> Result<Option<String>> {
+        if let Some(env) = self.worktree_env(wt)? {
+            return Ok(Some(env));
+        }
+        self.workspace_env(repo_path)
+    }
+
     /// Save (or replace) a named layout snapshot. `spec` is a serialized
     /// `LayoutSpec` JSON string.
     fn put_layout(&self, name: &str, spec: &str) -> Result<()> {
@@ -3042,5 +3049,50 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn effective_env_checked_surfaces_a_read_failure() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        db.set_worktree_env("/wt/a", "sandboxed").unwrap();
+        db.conn().execute_batch("DROP TABLE worktrees").unwrap();
+
+        assert!(db.effective_env_checked("/wt/a", "/repo").is_err());
+        // Positive control: the legacy convenience method still swallows read failures.
+        assert_eq!(db.effective_env("/wt/a", "/repo"), None);
+    }
+
+    #[test]
+    fn effective_env_checked_prefers_the_worktree_then_the_workspace() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repo", "repo", "repo").unwrap();
+        db.set_workspace_env("/repo", "ws-env").unwrap();
+        db.set_worktree_env("/wt/a", "wt-env").unwrap();
+
+        assert_eq!(
+            db.effective_env_checked("/wt/a", "/repo")
+                .unwrap()
+                .as_deref(),
+            Some("wt-env")
+        );
+        assert_eq!(
+            db.effective_env_checked("/wt/b", "/repo")
+                .unwrap()
+                .as_deref(),
+            Some("ws-env")
+        );
+    }
+
+    #[test]
+    fn effective_env_checked_is_none_without_a_selection() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+
+        assert_eq!(db.effective_env_checked("/wt/a", "/repo").unwrap(), None);
     }
 }
