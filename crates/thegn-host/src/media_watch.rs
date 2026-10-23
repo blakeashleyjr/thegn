@@ -1764,7 +1764,7 @@ mod tests {
         let collector = tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 let at = tokio::time::Instant::now().duration_since(started);
-                let delivery = rx.borrow_and_update().clone();
+                let delivery: Option<MediaSnapshotDelivery> = rx.borrow_and_update().clone();
                 if let Some(delivery) = delivery {
                     recorded
                         .lock()
