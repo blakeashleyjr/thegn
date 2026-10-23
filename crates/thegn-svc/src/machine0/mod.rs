@@ -338,6 +338,19 @@ impl Machine0Provider {
         }
     }
 
+    /// Look up a VM for destroy. Unlike the ordinary existence checks, an
+    /// unrecognized or ambiguous response must never be treated as absence.
+    async fn vm_by_name_for_destroy(&self, name: &str) -> Result<Option<Machine0Vm>> {
+        match self
+            .call(tool::VM_GET_BY_NAME, json!({ "name": name }))
+            .await
+        {
+            Ok(v) => vm_for_destroy(&v, name).map(Some),
+            Err(e) if is_not_found(&e.to_string()) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Import thegn's managed public key (idempotent — reuse a same-material key
     /// already registered), returning its key id for `vm_create.sshKeyId`. Uses
     /// `ssh_key_create_public` (import — we hold the private half) so our own ssh
@@ -978,18 +991,12 @@ impl RemoteProvider for Machine0Provider {
             let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
             thegn_core::managed_ssh::read("machine0", &custody_account, id)
                 .context("machine0: validate managed SSH custody before destroy")?;
-            let Some(vm) = self.vm_by_name(id).await? else {
+            let Some(vm) = self.vm_by_name_for_destroy(id).await? else {
                 self.retire_local_state(id).await;
                 thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                     .context("machine0: retire managed SSH custody")?;
                 return Ok(()); // already gone
             };
-            if vm.id.is_empty() {
-                self.retire_local_state(id).await;
-                thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
-                    .context("machine0: retire managed SSH custody")?;
-                return Ok(());
-            }
             *self.endpoint.lock().unwrap() = None;
             match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
                 Ok(_) => {
@@ -1305,6 +1312,27 @@ pub fn parse_vm(v: &Value) -> Option<Machine0Vm> {
         address,
         user,
     })
+}
+
+/// Validate a by-name VM lookup before destroy can act on it or retire local
+/// state. The raw response is deliberately excluded from refusal messages.
+fn vm_for_destroy(v: &Value, name: &str) -> Result<Machine0Vm> {
+    let Some(vm) = parse_vm(v) else {
+        return Err(anyhow!(
+            "machine0: vm_get_by_name returned an unrecognized response for {name}; refusing to treat it as already destroyed"
+        ));
+    };
+    if vm.id.is_empty() {
+        return Err(anyhow!(
+            "machine0: vm_get_by_name returned no VM id for {name}; refusing to treat it as already destroyed"
+        ));
+    }
+    if !vm.name.is_empty() && vm.name != name {
+        return Err(anyhow!(
+            "machine0: vm_get_by_name for {name} returned a different VM; refusing to destroy or retire it"
+        ));
+    }
+    Ok(vm)
 }
 
 /// Parse a `vm_list` response (array, or `{machines|vms|items: [...]}`) into
@@ -2602,5 +2630,40 @@ mod tests {
             parse_ssh_key_list(&json!([{ "id": "k2" }])).unwrap(),
             vec![("k2".to_string(), String::new())]
         );
+    }
+
+    #[test]
+    fn vm_for_destroy_refuses_an_unrecognized_shape() {
+        for response in [json!({}), json!({ "error": "x" })] {
+            let error = vm_for_destroy(&response, "dev").unwrap_err();
+            assert!(error.to_string().contains("unrecognized response"));
+            assert!(!error.to_string().contains("\"error\""));
+        }
+    }
+
+    #[test]
+    fn vm_for_destroy_refuses_a_vm_without_an_id() {
+        let error =
+            vm_for_destroy(&json!({ "name": "dev", "status": "RUNNING" }), "dev").unwrap_err();
+        assert!(error.to_string().contains("no VM id"));
+    }
+
+    #[test]
+    fn vm_for_destroy_refuses_a_different_vm_name() {
+        let error = vm_for_destroy(&json!({ "id": "u1", "name": "other" }), "dev").unwrap_err();
+        assert!(error.to_string().contains("different VM"));
+    }
+
+    #[test]
+    fn vm_for_destroy_accepts_envelopes_and_a_matching_name() {
+        let matching = vm_for_destroy(&json!({ "id": "u1", "name": "dev" }), "dev").unwrap();
+        assert_eq!(matching.id, "u1");
+
+        let envelope = vm_for_destroy(
+            &json!({ "machine": { "id": "u2", "state": "running" } }),
+            "dev",
+        )
+        .unwrap();
+        assert_eq!(envelope.id, "u2");
     }
 }
