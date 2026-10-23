@@ -469,6 +469,8 @@ pub fn validate_vps_config(
 /// Validate every configured Fly/VPS table using the same local grammar that
 /// the service constructors use. Provider names outside these implemented
 /// adapters are handled by the schema/enum validator and are not probed here.
+/// Managed provider ids must also be lowercase; custom and Daytona ids remain
+/// vendor-opaque and are exempt.
 pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
     let mut errors = Vec::new();
     for (env_name, env) in &cfg.env {
