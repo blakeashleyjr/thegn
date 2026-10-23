@@ -331,6 +331,14 @@ pub fn validate_diagnostics_with_policy(
                     message,
                 }),
         );
+        diagnostics.extend(
+            crate::provider_admission::unenforced_lifetime_warnings(&cfg)
+                .into_iter()
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
     }
     diagnostics
 }
@@ -1742,6 +1750,45 @@ template = "image:registry.example/dev:1"
         assert_eq!(diagnostics[0].severity, ValidationSeverity::Warning);
         assert!(diagnostics[0].message.contains("deprecated and disabled"));
         assert!(validate_str("[sandbox]\nwarm_direnv = \"auto\"\n").is_empty());
+    }
+
+    #[test]
+    fn unenforced_lifetime_is_a_warning_for_unreaped_providers() {
+        for provider in ["machine0", "sprites"] {
+            let body = format!(
+                "[env.m0.provider]\nprovider = \"{provider}\"\nregion = \"us-east\"\nmax_lifetime_secs = 3600\n"
+            );
+            let matching: Vec<_> = validate_diagnostics(&body)
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("env.m0.provider.max_lifetime_secs")
+                        && diagnostic.message.contains("not enforced")
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "{provider}: {matching:?}");
+            assert_eq!(matching[0].severity, ValidationSeverity::Warning);
+            assert!(validate_str(&body).is_empty(), "{provider}");
+        }
+
+        for provider in ["fly", "hetzner", "digitalocean"] {
+            let body = format!(
+                "[env.{provider}.provider]\nprovider = \"{provider}\"\nmax_lifetime_secs = 3600\n"
+            );
+            assert!(validate_diagnostics(&body).iter().all(|diagnostic| {
+                !diagnostic
+                    .message
+                    .contains(&format!("env.{provider}.provider.max_lifetime_secs"))
+            }));
+        }
+
+        let machine0_off = "[env.m0.provider]\nprovider = \"machine0\"\nmax_lifetime_secs = 0\n";
+        assert!(validate_diagnostics(machine0_off).iter().all(|diagnostic| {
+            !diagnostic
+                .message
+                .contains("env.m0.provider.max_lifetime_secs")
+        }));
     }
 
     #[test]

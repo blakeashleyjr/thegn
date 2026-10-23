@@ -245,9 +245,10 @@ pub struct EnvProviderConfig {
     /// VPS providers only: hard cap on concurrently-managed instances — the
     /// spend guardrail enforced at create. `0` ⇒ the built-in default (5).
     pub max_instances: u32,
-    /// VPS providers only: ceiling on any instance's lifetime in seconds; the
-    /// reaper destroys older ones (a VPS bills until destroyed — there is no
-    /// free suspended state). `0` ⇒ no ceiling.
+    /// Fly and VPS providers: ceiling on any instance's lifetime in seconds;
+    /// their reaper destroys older ones (a VPS bills until destroyed — there is
+    /// no free suspended state). Other provider kinds have no lifetime reaper:
+    /// `config validate` warns when this is set. `0` ⇒ no ceiling.
     #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub max_lifetime_secs: u64,
     /// Hibernation (snapshot-then-destroy on idle) for this env's claimed
@@ -446,6 +447,12 @@ impl EnvProviderKind {
     /// "don't also age it out" case).
     pub fn self_suspends(self) -> bool {
         matches!(self, Self::Sprites)
+    }
+
+    /// Whether a reaper enforces `max_lifetime_secs` for this kind
+    /// (`fly_reaper` / `vps_reaper`).
+    pub fn lifetime_reaped(self) -> bool {
+        matches!(self, Self::Fly) || self.is_vps()
     }
 }
 
@@ -946,5 +953,30 @@ mod tests {
         let l = LifecycleConfig::default();
         assert_eq!(l.hibernate_after_secs, 3600);
         assert_eq!(l.snapshot.backend, SnapshotBackend::Local);
+    }
+
+    #[test]
+    fn lifetime_reaped_matches_the_scheduled_reapers() {
+        for kind in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+        ] {
+            match kind {
+                EnvProviderKind::Fly | EnvProviderKind::Hetzner | EnvProviderKind::DigitalOcean => {
+                    assert!(kind.lifetime_reaped(), "{kind:?} is reaped");
+                }
+                EnvProviderKind::Custom
+                | EnvProviderKind::Daytona
+                | EnvProviderKind::Sprites
+                | EnvProviderKind::Machine0 => {
+                    assert!(!kind.lifetime_reaped(), "{kind:?} has no lifetime reaper");
+                }
+            }
+        }
     }
 }
