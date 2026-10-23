@@ -2712,7 +2712,11 @@ pub fn is_transient_lock(error: &anyhow::Error) -> bool {
 
 const RETRY_TRANSIENT_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 400];
 
-/// Retry a DB read when SQLite reports a transient busy/locked condition.
+/// Retry a launch-state DB operation when SQLite reports a transient busy/locked condition.
+/// A failed attempt is retried only when it returned in under 200 ms, avoiding
+/// another full busy-timeout wait after SQLite has already waited for a lock.
+/// With the 5 s connection timeout and the configured retry delays, a call can
+/// spend at most one timeout wait plus the short retries (about 6.8 s).
 pub fn retry_transient<T>(f: impl FnMut() -> Result<T>) -> Result<T> {
     retry_transient_with(&RETRY_TRANSIENT_DELAYS_MS, std::thread::sleep, f)
 }
@@ -2723,25 +2727,23 @@ fn retry_transient_with<T>(
     mut f: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     use anyhow::Context;
+    const QUICK_BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
 
-    let mut last_error = match f() {
-        Ok(value) => return Ok(value),
-        Err(error) => error,
-    };
-    for delay_ms in delays_ms {
-        if !is_transient_lock(&last_error) {
-            return Err(last_error);
-        }
-        sleep(std::time::Duration::from_millis(*delay_ms));
+    let mut retries = 0;
+    loop {
+        let started = std::time::Instant::now();
         match f() {
             Ok(value) => return Ok(value),
-            Err(error) => last_error = error,
+            Err(error) if !is_transient_lock(&error) => return Err(error),
+            Err(error) => {
+                if started.elapsed() >= QUICK_BUSY_RETRY || retries == delays_ms.len() {
+                    return Err(error).context(format!("still locked after {retries} retries"));
+                }
+                sleep(std::time::Duration::from_millis(delays_ms[retries]));
+                retries += 1;
+            }
         }
     }
-    if !is_transient_lock(&last_error) {
-        return Err(last_error);
-    }
-    Err(last_error).context(format!("still locked after {} retries", delays_ms.len()))
 }
 
 /// A current-state read could not safely use the immutable view or join the WAL.

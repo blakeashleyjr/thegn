@@ -2928,7 +2928,7 @@ fn configured_launch_survives_a_held_write_lock() {
 
         std::thread::scope(|scope| {
             let commit = scope.spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_secs(2));
                 writer.execute_batch("COMMIT;").unwrap();
             });
             let result = launch_spec_full(
