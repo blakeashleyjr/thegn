@@ -2721,7 +2721,10 @@ fn key_ref_state(raw: &str) -> String {
     if let Some(path) = raw.strip_prefix("file:") {
         let path = path.trim();
         let expanded = thegn_core::util::expand_tilde(path);
-        return match thegn_core::fsperm::read_owner_only_secret_file(&expanded, 64 * 1024) {
+        return match thegn_core::fsperm::read_owner_only_secret_file(
+            std::path::Path::new(&expanded),
+            64 * 1024,
+        ) {
             Ok(_) => format!("file:{path} (present; policy accepted)"),
             Err(thegn_core::fsperm::SecretFileError::NotFound) => {
                 format!("file:{path} (MISSING)")
