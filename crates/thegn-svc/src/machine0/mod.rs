@@ -344,7 +344,7 @@ impl Machine0Provider {
     /// works; `ssh_key_create_managed` would keep the private key server-side.
     async fn ensure_ssh_key(&self) -> Result<String> {
         let listed = self.call(tool::SSH_KEY_LIST, json!({})).await?;
-        if let Some((id, _)) = parse_ssh_key_list(&listed)
+        if let Some((id, _)) = parse_ssh_key_list(&listed)?
             .into_iter()
             .find(|(_, pk)| same_pubkey(pk, &self.spec.pubkey))
         {
@@ -1045,7 +1045,7 @@ impl ProviderCheckpoints for Machine0Provider {
     fn list_checkpoints<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<Vec<CheckpointInfo>>> {
         Box::pin(async move {
             let v = self.call(tool::IMAGE_LIST, json!({})).await?;
-            Ok(parse_image_list(&v))
+            parse_image_list(&v)
         })
     }
 
@@ -1271,6 +1271,7 @@ pub fn parse_vm_list(v: &Value) -> Result<Vec<String>> {
     let rows = strict_array_field(v, &["machines", "vms", "items"]).map_err(|_| {
         anyhow!("machine0: vm_list returned an unrecognised response shape; refusing to treat it as an empty VM list")
     })?;
+    let mut names = std::collections::HashSet::with_capacity(rows.len());
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
@@ -1283,32 +1284,52 @@ pub fn parse_vm_list(v: &Value) -> Result<Vec<String>> {
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
-            name.or(id)
+            let name = name
+                .or(id)
                 .map(str::to_string)
-                .ok_or_else(|| anyhow!("machine0: vm_list element {index} has no name or id"))
+                .ok_or_else(|| anyhow!("machine0: vm_list element {index} has no name or id"))?;
+            anyhow::ensure!(
+                names.insert(name.clone()),
+                "machine0: vm_list names {name} twice"
+            );
+            Ok(name)
         })
         .collect()
 }
 
 /// Parse an `image_list` response into checkpoints. The `id` is the image
 /// **name** (what `vm_create.imageName` / restore consumes). Pure.
-pub fn parse_image_list(v: &Value) -> Vec<CheckpointInfo> {
-    array_field(v, &["images", "items"])
-        .iter()
-        .filter_map(|e| {
+pub fn parse_image_list(v: &Value) -> Result<Vec<CheckpointInfo>> {
+    let rows = strict_array_field(v, &["images", "items"]).map_err(|_| {
+        anyhow!("machine0: image_list returned an unrecognised response shape; refusing to treat it as an empty image list")
+    })?;
+    let mut ids = std::collections::HashSet::with_capacity(rows.len());
+    rows.iter()
+        .enumerate()
+        .map(|(index, e)| {
             let obj = e.get("image").unwrap_or(e);
             let id = obj
                 .get("name")
-                .or_else(|| obj.get("id"))
-                .and_then(Value::as_str)?
-                .to_string();
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    obj.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                })
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("machine0: image_list element {index} has no name or id"))?;
+            anyhow::ensure!(
+                ids.insert(id.clone()),
+                "machine0: image_list names image {id} twice"
+            );
             let label = obj
                 .get("description")
                 .or_else(|| obj.get("label"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            Some(CheckpointInfo { id, label })
+            Ok(CheckpointInfo { id, label })
         })
         .collect()
 }
@@ -1365,12 +1386,25 @@ pub fn pick_size(sizes: &[Machine0Size], req: &SizeReq) -> Option<String> {
 }
 
 /// Parse an ssh-key list into `(id, publicKey)` pairs. Pure.
-pub fn parse_ssh_key_list(v: &Value) -> Vec<(String, String)> {
-    array_field(v, &["sshKeys", "keys", "items"])
-        .iter()
-        .filter_map(|e| {
+pub fn parse_ssh_key_list(v: &Value) -> Result<Vec<(String, String)>> {
+    let rows = strict_array_field(v, &["sshKeys", "keys", "items"]).map_err(|_| {
+        anyhow!("machine0: ssh_key_list returned an unrecognised response shape; refusing to treat it as an empty key list")
+    })?;
+    let mut ids = std::collections::HashSet::with_capacity(rows.len());
+    rows.iter()
+        .enumerate()
+        .map(|(index, e)| {
             let obj = e.get("sshKey").or_else(|| e.get("key")).unwrap_or(e);
-            let id = obj.get("id").and_then(Value::as_str)?.to_string();
+            let id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow!("machine0: ssh_key_list element {index} has no id"))?
+                .to_string();
+            anyhow::ensure!(
+                ids.insert(id.clone()),
+                "machine0: ssh_key_list repeats key id {id}"
+            );
             let pk = obj
                 .get("publicKey")
                 .or_else(|| obj.get("public_key"))
@@ -1378,7 +1412,7 @@ pub fn parse_ssh_key_list(v: &Value) -> Vec<(String, String)> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            Some((id, pk))
+            Ok((id, pk))
         })
         .collect()
 }
@@ -1746,7 +1780,8 @@ mod tests {
     fn restore_checkpoint_present_guards_against_missing_image() {
         let images = parse_image_list(&json!({ "images": [
             { "name": "gm-1" }, { "name": "dev-1700" }
-        ]}));
+        ]}))
+        .unwrap();
         // Present ⇒ restore may proceed (destroy is safe).
         assert!(restore_checkpoint_present(&images, "gm-1"));
         assert!(restore_checkpoint_present(&images, "  dev-1700  ")); // trimmed
@@ -2108,7 +2143,7 @@ mod tests {
             { "name": "gm-1", "description": "golden" },
             { "id": "img-2" }
         ]});
-        let cps = parse_image_list(&v);
+        let cps = parse_image_list(&v).unwrap();
         assert_eq!(cps.len(), 2);
         assert_eq!(cps[0].id, "gm-1");
         assert_eq!(cps[0].label.as_deref(), Some("golden"));
@@ -2121,7 +2156,7 @@ mod tests {
         let list = json!({ "sshKeys": [
             { "id": "k1", "publicKey": "ssh-ed25519 AAA me@host" }
         ]});
-        let ks = parse_ssh_key_list(&list);
+        let ks = parse_ssh_key_list(&list).unwrap();
         assert_eq!(ks[0].0, "k1");
         assert!(same_pubkey(&ks[0].1, "ssh-ed25519 AAA other@comment"));
         assert!(!same_pubkey(&ks[0].1, "ssh-ed25519 BBB me@host"));
@@ -2356,5 +2391,87 @@ mod tests {
         let result = acquire_create_lock(third, std::time::Duration::ZERO).await;
         assert!(result.is_err(), "the returned file must hold the lock");
         drop(acquired);
+    }
+
+    #[test]
+    fn strict_inventory_image_list_refuses_unknown_shapes() {
+        for response in [
+            json!({ "data": [] }),
+            json!({ "images": [], "items": [] }),
+            json!("x"),
+        ] {
+            assert!(parse_image_list(&response).is_err(), "{response}");
+        }
+    }
+
+    #[test]
+    fn strict_inventory_image_list_refuses_unidentifiable_and_duplicate_rows() {
+        assert!(parse_image_list(&json!([{ "description": "x" }])).is_err());
+        assert!(
+            parse_image_list(&json!([
+                { "name": "a" },
+                { "image": { "name": "a" } }
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_inventory_ssh_key_list_refuses_unknown_shapes_and_bad_rows() {
+        assert!(parse_ssh_key_list(&json!({ "data": [] })).is_err());
+        assert!(parse_ssh_key_list(&json!([{ "publicKey": "ssh-ed25519 AAA" }])).is_err());
+        assert!(
+            parse_ssh_key_list(&json!([
+                { "id": "k1", "publicKey": "ssh-ed25519 AAA" },
+                { "key": { "id": "k1", "publicKey": "ssh-ed25519 BBB" } }
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_inventory_vm_list_refuses_duplicate_names() {
+        assert!(parse_vm_list(&json!([{ "name": "a" }, { "name": "a" }])).is_err());
+    }
+
+    #[test]
+    fn strict_inventory_accepts_todays_shapes() {
+        let expected_image = vec![CheckpointInfo {
+            id: "img-a".to_string(),
+            label: Some("label".to_string()),
+        }];
+        for response in [
+            json!([{ "name": "img-a", "label": "label" }]),
+            json!({ "images": [{ "image": { "name": "img-a", "label": "label" } }] }),
+            json!({ "items": [{ "id": "img-a", "label": "label" }] }),
+        ] {
+            assert_eq!(parse_image_list(&response).unwrap(), expected_image);
+        }
+        assert!(parse_image_list(&json!([])).unwrap().is_empty());
+        assert!(
+            parse_image_list(&json!({ "images": [] }))
+                .unwrap()
+                .is_empty()
+        );
+
+        let expected_key = vec![("k1".to_string(), "ssh-ed25519 AAA".to_string())];
+        for response in [
+            json!([{ "id": "k1", "publicKey": "ssh-ed25519 AAA" }]),
+            json!({ "sshKeys": [{ "sshKey": { "id": "k1", "publicKey": "ssh-ed25519 AAA" } }] }),
+            json!({ "keys": [{ "key": { "id": "k1", "public_key": "ssh-ed25519 AAA" } }] }),
+            json!({ "items": [{ "key": { "id": "k1", "key": "ssh-ed25519 AAA" } }] }),
+        ] {
+            assert_eq!(parse_ssh_key_list(&response).unwrap(), expected_key);
+        }
+        assert!(parse_ssh_key_list(&json!([])).unwrap().is_empty());
+        assert!(
+            parse_ssh_key_list(&json!({ "keys": [] }))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            parse_ssh_key_list(&json!([{ "id": "k2" }])).unwrap(),
+            vec![("k2".to_string(), String::new())]
+        );
     }
 }
