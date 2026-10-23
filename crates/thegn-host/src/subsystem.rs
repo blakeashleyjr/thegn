@@ -168,6 +168,17 @@ pub struct PreparedBinding {
     db: Db,
 }
 
+/// What a subsystem's storage binding is right now. Never names a scope whose storage is closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubprofileStatus {
+    /// The subsystem never splits (`workspace`): it always uses the profile-level scope.
+    ProfileScope,
+    /// Storage for this subprofile is open.
+    Active(String),
+    /// No storage is open (never bound, or torn down).
+    Unbound,
+}
+
 /// A coherent feature area with its own storage + identity within a profile.
 pub trait Subsystem {
     /// Stable id (`"workspace"`, `"comms"`, later `"ai"`).
@@ -175,8 +186,11 @@ pub trait Subsystem {
     /// Whether this subsystem can split into named subprofiles. `workspace` is
     /// `false` — it always uses the profile-level (shared) scope.
     fn supports_subprofiles(&self) -> bool;
-    /// The active subprofile name (`"default"` = the profile-level scope).
+    /// The active subprofile name; `"default"` is the profile-level scope or, for a
+    /// subprofile-capable subsystem, no binding (see [`Subsystem::status`]).
     fn active_subprofile(&self) -> &str;
+    /// Truthful binding status; `Active` only while storage is open.
+    fn status(&self) -> SubprofileStatus;
     /// Pane ids this subsystem currently owns.
     fn pane_ids(&self) -> Vec<u32>;
     #[cfg(test)]
@@ -213,6 +227,9 @@ impl Subsystem for WorkspaceSubsystem {
     }
     fn active_subprofile(&self) -> &str {
         "default"
+    }
+    fn status(&self) -> SubprofileStatus {
+        SubprofileStatus::ProfileScope
     }
     fn pane_ids(&self) -> Vec<u32> {
         Vec::new()
@@ -288,6 +305,13 @@ impl Subsystem for StubSubsystem {
     fn active_subprofile(&self) -> &str {
         &self.active
     }
+    fn status(&self) -> SubprofileStatus {
+        if self.db.is_some() {
+            SubprofileStatus::Active(self.active.clone())
+        } else {
+            SubprofileStatus::Unbound
+        }
+    }
     fn pane_ids(&self) -> Vec<u32> {
         self.panes.clone()
     }
@@ -325,6 +349,7 @@ impl Subsystem for StubSubsystem {
     }
     fn teardown(&mut self) -> Vec<u32> {
         self.db = None; // clean handle drop — never touches the shared profile DB
+        self.active = "default".to_string();
         std::mem::take(&mut self.panes)
     }
 }
@@ -404,6 +429,45 @@ mod tests {
         assert_eq!(doomed, vec![7, 9]);
         assert!(!s.has_storage());
         assert!(s.pane_ids().is_empty());
+    }
+
+    #[test]
+    fn teardown_leaves_no_active_subprofile() {
+        let mut subsystem = StubSubsystem::in_memory("comms");
+        subsystem.bind("work").unwrap();
+        subsystem.adopt_pane(7);
+
+        assert_eq!(subsystem.teardown(), vec![7]);
+        assert_eq!(subsystem.active_subprofile(), "default");
+        assert_eq!(subsystem.status(), SubprofileStatus::Unbound);
+    }
+
+    #[test]
+    fn status_reports_active_only_with_open_storage() {
+        let mut subsystem = StubSubsystem::in_memory("comms");
+        assert_eq!(subsystem.status(), SubprofileStatus::Unbound);
+        subsystem.bind("work").unwrap();
+        // Positive control: a successful bind reports the open binding.
+        assert_eq!(subsystem.status(), SubprofileStatus::Active("work".into()));
+
+        let mut subsystems = Subsystems {
+            subsystems: vec![Box::new(subsystem)],
+        };
+        assert!(subsystems.switch_subprofile("comms", "").is_err());
+        assert_eq!(
+            subsystems.get_mut("comms").unwrap().status(),
+            SubprofileStatus::Active("work".into())
+        );
+        subsystems.switch_subprofile("comms", "home").unwrap();
+        assert_eq!(
+            subsystems.get_mut("comms").unwrap().status(),
+            SubprofileStatus::Active("home".into())
+        );
+    }
+
+    #[test]
+    fn workspace_reports_the_profile_scope() {
+        assert_eq!(WorkspaceSubsystem.status(), SubprofileStatus::ProfileScope);
     }
 
     #[test]
