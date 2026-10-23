@@ -3149,6 +3149,7 @@ fn ls_files_run_git(dir: &std::path::Path, args: &[&str]) -> std::io::Result<std
         .arg(dir)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
 }
 

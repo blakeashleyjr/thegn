@@ -172,8 +172,7 @@ fn parse_stage_gitlinks(out: &str) -> Result<HashMap<String, String>> {
 
 fn recorded_gitlinks(loc: &GitLoc) -> Result<HashMap<String, String>> {
     let out = run(loc, &["ls-files", "--stage", "-z", "--"])?;
-    let result = parse_stage_gitlinks(&out)?;
-    Ok(result)
+    parse_stage_gitlinks(&out)
 }
 
 /// Read recursive submodule state plus ordinary status evidence in one
