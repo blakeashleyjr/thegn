@@ -636,7 +636,14 @@ fn queue_row_for_worktree(rows: Vec<thegn_core::db::PrQueueRow>, worktree: &str)
             .into_iter()
             .max_by_key(|row| row.queued_at)
             .map_or(QueueRowPick::None, |row| QueueRowPick::One(Box::new(row))),
-        1 => QueueRowPick::One(Box::new(live.into_iter().next().expect("one live row"))),
+        1 => match <[_; 1]>::try_from(live) {
+            Ok([row]) => QueueRowPick::One(Box::new(row)),
+            Err(live) => {
+                let mut numbers = live.into_iter().map(|row| row.number).collect::<Vec<_>>();
+                numbers.sort_unstable();
+                QueueRowPick::Ambiguous(numbers)
+            }
+        },
         _ => {
             let mut numbers = live.into_iter().map(|row| row.number).collect::<Vec<_>>();
             numbers.sort_unstable();
@@ -1367,31 +1374,18 @@ mod tests {
         }
     }
 
+    fn enqueue_pr(db: &thegn_core::db::Db, path: &str, number: u64, url: &str) {
+        db.enqueue_bound_pr(path, number, Some(path), "fixture", "main", "github", url)
+            .unwrap();
+    }
+
     #[test]
     fn queue_row_pick_prefers_the_live_row_in_either_order() {
         let fixture = Fixture::new();
         let path = fixture.dir.path().to_str().unwrap();
         let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("picker.db")).unwrap();
-        db.enqueue_bound_pr(
-            path,
-            7,
-            Some(path),
-            "fixture",
-            "main",
-            "github",
-            &fixture.pr.url,
-        )
-        .unwrap();
-        db.enqueue_bound_pr(
-            path,
-            9,
-            Some(path),
-            "fixture",
-            "main",
-            "github",
-            &fixture.pr.url.replace("/pull/7", "/pull/9"),
-        )
-        .unwrap();
+        enqueue_pr(&db, path, 7, &fixture.pr.url);
+        enqueue_pr(&db, path, 9, &fixture.pr.url.replace("/pull/7", "/pull/9"));
         let rows = db.list_pr_queue().unwrap();
         let merged = rows.iter().find(|row| row.number == 9).unwrap();
         db.update_pr_status(&merged.key, "merged", None, None, None)
@@ -1413,26 +1407,8 @@ mod tests {
         let fixture = Fixture::new();
         let path = fixture.dir.path().to_str().unwrap();
         let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("picker.db")).unwrap();
-        db.enqueue_bound_pr(
-            path,
-            7,
-            Some(path),
-            "fixture",
-            "main",
-            "github",
-            &fixture.pr.url,
-        )
-        .unwrap();
-        db.enqueue_bound_pr(
-            path,
-            9,
-            Some(path),
-            "fixture",
-            "main",
-            "github",
-            &fixture.pr.url.replace("/pull/7", "/pull/9"),
-        )
-        .unwrap();
+        enqueue_pr(&db, path, 7, &fixture.pr.url);
+        enqueue_pr(&db, path, 9, &fixture.pr.url.replace("/pull/7", "/pull/9"));
 
         assert_eq!(
             queue_row_for_worktree(db.list_pr_queue().unwrap(), path),
@@ -1445,16 +1421,7 @@ mod tests {
         let fixture = Fixture::new();
         let path = fixture.dir.path().to_str().unwrap();
         let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("picker.db")).unwrap();
-        db.enqueue_bound_pr(
-            path,
-            9,
-            Some(path),
-            "fixture",
-            "main",
-            "github",
-            &fixture.pr.url.replace("/pull/7", "/pull/9"),
-        )
-        .unwrap();
+        enqueue_pr(&db, path, 9, &fixture.pr.url.replace("/pull/7", "/pull/9"));
         let row = db.list_pr_queue().unwrap().remove(0);
         db.update_pr_status(&row.key, "closed", None, None, None)
             .unwrap();
@@ -1475,18 +1442,12 @@ mod tests {
         let fixture = Fixture::new();
         let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
         let path = handoff.entry.worktree.as_str();
-        handoff
-            .db
-            .enqueue_bound_pr(
-                path,
-                9,
-                Some(path),
-                "fixture",
-                "main",
-                "github",
-                &fixture.pr.url.replace("/pull/7", "/pull/9"),
-            )
-            .unwrap();
+        enqueue_pr(
+            &handoff.db,
+            path,
+            9,
+            &fixture.pr.url.replace("/pull/7", "/pull/9"),
+        );
 
         consider(&handoff, false);
 
