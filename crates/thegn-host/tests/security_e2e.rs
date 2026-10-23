@@ -390,8 +390,10 @@ impl Fixture {
             );
             let result_path = shell_quote(result.to_str().expect("result path is UTF-8"));
             let command = format!(
-                "if touch {pane_write_path}; then write=written; else write=blocked; fi; if test -e {sentinel_path}; then visibility=visible; else visibility=hidden; fi; printf '%s:%s' \"$visibility\" \"$write\" > {result_path}.tmp && mv {result_path}.tmp {result_path}"
+                "if touch {pane_write_path}; then write=written; else write=blocked; fi; if test -e {sentinel_path}; then visibility=visible; else visibility=hidden; fi; printf '%s:%s' \"$visibility\" \"$write\" > {result_path}.tmp && mv {result_path}.tmp {result_path}; :"
             );
+            // `session open --prompt` appends the prompt to a harness-less `[[agents]]` command (the
+            // `{command} {prompt}` fallback template): the trailing `:` absorbs it so `mv` keeps two operands.
             let config_dir = state.root().join(".config/thegn");
             fs::create_dir_all(&config_dir).expect("create daemon config directory");
             fs::write(
@@ -811,8 +813,30 @@ fn security_e2e_daemon_pane_cannot_see_or_write_the_state_run_dir() {
     {
         thread::sleep(Duration::from_millis(20));
     }
-    let result = fs::read_to_string(&result_path)
-        .expect("daemon agent did not write its result before timeout");
+    let result = fs::read_to_string(&result_path).unwrap_or_else(|error| {
+        let partial = fs::read_to_string(result_path.with_extension("tmp")).unwrap_or_default();
+        let worktree: Vec<String> = fs::read_dir(fixture.worktree.path())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let run_listing: Vec<String> = fs::read_dir(&run_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        panic!(
+            "daemon agent did not write its result before timeout: {error}; partial result {partial:?}; \
+             worktree {worktree:?}; host run dir {run_listing:?}; session open stdout: {}",
+            String::from_utf8_lossy(&opened.stdout)
+        )
+    });
     assert_eq!(result, "hidden:written");
     assert!(
         !pane_write.exists(),
