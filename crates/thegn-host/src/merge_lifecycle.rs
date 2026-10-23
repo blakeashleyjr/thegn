@@ -795,7 +795,7 @@ pub(crate) fn remove_landed_with_config(
         db.del_worktree(worktree)?;
         db.delete_tab_groups_for_worktree_all_sessions(worktree)?;
         if !delete_branch {
-            db.remove_merge_entry(worktree)?;
+            db.remove_merge_entry_as(worktree, "thegn close")?;
             return Ok(true);
         }
         Ok(false)
