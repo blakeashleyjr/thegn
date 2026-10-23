@@ -10,7 +10,8 @@ use thegn_core::seam::{Availability, Probe, ProbeReport};
 
 use crate::ci::{
     CiProvider, CiRunDetail, CiRunList, MAX_PROVIDER_FIELD_BYTES, PROVIDER_LOG_MAX_BYTES,
-    PROVIDER_LOG_MAX_LINES, validate_branch_ref, validate_ci_id, validate_workflow_selector,
+    PROVIDER_LOG_MAX_LINES, validate_branch_ref, validate_ci_id, validate_trigger_inputs,
+    validate_workflow_selector,
 };
 
 use super::provider::{BridgeError, ProviderBridge};
@@ -324,6 +325,7 @@ impl CiProvider for PluginCiProvider {
     ) -> Result<(), CiError> {
         Self::require_cap(self.caps.trigger, "trigger")?;
         validate_workflow_selector(workflow)?;
+        validate_trigger_inputs(inputs)?;
         let mut args = Self::loc_args(loc);
         args["workflow"] = serde_json::json!(workflow);
         args["inputs"] = serde_json::json!(
@@ -651,6 +653,41 @@ done
             provider.run_detail(&loc(), "abc"),
             Err(CiError::Other(_))
         ));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn invalid_trigger_inputs_are_refused_before_sending() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("ops");
+        let script = format!(
+            "while read -r line; do printf 'called\\n' >> '{}'; done",
+            marker.display()
+        );
+        let rt = runtime();
+        let (_fixture, _session, bridge) = live_ci_bridge(&script, Duration::from_millis(200));
+        let provider = adapter(bridge, &rt, all_caps());
+        let cases = [
+            (vec![(String::new(), "v".to_string())], "\"\""),
+            (
+                vec![("a".into(), "1".into()), ("a".into(), "2".into())],
+                "\"a\"",
+            ),
+            (vec![("k".into(), "x\u{1b}y".into())], "\"k\""),
+            (
+                vec![("k".into(), "x".repeat(MAX_PROVIDER_FIELD_BYTES + 1))],
+                "\"k\"",
+            ),
+        ];
+
+        for (inputs, expected_key) in cases {
+            assert!(matches!(
+                provider.trigger(&loc(), "ci.yml", &inputs),
+                Err(CiError::Other(message))
+                    if message.contains("invalid workflow input")
+                        && message.contains(expected_key)
+            ));
+        }
         assert!(!marker.exists());
     }
 }
