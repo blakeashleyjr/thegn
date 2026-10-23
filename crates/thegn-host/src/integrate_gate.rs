@@ -753,14 +753,16 @@ fn unique_selection(config: &MergeQueueConfig) -> Result<GateSelection> {
         .tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)?;
     let parent = Directory::open(temporary.path(), None)?;
     let path = temporary.keep();
-    // An isolated gate must not inherit the reused/default target directory.
-    // An explicitly configured directory is an operator opt-in to sharing it.
-    let target_private = config.gate_target_dir.is_empty();
-    let target = if target_private {
-        path.join("target")
-    } else {
-        PathBuf::from(&config.gate_target_dir)
-    };
+    // An isolated gate never shares a target directory, even an explicitly
+    // configured one (THE-609).
+    if !config.gate_target_dir.is_empty() {
+        tracing::info!(
+            target: "thegn::merge_gate",
+            configured = %config.gate_target_dir,
+            "isolated gate ignores gate_target_dir; it builds in a private target"
+        );
+    }
+    let (target, target_private) = gate_target_for(&config.gate_target_dir, None, &path)?;
     Ok((parent, None, Some(path), Some(target), target_private))
 }
 
@@ -841,12 +843,9 @@ impl Workspace {
             });
             match reused {
                 Some((parent, lock, base)) => {
-                    let target = if config.gate_target_dir.is_empty() {
-                        base.join("target")
-                    } else {
-                        PathBuf::from(&config.gate_target_dir)
-                    };
-                    (parent, Some(lock), None, Some(target), false)
+                    let (target, target_private) =
+                        gate_target_for(&config.gate_target_dir, Some(&base), Path::new(""))?;
+                    (parent, Some(lock), None, Some(target), target_private)
                 }
                 None => {
                     if let Err(error) = identity {
@@ -1163,11 +1162,14 @@ impl NativeWorkspace {
             worktree.display(),
             output_tail(&output)
         );
-        let target = if config.gate_target_dir.is_empty() {
-            parent.join("target")
-        } else {
-            PathBuf::from(&config.gate_target_dir)
-        };
+        if !config.gate_target_dir.is_empty() {
+            tracing::info!(
+                target: "thegn::merge_gate",
+                configured = %config.gate_target_dir,
+                "isolated gate ignores gate_target_dir; it builds in a private target"
+            );
+        }
+        let (target, _) = gate_target_for(&config.gate_target_dir, None, &parent)?;
         let this = Self {
             repo,
             parent,
@@ -1527,4 +1529,21 @@ fn output_tail(output: &std::process::Output) -> String {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     tail(&text, 4000)
+}
+
+fn gate_target_for(
+    configured: &str,
+    reused_base: Option<&Path>,
+    private_parent: &Path,
+) -> Result<(PathBuf, bool)> {
+    match reused_base {
+        Some(base) if configured.is_empty() => Ok((base.join("target"), false)),
+        Some(base) => {
+            let repository = base
+                .file_name()
+                .context("reused gate base has no repository name")?;
+            Ok((PathBuf::from(configured).join(repository), false))
+        }
+        None => Ok((private_parent.join("target"), true)),
+    }
 }

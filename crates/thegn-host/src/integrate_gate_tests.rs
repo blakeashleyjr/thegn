@@ -1711,3 +1711,49 @@ fn forged_symlink_parent_gitfile_refuses_before_any_checkout_mutation() {
         forged
     );
 }
+
+#[test]
+fn shared_gate_target_reused_keys_explicit_dir_by_repository() {
+    let first = gate_target_for(
+        "/cache/gate",
+        Some(Path::new("/s/thegn/gate/repo-abc")),
+        Path::new("/tmp/p"),
+    )
+    .unwrap();
+    let second = gate_target_for(
+        "/cache/gate",
+        Some(Path::new("/s/thegn/gate/repo-def")),
+        Path::new("/tmp/p"),
+    )
+    .unwrap();
+    assert_eq!(first, (PathBuf::from("/cache/gate/repo-abc"), false));
+    assert_eq!(second, (PathBuf::from("/cache/gate/repo-def"), false));
+    assert_ne!(first.0, second.0);
+}
+
+#[test]
+fn shared_gate_target_isolated_never_uses_explicit_dir() {
+    assert_eq!(
+        gate_target_for("/cache/gate", None, Path::new("/tmp/p")).unwrap(),
+        (PathBuf::from("/tmp/p/target"), true)
+    );
+}
+
+#[test]
+fn shared_gate_target_defaults_unchanged() {
+    let base = Path::new("/s/thegn/gate/repo-abc");
+    let parent = Path::new("/tmp/p");
+    assert_eq!(
+        gate_target_for("", Some(base), parent).unwrap(),
+        (base.join("target"), false)
+    );
+    assert_eq!(
+        gate_target_for("", None, parent).unwrap(),
+        (parent.join("target"), true)
+    );
+}
+
+#[test]
+fn shared_gate_target_reused_requires_repository_base_name() {
+    assert!(gate_target_for("/cache/gate", Some(Path::new("/")), Path::new("/tmp/p")).is_err());
+}
