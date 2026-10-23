@@ -206,6 +206,16 @@ fn shared_cache_branch<'a>(requested: Option<&'a str>, current: Option<&str>) ->
     requested.filter(|branch| current == Some(*branch))
 }
 
+const NO_CI_PROVIDER_MESSAGE: &str =
+    "no CI provider for this worktree (set [ci] provider, or check the remote)";
+
+fn no_provider_json() -> serde_json::Value {
+    serde_json::json!({
+        "error": NO_CI_PROVIDER_MESSAGE,
+        "reason": "no-provider"
+    })
+}
+
 fn runs(
     cfg: &Config,
     worktree: Option<String>,
@@ -223,17 +233,17 @@ fn runs(
         bail!("--limit must be between 1 and {MAX_CI_RUNS}");
     }
     // `runs` is a READ verb: unlike the mutation verbs, listing when no CI
-    // provider resolves is graceful degradation, not an error — emit an empty
-    // JSON array (valid for scripts) / a friendly note and exit 0.
+    // provider resolves is graceful degradation, not an error — emit a typed
+    // JSON object / a friendly note and exit 0.
     let wt = resolve_worktree(worktree);
     // Host-path cache key — matches the panel's reader (never `loc.path()`).
     let cache_key = GitLoc::worktree_cache_key(&wt);
     let loc = GitLoc::for_worktree(&wt);
     let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg.ci) else {
         if json_out {
-            return super::emit_json(&Vec::<CiRun>::new());
+            return super::emit_json(&no_provider_json());
         }
-        outln!("no CI provider for this worktree (set [ci] provider, or check the remote)");
+        outln!("{NO_CI_PROVIDER_MESSAGE}");
         return Ok(());
     };
     let limit = limit.unwrap_or(cfg.ci.max_runs.min(MAX_CI_RUNS));
@@ -734,6 +744,25 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn runs_json_without_provider_is_a_typed_error_object() {
+        let output = no_provider_json();
+        assert!(output.is_object());
+        assert_eq!(output["reason"], "no-provider");
+        assert!(
+            output["error"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+        );
+    }
+
+    #[test]
+    fn runs_json_valid_empty_list_stays_an_array() {
+        let empty_list = serde_json::to_value(Vec::<CiRun>::new()).unwrap();
+        assert_eq!(empty_list, serde_json::json!([]));
+        assert_ne!(empty_list, no_provider_json());
+    }
 
     #[test]
     fn runs_warms_the_shared_cache_only_for_the_current_branch() {
