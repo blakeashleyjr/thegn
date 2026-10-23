@@ -387,7 +387,9 @@ impl FlyProvider {
         {
             return Ok(ip);
         }
-        if let Some(rec) = registry::read(name)
+        let record = registry::read_checked(name)
+            .with_context(|| format!("fly: the ledger record for {name} is unreadable"))?;
+        if let Some(rec) = record
             .filter(|r| r.provider == LEDGER_PROVIDER && r.state == "ready" && !r.ip.is_empty())
         {
             self.ips
