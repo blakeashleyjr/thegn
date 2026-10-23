@@ -492,11 +492,9 @@ impl Machine0Provider {
     }
 
     async fn pending_names() -> Result<Result<Vec<String>>> {
-        Ok(
-            tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
-                .await
-                .context("machine0: pending create listing worker failed")?,
-        )
+        tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
+            .await
+            .context("machine0: pending create listing worker failed")
     }
 
     fn warn_pending_names_unknown(name: &str) {
