@@ -13996,6 +13996,8 @@ async fn event_loop<T: Terminal>(
                     // generation untouched.
                     schedule.reconfigure(&current_config);
                     crate::automation_runtime::install(&current_config);
+                    // Live `[model_proxy]` reload: supervisor stops, starts or restarts to match.
+                    crate::model_proxy_daemon::spawn_supervisor(&current_config);
                     preview_supervisor.set_enabled(current_config.preview.enabled);
                     request_preview_scan(
                         &mut preview_supervisor,
