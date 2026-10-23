@@ -157,14 +157,30 @@ pub fn create_symlink(_target: &Path, _link: &Path, _is_dir: bool) -> std::io::R
 /// FIFO or device. Unix opens are nonblocking as well as no-follow, preventing
 /// a raced FIFO from hanging before that descriptor check.
 pub fn open_regular_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(path, true)
+}
+
+/// Open a regular file while following a final-component symlink.
+fn open_regular_file_following(path: &Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(path, false)
+}
+
+/// The returned descriptor is checked after opening, so callers can safely read from it without
+/// a race changing a regular file into a FIFO or device. Unix opens are nonblocking as well.
+fn open_regular_file(path: &Path, nofollow: bool) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use nix::fcntl::{OFlag, open};
         use nix::sys::stat::{Mode, SFlag, fstat};
 
+        let nofollow_flag = if nofollow {
+            OFlag::O_NOFOLLOW
+        } else {
+            OFlag::empty()
+        };
         let fd = open(
             path,
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY | nofollow_flag | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
         .map_err(|error| {
@@ -206,9 +222,12 @@ pub fn open_regular_file_nofollow(path: &Path) -> std::io::Result<std::fs::File>
         use std::os::windows::fs::OpenOptionsExt;
         let mut options = OpenOptions::new();
         options.read(true);
-        // Open the reparse point itself; metadata below refuses it instead of
-        // allowing a final-component symlink to redirect the read.
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        if nofollow {
+            // Open the reparse point itself so metadata refuses it instead of following it.
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
         let file = options.open(path)?;
         if !file.metadata()?.file_type().is_file() {
             return Err(std::io::Error::new(
@@ -220,11 +239,138 @@ pub fn open_regular_file_nofollow(path: &Path) -> std::io::Result<std::fs::File>
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = path;
+        let _ = (path, nofollow);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "no-follow regular-file opening is unavailable on this platform",
         ))
+    }
+}
+
+/// Why a user-named secret file was not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretFileError {
+    /// The path (final component) does not exist.
+    NotFound,
+    /// The file exists but must not be used; the text names the path and remedy, never its contents.
+    Refused(String),
+}
+
+/// Read a `file:` SecretRef after checking its resolved target's owner, mode, link, size and UTF-8.
+///
+/// Final-component symlinks are followed. Group access is allowed with a one-time warning; world
+/// access, non-regular targets, extra links and targets owned by neither the current user nor root
+/// are refused. The managed store uses the separate stricter no-follow checks above.
+/// The returned string is trimmed; callers treat an empty value as missing.
+pub fn read_owner_only_secret_file(path: &Path, max_bytes: u64) -> Result<String, SecretFileError> {
+    let file = open_regular_file_following(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    SecretFileError::Refused(format!(
+                        "secret file {} is a dangling symlink; refusing to read it",
+                        path.display()
+                    ))
+                }
+                _ => SecretFileError::NotFound,
+            }
+        } else {
+            SecretFileError::Refused(format!("secret file {}: {error}", path.display()))
+        }
+    })?;
+    let metadata = secret_metadata(path, file.metadata())?;
+    check_secret_owner(path, owned_by_current_user_or_root(&metadata))?;
+    if ensure_single_link_regular_file(&metadata).is_err() {
+        return Err(SecretFileError::Refused(format!(
+            "secret file {} has other hard links; refusing to read it (remove the extra link, then store the secret again)",
+            path.display()
+        )));
+    }
+    if let Some(mode) = mode_bits_from_metadata(&metadata) {
+        if mode & 0o007 != 0 {
+            return Err(SecretFileError::Refused(format!(
+                "secret file {} is world-accessible (mode {mode:o}); refusing to read it (remove world permission bits)",
+                path.display()
+            )));
+        }
+        if mode & 0o070 != 0 {
+            warn_group_access_once(path);
+        }
+    }
+
+    let bytes = read_secret_bytes(file, max_bytes).map_err(|error| {
+        SecretFileError::Refused(format!("secret file {}: {error}", path.display()))
+    })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(SecretFileError::Refused(format!(
+            "secret file {} exceeds size limit ({max_bytes} bytes); refusing to read it",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map(|value| value.trim().to_string())
+        .map_err(|_| {
+            SecretFileError::Refused(format!("secret file {} is not valid UTF-8", path.display()))
+        })
+}
+
+fn owned_by_current_user_or_root(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        owner_uid_allowed(metadata.uid(), nix::unistd::geteuid().as_raw())
+    }
+    #[cfg(not(unix))]
+    {
+        owned_by_current_user(metadata)
+    }
+}
+
+fn owner_uid_allowed(owner: u32, effective: u32) -> bool {
+    owner == effective || owner == 0
+}
+
+fn check_secret_owner(path: &Path, allowed: bool) -> Result<(), SecretFileError> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(SecretFileError::Refused(format!(
+            "secret file {} is owned by another user; refusing to read it",
+            path.display()
+        )))
+    }
+}
+
+fn secret_metadata(
+    path: &Path,
+    result: std::io::Result<std::fs::Metadata>,
+) -> Result<std::fs::Metadata, SecretFileError> {
+    result.map_err(|error| {
+        SecretFileError::Refused(format!("secret file {}: {error}", path.display()))
+    })
+}
+
+fn read_secret_bytes(reader: impl std::io::Read, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn warn_group_access_once(path: &Path) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut paths = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if paths.insert(path.to_path_buf()) {
+        tracing::warn!(path = %path.display(), "file secret is group-accessible");
     }
 }
 
@@ -2442,5 +2588,167 @@ mod tests {
             Err(error) => panic!("could not set fixture mode: {error}"),
         }
         assert_eq!(mode_bits(&path).unwrap(), Some(0o640));
+    }
+
+    #[test]
+    fn secret_file_read_accepts_group_readable_symlink_targets_and_refuses_world_or_hard_links() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        restrict_dir_to_owner(temp.path()).unwrap();
+        let path = temp.path().join("secret");
+        std::fs::write(&path, b"tok").unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert_eq!(read_owner_only_secret_file(&path, 16), Ok("tok".into()));
+
+        match set_mode_for_test(&path, 0o440) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            read_owner_only_secret_file(&path, 16)
+        });
+        assert_eq!(result, Ok("tok".into()));
+        let log = String::from_utf8(capture.lock().unwrap().clone()).unwrap();
+        assert!(log.contains(&path.display().to_string()), "{log}");
+        assert!(!log.contains("tok"), "{log}");
+        restrict_to_owner(&path).unwrap();
+
+        match set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
+        assert!(matches!(
+            read_owner_only_secret_file(&path, 16),
+            Err(SecretFileError::Refused(reason)) if reason.contains("world-accessible")
+        ));
+        let world_link = temp.path().join("world-secret-link");
+        match create_symlink(&path, &world_link, false) {
+            Ok(()) => {
+                assert!(matches!(
+                    read_owner_only_secret_file(&world_link, 16),
+                    Err(SecretFileError::Refused(reason)) if reason.contains("world-accessible")
+                ));
+                std::fs::remove_file(world_link).unwrap();
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => panic!("could not create world-readable fixture symlink: {error}"),
+        }
+        restrict_to_owner(&path).unwrap();
+
+        let linked = temp.path().join("secret-link-name");
+        std::fs::hard_link(&path, &linked).unwrap();
+        assert!(matches!(
+            read_owner_only_secret_file(&path, 16),
+            Err(SecretFileError::Refused(reason)) if reason.contains("hard links")
+        ));
+        std::fs::remove_file(linked).unwrap();
+
+        let symlink = temp.path().join("secret-symlink");
+        match create_symlink(&path, &symlink, false) {
+            Ok(()) => {
+                assert_eq!(read_owner_only_secret_file(&symlink, 16), Ok("tok".into()));
+                let dangling = temp.path().join("dangling-link");
+                create_symlink(&temp.path().join("missing-target"), &dangling, false).unwrap();
+                assert!(matches!(
+                    read_owner_only_secret_file(&dangling, 16),
+                    Err(SecretFileError::Refused(reason)) if reason.contains("dangling symlink")
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => panic!("could not create fixture symlink: {error}"),
+        }
+        assert_eq!(
+            read_owner_only_secret_file(&temp.path().join("missing"), 16),
+            Err(SecretFileError::NotFound)
+        );
+        assert!(matches!(
+            read_owner_only_secret_file(temp.path(), 16),
+            Err(SecretFileError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn secret_file_read_bounds_size_and_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        restrict_dir_to_owner(temp.path()).unwrap();
+        let path = temp.path().join("secret");
+
+        std::fs::write(&path, b"12345").unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert!(matches!(
+            read_owner_only_secret_file(&path, 4),
+            Err(SecretFileError::Refused(reason)) if reason.contains("size limit")
+        ));
+
+        std::fs::write(&path, [0xff_u8]).unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert!(matches!(
+            read_owner_only_secret_file(&path, 4),
+            Err(SecretFileError::Refused(reason)) if reason.contains("not valid UTF-8")
+        ));
+
+        std::fs::write(&path, b"1234").unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert_eq!(read_owner_only_secret_file(&path, 4), Ok("1234".into()));
+    }
+
+    #[test]
+    fn secret_file_read_error_and_foreign_owner_branches_are_covered() {
+        let path = Path::new("fixture-token");
+        assert!(matches!(
+            secret_metadata(
+                path,
+                Err(std::io::Error::other("metadata fixture failure"))
+            ),
+            Err(SecretFileError::Refused(reason)) if reason.contains("metadata fixture failure")
+        ));
+
+        struct ReadFailure;
+        impl std::io::Read for ReadFailure {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("read fixture failure"))
+            }
+        }
+        assert!(matches!(
+            read_secret_bytes(ReadFailure, 16),
+            Err(error) if error.to_string().contains("read fixture failure")
+        ));
+
+        assert!(matches!(
+            check_secret_owner(path, owner_uid_allowed(1234, 5678)),
+            Err(SecretFileError::Refused(reason)) if reason.contains("owned by another user")
+        ));
+        assert!(owner_uid_allowed(5678, 5678));
+        assert!(owner_uid_allowed(0, 5678));
     }
 }

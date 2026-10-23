@@ -1061,6 +1061,7 @@ fn env_halt_reason_resolves_a_file_secret_ref() {
     with_temp_state("halt-file-secret", || {
         let tok = std::env::temp_dir().join(format!("tg-m0-token-{}", std::process::id()));
         std::fs::write(&tok, "secret-token-value\n").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&tok).unwrap();
         let cfg: Config = toml::from_str(&format!(
             "[env.m0f]\nplacement = \"provider\"\n[env.m0f.provider]\nprovider = \"machine0\"\napi_key_env = \"file:{}\"\n",
             tok.display()
