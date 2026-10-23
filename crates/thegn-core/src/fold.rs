@@ -117,8 +117,9 @@ pub enum ConflictKind {
     /// Conflicts confined to regenerable artifacts (lockfiles/manifests); the
     /// host can resolve these by regenerating rather than handing them back.
     Regenerable,
-    /// The branch's history contains merge commits, which the `rebase` land
-    /// strategy cannot replay; held, not a content conflict.
+    /// The branch has unrelated history or root/merge commits in the replay
+    /// range, which the `rebase` land strategy cannot replay; held, not a
+    /// content conflict.
     UnsupportedMergeHistory,
 }
 
