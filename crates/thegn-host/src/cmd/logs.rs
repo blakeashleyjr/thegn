@@ -85,17 +85,7 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> anyhow::Result<(
 
             let start = filtered.len().saturating_sub(lines);
             for l in &filtered[start..] {
-                if json {
-                    let obj = serde_json::json!({
-                        "timestamp": l.timestamp,
-                        "level": l.level.label(),
-                        "target": l.target,
-                        "message": l.message,
-                    });
-                    println!("{obj}");
-                } else {
-                    println!("{}", l.raw);
-                }
+                println!("{}", tail_output(l, json));
             }
         }
         Action::Count { level, filter } => {
@@ -125,6 +115,20 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> anyhow::Result<(
     Ok(())
 }
 
+fn tail_output(line: &thegn_core::log_view::LogLine, json: bool) -> String {
+    if json {
+        let obj = serde_json::json!({
+            "timestamp": line.timestamp,
+            "level": line.level.label(),
+            "target": line.target,
+            "message": line.message,
+        });
+        thegn_core::pipeline_report::json_terminal_safe(&obj.to_string()).into_owned()
+    } else {
+        thegn_core::pipeline_report::display_cell(&line.raw)
+    }
+}
+
 fn parse_level(s: Option<&str>) -> anyhow::Result<Option<LogLevel>> {
     match s {
         None => Ok(None),
@@ -134,5 +138,61 @@ fn parse_level(s: Option<&str>) -> anyhow::Result<Option<LogLevel>> {
                 s
             )
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_output;
+    use thegn_core::log_view::{LogLevel, LogLine};
+
+    #[test]
+    fn tail_output_neutralizes_controls_in_human_and_json() {
+        let message = "hi \x1b]0;forged\x07 \u{9b}31m \u{202e}x\u{2028}y é 界";
+        let line = LogLine {
+            timestamp: "2026-10-22T00:00:00Z".into(),
+            level: LogLevel::Info,
+            target: "thegn::x".into(),
+            message: message.into(),
+            raw: format!("2026-10-22T00:00:00Z  INFO  thegn::x  {message}"),
+        };
+
+        let human = tail_output(&line, false);
+        assert!(
+            !human
+                .chars()
+                .any(|c| { c.is_control() || thegn_core::pipeline_report::is_format_control(c) })
+        );
+        assert!(human.contains('\u{fffd}'));
+        assert!(human.contains("é 界"));
+
+        let json = tail_output(&line, true);
+        assert!(
+            !json
+                .chars()
+                .any(|c| { c.is_control() || thegn_core::pipeline_report::is_format_control(c) })
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["message"], line.message);
+    }
+
+    #[test]
+    fn tail_output_keeps_clean_lines_byte_identical() {
+        // Positive control: clean output matched the base implementation byte for byte.
+        let line = LogLine {
+            timestamp: "2026-10-22T00:00:00Z".into(),
+            level: LogLevel::Info,
+            target: "thegn::x".into(),
+            message: "hello é 界 😀".into(),
+            raw: "2026-10-22T00:00:00Z  INFO  thegn::x  hello é 界 😀".into(),
+        };
+        let obj = serde_json::json!({
+            "timestamp": line.timestamp,
+            "level": line.level.label(),
+            "target": line.target,
+            "message": line.message,
+        });
+        assert_eq!(tail_output(&line, false), line.raw);
+        assert_eq!(tail_output(&line, true), obj.to_string());
     }
 }

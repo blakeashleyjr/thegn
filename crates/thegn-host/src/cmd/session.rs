@@ -12,7 +12,7 @@ use thegn_core::config::Config;
 use thegn_core::db::{Db, LeadProof, ResumeDispatchConflict};
 use thegn_core::issue::{AgentDispatchStatus, DispatchRunPublishOutcome, NewDispatch};
 use thegn_core::outln;
-use thegn_core::pipeline_report::display_cell;
+use thegn_core::pipeline_report::{display_cell, json_terminal_safe};
 use thegn_core::pipeline_resume;
 use thegn_core::pipeline_run;
 use thegn_core::store::NotificationStore;
@@ -301,7 +301,7 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
                 .exit_code
                 .map_or_else(|| "?".to_string(), |c| c.to_string());
             match s.final_state.as_deref() {
-                Some(w) if !w.is_empty() => format!("exited({code},{w})"),
+                Some(w) if !w.is_empty() => format!("exited({code},{})", display_cell(w)),
                 _ => format!("exited({code})"),
             }
         }
@@ -313,23 +313,36 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
     let lineage = s
         .forked_from
         .as_deref()
-        .map(|source| format!("  ← forked from {source}"))
+        .map(|source| format!("  ← forked from {}", display_cell(source)))
         .unwrap_or_default();
     format!(
         "{}  {}  {}x{}  {} client(s)  {}{}{}{}",
-        s.id,
+        display_cell(&s.id),
         state,
         s.cols,
         s.rows,
         s.attached_clients,
-        s.program,
+        display_cell(&s.program),
         s.worktree
             .as_deref()
-            .map(|w| format!("  [{w}]"))
+            .map(|w| format!("  [{}]", display_cell(w)))
             .unwrap_or_default(),
         lease,
         lineage
     )
+}
+
+/// Serde's pretty output uses raw newlines only for structural line breaks;
+/// string contents are escaped. Escaping each line keeps the layout and parsed
+/// value intact while keeping terminal control and format characters out of
+/// the terminal (THE-507).
+fn terminal_safe_pretty_json<T: serde::Serialize>(value: &T) -> serde_json::Result<String> {
+    let pretty = serde_json::to_string_pretty(value)?;
+    Ok(pretty
+        .lines()
+        .map(json_terminal_safe)
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Parse a `--until`/`condition` string into a `WaitCondition` JSON value.
@@ -446,7 +459,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 sessions.retain(|s| s.exited_at_ms.is_none());
             }
             if json {
-                outln!("{}", serde_json::to_string_pretty(&sessions)?);
+                outln!("{}", terminal_safe_pretty_json(&sessions)?);
             } else if sessions.is_empty() {
                 outln!("no live sessions");
             } else {
@@ -576,9 +589,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 };
                 let info = client.open(&spec).await?;
                 if json {
-                    outln!("{}", serde_json::to_string_pretty(&info)?);
+                    outln!("{}", terminal_safe_pretty_json(&info)?);
                 } else {
-                    outln!("{}", info.id);
+                    outln!("{}", display_cell(&info.id));
                 }
             }
         }
@@ -610,12 +623,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         SessionAction::Close { session, json } => {
             client.kill(&session).await?;
             if json {
-                outln!(
-                    "{}",
-                    serde_json::json!({ "session": session, "closed": true })
-                );
+                super::emit_json(&serde_json::json!({ "session": session, "closed": true }))?;
             } else {
-                outln!("closed {session}");
+                outln!("closed {}", display_cell(&session));
             }
         }
         SessionAction::Send {
@@ -625,8 +635,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         } => {
             client.send_input(&session, text.as_bytes(), enter).await?;
             outln!(
-                "sent {} byte(s) to {session}",
-                text.len() + usize::from(enter)
+                "sent {} byte(s) to {}",
+                text.len() + usize::from(enter),
+                display_cell(&session)
             );
         }
         SessionAction::Snapshot {
@@ -646,7 +657,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 if let Some(t) = plain {
                     doc["text"] = serde_json::Value::String(t);
                 }
-                outln!("{doc}");
+                super::emit_json(&doc)?;
             } else if let Some(t) = plain {
                 outln!("{t}");
             } else {
@@ -698,7 +709,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if json {
-                outln!("{}", serde_json::to_string_pretty(&outcome)?);
+                outln!("{}", terminal_safe_pretty_json(&outcome)?);
             } else if matched {
                 let what = outcome
                     .get("condition")
@@ -709,9 +720,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     .and_then(|c| c.as_i64())
                     .map(|c| format!(" (exit {c})"))
                     .unwrap_or_default();
-                outln!("{what} on {session}{code}");
+                outln!("{} on {}{code}", display_cell(what), display_cell(&session));
             } else {
-                outln!("timeout waiting on {session}");
+                outln!("timeout waiting on {}", display_cell(&session));
             }
             if !matched {
                 std::process::exit(crate::cmd::EXIT_RETRYABLE);
@@ -719,7 +730,12 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
         SessionAction::Split { session, dir, argv } => {
             let info = client.split(&session, &dir, &argv).await?;
-            outln!("opened {} ({}x{})", info.id, info.cols, info.rows);
+            outln!(
+                "opened {} ({}x{})",
+                display_cell(&info.id),
+                info.cols,
+                info.rows
+            );
         }
         SessionAction::Record {
             session,
@@ -736,13 +752,13 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             };
             let st = client.record(&session, op).await?;
             if json {
-                outln!("{}", serde_json::to_string_pretty(&st)?);
+                outln!("{}", terminal_safe_pretty_json(&st)?);
             } else {
-                let where_ = st.path.as_deref().unwrap_or("(no file)");
+                let where_ = display_cell(st.path.as_deref().unwrap_or("(no file)"));
                 if let Some(reason) = &st.truncated {
                     // Never report a truncated recording as saved: the file is
                     // short of the session's last output.
-                    outln!("recording TRUNCATED → {where_} ({reason})");
+                    outln!("recording TRUNCATED → {where_} ({})", display_cell(reason));
                 } else if st.stopping {
                     if st.dropped_bytes > 0 {
                         outln!(
@@ -755,12 +771,17 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 } else if st.recording {
                     if st.dropped_bytes > 0 {
                         outln!(
-                            "recording {session} → {where_} ({} bytes; {} bytes dropped in gaps; see cast markers)",
+                            "recording {} → {where_} ({} bytes; {} bytes dropped in gaps; see cast markers)",
+                            display_cell(&session),
                             st.bytes,
                             st.dropped_bytes
                         );
                     } else {
-                        outln!("recording {session} → {where_} ({} bytes)", st.bytes);
+                        outln!(
+                            "recording {} → {where_} ({} bytes)",
+                            display_cell(&session),
+                            st.bytes
+                        );
                     }
                 } else if st.capped {
                     if st.dropped_bytes > 0 {
@@ -779,7 +800,9 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 } else {
                     outln!(
                         "not recording{}",
-                        st.path.map(|p| format!(" (last: {p})")).unwrap_or_default()
+                        st.path
+                            .map(|p| format!(" (last: {})", display_cell(&p)))
+                            .unwrap_or_default()
                     );
                 }
             }
@@ -787,7 +810,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         SessionAction::Leases { json } => {
             let v = client.leases().await?;
             if json {
-                outln!("{}", serde_json::to_string_pretty(&v)?);
+                outln!("{}", terminal_safe_pretty_json(&v)?);
             } else {
                 let leases = v
                     .get("leases")
@@ -800,8 +823,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 for l in leases {
                     outln!(
                         "{}  {}  expires_at={}",
-                        l.get("session").and_then(|s| s.as_str()).unwrap_or("?"),
-                        l.get("kind").and_then(|s| s.as_str()).unwrap_or("?"),
+                        display_cell(l.get("session").and_then(|s| s.as_str()).unwrap_or("?")),
+                        display_cell(l.get("kind").and_then(|s| s.as_str()).unwrap_or("?")),
                         l.get("expires_at")
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| "-".into()),
@@ -1193,25 +1216,26 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             publish_opened_dispatch(&db, client, row_id, &info.id, &artifact).await?;
             // 13. Print.
             if d.json {
-                outln!(
-                    "{}",
-                    serde_json::json!({
-                        "row": row_id,
-                        "session": info.id,
-                        "stage": stage.name,
-                        "artifact": artifact,
-                        "issue": issue,
-                        "worktree": wt,
-                        "branch": branch,
-                    })
-                );
+                super::emit_json(&serde_json::json!({
+                    "row": row_id,
+                    "session": info.id,
+                    "stage": stage.name,
+                    "artifact": artifact,
+                    "issue": issue,
+                    "worktree": wt,
+                    "branch": branch,
+                }))?;
             } else {
                 outln!(
                     "dispatch {row_id} → session {} (stage {})",
-                    info.id,
-                    stage.name
+                    display_cell(&info.id),
+                    display_cell(&stage.name)
                 );
-                outln!("artifact {artifact} (branch {branch})");
+                outln!(
+                    "artifact {} (branch {})",
+                    display_cell(&artifact),
+                    display_cell(&branch)
+                );
             }
             Ok(())
         }
@@ -1670,23 +1694,20 @@ async fn resume_work(
         Ok(info) => {
             publish_opened_dispatch(&db, client, new_row, &info.id, &artifact).await?;
             if json {
-                outln!(
-                    "{}",
-                    serde_json::json!({
-                        "row": new_row,
-                        "session": info.id,
-                        "stage": stage.name,
-                        "artifact": artifact,
-                        "issue": row.issue_id,
-                        "worktree": wt,
-                        "resumed_from": row_id,
-                    })
-                );
+                super::emit_json(&serde_json::json!({
+                    "row": new_row,
+                    "session": info.id,
+                    "stage": stage.name,
+                    "artifact": artifact,
+                    "issue": row.issue_id,
+                    "worktree": wt,
+                    "resumed_from": row_id,
+                }))?;
             } else {
                 outln!(
                     "dispatch {new_row} → session {} (stage {}, resume of {row_id})",
-                    info.id,
-                    stage.name
+                    display_cell(&info.id),
+                    display_cell(&stage.name)
                 );
             }
             Ok(())
@@ -1802,6 +1823,28 @@ mod session_line_tests {
             token(&session_line(&info(Some(1), Some(0), Some("done")))),
             "exited(0,done)"
         );
+    }
+
+    #[test]
+    fn hostile_daemon_fields_render_as_one_safe_line() {
+        let info = SessionInfo {
+            id: "sess\x1b[2J".into(),
+            program: "sh\u{9b}31m\u{202e}".into(),
+            worktree: Some("/w\x1b]52;c;ZXZpbA==\x07".into()),
+            exited_at_ms: Some(1),
+            exit_code: Some(0),
+            final_state: Some("done\u{2028}".into()),
+            forked_from: Some("src\u{200b}".into()),
+            ..Default::default()
+        };
+        let line = session_line(&info);
+        assert!(
+            !line
+                .chars()
+                .any(|c| { c.is_control() || thegn_core::pipeline_report::is_format_control(c) })
+        );
+        assert!(line.contains('\u{fffd}'));
+        assert_eq!(token(&line), "exited(0,done\u{fffd})");
     }
 }
 
@@ -2581,6 +2624,46 @@ mod fail_reserved_row_tests {
             notes
                 .iter()
                 .any(|note| { note.text == "finisher prompt render failed" })
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_safe_output_tests {
+    use super::terminal_safe_pretty_json;
+
+    #[test]
+    fn pretty_json_escapes_terminal_unsafe_characters_and_round_trips() {
+        let value = serde_json::json!({
+            "program": "sh\u{9b}31m",
+            "worktree": "/w\u{202e}t",
+            "nested": { "note": "a\u{7f}b\u{2028}c\u{e0041}d" },
+            "ok": "é 界 😀",
+        });
+        let rendered = terminal_safe_pretty_json(&value).unwrap();
+        assert!(!rendered.chars().any(|c| {
+            (c.is_control() && c != '\n') || thegn_core::pipeline_report::is_format_control(c)
+        }));
+        assert!(rendered.contains('\n'));
+        assert!(rendered.contains("\\u009b"));
+        assert!(rendered.contains("\\u202e"));
+        assert!(rendered.contains("\\u007f"));
+        assert!(rendered.contains("\\u2028"));
+        assert!(rendered.contains("\\udb40\\udc41"));
+        assert!(rendered.contains("é 界 😀"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn pretty_json_of_a_clean_document_is_byte_identical() {
+        // Positive control: the pretty field layout remains byte-identical for clean JSON.
+        let value = serde_json::json!({ "id": "abc123", "program": "sh é 界 😀" });
+        assert_eq!(
+            terminal_safe_pretty_json(&value).unwrap(),
+            serde_json::to_string_pretty(&value).unwrap()
         );
     }
 }
