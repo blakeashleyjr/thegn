@@ -241,6 +241,11 @@ run, or the PR's head commit. So it survives restarts, refreshes, and being
 temporarily outranked by something more urgent; but a new run, or a new push,
 is a new episode and does raise the signal again.
 
+While a worktree's CI refresh is failing, a cached running or pending run no
+longer counts as "CI running" toward working attention because no live result
+backs it. A cached failed run still counts. This working-tier signal does not
+count toward the `✋` needs-you chip.
+
 ## AI account usage
 
 The `◔` gauge shows the most-consumed rate-limit window across your AI coding

@@ -9,6 +9,47 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.39] — 2026-10-23 (maintenance batch 76)
 
+### Changed
+
+- Launch-gate warnings also appear on the status line and in the notification
+  inbox while the UI is running.
+- `thegn doctor` reports where it found `tgproxy`, or that it is not installed.
+  The release tarball and Nix flake ship only `thegn`; build the proxy from
+  source.
+- Adding a managed account picks the lowest free name and never reuses an
+  existing account home.
+- Native MPRIS push notifications trigger snapshot reads at least 250 ms apart.
+
+### Fixed
+
+- PR-queue and CI-autofix agents that never start no longer spend an attempt;
+  the row is held as `needs_human` with the reason.
+- `thegn pr` actions other than `thegn pr queue` refuse an explicit
+  `--worktree` outside a registered remote worktree or local git worktree
+  before contacting the forge. A nested local path targets its worktree root.
+- `thegn merge land`, its queue-section action and the drain ask you to
+  re-enqueue a branch that moved after verification with `thegn merge add`.
+- A cached running or pending CI run no longer counts toward working attention
+  while that worktree's CI refresh is failing. A cached failure still counts.
+- The daemon removes dead, relocated `/tmp` socket directories at startup.
+- On the dev channel, unreadable or malformed VPS and Fly ledger records are
+  refused instead of being treated as absent by destroy, retarget, address
+  lookup and the `vps-ssh` bridge.
+- A workspace clone is not promoted if its parent directory is replaced while
+  it is cloning; the staging directory is left for the startup sweep.
+
+### Security
+
+- An unreadable worktree environment selection no longer falls back to the
+  default. `thegn env` reports an error, worktree deletion refuses before
+  removing anything, and tab close uses path-only cleanup with a warning and
+  skips its auto-checkpoint. On the dev channel, provider SSH connect,
+  warm-pool operations, hibernation, provisioning and host placement are
+  refused or skipped with the reason.
+- On the dev channel, Hetzner, DigitalOcean and machine0 SSH key names use the
+  first 32 hexadecimal characters of the SHA-256 digest of the decoded public
+  key; invalid OpenSSH public keys are refused.
+
 ## [0.1.0-alpha.38] — 2026-10-23 (maintenance batch 75)
 
 ### Fixed
