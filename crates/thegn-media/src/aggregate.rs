@@ -22,7 +22,7 @@ use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaSnapshot, Med
 /// A child that does not answer a snapshot cannot hold the aggregate hostage.
 /// Child futures are polled concurrently, while results are consumed in child
 /// order so source priority remains deterministic.
-const SNAPSHOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+const SNAPSHOT_BUDGET: std::time::Duration = crate::MEDIA_READ_BUDGET;
 
 /// A set of media sources presented as one backend.
 pub struct Aggregate {
