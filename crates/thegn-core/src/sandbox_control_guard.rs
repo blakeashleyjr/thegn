@@ -14,13 +14,22 @@ pub fn publish_control_socket_dir(dir: PathBuf) {
 }
 
 pub(crate) fn control_dirs() -> Vec<PathBuf> {
+    control_dirs_from(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        PUBLISHED.get().map(PathBuf::as_path),
+    )
+}
+
+pub(crate) fn control_dirs_from(
+    runtime_dir: Option<std::ffi::OsString>,
+    published: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())
-    {
+    if let Some(runtime_dir) = runtime_dir.filter(|value| !value.is_empty()) {
         dirs.push(PathBuf::from(runtime_dir).join("thegn"));
     }
-    if let Some(dir) = PUBLISHED.get() {
-        dirs.push(dir.clone());
+    if let Some(dir) = published {
+        dirs.push(dir.to_path_buf());
     }
     normalize(dirs)
 }
@@ -134,6 +143,26 @@ pub(crate) fn in_sandbox_paths(
     (normalize(translated), None)
 }
 
+pub(crate) fn mount_inside_control_dir(
+    control_dirs: &[PathBuf],
+    mounts: &[(&Path, &Path)],
+) -> Option<ControlExposure> {
+    control_dirs.iter().find_map(|control_dir| {
+        let canonical_control = canonicalize_with_missing_tail(control_dir);
+        mounts.iter().find_map(|(host, dest)| {
+            let canonical_host = std::fs::canonicalize(host);
+            let strictly_inside = match (canonical_control.as_ref(), canonical_host.as_ref()) {
+                (Some(control), Ok(host)) => host != control && host.starts_with(control),
+                _ => host.starts_with(control_dir.as_path()) && *host != control_dir.as_path(),
+            };
+            strictly_inside.then(|| ControlExposure {
+                control_dir: control_dir.clone(),
+                visible_through: (*dest).to_path_buf(),
+            })
+        })
+    })
+}
+
 fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
     let mut current = path;
     let mut missing = Vec::new();
@@ -184,7 +213,10 @@ fn normalize(mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlExposure, MaskPlan, exposure, in_sandbox_paths, normalize, plan};
+    use super::{
+        ControlExposure, MaskPlan, control_dirs_from, exposure, in_sandbox_paths,
+        mount_inside_control_dir, normalize, plan,
+    };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
@@ -407,6 +439,86 @@ mod tests {
                 "/run/user/42"
             ])),
             paths(&["/run/user/42"])
+        );
+    }
+
+    #[test]
+    fn control_dirs_from_joins_thegn_to_the_runtime_dir_and_adds_the_published_dir() {
+        assert_eq!(
+            control_dirs_from(Some("/run/user/42".into()), Some(Path::new("/srv/ctl"))),
+            paths(&["/run/user/42/thegn", "/srv/ctl"])
+        );
+    }
+
+    #[test]
+    fn control_dirs_from_ignores_an_empty_runtime_dir() {
+        assert!(control_dirs_from(Some("".into()), None).is_empty());
+        assert_eq!(
+            control_dirs_from(None, Some(Path::new("/srv/ctl"))),
+            paths(&["/srv/ctl"])
+        );
+    }
+
+    #[test]
+    fn control_dirs_from_drops_a_published_dir_inside_the_runtime_dir() {
+        assert_eq!(
+            control_dirs_from(
+                Some("/run/user/42".into()),
+                Some(Path::new("/run/user/42/thegn/key")),
+            ),
+            paths(&["/run/user/42/thegn"])
+        );
+    }
+
+    #[test]
+    fn control_dirs_from_mount_inside_control_dir_is_component_wise() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let control = root.path().join("run/thegn");
+        let child = control.join("key");
+        std::fs::create_dir_all(&child).unwrap();
+        let sibling = root.path().join("run/thegn2");
+        std::fs::create_dir(&sibling).unwrap();
+        let missing = control.join("missing");
+        let ancestor = root.path().join("run");
+
+        let inside = mount_inside_control_dir(
+            std::slice::from_ref(&control),
+            &[(child.as_path(), Path::new("/data"))],
+        );
+        assert_eq!(
+            inside,
+            Some(ControlExposure {
+                control_dir: control.clone(),
+                visible_through: PathBuf::from("/data"),
+            })
+        );
+        assert_eq!(
+            mount_inside_control_dir(
+                std::slice::from_ref(&control),
+                &[(ancestor.as_path(), Path::new("/ancestor"))],
+            ),
+            None
+        );
+        assert_eq!(
+            mount_inside_control_dir(
+                std::slice::from_ref(&control),
+                &[(control.as_path(), Path::new("/equal"))],
+            ),
+            None
+        );
+        assert_eq!(
+            mount_inside_control_dir(
+                std::slice::from_ref(&control),
+                &[(sibling.as_path(), Path::new("/sibling"))],
+            ),
+            None
+        );
+        assert!(
+            mount_inside_control_dir(
+                std::slice::from_ref(&control),
+                &[(missing.as_path(), Path::new("/missing"))],
+            )
+            .is_some()
         );
     }
 }
