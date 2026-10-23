@@ -166,8 +166,10 @@ impl Forge for CliPollBreaker {
         pr: PrRef,
         state: ReviewState,
         body: Option<&str>,
+        expected_head: Option<&str>,
     ) -> Result<(), ForgeError> {
-        self.inner.submit_review(loc, pr, state, body)
+        self.inner
+            .submit_review(loc, pr, state, body, expected_head)
     }
     fn reply_thread(&self, loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), ForgeError> {
         self.inner.reply_thread(loc, thread_id, body)
