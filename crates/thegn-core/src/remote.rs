@@ -292,10 +292,27 @@ impl GitLoc {
     /// DB is never created here.
     #[track_caller]
     pub fn for_worktree_op(path: &Path, op: &str) -> Result<GitLoc, String> {
-        if !crate::db::db_path().exists() {
+        match crate::db::db_path().try_exists() {
+            Ok(false) => return Ok(GitLoc::Local(path.to_path_buf())),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(format!(
+                    "{op} refused: cannot read where {} lives (stat state DB: {error}); nothing was run against the local checkout",
+                    path.display()
+                ));
+            }
+        }
+        let path_text = path.to_string_lossy();
+        let db =
+            crate::db::Db::open().map_err(|error| format!("open worktree location DB: {error}"));
+        let location = db.and_then(|db| {
+            db.location_for(path_text.as_ref())
+                .map_err(|error| format!("read worktree location: {error}"))
+        });
+        if path.to_str().is_none() && matches!(&location, Ok(None)) {
             return Ok(GitLoc::Local(path.to_path_buf()));
         }
-        Self::for_worktree_checked(path).map_err(|error| {
+        Self::from_checked_lookup(path_text.as_ref(), location).map_err(|error| {
             format!(
                 "{op} refused: cannot read where {} lives ({error}); nothing was run against the local checkout",
                 path.display()
@@ -1930,6 +1947,17 @@ mod tests {
             Ok(GitLoc::Local(path)) if path == Path::new("/wt/x")
         ));
         assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn for_worktree_op_refuses_when_state_database_path_cannot_be_statted() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home()).unwrap();
+        std::fs::write(state.state_home().join("thegn"), "not a directory").unwrap();
+        let result = GitLoc::for_worktree_op(Path::new("/wt/x"), "commit");
+        assert!(matches!(result, Err(message)
+            if message.contains("commit refused")
+                && message.contains("stat state DB")));
     }
 
     #[test]
