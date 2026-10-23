@@ -2197,7 +2197,7 @@ fn refusal_summary(paths: &[String], refusals: &BTreeMap<String, String>) -> Opt
 
 fn deferral_refusal(deferred: &fold::Deferred) -> Option<String> {
     (deferred.kind == ConflictKind::UnsupportedMergeHistory).then(|| {
-        "branch history contains merge commits; the rebase land strategy only replays linear history: land it with the merge or squash strategy, or linearize the branch"
+        "branch history is not a linear descendant of the target (merge commits or unrelated history); the rebase land strategy only replays linear history: land it with the merge or squash strategy, or linearize the branch"
             .to_string()
     })
 }
@@ -3777,6 +3777,277 @@ mod tests {
                 ..
             } => assert!(reason.contains("merge commits"), "{reason}"),
             outcome => panic!("expected typed merge-history refusal, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn rebase_unrelated_history_holds_without_moving_main() {
+        let repo = Repo::new("rebase-unrelated-history");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        git(&repo.dir, &["checkout", "-q", "--orphan", "feat"]);
+        repo.commit("orphan.txt", "orphan\n", "orphan root");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        let before = repo.out(&["rev-parse", "main"]);
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(!report.advanced, "unrelated history must hold: {report:?}");
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(
+            report.deferred[0].kind,
+            ConflictKind::UnsupportedMergeHistory
+        );
+        assert!(report.deferred[0].paths.is_empty());
+        assert!(
+            report.deferred[0]
+                .driver_refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unrelated history"))
+        );
+        match attempt_land(&c, &repo.dir, "feat", &GitLoc::Local(repo.dir.clone())).unwrap() {
+            AttemptOutcome::Conflict {
+                driver_refusal: Some(reason),
+                ..
+            } => assert!(reason.contains("unrelated history"), "{reason}"),
+            outcome => panic!("expected typed unrelated-history refusal, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn rebase_octopus_history_holds_without_moving_main() {
+        // Positive control: the existing merge-parent check already holds an octopus merge.
+        let repo = Repo::new("rebase-octopus-history");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feat.txt", "feature\n");
+        git(&repo.dir, &["checkout", "-q", "feat", "-b", "b1"]);
+        repo.commit("b1.txt", "one\n", "b1 work");
+        git(&repo.dir, &["checkout", "-q", "feat", "-b", "b2"]);
+        repo.commit("b2.txt", "two\n", "b2 work");
+        git(&repo.dir, &["checkout", "-q", "feat"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "octopus",
+                "b1",
+                "b2",
+            ],
+        );
+        git(&repo.dir, &["branch", "-q", "-D", "b1"]);
+        git(&repo.dir, &["branch", "-q", "-D", "b2"]);
+        let before = repo.out(&["rev-parse", "main"]);
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(!report.advanced, "octopus history must hold: {report:?}");
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(
+            report.deferred[0].kind,
+            ConflictKind::UnsupportedMergeHistory
+        );
+    }
+
+    #[test]
+    fn rebase_nested_merge_history_holds_without_moving_main() {
+        // Positive control: a nested merge still contains a multi-parent commit in the walk.
+        let repo = Repo::new("rebase-nested-merge-history");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feat.txt", "feature\n");
+        git(&repo.dir, &["checkout", "-q", "feat", "-b", "inner"]);
+        repo.commit("inner.txt", "inner\n", "inner work");
+        git(&repo.dir, &["checkout", "-q", "feat", "-b", "nested"]);
+        repo.commit("nested.txt", "nested\n", "nested work");
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "inner merge",
+                "inner",
+            ],
+        );
+        git(&repo.dir, &["checkout", "-q", "feat"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "nested merge",
+                "nested",
+            ],
+        );
+        git(&repo.dir, &["branch", "-q", "-D", "inner"]);
+        git(&repo.dir, &["branch", "-q", "-D", "nested"]);
+        let before = repo.out(&["rev-parse", "main"]);
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(
+            !report.advanced,
+            "nested merge history must hold: {report:?}"
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(
+            report.deferred[0].kind,
+            ConflictKind::UnsupportedMergeHistory
+        );
+    }
+
+    #[test]
+    fn rebase_criss_cross_history_holds_without_moving_main() {
+        // Positive control: two independent merge commits with reversed parent order create criss-cross ancestry.
+        let repo = Repo::new("rebase-criss-cross-history");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("feat", "feat.txt", "feature\n");
+        repo.feature("side", "side.txt", "side\n");
+
+        git(&repo.dir, &["checkout", "-q", "-b", "combined", "main"]);
+        git(&repo.dir, &["checkout", "-q", "feat", "--", "feat.txt"]);
+        git(&repo.dir, &["checkout", "-q", "side", "--", "side.txt"]);
+        git(&repo.dir, &["add", "-A"]);
+        let merge_tree = repo.out(&["write-tree"]);
+        git(&repo.dir, &["checkout", "-q", "-f", "main"]);
+        git(&repo.dir, &["branch", "-q", "-D", "combined"]);
+
+        let forward_merge = repo.out(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            &merge_tree,
+            "-p",
+            "feat",
+            "-p",
+            "side",
+            "-m",
+            "feat merge",
+        ]);
+        let reverse_merge = repo.out(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            &merge_tree,
+            "-p",
+            "side",
+            "-p",
+            "feat",
+            "-m",
+            "side merge",
+        ]);
+        let criss_cross_merge = repo.out(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            &merge_tree,
+            "-p",
+            &forward_merge,
+            "-p",
+            &reverse_merge,
+            "-m",
+            "criss-cross merge",
+        ]);
+        git(
+            &repo.dir,
+            &["update-ref", "refs/heads/feat", &criss_cross_merge],
+        );
+        git(
+            &repo.dir,
+            &["update-ref", "refs/heads/side", &reverse_merge],
+        );
+        git(&repo.dir, &["branch", "-q", "-D", "side"]);
+        let before = repo.out(&["rev-parse", "main"]);
+
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+        assert!(
+            !report.advanced,
+            "criss-cross history must hold: {report:?}"
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), before, "target unmoved");
+        assert_eq!(report.deferred.len(), 1);
+        assert!(
+            report
+                .deferred
+                .iter()
+                .all(|deferred| deferred.kind == ConflictKind::UnsupportedMergeHistory)
+        );
+    }
+
+    #[test]
+    fn rebase_octopus_history_still_lands_under_merge_and_squash() {
+        // Positive control: merge and squash retain their existing octopus behaviour.
+        for strategy in [
+            thegn_core::config::LandStrategy::Merge,
+            thegn_core::config::LandStrategy::Squash,
+        ] {
+            let repo = Repo::new("rebase-octopus-non-rebase");
+            if !repo.history_supported_or_refused() {
+                return;
+            }
+            repo.feature("feat", "feat.txt", "feature\n");
+            git(&repo.dir, &["checkout", "-q", "feat", "-b", "b1"]);
+            repo.commit("b1.txt", "one\n", "b1 work");
+            git(&repo.dir, &["checkout", "-q", "feat", "-b", "b2"]);
+            repo.commit("b2.txt", "two\n", "b2 work");
+            git(&repo.dir, &["checkout", "-q", "feat"]);
+            git(
+                &repo.dir,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "merge",
+                    "--no-ff",
+                    "-q",
+                    "-m",
+                    "octopus",
+                    "b1",
+                    "b2",
+                ],
+            );
+            git(&repo.dir, &["branch", "-q", "-D", "b1"]);
+            git(&repo.dir, &["branch", "-q", "-D", "b2"]);
+
+            let strategy_label = format!("{strategy:?}");
+            let mut c = cfg("");
+            c.land_strategy = strategy;
+            let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+
+            assert!(
+                report.advanced,
+                "octopus must land under {strategy_label}: {report:?}"
+            );
+            assert!(report.deferred.is_empty(), "{strategy_label}: {report:?}");
         }
     }
 
