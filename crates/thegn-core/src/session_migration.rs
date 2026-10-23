@@ -11,6 +11,7 @@ use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// A worktree row explicitly allowlisted for migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,8 +63,9 @@ pub struct MigrationGroup {
     pub tabs: Vec<MigrationTab>,
 }
 
-/// An explicitly allowlisted tab payload. `pane_sessions` is retained in the
-/// source snapshot for liveness preflight, then cleared at import because daemon
+/// An explicitly allowlisted tab payload. Pane cwd hints outside the moved
+/// worktree are dropped at import. `pane_sessions` is retained in the source
+/// snapshot for liveness preflight, then cleared at import because daemon
 /// session ids are profile-local.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationTab {
@@ -804,10 +806,16 @@ fn migrated_note(status: &str, note: Option<&str>) -> String {
 }
 
 /// Return a copy of a migration bundle in the exact form imported by the
-/// target, preserving row order and source ids for parent/note remapping.
+/// target, preserving row order and source ids for parent/note remapping. Pane
+/// cwd hints outside the moved worktree are dropped in either history mode.
 pub fn imported_bundle(bundle: &MigrationBundle, history: HistoryPolicy) -> MigrationBundle {
     let mut imported = bundle.clone();
     imported.dispatches = bundle.dispatches.iter().map(imported_dispatch).collect();
+    for group in &mut imported.groups {
+        for tab in &mut group.tabs {
+            tab.pane_cwds = scoped_pane_cwds(&tab.pane_cwds, &bundle.worktree_path);
+        }
+    }
     if history == HistoryPolicy::Drop {
         for group in &mut imported.groups {
             for tab in &mut group.tabs {
@@ -830,6 +838,25 @@ pub fn imported_bundle(bundle: &MigrationBundle, history: HistoryPolicy) -> Migr
         imported.notes.clear();
     }
     imported
+}
+
+fn scoped_pane_cwds(pane_cwds: &str, worktree_path: &str) -> String {
+    if pane_cwds.is_empty() {
+        return String::new();
+    }
+    let Ok(cwds) = serde_json::from_str::<BTreeMap<u32, String>>(pane_cwds) else {
+        return String::new();
+    };
+    let worktree = Path::new(worktree_path);
+    let kept: BTreeMap<u32, String> = cwds
+        .into_iter()
+        .filter(|(_, cwd)| {
+            !worktree_path.is_empty()
+                && Path::new(cwd).is_absolute()
+                && Path::new(cwd).starts_with(worktree)
+        })
+        .collect();
+    serde_json::to_string(&kept).unwrap_or_default()
 }
 
 fn is_migration_prefix(note: &str) -> bool {
@@ -1628,6 +1655,32 @@ mod tests {
 
         let dropped = imported_bundle(&source, HistoryPolicy::Drop);
         assert_eq!(imported_bundle(&dropped, HistoryPolicy::Drop), dropped);
+    }
+
+    #[test]
+    fn pane_cwds_outside_the_worktree_are_dropped_on_import() {
+        let mut source = bundle();
+        source.groups[0].tabs[0].pane_cwds =
+            r#"{"1":"/wt/api/src","2":"/home/u/.config/work","3":"/wt/api-v2","4":"/wt/api"}"#
+                .into();
+
+        for history in [HistoryPolicy::Include, HistoryPolicy::Drop] {
+            let imported = imported_bundle(&source, history);
+            let cwds: BTreeMap<u32, String> =
+                serde_json::from_str(&imported.groups[0].tabs[0].pane_cwds).unwrap();
+            assert_eq!(
+                cwds,
+                BTreeMap::from([(1, "/wt/api/src".into()), (4, "/wt/api".into())])
+            );
+        }
+    }
+
+    #[test]
+    fn pane_cwds_unparsable_or_relative_hints_are_dropped() {
+        assert_eq!(scoped_pane_cwds("not json", "/wt/api"), "");
+        assert_eq!(scoped_pane_cwds(r#"{"1":"src"}"#, "/wt/api"), "{}");
+        assert_eq!(scoped_pane_cwds(r#"{"1":"/wt/api/src"}"#, ""), "{}");
+        assert_eq!(scoped_pane_cwds("", "/wt/api"), "");
     }
 
     #[test]
