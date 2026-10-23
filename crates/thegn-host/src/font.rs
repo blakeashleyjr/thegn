@@ -788,12 +788,47 @@ fn kitty_config_path() -> PathBuf {
     thegn_core::util::xdg_config_home().join("kitty/kitty.conf")
 }
 
+/// A config replacement that happened. `NotSynced` carries the parent-directory sync error: the
+/// new file is in place, but a crash could still roll it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Replaced {
+    Durable,
+    NotSynced(String),
+}
+
+/// A font switch that was written. `warning` is set when the write happened but was not made durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontApplied {
+    pub path: PathBuf,
+    pub warning: Option<String>,
+}
+
+impl FontApplied {
+    fn new(path: PathBuf, replaced: Replaced) -> Self {
+        let warning = match replaced {
+            Replaced::Durable => None,
+            Replaced::NotSynced(error) => Some(error),
+        };
+        Self { path, warning }
+    }
+}
+
+pub(crate) fn font_status_line(family: &str, applied: &FontApplied) -> String {
+    match &applied.warning {
+        None => format!("Font → {family} ({})", applied.path.display()),
+        Some(warning) => format!(
+            "Font → {family} ({}); warning: {warning}",
+            applied.path.display()
+        ),
+    }
+}
+
 /// Set the terminal's font family, for whichever terminal is actually running.
 ///
 /// Previously this always patched an Alacritty config — 4th of the 5 terminals
 /// the macOS `.app` launcher will start, and not the one it prefers — so on a
 /// Ghostty session it edited a file nothing was reading and reported success.
-pub fn apply_font_family(family: &str) -> Result<PathBuf, String> {
+pub fn apply_font_family(family: &str) -> Result<FontApplied, String> {
     let env = thegn_core::termcaps::TermEnv::from_env();
     apply_font_family_for(
         detect_terminal(env.program_name(), env.term.as_deref()),
@@ -803,7 +838,7 @@ pub fn apply_font_family(family: &str) -> Result<PathBuf, String> {
 
 /// [`apply_font_family`] with the terminal chosen by the caller — the seam the
 /// tests drive.
-pub fn apply_font_family_for(kind: TerminalKind, family: &str) -> Result<PathBuf, String> {
+pub fn apply_font_family_for(kind: TerminalKind, family: &str) -> Result<FontApplied, String> {
     validate_family(family)?;
     match kind {
         TerminalKind::Alacritty => {
@@ -812,28 +847,28 @@ pub fn apply_font_family_for(kind: TerminalKind, family: &str) -> Result<PathBuf
                  ~/.config/alacritty/alacritty.toml"
                     .to_string()
             })?;
-            apply_font_family_to_path(&path, family)?;
-            Ok(path)
+            let replaced = apply_font_family_to_path(&path, family)?;
+            Ok(FontApplied::new(path, replaced))
         }
         TerminalKind::Ghostty => {
             let path = ghostty_config_path();
-            write_simple_key(
+            let replaced = write_simple_key(
                 &path,
                 "font-family",
                 &format!("font-family = {family}"),
                 family,
             )?;
-            Ok(path)
+            Ok(FontApplied::new(path, replaced))
         }
         TerminalKind::Kitty => {
             let path = kitty_config_path();
-            write_simple_key(
+            let replaced = write_simple_key(
                 &path,
                 "font_family",
                 &format!("font_family {family}"),
                 family,
             )?;
-            Ok(path)
+            Ok(FontApplied::new(path, replaced))
         }
         TerminalKind::Unsupported(name) => Err(manual_instructions(name, family)),
         TerminalKind::Unknown => Err(format!(
@@ -847,7 +882,12 @@ pub fn apply_font_family_for(kind: TerminalKind, family: &str) -> Result<PathBuf
 /// appending it when absent. Creates the file (and its directory) if needed —
 /// both terminals treat a missing config as empty defaults, so writing one is
 /// the same as editing it.
-fn write_simple_key(path: &Path, key: &str, new_line: &str, family: &str) -> Result<(), String> {
+fn write_simple_key(
+    path: &Path,
+    key: &str,
+    new_line: &str,
+    family: &str,
+) -> Result<Replaced, String> {
     validate_family(family)?;
     let (observed, observed_exists) = match read_config(path) {
         Ok(bytes) => (bytes, true),
@@ -884,7 +924,7 @@ fn write_simple_key(path: &Path, key: &str, new_line: &str, family: &str) -> Res
     replace_config(path, &observed, observed_exists, body.as_bytes())
 }
 
-fn apply_font_family_to_path(path: &Path, family: &str) -> Result<(), String> {
+fn apply_font_family_to_path(path: &Path, family: &str) -> Result<Replaced, String> {
     let observed = read_config(path).map_err(|e| config_read_error(path, e))?;
     let current = String::from_utf8(observed.clone())
         .map_err(|e| format!("read {} failed: {e}", path.display()))?;
@@ -922,13 +962,14 @@ fn replace_config(
     observed: &[u8],
     observed_exists: bool,
     new: &[u8],
-) -> Result<(), String> {
+) -> Result<Replaced, String> {
     replace_config_with(
         path,
         observed,
         observed_exists,
         new,
         &mut random_staging_suffix,
+        &mut |parent: &Path| thegn_core::fsperm::sync_parent_dir(parent),
     )
 }
 
@@ -938,7 +979,8 @@ fn replace_config_with(
     observed_exists: bool,
     new: &[u8],
     suffix: &mut dyn FnMut() -> Result<String, String>,
-) -> Result<(), String> {
+    sync_parent: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Result<Replaced, String> {
     let (current, metadata) = match thegn_core::fsperm::open_regular_file_nofollow(path) {
         Ok(mut file) => {
             let metadata = file
@@ -1000,14 +1042,14 @@ fn replace_config_with(
             )),
         };
     }
-    thegn_core::fsperm::sync_parent_dir(parent).map_err(|e| {
-        format!(
-            "{} was replaced, but syncing {} failed: {e}",
+    match sync_parent(parent) {
+        Ok(()) => Ok(Replaced::Durable),
+        Err(error) => Ok(Replaced::NotSynced(format!(
+            "{} was replaced, but syncing {} failed: {error}",
             path.display(),
             parent.display()
-        )
-    })?;
-    Ok(())
+        ))),
+    }
 }
 
 /// The staging create retries collisions without ever replacing an existing entry.
@@ -1116,10 +1158,30 @@ fn validate_family(family: &str) -> Result<(), String> {
     if family.chars().any(char::is_control) {
         return Err("font family must not contain control characters".into());
     }
+    if family.chars().any(is_format_char) {
+        return Err(
+            "font family must not contain invisible or bidirectional formatting characters".into(),
+        );
+    }
     if family.len() > 256 {
         return Err("font family must be no more than 256 bytes".into());
     }
     Ok(())
+}
+
+fn is_format_char(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+    )
 }
 
 fn normalize_family(family: &str) -> String {
@@ -1926,7 +1988,15 @@ size = 13\n\
         let mut next_suffix = suffixes.iter();
         let mut suffix = || Ok(next_suffix.next().unwrap().to_string());
 
-        replace_config_with(&config, observed, true, b"font_family Hack\n", &mut suffix).unwrap();
+        replace_config_with(
+            &config,
+            observed,
+            true,
+            b"font_family Hack\n",
+            &mut suffix,
+            &mut |parent: &Path| thegn_core::fsperm::sync_parent_dir(parent),
+        )
+        .unwrap();
 
         assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
         assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
@@ -1947,8 +2017,14 @@ size = 13\n\
             Ok("aaaa".to_string())
         };
 
-        let result =
-            replace_config_with(&config, observed, true, b"font_family Hack\n", &mut suffix);
+        let result = replace_config_with(
+            &config,
+            observed,
+            true,
+            b"font_family Hack\n",
+            &mut suffix,
+            &mut |parent: &Path| thegn_core::fsperm::sync_parent_dir(parent),
+        );
 
         assert!(
             matches!(result, Err(ref error) if error.contains("could not create a unique staging file"))
@@ -1981,5 +2057,125 @@ size = 13\n\
             "the staged file must inherit the explicitly read-only destination permissions"
         );
         assert_eq!(std::fs::read(&staged).unwrap(), b"x");
+    }
+
+    #[test]
+    fn parent_sync_failure_after_rename_reports_a_replaced_file_with_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+
+        let result = replace_config_with(
+            &config,
+            observed,
+            true,
+            b"font_family Hack\n",
+            &mut || Ok("dddd".to_string()),
+            &mut |_| Err(std::io::Error::other("injected sync failure")),
+        );
+
+        assert!(matches!(
+            result,
+            Ok(Replaced::NotSynced(ref message))
+                if message.contains("injected sync failure") && message.contains("was replaced")
+        ));
+        assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn durable_replacement_reports_no_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let observed = b"font_family Menlo\n";
+        std::fs::write(&config, observed).unwrap();
+
+        let result = replace_config_with(
+            &config,
+            observed,
+            true,
+            b"font_family Hack\n",
+            &mut || Ok("eeee".to_string()),
+            &mut |_| Ok(()),
+        );
+
+        assert_eq!(result, Ok(Replaced::Durable));
+        assert_eq!(std::fs::read(&config).unwrap(), b"font_family Hack\n");
+    }
+
+    #[test]
+    fn font_family_format_characters_are_rejected_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("kitty.conf");
+        let original = b"font_family Menlo\n";
+        std::fs::write(&config, original).unwrap();
+        let input = "[font]\nnormal = { family = \"Menlo\" }\n";
+        let format_characters = [
+            '\u{00ad}', '\u{061c}', '\u{180e}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}',
+            '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2060}',
+            '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}', '\u{feff}', '\u{fff9}', '\u{fffa}', '\u{fffb}',
+        ];
+
+        for character in format_characters {
+            let family = format!("Ha{character}ck");
+            let error = validate_family(&family).unwrap_err();
+            assert!(
+                error.contains("formatting"),
+                "U+{:04X}: {error}",
+                character as u32
+            );
+
+            let error = write_simple_key(
+                &config,
+                "font_family",
+                &format!("font_family {family}"),
+                &family,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("formatting"),
+                "U+{:04X}: {error}",
+                character as u32
+            );
+            assert_eq!(std::fs::read(&config).unwrap(), original);
+
+            let error = patch_alacritty_font_family(input, &family).unwrap_err();
+            assert!(
+                error.contains("formatting"),
+                "U+{:04X}: {error}",
+                character as u32
+            );
+        }
+
+        assert!(validate_family("Hack Nerd Font Mono").is_ok());
+        assert!(validate_family("思源黑体").is_ok());
+    }
+
+    #[test]
+    fn font_status_line_mentions_a_sync_warning() {
+        let applied = FontApplied {
+            path: "/c/kitty.conf".into(),
+            warning: None,
+        };
+        assert_eq!(
+            font_status_line("Hack", &applied),
+            "Font → Hack (/c/kitty.conf)"
+        );
+
+        let applied = FontApplied {
+            path: "/c/kitty.conf".into(),
+            warning: Some("x was replaced, but syncing /c failed: EIO".into()),
+        };
+        let line = font_status_line("Hack", &applied);
+        assert!(line.starts_with("Font → Hack (/c/kitty.conf)"));
+        assert!(line.contains("; warning: x was replaced"));
     }
 }

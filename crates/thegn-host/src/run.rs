@@ -20968,9 +20968,9 @@ async fn event_loop<T: Terminal>(
                                 // --- end new dispatch ---
                                 if let Some(family) = key.strip_prefix("font:") {
                                     match crate::font::apply_font_family(family) {
-                                        Ok(path) => {
+                                        Ok(applied) => {
                                             model.status =
-                                                format!("Font → {family} ({})", path.display());
+                                                crate::font::font_status_line(family, &applied);
                                         }
                                         Err(e) => model.status = format!("Font switch failed: {e}"),
                                     }
