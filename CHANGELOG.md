@@ -9,7 +9,77 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.34] — 2026-10-22 (maintenance batch 71)
 
+### Added
+
+- `thegn merge sweep --json` reports kept branches with a cleanup class and
+  reason, and its `incomplete` field matches the command's exit status.
+
+### Changed
+
+- Merge-queue rows are held for review if the worktree's repository identity
+  changes before the drain. PR-queue failure prompts can include a bounded,
+  redacted log excerpt for that PR head. One-shot plugin runs give the
+  least-recently-started work priority.
+
+### Fixed
+
+- Partial or failed CI run lists no longer replace the last good list; the
+  cached list is labelled stale, and unavailable job details stay visible.
+  Repository discovery skips roots nested inside another configured root.
+- Exit restores the terminal even if a frame write is stuck. Font changes
+  report when the file was applied but its directory was not synced.
+  Projection rollback timeouts report a transport failure instead of claiming
+  that the projection is not mounted.
+- Fly machine lists reject malformed entries and multiple live managed
+  machines rather than choosing one (dev channel). Machine0 MCP calls use the
+  shared provider control gate (dev channel).
+
+### Security
+
+- `thegn session` and `thegn logs tail` keep untrusted text from emitting
+  terminal control or formatting sequences. File-backed secrets reject files
+  with group or other access, or extra hard links.
+- Sandbox mounts that expose or hide a daemon control-socket directory are
+  refused, including for Compose. Media labels strip invisible formatting
+  characters, and font family names with invisible or bidirectional
+  characters are refused.
+- Invalid VPS names are refused instead of sharing a fallback `known_hosts`
+  pin (dev channel).
+
 ## [0.1.0-alpha.33] — 2026-10-22 (maintenance batch 70)
+
+### Added
+
+- `just release-verify <tag>` rehearses a local archive and refuses a binary
+  tied to a `/nix/store` interpreter unless `host_only=1` is supplied.
+- `thegn doctor` reports unbound claimed and quarantined warm-pool spares, and
+  VPS/Fly reapers alert when the set of billable resources kept for review
+  changes (dev channel).
+
+### Changed
+
+- README, release instructions, known issues and in-app help describe the
+  public-alpha platform and install-channel support, including that
+  `install.sh` is for source checkouts.
+
+### Fixed
+
+- An unsafe predictable `/tmp` control fallback no longer prevents daemon
+  startup; clients find its private replacement through an owner-only locator.
+- Failed share stops remain visible and retryable. PR check reruns target the
+  current head, and approvals and reviews refuse if that head has moved.
+- After a PR-queue or CI-autofix agent returns, thegn rechecks the PR context
+  before follow-up writes and holds the row for human review if it changed.
+
+### Security
+
+- Release publication requires an annotated, version-matching tag admitted
+  through a protected environment; release checkouts do not persist GitHub
+  credentials. Self-hosted CI runners are limited to manual runs in the main
+  repository.
+- Named-profile directories and profile SSH keys must be owner-only. Plugin
+  launch fields are validated and bounded, and bore secrets in
+  `[share.bore] extra_args` are refused without echoing the value.
 
 ## [0.1.0-alpha.32] — 2026-10-22 (maintenance batch 69)
 
