@@ -426,6 +426,11 @@ If the state database cannot be read (a newer schema, a refused migration, a
 damaged host row) the configuration is still admitted — without the stored
 hosts — and a statusbar banner says so; agent and tool launches are refused
 until it is fixed.
+If the database cannot be opened at all when a pane launches, configured
+agents and tools are refused because their saved sandbox override and
+credential-overlay gate cannot be checked. A plain shell, including the
+`clean-shell` fallback, still starts with a warning that it launches without
+the saved override.
 
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,

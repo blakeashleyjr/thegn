@@ -202,3 +202,8 @@ verification ·
 now · `o` open in a browser. CLI equivalents for queue rows are
 `thegn pr queue add|rm|clear|rebind|drain|list|status`; `list`, `drain`, and
 `status` take `--json`.
+
+Removing or clearing the queue keeps any row whose PR agent is running.
+`thegn pr queue rm <n>` refuses with an error; `clear` removes the other rows,
+reports how many it removed, names the kept PRs and exits with an error. The
+section’s `x` and `c` actions report the same result in the status line.
