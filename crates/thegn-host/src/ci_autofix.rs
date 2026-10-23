@@ -109,17 +109,28 @@ fn consider_candidate_with_forge(
         return;
     }
 
-    let Some(item) = db
-        .list_pr_queue()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|row| row.worktree.as_deref() == Some(entry.worktree.as_str()))
-    else {
-        notify(format!(
-            "CI job {} failed, but no queued PR context is available for autofix",
-            entry.job_name
-        ));
-        return;
+    let item = match queue_row_for_worktree(db.list_pr_queue().unwrap_or_default(), &entry.worktree)
+    {
+        QueueRowPick::One(row) => *row,
+        QueueRowPick::None => {
+            notify(format!(
+                "CI job {} failed, but no queued PR context is available for autofix",
+                entry.job_name
+            ));
+            return;
+        }
+        QueueRowPick::Ambiguous(numbers) => {
+            let numbers = numbers
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            notify(format!(
+                "CI job {} failed, but PR queue rows {numbers} share this worktree; autofix is held until one remains (remove the stale row with `thegn pr queue rm <number>`)",
+                entry.job_name
+            ));
+            return;
+        }
     };
     let item = match db.pr_agent_lease_view(&item.key) {
         Ok(Some(view))
@@ -595,6 +606,43 @@ fn head_is_current(
         && fetched.pr.head_ref_oid == expected
         && loc.git_out(&["rev-parse", "HEAD"]).as_deref() == Some(expected)
         && !forge.id().is_empty()
+}
+
+/// Which PR queue row owns a worktree's CI evidence.
+#[derive(Debug, PartialEq, Eq)]
+enum QueueRowPick {
+    None,
+    One(Box<thegn_core::db::PrQueueRow>),
+    Ambiguous(Vec<u64>),
+}
+
+/// Merged and closed rows for the worktree are history. Exactly one other row
+/// is the candidate; two or more are ambiguous (held, never resolved by queue
+/// order). With only history left, the newest row is returned so its state
+/// hold is reported as before. An unknown status counts as live (fail closed).
+fn queue_row_for_worktree(rows: Vec<thegn_core::db::PrQueueRow>, worktree: &str) -> QueueRowPick {
+    let (history, live): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .filter(|row| row.worktree.as_deref() == Some(worktree))
+        .partition(|row| {
+            matches!(
+                PrqStatus::parse(&row.status),
+                Some(PrqStatus::Merged | PrqStatus::Closed)
+            )
+        });
+
+    match live.len() {
+        0 => history
+            .into_iter()
+            .max_by_key(|row| row.queued_at)
+            .map_or(QueueRowPick::None, |row| QueueRowPick::One(Box::new(row))),
+        1 => QueueRowPick::One(Box::new(live.into_iter().next().expect("one live row"))),
+        _ => {
+            let mut numbers = live.into_iter().map(|row| row.number).collect::<Vec<_>>();
+            numbers.sort_unstable();
+            QueueRowPick::Ambiguous(numbers)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1198,7 +1246,9 @@ mod tests {
         let cases = [
             ("needs_human", false, false, "needs_human"),
             ("closed", false, false, "closed"),
+            ("merged", false, false, "merged"),
             ("agent_running", false, false, "agent_running"),
+            ("merging", false, false, "merging"),
             ("blocked_ci", true, false, "CI is not in [pr_queue] watch"),
             ("blocked_ci", false, true, "someone else pushed"),
         ];
@@ -1315,6 +1365,154 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn queue_row_pick_prefers_the_live_row_in_either_order() {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("picker.db")).unwrap();
+        db.enqueue_bound_pr(
+            path,
+            7,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url,
+        )
+        .unwrap();
+        db.enqueue_bound_pr(
+            path,
+            9,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url.replace("/pull/7", "/pull/9"),
+        )
+        .unwrap();
+        let rows = db.list_pr_queue().unwrap();
+        let merged = rows.iter().find(|row| row.number == 9).unwrap();
+        db.update_pr_status(&merged.key, "merged", None, None, None)
+            .unwrap();
+        let rows = db.list_pr_queue().unwrap();
+        let mut reversed = rows.clone();
+        reversed.reverse();
+
+        for rows in [rows, reversed] {
+            match queue_row_for_worktree(rows, path) {
+                QueueRowPick::One(row) => assert_eq!(row.number, 7),
+                pick => panic!("expected the live PR #7, got {pick:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn queue_row_pick_holds_two_live_rows() {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("picker.db")).unwrap();
+        db.enqueue_bound_pr(
+            path,
+            7,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url,
+        )
+        .unwrap();
+        db.enqueue_bound_pr(
+            path,
+            9,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url.replace("/pull/7", "/pull/9"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            queue_row_for_worktree(db.list_pr_queue().unwrap(), path),
+            QueueRowPick::Ambiguous(vec![7, 9])
+        );
+    }
+
+    #[test]
+    fn queue_row_pick_returns_a_lone_settled_row_and_ignores_other_worktrees() {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("picker.db")).unwrap();
+        db.enqueue_bound_pr(
+            path,
+            9,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url.replace("/pull/7", "/pull/9"),
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        db.update_pr_status(&row.key, "closed", None, None, None)
+            .unwrap();
+        let rows = db.list_pr_queue().unwrap();
+
+        match queue_row_for_worktree(rows.clone(), path) {
+            QueueRowPick::One(row) => assert_eq!(row.number, 9),
+            pick => panic!("expected settled PR #9, got {pick:?}"),
+        }
+        assert_eq!(
+            queue_row_for_worktree(rows, "/another/worktree"),
+            QueueRowPick::None
+        );
+    }
+
+    #[test]
+    fn two_live_queue_rows_hold_ci_autofix_without_claiming_or_spending() {
+        let fixture = Fixture::new();
+        let handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        let path = handoff.entry.worktree.as_str();
+        handoff
+            .db
+            .enqueue_bound_pr(
+                path,
+                9,
+                Some(path),
+                "fixture",
+                "main",
+                "github",
+                &fixture.pr.url.replace("/pull/7", "/pull/9"),
+            )
+            .unwrap();
+
+        consider(&handoff, false);
+
+        assert!(!handoff.sentinel.exists());
+        assert!(
+            handoff
+                .db
+                .list_pr_queue()
+                .unwrap()
+                .iter()
+                .all(|row| row.agent_attempts == 0)
+        );
+        assert!(
+            handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| notification.message.contains("share this worktree"))
+        );
     }
 
     #[test]
