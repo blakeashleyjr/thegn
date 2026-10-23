@@ -1295,18 +1295,29 @@ pub fn install_shutdown_signal(flag: Arc<AtomicBool>, waker: termwiz::terminal::
     });
 }
 
-/// Daemon shutdown: notify `shutdown` on SIGTERM/SIGINT so `kill <daemon>`
-/// takes the same graceful path as the shutdown RPC. Must be called inside a
-/// tokio runtime.
-pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
-    tokio::spawn(async move {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
+/// Register daemon termination signals synchronously, before the socket bind.
+/// Tokio buffers signals received before the returned future is polled.
+pub fn register_shutdown_signal() -> impl std::future::Future<Output = ()> + Send {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("install SIGINT handler");
+    async move {
         tokio::select! {
             _ = term.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
+            _ = interrupt.recv() => {}
         }
-        shutdown.notify_waiters();
+    }
+}
+
+/// Forward a registered signal to the daemon's latched graceful-shutdown token.
+pub fn spawn_shutdown_notifier(
+    shutdown: tokio_util::sync::CancellationToken,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        signal.await;
+        shutdown.cancel();
     });
 }
 

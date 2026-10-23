@@ -49,7 +49,7 @@ pub fn spawn(
     cfg: &Config,
     svc: Arc<DaemonService>,
     db: SharedDb,
-    shutdown: Arc<Notify>,
+    shutdown: tokio_util::sync::CancellationToken,
     server_label: String,
 ) {
     let push = &cfg.notifications.push;
@@ -107,7 +107,15 @@ pub fn spawn(
     };
 
     let (raw_tx, raw_rx) = mpsc::channel::<String>(RAW_BUFFER);
-    let sub_shutdown = shutdown.clone();
+    let sub_shutdown = Arc::new(Notify::new());
+    let subscriber_shutdown = sub_shutdown.clone();
+    let inbox_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        inbox_shutdown.cancelled().await;
+        // The subscriber API is owned by the service crate and still accepts
+        // Notify; notify_one retains a permit if its next wait is not polled yet.
+        subscriber_shutdown.notify_one();
+    });
     tokio::spawn(async move {
         subscriber.run(raw_tx, sub_shutdown).await;
     });
@@ -144,7 +152,7 @@ async fn execute_loop(
     ceiling: thegn_core::control::ScopeSet,
     state: ControlState,
     reply: Option<Box<dyn PushProvider>>,
-    shutdown: Arc<Notify>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut replay = ReplayGuard::default_guard();
     let mut counters = Counters::default();
@@ -152,7 +160,7 @@ async fn execute_loop(
 
     loop {
         let raw = tokio::select! {
-            _ = shutdown.notified() => break,
+            _ = shutdown.cancelled() => break,
             msg = rx.recv() => match msg {
                 Some(m) => m,
                 None => break, // subscriber gone
