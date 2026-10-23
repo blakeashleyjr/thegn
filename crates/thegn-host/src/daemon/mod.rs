@@ -476,6 +476,208 @@ fn lock_allocation_file_within(
 }
 
 #[cfg(unix)]
+fn tmp_fallback_socket_live(socket: &std::path::Path) -> bool {
+    use std::os::unix::net::UnixStream;
+
+    // UnixStream::connect is blocking; a live listener with a full backlog can
+    // hold the allocation lock until the connect resolves, like the legacy probe.
+    match UnixStream::connect(socket) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => legacy_socket_decision(true, Some(error.kind())) == LegacySocketState::Live,
+    }
+}
+
+#[cfg(unix)]
+fn reclaim_stale_tmp_fallback_siblings(
+    tmp_root: &std::path::Path,
+    euid: u32,
+    state_key: &str,
+    keep: Option<&str>,
+    socket_live: &dyn Fn(&std::path::Path) -> bool,
+) -> usize {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let entries = match std::fs::read_dir(tmp_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(target: "thegn::daemon", path = %tmp_root.display(), %error, "could not list private control-runtime siblings");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(target: "thegn::daemon", %error, "could not inspect private control-runtime sibling");
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !fallback_name_ok(&name, euid, state_key) || Some(name.as_str()) == keep {
+            continue;
+        }
+        let dir = entry.path();
+        if !live_dir_meta(&dir).is_some_and(|meta| {
+            meta.is_dir && !meta.is_symlink && meta.owned && meta.mode & 0o777 == 0o700
+        }) {
+            tracing::debug!(target: "thegn::daemon", path = %dir.display(), "keeping unverified private control-runtime sibling");
+            continue;
+        }
+
+        let contents = match std::fs::read_dir(&dir) {
+            Ok(contents) => contents,
+            Err(error) => {
+                tracing::debug!(target: "thegn::daemon", path = %dir.display(), %error, "could not inspect private control-runtime sibling");
+                continue;
+            }
+        };
+        let mut socket_path = None;
+        let mut socket_identity = None;
+        let mut lock_path = None;
+        let mut safe = true;
+        for child in contents {
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::daemon", path = %dir.display(), %error, "could not inspect private control-runtime entry");
+                    safe = false;
+                    break;
+                }
+            };
+            let child_name = child.file_name();
+            let child_path = child.path();
+            let socket_name = std::ffi::OsStr::new("daemon.sock");
+            let lock_name = std::ffi::OsStr::new("daemon.sock.lock");
+            let metadata = match std::fs::symlink_metadata(&child_path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    tracing::debug!(target: "thegn::daemon", path = %child_path.display(), %error, "could not inspect private control-runtime entry");
+                    safe = false;
+                    break;
+                }
+            };
+            if child_name == socket_name
+                && metadata.file_type().is_socket()
+                && socket_path.is_none()
+            {
+                socket_identity = Some((metadata.dev(), metadata.ino()));
+                socket_path = Some(child_path);
+                continue;
+            }
+            if child_name == lock_name
+                && metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.nlink() == 1
+                && thegn_core::fsperm::owned_by_current_user(&metadata)
+                && lock_path.replace(child_path).is_none()
+            {
+                continue;
+            }
+            safe = false;
+            break;
+        }
+        if !safe {
+            tracing::debug!(target: "thegn::daemon", path = %dir.display(), "keeping private control-runtime sibling with unverified contents");
+            continue;
+        }
+        let socket = dir.join("daemon.sock");
+        if socket_live(&socket) {
+            tracing::debug!(target: "thegn::daemon", path = %dir.display(), "keeping live private control-runtime sibling");
+            continue;
+        }
+
+        let (lock, lock_identity) = match lock_path.as_ref() {
+            Some(path) => {
+                let file = match thegn_core::fsperm::open_regular_file_nofollow(path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::daemon", path = %path.display(), %error, "keeping private control-runtime sibling with an unopenable lock");
+                        continue;
+                    }
+                };
+                let metadata = match file.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::daemon", path = %path.display(), %error, "keeping private control-runtime sibling with an unreadable lock");
+                        continue;
+                    }
+                };
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || !thegn_core::fsperm::owned_by_current_user(&metadata)
+                {
+                    tracing::debug!(target: "thegn::daemon", path = %path.display(), "keeping private control-runtime sibling with an unowned lock");
+                    continue;
+                }
+                let identity = (metadata.dev(), metadata.ino());
+                match file.try_lock() {
+                    Ok(()) => (Some(file), Some(identity)),
+                    Err(error) => {
+                        tracing::debug!(target: "thegn::daemon", path = %path.display(), %error, "keeping private control-runtime sibling with a held lock");
+                        continue;
+                    }
+                }
+            }
+            None => (None, None),
+        };
+
+        if let Some(path) = socket_path.as_ref() {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.file_type().is_socket()
+                        && Some((metadata.dev(), metadata.ino())) == socket_identity
+                        && !socket_live(path) =>
+                {
+                    if let Err(error) = std::fs::remove_file(path) {
+                        tracing::debug!(target: "thegn::daemon", path = %path.display(), %error, "could not remove stale private control socket");
+                        continue;
+                    }
+                }
+                _ => {
+                    tracing::debug!(target: "thegn::daemon", path = %path.display(), "keeping changed private control socket entry");
+                    continue;
+                }
+            }
+        }
+        if let Some(path) = lock_path.as_ref() {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.nlink() == 1
+                        && thegn_core::fsperm::owned_by_current_user(&metadata)
+                        && Some((metadata.dev(), metadata.ino())) == lock_identity =>
+                {
+                    if let Err(error) = std::fs::remove_file(path) {
+                        tracing::debug!(target: "thegn::daemon", path = %path.display(), %error, "could not remove stale private control lock");
+                        continue;
+                    }
+                }
+                _ => {
+                    tracing::debug!(target: "thegn::daemon", path = %path.display(), "keeping changed private control lock entry");
+                    continue;
+                }
+            }
+        }
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {
+                removed += 1;
+                tracing::debug!(target: "thegn::daemon", path = %dir.display(), "reclaimed dead private control-runtime sibling");
+            }
+            Err(error) => {
+                tracing::debug!(target: "thegn::daemon", path = %dir.display(), %error, "could not remove private control-runtime sibling");
+            }
+        }
+        drop(lock);
+    }
+    removed
+}
+
+#[cfg(unix)]
 fn allocate_private_tmp_fallback_within(
     tmp_root: &std::path::Path,
     state_dir: &std::path::Path,
@@ -524,7 +726,18 @@ fn allocate_private_tmp_fallback_within(
     lock_allocation_file_within(&lock, &lock_path, wait)?;
 
     let state_key = thegn_core::config_daemon::state_endpoint_key(state_dir);
-    if let Some(name) = read_tmp_fallback_locator_at(&locator) {
+    let current = read_tmp_fallback_locator_at(&locator);
+    let keep = current
+        .as_deref()
+        .filter(|name| fallback_name_ok(name, euid, &state_key));
+    reclaim_stale_tmp_fallback_siblings(
+        tmp_root,
+        euid,
+        &state_key,
+        keep,
+        &tmp_fallback_socket_live,
+    );
+    if let Some(name) = current {
         let candidate = tmp_root.join(&name);
         if fallback_name_ok(&name, euid, &state_key)
             && live_dir_meta(&candidate).is_some_and(|meta| {
@@ -2666,5 +2879,189 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reused, first);
+    }
+
+    #[cfg(unix)]
+    fn tmp_fallback_test_sibling(root: &std::path::Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = root.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn tmp_fallback_test_dead_socket(dir: &std::path::Path) {
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(dir.join("daemon.sock")).unwrap();
+        drop(listener);
+        std::fs::write(dir.join("daemon.sock.lock"), b"").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_reclaim_removes_a_dead_sibling() {
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let key = "0123456789abcdef0123456789abcdef";
+        let name = format!("thegn-{}-{key}-{}", effective_uid(), "a".repeat(32));
+        let dir = tmp_fallback_test_sibling(tmp.path(), &name);
+        tmp_fallback_test_dead_socket(&dir);
+
+        assert_eq!(
+            reclaim_stale_tmp_fallback_siblings(
+                tmp.path(),
+                effective_uid(),
+                key,
+                None,
+                &tmp_fallback_socket_live,
+            ),
+            1
+        );
+        assert!(!dir.exists(), "dead socket sibling should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_reclaim_keeps_every_unproven_sibling() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let key = "0123456789abcdef0123456789abcdef";
+        let name_for = |uid: u32, state_key: &str, fill: char| {
+            format!("thegn-{uid}-{state_key}-{}", fill.to_string().repeat(32))
+        };
+        let keep_name = name_for(effective_uid(), key, 'a');
+        let keep_dir = tmp_fallback_test_sibling(tmp.path(), &keep_name);
+        tmp_fallback_test_dead_socket(&keep_dir);
+
+        let live_name = name_for(effective_uid(), key, 'b');
+        let live_dir = tmp_fallback_test_sibling(tmp.path(), &live_name);
+        let live_listener = UnixListener::bind(live_dir.join("daemon.sock")).unwrap();
+
+        let mode_name = name_for(effective_uid(), key, 'c');
+        let mode_dir = tmp_fallback_test_sibling(tmp.path(), &mode_name);
+        std::fs::set_permissions(&mode_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let target_dir = tmp.path().join("symlink-target");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        tmp_fallback_test_dead_socket(&target_dir);
+        let symlink_name = name_for(effective_uid(), key, 'e');
+        let symlink_path = tmp.path().join(&symlink_name);
+        symlink(&target_dir, &symlink_path).unwrap();
+
+        let extra_name = name_for(effective_uid(), key, 'f');
+        let extra_dir = tmp_fallback_test_sibling(tmp.path(), &extra_name);
+        std::fs::write(extra_dir.join("other"), b"keep").unwrap();
+
+        let held_name = name_for(effective_uid(), key, '1');
+        let held_dir = tmp_fallback_test_sibling(tmp.path(), &held_name);
+        let held_lock_path = held_dir.join("daemon.sock.lock");
+        std::fs::write(&held_lock_path, b"").unwrap();
+        let held_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&held_lock_path)
+            .unwrap();
+        held_lock.lock().unwrap();
+
+        let hardlink_name = name_for(effective_uid(), key, '4');
+        let hardlink_dir = tmp_fallback_test_sibling(tmp.path(), &hardlink_name);
+        let hardlink_victim = tmp.path().join("hardlink-victim");
+        std::fs::write(&hardlink_victim, b"keep linked file").unwrap();
+        std::fs::hard_link(&hardlink_victim, hardlink_dir.join("daemon.sock.lock")).unwrap();
+
+        let other_key_name = name_for(effective_uid(), "fedcba9876543210fedcba9876543210", '2');
+        let other_key_dir = tmp_fallback_test_sibling(tmp.path(), &other_key_name);
+        let other_uid_name = name_for(effective_uid().wrapping_add(1), key, '3');
+        let other_uid_dir = tmp_fallback_test_sibling(tmp.path(), &other_uid_name);
+        let short_name = format!("thegn-{}-{key}-{}", effective_uid(), "c".repeat(31));
+        let short_dir = tmp_fallback_test_sibling(tmp.path(), &short_name);
+
+        assert_eq!(
+            reclaim_stale_tmp_fallback_siblings(
+                tmp.path(),
+                effective_uid(),
+                key,
+                Some(&keep_name),
+                &tmp_fallback_socket_live,
+            ),
+            0
+        );
+        assert!(keep_dir.exists(), "locator-named sibling must remain");
+        assert!(live_dir.exists(), "live listener sibling must remain");
+        assert!(mode_dir.exists(), "non-0700 sibling must remain");
+        assert!(
+            std::fs::symlink_metadata(&symlink_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target_dir.exists(), "symlink target must remain");
+        assert!(
+            extra_dir.exists(),
+            "sibling with other contents must remain"
+        );
+        assert!(held_dir.exists(), "held sidecar lock sibling must remain");
+        assert!(
+            hardlink_dir.exists(),
+            "hard-linked sidecar sibling must remain"
+        );
+        assert_eq!(
+            std::fs::read(&hardlink_victim).unwrap(),
+            b"keep linked file",
+            "a hard-linked file must never be unlinked"
+        );
+        assert!(other_key_dir.exists(), "other state key must remain");
+        assert!(other_uid_dir.exists(), "other uid name must remain");
+        assert!(short_dir.exists(), "malformed sibling name must remain");
+        drop(live_listener);
+        drop(held_lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_allocator_reclaims_dead_siblings_under_its_lock() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let state = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let euid = effective_uid();
+        let key = thegn_core::config_daemon::state_endpoint_key(state.path());
+        let first = allocate_private_tmp_fallback_in(tmp.path(), state.path(), euid).unwrap();
+        let stale_name = format!("thegn-{euid}-{key}-{}", "d".repeat(32));
+        let stale_dir = tmp_fallback_test_sibling(tmp.path(), &stale_name);
+        let listener = UnixListener::bind(stale_dir.join("daemon.sock")).unwrap();
+        drop(listener);
+        std::fs::write(stale_dir.join("daemon.sock.lock"), b"").unwrap();
+
+        let second = allocate_private_tmp_fallback_in(tmp.path(), state.path(), euid).unwrap();
+        assert_eq!(
+            second, first,
+            "the locator-named allocation should be reused"
+        );
+        assert!(
+            !stale_dir.exists(),
+            "dead non-locator sibling should be reclaimed"
+        );
+        assert!(
+            first.parent().unwrap().exists(),
+            "locator directory must remain"
+        );
     }
 }
