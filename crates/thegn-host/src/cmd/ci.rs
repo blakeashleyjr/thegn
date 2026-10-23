@@ -212,7 +212,7 @@ const NO_CI_PROVIDER_MESSAGE: &str =
 fn no_provider_json() -> serde_json::Value {
     serde_json::json!({
         "error": NO_CI_PROVIDER_MESSAGE,
-        "reason": "no-provider"
+        "reason": crate::ci_refresh::NO_PROVIDER_REASON
     })
 }
 
