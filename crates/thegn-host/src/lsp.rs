@@ -324,8 +324,8 @@ impl LspInner {
             // job. rust-analyzer alone can take gigabytes — a language server
             // is exactly the background hog the slice exists to bound. The
             // wrap is fail-safe: no published policy / unusable systemd-run ⇒
-            // the server spawns unwrapped, exactly as before. Off-loop, so the
-            // wrap's probe spawn is fine here.
+            // the server spawns unwrapped, with the degraded case logged once
+            // per process. Off-loop, so the wrap's probe spawn is fine here.
             let resolved = thegn_svc::lsp::resolve_server_command(
                 &spec.command,
                 std::env::var_os("PATH").as_deref(),
@@ -335,7 +335,17 @@ impl LspInner {
             })?;
             let mut argv = spec.argv();
             argv[0] = resolved.to_string();
-            let argv = thegn_core::sandbox_cpucap::wrap_background_argv(argv);
+            let (argv, wrap) = thegn_core::sandbox_cpucap::wrap_background_argv_reporting(argv);
+            if wrap == thegn_core::sandbox_cpucap::BackgroundWrap::ScopeUnusable {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "thegn::lsp",
+                        server = %key,
+                        "CPU-cap scope unavailable; language servers run outside the thegn slice"
+                    );
+                }
+            }
             let client = LspClient::start_argv_with_identity(
                 &argv,
                 &spec.language_id,
