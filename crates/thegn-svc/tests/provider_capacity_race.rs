@@ -141,11 +141,11 @@ fn run_children(fixture: RaceFixture<'_>) -> Vec<(String, String)> {
     fs::write(fixture.start_file, b"go").expect("release all capacity race children together");
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let missing: Vec<&str> = children
+        let missing: Vec<String> = children
             .0
             .iter()
             .filter(|process| !fixture.report_dir.join(&process.name).is_file())
-            .map(|process| process.name.as_str())
+            .map(|process| process.name.clone())
             .collect();
         if missing.is_empty() {
             break;
