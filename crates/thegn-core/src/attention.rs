@@ -17,6 +17,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::notification::NotificationKind;
 
+/// Unacknowledged process/test/agent failure notifications stop driving
+/// Needs-you after a week. They remain in the inbox until read/pruned.
+pub const FAILURE_ATTENTION_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// Whether an unread failure notification has aged out of attention scoring.
+/// Notification timestamps are unix seconds despite the legacy `_ms` name.
+pub fn note_is_stale(kind: &str, at: i64, now: i64, ttl: i64) -> bool {
+    ttl >= 0
+        && now.saturating_sub(at) > ttl
+        && matches!(kind, "process_failed" | "agent_failed" | "test_failed")
+}
+
 /// Urgency tier, most urgent first (`Ord`: `Blocked < Failure < …`, so
 /// ascending sorts put the most urgent first).
 ///
@@ -783,6 +795,29 @@ pub fn rollup<'a>(scores: impl IntoIterator<Item = &'a AttentionScore>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_attention_ttl_only_ages_failure_kinds() {
+        let now = 100_000;
+        assert!(note_is_stale(
+            "process_failed",
+            now - FAILURE_ATTENTION_TTL_SECS - 1,
+            now,
+            FAILURE_ATTENTION_TTL_SECS
+        ));
+        assert!(!note_is_stale(
+            "process_failed",
+            now - FAILURE_ATTENTION_TTL_SECS,
+            now,
+            FAILURE_ATTENTION_TTL_SECS
+        ));
+        assert!(!note_is_stale(
+            "usage_limit",
+            now - 100_000,
+            now,
+            FAILURE_ATTENTION_TTL_SECS
+        ));
+    }
     use AttentionReason as R;
     use AttentionTier as T;
 
