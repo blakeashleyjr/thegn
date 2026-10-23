@@ -75,9 +75,13 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str, known
         .map(PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(Path::new(wt)))
         .unwrap_or_else(|| PathBuf::from(wt));
-    let selected = db
-        .as_ref()
-        .and_then(|db| db.effective_env(wt, &repo_root.to_string_lossy()));
+    let read = match db.as_ref() {
+        Some(db) => db.effective_env_checked(wt, &repo_root.to_string_lossy()),
+        None => Err(anyhow::anyhow!("the state database could not be opened")),
+    };
+    let Some(selected) = connect_failure_selection(wt, read) else {
+        return;
+    };
     let env = cfg.resolve_env(&repo_root, &loc, Path::new(wt), selected.as_deref());
     if env.placement.is_local() {
         return;
@@ -94,12 +98,33 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str, known
     }
 }
 
+/// The env selection a pane connect-failure health mark acts on. `None` when it
+/// cannot be read: marking the DEFAULT env's provider unhealthy would halt
+/// every other worktree on it, so the mark is skipped (a later bring-up
+/// failure is still caught by `prepare_sandbox_env` / the native relay).
+fn connect_failure_selection(
+    wt: &str,
+    read: anyhow::Result<Option<String>>,
+) -> Option<Option<String>> {
+    match read {
+        Ok(selected) => Some(selected),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::sandbox", worktree = %wt, error = %format!("{error:#}"),
+                "pane connect-failure health mark skipped: the environment selection could not be read"
+            );
+            None
+        }
+    }
+}
+
 fn fast_fail_placement_known_local(
     is_active_group: bool,
     active_placement_kind: Option<&str>,
     force_host: bool,
 ) -> bool {
-    is_active_group && (active_placement_kind.is_none() || force_host)
+    is_active_group
+        && (active_placement_kind.is_none() || active_placement_kind == Some("env?") || force_host)
 }
 
 /// Raw, unparsed PTY chunks awaiting their parse slice, per pane, FIFO within
@@ -1740,6 +1765,7 @@ mod tests {
     fn fast_fail_placement_known_local_only_skips_known_local_active_groups() {
         let cases = [
             (true, None, false, true),
+            (true, Some("env?"), false, true),
             (true, Some("ssh"), false, false),
             (true, Some("ssh"), true, true),
             (false, None, false, false),
@@ -2596,5 +2622,21 @@ mod tests {
         }
         assert_eq!(admissions.iter().copied().collect::<HashSet<_>>(), expected);
         assert_eq!(admissions.len(), expected.len());
+    }
+
+    #[test]
+    fn connect_failure_selection_skips_an_unreadable_selection() {
+        assert!(
+            connect_failure_selection("/wt", Err(anyhow::anyhow!("database is locked"))).is_none()
+        );
+    }
+
+    #[test]
+    fn connect_failure_selection_passes_a_read_through() {
+        assert_eq!(
+            connect_failure_selection("/wt", Ok(Some("m0".into()))),
+            Some(Some("m0".into()))
+        );
+        assert_eq!(connect_failure_selection("/wt", Ok(None)), Some(None));
     }
 }

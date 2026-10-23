@@ -1560,11 +1560,8 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                 .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
                 .ok_or_else(|| anyhow::anyhow!("sprite-proxy: no worktree"))?;
             let (provider, id, _workdir, provider_kind, custody_account) =
-                agent::provider_proxy_target(&cfg, &wt).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "sprite-proxy: {wt} is not a provider env (or its API token is unset)"
-                    )
-                })?;
+                agent::provider_proxy_target(&cfg, &wt)
+                    .ok_or_else(|| anyhow::anyhow!("{}", agent::provider_proxy_refusal(&wt)))?;
             if let Some(expected) = expected_provider
                 && !provider_kind.eq_ignore_ascii_case(&expected)
             {
