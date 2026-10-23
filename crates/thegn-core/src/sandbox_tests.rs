@@ -5182,9 +5182,10 @@ fn control_socket_oci_control_dir_outside_every_mount_is_clear() {
     ));
 }
 
-// Wiring check: the production ensure path includes all resolved control dirs.
+// Compile/wiring check only: in this test process the resolved list may be empty,
+// so this does not prove that each configured control dir is added to the guard.
 #[test]
-fn control_socket_host_compose_guard_protects_every_control_dir() {
+fn control_socket_host_compose_guard_wiring_compile_check() {
     let guard = host_compose_guard();
     assert!(
         crate::sandbox_control_guard::control_dirs()

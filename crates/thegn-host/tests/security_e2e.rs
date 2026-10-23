@@ -247,9 +247,6 @@ struct EndpointCleanup(PathBuf);
 
 impl Drop for EndpointCleanup {
     fn drop(&mut self) {
-        if self.0.starts_with("/run/user") {
-            return;
-        }
         let lock = self.0.with_extension("sock.lock");
         for path in [self.0.as_path(), lock.as_path()] {
             if let Err(error) = fs::remove_file(path)
