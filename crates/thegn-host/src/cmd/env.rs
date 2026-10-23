@@ -749,10 +749,13 @@ fn resolve_with_selection(
     read: anyhow::Result<Option<String>>,
 ) -> Result<thegn_core::env::Environment> {
     let selected = read.with_context(|| {
-        format!(concat!(
-            "could not read the environment selection for {wt}; ",
-            "refusing to fall back to the default environment"
-        ))
+        format!(
+            concat!(
+                "could not read the environment selection for {wt}; ",
+                "refusing to fall back to the default environment"
+            ),
+            wt = wt
+        )
     })?;
     Ok(cfg.resolve_env(repo_root, loc, Path::new(wt), selected.as_deref()))
 }
