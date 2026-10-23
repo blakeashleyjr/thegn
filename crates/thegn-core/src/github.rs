@@ -1043,12 +1043,15 @@ impl Forge for GithubCli {
             (PrRef::Current, Some(_)) => Err(GhError::Unsupported("submit_review expected head")),
             (PrRef::Current, None) => submit_review(loc, state, body),
             (PrRef::Number(number), Some(head)) => {
+                let identity = origin_identity(loc)?;
                 let repo = self.repo_ref(loc).ok_or_else(|| {
                     GhError::Other(
                         "could not resolve the PR's repository; nothing was submitted".into(),
                     )
                 })?;
-                let args = review_api_args(&repo, number, head, state, body)?;
+                let host = (!identity.host.eq_ignore_ascii_case("github.com"))
+                    .then_some(identity.host.as_str());
+                let args = review_api_args(&repo, host, number, head, state, body)?;
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                 gh_run(loc, &args)
             }
@@ -1200,6 +1203,7 @@ fn merge_args(
 
 fn review_api_args(
     repo: &RepoRef,
+    host: Option<&str>,
     number: u64,
     head: &str,
     state: ReviewState,
@@ -1211,14 +1215,17 @@ fn review_api_args(
     if number == 0 {
         return Err(GhError::Other("PR number must be greater than zero".into()));
     }
-    if !matches!(state, ReviewState::Approve) && body.is_none_or(|value| value.trim().is_empty()) {
+    if !matches!(state, ReviewState::Approve) && body.is_none() {
         return Err(GhError::Other(
             "a body is required for request-changes / comment reviews".into(),
         ));
     }
 
-    let mut args = vec![
-        "api".into(),
+    let mut args = vec!["api".into()];
+    if let Some(host) = host {
+        args.extend(["--hostname".into(), host.to_owned()]);
+    }
+    args.extend([
         "-X".into(),
         "POST".into(),
         format!("repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.repo),
@@ -1226,7 +1233,7 @@ fn review_api_args(
         format!("commit_id={head}"),
         "-f".into(),
         format!("event={}", state.api_event()),
-    ];
+    ]);
     if let Some(body) = body {
         args.push("-f".into());
         args.push(format!("body={body}"));
@@ -1496,18 +1503,23 @@ mod review_args_tests {
             owner: "o".into(),
             repo: "r".into(),
         };
-        for (state, body, event) in [
-            (ReviewState::Approve, None, "APPROVE"),
-            (ReviewState::Approve, Some("looks good"), "APPROVE"),
+        for (host, state, body, event) in [
+            (None, ReviewState::Approve, None, "APPROVE"),
+            (None, ReviewState::Approve, Some("looks good"), "APPROVE"),
             (
+                None,
                 ReviewState::RequestChanges,
                 Some("please revise"),
                 "REQUEST_CHANGES",
             ),
-            (ReviewState::Comment, Some("note"), "COMMENT"),
+            (None, ReviewState::Comment, Some("note"), "COMMENT"),
+            (Some("ghe.example"), ReviewState::Approve, None, "APPROVE"),
         ] {
-            let mut expected = vec![
-                "api".to_owned(),
+            let mut expected = vec!["api".to_owned()];
+            if let Some(host) = host {
+                expected.extend(["--hostname".to_owned(), host.to_owned()]);
+            }
+            expected.extend([
                 "-X".to_owned(),
                 "POST".to_owned(),
                 "repos/o/r/pulls/7/reviews".to_owned(),
@@ -1515,13 +1527,13 @@ mod review_args_tests {
                 format!("commit_id={HEAD}"),
                 "-f".to_owned(),
                 format!("event={event}"),
-            ];
+            ]);
             if let Some(body) = body {
                 expected.push("-f".to_owned());
                 expected.push(format!("body={body}"));
             }
             assert_eq!(
-                review_api_args(&repo, 7, HEAD, state, body).unwrap(),
+                review_api_args(&repo, host, 7, HEAD, state, body).unwrap(),
                 expected
             );
         }
@@ -1535,20 +1547,19 @@ mod review_args_tests {
         };
         for head in ["", "1234567", "0123456789abcdef0123456789abcdef0123456g"] {
             assert!(matches!(
-                review_api_args(&repo, 7, head, ReviewState::Approve, None),
+                review_api_args(&repo, None, 7, head, ReviewState::Approve, None),
                 Err(ForgeError::Other(_))
             ));
         }
         assert!(matches!(
-            review_api_args(&repo, 0, HEAD, ReviewState::Approve, None),
+            review_api_args(&repo, None, 0, HEAD, ReviewState::Approve, None),
             Err(ForgeError::Other(_))
         ));
-        for body in [None, Some("   ")] {
-            assert!(matches!(
-                review_api_args(&repo, 7, HEAD, ReviewState::Comment, body),
-                Err(ForgeError::Other(_))
-            ));
-        }
+        assert!(matches!(
+            review_api_args(&repo, None, 7, HEAD, ReviewState::Comment, None),
+            Err(ForgeError::Other(_))
+        ));
+        assert!(review_api_args(&repo, None, 7, HEAD, ReviewState::Comment, Some("   ")).is_ok());
     }
 
     #[test]
