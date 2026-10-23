@@ -256,12 +256,17 @@ pub(crate) fn loading_context(
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
     // Prefer an explicit override (the creation wizard's pick, captured before
-    // the DB env row is written) over the persisted `effective_env`.
-    let selected = selected.map(str::to_owned).or_else(|| {
-        Db::open()
-            .ok()
-            .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()))
-    });
+    // the DB env row is written) over the persisted selection. An unreadable
+    // selection is shown as such, never as the default environment.
+    let selected = match selected {
+        Some(selected) => Some(selected.to_owned()),
+        None => match Db::open()
+            .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()))
+        {
+            Ok(selected) => selected,
+            Err(error) => return unreadable_selection_context(cfg, &error),
+        },
+    };
     let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
     if env.placement.is_local() {
         return Vec::new();
@@ -301,6 +306,29 @@ pub(crate) fn loading_context(
     let strategy = format!("{:?}", env.sandbox.home.strategy).to_lowercase();
     out.push(("home".to_string(), strategy));
     out
+}
+
+/// The splash context while the worktree's environment selection cannot be
+/// read. Empty when no non-local `[env.*]` is configured (the env can only be
+/// local, which the splash never describes).
+fn unreadable_selection_context(
+    cfg: &thegn_core::config::Config,
+    error: &anyhow::Error,
+) -> Vec<(String, String)> {
+    if !cfg
+        .env
+        .values()
+        .any(|e| e.placement != thegn_core::config::PlacementMode::Local)
+    {
+        return Vec::new();
+    }
+    vec![
+        ("env".to_string(), "unknown".to_string()),
+        (
+            "selection".to_string(),
+            format!("could not be read: {error:#}"),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -505,5 +533,40 @@ mod tests {
         t.rename(&key(), new.clone());
         assert!(t.get(&key()).is_none());
         assert_eq!(t.get(&new).unwrap()[0].started_at, stamp);
+    }
+
+    #[test]
+    fn unreadable_selection_context_names_the_failure() {
+        let cfg = thegn_core::config::Config {
+            env: std::collections::BTreeMap::from([(
+                "m0".into(),
+                thegn_core::config::EnvConfig {
+                    placement: thegn_core::config::PlacementMode::Provider,
+                    ..thegn_core::config::EnvConfig::default()
+                },
+            )]),
+            ..thegn_core::config::Config::default()
+        };
+        assert_eq!(
+            unreadable_selection_context(&cfg, &anyhow::anyhow!("database is locked")),
+            vec![
+                ("env".into(), "unknown".into()),
+                (
+                    "selection".into(),
+                    "could not be read: database is locked".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_selection_context_is_empty_for_a_local_only_config() {
+        assert!(
+            unreadable_selection_context(
+                &thegn_core::config::Config::default(),
+                &anyhow::anyhow!("database is locked"),
+            )
+            .is_empty()
+        );
     }
 }
