@@ -655,6 +655,11 @@ the first and counting the rest. An unchanged set does not repeat it.
 A VPS or Fly `max_instances` cap
 counts sandboxes for the same provider account; records without an account or
 that cannot be read count against every account.
+
+On the dev channel, the Fly backend strictly parses an app's machine list and
+rejects malformed lists or duplicate machine IDs. If more than one live
+thegn-managed machine is present, it refuses to choose one.
+
 Machine0 creates and restores are serialized across thegn processes by an
 owner-only lock in the VPS registry. A create that cannot get the lock within
 the six-minute readiness budget is refused with a busy message.
