@@ -2497,6 +2497,7 @@ fn permissioned_launch_is_command_scoped_and_never_touches_the_repository() {
     use crate::daemon::agent_open::command_for;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+    use thegn_core::store::WorkspaceStore;
 
     with_temp_state("the440-perm-seam", || {
         // Initialize the isolated database schema before concurrent launch
@@ -2560,6 +2561,24 @@ fn permissioned_launch_is_command_scoped_and_never_touches_the_repository() {
             std::fs::write(wt.join(".claude/settings.local.json"), user_bytes).unwrap();
         });
         let worktrees = [&wt_leaf, &wt_dir, &wt_fifo, &wt_user];
+
+        // launch_spec_full reads the saved sandbox override through the state
+        // store. Seed this fixture through the same migrated store API used by
+        // the other launch tests so the permissioned launch reaches its argv
+        // assertions instead of failing on an absent `worktrees` table.
+        let db = Db::open().unwrap();
+        for (index, worktree) in worktrees.iter().enumerate() {
+            let worktree = worktree.to_string_lossy();
+            db.put_worktree(
+                &format!("app/wt-{index}"),
+                "/x/app",
+                &worktree,
+                "tg/wt",
+                None,
+                None,
+            )
+            .unwrap();
+        }
 
         let mut cfg = cfg_with(&[("worker", "claude")], &[]);
         cfg.agents[0].permissions = vec!["Read".into()];
@@ -2822,4 +2841,46 @@ fn compose_guard_protects_host_credentials_sockets_state_runtime_and_extra_paths
             "missing protected path {path:?}"
         );
     }
+}
+
+#[test]
+fn launch_state_gate_refuses_a_configured_agent() {
+    let agent_cfg = cfg_with(&[("codex", "codex")], &[]);
+    let error = anyhow::anyhow!("disk I/O error");
+    let result = launch_state_gate(&agent_cfg, "codex", "saved override unreadable", &error);
+    let Err(error) = result else {
+        panic!("configured agent must be refused");
+    };
+    let detail = format!("{error:#}");
+    assert!(detail.contains("refusing to launch `codex`"), "{detail}");
+    assert!(detail.contains("saved override unreadable"), "{detail}");
+    assert!(detail.contains("disk I/O error"), "{detail}");
+
+    let tool_cfg = cfg_with(&[], &[("lazygit", "lazygit")]);
+    let error = anyhow::anyhow!("disk I/O error");
+    let result = launch_state_gate(&tool_cfg, "lazygit", "saved override unreadable", &error);
+    let Err(error) = result else {
+        panic!("configured tool must be refused");
+    };
+    let detail = format!("{error:#}");
+    assert!(detail.contains("refusing to launch `lazygit`"), "{detail}");
+    assert!(detail.contains("saved override unreadable"), "{detail}");
+    assert!(detail.contains("disk I/O error"), "{detail}");
+}
+
+#[test]
+fn launch_state_gate_lets_a_shell_launch_with_a_warning() {
+    let cfg = cfg_with(&[("codex", "codex")], &[]);
+    let error = anyhow::anyhow!("disk I/O error");
+    assert!(launch_state_gate(&cfg, "shell", "saved override unreadable", &error).is_ok());
+}
+
+#[test]
+fn repo_slug_checked_is_none_without_a_directory_name() {
+    let db = Db::open_memory().unwrap();
+    assert_eq!(repo_slug_checked(&db, Path::new("/")).unwrap(), None);
+    assert_eq!(
+        repo_slug_checked(&db, Path::new("/tmp/x/foo")).unwrap(),
+        Some("foo".to_string())
+    );
 }

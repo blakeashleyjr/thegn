@@ -4024,7 +4024,18 @@ pub fn launch_spec_full(
     let eff_agent = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage).ok();
 
     // One DB handle for the whole spec resolution (each open re-runs pragmas).
-    let db = Db::open().ok(); // best-effort: cache: choice recording and repo-root/sandbox lookups all fall back to local git below
+    let db = match Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            launch_state_gate(
+                cfg,
+                choice,
+                "the state database could not be opened, so this worktree's saved sandbox override and credential-overlay gate cannot be checked",
+                &error,
+            )?;
+            None
+        }
+    }; // best-effort for shells: choice recording and repo-root lookups fall back to local git below
 
     // Record the choice for the dashboard / `--resume` (keyed by worktree path).
     // Two launches are deliberately NOT recorded as the worktree's remembered
@@ -4032,15 +4043,29 @@ pub fn launch_spec_full(
     // their dotfiles), and tool drawers (yazi/lazygit/editor/diff) — those are
     // overlays, not the worktree's agent, and are auto-prewarmed on every switch,
     // so recording them would clobber the real choice on every worktree.
-    let saved_backend = db.as_ref().and_then(|db| {
-        if !extras.suppress_agent_record
-            && choice != "clean-shell"
-            && cfg.tool_command(choice).is_none()
-        {
-            let _ = db.set_worktree_agent(worktree, choice); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let saved_backend = match db.as_ref() {
+        Some(db) => {
+            if !extras.suppress_agent_record
+                && choice != "clean-shell"
+                && cfg.tool_command(choice).is_none()
+            {
+                let _ = db.set_worktree_agent(worktree, choice); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
+            match db.worktree_sandbox(worktree) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    launch_state_gate(
+                        cfg,
+                        choice,
+                        "this worktree's saved sandbox override could not be read",
+                        &error,
+                    )?;
+                    None
+                }
+            }
         }
-        db.worktree_sandbox(worktree).ok().flatten()
-    });
+        None => None,
+    };
 
     // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
     // DB (carries remote worktrees with no local cwd), else climb from the path.
@@ -4134,9 +4159,17 @@ pub fn launch_spec_full(
     // of a terminal.
     if !loc.is_remote()
         && let Some(db) = db.as_ref()
-        && let Some(slug) = repo_slug(db, &repo_root)
     {
-        credential_overlay_gate(cfg, db, &slug, choice)?;
+        match repo_slug_checked(db, &repo_root) {
+            Ok(Some(slug)) => credential_overlay_gate(cfg, db, &slug, choice)?,
+            Ok(None) => {}
+            Err(error) => launch_state_gate(
+                cfg,
+                choice,
+                "the workspace slug for the credential-overlay gate could not be read",
+                &error,
+            )?,
+        }
     }
     let resolved = (!loc.is_remote())
         .then_some(db.as_ref())
@@ -4496,12 +4529,7 @@ pub(crate) fn credential_overlay_gate(
     // program maps to a known account provider: `env_bundle` redirects HOME for
     // ANY of them, which is exactly the credential the refused block pinned. A
     // choice that is not a configured entry (a shell) always launches.
-    let configured = cfg
-        .agents
-        .iter()
-        .chain(cfg.tools.iter())
-        .any(|entry| entry.name == choice);
-    if !configured {
+    if !is_configured_entry(cfg, choice) {
         return Ok(());
     }
     if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
@@ -4518,12 +4546,7 @@ pub(crate) fn dotfiles_launch_gate(
     choice: &str,
     failure: anyhow::Error,
 ) -> anyhow::Result<()> {
-    let configured = cfg
-        .agents
-        .iter()
-        .chain(cfg.tools.iter())
-        .any(|entry| entry.name == choice);
-    if configured {
+    if is_configured_entry(cfg, choice) {
         let detail = format!("{failure:#}");
         return Err(failure.context(format!(
             "refusing to launch `{choice}`: its bundle HOME could not be prepared: {detail}"
@@ -4533,11 +4556,39 @@ pub(crate) fn dotfiles_launch_gate(
     Ok(())
 }
 
+fn is_configured_entry(cfg: &Config, choice: &str) -> bool {
+    cfg.agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .any(|entry| entry.name == choice)
+}
+
+pub(crate) fn launch_state_gate(
+    cfg: &Config,
+    choice: &str,
+    what: &str,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    if is_configured_entry(cfg, choice) {
+        anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");
+    }
+    thegn_core::msg::warn(&format!("{what}: {error:#}; the shell launches without it"));
+    Ok(())
+}
+
 /// The persisted slug for a repo root (for per-workspace account defaults), or
 /// `None` if the DB has no slug yet.
 pub(crate) fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
-    let base = repo_root.file_name()?.to_string_lossy().into_owned();
-    db.slug_for_repo(&repo_root.to_string_lossy(), &base).ok()
+    repo_slug_checked(db, repo_root).ok().flatten()
+}
+
+pub(crate) fn repo_slug_checked(db: &Db, repo_root: &Path) -> anyhow::Result<Option<String>> {
+    let Some(file_name) = repo_root.file_name() else {
+        return Ok(None);
+    };
+    let base = file_name.to_string_lossy().into_owned();
+    db.slug_for_repo(&repo_root.to_string_lossy(), &base)
+        .map(Some)
 }
 
 fn sandbox_candidates(
