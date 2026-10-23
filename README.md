@@ -1,19 +1,20 @@
 # thegn
 
 > **Status: public alpha** (`0.1.0-alpha.34`). **x86_64 Linux is the supported
-> platform.** macOS on Apple silicon is best-effort: an unsigned release archive
-> and the flake are available, but CI is opt-in and the interactive on-device
-> checklist is unfinished. Windows is deferred and has no release binary.
+> platform.** macOS on Apple silicon is best-effort: use the flake or source
+> setup until a release archive is published. CI is opt-in and the
+> interactive on-device checklist is unfinished. Windows is deferred and has no release binary.
 > Expect rough edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
-One session: each git repo is a **project**, each git **worktree** is a
-**tab**, and the chrome — a left sidebar tree, a right diff/PR panel, masthead,
+One session: each git repo is a **project**, and each git **worktree** gets
+its own tabs. The chrome — a left sidebar tree, a right diff/PR panel, masthead,
 statusbar, and a pinned-program strip — is rendered in-process by a native
-compositor. No plugins, no external multiplexer. (thegn was originally built
-on zellij; that architecture was fully stripped and it is now a from-scratch
-native compositor.)
+compositor. It has no external multiplexer; `[[plugins]]` extensions run as
+native, unsandboxed processes (see the [plugins help page](docs/help/plugins.md)).
+(thegn was originally built on zellij; that architecture was fully stripped
+and it is now a from-scratch native compositor.)
 
 A single **Rust** binary (`thegn`, with a short `tg` alias) drives
 portable-pty panes, composites them with the chrome into a termwiz surface,
@@ -21,8 +22,9 @@ and diff-flushes to your terminal. Panes are owned by a background **pane
 daemon**, so quitting the UI detaches your sessions and the next launch
 reattaches them, scrollback intact (tmux semantics — disable with `[daemon]
 enabled = false`). A bundled SQLite store keeps repo history, worktree state,
-session layout, and a PR cache. Everything is instant by construction:
-sub-300ms launch, <16ms renders, ~0% idle CPU.
+session layout, and a PR cache. Design targets are sub-300ms launch,
+<16ms renders, and near-zero idle CPU; measure with `just bench` and
+`just bench-idle`.
 
 ## Mental model
 
@@ -32,13 +34,13 @@ never a session change.
 | Concept       | Maps to                       | Created / toggled by                                                    |
 | ------------- | ----------------------------- | ----------------------------------------------------------------------- |
 | **Project**   | a repo                        | `Alt-W` — pick/clone a repo                                             |
-| **Worktree**  | a git worktree = a tab        | `Alt-w` — new worktree off the base branch, then a "what to run" picker |
+| **Worktree**  | git worktree (own tabs)       | `Alt-w` — new worktree off the base branch, then a "what to run" picker |
 | **Pane**      | a terminal split within a tab | `Alt-p` smart split (`Alt-n` down, `Alt-N` right)                       |
-| **Sidebar**   | native left tree              | repo → worktree → tabs; `Alt-s` focus, `Ctrl-Alt-s` hide                |
+| **Sidebar**   | native left tree              | repo → worktree; tabs in tabbar; `Alt-s` focus, `Ctrl-Alt-s` hide       |
 | **Diff / PR** | native right panel            | tracks the focused worktree; `Alt-.` focus, `Ctrl-Alt-p` hide           |
 | **Pins**      | daemon panes in a top strip   | `Ctrl-Alt-1..9` launch/focus a `[[pins]]` program                       |
 
-- **Worktree = tab.** `Alt-w` creates a new git worktree off the base branch,
+- **Worktree tabs.** `Alt-w` creates a new git worktree off the base branch,
   opens a tab named after the branch, and prompts for what to run there — a
   plain shell, or any configured `[[agents]]` / `[[tools]]` entry (claude,
   aider, …) launched as an ordinary command — optionally inside a sandbox
@@ -113,7 +115,8 @@ familiar IDE chords._
 ### Nix / home-manager (recommended)
 
 On x86_64 Linux, the flake is a supported install path alongside the release
-tarball. `nix profile install` works from any Git ref.
+tarball (once published; see [Prebuilt binary](#prebuilt-binary-no-nix)).
+`nix profile install` works from any Git ref.
 
 ```nix
 # flake.nix inputs
@@ -224,9 +227,9 @@ the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
 
 ### Prebuilt binary (no Nix)
 
-Release archives are available on the [releases page][releases] for
-**x86_64 Linux** (GNU or musl) and best-effort **Apple silicon**
-(`aarch64-apple-darwin`). On Linux x86_64, install the GNU or musl archive for
+Release archives are attached to [each published release][releases], starting
+with the first published alpha tag; until then use the flake or `./install.sh`.
+On Linux x86_64, install the GNU or musl archive for
 your system. For example, with GitHub CLI installed and authenticated
 (`gh auth login`), this downloads the GNU archive and its checksum for the
 newest published release:
@@ -260,9 +263,9 @@ SSH integration where native support has gaps. Diff highlighting is built in;
 `lazygit` (the embedded Git UI) is optional.
 
 **On macOS, prefer Nix or a local source build.** Homebrew and AUR publication
-are pending owner setup and a clean-host rehearsal. The macOS archive is
-deliberately unsigned, and
-a tarball downloaded through a browser is quarantined by Gatekeeper — it needs
+are pending owner setup and a clean-host rehearsal. If a macOS archive is
+published, it is deliberately unsigned, and a tarball downloaded through a
+browser is quarantined by Gatekeeper — it needs
 `xattr -dr com.apple.quarantine ./thegn` before it will launch. Homebrew formula
 downloads, if published, Nix store paths, and the locally generated `thegn.app`
 are not quarantined, so none of them hit that. The reasoning is in
@@ -315,9 +318,9 @@ prebuilt `.app` would need Developer ID signing and notarization first. Re-run
 after moving or reinstalling the binary (the launcher falls back to searching
 the usual prefixes, but the baked path is what it prefers).
 
-**macOS is best-effort; Windows is deferred.** On Apple silicon, the unsigned
-macOS release archive and flake are available, but CI is opt-in and the
-interactive on-device checklist is unfinished (see
+**macOS is best-effort; Windows is deferred.** Until a macOS release archive
+is published, use the flake or source setup;
+CI is opt-in and the interactive on-device checklist is unfinished (see
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Windows has no release binary; source
 build notes below are for contributors, not a supported install path:
 
@@ -341,11 +344,13 @@ Reports from either platform are welcome.
 - **Fully event-driven.** The loop blocks on terminal input with no tick or
   timeout; PTY readers, hydration, and fs-watchers wake it over channels. A
   damage-region render planner repaints only what changed — pane output costs
-  a bounded diff, not a chrome recompose. Idle CPU is ~0% by contract.
+  a bounded diff, not a chrome recompose. Idle cost is therefore near zero
+  (measured with `just bench-idle`, not guaranteed).
 - **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL): repos,
   workspaces, worktrees, PR cache, layouts, session state. **git is the source
   of truth** for worktrees; the DB is a cache + resurrection layer. Restarting
-  restores your exact workspace/worktree/pane position.
+  restores your workspace, worktree and pane layout (after a crash the active
+  tab can be one switch stale; see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)).
 - **Worktrees** default to `~/.thegn/worktrees/<repo>/<branch-slug>`;
   `worktree_mode = "in_repo"` uses `<repo>/.worktrees`.
 
@@ -358,9 +363,9 @@ queue), `disk` / `clean` (per-worktree disk usage / reclaim `target/`),
 `share`, `forward`, `notify`, `logs`, `doctor`. `--profile <name>`
 runs everything under a separate whole-process profile (own state/DB/config).
 
-`thegn mcp serve` runs thegn as a read-only **MCP server** so a coding agent can
-learn how thegn works — search/read the built-in help, the effective keymap, the
-config reference, and your current (secret-redacted) config. Register it with
+`thegn mcp serve` is read-only by default: it serves docs and live state
+(sessions, worktrees, leases). `--scopes write` and `--scopes git` grant
+mutating tools. Register it with
 `claude mcp add thegn -- thegn mcp serve` (see [`docs/cli.md`](docs/cli.md)).
 
 ## Config
@@ -416,18 +421,24 @@ environment and exactly which features are enabled vs degraded.
 ## Sandboxing worktrees
 
 By default each worktree's interactive process (agent / shell / tools) runs
-inside a container or sandbox, so a coding agent can't reach your whole
-machine. The worktree stays on the host and is **bind-mounted at its real
-path**, so host-side git reads (sidebar, panel, PR) keep working.
+inside a container or sandbox. With the default `standard` profile, files
+outside the worktree are read-only apart from a few carved-back state
+directories (see the [sandboxing help page](docs/help/sandboxing.md)); `$HOME`
+remains readable, credentials included. Use `sealed` for confidentiality. The
+worktree stays on the host and is **bind-mounted at its real path**, so host-side
+git reads (sidebar, panel, PR) keep working.
 
 - **Backends** (`[sandbox] backend`): `auto` walks `backend_chain` —
-  `podman` (rootless, preferred) → `docker` → `bwrap` (lightweight, reuses
-  host tools, no image) → host. `systemd`, `apple` (macOS `container`), and
-  `wsl` are also selectable. Hardening presets: `open` / `standard` (default)
+  `podman-rootless` → `podman-rootful` → `docker` → `apple` (macOS `container`)
+  → `bwrap` → `jobobject` (Windows Job Objects). `apple` and `jobobject` probe
+  absent off their respective OSes. There is no host fallback; a launch with
+  no usable backend refuses. `systemd` and `wsl` are also selectable
+  explicitly. Hardening presets: `open` / `standard` (default)
   / `sealed` (no network, read-only root, all caps dropped).
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
-  selects them. _(Non-local placement is **dev channel only** — see Channels.)_
+  selects them. _(SSH and managed-provider placement are **dev channel only** —
+  see Channels.)_
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over
   **ssh**; composes with the container backends. _(**Dev channel only.**)_
@@ -442,7 +453,8 @@ Linux x86_64 Nix flake — ships the shell described above. A source checkout ca
 also build and install it with `./install.sh`. A set of experimental
 subsystems is compiled in but **clamped off** outside the dev channel:
 
-- remote worktrees over SSH and named non-local environments,
+- remote worktrees over SSH and named environments over SSH or managed
+  providers,
 - cloud execution providers and the managed pool,
 - the Observe dashboards,
 - the placement engine,
