@@ -955,7 +955,7 @@ fn run_checked(
     }
 }
 
-fn key_id(public_key: &str) -> Result<(String, String)> {
+pub(crate) fn key_id(public_key: &str) -> Result<(String, String)> {
     let mut fields = public_key.split_whitespace();
     let key_type = fields
         .next()
@@ -986,7 +986,7 @@ fn awk_key_match(key_id: &(String, String), program: &str) -> String {
     )
 }
 
-fn authorize_script(public_key: &str, key_id: &(String, String)) -> Result<String> {
+pub(crate) fn authorize_script(public_key: &str, key_id: &(String, String)) -> Result<String> {
     let matcher = awk_key_match(
         key_id,
         "{ if (key_matches()) found = 1 } END { if (found) exit 0; exit 1 }",
@@ -1010,6 +1010,22 @@ fn authorize_script(public_key: &str, key_id: &(String, String)) -> Result<Strin
              printf '%s\\n' {key} >> \"$f\"\n\
          fi"
     ))
+}
+
+/// Probe whether the decoded managed key is authorized: exit 0 present, 1 absent, 2 when
+/// authorized_keys is a symlink, missing or not a regular file. Comment lines never count;
+/// option-prefixed lines do.
+pub(crate) fn authorized_probe_script(key_id: &(String, String)) -> String {
+    let probe = awk_key_match(
+        key_id,
+        "{ if (key_matches()) found = 1 } END { if (found) exit 0; exit 1 }",
+    );
+    format!(
+        "set -eu\n\
+         f=\"$HOME/.ssh/authorized_keys\"\n\
+         if [ -L \"$f\" ] || [ ! -f \"$f\" ]; then printf '%s\\n' 'TG-AUTHKEYS-ERROR:authorized_keys is not a regular file' >&2; exit 2; fi\n\
+         {probe} \"$f\""
+    )
 }
 
 fn deauthorize_script(key_id: &(String, String)) -> Result<String> {
@@ -1486,6 +1502,75 @@ mod tests {
         };
         assert!(!output.status.success());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn authorized_probe_ignores_a_commented_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let path = ssh.join("authorized_keys");
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        std::fs::write(&path, "# ssh-ed25519 AAAATARGET old-comment\n").unwrap();
+        let key = key_id(public).unwrap();
+        let script = authorized_probe_script(&key);
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert_eq!(output.status.code(), Some(1));
+
+        std::fs::write(&path, "# ssh-ed25519 AAAATARGET new-comment\n").unwrap();
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert_eq!(output.status.code(), Some(1));
+    }
+
+    #[test]
+    fn authorized_probe_finds_the_key_under_options_and_another_comment() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(
+            ssh.join("authorized_keys"),
+            "from=\"10.0.0.1\" ssh-ed25519 AAAATARGET other\n",
+        )
+        .unwrap();
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        let script = authorized_probe_script(&key_id(public).unwrap());
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "option-prefixed authorized key with another comment is present"
+        );
+    }
+
+    #[test]
+    fn authorized_probe_refuses_a_symlinked_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(
+            temp.path().join("target"),
+            "ssh-ed25519 AAAATARGET new-comment\n",
+        )
+        .unwrap();
+        let Some(link_output) = run_local_sh(
+            temp.path(),
+            "ln -s \"$HOME/target\" \"$HOME/.ssh/authorized_keys\"",
+        ) else {
+            return;
+        };
+        assert!(link_output.status.success());
+        let public = "ssh-ed25519 AAAATARGET new-comment";
+        let script = authorized_probe_script(&key_id(public).unwrap());
+        let Some(output) = run_local_sh(temp.path(), &script) else {
+            return;
+        };
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("TG-AUTHKEYS-ERROR"));
     }
 
     #[test]
