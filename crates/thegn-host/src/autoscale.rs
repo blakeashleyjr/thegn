@@ -186,15 +186,22 @@ fn engine_host_config(name: &str, ip: &str) -> Result<HostConfig> {
     })
 }
 
-/// Binding for an engine host def persisted this session (the loaded Config
-/// predates `put_host_def`, so synthesize from the DB row).
-pub(crate) fn db_host_binding(name: &str) -> Option<HostBinding> {
-    let db = Db::open().ok()?;
-    let defs = db.host_defs().ok()?;
-    let (_, hc) = defs.into_iter().find(|(n, _)| n == name)?;
+/// The def + binding for an engine host persisted this session (the loaded
+/// Config predates `put_host_def`, so synthesize from the DB row). A failed
+/// read is an error, never "no such host".
+pub(crate) fn db_host_def(
+    db: &Db,
+    name: &str,
+) -> anyhow::Result<Option<(HostConfig, HostBinding)>> {
+    let defs = db
+        .host_defs()
+        .with_context(|| format!("read the engine host def for {name}"))?;
+    let Some((_, hc)) = defs.into_iter().find(|(n, _)| n == name) else {
+        return Ok(None);
+    };
     let mut c = Config::default();
-    c.host.insert(name.to_string(), hc);
-    c.host_binding(name)
+    c.host.insert(name.to_string(), hc.clone());
+    Ok(c.host_binding(name).map(|binding| (hc, binding)))
 }
 
 /// Stamp a lane cooldown (escalating per consecutive failure, capped).
@@ -664,6 +671,33 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.len() <= 63);
         assert!(thegn_svc::vps::registry::checked_name(&first).is_ok());
+    }
+
+    #[test]
+    fn db_host_def_finds_a_def_persisted_after_config_load() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let name = "tg-auto-cx32-0000000000000001";
+        let hc = HostConfig {
+            reach: HostReach::Local,
+            ..HostConfig::default()
+        };
+        db.put_host_def(name, &hc, 1).unwrap();
+
+        let found = db_host_def(&db, name).unwrap();
+        assert!(matches!(found, Some((_, binding)) if binding.id == HostId::named(name)));
+    }
+
+    #[test]
+    fn db_host_def_is_none_for_an_unknown_name() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+
+        assert!(
+            db_host_def(&db, "tg-auto-cx32-0000000000000001")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
