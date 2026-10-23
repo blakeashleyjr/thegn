@@ -66,6 +66,13 @@ same destination reclaims it only when its process is gone and the directory
 is owned by you. Live clones, symlinks and other paths are left alone, and a
 failed cleanup does not fail the new clone.
 
+A clone keeps the destination's parent directory open while it runs and
+promotes the staged clone relative to that directory without replacing an
+existing destination. If the parent is replaced during the clone, promotion
+is refused and the staging directory is left for the startup sweep. A
+configured workspace directory that is itself a symlink still works; thegn
+resolves it first.
+
 Lifecycle hooks apply to every creation door, including the wizard, `wt new`,
 issue dispatch, and the daemon's `worktrees.create` request. A blocking
 `pre_create` leaves both git and the database unchanged. The wizard schedules
