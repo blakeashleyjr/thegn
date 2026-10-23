@@ -55,7 +55,7 @@ pub(crate) enum PasteImageOutcome {
 /// or remote), sweep stale drops, and send a [`PasteImageOutcome`] + waker pulse.
 ///
 /// `worktree` is the focused tab's worktree path (used to resolve the pane's
-/// `GitLoc` **off-loop** — `GitLoc::for_worktree` opens the DB); `pane` is echoed
+/// `GitLoc` **off-loop** — `GitLoc::for_worktree_checked` opens the DB); `pane` is echoed
 /// back so the loop pastes into the right pane even if focus moved.
 pub(crate) fn spawn(
     worktree: PathBuf,
@@ -96,13 +96,8 @@ fn run(worktree: &Path, pane: u32, cfg: &ClipboardConfig) -> PasteImageOutcome {
 
     let name = drop_filename();
     // Resolving the location opens the DB — correctly off-loop here.
-    let loc = GitLoc::for_worktree(worktree);
     let n = bytes.len();
-    let result = if loc.is_remote() {
-        remote_drop(&loc, cfg, &name, &bytes).map(|path| (path, true))
-    } else {
-        local_drop(cfg, &name, &bytes).map(|path| (path, false))
-    };
+    let result = drop_bytes(worktree, cfg, &name, &bytes);
     match result {
         Ok((path, remote)) => {
             tracing::debug!(target: "thegn::paste", bytes = n, remote, "clipboard image dropped");
@@ -114,6 +109,24 @@ fn run(worktree: &Path, pane: u32, cfg: &ClipboardConfig) -> PasteImageOutcome {
             }
         }
         Err(reason) => PasteImageOutcome::Failed { reason },
+    }
+}
+
+fn drop_bytes(
+    worktree: &Path,
+    cfg: &ClipboardConfig,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(String, bool), String> {
+    let loc = GitLoc::for_worktree_checked(worktree).map_err(|error| {
+        format!(
+            "paste refused: cannot read where this worktree lives ({error}); the image was not written"
+        )
+    })?;
+    if loc.is_remote() {
+        remote_drop(&loc, cfg, name, bytes).map(|path| (path, true))
+    } else {
+        local_drop(cfg, name, bytes).map(|path| (path, false))
     }
 }
 
@@ -333,6 +346,41 @@ pub(crate) fn resolve(outcome: PasteImageOutcome) -> (Option<(u32, String)>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_refuses_when_the_location_is_unreadable() {
+        let state = crate::testenv::IsolatedState::with_runtime_dir();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let result = drop_bytes(
+            wt.path(),
+            &ClipboardConfig::default(),
+            "img-test-aa.png",
+            b"png",
+        );
+
+        assert!(matches!(result, Err(ref message) if message.contains("paste refused")));
+        assert!(!local_drop_dir().join("img-test-aa.png").exists());
+    }
+
+    #[test]
+    fn drop_writes_locally_for_a_readable_local_worktree() {
+        let _state = crate::testenv::IsolatedState::with_runtime_dir();
+        let _db = thegn_core::db::Db::open().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+
+        let result = drop_bytes(
+            wt.path(),
+            &ClipboardConfig::default(),
+            "img-test-aa.png",
+            b"png",
+        );
+
+        let (path, remote) = result.unwrap();
+        assert!(!remote);
+        assert_eq!(std::fs::read(path).unwrap(), b"png");
+    }
 
     #[test]
     fn rand_token_is_alnum_and_right_length() {
