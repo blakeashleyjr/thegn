@@ -24,6 +24,33 @@ use thegn_core::mcp::protocol::JsonRpcResponse;
 
 use crate::provider::{CONTROL_TIMEOUT, transient_status};
 
+#[derive(Debug)]
+pub(super) struct DefiniteRefusal(String);
+
+impl DefiniteRefusal {
+    pub(super) fn new(message: String) -> Self {
+        Self(message)
+    }
+}
+
+impl std::fmt::Display for DefiniteRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DefiniteRefusal {}
+
+pub(super) fn is_definite_refusal(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DefiniteRefusal>().is_some()
+}
+
+fn definite_refusal_status(status: reqwest::StatusCode) -> bool {
+    status.is_client_error()
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Whether a reqwest transport error is worth retrying. Broader than the shared
 /// `provider::transient_err`: it also covers a generic "error sending request"
 /// (`is_request`) — the failure mode when a **pooled keep-alive socket** to the
@@ -248,6 +275,9 @@ impl Mcp0Client {
                             tokio::time::sleep(BACKOFF).await;
                             continue;
                         }
+                        if definite_refusal_status(status) {
+                            return Err(DefiniteRefusal::new(last).into());
+                        }
                         return Err(anyhow!(last));
                     }
                     let text =
@@ -372,10 +402,10 @@ pub fn unwrap_tool_result(result: Value) -> Result<Value> {
     let text = first_text_content(&result);
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
         let raw = text.unwrap_or_else(|| result.to_string());
-        // machine0 delivers business errors as an `isError` text block whose body
-        // is `{"error":CODE,"message":MSG}` (e.g. MACHINE_LIMIT_REACHED). Render
-        // that as `CODE: MSG` so the user sees the reason, not a raw JSON blob;
-        // fall back to the raw text for any other error shape.
+        if let Some(message) = business_error_refusal(&raw) {
+            return Err(DefiniteRefusal::new(message).into());
+        }
+        // Unrecognized tool errors retain the existing human-readable message.
         return Err(anyhow!(business_error_message(&raw)));
     }
     if let Some(sc) = result.get("structuredContent")
@@ -388,6 +418,16 @@ pub fn unwrap_tool_result(result: Value) -> Result<Value> {
         // No content at all — hand back the raw result so callers can inspect it.
         None => Ok(result),
     }
+}
+
+fn business_error_refusal(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let code = value.get("error").and_then(Value::as_str)?;
+    let message = value.get("message").and_then(Value::as_str);
+    Some(match message {
+        Some(message) if message != code => format!("{code}: {message}"),
+        _ => code.to_string(),
+    })
 }
 
 /// Turn a machine0 error text block into a human message. When it is the
@@ -628,6 +668,7 @@ mod tests {
             "content": [{"type":"text","text":"{\"error\":\"MACHINE_LIMIT_REACHED\",\"message\":\"machine limit reached\"}"}],
         });
         let e = unwrap_tool_result(result).unwrap_err();
+        assert!(is_definite_refusal(&e));
         assert_eq!(
             e.to_string(),
             "MACHINE_LIMIT_REACHED: machine limit reached"
@@ -755,5 +796,19 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[test]
+    fn only_nontransient_http_client_errors_are_definite_refusals() {
+        assert!(definite_refusal_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!definite_refusal_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(!definite_refusal_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!definite_refusal_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 }

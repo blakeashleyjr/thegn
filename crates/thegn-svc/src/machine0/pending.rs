@@ -48,7 +48,8 @@ pub(super) fn remove_at(registry: &Path, name: &str) -> Result<()> {
 }
 
 /// Every valid pending filename, even if its contents cannot be read or parsed.
-/// Non-JSON entries and entries with invalid names are skipped.
+/// Non-JSON entries are skipped; a `.json` entry with an invalid name stem is
+/// foreign and ignored.
 pub(super) fn names_at(registry: &Path) -> Result<Vec<String>> {
     let Some(pending_dir) = crate::vps::registry::open_machine0_pending_dir_at(registry)? else {
         return Ok(Vec::new());
@@ -77,6 +78,7 @@ pub(super) fn names_at(registry: &Path) -> Result<Vec<String>> {
 pub(super) enum Admission {
     Create,
     Adopt,
+    Unresolved,
 }
 
 #[cfg(test)]
