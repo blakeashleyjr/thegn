@@ -1951,6 +1951,28 @@ pub(crate) fn verify_v93_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v94: merge_queue.enqueue_common_dir + enqueue_admin_dir, the repository and linked-worktree identity captured at a local enqueue (THE-230).
+pub(crate) fn migrate_v94(conn: &Connection) -> Result<()> {
+    for column in ["enqueue_common_dir", "enqueue_admin_dir"] {
+        if !has_column(conn, "merge_queue", column) {
+            conn.execute(
+                &format!("ALTER TABLE merge_queue ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v94_schema(conn: &Connection) -> Result<()> {
+    for column in ["enqueue_common_dir", "enqueue_admin_dir"] {
+        if !has_column(conn, "merge_queue", column) {
+            bail!("schema v94 migration did not add merge_queue.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -2399,7 +2421,7 @@ mod tests {
     use crate::db::Db;
     use crate::store::{
         AutopilotStore, CalendarRow, CalendarStore, ClaimOutcome, NotificationStore,
-        SessionForkStore, WorkspaceStore,
+        SessionForkStore, WorkspaceStore, WorktreeAuxStore,
     };
     use rusqlite::{Connection, params};
 
@@ -3084,6 +3106,72 @@ mod tests {
         }
         let upgraded = Db::open_at(&path).unwrap();
         super::verify_v87_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v94_adds_merge_enqueue_identity_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v94_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE merge_queue (worktree TEXT PRIMARY KEY, branch TEXT NOT NULL);
+             PRAGMA user_version = 93;",
+        )
+        .unwrap();
+        for column in ["enqueue_common_dir", "enqueue_admin_dir"] {
+            assert!(!has_column(&conn, "merge_queue", column));
+        }
+        assert!(super::verify_v94_schema(&conn).is_err());
+        super::migrate_v94(&conn).unwrap();
+        super::migrate_v94(&conn).unwrap();
+        super::verify_v94_schema(&conn).unwrap();
+        for column in ["enqueue_common_dir", "enqueue_admin_dir"] {
+            assert!(has_column(&conn, "merge_queue", column));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v93.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.enqueue_merge_candidate(
+                "/private/repo/feature",
+                "feature",
+                "main",
+                &crate::store::MergeCandidate {
+                    branch_ref: "refs/heads/feature".into(),
+                    candidate_oid: "a".repeat(40),
+                },
+            )
+            .unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE merge_queue DROP COLUMN enqueue_admin_dir;
+                     ALTER TABLE merge_queue DROP COLUMN enqueue_common_dir;
+                     PRAGMA user_version=93;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        super::verify_v94_schema(upgraded.conn()).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(
+            upgraded.merge_candidate("/private/repo/feature").unwrap(),
+            Some(crate::store::MergeCandidate {
+                branch_ref: "refs/heads/feature".into(),
+                candidate_oid: "a".repeat(40),
+            })
+        );
+        assert_eq!(
+            upgraded
+                .merge_enqueue_identity("/private/repo/feature")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
