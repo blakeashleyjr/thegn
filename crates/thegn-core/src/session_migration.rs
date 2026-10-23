@@ -391,21 +391,6 @@ impl<'de> serde::de::Visitor<'de> for NoDuplicateKeysVisitor {
         Ok(())
     }
 
-    fn visit_string<E>(self, _value: String) -> Result<(), E> {
-        Ok(())
-    }
-
-    fn visit_none<E>(self) -> Result<(), E> {
-        Ok(())
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<(), D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        NoDuplicateKeys.deserialize(deserializer)
-    }
-
     fn visit_seq<A>(self, mut sequence: A) -> Result<(), A::Error>
     where
         A: serde::de::SeqAccess<'de>,
@@ -1170,7 +1155,7 @@ mod tests {
         assert_eq!(check_bundle_bounds(&bundle), Ok(()));
 
         bundle.groups[0].tabs[0].pane_cwds =
-            r#"[true,false,null,1,1.5,"text",{"nested":[]}]"#.into();
+            r#"[true,false,null,-1,1,1.5,"text",{"nested":[]}]"#.into();
         assert_eq!(check_bundle_bounds(&bundle), Ok(()));
 
         // An unterminated string ending in an escape remains opaque legacy text.
@@ -1184,6 +1169,34 @@ mod tests {
         bundle.groups[0].tabs[0].pane_sessions =
             r#"{"1":{"session":"a"},"2":{"session":"b"}}"#.into();
         assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+    }
+
+    #[test]
+    fn migration_bounds_error_display_is_stable_and_duplicate_key_truncates_on_char_boundary() {
+        assert_eq!(
+            MigrationBoundsError::TooLarge { bytes: 5, max: 4 }.to_string(),
+            "session bundle is 5 bytes; the limit is 4"
+        );
+        assert_eq!(
+            MigrationBoundsError::TooDeep {
+                group: "api".into(),
+                ordinal: 2,
+                field: "pane_tree",
+                max: 32,
+            }
+            .to_string(),
+            "group \"api\" tab 2 pane_tree nests deeper than 32"
+        );
+
+        let mut bundle = bundle();
+        let key = "é".repeat(100);
+        let encoded_key = serde_json::to_string(&key).unwrap();
+        bundle.groups[0].tabs[0].pane_sessions = format!("{{{encoded_key}:1,{encoded_key}:2}}");
+        let Err(error) = check_bundle_bounds(&bundle) else {
+            panic!("duplicate pane session key should be refused");
+        };
+        let message = error.to_string();
+        assert_eq!(message.matches('é').count(), 64);
     }
 
     #[test]
