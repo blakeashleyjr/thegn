@@ -184,7 +184,7 @@ fn registered_spelling(
     let target = canonical(resolved)?;
     let mut matches = registered.iter().filter(|path| {
         // Canonicalization is a best-effort identity probe; an unresolvable entry cannot match.
-        canonical(std::path::Path::new(path)) == Some(target.clone())
+        canonical(std::path::Path::new(path)).as_ref() == Some(&target)
     });
     let matched = matches.next()?;
     if matches.next().is_some() {
