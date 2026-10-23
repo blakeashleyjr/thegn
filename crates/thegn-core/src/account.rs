@@ -40,6 +40,9 @@ pub enum AccountHomeError {
     MalformedManifest { path: PathBuf },
     /// A managed account row points somewhere other than its canonical home.
     RelocatedManagedHome { stored: PathBuf, expected: PathBuf },
+    /// A new managed account's canonical home already exists (it may hold a forgotten account's
+    /// login).
+    HomeExists { path: PathBuf },
     /// A manifest-less legacy home may belong to another account with the same old slug.
     AmbiguousLegacyHome { path: PathBuf, aliases: Vec<String> },
     /// The requested provider is not account-switchable.
@@ -70,6 +73,11 @@ impl std::fmt::Display for AccountHomeError {
                 "managed account home {} is not the expected managed home {}; log in to the account again to recreate it (the old directory is left untouched)",
                 stored.display(),
                 expected.display()
+            ),
+            Self::HomeExists { path } => write!(
+                f,
+                "managed account home {} already exists and may hold another account's login; refusing to reuse it for a new account",
+                path.display()
             ),
             Self::AmbiguousLegacyHome { path, aliases } => write!(
                 f,
@@ -143,6 +151,31 @@ fn parse_owner_manifest(bytes: &[u8]) -> Option<(&str, String)> {
 /// Establish or verify the private, owner-bound credential home for an account.
 /// Legacy managed homes without a manifest are claimed on first use.
 pub fn ensure_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, AccountHomeError> {
+    ensure_managed_home_claiming(provider_id, name, &[])
+}
+
+/// Establish the credential home for a NEW managed account. Unlike
+/// [`ensure_managed_home`], an existing entry at the canonical path is never
+/// adopted: it may hold a removed account's login.
+pub fn create_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, AccountHomeError> {
+    if provider(provider_id).is_none() {
+        return Err(AccountHomeError::UnknownProvider {
+            provider: provider_id.to_owned(),
+        });
+    }
+    let path = managed_dir(provider_id, name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return Err(AccountHomeError::HomeExists { path }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(AccountHomeError::UnsafePath {
+                path,
+                error: error.to_string(),
+            });
+        }
+    }
+    // The existence check and creation are separate operations; the rooted
+    // private-directory helper still refuses unsafe path components.
     ensure_managed_home_claiming(provider_id, name, &[])
 }
 
@@ -1662,5 +1695,58 @@ mod tests {
             account_dir(&Config::default(), &db, "codex", "primary"),
             Some(adopted)
         );
+    }
+
+    #[test]
+    fn create_managed_home_refuses_an_existing_home() {
+        let _state = crate::testenv::IsolatedState::new();
+        let existing = ensure_managed_home("claude", "acct1").unwrap();
+
+        assert!(matches!(
+            create_managed_home("claude", "acct1"),
+            Err(AccountHomeError::HomeExists { path }) if path == managed_dir("claude", "acct1")
+        ));
+        assert_eq!(existing, managed_dir("claude", "acct1"));
+    }
+
+    #[test]
+    fn create_managed_home_refuses_a_leftover_manifestless_dir() {
+        let state = crate::testenv::IsolatedState::new();
+        let home = managed_dir("codex", "acct3");
+        std::fs::create_dir_all(&home).unwrap();
+        let auth = home.join("auth.json");
+        std::fs::write(&auth, b"forgotten login").unwrap();
+
+        assert!(matches!(
+            create_managed_home("codex", "acct3"),
+            Err(AccountHomeError::HomeExists { path }) if path == home
+        ));
+        assert_eq!(std::fs::read(auth).unwrap(), b"forgotten login");
+
+        let accounts = state.state_home().join("thegn/accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        let blocked_provider = accounts.join("claude");
+        std::fs::write(&blocked_provider, b"not a directory").unwrap();
+        assert!(matches!(
+            create_managed_home("claude", "acct1"),
+            Err(AccountHomeError::UnsafePath { path, .. }) if path == managed_dir("claude", "acct1")
+        ));
+    }
+
+    #[test]
+    fn create_managed_home_creates_a_fresh_owned_home() {
+        let _state = crate::testenv::IsolatedState::new();
+
+        let home = create_managed_home("codex", "acct2").unwrap();
+
+        assert_eq!(home, managed_dir("codex", "acct2"));
+        assert_eq!(
+            std::fs::read(home.join(OWNER_MANIFEST)).unwrap(),
+            owner_manifest("codex", "acct2")
+        );
+        assert!(matches!(
+            create_managed_home("unknown", "acct1"),
+            Err(AccountHomeError::UnknownProvider { provider }) if provider == "unknown"
+        ));
     }
 }
