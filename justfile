@@ -1444,7 +1444,7 @@ release-artifacts tag:
     echo "building ${archive}…"
     cargo build --release --locked -p thegn-host --bin thegn --features iroh --target "$target"
     rm -rf "$out/stage"; mkdir -p "$out/stage"
-    cp "target/$target/release/thegn" "$out/stage/thegn"
+    cp "${CARGO_TARGET_DIR:-target}/$target/release/thegn" "$out/stage/thegn"
     # Same `include:` set as the release workflow — a dual-licensed artifact
     # must carry its license text, and the rehearsal must match what ships.
     cp LICENSE-MIT LICENSE-APACHE README.md "$out/stage/"
