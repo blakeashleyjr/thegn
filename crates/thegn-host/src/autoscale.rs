@@ -53,9 +53,9 @@ fn lane_provider_config(cfg: &Config, t: &ManagedTemplate) -> EnvProviderConfig 
 }
 
 /// Create + register one engine host from `template`. Returns the host NAME
-/// (a `[host.<name>]`-shaped def persisted to the DB). On create failure the
-/// lane is cooled down (escalating, capped) and the error propagates so the
-/// broker walks the next lane on the next decision.
+/// (a `[host.<name>]`-shaped def persisted to the DB). On create or
+/// post-create registration failure the lane is cooled down (escalating,
+/// capped) and the error propagates.
 pub(crate) fn provision_managed(
     cfg: &Config,
     db: &Db,
@@ -87,28 +87,42 @@ pub(crate) fn provision_managed(
         cool_lane(db, template, &format!("create failed: {e}"), cfg);
         return Err(e).context(format!("autoscale create ({})", template.lane_key()));
     }
-    let ip = crate::agent::block_on_provider(|| async { provider.resolve_ip(&name).await })
-        .context("resolve fresh host ip")?;
+    let registration = (|| -> Result<String> {
+        let ip = crate::agent::block_on_provider(|| async { provider.resolve_ip(&name).await })
+            .context("resolve fresh host ip")?;
 
-    // Register: a DB host def (merged into the config catalog on next load;
-    // `db_host_binding` synthesizes a binding for THIS process) + the
-    // authoritative capacity spec from the template.
-    let hc = engine_host_config(&name, &ip)?;
-    db.put_host_def(&name, &hc, unix_now())
-        .context("persist engine host def")?;
-    db.capacity_put(&HostCapacityRow {
-        host: HostId::named(&name),
-        ownership: HostOwnership::Managed,
-        spec: template.spec(),
-        overcommit_cpu_pct: 0, // 0 ⇒ resolved config overcommit applies
-        overcommit_mem_pct: 0,
-        provider: template.provider.trim().to_string(),
-        template: template.size.trim().to_string(),
-        created_at: Some(unix_now()),
-        measured: None,
-        updated_at: unix_now(),
-    })
-    .context("persist engine host capacity")?;
+        // Register the host def (merged into the config catalog on next load)
+        // and the authoritative capacity spec from the template.
+        let hc = engine_host_config(&name, &ip)?;
+        db.put_host_def(&name, &hc, unix_now())
+            .context("persist engine host def")?;
+        db.capacity_put(&HostCapacityRow {
+            host: HostId::named(&name),
+            ownership: HostOwnership::Managed,
+            spec: template.spec(),
+            overcommit_cpu_pct: 0, // 0 ⇒ resolved config overcommit applies
+            overcommit_mem_pct: 0,
+            provider: template.provider.trim().to_string(),
+            template: template.size.trim().to_string(),
+            created_at: Some(unix_now()),
+            measured: None,
+            updated_at: unix_now(),
+        })
+        .context("persist engine host capacity")?;
+        Ok(ip)
+    })();
+    let ip = match registration {
+        Ok(ip) => ip,
+        Err(error) => {
+            cool_lane(
+                db,
+                template,
+                &format!("post-create failure: {error:#}"),
+                cfg,
+            );
+            return Err(error);
+        }
+    };
     // A successful create clears the lane's marker (explicit fail-back).
     let _ = db.health_clear(&template.lane_key()); // best-effort: cache write: the successful create already reported; the marker clear is bookkeeping
     // Fixed-cost meter: an engine host bills from create to destroy. Rate
@@ -186,15 +200,22 @@ fn engine_host_config(name: &str, ip: &str) -> Result<HostConfig> {
     })
 }
 
-/// Binding for an engine host def persisted this session (the loaded Config
-/// predates `put_host_def`, so synthesize from the DB row).
-pub(crate) fn db_host_binding(name: &str) -> Option<HostBinding> {
-    let db = Db::open().ok()?;
-    let defs = db.host_defs().ok()?;
-    let (_, hc) = defs.into_iter().find(|(n, _)| n == name)?;
+/// The def + binding for an engine host persisted this session (the loaded
+/// Config predates `put_host_def`, so synthesize from the DB row). A failed
+/// read is an error, never "no such host".
+pub(crate) fn db_host_def(
+    db: &Db,
+    name: &str,
+) -> anyhow::Result<Option<(HostConfig, HostBinding)>> {
+    let defs = db
+        .host_defs()
+        .with_context(|| format!("read the engine host def for {name}"))?;
+    let Some((_, hc)) = defs.into_iter().find(|(n, _)| n == name) else {
+        return Ok(None);
+    };
     let mut c = Config::default();
-    c.host.insert(name.to_string(), hc);
-    c.host_binding(name)
+    c.host.insert(name.to_string(), hc.clone());
+    Ok(c.host_binding(name).map(|binding| (hc, binding)))
 }
 
 /// Stamp a lane cooldown (escalating per consecutive failure, capped).
@@ -664,6 +685,33 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.len() <= 63);
         assert!(thegn_svc::vps::registry::checked_name(&first).is_ok());
+    }
+
+    #[test]
+    fn db_host_def_finds_a_def_persisted_after_config_load() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let name = "tg-auto-cx32-0000000000000001";
+        let hc = HostConfig {
+            reach: HostReach::Local,
+            ..HostConfig::default()
+        };
+        db.put_host_def(name, &hc, 1).unwrap();
+
+        let found = db_host_def(&db, name).unwrap();
+        assert!(matches!(found, Some((_, binding)) if binding.id == HostId::named(name)));
+    }
+
+    #[test]
+    fn db_host_def_is_none_for_an_unknown_name() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+
+        assert!(
+            db_host_def(&db, "tg-auto-cx32-0000000000000001")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
