@@ -2693,6 +2693,30 @@ impl Db {
         tx.commit()?;
         Ok(out)
     }
+
+    /// Like [`Db::transaction_immediate`], but a held write lock fails at once
+    /// with SQLITE_BUSY instead of waiting out the busy timeout. For callers on
+    /// the UI loop or the startup path, which must never stall on another
+    /// process's writer and already fall back when the write fails.
+    pub fn transaction_immediate_nowait<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
+        let previous_ms: u64 = self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let begun = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        );
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(previous_ms))?;
+        let tx = begun?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
 }
 
 /// Whether an error chain contains a transient SQLite busy/locked error.

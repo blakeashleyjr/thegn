@@ -6031,7 +6031,7 @@ fn bundle_scope_slug(db: &thegn_core::db::Db, worktree: &str) -> Option<String> 
         .file_name()?
         .to_string_lossy()
         .into_owned();
-    db.slug_for_repo(&root, &base).ok()
+    db.slug_for_repo_nowait(&root, &base).ok()
 }
 
 /// Spawn the worktree's interactive shell pane in `dir`, routing through the

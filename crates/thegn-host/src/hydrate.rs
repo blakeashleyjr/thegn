@@ -1164,7 +1164,7 @@ pub(crate) fn workspace_list(
             };
             let base = thegn_core::util::slugify(&display);
             let slug = db
-                .slug_for_repo(&w.repo_path, &base)
+                .slug_for_repo_nowait(&w.repo_path, &base)
                 .unwrap_or_else(|_| base.clone());
             if !db_backed.iter().any(|(s, _, _, _)| *s == slug) {
                 db_backed.push((slug, display, w.kind.clone(), w.repo_path.clone()));
