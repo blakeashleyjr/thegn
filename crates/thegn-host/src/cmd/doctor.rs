@@ -5853,9 +5853,8 @@ args = ["--verbose"]
             },
             ..Config::default()
         };
-        let hazards = source_control_json(&cfg)["shared_target_hazards"]
-            .as_array()
-            .unwrap();
+        let json = source_control_json(&cfg);
+        let hazards = json["shared_target_hazards"].as_array().unwrap();
         assert_eq!(hazards.len(), 2);
         assert!(hazards[0].as_str().unwrap().contains("shared_target_dir"));
         assert!(hazards[1].as_str().unwrap().contains("gate_target_dir"));
