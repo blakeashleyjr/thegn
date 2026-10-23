@@ -128,6 +128,25 @@ impl NotificationStore for Db {
         Ok(())
     }
 
+    fn mark_notification_read_by_source(
+        &self,
+        kind: &str,
+        source_ref: &str,
+        worktree_path: &str,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE notifications SET read=1 WHERE kind=?1 AND issue_id=?2 AND worktree_path=?3 AND read=0",
+            params![kind, source_ref, worktree_path],
+        )?)
+    }
+
+    fn expire_failures(&self, cutoff: i64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE notifications SET read=1 WHERE read=0 AND kind IN ('process_failed','agent_failed','test_failed') AND created_at_ms < ?1",
+            params![cutoff],
+        )?)
+    }
+
     /// Mark all notifications as read.
     fn mark_all_notifications_read(&self) -> Result<()> {
         self.conn().execute("UPDATE notifications SET read=1", [])?;
@@ -974,6 +993,54 @@ fn map_dispatch_base(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::Ag
 mod tests {
     use super::*;
     use crate::store::NotificationStore;
+
+    #[test]
+    fn expire_failures_marks_old_unread_failures_read() {
+        let db = Db::open_memory().unwrap();
+        let cutoff = 10_000;
+        let old = db
+            .put_notification("process_failed", "cargo", "old", "/wt")
+            .unwrap();
+        let recent = db
+            .put_notification("process_failed", "cargo", "recent", "/wt")
+            .unwrap();
+        let other = db
+            .put_notification("usage_limit", "weekly", "other", "/wt")
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE notifications SET created_at_ms=?1 WHERE id=?2",
+                params![cutoff - 1, old],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE notifications SET created_at_ms=?1 WHERE id=?2",
+                params![cutoff, recent],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE notifications SET created_at_ms=?1 WHERE id=?2",
+                params![cutoff - 1, other],
+            )
+            .unwrap();
+
+        assert_eq!(db.expire_failures(cutoff).unwrap(), 1);
+        let rows = db.get_all_notifications(10).unwrap();
+        assert!(
+            rows.iter().find(|n| n.id == old).unwrap().read,
+            "old failure must expire"
+        );
+        assert!(
+            !rows.iter().find(|n| n.id == recent).unwrap().read,
+            "cutoff is exclusive"
+        );
+        assert!(
+            !rows.iter().find(|n| n.id == other).unwrap().read,
+            "non-failure kinds are retained"
+        );
+    }
 
     #[test]
     fn equal_timestamps_list_newest_id_first() {

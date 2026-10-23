@@ -23728,25 +23728,22 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
+                                let refresh = refresh_tx.clone();
+                                let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let Ok(db) = thegn_core::db::Db::open() else {
-                                        return;
-                                    };
-                                    let _ = db.mark_notification_read(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                    if let Err(error) = thegn_core::db::Db::open()
+                                        .and_then(|db| db.mark_notification_read(id))
+                                    {
+                                        tracing::debug!(%error, "could not clear notification");
+                                    }
+                                    if refresh.send(RefreshKind::Model).is_ok()
+                                        && let Err(error) = wake.wake()
+                                    {
+                                        tracing::debug!(%error, "could not wake after notification clear");
+                                    }
                                 });
+                                model.panel.mark_read_where(|n| n.id == id);
                                 hydration_gen += 1;
-                                crate::hydrate::spawn_model_hydration(
-                                    model_tx.clone(),
-                                    hydration_gen,
-                                    session.clone_for_hydrate(),
-                                    Some(waker.clone()),
-                                    crate::hydrate::HydrateHints {
-                                        open: panel_ui.open,
-                                        expanded: panel_ui.width.is_expanded(),
-                                        ..Default::default()
-                                    },
-                                    None,
-                                );
                             }
                             true
                         }
@@ -23787,28 +23784,46 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
+                                let selected = model
+                                    .panel
+                                    .notifications
+                                    .iter()
+                                    .find(|n| n.id == id)
+                                    .cloned();
+                                let refresh = refresh_tx.clone();
+                                let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let Ok(db) = thegn_core::db::Db::open() else {
-                                        return;
-                                    };
-                                    let _ = db.delete_notification(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                    if let Err(error) = thegn_core::db::Db::open()
+                                        .and_then(|db| db.delete_notification(id))
+                                    {
+                                        tracing::debug!(%error, "could not delete notification");
+                                    }
+                                    if refresh.send(RefreshKind::Model).is_ok()
+                                        && let Err(error) = wake.wake()
+                                    {
+                                        tracing::debug!(%error, "could not wake after notification delete");
+                                    }
                                 });
+                                model.panel.notifications.retain(|n| n.id != id);
+                                if let Some(row) = selected.filter(|n| !n.read) {
+                                    match model.panel.priority_of(row.kind) {
+                                        thegn_core::notification::Priority::Alert => {
+                                            model.panel.alert_notifications =
+                                                model.panel.alert_notifications.saturating_sub(1);
+                                            model.panel.unread_notifications =
+                                                model.panel.unread_notifications.saturating_sub(1);
+                                        }
+                                        thegn_core::notification::Priority::Notice => {
+                                            model.panel.unread_notifications =
+                                                model.panel.unread_notifications.saturating_sub(1);
+                                        }
+                                        thegn_core::notification::Priority::Info => {}
+                                    }
+                                }
                                 panel_ui.notifications_cursor =
                                     panel_ui.notifications_cursor.saturating_sub(1);
                                 panel_ui.cursor = panel_ui.notifications_cursor;
                                 hydration_gen += 1;
-                                crate::hydrate::spawn_model_hydration(
-                                    model_tx.clone(),
-                                    hydration_gen,
-                                    session.clone_for_hydrate(),
-                                    Some(waker.clone()),
-                                    crate::hydrate::HydrateHints {
-                                        open: panel_ui.open,
-                                        expanded: panel_ui.width.is_expanded(),
-                                        ..Default::default()
-                                    },
-                                    None,
-                                );
                             }
                             true
                         }
