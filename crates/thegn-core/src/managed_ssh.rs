@@ -75,6 +75,13 @@ pub fn key_fingerprint(public_key: &str) -> String {
 
 /// OpenSSH SHA-256 fingerprint of the decoded public-key wire blob.
 pub fn try_key_fingerprint(public_key: &str) -> Result<String> {
+    Ok(format!(
+        "SHA256:{}",
+        base64_unpadded(&Sha256::digest(decoded_key_blob(public_key)?))
+    ))
+}
+
+fn decoded_key_blob(public_key: &str) -> Result<Vec<u8>> {
     let mut fields = public_key.split_whitespace();
     let key_type = fields.next().context("missing SSH public key type")?;
     let encoded = fields.next().context("missing SSH public key body")?;
@@ -94,14 +101,22 @@ pub fn try_key_fingerprint(public_key: &str) -> Result<String> {
         blob_type == key_type.as_bytes(),
         "SSH public key type does not match its blob"
     );
-    Ok(format!(
-        "SHA256:{}",
-        base64_unpadded(&Sha256::digest(&blob))
-    ))
+    Ok(blob)
 }
 
 pub fn fingerprint_is_verified(fingerprint: &str) -> bool {
     fingerprint.starts_with("SHA256:")
+}
+
+/// Provider-side name for thegn's managed public key: SHA-256 of the decoded
+/// key blob, first 32 hex characters (128 bits). Comments and whitespace never
+/// change it; an unparsable key is refused.
+pub fn vendor_key_name(public_key: &str) -> Result<String> {
+    let blob = decoded_key_blob(public_key)?;
+    Ok(format!(
+        "thegn-managed-{}",
+        hex_prefix(&Sha256::digest(&blob), 32)
+    ))
 }
 
 /// Fingerprint text for custody audit output, identifying pre-SHA256 rows.
@@ -1024,5 +1039,45 @@ mod tests {
         let error = list_at(temp.path()).unwrap_err();
         assert!(error.to_string().contains("read"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn vendor_key_name_is_the_sha256_of_the_decoded_key() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let name = vendor_key_name(key).unwrap();
+
+        assert_eq!(name, "thegn-managed-ef034764f5154129dbb127b9c94ec413");
+        assert_eq!(name.len(), 14 + 32);
+    }
+
+    #[test]
+    fn vendor_key_name_ignores_comment_and_whitespace() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let same_key = "  ssh-ed25519\n\tAAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB   other comment ";
+        let different_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
+
+        assert_eq!(
+            vendor_key_name(key).unwrap(),
+            vendor_key_name(same_key).unwrap()
+        );
+        assert_ne!(
+            vendor_key_name(key).unwrap(),
+            vendor_key_name(different_key).unwrap()
+        );
+    }
+
+    #[test]
+    fn vendor_key_name_refuses_unparsable_keys() {
+        for key in [
+            "",
+            "ssh-ed25519 AAAATEST x",
+            "ssh-ed25519 AAAA",
+            "ssh-ed25519 AAAABXNz",
+            "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB",
+            "ssh-ed25519",
+        ] {
+            assert!(vendor_key_name(key).is_err(), "accepted key: {key:?}");
+        }
     }
 }
