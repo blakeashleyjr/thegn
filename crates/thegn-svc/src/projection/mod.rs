@@ -322,6 +322,33 @@ fn run_unmount_with_timeout(argv: &[String], timeout: std::time::Duration) -> Re
     run_bounded(argv, timeout)
 }
 
+/// A typed failure from a bounded projection transport.
+#[derive(Debug)]
+pub struct TransportError {
+    pub program: String,
+    pub error: thegn_proc::ProcError,
+    pub timeout: std::time::Duration,
+    pub stderr_tail: String,
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match &self.error {
+            thegn_proc::ProcError::TimedOut => {
+                format!("timed out after {}s", self.timeout.as_secs_f64())
+            }
+            error => error.to_string(),
+        };
+        write!(formatter, "{} failed: {reason}", self.program)?;
+        if !self.stderr_tail.is_empty() {
+            write!(formatter, ": {}", self.stderr_tail)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TransportError {}
+
 fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
     use std::sync::atomic::AtomicBool;
 
@@ -336,25 +363,18 @@ fn run_bounded(argv: &[String], timeout: std::time::Duration) -> Result<()> {
         ..thegn_proc::Limits::silent(timeout)
     };
     let run = thegn_proc::run(&mut command, &limits, &cancelled);
-    if !run.success() {
-        let reason = match (&run.end, &run.leader) {
-            (thegn_proc::End::TimedOut, _) => {
-                format!("timed out after {}s", timeout.as_secs_f64())
-            }
-            (thegn_proc::End::Spawn(error), _) => format!("could not run: {error}"),
-            (thegn_proc::End::LeaderExited, thegn_proc::Leader::Reaped(status)) => {
-                format!("exited with {status}")
-            }
-            _ => format!("end={:?}, leader={:?}", run.end, run.leader),
-        };
-        let stderr = String::from_utf8_lossy(&run.stderr.bytes);
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            bail!("{} failed: {reason}", argv[0]);
-        }
-        bail!("{} failed: {reason}: {stderr}", argv[0]);
-    }
-    Ok(())
+    let Some(error) = run.error() else {
+        return Ok(());
+    };
+    let stderr_tail = String::from_utf8_lossy(&run.stderr.bytes)
+        .trim()
+        .to_string();
+    Err(anyhow::Error::new(TransportError {
+        program: argv[0].clone(),
+        error,
+        timeout,
+        stderr_tail,
+    }))
 }
 
 /// Planner value for a slow ssh handshake plus FUSE setup, not a measured ceiling.
@@ -489,7 +509,15 @@ fn nonzero_exit_message(
 }
 
 fn rollback_means_not_mounted(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
+    if let Some(transport) = error.downcast_ref::<TransportError>() {
+        return matches!(&transport.error, thegn_proc::ProcError::NonZero(_))
+            && not_mounted_text(&transport.stderr_tail);
+    }
+    not_mounted_text(&format!("{error:#}"))
+}
+
+fn not_mounted_text(text: &str) -> bool {
+    let message = text.to_ascii_lowercase();
     message.contains("not mounted") || message.contains("not found in /etc/mtab")
 }
 
@@ -1535,5 +1563,163 @@ mod tests {
             state.is_some_and(|state| state != "Z"),
             "a successful mount daemon must keep running"
         );
+    }
+
+    fn transport_error_descendant_gone_or_zombie(pid: u32) -> bool {
+        let stat_path = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
+        match std::fs::read_to_string(stat_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().next())
+                .is_some_and(|state| matches!(state, "Z" | "X" | "x")),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn transport_error_is_typed_for_spawn_nonzero_and_timeout() {
+        let Err(spawn_error) = run_bounded(
+            &["thegn-no-such-binary-xyz".into()],
+            std::time::Duration::from_secs(2),
+        ) else {
+            panic!("a missing projection transport must fail");
+        };
+        assert!(matches!(
+            spawn_error
+                .downcast_ref::<TransportError>()
+                .map(|error| &error.error),
+            Some(thegn_proc::ProcError::Spawn {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            })
+        ));
+
+        let Err(nonzero_error) = run_bounded(
+            &["sh".into(), "-c".into(), "echo boom >&2; exit 3".into()],
+            std::time::Duration::from_secs(5),
+        ) else {
+            panic!("a nonzero projection transport must fail");
+        };
+        let transport = nonzero_error
+            .downcast_ref::<TransportError>()
+            .expect("nonzero transport errors retain their type");
+        let thegn_proc::ProcError::NonZero(status) = &transport.error else {
+            panic!("exit 3 must be classified as nonzero");
+        };
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(transport.stderr_tail, "boom");
+        assert_eq!(
+            transport.to_string(),
+            format!("sh failed: exited with {status}: boom")
+        );
+
+        let Err(timeout_error) = run_bounded(
+            &["sleep".into(), "30".into()],
+            std::time::Duration::from_millis(300),
+        ) else {
+            panic!("a timed-out projection transport must fail");
+        };
+        let transport = timeout_error
+            .downcast_ref::<TransportError>()
+            .expect("timeout errors retain their type");
+        assert!(matches!(&transport.error, thegn_proc::ProcError::TimedOut));
+        assert!(
+            transport
+                .to_string()
+                .starts_with("sleep failed: timed out after 0.3s")
+        );
+    }
+
+    #[test]
+    fn transport_error_timed_out_unmount_is_never_not_mounted() {
+        let Err(error) = run_unmount_with_timeout(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "echo 'x: not mounted' >&2; sleep 30".into(),
+            ],
+            std::time::Duration::from_millis(500),
+        ) else {
+            panic!("a stalled unmount must fail");
+        };
+        assert!(matches!(
+            error
+                .downcast_ref::<TransportError>()
+                .map(|error| &error.error),
+            Some(thegn_proc::ProcError::TimedOut)
+        ));
+        assert!(!rollback_means_not_mounted(&error));
+    }
+
+    #[test]
+    fn transport_error_nonzero_not_mounted_is_not_mounted() {
+        let Err(error) = run_unmount_with_timeout(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "echo 'fusermount: /x: not mounted' >&2; exit 1".into(),
+            ],
+            std::time::Duration::from_secs(2),
+        ) else {
+            panic!("a nonzero unmount must fail");
+        };
+        assert!(matches!(
+            error
+                .downcast_ref::<TransportError>()
+                .map(|error| &error.error),
+            Some(thegn_proc::ProcError::NonZero(_))
+        ));
+        assert!(rollback_means_not_mounted(&error));
+    }
+
+    // Each shell leader stays blocked in `wait` after recording its direct
+    // descendant, and both inherit the owned process group. The 2 s timeout
+    // leaves time to write the pid file; each retry uses a separate private
+    // directory and the runner must settle its group before returning.
+    #[test]
+    fn transport_error_repeated_timeouts_leave_no_descendants() {
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
+        for attempt in 0..3 {
+            let dir = tempfile::tempdir().expect("create private transport fixture directory");
+            thegn_core::fsperm::restrict_dir_to_owner(dir.path())
+                .expect("restrict transport fixture directory");
+            let pid_file = dir.path().join("descendant.pid");
+            let Err(error) = run_bounded(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "sleep 30 & echo $! > \"$1\"; wait".into(),
+                    "sh".into(),
+                    pid_file.display().to_string(),
+                ],
+                std::time::Duration::from_secs(2),
+            ) else {
+                panic!("timed-out transport attempt {attempt} must fail");
+            };
+            assert!(matches!(
+                error
+                    .downcast_ref::<TransportError>()
+                    .map(|error| &error.error),
+                Some(thegn_proc::ProcError::TimedOut)
+            ));
+            let descendant_pid = std::fs::read_to_string(&pid_file)
+                .expect("the shell records its descendant before timeout")
+                .trim()
+                .parse::<u32>()
+                .expect("the recorded descendant pid is numeric");
+            let mut gone = false;
+            for _ in 0..100 {
+                if transport_error_descendant_gone_or_zombie(descendant_pid) {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(gone, "timed-out retry {attempt} left a live descendant");
+        }
     }
 }

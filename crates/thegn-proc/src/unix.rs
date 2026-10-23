@@ -1148,4 +1148,124 @@ mod tests {
         assert!(run.stdout.bytes.is_empty());
         assert_eq!(run.stdout.total, 100_000);
     }
+
+    #[test]
+    fn proc_error_classifies_each_run_end() {
+        let scripts = Scripts::new();
+        let successful = scripts.write("proc-error-success.sh", "exit 0\n");
+        let result = run(
+            &mut command(&successful),
+            &Limits::silent(Duration::from_secs(2)),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result.error(), None);
+        assert_eq!(result.error().is_none(), result.success());
+
+        let nonzero = scripts.write("proc-error-nonzero.sh", "exit 3\n");
+        let result = run(
+            &mut command(&nonzero),
+            &Limits::silent(Duration::from_secs(2)),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(result.error(), Some(crate::ProcError::NonZero(status)) if status.code() == Some(3))
+        );
+        assert_eq!(result.error().is_none(), result.success());
+
+        let timeout = scripts.write("proc-error-timeout.sh", "sleep 30 & wait\n");
+        let result = run(
+            &mut command(&timeout),
+            &limits(Duration::from_millis(250)),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(result.error(), Some(crate::ProcError::TimedOut)));
+        assert_eq!(result.error().is_none(), result.success());
+
+        let overflow = scripts.write("proc-error-overflow.sh", "yes\n");
+        let output_limits = Limits {
+            stdout: Stream::HeadOrFail { cap: 1024 },
+            ..Limits::silent(Duration::from_secs(2))
+        };
+        let result = run(
+            &mut command(&overflow),
+            &output_limits,
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(
+            result.error(),
+            Some(crate::ProcError::OutputLimit(Which::Stdout))
+        ));
+        assert_eq!(result.error().is_none(), result.success());
+
+        let mut missing = Command::new("/no/such/thegn-proc-program");
+        let result = run(
+            &mut missing,
+            &Limits::silent(Duration::from_secs(1)),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(
+            result.error(),
+            Some(crate::ProcError::Spawn {
+                kind: io::ErrorKind::NotFound,
+                ..
+            })
+        ));
+        assert_eq!(result.error().is_none(), result.success());
+    }
+
+    #[test]
+    fn proc_error_reports_cancellation() {
+        let scripts = Scripts::new();
+        let script = scripts.write("proc-error-cancel.sh", "sleep 30 & wait\n");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child_cancel = Arc::clone(&cancel);
+        let runner = thread::spawn(move || {
+            run(
+                &mut command(&script),
+                &limits(Duration::from_secs(10)),
+                &child_cancel,
+            )
+        });
+        thread::sleep(Duration::from_millis(100));
+        cancel.store(true, Ordering::Release);
+        let result = runner.join().unwrap();
+        assert_eq!(result.error(), Some(crate::ProcError::Cancelled));
+        assert_eq!(result.error().is_none(), result.success());
+    }
+
+    #[test]
+    fn proc_error_display_names_each_class() {
+        assert_eq!(crate::ProcError::TimedOut.to_string(), "timed out");
+        assert_eq!(crate::ProcError::Cancelled.to_string(), "cancelled");
+        assert_eq!(
+            crate::ProcError::OutputLimit(Which::Stderr).to_string(),
+            "stderr exceeded its byte cap"
+        );
+        assert_eq!(
+            crate::ProcError::Spawn {
+                kind: io::ErrorKind::NotFound,
+                message: "boom".into(),
+            }
+            .to_string(),
+            "could not run: boom"
+        );
+        assert_eq!(
+            crate::ProcError::Unreaped.to_string(),
+            "was not reaped within the kill budget"
+        );
+        let scripts = Scripts::new();
+        let nonzero = scripts.write("proc-error-display.sh", "exit 3\n");
+        let result = run(
+            &mut command(&nonzero),
+            &Limits::silent(Duration::from_secs(2)),
+            &AtomicBool::new(false),
+        );
+        let Some(crate::ProcError::NonZero(status)) = result.error() else {
+            panic!("exit 3 must produce a typed nonzero error");
+        };
+        assert_eq!(
+            crate::ProcError::NonZero(status).to_string(),
+            format!("exited with {status}")
+        );
+    }
 }
