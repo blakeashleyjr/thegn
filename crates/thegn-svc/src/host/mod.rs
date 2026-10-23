@@ -730,7 +730,8 @@ impl OciRunner {
     }
 
     /// Tar a local staging directory into `dest` inside a container on this
-    /// host (creates `dest` first; ownership follows the container user).
+    /// host (creates `dest` first; extracted files are owned by the container
+    /// user because archive ownership is not restored).
     pub fn push_dir_to_container(
         &self,
         container: &str,
@@ -894,7 +895,7 @@ fn container_shell_cmd(bin: &str, container: &str, stdin: bool, script: &str) ->
 
 fn untar_into_script(dest: &str) -> String {
     format!(
-        "mkdir -p -- {d} && tar -xf - -C {d}",
+        "mkdir -p -- {d} && tar -x -o -f - -C {d}",
         d = thegn_core::util::sh_quote(dest)
     )
 }
@@ -1475,6 +1476,13 @@ mod tests {
             b"payload"
         );
         assert!(!root.path().join("CANARY").exists());
+    }
+
+    #[test]
+    fn untar_script_does_not_restore_archive_ownership() {
+        let script = untar_into_script("/home/user with space");
+        assert!(script.contains("tar -x -o -f -"), "{script}");
+        assert!(script.contains("'/home/user with space'"), "{script}");
     }
 
     #[test]
