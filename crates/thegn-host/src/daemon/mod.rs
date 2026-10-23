@@ -17,6 +17,7 @@ pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
 pub(crate) mod calendar_api;
 pub(crate) mod client;
+pub(crate) mod control_publish;
 pub(crate) mod fork;
 pub(crate) mod inbox;
 pub(crate) mod pipeline_reaper;
@@ -1166,9 +1167,10 @@ async fn run(
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
-    if let Some(dir) = sock.parent().filter(|p| !p.as_os_str().is_empty()) {
-        thegn_core::sandbox_control_guard::publish_control_socket_dir(dir.to_path_buf());
+    if let Err(error) = control_publish::prepare_run_dir(&state_dir) {
+        tracing::warn!(target: "thegn::daemon", path = %state_dir.display(), %error, "could not create the private control locator directory; it stays write-protected from sandboxes");
     }
+    control_publish::publish(&sock, &state_dir);
     // Warm the scope probe off the runtime's worker threads: it spawns a real
     // `systemd-run … true`, and no control-API request should ever pay for it.
     tokio::task::spawn_blocking(|| {
