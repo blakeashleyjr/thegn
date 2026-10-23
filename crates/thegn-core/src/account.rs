@@ -430,13 +430,32 @@ fn resolved_entries(cfg: &Config, db: &Db, provider_id: &str) -> Vec<(String, Pa
     entries
 }
 
-/// Names participating in a shared physical directory. Repeated records for
-/// the same exact logical name do not constitute a collision.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DirKey {
+    /// Same filesystem object (follows symlinks; catches bind mounts).
+    Fs(String),
+    /// The directory does not exist yet: compare lexically.
+    Lexical(PathBuf),
+}
+
+fn dir_key(dir: &Path) -> DirKey {
+    match util::file_identity(dir) {
+        Some(id) => DirKey::Fs(id),
+        None => DirKey::Lexical(dir.components().collect()),
+    }
+}
+
+/// Names participating in a shared physical directory. Existing directories
+/// are compared by filesystem identity (including symlinks, `..` spellings,
+/// and bind mounts); missing directories are compared by path components
+/// (`.` and trailing slashes are normalized; `..` and symlinks are not).
+/// Repeated records for the same exact logical name do not constitute a
+/// collision.
 fn shared_dirs(entries: &[(String, PathBuf)]) -> HashSet<String> {
-    let mut owners: std::collections::HashMap<&PathBuf, HashSet<&str>> =
+    let mut owners: std::collections::HashMap<DirKey, HashSet<&str>> =
         std::collections::HashMap::new();
     for (name, dir) in entries {
-        owners.entry(dir).or_default().insert(name);
+        owners.entry(dir_key(dir)).or_default().insert(name);
     }
     owners
         .into_values()
@@ -781,6 +800,81 @@ mod tests {
         let listed = list(&cfg, &db, "codex");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "same");
+    }
+
+    #[test]
+    fn symlinked_spelling_of_one_dir_is_refused() {
+        let fixture = crate::testenv::symlinked_tempdir();
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "cfg".into(),
+            provider: "codex".into(),
+            dir: Some(fixture.real_path().to_string_lossy().into_owned()),
+        });
+        let link_dir = fixture.path().to_string_lossy().into_owned();
+        db.put_account("codex", "dbrow", &link_dir, false, 1)
+            .unwrap();
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "cfg"), None);
+        assert_eq!(account_dir(&cfg, &db, "codex", "dbrow"), None);
+        let listed = list(&cfg, &db, "codex");
+        assert!(
+            !listed
+                .iter()
+                .any(|account| account.name == "cfg" || account.name == "dbrow")
+        );
+    }
+
+    #[test]
+    fn dot_dot_spelling_of_one_dir_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let creds = temp.path().join("creds");
+        std::fs::create_dir_all(creds.join("sub")).unwrap();
+        let dot_dot = creds.join("sub").join("..");
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "cfg".into(),
+            provider: "codex".into(),
+            dir: Some(creds.to_string_lossy().into_owned()),
+        });
+        let dot_dot_dir = dot_dot.to_string_lossy().into_owned();
+        db.put_account("codex", "dbrow", &dot_dot_dir, false, 1)
+            .unwrap();
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "cfg"), None);
+        assert_eq!(account_dir(&cfg, &db, "codex", "dbrow"), None);
+        let listed = list(&cfg, &db, "codex");
+        assert!(
+            !listed
+                .iter()
+                .any(|account| account.name == "cfg" || account.name == "dbrow")
+        );
+    }
+
+    #[test]
+    fn different_existing_account_dirs_are_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_dir = temp.path().join("first");
+        let second_dir = temp.path().join("second");
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::create_dir(&second_dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "first".into(),
+            provider: "codex".into(),
+            dir: Some(first_dir.to_string_lossy().into_owned()),
+        });
+        cfg.accounts.push(Account {
+            name: "second".into(),
+            provider: "codex".into(),
+            dir: Some(second_dir.to_string_lossy().into_owned()),
+        });
+        let db = Db::open_memory().unwrap();
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "first"), Some(first_dir));
+        assert_eq!(account_dir(&cfg, &db, "codex", "second"), Some(second_dir));
     }
 
     /// A live main checkout (`.git` directory) at `dir/<name>`.
