@@ -90,6 +90,10 @@ pub(crate) fn spawn(
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let (healed, _roots) = run(&cwd, &group_paths, start);
             gate.complete();
+            if healed {
+                let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: consumer may be gone
+                let _ = waker.wake(); // best-effort: loop may be gone
+            }
             if let Some(dir) = workspaces_dir {
                 let reclaimed = crate::workspace_create::sweep_stale_clone_staging(
                     &dir,
@@ -104,10 +108,6 @@ pub(crate) fn spawn(
                         "reclaimed stale workspace clone staging"
                     );
                 }
-            }
-            if healed {
-                let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: consumer may be gone
-                let _ = waker.wake(); // best-effort: loop may be gone
             }
         });
     if let Err(e) = spawned {

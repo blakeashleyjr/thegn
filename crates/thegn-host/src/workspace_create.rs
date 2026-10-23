@@ -870,14 +870,10 @@ fn stale_staging_pid(file_name: &str, name: Option<&str>) -> Option<u32> {
     {
         return None;
     }
-    match generation.parse::<u64>() {
-        Ok(_) => {}
-        Err(_) => return None,
+    if generation.parse::<u64>().is_err() {
+        return None;
     }
-    match pid.parse::<u32>() {
-        Ok(pid) => Some(pid),
-        Err(_) => None,
-    }
+    pid.parse::<u32>().ok()
 }
 
 fn remove_partial_clone_dest(dest: &std::path::Path, dest_existed: bool) {
@@ -2217,8 +2213,8 @@ Receiving objects: 100% (10/10)\rdone.\n";
             return;
         }
         let non_matching_dirs = [
-            ".clone-7-4242",
-            "a.clone-7-4242",
+            ".clone-7-4245",
+            "a.clone-7-4246",
             ".a.clone-x-4242",
             ".a.clone-7-",
             ".a.clone-7-4242-extra",
@@ -2227,7 +2223,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
         for name in non_matching_dirs {
             std::fs::create_dir(temp.path().join(name)).unwrap();
         }
-        let regular_file = temp.path().join(".f.clone-9-4242");
+        let regular_file = temp.path().join(".f.clone-9-4247");
         std::fs::write(&regular_file, b"not a directory").unwrap();
 
         assert_eq!(
