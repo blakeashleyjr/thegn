@@ -7,6 +7,8 @@
 
 ## 2. Framework
 
+Re-owned to THE-1362 (batch 72): THE-829 is Done; that issue ticks the delivered boxes below with evidence and owns the remaining cleanup tasks.
+
 - [ ] F1a (THE-830): Implement shared numeric formatting in
       `thegn-core/src/numfmt.rs`.
 - [ ] F1b (THE-831): Implement graph rasters in `thegn-core/src/viz_raster.rs`.

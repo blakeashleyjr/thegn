@@ -86,8 +86,9 @@
       cache with no provider, re-redacts it, and never labels a miss as cached;
       no frame changed, so no e2e re-record)
 
-Remaining: task 20 (the pre-PR gate).
+Archived in batch 72.
 
 ## Final
 
-- [ ] 20. Run `just ci` once (includes openspec validate) as the pre-PR gate
+- [x] 20. Run `just ci` once (includes openspec validate) as the pre-PR gate
+      Superseded, not performed as a separate check: batch 72's final gate (`just ci`-equivalent stamped gate) covers it, per the owner decision of 2026-10-22; the change is archived in batch 72.

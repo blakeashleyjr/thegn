@@ -7,13 +7,18 @@
 
 ## Verification
 
-- [ ] Test missing/live/unreachable/malformed session results through real adapters.
+- [x] Test missing/live/unreachable/malformed session results through real adapters.
+      Superseded, not performed as a separate check: the owner issues are Done and the owner decided on 2026-10-22 to archive with this verification outstanding; the change is archived in batch 72.
 - [x] Test retry success, exhaustion, input ownership, close and detach cancellation.
-- [ ] Test actual host/remote launch admission for fail/degrade/off and provider bypass.
+- [x] Test actual host/remote launch admission for fail/degrade/off and provider bypass.
+      Superseded, not performed as a separate check: the owner issues are Done and the owner decided on 2026-10-22 to archive with this verification outstanding; the change is archived in batch 72.
 - [x] Run real PTY healthy, hangup and unwind cleanup tests.
-- [ ] Run scoped crate tests/clippy, formatting, source ratchets and strict OpenSpec validation.
-- [ ] Obtain root/adversarial code review and address findings before integration.
-- [ ] Run `just ci` once at the final pre-PR gate, or record environment limitations.
+- [x] Run scoped crate tests/clippy, formatting, source ratchets and strict OpenSpec validation.
+      Superseded, not performed as a separate check: the owner issues are Done and the owner decided on 2026-10-22 to archive with this verification outstanding; the change is archived in batch 72.
+- [x] Obtain root/adversarial code review and address findings before integration.
+      Superseded, not performed as a separate check: the owner issues are Done and the owner decided on 2026-10-22 to archive with this verification outstanding; the change is archived in batch 72.
+- [x] Run `just ci` once at the final pre-PR gate, or record environment limitations.
+      Superseded, not performed as a separate check: the owner issues are Done and the owner decided on 2026-10-22 to archive with this verification outstanding; the change is archived in batch 72.
 
 Evidence and outstanding environment checks: `docs/audits/live-build-2026-09-13-session-remediation.md`.
 
