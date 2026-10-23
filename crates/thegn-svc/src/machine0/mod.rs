@@ -453,13 +453,24 @@ impl Machine0Provider {
     /// machine0 says provisioning takes 1–3 min; bounded. Unifies the
     /// create-wait and the resume-on-claim wait.
     async fn ensure_running_vm(&self, name: &str) -> Result<Machine0Vm> {
-        let start = std::time::Instant::now();
+        let budget = crate::op_budget::OpBudget::start(VM_READY_BUDGET);
         let mut last: String;
         loop {
             // A transient control-plane blip (or brief post-create not-found from
             // eventual consistency) must not abort a multi-minute wait — poll
             // through it until the budget, surfacing the last state on timeout.
-            match self.vm_by_name(name).await {
+            last = "in-flight call exceeded the budget".into();
+            // A cancelled MCP call drops its control-gate permit.
+            let vm_result = match budget.within(self.vm_by_name(name)).await {
+                Some(result) => result,
+                None => {
+                    return Err(anyhow!(
+                        "machine0: vm {name} not RUNNING after {}s (last {last})",
+                        VM_READY_BUDGET.as_secs(),
+                    ));
+                }
+            };
+            match vm_result {
                 Ok(Some(vm)) => {
                     if status_running(&vm.status) && vm.address.is_some() {
                         return Ok(vm);
@@ -473,22 +484,33 @@ impl Machine0Provider {
                     // mid-SUSPENDING) must not abort the wait; the next poll
                     // retries. Transitional states aren't startable, so this does
                     // not spam vm_start while the VM is booting.
-                    if should_attempt_start(vm.id.is_empty(), &vm.status)
-                        && let Err(e) = self.call(tool::VM_START, json!({ "id": vm.id })).await
-                    {
-                        last = format!("start-transient: {e}");
+                    if should_attempt_start(vm.id.is_empty(), &vm.status) {
+                        match budget
+                            .within(self.call(tool::VM_START, json!({ "id": vm.id })))
+                            .await
+                        {
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => last = format!("start-transient: {e}"),
+                            None => {
+                                last = "in-flight call exceeded the budget".into();
+                                return Err(anyhow!(
+                                    "machine0: vm {name} not RUNNING after {}s (last {last})",
+                                    VM_READY_BUDGET.as_secs(),
+                                ));
+                            }
+                        }
                     }
                 }
                 Ok(None) => last = "not-found".into(),
                 Err(e) => last = format!("transient: {e}"),
             }
-            if start.elapsed() >= VM_READY_BUDGET {
+            if budget.expired() {
                 return Err(anyhow!(
                     "machine0: vm {name} not RUNNING after {}s (last {last})",
                     VM_READY_BUDGET.as_secs(),
                 ));
             }
-            tokio::time::sleep(VM_READY_POLL).await;
+            budget.pause(VM_READY_POLL).await;
         }
     }
 
@@ -496,26 +518,13 @@ impl Machine0Provider {
     /// image). Bounded; `label` names the target state for the timeout error.
     async fn wait_status(&self, name: &str, pred: fn(&str) -> bool, label: &str) -> Result<()> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
-        let start = std::time::Instant::now();
-        let mut last: String;
-        loop {
-            match self.vm_by_name(name).await {
-                Ok(Some(vm)) => {
-                    if pred(&vm.status) {
-                        return Ok(());
-                    }
-                    last = vm.status.clone();
-                }
-                Ok(None) => last = "not-found".into(),
-                Err(e) => last = format!("transient: {e}"),
-            }
-            if start.elapsed() >= BUDGET {
-                return Err(anyhow!(
-                    "machine0: vm {name} not {label} after {}s (last {last})",
-                    BUDGET.as_secs(),
-                ));
-            }
-            tokio::time::sleep(VM_READY_POLL).await;
+        let budget = crate::op_budget::OpBudget::start(BUDGET);
+        match poll_vm_status(&budget, VM_READY_POLL, || self.vm_by_name(name), pred).await {
+            Ok(()) => Ok(()),
+            Err(last) => Err(anyhow!(
+                "machine0: vm {name} not {label} after {}s (last {last})",
+                BUDGET.as_secs(),
+            )),
         }
     }
 
@@ -552,21 +561,56 @@ impl Machine0Provider {
             user: user.to_string(),
             key_path: self.spec.key_path.clone(),
         };
-        let start = std::time::Instant::now();
+        let budget = crate::op_budget::OpBudget::start(AUTH_BUDGET);
         loop {
-            if let Ok((0, _)) = shim
-                .run_exec(&["/bin/sh".into(), "-lc".into(), "true".into()], None, &[])
+            match budget
+                .within(shim.run_exec(&["/bin/sh".into(), "-lc".into(), "true".into()], None, &[]))
                 .await
             {
-                return Ok(());
+                Some(Ok((0, _))) => return Ok(()),
+                Some(Ok(_)) | Some(Err(_)) => {}
+                // SshShim kills the ssh child on drop, so cancelling this exec
+                // bounds the auth probe without leaving a process behind.
+                None => {
+                    return Err(anyhow!(
+                        "machine0: {name} ({ip}) ssh auth as {user} not ready after {}s",
+                        AUTH_BUDGET.as_secs()
+                    ));
+                }
             }
-            if start.elapsed() >= AUTH_BUDGET {
+            if budget.expired() {
                 return Err(anyhow!(
                     "machine0: {name} ({ip}) ssh auth as {user} not ready after {}s",
                     AUTH_BUDGET.as_secs()
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            budget.pause(std::time::Duration::from_secs(3)).await;
+        }
+    }
+
+    async fn poll_vm_status<F, Fut>(
+        budget: &crate::op_budget::OpBudget,
+        poll: std::time::Duration,
+        mut probe: F,
+        pred: fn(&str) -> bool,
+    ) -> std::result::Result<(), String>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Option<Machine0Vm>>>,
+    {
+        let mut last = "in-flight call exceeded the budget".to_owned();
+        loop {
+            match budget.within(probe()).await {
+                Some(Ok(Some(vm))) if pred(&vm.status) => return Ok(()),
+                Some(Ok(Some(vm))) => last = vm.status,
+                Some(Ok(None)) => last = "not-found".into(),
+                Some(Err(error)) => last = format!("transient: {error}"),
+                None => return Err(last),
+            }
+            if budget.expired() {
+                return Err(last);
+            }
+            budget.pause(poll).await;
         }
     }
 
@@ -1647,6 +1691,79 @@ fn flake_identity_for(tree_digest: Option<&str>, flake: &str) -> String {
     match tree_digest {
         Some(digest) => format!("tree:{digest}"),
         None => format!("ref:{:x}", Sha256::digest(flake.trim().as_bytes())),
+    }
+}
+
+#[cfg(test)]
+mod wait_budget_tests {
+    use super::{Machine0Provider, Machine0Vm};
+    use crate::op_budget::OpBudget;
+    use std::future;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_probe_ends_at_the_budget() {
+        let budget = OpBudget::start(Duration::from_secs(180));
+        let started = tokio::time::Instant::now();
+        let mut probe_calls: usize = 0;
+        let result = tokio::time::timeout(
+            Duration::from_secs(600),
+            Machine0Provider::poll_vm_status(
+                &budget,
+                Duration::from_secs(4),
+                || {
+                    probe_calls += 1;
+                    let stalled = probe_calls > 1;
+                    let vm = Machine0Vm {
+                        id: "vm-1".into(),
+                        name: "test-vm".into(),
+                        status: "STOPPING".into(),
+                        address: None,
+                        user: None,
+                    };
+                    async move {
+                        if stalled {
+                            future::pending::<anyhow::Result<Option<Machine0Vm>>>().await
+                        } else {
+                            Ok(Some(vm))
+                        }
+                    }
+                },
+                |status| status == "STOPPED",
+            ),
+        )
+        .await
+        .expect("stalled probe must be bounded by the operation budget");
+        let elapsed = started.elapsed();
+
+        assert_eq!(result, Err("STOPPING".into()));
+        assert!(
+            elapsed <= Duration::from_secs(180),
+            "budget elapsed {elapsed:?} exceeded 180s"
+        );
+        assert_eq!(elapsed, Duration::from_secs(180));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_reaching_the_state_returns_ok() {
+        let budget = OpBudget::start(Duration::from_secs(180));
+        let result = Machine0Provider::poll_vm_status(
+            &budget,
+            Duration::from_secs(4),
+            || async {
+                Ok(Some(Machine0Vm {
+                    id: "vm-1".into(),
+                    name: "test-vm".into(),
+                    status: "STOPPED".into(),
+                    address: None,
+                    user: None,
+                }))
+            },
+            |status| status == "STOPPED",
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
     }
 }
 
