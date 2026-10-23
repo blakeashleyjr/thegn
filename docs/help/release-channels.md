@@ -29,6 +29,11 @@ this is why:
 | `placement` | the multi-host placement engine                                            | `[placement]`                                   |
 | `voice`     | command-backed voice mode                                                  | `[voice]`                                       |
 
+On the stable channel, SSH and provider `[env.*]` environments are removed
+when the config loads. If a worktree's `[sandbox] default_env` or selection
+names one, its pane halts instead of falling back to a local shell; the message
+explains that the environment is unavailable and points to `THEGN_CHANNEL=dev`.
+
 Issue trackers including Linear, Jira, Kaneo, and GitHub are available in both
 channels. GitHub PR viewing is also stable. See [[review-a-pr]].
 

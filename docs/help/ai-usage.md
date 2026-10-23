@@ -46,6 +46,11 @@ machine comes to hold many logins side by side: thegn's own
 different directories, and Claude Code's profile convention parks them under
 `~/.claude-profiles/`.
 
+Two accounts that resolve to the same credential directory are refused rather
+than treated as separate logins. This includes existing directories reached
+through a symlink or a path containing `..`; thegn warns which account it
+refused.
+
 So usage is tracked **per credential home**, not per harness. thegn finds them by
 looking at:
 
