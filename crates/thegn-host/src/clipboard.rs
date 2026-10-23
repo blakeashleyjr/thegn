@@ -91,10 +91,10 @@ impl Clipboard {
         });
         *active_slot().lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&inner);
         let worker_inner = Arc::clone(&inner);
-        let worker = std::thread::Builder::new()
-            .name("thegn-clipboard".into())
-            .spawn(move || worker_loop(worker_inner))
-            .expect("clipboard worker thread must start");
+        let worker = thegn_core::thread_name::try_spawn_named("thegn-clipboard", move || {
+            worker_loop(worker_inner)
+        })
+        .expect("clipboard worker thread must start");
         Self {
             inner,
             worker: Some(worker),

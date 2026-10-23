@@ -220,63 +220,59 @@ fn reaper() -> &'static std::sync::mpsc::Sender<std::process::Child> {
         std::sync::OnceLock::new();
     TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<std::process::Child>();
-        let spawned = std::thread::Builder::new()
-            .name("thegn-reaper".into())
-            .spawn(move || {
-                // Housekeeping, so it stays off the performance cores on Apple
-                // silicon (CLAUDE.md: a new long-lived thread must declare one).
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                let mut held: Vec<std::process::Child> = Vec::new();
-                let mut poll = POLL_MIN;
-                loop {
-                    if held.is_empty() {
-                        // Nothing owed: block. No timer, no wake, no cost.
-                        match rx.recv() {
-                            Ok(child) => {
-                                held.push(child);
-                                poll = POLL_MIN;
-                            }
-                            // Sender is 'static, so this only happens at
-                            // teardown; nothing is held, so just stop.
-                            Err(_) => return,
+        let spawned = thegn_core::thread_name::try_spawn_named("thegn-reaper", move || {
+            // Housekeeping, so it stays off the performance cores on Apple
+            // silicon (CLAUDE.md: a new long-lived thread must declare one).
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let mut held: Vec<std::process::Child> = Vec::new();
+            let mut poll = POLL_MIN;
+            loop {
+                if held.is_empty() {
+                    // Nothing owed: block. No timer, no wake, no cost.
+                    match rx.recv() {
+                        Ok(child) => {
+                            held.push(child);
+                            poll = POLL_MIN;
                         }
-                    } else {
-                        match rx.recv_timeout(poll) {
-                            Ok(child) => {
-                                held.push(child);
-                                poll = POLL_MIN;
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                            // No more work can arrive, but what we hold is still
-                            // owed a wait — keep reaping until it is all gone.
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                while !held.is_empty() {
-                                    held.retain_mut(|c| {
-                                        !matches!(c.try_wait(), Ok(Some(_)) | Err(_))
-                                    });
-                                    if !held.is_empty() {
-                                        std::thread::sleep(poll);
-                                    }
-                                }
-                                return;
-                            }
-                        }
-                        let before = held.len();
-                        // `Err` drops the handle too: a child we cannot query is
-                        // one we can never reap, and holding it forever would
-                        // leak the slot instead of the process.
-                        held.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
-                        // Back off only while nothing is happening; any reap or
-                        // arrival means more is likely imminent.
-                        poll = if held.len() == before {
-                            (poll * 2).min(POLL_MAX)
-                        } else {
-                            POLL_MIN
-                        };
+                        // Sender is 'static, so this only happens at
+                        // teardown; nothing is held, so just stop.
+                        Err(_) => return,
                     }
+                } else {
+                    match rx.recv_timeout(poll) {
+                        Ok(child) => {
+                            held.push(child);
+                            poll = POLL_MIN;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        // No more work can arrive, but what we hold is still
+                        // owed a wait — keep reaping until it is all gone.
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            while !held.is_empty() {
+                                held.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+                                if !held.is_empty() {
+                                    std::thread::sleep(poll);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    let before = held.len();
+                    // `Err` drops the handle too: a child we cannot query is
+                    // one we can never reap, and holding it forever would
+                    // leak the slot instead of the process.
+                    held.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+                    // Back off only while nothing is happening; any reap or
+                    // arrival means more is likely imminent.
+                    poll = if held.len() == before {
+                        (poll * 2).min(POLL_MAX)
+                    } else {
+                        POLL_MIN
+                    };
                 }
-            })
-            .is_ok();
+            }
+        })
+        .is_ok();
         if !spawned {
             tracing::warn!(
                 target: "thegn::actions",

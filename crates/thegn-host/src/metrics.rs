@@ -75,10 +75,10 @@ pub fn spawn_metrics_supervisor(
     }
 
     // best-effort: supervisor thread: a failed spawn just disables metrics this session
-    std::thread::Builder::new()
-        .name("thegn-metrics".into())
-        .spawn(move || run_supervisor(config, tx, waker))
-        .ok();
+    thegn_core::thread_name::try_spawn_named("thegn-metrics", move || {
+        run_supervisor(config, tx, waker)
+    })
+    .ok();
 }
 
 fn run_supervisor(
