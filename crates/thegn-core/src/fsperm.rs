@@ -1577,6 +1577,117 @@ impl RootedDir {
         }
     }
 
+    /// Open an existing child directory without creating it or following a
+    /// symlink. A missing child is reported as `None`.
+    pub fn open_child_dir(&self, name: &str) -> std::io::Result<Option<RootedDir>> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::{Mode, SFlag, fstat};
+
+            let fd = match openat(
+                &self.fd,
+                name_path,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::ENOENT) => return Ok(None),
+                Err(error) => return Err(map_directory_open_error(error)),
+            };
+            let stat = fstat(&fd).map_err(nix_io_error)?;
+            if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path component is not a directory",
+                ));
+            }
+            Ok(Some(RootedDir {
+                path: self.path.join(name_path),
+                fd,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name_path);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "path component is a symlink or not a directory",
+                    ))
+                }
+                Ok(_) => Ok(Some(RootedDir { path })),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    /// Read an existing regular child file without following a symlink, up to
+    /// `limit` bytes. A missing child is reported as `None`.
+    pub fn read_regular(&self, name: &str, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        let file = {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::{Mode, SFlag, fstat};
+
+            let fd = match openat(
+                &self.fd,
+                name_path,
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::ENOENT) => return Ok(None),
+                Err(nix::errno::Errno::ELOOP) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "local entry is a symlink",
+                    ));
+                }
+                Err(error) => return Err(nix_io_error(error)),
+            };
+            let stat = fstat(&fd).map_err(nix_io_error)?;
+            if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "local entry is not a regular file",
+                ));
+            }
+            std::fs::File::from(fd)
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let path = self.path.join(name_path);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "local entry is a symlink or not a regular file",
+                ));
+            }
+            std::fs::File::open(path)?
+        };
+        use std::io::Read;
+        let read_limit = limit.saturating_add(1);
+        let mut bytes = Vec::new();
+        file.take(read_limit).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "local file exceeds the comparison limit",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
     /// Return whether `path` still names the directory held by this handle.
     /// The final path component is inspected without following a symlink.
     #[allow(
@@ -3267,5 +3378,69 @@ mod tests {
 
         assert!(moved.join("dest").is_dir());
         assert!(!outside.join("dest").exists());
+    }
+
+    #[test]
+    fn rooted_dir_read_regular_returns_bytes_or_none() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("f"), b"abc").unwrap();
+        let rooted = open_rooted_dir(temp.path()).unwrap();
+        assert_eq!(rooted.read_regular("f", 3).unwrap(), Some(b"abc".to_vec()));
+        assert_eq!(rooted.read_regular("missing", 3).unwrap(), None);
+        assert!(matches!(
+            rooted.read_regular("f", 2),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn rooted_dir_read_regular_refuses_a_symlink_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&outside, b"safe").unwrap();
+        let rooted = open_rooted_dir(&root).unwrap();
+        if let Err(error) = create_symlink(&outside, &root.join("link"), false) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create leaf symlink fixture: {error}");
+        }
+        assert!(matches!(
+            rooted.read_regular("link", 10),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn rooted_dir_read_open_child_dir_never_creates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(root.join("existing")).unwrap();
+        let rooted = open_rooted_dir(&root).unwrap();
+        assert!(rooted.open_child_dir("absent").unwrap().is_none());
+        assert!(!root.join("absent").exists());
+        assert!(rooted.open_child_dir("existing").unwrap().is_some());
+        if let Err(error) = create_symlink(&outside, &root.join("link"), true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create child directory symlink fixture: {error}");
+        }
+        assert!(matches!(
+            rooted.open_child_dir("link"),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 }

@@ -727,6 +727,12 @@ all allow entries.
 A provider launch using `sealed-tunnel` with a VPN configured is refused before
 provisioning; if a refused launch created its provider sandbox, thegn destroys
 that sandbox.
+With `data = "sync"`, closing the worktree copies sandbox changes back by
+comparing each file with what the upload sent: a file the sandbox did not
+change never overwrites a local edit. A file changed in both places (or deleted
+locally and changed in the sandbox) stops the sync with a list of files; nothing
+is written locally and the sandbox is kept. Make each listed file match one
+copy and close again. Files deleted in the sandbox are not deleted locally.
 
 ## Inspecting
 
