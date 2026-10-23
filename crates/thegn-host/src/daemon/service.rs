@@ -6271,6 +6271,176 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
+    /// Detach a live client and reconnect over the real WS route. The first
+    /// connection's echoed output must remain in the pane snapshot, and the
+    /// second connection's first live delta must continue its sequence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_detach_then_reattach_keeps_the_session_and_its_screen() {
+        use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
+
+        async fn next_frame(rx: &mut mpsc::Receiver<EventFrame>) -> EventFrame {
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("frame within 10s")
+                .expect("stream open")
+        }
+
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = root
+            .path()
+            .join(format!("thegn-daemon-reattach-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        let ep = thegn_svc::ipc::IpcEndpoint::for_socket_path(&sock);
+        let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&ep)
+            .await
+            .unwrap()
+        {
+            thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
+            thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+        };
+
+        let (svc, _events) = service(0);
+        let svc = Arc::new(svc);
+        let state = thegn_svc::control::http::ControlState {
+            api: svc.clone(),
+            store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+            local_admin: true,
+            daemon_euid: thegn_svc::ipc::effective_uid(),
+            require_approval: false,
+            server_label: "test thegn".into(),
+            cors_origins: Vec::new(),
+            event_streams: Default::default(),
+        };
+        let app = thegn_svc::control::http::router(state);
+        let server = tokio::spawn(axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+        ));
+
+        let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
+        let cat = thegn_core::util::which_path("cat").unwrap_or_else(|| "/bin/cat".into());
+        let info = client
+            .open(&OpenSpec {
+                argv: vec![cat],
+                cwd: None,
+                env: vec![],
+                rows: 24,
+                cols: 80,
+                worktree: None,
+                ..Default::default()
+            })
+            .await
+            .expect("open session");
+
+        let mut first = client
+            .attach(&info.id, "first", 24, 80, false)
+            .await
+            .expect("first attach");
+        assert!(matches!(
+            next_frame(&mut first.frames).await,
+            EventFrame::Hello(_)
+        ));
+        assert!(matches!(
+            next_frame(&mut first.frames).await,
+            EventFrame::PaneSnapshot { .. }
+        ));
+        first
+            .control
+            .send(AttachControl::Input(b"marker-one\n".to_vec()))
+            .await
+            .expect("first input channel is open");
+        let mut first_echo = Vec::new();
+        while !String::from_utf8_lossy(&first_echo).contains("marker-one") {
+            match next_frame(&mut first.frames).await {
+                EventFrame::PaneDelta { bytes, .. } => first_echo.extend_from_slice(&bytes),
+                other => panic!("expected first client's pane delta, got {other:?}"),
+            }
+        }
+
+        first
+            .control
+            .send(AttachControl::Close)
+            .await
+            .expect("close first attach");
+        drop(first);
+        client
+            .detach(&info.id, "first")
+            .await
+            .expect("detach is idempotent after the closed subscriber");
+        assert!(
+            client
+                .sessions()
+                .await
+                .unwrap()
+                .iter()
+                .any(|session| session.id == info.id)
+        );
+
+        let mut second = client
+            .attach(&info.id, "second", 24, 80, false)
+            .await
+            .expect("reattach kept session alive");
+        assert!(matches!(
+            next_frame(&mut second.frames).await,
+            EventFrame::Hello(_)
+        ));
+        let snap_seq = match next_frame(&mut second.frames).await {
+            EventFrame::PaneSnapshot { seq, .. } => seq,
+            other => panic!("second frame is the reattach snapshot, got {other:?}"),
+        };
+        let (_, rows, cols, ansi) = client.snapshot(&info.id).await.expect("snapshot retained");
+        let screen = crate::cmd::session::snapshot_text(rows, cols, &ansi);
+        assert!(
+            screen.contains("marker-one"),
+            "reattach snapshot retained first output: {screen:?}"
+        );
+
+        second
+            .control
+            .send(AttachControl::Input(b"marker-two\n".to_vec()))
+            .await
+            .expect("second input channel is open");
+        let mut second_echo = Vec::new();
+        let mut first_delta_seq = None;
+        while !String::from_utf8_lossy(&second_echo).contains("marker-two") {
+            match next_frame(&mut second.frames).await {
+                EventFrame::PaneDelta { seq, bytes, .. } => {
+                    if first_delta_seq.is_none() {
+                        first_delta_seq = Some(seq);
+                    }
+                    second_echo.extend_from_slice(&bytes);
+                }
+                other => panic!("expected second client's pane delta, got {other:?}"),
+            }
+        }
+        assert_eq!(first_delta_seq, Some(snap_seq + 1));
+
+        client
+            .kill(&info.id)
+            .await
+            .expect("kill reattached session");
+        loop {
+            match next_frame(&mut second.frames).await {
+                EventFrame::SessionExit { session, .. } => {
+                    assert_eq!(session, info.id);
+                    break;
+                }
+                EventFrame::PaneDelta { .. } | EventFrame::PaneSnapshot { .. } => continue,
+                other => panic!("unexpected frame while awaiting exit: {other:?}"),
+            }
+        }
+        server.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), server)
+                .await
+                .expect("test server task stops promptly")
+                .is_err(),
+            "aborted server task reports cancellation"
+        );
+        drop(root); // owns and removes the private socket directory
+    }
+
     /// Exercise the actual control-plane fork through `ControlApi`. This keeps
     /// the source alive while checking that resize state reaches the child,
     /// identity and handoff data cross only through the child environment,
