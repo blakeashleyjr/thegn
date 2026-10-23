@@ -1110,8 +1110,11 @@ fn teardown_selection(read: anyhow::Result<Option<String>>) -> Result<Option<Str
 }
 
 /// Resolve the worktree location once before teardown or removal. A failed
-/// read or unrecognised recorded location refuses deletion: guessing local
-/// could tombstone a remote path, target the wrong runtime, and skip its purge.
+/// read (or a state DB that cannot be re-opened when the caller has no handle)
+/// and a recorded location that is not recognised refuse the delete: guessing
+/// "local" could tombstone a remote path, tear down the wrong host's runtime,
+/// and skip the remote purge, leaking the remote checkout once the row is
+/// forgotten.
 fn destroy_location(
     db: Option<&Db>,
     worktree: &Path,
