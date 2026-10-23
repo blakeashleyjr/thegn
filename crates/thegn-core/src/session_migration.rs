@@ -7,6 +7,7 @@
 
 use crate::issue::{AgentDispatch, DispatchNote};
 use crate::models::{GroupTabRow, TabGroupRow, WorktreeRow};
+use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -167,6 +168,265 @@ pub struct MigrationBundle {
     pub notes: Vec<MigrationNote>,
     pub pin_state: Option<String>,
     pub pin_updated_at: Option<i64>,
+}
+
+/// Total serialized size a migration bundle may have (primary decision, batch 70).
+pub const MAX_MIGRATION_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
+/// Deepest JSON nesting a migrated tab field may have (primary decision, batch 70).
+pub const MAX_MIGRATION_JSON_DEPTH: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationBoundsError {
+    TooLarge {
+        bytes: usize,
+        max: usize,
+    },
+    TooDeep {
+        group: String,
+        ordinal: i64,
+        field: &'static str,
+        max: usize,
+    },
+    DuplicateKey {
+        group: String,
+        ordinal: i64,
+        field: &'static str,
+        key: String,
+    },
+}
+
+impl std::fmt::Display for MigrationBoundsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { bytes, max } => {
+                write!(f, "session bundle is {bytes} bytes; the limit is {max}")
+            }
+            Self::TooDeep {
+                group,
+                ordinal,
+                field,
+                max,
+            } => write!(
+                f,
+                "group {group:?} tab {ordinal} {field} nests deeper than {max}"
+            ),
+            Self::DuplicateKey {
+                group,
+                ordinal,
+                field,
+                key,
+            } => write!(
+                f,
+                "group {group:?} tab {ordinal} {field} repeats the key {key:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationBoundsError {}
+
+/// Refuse migration bundles whose opaque tab payloads exceed safe parse bounds.
+pub fn check_bundle_bounds(bundle: &MigrationBundle) -> Result<(), MigrationBoundsError> {
+    let bytes = match serde_json::to_vec(bundle) {
+        Ok(encoded) => encoded.len(),
+        Err(_) => usize::MAX,
+    };
+    if bytes > MAX_MIGRATION_BUNDLE_BYTES {
+        return Err(MigrationBoundsError::TooLarge {
+            bytes,
+            max: MAX_MIGRATION_BUNDLE_BYTES,
+        });
+    }
+
+    for group in &bundle.groups {
+        for tab in &group.tabs {
+            for (field, value) in [
+                ("pane_tree", tab.pane_tree.as_str()),
+                ("pane_cwds", tab.pane_cwds.as_str()),
+                ("pane_cmds", tab.pane_cmds.as_str()),
+                ("pane_sessions", tab.pane_sessions.as_str()),
+                ("scrollback_snapshot", tab.scrollback_snapshot.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    continue;
+                }
+                if json_nesting_depth(value) > MAX_MIGRATION_JSON_DEPTH {
+                    return Err(MigrationBoundsError::TooDeep {
+                        group: group.name.clone(),
+                        ordinal: tab.ordinal,
+                        field,
+                        max: MAX_MIGRATION_JSON_DEPTH,
+                    });
+                }
+                if let Err(error) = parse_no_duplicate_keys(value)
+                    && let Some(key) = duplicate_key_from_error(&error)
+                {
+                    return Err(MigrationBoundsError::DuplicateKey {
+                        group: group.name.clone(),
+                        ordinal: tab.ordinal,
+                        field,
+                        key: truncate_chars(&key, 64),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+const DUP_MARKER_PREFIX: &str = "duplicate-json-key-hex:";
+
+fn duplicate_key_marker(key: &str) -> String {
+    let mut marker = String::with_capacity(DUP_MARKER_PREFIX.len() + key.len() * 2 + 1);
+    marker.push_str(DUP_MARKER_PREFIX);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in key.bytes() {
+        marker.push(char::from(HEX[usize::from(byte >> 4)]));
+        marker.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    marker.push(':');
+    marker
+}
+
+fn duplicate_key_from_error(error: &str) -> Option<String> {
+    let encoded = error.strip_prefix(DUP_MARKER_PREFIX)?.split(':').next()?;
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn json_nesting_depth(value: &str) -> usize {
+    let mut depth = 0;
+    let mut maximum = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in value.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'[' | b'{' => {
+                    depth += 1;
+                    maximum = maximum.max(depth);
+                }
+                b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    maximum
+}
+
+fn parse_no_duplicate_keys(value: &str) -> Result<(), String> {
+    let mut deserializer = serde_json::Deserializer::from_str(value);
+    NoDuplicateKeys
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .map_err(|error| error.to_string())
+}
+
+struct NoDuplicateKeys;
+
+impl<'de> serde::de::DeserializeSeed<'de> for NoDuplicateKeys {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(NoDuplicateKeysVisitor)
+    }
+}
+
+struct NoDuplicateKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NoDuplicateKeysVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any JSON value without duplicate object keys")
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        NoDuplicateKeys.deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<(), A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(NoDuplicateKeys)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key.clone()) {
+                return Err(serde::de::Error::custom(duplicate_key_marker(&key)));
+            }
+            map.next_value_seed(NoDuplicateKeys)?;
+        }
+        Ok(())
+    }
 }
 
 /// The target's allowlisted rows. `groups`/`tabs` may contain other groups so
@@ -846,6 +1106,84 @@ mod tests {
             Some("[\"api\"]".into()),
             Some(4),
         )
+    }
+
+    #[test]
+    fn bundle_bounds_refuse_an_oversized_bundle() {
+        let mut bundle = bundle();
+        bundle.groups[0].tabs[0].scrollback_snapshot = "x".repeat(MAX_MIGRATION_BUNDLE_BYTES);
+
+        assert!(matches!(
+            check_bundle_bounds(&bundle),
+            Err(MigrationBoundsError::TooLarge { bytes, max }) if bytes > max
+        ));
+    }
+
+    #[test]
+    fn bundle_bounds_refuse_deep_nesting_even_when_not_json() {
+        let mut bundle = bundle();
+        bundle.groups[0].tabs[0].pane_tree = "[".repeat(MAX_MIGRATION_JSON_DEPTH + 1);
+        assert!(matches!(
+            check_bundle_bounds(&bundle),
+            Err(MigrationBoundsError::TooDeep {
+                field: "pane_tree",
+                ..
+            })
+        ));
+
+        bundle.groups[0].tabs[0].pane_tree = format!(
+            "{}{}",
+            "[".repeat(MAX_MIGRATION_JSON_DEPTH),
+            "]".repeat(MAX_MIGRATION_JSON_DEPTH)
+        );
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+    }
+
+    #[test]
+    fn bundle_bounds_refuse_duplicate_pane_session_keys() {
+        let mut bundle = bundle();
+        bundle.groups[0].tabs[0].pane_sessions =
+            r#"{"1":{"session":"a"},"1":{"session":"b"}}"#.into();
+        assert!(matches!(
+            check_bundle_bounds(&bundle),
+            Err(MigrationBoundsError::DuplicateKey { field: "pane_sessions", key, .. }) if key == "1"
+        ));
+
+        bundle.groups[0].tabs[0].pane_sessions.clear();
+        bundle.groups[0].tabs[0].pane_cmds = r#"{"1":{"argv":[],"argv":[]}}"#.into();
+        assert!(matches!(
+            check_bundle_bounds(&bundle),
+            Err(MigrationBoundsError::DuplicateKey { field: "pane_cmds", key, .. }) if key == "argv"
+        ));
+    }
+
+    #[test]
+    fn bundle_bounds_ignore_brackets_inside_strings_and_opaque_legacy_text() {
+        let mut bundle = bundle();
+        // Positive control: the fixture's legacy pane_sessions/scrollback stay opaque.
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+
+        bundle.groups[0].tabs[0].pane_cwds = format!(r#"{{"path":"{}"}}"#, "[".repeat(100));
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+
+        bundle.groups[0].tabs[0].pane_cwds = r#"{"quote":"\"[{}]","items":[{}]}"#.into();
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+
+        bundle.groups[0].tabs[0].pane_cwds =
+            r#"[true,false,null,1,1.5,"text",{"nested":[]}]"#.into();
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+
+        // An unterminated string ending in an escape remains opaque legacy text.
+        bundle.groups[0].tabs[0].pane_cwds = r#"{"path":"abc\"#.into();
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+
+        // Unmatched closing brackets in opaque text do not underflow the scanner.
+        bundle.groups[0].tabs[0].pane_cwds = "]".into();
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
+
+        bundle.groups[0].tabs[0].pane_sessions =
+            r#"{"1":{"session":"a"},"2":{"session":"b"}}"#.into();
+        assert_eq!(check_bundle_bounds(&bundle), Ok(()));
     }
 
     #[test]

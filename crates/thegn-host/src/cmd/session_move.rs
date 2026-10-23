@@ -150,6 +150,31 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     } else {
         Db::open().context("open source profile database")?
     };
+    let session = thegn_core::db::session();
+    let bundle = source_db.migration_snapshot(&source.name, &target.name, &session, &worktree)?;
+    let history = if include_history {
+        HistoryPolicy::Include
+    } else {
+        HistoryPolicy::Drop
+    };
+    fill_bundle_audit(&mut audit, &bundle, history);
+    if let Err(error) = thegn_core::session_migration::check_bundle_bounds(&bundle) {
+        return fail(
+            &mut audit,
+            json,
+            &format!("refusing to move: {error}"),
+            false,
+        );
+    }
+    if bundle.worktree.is_none() && bundle.groups.is_empty() && bundle.dispatches.is_empty() {
+        return fail(
+            &mut audit,
+            json,
+            "worktree path is not registered and has no session groups or dispatches",
+            false,
+        );
+    }
+
     let target_db = if dry_run {
         dry_run_open_at(&target_db_path, "target")?
     } else {
@@ -160,22 +185,6 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
             )
         })?
     };
-    let session = thegn_core::db::session();
-    let bundle = source_db.migration_snapshot(&source.name, &target.name, &session, &worktree)?;
-    let history = if include_history {
-        HistoryPolicy::Include
-    } else {
-        HistoryPolicy::Drop
-    };
-    fill_bundle_audit(&mut audit, &bundle, history);
-    if bundle.worktree.is_none() && bundle.groups.is_empty() && bundle.dispatches.is_empty() {
-        return fail(
-            &mut audit,
-            json,
-            "worktree path is not registered and has no session groups or dispatches",
-            false,
-        );
-    }
 
     let target_state = target_db
         .as_ref()
