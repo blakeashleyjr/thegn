@@ -978,7 +978,9 @@ mod tests {
 
     #[test]
     fn tgproxy_status_line_names_the_path_or_says_not_installed() {
-        let found = std::path::Path::new("/opt/thegn/tgproxy");
+        // A real executable file (the running test binary): the status line names its path.
+        let exe = std::env::current_exe().unwrap();
+        let found = exe.as_path();
         assert_eq!(
             tgproxy_status_line(Some(found)),
             found.display().to_string()
