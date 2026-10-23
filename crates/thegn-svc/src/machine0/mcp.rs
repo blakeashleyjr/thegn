@@ -36,8 +36,8 @@ fn retryable_err(e: &reqwest::Error) -> bool {
 /// A dedicated HTTP client for the MCP endpoint that **disables keep-alive
 /// pooling** (`pool_max_idle_per_host(0)`), so every call dials a fresh
 /// connection instead of risking a reused-but-reset socket — the observed
-/// "error sending request" mid-poll. It follows the shared provider control
-/// policy and refuses redirects so the `x-api-key` is never replayed elsewhere.
+/// "error sending request" mid-poll. Its calls share the provider control gate
+/// and it refuses redirects so the `x-api-key` is never replayed elsewhere.
 fn mcp_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -127,6 +127,12 @@ impl Mcp0Client {
         if *done {
             return;
         }
+        let Ok(authority) = crate::provider::authority_key(&self.endpoint) else {
+            return;
+        };
+        let Ok(_permit) = crate::provider::CONTROL_GATE.acquire(&authority).await else {
+            return;
+        };
         *done = true; // attempt at most once regardless of outcome
         let body = json!({
             "jsonrpc": "2.0",
@@ -183,10 +189,13 @@ impl Mcp0Client {
     /// Call an MCP tool by name and return its **unwrapped** result value
     /// (`structuredContent` when present, else the parsed text content). Errors
     /// on a JSON-RPC error, an `isError` tool result, or a non-success HTTP
-    /// status after the retry budget.
+    /// status after the retry budget. Each attempt shares the provider control
+    /// gate with the other provider control-plane requests.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
         self.ensure_initialized().await;
         let session = self.session.lock().await.clone();
+        let authority = crate::provider::authority_key(&self.endpoint)
+            .with_context(|| format!("machine0 mcp {name}: endpoint"))?;
         // Non-idempotent tools (create verbs) must never be retried after an
         // ambiguous transport failure: the request may have been accepted while
         // only the response was lost, and a retry would duplicate a billing VM /
@@ -194,6 +203,10 @@ impl Mcp0Client {
         let retry_ok = is_idempotent_tool(name);
         let mut last = String::new();
         for attempt in 0..ATTEMPTS {
+            let permit = crate::provider::CONTROL_GATE
+                .acquire(&authority)
+                .await
+                .with_context(|| format!("machine0 mcp {name}"))?;
             let body = tools_call_body(self.id(), name, arguments.clone());
             let mut req = self
                 .http
@@ -231,6 +244,7 @@ impl Mcp0Client {
                         };
                         last = format!("machine0 mcp {name}: HTTP {status}: {text}");
                         if retry_ok && transient_status(status) && attempt + 1 < ATTEMPTS {
+                            drop(permit);
                             tokio::time::sleep(BACKOFF).await;
                             continue;
                         }
@@ -266,6 +280,7 @@ impl Mcp0Client {
                         )
                     );
                     if should_retry {
+                        drop(permit);
                         tokio::time::sleep(BACKOFF).await;
                         continue;
                     }
@@ -475,6 +490,62 @@ mod tests {
 
     fn torn_success_response() -> Vec<u8> {
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n1234567890".to_vec()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn call_tool_waits_for_the_shared_control_gate() {
+        let endpoint = "http://127.0.0.1:19/mcp";
+        let authority = crate::provider::authority_key(endpoint).unwrap();
+        let permits = (0..crate::provider::CONTROL_PER_AUTHORITY_CONCURRENCY)
+            .map(|_| {
+                crate::provider::CONTROL_GATE
+                    .try_acquire(&authority)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let error = Mcp0Client::new(endpoint, "test-api-key")
+            .call_tool("vm_list", json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("provider concurrency cap reached"));
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn call_tool_releases_its_control_permit_after_a_response() {
+        // Positive control: this succeeds without the change too; it checks that
+        // the newly acquired permit is released after the response is consumed.
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":true}}}"#;
+        let (endpoint, server) = fault_server(move |_| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+        })
+        .await;
+        let result = Mcp0Client::new(&endpoint, "test-api-key")
+            .call_tool("vm_list", json!({}))
+            .await
+            .unwrap();
+        assert!(result["ok"].as_bool().unwrap());
+
+        let authority = crate::provider::authority_key(&endpoint).unwrap();
+        let permits = (0..crate::provider::CONTROL_PER_AUTHORITY_CONCURRENCY)
+            .map(|_| {
+                crate::provider::CONTROL_GATE
+                    .try_acquire(&authority)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            permits.len(),
+            crate::provider::CONTROL_PER_AUTHORITY_CONCURRENCY
+        );
+        drop(permits);
+        assert_eq!(server.await.unwrap(), 1);
     }
 
     #[test]
