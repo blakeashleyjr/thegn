@@ -22,24 +22,19 @@ actions: [pr-open, pr-create]
    is available; PR review shows the PR head diff, inline threads, outdated
    feedback, and top-level comments. Stale, loading, unsupported, and absent
    snapshots are labeled rather than attached to local lines.
-4. Act from the panel's _pr_ section: `A` approves and `o` opens the PR in
-   your browser. `M` opens a merge-method menu (squash is the default) and
-   lists blockers; `c` comments when a PR exists and asks
-   before creating one otherwise. `r` needs a PR and re-runs only the failed
-   workflow runs of the PR's current head commit. Enter on an OPEN PRS row opens
-   that PR read-only; Enter on the branch PR opens its PR view;
-5. Act from the panel's _pr_ section: `A` approves the PR head the panel
-   shows; if the PR moved since, nothing is submitted and the status line says
-   so — refresh and review again. `o` opens the PR in your browser. `M` opens a
-   merge-method menu (squash is the default) and lists blockers; `c` comments
-   when a PR exists and asks before creating one otherwise.
-   `r` needs a PR. Enter on an OPEN PRS row
-   opens that PR read-only; Enter on the branch PR opens its PR view;
+4. Act from the panel's _pr_ section: `A` re-reads the PR before approving the
+   head the panel shows; if the PR moved since, nothing is submitted and the
+   status line says so — refresh and review again. `o` opens the PR in your
+   browser. `M` opens a merge-method menu (squash is the default) and lists
+   blockers; `c` comments when a PR exists and asks before creating one
+   otherwise. `r` needs a PR and re-runs only the failed workflow runs pinned to
+   that PR's head commit. Enter on an OPEN PRS row opens that PR read-only;
+   Enter on the branch PR opens its PR view;
    Full shows its two-column page: header and checks beside threads and OPEN
    PRS. Or run `gh` in the pane, or open the PR view for the conversation
    feed. The palette's **PR — open in browser** action (`pr-open`) does the
    same from anywhere, when the conversation outgrows a pane.
-6. Done? `Alt-X` removes the review worktree; the branch stays.
+5. Done? `Alt-X` removes the review worktree; the branch stays.
 
 ## Review feedback
 
