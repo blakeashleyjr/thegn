@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::{Db, PrQueueRow, PrRebind};
 use thegn_core::outln;
-use thegn_core::store::WorktreeAuxStore;
+use thegn_core::store::{PrRemoval, WorktreeAuxStore};
 
 use crate::integrate;
 use crate::pr_driver::{self, PrItem, PrStep};
@@ -276,7 +276,10 @@ fn rm(number: u64) -> Result<()> {
         .into_iter()
         .filter(|row| row.number == number)
         .collect();
-    anyhow::ensure!(!matches.is_empty(), "PR #{number} is not in the queue");
+    anyhow::ensure!(
+        !matches.is_empty(),
+        "PR #{number} is no longer in the queue"
+    );
     anyhow::ensure!(
         matches.len() == 1,
         "PR #{number} is ambiguous; matching queue keys: {}",
@@ -287,8 +290,13 @@ fn rm(number: u64) -> Result<()> {
             .join(", ")
     );
     let key = matches.remove(0).key;
-    db.remove_pr_entry(&key)?;
-    outln!("Removed PR #{number} from the queue.");
+    match db.remove_pr_entry(&key)? {
+        PrRemoval::Removed => outln!("Removed PR #{number} from the queue."),
+        PrRemoval::AgentRunning => anyhow::bail!(
+            "PR #{number} was not removed: a PR agent is running for it; remove it after the agent finishes"
+        ),
+        PrRemoval::Missing => anyhow::bail!("PR #{number} is no longer in the queue"),
+    }
     Ok(())
 }
 
@@ -392,8 +400,17 @@ fn rebind_target(rows: &[PrQueueRow], number: u64) -> Result<&PrQueueRow> {
 fn clear() -> Result<()> {
     let root = repo_root()?;
     let db = Db::open()?;
-    let n = db.clear_pr_queue(&root.to_string_lossy())?;
-    outln!("PR queue cleared ({n} removed).");
+    let outcome = db.clear_pr_queue(&root.to_string_lossy())?;
+    outln!("PR queue cleared ({} removed).", outcome.removed);
+    if !outcome.kept_running.is_empty() {
+        let kept = outcome
+            .kept_running
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("kept PR {kept}: a PR agent is running for them");
+    }
     Ok(())
 }
 

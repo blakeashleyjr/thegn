@@ -170,6 +170,9 @@ mod pr_agent_head_tests;
 #[cfg(test)]
 #[path = "db_pr_agent_lease_tests.rs"]
 mod pr_agent_lease_tests;
+#[cfg(test)]
+#[path = "db_pr_queue_removal_tests.rs"]
+mod pr_queue_removal_tests;
 
 #[cfg(test)]
 #[path = "db_pr_agent_reap_tests.rs"]
@@ -1721,18 +1724,60 @@ impl WorktreeAuxStore for Db {
         Ok(changed == 1)
     }
 
-    fn remove_pr_entry(&self, key: &str) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM pr_queue WHERE key=?1", params![key])?;
-        Ok(())
+    fn remove_pr_entry(&self, key: &str) -> Result<crate::store::PrRemoval> {
+        let tx = self.conn().unchecked_transaction()?;
+        let now_ms = util::now_ms();
+        let removed = tx.execute(
+            "DELETE FROM pr_queue WHERE key=?1
+             AND (agent_claim_owner IS NULL OR agent_claim_lease_until_ms IS NULL
+                  OR agent_claim_lease_until_ms < ?2)",
+            params![key, now_ms],
+        )?;
+        let outcome = if removed == 1 {
+            crate::store::PrRemoval::Removed
+        } else {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pr_queue WHERE key=?1)",
+                [key],
+                |row| row.get(0),
+            )?;
+            if exists {
+                crate::store::PrRemoval::AgentRunning
+            } else {
+                crate::store::PrRemoval::Missing
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
-    fn clear_pr_queue(&self, repo_root: &str) -> Result<usize> {
-        let n = self.conn().execute(
-            "DELETE FROM pr_queue WHERE repo_root=?1",
-            params![repo_root],
+    fn clear_pr_queue(&self, repo_root: &str) -> Result<crate::store::PrClearOutcome> {
+        let tx = self.conn().unchecked_transaction()?;
+        let now_ms = util::now_ms();
+        let kept_running = {
+            let mut stmt = tx.prepare(
+                "SELECT number FROM pr_queue WHERE repo_root=?1
+                 AND agent_claim_owner IS NOT NULL
+                 AND agent_claim_lease_until_ms IS NOT NULL
+                 AND agent_claim_lease_until_ms >= ?2
+                 ORDER BY number",
+            )?;
+            let numbers = stmt.query_map(params![repo_root, now_ms], |row| row.get::<_, i64>(0))?;
+            numbers
+                .map(|number| number.map(|number| number.max(0) as u64))
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let removed = tx.execute(
+            "DELETE FROM pr_queue WHERE repo_root=?1
+             AND (agent_claim_owner IS NULL OR agent_claim_lease_until_ms IS NULL
+                  OR agent_claim_lease_until_ms < ?2)",
+            params![repo_root, now_ms],
         )?;
-        Ok(n)
+        tx.commit()?;
+        Ok(crate::store::PrClearOutcome {
+            removed,
+            kept_running,
+        })
     }
 
     fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>> {
