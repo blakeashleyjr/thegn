@@ -1271,8 +1271,14 @@ mod tests {
     #[test]
     fn pr_repair_excerpt_is_none_without_head_evidence() {
         let entry = pr_repair_entry("abc", "1", "1", "test", "log", 1);
-        assert_eq!(pr_repair_excerpt(&[entry.clone()], "", 1024), None);
-        assert_eq!(pr_repair_excerpt(&[entry.clone()], "  \n", 1024), None);
+        assert_eq!(
+            pr_repair_excerpt(std::slice::from_ref(&entry), "", 1024),
+            None
+        );
+        assert_eq!(
+            pr_repair_excerpt(std::slice::from_ref(&entry), "  \n", 1024),
+            None
+        );
         assert_eq!(pr_repair_excerpt(&[entry], "other", 1024), None);
         let blank = pr_repair_entry("abc", "1", "1", "test", " \n", 1);
         assert_eq!(pr_repair_excerpt(&[blank], "abc", 1024), None);
@@ -1304,7 +1310,6 @@ mod tests {
         assert!(excerpt.len() <= 2048);
         assert!(excerpt.contains("error: boom"));
         assert!(excerpt.contains(EARLIER_OMITTED));
-        assert!(excerpt.is_char_boundary(excerpt.len()));
 
         let unicode = pr_repair_entry("abc", "2", "2", "界", "ééééé", 2);
         let clipped = pr_repair_excerpt(&[unicode], "abc", 33).unwrap();
@@ -1312,7 +1317,6 @@ mod tests {
             clipped.len() <= 33,
             "multi-byte text must fit the byte budget"
         );
-        assert!(clipped.is_char_boundary(clipped.len()));
     }
 
     #[test]
@@ -1325,10 +1329,10 @@ mod tests {
         ];
         let excerpt = pr_repair_excerpt(&entries, "abc", 2048).unwrap();
         let newest = excerpt.find("job newest").unwrap();
-        let earlier_job = excerpt.find("job tie-earlier-job").unwrap();
-        let later_job = excerpt.find("job tie-earlier-run").unwrap();
-        let later_run = excerpt.find("job tie-later-job").unwrap();
-        assert!(newest < earlier_job && earlier_job < later_job && later_job < later_run);
+        let run_a_job_a = excerpt.find("job tie-earlier-job").unwrap();
+        let run_a_job_b = excerpt.find("job tie-earlier-run").unwrap();
+        let run_b_job_z = excerpt.find("job tie-later-job").unwrap();
+        assert!(newest < run_a_job_a && run_a_job_a < run_a_job_b && run_a_job_b < run_b_job_z);
     }
 
     #[test]
