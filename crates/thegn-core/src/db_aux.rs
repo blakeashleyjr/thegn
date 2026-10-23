@@ -1725,7 +1725,7 @@ impl WorktreeAuxStore for Db {
     }
 
     fn remove_pr_entry(&self, key: &str) -> Result<crate::store::PrRemoval> {
-        let tx = self.conn().unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
         let now_ms = util::now_ms();
         let removed = tx.execute(
             "DELETE FROM pr_queue WHERE key=?1
@@ -1752,7 +1752,7 @@ impl WorktreeAuxStore for Db {
     }
 
     fn clear_pr_queue(&self, repo_root: &str) -> Result<crate::store::PrClearOutcome> {
-        let tx = self.conn().unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
         let now_ms = util::now_ms();
         let kept_running = {
             let mut stmt = tx.prepare(
