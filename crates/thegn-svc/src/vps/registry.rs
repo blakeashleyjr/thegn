@@ -237,6 +237,31 @@ pub fn ensure_known_hosts_dir() -> Result<PathBuf> {
     ensure_known_hosts_dir_at(&dir())
 }
 
+/// Subdirectory of the registry root holding machine0 pending-create records (`<name>.json`).
+pub const MACHINE0_PENDING_DIR: &str = "machine0-pending.d";
+
+/// Create (owner-only, no-follow) and open the machine0 pending-create directory.
+pub fn ensure_machine0_pending_dir_at(d: &Path) -> Result<thegn_core::fsperm::PrivateDir> {
+    let _root = open_root(d, true)?;
+    thegn_core::fsperm::ensure_private_dir_beneath(d, Path::new(MACHINE0_PENDING_DIR))
+        .context("vps registry: machine0 pending directory is not an owned private directory")
+}
+
+/// Open the machine0 pending-create directory if it exists.
+/// `Ok(None)` only when the registry root or subdirectory is absent; a symlinked,
+/// foreign-owned or unreadable directory is an error.
+pub fn open_machine0_pending_dir_at(d: &Path) -> Result<Option<thegn_core::fsperm::PrivateDir>> {
+    let Some(root) = open_root(d, false)? else {
+        return Ok(None);
+    };
+    if !root.entry_exists_nofollow(MACHINE0_PENDING_DIR)? {
+        return Ok(None);
+    }
+    thegn_core::fsperm::open_private_dir(&d.join(MACHINE0_PENDING_DIR))
+        .map(Some)
+        .context("vps registry: machine0 pending directory is not an owned private directory")
+}
+
 /// Write (atomically: tmp + rename) a record into `d`.
 pub fn write_at(d: &Path, rec: &VpsRecord) -> Result<()> {
     checked_name(&rec.name)?;
