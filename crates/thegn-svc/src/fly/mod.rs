@@ -480,7 +480,8 @@ impl FlyProvider {
     async fn first_machine(&self, app: &str) -> Result<Option<machines::FlyMachine>> {
         let base = self.spec.api_base()?;
         let body = self.get_json(&machines::machines_url(&base, app)).await?;
-        Ok(machines::parse_machine_list(&body).into_iter().next())
+        machines::single_live_managed_machine(&body)
+            .map_err(|error| anyhow!("fly: app {app}: {error}"))
     }
 
     /// Stop the machine and wait until it is really `stopped` (scale-to-zero
