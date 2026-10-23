@@ -75,6 +75,11 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   worktree off that branch, the row is held `agent_blocked` with an
   `identity drift:` reason and no attempt spent. `thegn merge add` re-enqueues
   it against the current tip.
+  The row also records which repository and Git worktree registration the path
+  belonged to; if the worktree is gone, now belongs to another repository, or
+  has a different registration, the row is held the same way before any fold.
+  A worktree re-created at the same path in the same repository reuses its
+  registration and is caught only by the branch-tip check above.
 - If a fixing agent does not start, the row is held `agent_blocked` with no
   attempt spent; `thegn merge retry` re-arms it.
 - If Git cannot read the queued branch or fixer's checkout during a drain, the
@@ -166,6 +171,10 @@ else. A week is how long you have to notice.
   partly cleaned up, so scripts can tell. Existing THE-596 branch holds and
   rows that cannot be identified as belonging to this repository are reported
   as informational and do not change the exit status.
+  `thegn merge sweep --json` prints the same result as one JSON document; each
+  refused entry in `kept` has a stable `class` (`database`, `identity`,
+  `claim_busy`, `unsafe`, `remote`, `resources`, `removal`), and `incomplete`
+  matches the exit status.
 - A refused cleanup is retried with a growing delay (5 minutes, doubling up to
   a day). Until then it is reported as informational and does not make that
   sweep incomplete; `--force` retries immediately.

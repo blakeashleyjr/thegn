@@ -17,7 +17,9 @@ use thegn_core::models::WorktreeRow;
 use thegn_core::remote::GitLoc;
 #[cfg(test)]
 use thegn_core::store::MergeClaimRequest;
-use thegn_core::store::{MergeCandidate, MergeClaimView, WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{
+    MergeCandidate, MergeClaimView, MergeEnqueueIdentity, WorkspaceStore, WorktreeAuxStore,
+};
 use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend, PlumbingOps};
 
@@ -93,8 +95,11 @@ pub(crate) fn enqueue_bound_local_with(
 ) -> Result<()> {
     let branch_ref = format!("refs/heads/{branch}");
     let candidate_oid = CliGit.rev_parse(&GitLoc::from_db(worktree, None), &branch_ref)?;
+    let identity = local_enqueue_identity(Path::new(worktree)).map_err(|reason| {
+        anyhow::anyhow!("cannot record the worktree identity of {worktree}: {reason}")
+    })?;
     crate::cmd::dispatch::gate::pipeline_merge_admission(db, worktree, &candidate_oid, admin_why)?;
-    db.enqueue_merge_candidate(
+    db.enqueue_merge_candidate_with_identity(
         worktree,
         branch,
         target,
@@ -102,7 +107,55 @@ pub(crate) fn enqueue_bound_local_with(
             branch_ref,
             candidate_oid,
         },
+        &identity,
     )
+}
+
+pub(crate) fn local_enqueue_identity(
+    worktree: &Path,
+) -> std::result::Result<MergeEnqueueIdentity, String> {
+    let canonical = worktree
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve worktree path: {error}"))?;
+    let dot_git = canonical.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git)
+        .map_err(|_| "worktree has no Git registration".to_string())?;
+    let admin_path = if metadata.file_type().is_dir() {
+        dot_git
+    } else if metadata.file_type().is_file() {
+        let contents = std::fs::read_to_string(&dot_git)
+            .map_err(|_| "worktree has no Git registration".to_string())?;
+        let first_line = contents.lines().next().unwrap_or_default();
+        let value = first_line
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "worktree has no Git registration".to_string())?;
+        let path = Path::new(value);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            canonical.join(path)
+        }
+    } else {
+        return Err("worktree has no Git registration".into());
+    };
+    let admin_dir = admin_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve worktree registration: {error}"))?;
+    let common_dir = util::git_common_dir(&canonical)
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve repository identity: {error}"))?;
+    let common_dir = common_dir
+        .to_str()
+        .ok_or_else(|| "worktree identity is not valid UTF-8".to_string())?;
+    let admin_dir = admin_dir
+        .to_str()
+        .ok_or_else(|| "worktree identity is not valid UTF-8".to_string())?;
+    Ok(MergeEnqueueIdentity {
+        common_dir: common_dir.to_owned(),
+        admin_dir: admin_dir.to_owned(),
+    })
 }
 
 /// The repo root (main checkout) a worktree belongs to.
@@ -871,6 +924,25 @@ mod tests {
                 branch_ref: "refs/heads/feat".into(),
                 candidate_oid: tip,
             })
+        );
+    }
+
+    #[test]
+    fn enqueue_identity_records_repository_and_worktree_registration() {
+        let (_temp, repo, worktree, db, cfg) = local_candidate_fixture();
+        let _queued = enqueue_worktree(&cfg, &db, &worktree).unwrap();
+        let wt = crate::merge_ops::canonical_worktree(&worktree)
+            .to_string_lossy()
+            .into_owned();
+        let expected = crate::merge_ops::local_enqueue_identity(Path::new(&wt)).unwrap();
+        assert_eq!(
+            db.merge_enqueue_identity(&wt).unwrap(),
+            Some(expected.clone())
+        );
+        assert!(expected.admin_dir.ends_with("/worktrees/feat"));
+        assert_eq!(
+            expected.common_dir,
+            format!("{}/.git", repo.canonicalize().unwrap().display())
         );
     }
 

@@ -62,8 +62,9 @@
       `auto` dispatches via `agent_run` (worktree, watchdog, shared slice);
       attempt budget persisted per head SHA
 - [x] 14. `PrCiFailure` `{log}` upgrade in
-      `pr_driver::compose_with_log` — redacted cached excerpt (as built in
-      `crates/thegn-host/src/pr_driver.rs`); `check_urls` fallback; update the
+      `pr_driver::compose_with_log` — the PR-queue driver passes
+      `ci_log::pr_repair_excerpt` over cached entries for the PR head; CI
+      autofix passes `failure_excerpt`; `check_urls` fallback; update the
       pinned prompt tests
 - [x] 15. New action id(s) + notification kind → keymap/palette wiring and
       `ACTION_SPECS`
@@ -71,8 +72,8 @@
 ## Phase 4 — docs, help, config example
 
 - [x] 16. `config/config.toml.example`: `log_cache_runs`, `[ci.autofix]`
-      (with the prompt-injection caution next to `mode`), and the act/wrkflw
-      `[[tools]]` recipe
+      (with the prompt-injection caution next to `mode`); the `act`
+      `[[tools]]` recipe lives in `docs/help/panel.md`
 - [x] 17. `docs/help/` — claim the new action ids + notification kind and
       document the CI log cache, MCP tools, and autofix policy;
       `just help-ratchet-update` only if pinned debt genuinely shrinks

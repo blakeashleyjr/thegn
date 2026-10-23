@@ -437,7 +437,7 @@
       "type": "object"
     },
     "CiRunsReply": {
-      "description": "Cached CI run history projected through the control plane. `runs` is kept as JSON because the provider-neutral CI model intentionally belongs to `thegn-core` without a control-wire schema dependency; the response still carries the cache source and timestamp explicitly.",
+      "description": "Cached CI run history projected through the control plane. `runs` is kept as JSON because the provider-neutral CI model intentionally belongs to `thegn-core` without a control-wire schema dependency; the response still carries its source (`cache`, `provider`, or `stale-cache`) and timestamp explicitly.",
       "properties": {
         "discarded_rows": {
           "default": 0,
@@ -453,6 +453,13 @@
         "runs": true,
         "source": {
           "type": "string"
+        },
+        "stale_reason": {
+          "description": "Why a cached list was served after a failed or incomplete provider read (`source == \"stale-cache\"`).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "worktree": {
           "type": "string"

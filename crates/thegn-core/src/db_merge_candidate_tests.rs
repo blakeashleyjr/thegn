@@ -1,5 +1,7 @@
 use super::*;
-use crate::store::{MergeCandidate, MergeClaimRequest, MergeFinalOutcome, MergeFinalStatus};
+use crate::store::{
+    MergeCandidate, MergeClaimRequest, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
+};
 use crate::store::{WorkspaceStore, WorktreeAuxStore};
 
 const WORKTREE: &str = "/private/repo/feature";
@@ -15,9 +17,239 @@ fn candidate(oid: &str) -> MergeCandidate {
     }
 }
 
+fn enqueue_identity() -> MergeEnqueueIdentity {
+    MergeEnqueueIdentity {
+        common_dir: "/private/repo/.git".into(),
+        admin_dir: "/private/repo/.git/worktrees/feature".into(),
+    }
+}
+
 fn bound(db: &Db, oid: &str) {
     db.enqueue_merge_candidate(WORKTREE, "feature", "main", &candidate(oid))
         .unwrap();
+}
+
+#[test]
+fn enqueue_identity_round_trips_and_reenqueue_replaces_it() {
+    let db = Db::open_memory().unwrap();
+    let first = enqueue_identity();
+    db.enqueue_merge_candidate_with_identity(
+        WORKTREE,
+        "feature",
+        "main",
+        &candidate(OID_A),
+        &first,
+    )
+    .unwrap();
+    assert_eq!(db.merge_enqueue_identity(WORKTREE).unwrap(), Some(first));
+
+    let replacement = MergeEnqueueIdentity {
+        common_dir: "/private/other/.git".into(),
+        admin_dir: "/private/other/.git/worktrees/feature".into(),
+    };
+    db.enqueue_merge_candidate_with_identity(
+        WORKTREE,
+        "feature",
+        "main",
+        &candidate(OID_B),
+        &replacement,
+    )
+    .unwrap();
+    assert_eq!(
+        db.merge_enqueue_identity(WORKTREE).unwrap(),
+        Some(replacement)
+    );
+}
+
+#[test]
+fn enqueue_identity_is_cleared_by_unbound_and_identityless_enqueue() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge_candidate_with_identity(
+        WORKTREE,
+        "feature",
+        "main",
+        &candidate(OID_A),
+        &enqueue_identity(),
+    )
+    .unwrap();
+    db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+    assert_eq!(db.merge_enqueue_identity(WORKTREE).unwrap(), None);
+
+    db.enqueue_merge_candidate_with_identity(
+        WORKTREE,
+        "feature",
+        "main",
+        &candidate(OID_A),
+        &enqueue_identity(),
+    )
+    .unwrap();
+    db.enqueue_merge_candidate(WORKTREE, "feature", "main", &candidate(OID_B))
+        .unwrap();
+    assert_eq!(db.merge_enqueue_identity(WORKTREE).unwrap(), None);
+    assert_eq!(
+        db.merge_candidate(WORKTREE).unwrap(),
+        Some(candidate(OID_B))
+    );
+
+    db.put_worktree(
+        "feature",
+        REPO,
+        WORKTREE,
+        "feature",
+        Some("remote-location"),
+        None,
+    )
+    .unwrap();
+    db.enqueue_merge_candidate_with_identity(
+        WORKTREE,
+        "feature",
+        "main",
+        &candidate(OID_A),
+        &enqueue_identity(),
+    )
+    .unwrap();
+    assert!(
+        db.enqueue_merge_if_worktree_matches(WORKTREE, "feature", REPO, "remote-location", "main")
+            .unwrap()
+    );
+    assert_eq!(db.merge_enqueue_identity(WORKTREE).unwrap(), None);
+    assert_eq!(db.merge_candidate(WORKTREE).unwrap(), None);
+}
+
+#[test]
+fn enqueue_identity_rejects_empty_or_control_paths() {
+    let db = Db::open_memory().unwrap();
+    let identity = enqueue_identity();
+    db.enqueue_merge_candidate_with_identity(
+        WORKTREE,
+        "feature",
+        "main",
+        &candidate(OID_A),
+        &identity,
+    )
+    .unwrap();
+    for invalid in [
+        MergeEnqueueIdentity {
+            common_dir: String::new(),
+            ..identity.clone()
+        },
+        MergeEnqueueIdentity {
+            admin_dir: "/private/repo/.git/worktrees/feature\nother".into(),
+            ..identity.clone()
+        },
+    ] {
+        assert!(
+            db.enqueue_merge_candidate_with_identity(
+                WORKTREE,
+                "feature",
+                "main",
+                &candidate(OID_B),
+                &invalid,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.merge_enqueue_identity(WORKTREE).unwrap(),
+            Some(identity.clone())
+        );
+        assert_eq!(
+            db.merge_candidate(WORKTREE).unwrap(),
+            Some(candidate(OID_A))
+        );
+    }
+}
+
+#[test]
+fn enqueue_identity_claimed_row_is_refused() {
+    let db = Db::open_memory().unwrap();
+    let identity = enqueue_identity();
+    db.put_worktree("feature", REPO, WORKTREE, "feature", None, None)
+        .unwrap();
+    db.enqueue_merge_candidate_with_identity(
+        WORKTREE,
+        "feature",
+        "main",
+        &candidate(OID_A),
+        &identity,
+    )
+    .unwrap();
+    let claim = db
+        .admit_merge_claim(&MergeClaimRequest {
+            worktree: WORKTREE.into(),
+            branch: "feature".into(),
+            repo_root: REPO.into(),
+            target_branch: "main".into(),
+            location: String::new(),
+            expected_status: "queued".into(),
+            lease_until_ms: crate::util::now_ms() + 60_000,
+            owner_hint: Some("enqueue-identity-test".into()),
+        })
+        .unwrap()
+        .unwrap();
+    let claim_state_before = db
+        .conn()
+        .query_row(
+            "SELECT claim_owner,claim_generation,claim_phase,claim_lease_until_ms,\
+                    claim_owner_hint,claim_launch_nonce,claim_diagnostic,status \
+             FROM merge_queue WHERE worktree=?1",
+            [WORKTREE],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    let error = db
+        .enqueue_merge_candidate_with_identity(
+            WORKTREE,
+            "feature",
+            "main",
+            &candidate(OID_B),
+            &MergeEnqueueIdentity {
+                common_dir: "/private/other/.git".into(),
+                admin_dir: "/private/other/.git/worktrees/feature".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains(crate::store::MERGE_CLAIM_ACTIVE));
+    assert_eq!(db.merge_enqueue_identity(WORKTREE).unwrap(), Some(identity));
+    assert_eq!(
+        db.merge_candidate(WORKTREE).unwrap(),
+        Some(candidate(OID_A))
+    );
+    let claim_state_after = db
+        .conn()
+        .query_row(
+            "SELECT claim_owner,claim_generation,claim_phase,claim_lease_until_ms,\
+                    claim_owner_hint,claim_launch_nonce,claim_diagnostic,status \
+             FROM merge_queue WHERE worktree=?1",
+            [WORKTREE],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(claim_state_after, claim_state_before);
+    let settled = db.settle_merge_claim_no_child(&claim).unwrap();
+    db.release_merge_claim(&settled).unwrap();
 }
 
 #[test]

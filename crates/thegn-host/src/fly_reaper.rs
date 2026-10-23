@@ -80,7 +80,7 @@ pub fn tick(cfg: &Config) {
         *last = Some(Instant::now());
     }
     let spawned = std::thread::Builder::new()
-        .name("thegn-fly-reaper".into())
+        .name("thegn-fly-reap".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             struct FlightGuard;

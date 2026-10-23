@@ -101,7 +101,7 @@ impl ThemeStore {
         let watcher_tx = request.clone();
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = std::thread::Builder::new()
-            .name("theme-store".into())
+            .name("thegn-themes".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 worker(

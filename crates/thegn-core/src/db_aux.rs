@@ -10,9 +10,9 @@ use crate::models::ContainerEvent;
 use crate::store::{
     MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
     MergeAttemptResult, MergeCandidate, MergeClaim, MergeClaimPhase, MergeClaimRequest,
-    MergeClaimView, MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation,
-    MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields,
-    WorktreeAuxStore,
+    MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
+    MergeOutcomeObservation, MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome,
+    MergeStatusFields, WorktreeAuxStore,
 };
 use crate::util;
 use anyhow::Result;
@@ -380,8 +380,9 @@ impl Db {
             let changed = conn.execute(
                 r#"INSERT INTO merge_queue
                      (worktree,branch,target_branch,status,queued_at,updated_at,
-                      result_oid,conflict_paths,error_detail,location,branch_ref,candidate_oid)
-                   VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,?5,NULL,NULL)
+                      result_oid,conflict_paths,error_detail,location,branch_ref,candidate_oid,
+                      enqueue_common_dir,enqueue_admin_dir)
+                   VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,?5,NULL,NULL,NULL,NULL)
                    ON CONFLICT(worktree) DO UPDATE SET
                      branch=?2, target_branch=?3, status='queued',
                      queued_at=?4, updated_at=?4,
@@ -389,7 +390,8 @@ impl Db {
                      agent_attempts=CASE WHEN merge_queue.status IN
                        ('queued','folding','verifying','agent_running')
                      THEN merge_queue.agent_attempts ELSE 0 END,
-                     location=?5, branch_ref=NULL, candidate_oid=NULL
+                     location=?5, branch_ref=NULL, candidate_oid=NULL,
+                     enqueue_common_dir=NULL, enqueue_admin_dir=NULL
                    WHERE merge_queue.claim_owner IS NULL"#,
                 params![worktree, branch, target_branch, now, location],
             )?;
@@ -402,6 +404,22 @@ impl Db {
         }
         result
     }
+
+    fn validate_merge_candidate(branch: &str, candidate: &MergeCandidate) -> Result<()> {
+        anyhow::ensure!(
+            candidate.branch_ref == format!("refs/heads/{branch}"),
+            "invalid merge candidate branch_ref"
+        );
+        anyhow::ensure!(
+            matches!(candidate.candidate_oid.len(), 40 | 64)
+                && candidate
+                    .candidate_oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid merge candidate candidate_oid"
+        );
+        Ok(())
+    }
 }
 
 fn enqueue_merge_row(
@@ -410,14 +428,16 @@ fn enqueue_merge_row(
     branch: &str,
     target_branch: &str,
     candidate: Option<&MergeCandidate>,
+    identity: Option<&MergeEnqueueIdentity>,
 ) -> Result<()> {
     let now = util::now();
     let changed = db.conn().execute(
         r#"INSERT INTO merge_queue
              (worktree,branch,target_branch,status,queued_at,updated_at,
-              result_oid,conflict_paths,error_detail,location,branch_ref,candidate_oid)
+              result_oid,conflict_paths,error_detail,location,branch_ref,candidate_oid,
+              enqueue_common_dir,enqueue_admin_dir)
            VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,
-              (SELECT location FROM worktrees WHERE worktree=?1),?5,?6)
+              (SELECT location FROM worktrees WHERE worktree=?1),?5,?6,?7,?8)
            ON CONFLICT(worktree) DO UPDATE SET
              branch=?2, target_branch=?3, status='queued',
              queued_at=?4, updated_at=?4,
@@ -426,7 +446,8 @@ fn enqueue_merge_row(
                    ('queued','folding','verifying','agent_running')
                  THEN merge_queue.agent_attempts ELSE 0 END,
              location=(SELECT location FROM worktrees WHERE worktree=?1),
-             branch_ref=?5, candidate_oid=?6
+             branch_ref=?5, candidate_oid=?6,
+             enqueue_common_dir=?7, enqueue_admin_dir=?8
            WHERE merge_queue.claim_owner IS NULL"#,
         params![
             worktree,
@@ -434,7 +455,9 @@ fn enqueue_merge_row(
             target_branch,
             now,
             candidate.map(|value| value.branch_ref.as_str()),
-            candidate.map(|value| value.candidate_oid.as_str())
+            candidate.map(|value| value.candidate_oid.as_str()),
+            identity.map(|value| value.common_dir.as_str()),
+            identity.map(|value| value.admin_dir.as_str())
         ],
     )?;
     anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
@@ -615,7 +638,7 @@ impl WorktreeAuxStore for Db {
     /// counter. `location` mirrors `worktrees.location` via a correlated subquery;
     /// NULL when the worktree is unregistered is treated as local.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()> {
-        enqueue_merge_row(self, worktree, branch, target_branch, None)
+        enqueue_merge_row(self, worktree, branch, target_branch, None, None)
     }
 
     fn enqueue_merge_candidate(
@@ -625,19 +648,57 @@ impl WorktreeAuxStore for Db {
         target_branch: &str,
         candidate: &MergeCandidate,
     ) -> Result<()> {
+        Self::validate_merge_candidate(branch, candidate)?;
+        enqueue_merge_row(self, worktree, branch, target_branch, Some(candidate), None)
+    }
+
+    fn enqueue_merge_candidate_with_identity(
+        &self,
+        worktree: &str,
+        branch: &str,
+        target_branch: &str,
+        candidate: &MergeCandidate,
+        identity: &MergeEnqueueIdentity,
+    ) -> Result<()> {
+        Self::validate_merge_candidate(branch, candidate)?;
         anyhow::ensure!(
-            candidate.branch_ref == format!("refs/heads/{branch}"),
-            "invalid merge candidate branch_ref"
+            valid_claim_text(&identity.common_dir, 4096)
+                && valid_claim_text(&identity.admin_dir, 4096),
+            "invalid merge enqueue identity"
         );
-        anyhow::ensure!(
-            matches!(candidate.candidate_oid.len(), 40 | 64)
-                && candidate
-                    .candidate_oid
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "invalid merge candidate candidate_oid"
-        );
-        enqueue_merge_row(self, worktree, branch, target_branch, Some(candidate))
+        enqueue_merge_row(
+            self,
+            worktree,
+            branch,
+            target_branch,
+            Some(candidate),
+            Some(identity),
+        )
+    }
+
+    fn merge_enqueue_identity(&self, worktree: &str) -> Result<Option<MergeEnqueueIdentity>> {
+        let pair = self
+            .conn()
+            .query_row(
+                "SELECT enqueue_common_dir, enqueue_admin_dir FROM merge_queue WHERE worktree=?1",
+                [worktree],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(
+            pair.and_then(|(common_dir, admin_dir)| match (common_dir, admin_dir) {
+                (Some(common_dir), Some(admin_dir)) => Some(MergeEnqueueIdentity {
+                    common_dir,
+                    admin_dir,
+                }),
+                _ => None,
+            }),
+        )
     }
 
     fn merge_candidate(&self, worktree: &str) -> Result<Option<MergeCandidate>> {

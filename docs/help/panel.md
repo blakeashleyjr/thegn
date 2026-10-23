@@ -277,8 +277,14 @@ and canceled jobs together, while **R** is refused because GitLab has no full re
 
 The daemon serves a cached CI run list only while it is younger than
 `[ci] ttl_secs` and recorded for the worktree's current branch; otherwise it
-asks the provider. Cached job logs written under an older redaction policy are
-redacted and bounded into a window again when read.
+asks the provider. When the provider fails or returns an incomplete run list,
+the daemon keeps its cached list (an incomplete list never replaces it) and
+serves the last good list recorded for the same branch and provider as
+`source: "stale-cache"` with a `stale_reason`; with no such list, the error is
+returned. If a run's job detail cannot be fetched, the drill says "job detail
+unavailable", keeps the cached run, and refuses **f**. Cached job logs written
+under an older redaction policy are redacted and bounded into a window again
+when read.
 
 Cached run lists are shown when their recorded provider context matches the
 worktree's current context. A different or unknown cached context shows
@@ -293,6 +299,26 @@ unknown current context keeps the cached failure.
 It also skips runs cached for another branch, or with no recorded branch, in
 the sidebar and **across**; when the current branch is unknown, cached runs
 still count.
+
+#### CI log retention and privacy
+
+The CI cache keeps logs for the newest `log_cache_runs` terminal runs per
+worktree (default 10). Each job is limited by `log_tail_lines` (default 2000)
+and `log_max_bytes` (default 1 MiB), with hard caps of 100,000 lines and
+4 MiB. Logs are stored only in the local state database; thegn itself never
+uploads them, but redacted excerpts are passed to the agent command you
+configure for the PR queue and CI autofix. They are purged when provider
+context changes. Redaction is pattern-based and best-effort, so treat cached
+logs as sensitive. Set `log_cache_runs = 0` to disable persistence.
+
+Thegn does not run workflows locally. To run them locally, add a tool such as
+`act` and launch it from the tool picker:
+
+```toml
+[[tools]]
+name = "act"
+command = "act"
+```
 
 ### merge — the local merge queue
 

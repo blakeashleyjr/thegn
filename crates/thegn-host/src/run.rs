@@ -1308,8 +1308,6 @@ pub async fn main(
     };
 
     {
-        use std::io::Write as _;
-        let mut out = std::io::stdout();
         // Trailing `?25h` restores the cursor: the last frame may have taken a
         // Hidden branch (modal / app tile / corner focus), and terminals that
         // don't scope DECTCEM to the 1049 buffer would leave the primary
@@ -1326,9 +1324,16 @@ pub async fn main(
         // deliberate, not a leftover: popping an empty stack is a documented
         // no-op in the kitty spec, and it is defensive against an inner app
         // that pushed flags and died without popping them. Leave the bytes.
-        let _ = out // best-effort: terminal teardown: leave the bytes; the tty drops anyway
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h")
-            .and_then(|_| out.flush());
+        let outcome = crate::frame_writer::write_terminal_teardown(
+            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h",
+        );
+        if outcome != crate::frame_writer::TeardownWrite::Written {
+            tracing::warn!(
+                target: "thegn::shutdown",
+                ?outcome,
+                "terminal teardown write did not complete; continuing exit"
+            );
+        }
     }
     // Share the one restore path with the panic hook behind the swap-once guard:
     // if a panic already restored the terminal this is a no-op, and once this
@@ -7450,7 +7455,7 @@ async fn event_loop<T: Terminal>(
         let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
         let spawned = std::thread::Builder::new()
-            .name("thegn-lsp-bridge".into())
+            .name("thegn-lsp-brdg".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 while wake_rx.wait() {
@@ -7992,7 +7997,7 @@ async fn event_loop<T: Terminal>(
         let ns = std::sync::Arc::clone(&notify_state);
         let wk = waker.clone();
         std::thread::Builder::new()
-            .name("crash-scan".into())
+            .name("thegn-crashscan".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 let reports = thegn_core::diagnostics::unacknowledged_reports();
@@ -20963,9 +20968,9 @@ async fn event_loop<T: Terminal>(
                                 // --- end new dispatch ---
                                 if let Some(family) = key.strip_prefix("font:") {
                                     match crate::font::apply_font_family(family) {
-                                        Ok(path) => {
+                                        Ok(applied) => {
                                             model.status =
-                                                format!("Font → {family} ({})", path.display());
+                                                crate::font::font_status_line(family, &applied);
                                         }
                                         Err(e) => model.status = format!("Font switch failed: {e}"),
                                     }

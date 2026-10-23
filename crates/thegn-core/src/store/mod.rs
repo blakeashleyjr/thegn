@@ -89,8 +89,8 @@ pub use workspace::{WorkspaceStore, WorkspaceTombstonedError};
 pub use worktree_aux::{
     MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
     MergeAttemptResult, MergeCandidate, MergeClaim, MergeClaimPhase, MergeClaimRequest,
-    MergeClaimView, MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation,
-    MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields,
-    WorktreeAuxStore,
+    MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
+    MergeOutcomeObservation, MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome,
+    MergeStatusFields, WorktreeAuxStore,
 };
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

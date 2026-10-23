@@ -796,7 +796,13 @@ pub(crate) fn drive_queue(
                 else {
                     continue;
                 };
-                let prepared = compose(cfg, kind, wt, &item, &fetched, &blocker);
+                let ci_log = if kind == TaskKind::PrCiFailure {
+                    pr_ci_log_evidence(db, wt, &head)
+                } else {
+                    None
+                };
+                let prepared =
+                    compose_with_log(cfg, kind, wt, &item, &fetched, &blocker, ci_log.as_deref());
                 if let Err(refusal) = thegn_core::pr_queue::admit_prepared_dispatch(
                     kind,
                     prepared.is_some(),
@@ -1342,6 +1348,7 @@ fn describe(e: &ForgeError) -> String {
 ///
 /// The mapping (which blocker fills which
 /// variables) is unit-testable without spawning anything.
+#[cfg(test)]
 fn compose(
     cfg: &PrQueueConfig,
     kind: TaskKind,
@@ -1410,6 +1417,25 @@ pub(crate) fn compose_with_log(
             None
         }
     }
+}
+
+fn pr_ci_log_evidence(db: &Db, worktree: &str, head: &str) -> Option<String> {
+    let entries = match db.list_ci_logs(&GitLoc::worktree_cache_key(Path::new(worktree))) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::prq",
+                %error,
+                "could not read cached CI logs for the PR prompt"
+            );
+            return None;
+        }
+    };
+    thegn_core::ci_log::pr_repair_excerpt(
+        &entries,
+        head,
+        thegn_core::agent_task::input_max_bytes(TaskKind::PrCiFailure, "log"),
+    )
 }
 
 /// Where the agent can read the failing runs. Bounded so a repo with dozens of
@@ -1798,6 +1824,65 @@ mod tests {
         .unwrap();
         assert!(p.contains("error: boom"));
         assert!(p.contains("***redacted***"));
+    }
+
+    #[test]
+    fn the_ci_prompt_uses_cached_log_for_the_pr_head() {
+        let db = Db::open_memory().unwrap();
+        db.put_ci_log(&thegn_core::ci_log::CiLogEntry {
+            worktree: "/w/feat".into(),
+            run_id: "11".into(),
+            job_id: "22".into(),
+            job_name: "test".into(),
+            text: "compile ok\nerror: boom\n".into(),
+            head_sha: "abc".into(),
+            fetched_at: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let evidence = pr_ci_log_evidence(&db, "/w/feat", "abc");
+        assert!(evidence.is_some());
+        let (_, prompt) = compose_with_log(
+            &cfg(),
+            TaskKind::PrCiFailure,
+            "/w/feat",
+            &item(),
+            &fetched(vec![]),
+            &Blocker::Ci(vec!["test".into()]),
+            evidence.as_deref(),
+        )
+        .unwrap();
+        assert!(prompt.contains("error: boom"));
+        assert!(!prompt.contains("no failing check details"));
+    }
+
+    #[test]
+    fn the_ci_prompt_keeps_urls_without_cached_head_evidence() {
+        let db = Db::open_memory().unwrap();
+        db.put_ci_log(&thegn_core::ci_log::CiLogEntry {
+            worktree: "/w/feat".into(),
+            run_id: "11".into(),
+            job_id: "22".into(),
+            job_name: "test".into(),
+            text: "compile ok\nerror: boom\n".into(),
+            head_sha: "abc".into(),
+            fetched_at: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let evidence = pr_ci_log_evidence(&db, "/w/feat", "zzz");
+        assert!(evidence.is_none());
+        let (_, prompt) = compose_with_log(
+            &cfg(),
+            TaskKind::PrCiFailure,
+            "/w/feat",
+            &item(),
+            &fetched(vec![]),
+            &Blocker::Ci(vec!["test".into()]),
+            evidence.as_deref(),
+        )
+        .unwrap();
+        assert!(prompt.contains("no failing check details"));
     }
 
     #[test]
