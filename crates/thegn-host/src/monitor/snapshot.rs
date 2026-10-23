@@ -219,6 +219,28 @@ fn graph_overlay(tab: MonitorTab, screen: Rect) -> MonitorOverlay {
             value: Some(82.0),
             ..Default::default()
         });
+    // The Network tab draws its throughput graph only from a healthy netdev part: seed one physical interface.
+    {
+        use thegn_metrics::collect::model::netdev::{IfaceName, IfaceSample, ScopeTotal};
+        use thegn_metrics::collect::policy::net_scope::{IfaceKind, Scope};
+        frame.health[thegn_metrics::collect::CollectorId::Netdev.index()] =
+            thegn_metrics::collect::health::Health::Ok;
+        frame.parts.netdev.ifaces = vec![IfaceSample {
+            id: thegn_metrics::collect::instances::InstanceId(1),
+            name: IfaceName::new(b"eth0"),
+            kind: IfaceKind::Ethernet,
+            scope: Scope::Physical,
+            rx_bps: Some(18_000_000.0),
+            tx_bps: Some(7_000_000.0),
+            ..IfaceSample::default()
+        }];
+        let total = ScopeTotal {
+            rx_bps: Some(18_000_000.0),
+            tx_bps: Some(7_000_000.0),
+        };
+        frame.parts.netdev.totals[Scope::Physical.index()] = total;
+        frame.parts.netdev.all = total;
+    }
     for _ in 0..120 {
         overlay.ingest_frame(&frame);
     }
