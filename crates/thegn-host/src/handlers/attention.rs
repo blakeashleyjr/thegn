@@ -567,8 +567,13 @@ mod tests {
 
     #[test]
     fn stale_notification_hydration_keeps_optimistic_read_until_epoch_commits() {
+        let failure_notification = |id, message, read| {
+            let mut row = notification(id, message, read);
+            row.kind = thegn_core::notification::NotificationKind::ProcessFailed;
+            row
+        };
         let mut loop_panel = crate::panel::PanelData {
-            notifications: vec![notification(1, "cleared", false)],
+            notifications: vec![failure_notification(1, "cleared", false)],
             ..Default::default()
         };
         loop_panel.mark_read_ids_at(7, [1]);
@@ -576,8 +581,8 @@ mod tests {
 
         let mut stale_hydration = crate::panel::PanelData {
             notifications: vec![
-                notification(1, "cleared", false),
-                notification(2, "new unread", false),
+                failure_notification(1, "cleared", false),
+                failure_notification(2, "new unread", false),
             ],
             notifications_epoch: 6,
             ..Default::default()
@@ -589,8 +594,8 @@ mod tests {
 
         let mut committed_hydration = crate::panel::PanelData {
             notifications: vec![
-                notification(1, "cleared", true),
-                notification(3, "genuinely new", false),
+                failure_notification(1, "cleared", true),
+                failure_notification(3, "genuinely new", false),
             ],
             notifications_epoch: 7,
             ..Default::default()
