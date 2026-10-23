@@ -30,6 +30,8 @@ reason and keeps its saved entry (shown as `failed` in `thegn share list`;
 restart on that port is refused until stopping it again succeeds. At the
 panel's full width the list gains a detail column with the untruncated URL (or
 iroh consumer command), provider, and reach.
+Pressing `o` on an iroh ticket or socket share with no browser URL reports that
+there is no browser link; `↵` still copies the endpoint.
 The bottom status bar shows a `⇅` chip while anything is
 shared; activating it opens a detail popup listing the shares (the
 `open-shares` action opens the panel section instead).
