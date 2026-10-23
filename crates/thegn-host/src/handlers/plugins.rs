@@ -52,6 +52,10 @@ pub(crate) struct PluginEntry {
     pub runtime: PluginRuntime,
     /// Generation of the resident process whose writer and events are live.
     pub session: Option<SessionGen>,
+    /// Highest generation whose exit or replacement has been observed.
+    pub retired: Option<SessionGen>,
+    /// Exit received before the worker published that generation's writer.
+    pub pending_exit: Option<SessionGen>,
     /// `Some` while a resident session is alive; `None` for one-shot plugins
     /// and dead residents.
     pub writer: Option<SessionWriter>,
@@ -266,6 +270,8 @@ fn build_entry(st: LoadedState) -> PluginEntry {
         runtime: PluginRuntime::new(negotiated),
         plugin: st.plugin,
         session: st.session,
+        retired: None,
+        pending_exit: None,
         writer: st.writer,
         feed_bridge: None,
         contributions,
@@ -588,11 +594,21 @@ fn drain_with_responder(
                 session,
                 event,
             } => {
-                if !state
-                    .plugins
-                    .get(&plugin)
-                    .is_some_and(|entry| entry.session == Some(session))
-                {
+                let Some(entry) = state.plugins.get(&plugin) else {
+                    tracing::debug!(target: "thegn::plugin", plugin = %plugin, session, "event from a replaced plugin session dropped");
+                    continue;
+                };
+                let is_current = entry.session == Some(session);
+                let is_queued_after_exit =
+                    entry.session.is_none() && entry.retired == Some(session);
+                // A future generation's Exit must survive the inbox-before-
+                // Respawned race. Other messages from that generation are
+                // pre-activation output and remain dropped until its writer is
+                // installed.
+                let is_future_exit = entry.session.is_none()
+                    && matches!(&event, SessionEvent::Exit { .. })
+                    && entry.retired.is_none_or(|retired| session > retired);
+                if !(is_current || is_queued_after_exit || is_future_exit) {
                     tracing::debug!(target: "thegn::plugin", plugin = %plugin, session, "event from a replaced plugin session dropped");
                     continue;
                 }
@@ -608,7 +624,12 @@ fn drain_with_responder(
                         tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
                     }
                     SessionEvent::Exit { code } => {
-                        damage.merge(handle_exit(state, model, host, &plugin, code, false));
+                        if is_current {
+                            damage.merge(handle_exit(state, model, host, &plugin, code, false));
+                        } else if is_future_exit && let Some(entry) = state.plugins.get_mut(&plugin)
+                        {
+                            entry.pending_exit = Some(session);
+                        }
                     }
                 }
             }
@@ -642,7 +663,25 @@ fn drain_with_responder(
                             tracing::debug!(target: "thegn::plugin", plugin = %plugin, "respawned writer has no session generation; dropping it");
                             continue;
                         };
+                        if state
+                            .plugins
+                            .get(&plugin)
+                            .is_some_and(|entry| entry.pending_exit == Some(session))
+                        {
+                            let entry = state.plugins.get_mut(&plugin).expect("checked above");
+                            entry.pending_exit = None;
+                            entry.session = Some(session);
+                            damage.merge(handle_exit(state, model, host, &plugin, None, false));
+                            continue;
+                        }
                         let entry = state.plugins.get_mut(&plugin).expect("checked above");
+                        if let Some(retired) = entry.session.take() {
+                            entry.retired = Some(
+                                entry
+                                    .retired
+                                    .map_or(retired, |previous| previous.max(retired)),
+                            );
+                        }
                         entry.runtime.begin_generation();
                         entry.feed_bridge = None;
                         if entry
@@ -657,6 +696,7 @@ fn drain_with_responder(
                         }
                         entry.writer = Some(w);
                         entry.session = Some(session);
+                        entry.pending_exit = None;
                         send_activate(entry);
                         sync_provider_registry(state);
                         damage.merge(PluginDamage::Structural);
@@ -719,7 +759,13 @@ fn handle_exit(
         return PluginDamage::None;
     };
     entry.writer = None;
-    entry.session = None;
+    if let Some(session) = entry.session.take() {
+        entry.retired = Some(
+            entry
+                .retired
+                .map_or(session, |retired| retired.max(session)),
+        );
+    }
     entry.feed_bridge = None;
     entry.bridge = None;
     sync_provider_registry(state);
@@ -2346,7 +2392,7 @@ mod tests {
         );
         drop(tx);
         let mut model = FrameModel::default();
-        let mut answered = 0;
+        let mut answered: usize = 0;
 
         drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {
             answered += 1;
@@ -3235,11 +3281,12 @@ mod tests {
         let mut state = state_with(vec![seg_spec("p")]);
         let mut model = FrameModel::default();
         for i in 1..=3u32 {
+            state.plugins.get_mut("p").unwrap().session = Some(u64::from(i));
             drain_one(
                 &mut state,
                 &mut model,
                 PluginMsg::Event {
-                    session: 1,
+                    session: u64::from(i),
                     plugin: "p".into(),
                     event: SessionEvent::Exit { code: Some(1) },
                 },
@@ -3248,11 +3295,12 @@ mod tests {
             assert!(!state.plugins["p"].disabled);
         }
         // Fourth crash exceeds the cap: disabled + user-visible status.
+        state.plugins.get_mut("p").unwrap().session = Some(4);
         drain_one(
             &mut state,
             &mut model,
             PluginMsg::Event {
-                session: 1,
+                session: 4,
                 plugin: "p".into(),
                 event: SessionEvent::Exit { code: Some(1) },
             },
@@ -3263,6 +3311,50 @@ mod tests {
             statusbar_views(&state).is_empty(),
             "disabled plugins render nothing"
         );
+    }
+
+    #[test]
+    fn stale_session_exit_before_its_respawn_still_restarts() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let entry = state.plugins.get_mut("p").unwrap();
+        entry.session = None;
+        entry.retired = Some(4);
+        entry.restarts = 1;
+        let mut model = FrameModel::default();
+        let (_tx, mut rx) = crate::plugins::plugin_channel();
+        rx.inbox()
+            .push("p".into(), 5, SessionEvent::Exit { code: Some(1) });
+
+        drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {});
+
+        assert_eq!(state.plugins["p"].restarts, 1);
+        assert_eq!(state.plugins["p"].pending_exit, Some(5));
+        assert_eq!(state.plugins["p"].session, None);
+    }
+
+    #[test]
+    fn queued_message_from_just_exited_session_is_applied() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let (_tx, mut rx) = crate::plugins::plugin_channel();
+        rx.inbox().push(
+            "p".into(),
+            1,
+            SessionEvent::Message(msg(
+                "update",
+                serde_json::json!({
+                    "surface": "p/seg",
+                    "view": {"spans": [{"text": "final", "role": "Default"}]}
+                }),
+            )),
+        );
+        rx.inbox()
+            .push("p".into(), 1, SessionEvent::Exit { code: None });
+
+        drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {});
+
+        assert_eq!(statusbar_views(&state)[0].1.text_content(), "final");
+        assert_eq!(state.plugins["p"].session, None);
     }
 
     #[test]
