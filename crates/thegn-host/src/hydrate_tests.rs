@@ -3144,9 +3144,7 @@ fn ls_files_local_argv_is_nul_framed_and_remote_is_unchanged() {
     reason = "test drives and reaps a real git fixture"
 )]
 fn ls_files_run_git(dir: &std::path::Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    thegn_core::util::git_cmd(dir)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
