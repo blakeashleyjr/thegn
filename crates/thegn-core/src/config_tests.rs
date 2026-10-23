@@ -1,6 +1,14 @@
 use super::*;
 
 #[test]
+fn forward_allow_external_bind_defaults_off_and_parses() {
+    assert!(!ForwardConfig::default().allow_external_bind);
+
+    let config: Config = toml::from_str("[forward]\nallow_external_bind = true\n").unwrap();
+    assert!(config.forward.allow_external_bind);
+}
+
+#[test]
 fn forward_reverse_tunnel_caps_default_to_shipped_limits_and_parse() {
     let defaults = ForwardConfig::default();
     assert_eq!(defaults.reverse_max_connections, 256);

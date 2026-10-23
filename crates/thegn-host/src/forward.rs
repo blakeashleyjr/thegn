@@ -132,6 +132,7 @@ impl ForwardSupervisor {
         container_port: u16,
         runtime: &[String],
     ) -> Result<Started, String> {
+        cfg.bind_check().map_err(|refusal| refusal.to_string())?;
         if self.has(worktree, container_port) {
             return Err(format!("already forwarding port {container_port}"));
         }
@@ -384,6 +385,30 @@ pub fn spawn_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_refuses_a_non_loopback_bind_without_opt_in() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut sup = ForwardSupervisor::new();
+            let cfg = ForwardConfig {
+                bind: "0.0.0.0".into(),
+                ..ForwardConfig::default()
+            };
+            let free_port = {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let result = sup.start(&cfg, "/wt/app", free_port, &["true".into()]);
+            assert!(matches!(result, Err(ref message) if message.contains("allow_external_bind")));
+            assert!(sup.views("/wt/app").is_empty());
+            std::net::TcpListener::bind(("127.0.0.1", free_port))
+                .expect("refusal must leave the candidate host port unbound");
+        });
+    }
 
     #[test]
     fn start_and_views_then_stop() {
