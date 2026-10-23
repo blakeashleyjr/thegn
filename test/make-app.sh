@@ -20,7 +20,16 @@ cat >"$mac_bin/plutil" <<'EOF'
 #!/usr/bin/env bash
 exit "${FAKE_PLUTIL_STATUS:-0}"
 EOF
-chmod 0755 "$mac_bin/uname" "$mac_bin/thegn" "$mac_bin/plutil"
+cat >"$mac_bin/envdump" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${1-} == --version ]]; then
+  printf 'thegn 1.2.3\n'
+else
+  printf '%s' "$TG_PROBE" >"$ENVDUMP_OUT"
+  printf '%s' "${TG_EMPTY-unset}" >"$ENVDUMP_OUT.empty"
+fi
+EOF
+chmod 0755 "$mac_bin/uname" "$mac_bin/thegn" "$mac_bin/plutil" "$mac_bin/envdump"
 
 run_make_app() {
   PATH="$mac_bin:$PATH" HOME="$tmp/home" FAKE_PLUTIL_STATUS="${FAKE_PLUTIL_STATUS:-0}" \
@@ -48,6 +57,8 @@ bundle="$apps/thegn.app"
 for required in \
   "$bundle/Contents/MacOS/thegn" \
   "$bundle/Contents/Resources/common.sh" \
+  "$bundle/Contents/Resources/env" \
+  "$bundle/Contents/Resources/launch.sh" \
   "$bundle/Contents/Resources/thegn.command" \
   "$bundle/Contents/Resources/.thegn-make-app" \
   "$bundle/Contents/Info.plist" \
@@ -88,10 +99,12 @@ assert_no_workdirs "$tmp/foreign" || fail "foreign refusal left staging director
 
 # failed lint keeps the previous bundle
 cp "$bundle/Contents/Resources/common.sh" "$tmp/common.sh.before"
+cp "$bundle/Contents/Resources/env" "$tmp/env.before"
 if FAKE_PLUTIL_STATUS=1 run_make_app --dest "$apps" --env THEGN_LOG=changed >"$tmp/lint.out" 2>"$tmp/lint.err"; then
   fail "failed plist lint was accepted"
 fi
 cmp -s "$tmp/common.sh.before" "$bundle/Contents/Resources/common.sh" || fail "failed lint changed the previous bundle"
+cmp -s "$tmp/env.before" "$bundle/Contents/Resources/env" || fail "failed lint changed the previous env data"
 assert_no_workdirs "$apps" || fail "failed lint left staging/old directories"
 
 # symlinked bundle path is refused
@@ -118,5 +131,53 @@ fi
 dry_dest="$tmp/dry-run-apps"
 run_make_app --dest "$dry_dest" --dry-run >"$tmp/dry-run.out" || fail "dry-run failed"
 [[ ! -e $dry_dest ]] || fail "dry-run created its destination"
+
+# Environment values stay data through the launcher, including shell syntax and newlines.
+probe=$'a;b $(touch '"$tmp"$'/pwned) `touch '"$tmp"$'/pwned2` \'q\' "d" \\ %s\nline2 *?[x]'
+test_user="${USER:-tester}"
+probe_apps="$tmp/probe-apps"
+run_make_app --bin "$mac_bin/envdump" --dest "$probe_apps" --env "TG_PROBE=$probe" --env TG_EMPTY= >/dev/null ||
+  fail "hostile environment bundle generation failed"
+probe_bundle="$probe_apps/thegn.app"
+ENVDUMP_OUT="$tmp/envdump.out" USER="$test_user" bash "$probe_bundle/Contents/Resources/thegn.command" || fail "environment launcher failed"
+printf '%s' "$probe" >"$tmp/probe.expected"
+cmp -s "$tmp/probe.expected" "$tmp/envdump.out" || fail "environment value changed in transit"
+[[ ! -s "$tmp/envdump.out.empty" ]] || fail "empty environment value was not preserved"
+[[ ! -e "$tmp/pwned" && ! -e "$tmp/pwned2" ]] || fail "environment value executed shell syntax"
+if grep -R -q 'eval' "$probe_bundle/Contents"; then
+  fail "generated bundle contains eval"
+fi
+[[ -f "$probe_bundle/Contents/Resources/env" ]] || fail "generated bundle lacks env data"
+[[ -x "$probe_bundle/Contents/Resources/launch.sh" ]] || fail "generated bundle launcher is not executable"
+if grep -Fq 'TG_PROBE' "$probe_bundle/Contents/Resources/common.sh"; then
+  fail "environment value leaked into common.sh"
+fi
+# shellcheck source=/dev/null
+command_text="$(
+  export USER="$test_user"
+  . "$probe_bundle/Contents/Resources/common.sh"
+  thegn_command /x/thegn /x/ghostty
+)"
+if [[ $command_text == *TG_PROBE* || $command_text == *pwned* ]]; then
+  fail "terminal command contains an environment value"
+fi
+
+# A tampered key record refuses before the target process can run.
+tampered_bundle="$tmp/tampered.app"
+cp -R "$probe_bundle" "$tampered_bundle"
+printf 'BAD;KEY=x\0' >>"$tampered_bundle/Contents/Resources/env"
+if ENVDUMP_OUT="$tmp/tampered.out" USER="$test_user" bash "$tampered_bundle/Contents/Resources/thegn.command" >"$tmp/tampered.stdout" 2>"$tmp/tampered.stderr"; then
+  fail "tampered environment key was accepted"
+fi
+[[ ! -e "$tmp/tampered.out" ]] || fail "tampered environment reached the target process"
+
+# A record without '=' is malformed even though its text resembles a valid key.
+no_value_bundle="$tmp/no-value.app"
+cp -R "$probe_bundle" "$no_value_bundle"
+printf 'FOO\0' >>"$no_value_bundle/Contents/Resources/env"
+if ENVDUMP_OUT="$tmp/no-value.out" USER="$test_user" bash "$no_value_bundle/Contents/Resources/thegn.command" >"$tmp/no-value.stdout" 2>"$tmp/no-value.stderr"; then
+  fail "environment record without '=' was accepted"
+fi
+[[ ! -e "$tmp/no-value.out" ]] || fail "malformed environment record reached the target process"
 
 echo "make-app tests passed"
