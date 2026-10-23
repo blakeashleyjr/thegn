@@ -277,8 +277,14 @@ and canceled jobs together, while **R** is refused because GitLab has no full re
 
 The daemon serves a cached CI run list only while it is younger than
 `[ci] ttl_secs` and recorded for the worktree's current branch; otherwise it
-asks the provider. Cached job logs written under an older redaction policy are
-redacted and bounded into a window again when read.
+asks the provider. When the provider fails or returns an incomplete run list,
+the daemon keeps its cached list (an incomplete list never replaces it) and
+serves the last good list recorded for the same branch and provider as
+`source: "stale-cache"` with a `stale_reason`; with no such list, the error is
+returned. If a run's job detail cannot be fetched, the drill says "job detail
+unavailable", keeps the cached run, and refuses **f**. Cached job logs written
+under an older redaction policy are redacted and bounded into a window again
+when read.
 
 Cached run lists are shown when their recorded provider context matches the
 worktree's current context. A different or unknown cached context shows
