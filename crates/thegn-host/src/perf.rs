@@ -180,7 +180,7 @@ pub fn request_stop_after(
         .filter(|&v| v > 0)?;
     STOP_REQUESTED.store(true, Ordering::Relaxed);
     std::thread::Builder::new()
-        .name("thegn-bench-window".into())
+        .name("thegn-bench-win".into())
         .spawn(move || {
             // Background: bench-only one-shot timer; the idle harness measures against
             // its own sampler clock, so wake lateness only lands in the generous tail.

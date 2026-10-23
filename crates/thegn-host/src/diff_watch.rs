@@ -492,7 +492,7 @@ impl Reviver {
         // best-effort: a failed spawn just leaves the claim withdrawn, which is
         // today's fall-back-to-periodic-reads behaviour.
         let _ = std::thread::Builder::new()
-            .name("diff-watch-revive".into())
+            .name("thegn-diff-rev".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 std::thread::sleep(backoff);
