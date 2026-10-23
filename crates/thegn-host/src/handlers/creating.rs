@@ -599,8 +599,9 @@ mod tests {
             .progress
             .insert(2, CreationProgress::new("current".into()));
         inflight.wizard_gen = Some(2);
+        let root = tempfile::tempdir().unwrap();
         let mut wizard = Some(NewWorktreeWizard::new_isolated_for_test(
-            std::env::temp_dir(),
+            root.path().to_path_buf(),
             &Default::default(),
         ));
         let (tx, _rx) = std::sync::mpsc::channel::<WizardCmd>();

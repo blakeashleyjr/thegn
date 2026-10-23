@@ -206,10 +206,11 @@ mod resolve_worktree_tests {
     #[test]
     fn nonexistent_env_worktree_falls_through() {
         // The remote-sprite case: the host path isn't mounted here, so it must be
-        // ignored rather than trusted. The cwd (a temp dir, not a git repo) has no
-        // toplevel, so resolution lands on the cwd itself — never the dead path.
+        // ignored rather than trusted. The cwd does not exist inside the owned
+        // tempdir, so git cannot discover a repository above it; resolution lands
+        // on that cwd itself — never the dead path.
         let cwd = tempfile::tempdir().unwrap();
-        let cwd_path = cwd.path().to_path_buf();
+        let cwd_path = cwd.path().join("not-a-repo");
         let dead = "/definitely/not/here/thegn-xyz";
         let got = resolve_worktree_from(None, Some(dead.into()), &cwd_path);
         assert_ne!(got, PathBuf::from(dead));
