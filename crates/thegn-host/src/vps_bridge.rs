@@ -66,7 +66,7 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     };
     shim.prepare_known_hosts()
         .context("vps-ssh: prepare the per-instance known_hosts pin")?;
-    let mut argv = shim.base_argv();
+    let mut argv = shim.base_argv().context("vps-ssh: build the ssh argv")?;
     // Interactive pane (we own a PTY) ⇒ force allocation; captured control
     // reads stay non-tty.
     if std::io::stdin().is_terminal() {
