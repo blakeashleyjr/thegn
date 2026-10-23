@@ -81,7 +81,10 @@ fn resolve_local(reference: &SecretRef) -> Option<String> {
         SecretRef::Env { var } => std::env::var(var).ok(),
         SecretRef::File { path } => {
             let path = thegn_core::util::expand_tilde(path);
-            match thegn_core::fsperm::read_owner_only_secret_file(&path, MAX_FILE_SECRET_BYTES) {
+            match thegn_core::fsperm::read_owner_only_secret_file(
+                std::path::Path::new(&path),
+                MAX_FILE_SECRET_BYTES,
+            ) {
                 Ok(value) => Some(value),
                 Err(thegn_core::fsperm::SecretFileError::NotFound) => None,
                 Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
