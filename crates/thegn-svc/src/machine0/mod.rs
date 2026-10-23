@@ -1307,7 +1307,10 @@ pub fn parse_image_list(v: &Value) -> Result<Vec<CheckpointInfo>> {
     rows.iter()
         .enumerate()
         .map(|(index, e)| {
-            let obj = e.get("image").unwrap_or(e);
+            let obj = e
+                .get("image")
+                .filter(|value| value.is_object())
+                .unwrap_or(e);
             let id = obj
                 .get("name")
                 .and_then(Value::as_str)
@@ -1394,7 +1397,11 @@ pub fn parse_ssh_key_list(v: &Value) -> Result<Vec<(String, String)>> {
     rows.iter()
         .enumerate()
         .map(|(index, e)| {
-            let obj = e.get("sshKey").or_else(|| e.get("key")).unwrap_or(e);
+            let obj = e
+                .get("sshKey")
+                .or_else(|| e.get("key"))
+                .filter(|value| value.is_object())
+                .unwrap_or(e);
             let id = obj
                 .get("id")
                 .and_then(Value::as_str)
@@ -1435,7 +1442,7 @@ pub fn parse_created_id(v: &Value) -> Option<String> {
 }
 
 /// The first array under any of `keys` at the top level, or `v` itself if it is
-/// an array. Pure helper for the `parse_*_list` fns.
+/// an array. Pure helper for `parse_size_list`.
 fn array_field(v: &Value, keys: &[&str]) -> Vec<Value> {
     if let Some(a) = v.as_array() {
         return a.clone();
@@ -1448,7 +1455,7 @@ fn array_field(v: &Value, keys: &[&str]) -> Vec<Value> {
     Vec::new()
 }
 
-/// Borrow the VM rows only when the response has one recognized list shape.
+/// Borrow list rows only when the response has one recognized list shape.
 fn strict_array_field<'a>(v: &'a Value, keys: &[&str]) -> Result<&'a [Value]> {
     if let Some(rows) = v.as_array() {
         return Ok(rows);
@@ -2463,6 +2470,13 @@ mod tests {
         ] {
             assert_eq!(parse_ssh_key_list(&response).unwrap(), expected_key);
         }
+        assert_eq!(
+            parse_ssh_key_list(&json!([
+                { "id": "k1", "key": "ssh-ed25519 AAA" }
+            ]))
+            .unwrap(),
+            expected_key
+        );
         assert!(parse_ssh_key_list(&json!([])).unwrap().is_empty());
         assert!(
             parse_ssh_key_list(&json!({ "keys": [] }))
