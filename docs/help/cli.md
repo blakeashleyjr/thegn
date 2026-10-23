@@ -358,6 +358,12 @@ Exit codes:
 > flag, bad value), which are permanent. A script that retries on `2`
 > should first confirm the command actually parsed.
 
+Thegn's info, warning and error lines, including the final error printed when a
+command fails, replace control characters other than newline and tab, DEL and
+invisible format characters (such as bidirectional overrides) with `�`
+(U+FFFD). This prevents a branch name, path or remote message from injecting
+terminal escape sequences.
+
 ## Inspecting the setup
 
 `thegn agent list` is the one-screen answer to "what will actually run": one
