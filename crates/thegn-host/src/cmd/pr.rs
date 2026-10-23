@@ -211,23 +211,7 @@ fn target_worktree_with(
 
 /// The location a mutating verb acts on; an unreadable location refuses before any forge call.
 fn mutation_loc(worktree: Option<String>, verb: &str) -> Result<GitLoc> {
-    let wt = match worktree {
-        None => resolve_worktree(None),
-        Some(raw) => {
-            let path = std::path::Path::new(&raw);
-            let registered = GitLoc::for_worktree_op(path, verb).map_err(anyhow::Error::msg)?;
-            if !matches!(registered, GitLoc::Local(_)) {
-                std::path::PathBuf::from(raw)
-            } else {
-                target_worktree_with(
-                    Some(raw),
-                    resolve_worktree,
-                    thegn_core::repo::worktree_root_for_cwd,
-                    |_| false,
-                )?
-            }
-        }
-    };
+    let wt = target_worktree(worktree)?;
     GitLoc::for_worktree_op(&wt, verb).map_err(anyhow::Error::msg)
 }
 

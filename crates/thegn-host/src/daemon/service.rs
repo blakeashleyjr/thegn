@@ -24,7 +24,7 @@ use thegn_svc::control::{
     GitFileStatus, OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
     SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition, WaitOutcome,
 };
-use thegn_svc::git::{CliGit, CommitOps, GitBackend};
+use thegn_svc::git::{CliGit, GitBackend};
 
 use super::session::{IdleTransition, LiveMeta, ProbeReply, SessionMeta, SessionMsg};
 use super::tombstone::Tombstone;
