@@ -226,6 +226,7 @@ const PUSH_DRAIN_MAX: usize = 256;
 /// Owner decision (batch 76): the minimum time between two push-path snapshot reads.
 const PUSH_READ_MIN_SPACING: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Returns the remaining read spacing, or `None` when the spacing has elapsed.
 fn push_read_wait(
     last_read: tokio::time::Instant,
     now: tokio::time::Instant,
@@ -660,7 +661,8 @@ async fn run_with<R, F>(
                     if !changed {
                         break true; // signal stream ended → reconnect
                     }
-                    // Timer wakes also poll here; a pending changed() future is safe to drop.
+                    // Every wake reaching this drain, signal or timer, spaces the push-path read.
+                    // A pending changed() future is safe to drop.
                     let (mut coalesced, mut ended) =
                         drain_ready_changes(&mut *watch, PUSH_DRAIN_MAX);
                     if !ended
