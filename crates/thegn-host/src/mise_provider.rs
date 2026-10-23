@@ -584,15 +584,36 @@ pub(crate) fn detect_on_target(
     runner: &thegn_svc::host::OciRunner,
     container: &str,
     target_worktree: &str,
-) -> Result<EnvRequirements, String> {
+) -> Result<(EnvRequirements, Option<String>), String> {
     let script = format!(
         "cd {} 2>/dev/null && {}",
         thegn_core::util::sh_quote(target_worktree),
         thegn_core::envplan::DETECT_PROBE_SCRIPT
     );
     let (ok, output, _) = runner.exec_in_container(container, &script, TARGET_DETECT_TIMEOUT)?;
-    ok.then(|| thegn_core::envplan::detect_from_probe(&output))
-        .ok_or_else(|| "target toolchain detection failed".into())
+    let requirements = ok
+        .then(|| thegn_core::envplan::detect_from_probe(&output))
+        .ok_or_else(|| "target toolchain detection failed".to_string())?;
+    let mut contents = requirements
+        .toolchain_files
+        .all_files()
+        .into_iter()
+        .map(|relative| {
+            Some((
+                relative.clone(),
+                target_file(runner, container, target_worktree, &relative)?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>();
+    if let Some(lock) = target_file(runner, container, target_worktree, "mise.lock")
+        && let Some(contents) = &mut contents
+    {
+        contents.push(("mise.lock".into(), lock));
+    }
+    let identity = contents.and_then(|contents| {
+        thegn_core::toolchain_activation::config_set_identity_from_bytes(target_worktree, &contents)
+    });
+    Ok((requirements, identity.map(|identity| identity.hash)))
 }
 
 fn target_file(
