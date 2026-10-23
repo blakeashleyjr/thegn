@@ -10,6 +10,11 @@ parent: configuration
 The `[notifications]` section controls the in-app notification inbox, badges,
 and optional desktop notifications.
 
+A `Needs you` process failure clears when you acknowledge it with `x`, when the
+same program later exits cleanly in that worktree, when the worktree is removed,
+or automatically after seven days. Acknowledging the inbox row does not stop a
+still-failing process from producing a new failure.
+
 ### `agent_error_signatures`
 
 A list of case-insensitive substrings. When any line of live agent output

@@ -73,7 +73,7 @@ pub use hibernate::{HibernationRow, HibernationStore};
 pub use host::HostStore;
 pub use intent::{IntentRow, IntentStore};
 pub use model_proxy::{ModelProxyBudgetStateRow, ModelProxyRequestRow, ModelProxyStore};
-pub use notification::NotificationStore;
+pub use notification::{NotificationStore, UsageAlertWrite};
 pub use placement::{
     HealthMarker, HostCapacityRow, PlacementEventRow, PlacementStore, ReserveOutcome, TenancyMode,
     TenancyRow, TenancyState,

@@ -162,6 +162,91 @@ fn frozen_overlay(tab: MonitorTab, screen: Rect) -> MonitorOverlay {
     MonitorOverlay::open(tab, Default::default(), &model, &ctx)
 }
 
+fn graph_overlay(tab: MonitorTab, screen: Rect) -> MonitorOverlay {
+    const NOW_MS: u64 = 1_767_268_800_000;
+    let stats = thegn_metrics::StatsSnapshot {
+        cpu_temp_c: Some(82.0),
+        temps: vec![("coretemp".into(), 82.0)],
+        net_bps: Some((18_000_000, 7_000_000)),
+        battery: Some((65, false)),
+        battery_power_w: Some(24.0),
+        power_present: true,
+        ..crate::e2e_freeze::stats()
+    };
+    let mut history = TelemetryHistory::default();
+    for age in (0..120_u64).rev() {
+        history.push(&stats, NOW_MS - age * 1000);
+    }
+    let model = crate::chrome::FrameModel {
+        stats,
+        ..Default::default()
+    };
+    let mut ctx = StatusCtx::new_for_test_on(&history, screen);
+    ctx.now_ms = NOW_MS as i64;
+    let mut overlay = MonitorOverlay::open(tab, Default::default(), &model, &ctx);
+    let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+    frame.parts.hwmon.layout = Some(std::sync::Arc::new(
+        thegn_metrics::collect::model::hwmon::HwmonLayout {
+            generation: 1,
+            chips: vec![thegn_metrics::collect::model::hwmon::HwmonChip {
+                name: "coretemp".into(),
+                device: "cpu0".into(),
+                group: thegn_metrics::collect::model::hwmon::ChipGroup::Cpu,
+                ordinal: 0,
+                gated: false,
+            }],
+            sensors: vec![thegn_metrics::collect::model::hwmon::HwmonSensor {
+                key: "package".into(),
+                chip: 0,
+                kind: thegn_metrics::collect::model::hwmon::SensorKind::Temp,
+                channel: 1,
+                role: thegn_metrics::collect::model::hwmon::SensorRole::Input,
+                label: Some("Package".into()),
+                thresholds: thegn_metrics::collect::model::hwmon::Thresholds {
+                    max: Some(85.0),
+                    crit: Some(95.0),
+                    ..Default::default()
+                },
+                cost: thegn_metrics::collect::model::hwmon::CostClass::Fast,
+            }],
+        },
+    ));
+    frame
+        .parts
+        .hwmon
+        .values
+        .push(thegn_metrics::collect::model::hwmon::HwmonValue {
+            value: Some(82.0),
+            ..Default::default()
+        });
+    // The Network tab draws its throughput graph only from a healthy netdev part: seed one physical interface.
+    {
+        use thegn_metrics::collect::model::netdev::{IfaceName, IfaceSample, ScopeTotal};
+        use thegn_metrics::collect::policy::net_scope::{IfaceKind, Scope};
+        frame.health[thegn_metrics::collect::CollectorId::Netdev.index()] =
+            thegn_metrics::collect::health::Health::Ok;
+        frame.parts.netdev.ifaces = vec![IfaceSample {
+            id: thegn_metrics::collect::instances::InstanceId(1),
+            name: IfaceName::new(b"eth0"),
+            kind: IfaceKind::Ethernet,
+            scope: Scope::Physical,
+            rx_bps: Some(18_000_000.0),
+            tx_bps: Some(7_000_000.0),
+            ..IfaceSample::default()
+        }];
+        let total = ScopeTotal {
+            rx_bps: Some(18_000_000.0),
+            tx_bps: Some(7_000_000.0),
+        };
+        frame.parts.netdev.totals[Scope::Physical.index()] = total;
+        frame.parts.netdev.all = total;
+    }
+    for _ in 0..120 {
+        overlay.ingest_frame(&frame);
+    }
+    overlay
+}
+
 fn snapshot(ov: &MonitorOverlay, w: usize, h: usize) -> (String, String) {
     let mut surface = Surface::new(w, h);
     ov.render(&mut surface, Rect::full(w, h));
@@ -321,6 +406,74 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn graph_cells_sit_on_the_panel_surface_and_keep_their_color() {
+        for depth in [ColorDepth::Truecolor, ColorDepth::Ansi256] {
+            crate::caps::test_override::with_color(depth, || {
+                let (panel, dim, text) = crate::chrome::with_palette(|palette| {
+                    (
+                        crate::wire::color_spec(crate::chrome::theme_color(&palette.panel), depth),
+                        crate::wire::color_spec(crate::chrome::theme_color(&palette.dim), depth),
+                        crate::wire::color_spec(crate::chrome::theme_color(&palette.text), depth),
+                    )
+                });
+                assert!(
+                    thegn_core::theme::relative_luminance(&crate::chrome::palette_snapshot().panel)
+                        < 0.1,
+                    "fixture palette must be the dark default"
+                );
+                assert_ne!(panel, dim);
+                // Power is covered by its label-colour test; this fixture does not seed power-supply graphs.
+                for tab in [
+                    MonitorTab::Thermal,
+                    MonitorTab::Network,
+                    MonitorTab::Overview,
+                    MonitorTab::Cpu,
+                ] {
+                    let overlay = graph_overlay(tab, Rect::full(100, 32));
+                    let mut surface = Surface::new(100, 32);
+                    overlay.render(&mut surface, Rect::full(100, 32));
+                    let mut tab_graph_cells = 0;
+                    for (y, line) in surface.screen_lines().iter().enumerate() {
+                        for cell in line.visible_cells() {
+                            let ch = cell.str().chars().next().unwrap_or(' ');
+                            let graph_glyph = ('\u{2580}'..='\u{259F}').contains(&ch)
+                                || ('\u{2800}'..='\u{28FF}').contains(&ch);
+                            if !graph_glyph {
+                                continue;
+                            }
+                            tab_graph_cells += 1;
+                            let x = cell.cell_index();
+                            let attrs = cell.attrs();
+                            let bg = crate::wire::color_spec(attrs.background(), depth);
+                            let fg = crate::wire::color_spec(attrs.foreground(), depth);
+                            assert!(
+                                bg != dim && bg != text,
+                                "{tab:?} ({x},{y}) {ch:?} background {bg:?}"
+                            );
+                            if ch == '\u{2800}' {
+                                assert!(
+                                    bg == panel || bg == ColorSpec::Default,
+                                    "{tab:?} ({x},{y}) blank graph background {bg:?}"
+                                );
+                            }
+                            if ch != '\u{2800}' && ch != '\u{2591}' {
+                                assert!(
+                                    fg != ColorSpec::Default && fg != text,
+                                    "{tab:?} ({x},{y}) {ch:?} foreground {fg:?}"
+                                );
+                            }
+                        }
+                    }
+                    assert!(
+                        tab_graph_cells > 0,
+                        "seeded {tab:?} frame must paint graph cells"
+                    );
+                }
+            });
+        }
     }
 
     #[test]

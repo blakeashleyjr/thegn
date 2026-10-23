@@ -1044,7 +1044,10 @@ pub async fn main(
                         continue;
                     };
                     let new_cfg_res = update.map(|admitted| {
-                        let mut c = admitted.config().clone();
+                        let mut c = crate::channel_state::runtime_config(
+                            admitted.config().clone(),
+                            crate::channel_state::current(),
+                        );
                         crate::e2e_freeze::apply_to_config(&mut c);
                         c
                     });
@@ -1945,6 +1948,17 @@ fn request_preview_scan(
 fn persist_share_event(ev: &crate::share::ShareEvent) {
     let op = crate::share::share_persist_for(ev);
     crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
+}
+
+fn shutdown_shares(share_supervisor: &mut crate::share::ShareSupervisor) {
+    for (worktree, port, generation) in share_supervisor.shutdown_all() {
+        let op = crate::share::SharePersist::DeleteIfOwned {
+            worktree,
+            port,
+            generation,
+        };
+        crate::db_task::persist_critical(move |db| crate::share::apply_share_persist(db, op));
+    }
 }
 
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
@@ -9199,10 +9213,11 @@ async fn event_loop<T: Terminal>(
             }
         }
         if session.worktrees.is_empty() {
+            shutdown_shares(&mut share_supervisor);
             return Ok(()); // last worktree closed
         }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            share_supervisor.shutdown_all();
+            shutdown_shares(&mut share_supervisor);
             forward_supervisor.shutdown_all();
             // Deactivate + kill resident plugin sessions. Every other loop
             // exit is covered by PluginsHost's Drop; this explicit call keeps
@@ -9253,6 +9268,7 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             crate::frame_writer::WriterStatus::Fatal(e) => {
+                shutdown_shares(&mut share_supervisor);
                 let note = match clipboard_outcome {
                     Some(outcome) => format!(
                         "; {}",
@@ -12093,6 +12109,12 @@ async fn event_loop<T: Terminal>(
             );
             if generation != hydration_gen {
                 continue;
+            }
+            if next_model.panel.reconcile_pending_reads(&model.panel) {
+                next_model
+                    .sidebar_status
+                    .acked
+                    .extend(model.sidebar_status.acked.iter().cloned());
             }
             // A failed hydration is a completion signal, not a replacement
             // model. Keep the last good sidebar/panel and stamp its typed DB
@@ -15154,10 +15176,21 @@ async fn event_loop<T: Terminal>(
         // update the supervisor, and re-sync the model so the badge + Share
         // panel repaint (a chrome change ⇒ Full frame).
         while let Ok(ev) = share_rx.try_recv() {
+            let stopping_generation = match &ev {
+                crate::share::ShareEvent::Down {
+                    worktree,
+                    port,
+                    generation,
+                } => share_supervisor.is_stopping(worktree, *port, *generation),
+                _ => false,
+            };
             if share_supervisor.on_event(ev.clone()) {
                 // Surface an accepted failure where the user is looking.
                 if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
                     model.status = format!("Share :{port} failed: {error}");
+                }
+                if stopping_generation && let crate::share::ShareEvent::Down { port, .. } = &ev {
+                    model.status = format!("Stopped share :{port}");
                 }
                 let replaced_generation_is_live = match &ev {
                     crate::share::ShareEvent::Down {
@@ -20985,6 +21018,7 @@ async fn event_loop<T: Terminal>(
                                     // Action::Quit keybind (audit run.rs:13511):
                                     // otherwise pane/split/focus changes made since
                                     // the last periodic persist are lost on relaunch.
+                                    shutdown_shares(&mut share_supervisor);
                                     persist_session_layout(&mut session, &panes);
                                     crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                         &session, &panes,
@@ -23531,8 +23565,7 @@ async fn event_loop<T: Terminal>(
                             match target {
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
-                                    let did_stop =
-                                        !stopped.removed.is_empty() || !stopped.pending.is_empty();
+                                    let status = crate::share::stop_status(&stopped, Some(port));
                                     crate::handlers::host::queue_stopped_share_deletes(
                                         wt.clone(),
                                         stopped.removed,
@@ -23542,16 +23575,7 @@ async fn event_loop<T: Terminal>(
                                         stopped.failed.clone(),
                                     );
                                     model.shares = current_share_views(&share_supervisor, &session);
-                                    model.status = if let Some(failure) = stopped.failed.first() {
-                                        format!(
-                                            "Share :{port} could not be stopped: {}; press x to retry",
-                                            failure.error
-                                        )
-                                    } else if !did_stop {
-                                        format!("Share :{port} was already down")
-                                    } else {
-                                        format!("Stopped share :{port}")
-                                    };
+                                    model.status = status;
                                 }
                                 None => model.status = "No share selected".into(),
                             }
@@ -23728,25 +23752,24 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
+                                let epoch = crate::hydrate_feed::issue_notification_write();
+                                let refresh = refresh_tx.clone();
+                                let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let Ok(db) = thegn_core::db::Db::open() else {
-                                        return;
-                                    };
-                                    let _ = db.mark_notification_read(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                    if let Err(error) = thegn_core::db::Db::open()
+                                        .and_then(|db| db.mark_notification_read(id))
+                                    {
+                                        tracing::debug!(%error, "could not clear notification");
+                                    }
+                                    crate::hydrate_feed::commit_notification_write(epoch);
+                                    if refresh.send(RefreshKind::Model).is_ok()
+                                        && let Err(error) = wake.wake()
+                                    {
+                                        tracing::debug!(%error, "could not wake after notification clear");
+                                    }
                                 });
+                                model.panel.mark_read_ids_at(epoch, [id]);
                                 hydration_gen += 1;
-                                crate::hydrate::spawn_model_hydration(
-                                    model_tx.clone(),
-                                    hydration_gen,
-                                    session.clone_for_hydrate(),
-                                    Some(waker.clone()),
-                                    crate::hydrate::HydrateHints {
-                                        open: panel_ui.open,
-                                        expanded: panel_ui.width.is_expanded(),
-                                        ..Default::default()
-                                    },
-                                    None,
-                                );
                             }
                             true
                         }
@@ -23787,28 +23810,27 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
+                                let epoch = crate::hydrate_feed::issue_notification_write();
+                                let refresh = refresh_tx.clone();
+                                let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let Ok(db) = thegn_core::db::Db::open() else {
-                                        return;
-                                    };
-                                    let _ = db.delete_notification(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                    if let Err(error) = thegn_core::db::Db::open()
+                                        .and_then(|db| db.delete_notification(id))
+                                    {
+                                        tracing::debug!(%error, "could not delete notification");
+                                    }
+                                    crate::hydrate_feed::commit_notification_write(epoch);
+                                    if refresh.send(RefreshKind::Model).is_ok()
+                                        && let Err(error) = wake.wake()
+                                    {
+                                        tracing::debug!(%error, "could not wake after notification delete");
+                                    }
                                 });
+                                model.panel.delete_notification_at(epoch, id);
                                 panel_ui.notifications_cursor =
                                     panel_ui.notifications_cursor.saturating_sub(1);
                                 panel_ui.cursor = panel_ui.notifications_cursor;
                                 hydration_gen += 1;
-                                crate::hydrate::spawn_model_hydration(
-                                    model_tx.clone(),
-                                    hydration_gen,
-                                    session.clone_for_hydrate(),
-                                    Some(waker.clone()),
-                                    crate::hydrate::HydrateHints {
-                                        open: panel_ui.open,
-                                        expanded: panel_ui.width.is_expanded(),
-                                        ..Default::default()
-                                    },
-                                    None,
-                                );
                             }
                             true
                         }
@@ -24812,6 +24834,7 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Quit | Action::Detach => {
+                                shutdown_shares(&mut share_supervisor);
                                 persist_session_layout(&mut session, &panes);
                                 // Quit is a detach: daemon-backed center panes
                                 // keep running; the next launch reattaches. Cover
@@ -24829,6 +24852,7 @@ async fn event_loop<T: Terminal>(
                                 return Ok(());
                             }
                             Action::QuitKill => {
+                                shutdown_shares(&mut share_supervisor);
                                 persist_session_layout(&mut session, &panes);
                                 // One-time bounded wait on the quit path so the
                                 // kills land before shutdown_background() aborts

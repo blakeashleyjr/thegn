@@ -69,6 +69,17 @@ pub fn clamp_and_record(cfg: &mut thegn_core::config::Config, channel: Channel) 
     features
 }
 
+/// Return a runtime copy with the release-channel restrictions applied.
+/// Admitted generations retain their source config for inspection, so callers
+/// that feed background consumers must clamp the copy they hand off.
+pub(crate) fn runtime_config(
+    mut cfg: thegn_core::config::Config,
+    channel: Channel,
+) -> thegn_core::config::Config {
+    clamp_and_record(&mut cfg, channel);
+    cfg
+}
+
 const fn to_u8(c: Channel) -> u8 {
     match c {
         Channel::Stable => 0,
@@ -188,5 +199,32 @@ mod tests {
         install(Channel::Stable);
         assert_eq!(current(), Channel::Stable);
         assert!(!allows(Feature::Remote));
+    }
+
+    #[test]
+    fn stable_runtime_config_removes_dev_envs_before_reaper_handoff() {
+        let cfg: thegn_core::config::Config = toml::from_str(
+            "[env.box]\nplacement = \"ssh\"\n[env.box.ssh]\nhost = \"box.example\"\n\
+             [env.fly]\nplacement = \"provider\"\n[env.fly.provider]\nprovider = \"fly\"\n\
+             [env.plain]\n[env.pod]\nplacement = \"k8s\"\n",
+        )
+        .unwrap();
+
+        // This is the same runtime copy passed as app_cfg to both reaper ticks.
+        let reaper_input = runtime_config(cfg, Channel::Stable);
+        assert_eq!(
+            reaper_input
+                .env
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["plain", "pod"]
+        );
+        assert!(
+            !reaper_input
+                .env
+                .values()
+                .any(|env| env.provider.provider == "fly")
+        );
     }
 }

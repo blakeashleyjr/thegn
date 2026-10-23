@@ -61,8 +61,10 @@ are midway through, and a land is awkward to walk back even with the
 grace period below. Prefer `thegn merge add`.
 
 `thegn merge land` and the section's `l` action land only a local, unclaimed
-`ready` queue row with a gate result for the checked-out branch. Otherwise they
-refuse with the reason; use `thegn land` to land that branch outside the queue.
+`ready` queue row with a gate result for the checked-out branch, and the branch
+must still point at the commit the queue verified. A branch that moved after
+`ready` is refused until the next drain verifies it. Otherwise they refuse with
+the reason; use `thegn land` to land that branch outside the queue.
 
 - A blocked branch is re-attempted by the next drain automatically. Once
   it has burned its `agent_max_attempts` the agent stops being
@@ -106,9 +108,9 @@ for a branch already merged. Within that, `[merge_queue]` lets you shape it:
   (`linear`; the branch's own commits replayed one at a time, keeping
   their original author). `land_message` templates the merge/squash
   subject (`{branch}`, `{target}`, `{subjects}`).
-  With `rebase`, a branch containing merge commits is held `needs_human` before
-  replay starts; no fixing agent runs. Land it with the merge or squash
-  strategy, or linearize the branch.
+  With `rebase`, a branch containing merge commits or history unrelated to the
+  target is held `needs_human` before replay starts; no fixing agent runs. Land
+  it with the merge or squash strategy, or linearize the branch.
 - **`sign_commits`** — sign the fold/land commits thegn creates. Signing
   is always non-interactive: a locked agent, a missing key, or anything
   that would prompt stops the drain as an _infrastructure_ error with a
@@ -156,7 +158,9 @@ command `<command>` (timeout Ns) -> tree <oid>”.
 `on_landed` decides what happens to a worktree whose branch just landed.
 The default is **`expire`**: the worktree is filed into the _Merged_
 folder and kept there for `merged_ttl_secs` (7 days out of the box),
-then swept away along with its branch.
+then the worktree is swept away. Automatic cleanup keeps the branch ref (it
+does not delete branches yet); `thegn merge sweep` reports each retained branch
+as a THE-596 branch hold.
 
 The grace period exists because the two halves of a land are not equally
 recoverable. The branch ref is the merge commit's second parent, so it

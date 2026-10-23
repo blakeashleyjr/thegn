@@ -132,6 +132,7 @@ impl ForwardSupervisor {
         container_port: u16,
         runtime: &[String],
     ) -> Result<Started, String> {
+        let bind_host = cfg.bind_host().map_err(|refusal| refusal.to_string())?;
         if self.has(worktree, container_port) {
             return Err(format!("already forwarding port {container_port}"));
         }
@@ -142,10 +143,14 @@ impl ForwardSupervisor {
             Some(&thegn_core::profile::name()),
         );
         let argv = thegn_svc::forward::exec_bridge_argv(runtime, &container, container_port);
-        let (listener, host_port) = bind_host_port(&cfg.bind, container_port, cfg.port_range())
+        let (listener, host_port) = bind_host_port(bind_host, container_port, cfg.port_range())
             .map_err(|e| format!("no free host port for {container_port}: {e}"))?;
         let proxy = spawn_proxy(listener, argv).map_err(|e| format!("proxy spawn failed: {e}"))?;
-        let url = format!("http://{}:{host_port}", cfg.bind);
+        let url_host = match bind_host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => format!("[{bind_host}]"),
+            _ => bind_host.to_string(),
+        };
+        let url = format!("http://{url_host}:{host_port}");
         let remapped = host_port != container_port;
         self.instances.push(ForwardInstance {
             worktree: worktree.to_string(),
@@ -384,6 +389,50 @@ pub fn spawn_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_refuses_a_non_loopback_bind_without_opt_in() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut sup = ForwardSupervisor::new();
+            let cfg = ForwardConfig {
+                bind: "0.0.0.0".into(),
+                ..ForwardConfig::default()
+            };
+            let free_port = {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let result = sup.start(&cfg, "/wt/app", free_port, &["true".into()]);
+            assert!(matches!(result, Err(ref message) if message.contains("allow_external_bind")));
+            assert!(sup.views("/wt/app").is_empty());
+            std::net::TcpListener::bind(("127.0.0.1", free_port))
+                .expect("refusal must leave the candidate host port unbound");
+        });
+    }
+
+    #[test]
+    fn start_normalizes_bracketed_ipv6_bind_for_socket_and_url() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut sup = ForwardSupervisor::new();
+            let cfg = ForwardConfig {
+                bind: " [::1] ".into(),
+                ..ForwardConfig::default()
+            };
+            let started = sup
+                .start(&cfg, "/wt/app", 0, &["true".into()])
+                .expect("accepted bracketed IPv6 must bind using its normalized host");
+            assert!(started.url.starts_with("http://[::1]:"));
+            assert!(sup.has("/wt/app", 0));
+        });
+    }
 
     #[test]
     fn start_and_views_then_stop() {

@@ -24,10 +24,11 @@
 //! window state, so they read the locally-stored OAuth token and make one
 //! lightweight authenticated request — gated behind `[usage] allow_network`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use thegn_core::account;
@@ -46,6 +47,21 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(6);
 /// background poll against someone else's rate-limited endpoint, and eight
 /// simultaneous requests to ask "am I near my limit" would be a poor joke.
 const FETCH_CONCURRENCY: usize = 4;
+static CLAUDE_IDENTITY_CACHE: OnceLock<Mutex<HashMap<PathBuf, thegn_core::usage::ClaudeIdentity>>> =
+    OnceLock::new();
+
+fn resolve_identity(
+    home: &Path,
+    parsed: Option<thegn_core::usage::ClaudeIdentity>,
+    cache: &mut HashMap<PathBuf, thegn_core::usage::ClaudeIdentity>,
+) -> Option<thegn_core::usage::ClaudeIdentity> {
+    if let Some(identity) = parsed {
+        cache.insert(home.to_path_buf(), identity.clone());
+        Some(identity)
+    } else {
+        cache.get(home).cloned()
+    }
+}
 
 /// Parse a harness's usage bytes through the seam — the one dispatch point for
 /// per-vendor usage parsing. Delegates to the same pure parsers in
@@ -502,7 +518,14 @@ fn claude_usage(
     client: Option<&reqwest::blocking::Client>,
     home: &UsageHome,
 ) -> AccountUsage {
-    let identity = claude_identity(&home.dir);
+    let identity_cache = CLAUDE_IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let identity = {
+        let parsed = claude_identity(&home.dir);
+        let mut cache = identity_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolve_identity(&home.dir, parsed, &mut cache)
+    };
     let label = home.fallback_label(".claude");
     // Every row — including the failures — carries the home and whatever
     // identity we could read. An "unavailable" row that can't say *which*
@@ -640,6 +663,22 @@ fn antigravity_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_identity_falls_back_to_last_good() {
+        let home = PathBuf::from("/scratch/claude-home");
+        let identity = thegn_core::usage::ClaudeIdentity {
+            account_uuid: Some("account".into()),
+            organization_uuid: Some("org".into()),
+            ..Default::default()
+        };
+        let mut cache = HashMap::new();
+        assert_eq!(
+            resolve_identity(&home, Some(identity.clone()), &mut cache),
+            Some(identity.clone())
+        );
+        assert_eq!(resolve_identity(&home, None, &mut cache), Some(identity));
+    }
 
     #[test]
     fn gather_disabled_is_empty() {

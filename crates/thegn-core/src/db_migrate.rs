@@ -1973,6 +1973,72 @@ pub(crate) fn verify_v94_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v95: durable usage-alert claims and one-time compaction of legacy inbox rows.
+pub(crate) fn migrate_v95(conn: &Connection, compact_legacy: bool) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usage_alert_claims (
+             claim_key TEXT PRIMARY KEY,
+             account_window TEXT NOT NULL,
+             notification_id INTEGER,
+             claimed_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_usage_alert_claims_window
+             ON usage_alert_claims(account_window);
+         CREATE INDEX IF NOT EXISTS idx_usage_alert_claims_claimed
+             ON usage_alert_claims(claimed_at);",
+    )?;
+    if compact_legacy {
+        conn.execute(
+            "DELETE FROM notifications
+             WHERE kind='usage_limit'
+               AND issue_id NOT LIKE 'model-proxy-budget:%'
+               AND id NOT IN (
+                   SELECT newest.id FROM notifications AS newest
+                   WHERE newest.kind='usage_limit'
+                     AND newest.issue_id=notifications.issue_id
+                     AND newest.issue_id NOT LIKE 'model-proxy-budget:%'
+                   ORDER BY newest.created_at_ms DESC, newest.id DESC
+                   LIMIT 1
+               )",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE notifications SET read=1
+             WHERE kind='usage_limit'
+               AND issue_id NOT LIKE 'model-proxy-budget:%'
+               AND created_at_ms < ?1",
+            [crate::util::now_ms() - 7 * 24 * 3600 * 1000],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v95_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "claim_key",
+        "account_window",
+        "notification_id",
+        "claimed_at",
+    ] {
+        if !has_column(conn, "usage_alert_claims", column) {
+            bail!("schema v95 migration did not add usage_alert_claims.{column}");
+        }
+    }
+    for (name, column) in [
+        ("idx_usage_alert_claims_window", "account_window"),
+        ("idx_usage_alert_claims_claimed", "claimed_at"),
+    ] {
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info('{name}')"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if columns.iter().map(String::as_str).collect::<Vec<_>>() != [column] {
+            bail!("schema v95 migration did not add index {name} on {column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3172,6 +3238,113 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn v95_compacts_duplicate_usage_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v94.db");
+        let old = crate::util::now_ms() - 8 * 24 * 3600 * 1000;
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP INDEX idx_usage_alert_claims_window;
+                     DROP INDEX idx_usage_alert_claims_claimed;
+                     DROP TABLE usage_alert_claims;
+                     PRAGMA user_version=94;",
+                )
+                .unwrap();
+            for n in 0..20 {
+                db.conn().execute(
+                    "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read) VALUES('usage_limit','claude#a',?1,?2,0)",
+                    // Insert order differs from event time: v95 must retain the
+                    // newest timestamp, not simply the last inserted row.
+                    params![format!("legacy {n}"), old + (19 - n)],
+                ).unwrap();
+            }
+            db.conn()
+                .execute(
+                    "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read) \
+                 VALUES('usage_limit','claude#b','old survivor',?1,0), \
+                       ('usage_limit','model-proxy-budget:scope','proxy',?1,0)",
+                    [old],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read) \
+                     VALUES('process_failed','shell','preserved',?1,0)",
+                    [old],
+                )
+                .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        super::migrate_v95(db.conn(), false).unwrap();
+        super::verify_v95_schema(db.conn()).unwrap();
+        let mut statement = db
+            .conn()
+            .prepare("SELECT issue_id, read, COUNT(*), (SELECT message FROM notifications AS newest WHERE newest.kind=notifications.kind AND newest.issue_id=notifications.issue_id ORDER BY newest.created_at_ms DESC, newest.id DESC LIMIT 1) FROM notifications WHERE kind='usage_limit' GROUP BY issue_id ORDER BY issue_id")
+            .unwrap();
+        let rows: Vec<(String, i64, i64, String)> = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            ("claude#a".to_string(), 1, 1, "legacy 0".to_string())
+        );
+        assert_eq!(
+            rows[1],
+            ("claude#b".to_string(), 1, 1, "old survivor".to_string())
+        );
+        assert_eq!(
+            rows[2],
+            (
+                "model-proxy-budget:scope".to_string(),
+                0,
+                1,
+                "proxy".to_string()
+            )
+        );
+        let preserved: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notifications \
+                 WHERE kind='process_failed' AND issue_id='shell' \
+                   AND message='preserved' AND read=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        let version: i64 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v95_schema_verification_rejects_a_missing_claim_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v95_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn v95_schema_verification_rejects_a_misbound_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::migrate_v95(&conn, false).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_usage_alert_claims_window;
+             CREATE INDEX idx_usage_alert_claims_window ON usage_alert_claims(claim_key);",
+        )
+        .unwrap();
+        assert!(super::verify_v95_schema(&conn).is_err());
     }
 
     #[test]

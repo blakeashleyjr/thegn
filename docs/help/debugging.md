@@ -97,6 +97,10 @@ capture: while the compositor owns the alternate screen, stray writes to
 stderr are redirected to `thegn-stderr.log`, with the configured size cap.
 The bundle treats those as separate log sinks.
 
+`thegn logs tail` replaces terminal control and formatting characters in each
+log line, while `thegn logs tail --json` escapes them, so hostile log messages
+cannot drive your terminal.
+
 ## Performance and profiling
 
 Set `THEGN_PERF=1` before launching the compositor to enable the runtime
