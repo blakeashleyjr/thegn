@@ -150,6 +150,10 @@ Before listing or stopping sessions, `thegn session move` validates every
 stored pane-session record. Malformed data refuses the move, including with
 `--dry-run`; the error names the group and tab without printing the stored
 payload.
+The move also refuses bundles over 4 MiB, pane metadata nested more than 32
+levels, or JSON objects that repeat a key. These bounds are checked before
+sessions are listed or stopped and before the target database is written; the
+metadata errors identify the group, tab and field.
 
 The source daemon is optional for a cold move. If live sessions are found for
 the exact path, or referenced by its persisted pane/dispatch rows, the move

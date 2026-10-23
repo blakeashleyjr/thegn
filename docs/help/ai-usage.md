@@ -44,7 +44,10 @@ environment variable — `CODEX_HOME` and `CLAUDE_CONFIG_DIR`. That is how one
 machine comes to hold many logins side by side: thegn's own
 [account switcher](configuration.md) works by pointing those variables at
 different directories, and Claude Code's profile convention parks them under
-`~/.claude-profiles/`.
+`~/.claude-profiles/`. Two accounts that resolve to the same credential
+directory are refused rather than treated as separate logins. This includes
+existing directories reached through a symlink or a path containing `..`; thegn
+warns which account it refused.
 
 So usage is tracked **per credential home**, not per harness. thegn finds them by
 looking at:
