@@ -242,8 +242,10 @@ fn create_list_destroy_round_trip_with_ledger() {
         ("GET", "/v1/ssh_keys?page=1&per_page=50")
     );
     assert_eq!(key_list.auth, "Bearer mock-token");
-    let key_create = &reqs[1];
-    assert_eq!(key_create.method, "POST");
+    let key_create = reqs
+        .iter()
+        .find(|request| request.method == "POST" && request.path == "/v1/ssh_keys")
+        .expect("SSH key registration request");
     assert!(
         key_create.body.contains("TrbdfTAcSvLvB"),
         "registers OUR key: {}",

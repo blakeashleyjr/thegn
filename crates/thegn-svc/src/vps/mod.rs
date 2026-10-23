@@ -744,8 +744,9 @@ impl VpsProvider {
         // "thegn-managed": vendor key names must be unique, so a fixed name
         // would 409 the moment the managed key material differs from an
         // already-registered same-named key (key rotation, or a stale key from a
-        // reinstall). Keyed by fingerprint, distinct material ⇒ distinct name,
-        // and identical material is already served by the `same_pubkey` fast path.
+        // reinstall). Keyed by SHA-256 of the decoded key, distinct material ⇒
+        // distinct name. `matching_ssh_key` reuses identical material under any
+        // name, including keys registered with the earlier FNV naming scheme.
         let name = thegn_core::managed_ssh::vendor_key_name(self.spec.pubkey.trim())
             .context("vps: the managed public key is not a valid OpenSSH key")?;
         let created = self
