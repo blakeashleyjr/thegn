@@ -1,6 +1,6 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.38`). **x86_64 Linux is the supported
+> **Status: public alpha** (`0.1.0-alpha.39`). **x86_64 Linux is the supported
 > platform.** macOS on Apple silicon is best-effort: use the flake or source
 > setup until a release archive is published. CI is opt-in and the
 > interactive on-device checklist is unfinished. Windows is deferred and has no release binary.

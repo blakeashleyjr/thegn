@@ -364,15 +364,16 @@ impl Machine0Provider {
         {
             return Ok(id);
         }
-        // Name/fileName by material fingerprint so distinct keys never collide on
+        // Name/fileName by the SHA-256 of the decoded key so distinct keys never collide on
         // a fixed name (machine0 requires a `fileName` too).
-        let fp = thegn_core::util::short_hash(self.spec.pubkey.trim(), 8);
+        let name = thegn_core::managed_ssh::vendor_key_name(self.spec.pubkey.trim())
+            .context("machine0: the managed public key is not a valid OpenSSH key")?;
         let created = self
             .call(
                 tool::SSH_KEY_CREATE_PUBLIC,
                 json!({
-                    "name": format!("thegn-managed-{fp}"),
-                    "fileName": format!("thegn-managed-{fp}.pub"),
+                    "name": name,
+                    "fileName": format!("{name}.pub"),
                     "publicKey": self.spec.pubkey.trim(),
                     "isDefault": false,
                 }),

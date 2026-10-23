@@ -187,7 +187,13 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
         if !loc.is_remote() {
             continue;
         }
-        let (_root, _repo, env_name) = crate::lifecycle::pool_context(&db, cfg, &g.path, &loc);
+        let env_name = match hibernate_selection(
+            &g.path,
+            crate::lifecycle::pool_context(&db, cfg, &g.path, &loc),
+        ) {
+            Some(env_name) => env_name,
+            None => continue,
+        };
         let Some(env) = cfg.env.get(&env_name) else {
             continue;
         };
@@ -225,6 +231,19 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
                 env_name,
             },
         );
+    }
+}
+
+fn hibernate_selection(
+    worktree: &str,
+    context: anyhow::Result<(std::path::PathBuf, String, String)>,
+) -> Option<String> {
+    match context {
+        Ok((_, _, env_name)) => Some(env_name),
+        Err(error) => {
+            tracing::warn!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "hibernation skipped: environment selection could not be read");
+            None
+        }
     }
 }
 
@@ -359,7 +378,7 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
 
     let db = thegn_core::db::Db::open()?;
     let loc = GitLoc::for_worktree(Path::new(worktree));
-    let (repo_root, _repo, _env) = crate::lifecycle::pool_context(&db, cfg, worktree, &loc);
+    let (repo_root, _repo, _env) = crate::lifecycle::pool_context(&db, cfg, worktree, &loc)?;
     let key = snapshot_key(&db, &repo_root, worktree, env_name)?;
     let store = open_store(&cfg.lifecycle.snapshot)?;
 
@@ -1074,5 +1093,21 @@ mod tests {
         let error = verify_published(&store, &key, &manifest).unwrap_err();
         assert!(error.to_string().contains("manifest differs"));
         assert!(error.to_string().contains("read-back"));
+    }
+
+    #[test]
+    fn hibernate_selection_skips_an_unreadable_selection() {
+        assert!(hibernate_selection("/wt", Err(anyhow::anyhow!("locked"))).is_none());
+    }
+
+    #[test]
+    fn hibernate_selection_passes_a_read_through() {
+        assert_eq!(
+            hibernate_selection(
+                "/wt",
+                Ok((std::path::PathBuf::new(), "repo".into(), "picked".into()))
+            ),
+            Some("picked".into())
+        );
     }
 }

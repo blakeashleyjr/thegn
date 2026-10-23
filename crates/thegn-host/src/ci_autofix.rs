@@ -489,11 +489,30 @@ fn consider_candidate_with_forge(
         guard.cancel_flag(),
     );
     if let Some(reason) = verdict.not_started() {
-        tracing::warn!(target: "thegn::ci_autofix", pr = item.number, %reason, "CI autofix agent did not start");
-        notify(format!(
-            "CI autofix for PR #{} did not start: {reason}; the attempt was still counted",
-            item.number
-        ));
+        match guard.finish_not_started(db, reason) {
+            crate::pr_agent_lease::NotStartedRelease::Refunded => {
+                notify(format!(
+                    "CI autofix for PR #{} held: {}",
+                    item.number,
+                    crate::pr_agent_lease::not_started_detail(reason, false)
+                ));
+            }
+            crate::pr_agent_lease::NotStartedRelease::RefundFailed(error) => {
+                let detail = crate::pr_agent_lease::not_started_detail(reason, true);
+                tracing::warn!(target: "thegn::ci_autofix", pr = item.number, %error, "{detail}");
+                notify(format!(
+                    "CI autofix for PR #{} held: {detail} ({error})",
+                    item.number
+                ));
+            }
+            crate::pr_agent_lease::NotStartedRelease::LeaseLost => {
+                notify(format!(
+                    "CI autofix for PR #{} stopped: its PR-agent lease could not be confirmed; the next refresh re-evaluates the row",
+                    item.number
+                ));
+            }
+        }
+        return;
     }
     if guard.lease_lost() {
         notify(format!(
@@ -609,13 +628,13 @@ fn head_is_current(
         && !forge.id().is_empty()
 }
 
-/// The PR-queue detail recorded when a CI autofix run ends. An agent that never started is an
-/// infrastructure failure, not a failed exit, and says why.
+/// The PR-queue detail recorded when a CI autofix run ends. A not-started run is held earlier
+/// through `finish_not_started` and never reaches this function.
 fn autofix_finish_detail(verdict: &crate::agent_run::AgentRunVerdict) -> String {
-    let outcome = match verdict.not_started() {
-        Some(reason) => format!("agent did not start: {reason}; the attempt was still counted"),
-        None if verdict.exited_zero() => "exit ok".to_string(),
-        None => "exit failed".to_string(),
+    let outcome = if verdict.exited_zero() {
+        "exit ok".to_string()
+    } else {
+        "exit failed".to_string()
     };
     format!("CI autofix finished ({outcome}); awaiting the next PR refresh")
 }
@@ -1386,6 +1405,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_history_cells_dispatch_like_a_current_head_and_unknown_heads_hold() {
+        let cells = [
+            ("NULL last head", None),
+            ("empty last head", Some("empty")),
+            ("current last head", Some("current")),
+            ("unknown older last head", Some("unknown")),
+        ];
+        let mut failures = Vec::new();
+
+        for (cell, recorded) in cells {
+            for mode in [CiAutofixMode::Auto, CiAutofixMode::Suggest] {
+                for human_authorized in [false, true] {
+                    let fixture = Fixture::new();
+                    let handoff = handoff(&fixture, mode, &fixture.pr.head_ref_oid);
+
+                    if let Some(recorded) = recorded {
+                        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+                        let unknown_head = "0".repeat(40);
+                        let head = match recorded {
+                            "empty" => "",
+                            "current" => fixture.pr.head_ref_oid.as_str(),
+                            "unknown" => unknown_head.as_str(),
+                            _ => unreachable!("test case has a known recorded-head marker"),
+                        };
+                        handoff
+                            .db
+                            .update_pr_status(&row.key, &row.status, None, None, Some(head))
+                            .unwrap();
+                    }
+
+                    consider(&handoff, human_authorized);
+
+                    let held = cell == "unknown older last head";
+                    let dispatched = !held && (mode == CiAutofixMode::Auto || human_authorized);
+                    let expected_attempts = u32::from(dispatched);
+                    let ran = handoff.sentinel.exists();
+                    if ran != dispatched {
+                        failures.push(format!(
+                            "{cell}, mode={mode:?}, human={human_authorized}: ran={ran}, expected={dispatched}"
+                        ));
+                    }
+
+                    let attempts = handoff.db.list_pr_queue().unwrap()[0].agent_attempts;
+                    if attempts != expected_attempts {
+                        failures.push(format!(
+                            "{cell}, mode={mode:?}, human={human_authorized}: attempts={attempts}, expected={expected_attempts}"
+                        ));
+                    }
+
+                    let claimable = handoff
+                        .db
+                        .claim_ci_autofix(&handoff.entry.candidate())
+                        .unwrap();
+                    let expected_claimable = !dispatched;
+                    if claimable != expected_claimable {
+                        failures.push(format!(
+                            "{cell}, mode={mode:?}, human={human_authorized}: claimable={claimable}, expected={}",
+                            expected_claimable
+                        ));
+                    }
+
+                    let expected_notice = if held {
+                        Some("someone else pushed")
+                    } else if mode == CiAutofixMode::Suggest && !human_authorized {
+                        Some("ready for a PR-agent handoff")
+                    } else {
+                        None
+                    };
+                    if let Some(expected_notice) = expected_notice {
+                        let notified = handoff
+                            .db
+                            .get_unread_notifications()
+                            .unwrap()
+                            .iter()
+                            .any(|notification| notification.message.contains(expected_notice));
+                        if !notified {
+                            failures.push(format!(
+                                "{cell}, mode={mode:?}, human={human_authorized}: missing notification `{expected_notice}`"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "missing-history policy cells failed:\n{}",
+            failures.join("\n")
+        );
+    }
+
     fn enqueue_pr(db: &thegn_core::db::Db, path: &str, number: u64, url: &str) {
         db.enqueue_bound_pr(path, number, Some(path), "fixture", "main", "github", url)
             .unwrap();
@@ -1778,14 +1890,14 @@ mod tests {
     }
 
     #[test]
-    fn not_started_finish_detail_names_the_reason() {
-        let finished = autofix_finish_detail(&crate::agent_run::AgentRunVerdict::NotStarted(
-            "sandbox entry refused".into(),
-        ));
-
-        assert!(
-            finished.starts_with("CI autofix finished (agent did not start: sandbox entry refused")
-        );
+    fn finish_detail_has_no_not_started_wording() {
+        for verdict in [
+            crate::agent_run::AgentRunVerdict::Exited(Some(1)),
+            crate::agent_run::AgentRunVerdict::Exited(None),
+            crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
+        ] {
+            assert!(!autofix_finish_detail(&verdict).contains("did not start"));
+        }
     }
 
     #[test]
@@ -1820,13 +1932,11 @@ mod tests {
 
         assert!(!handoff.sentinel.exists());
         let row = handoff.db.list_pr_queue().unwrap().remove(0);
-        assert_eq!(row.agent_attempts, 1);
-        assert_eq!(row.status, PrqStatus::BlockedCi.as_str());
-        assert!(
-            row.detail
-                .as_deref()
-                .is_some_and(|detail| { detail.contains("agent did not start:") })
-        );
+        assert_eq!(row.agent_attempts, 0);
+        assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+        assert!(row.detail.as_deref().is_some_and(|detail| {
+            detail.contains("agent did not start:") && detail.contains("no attempt spent")
+        }));
         assert!(
             handoff
                 .db
@@ -1834,6 +1944,12 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|notification| notification.message.contains("did not start:"))
+        );
+        assert!(
+            !handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
         );
     }
 }

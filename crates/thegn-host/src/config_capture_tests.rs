@@ -120,6 +120,7 @@ fn only_absent_implicit_base_selects_first_run_defaults() {
         thegn_core::config_admission::AdmissionHealth::FirstRunDefault
     );
 
+    let cwd = tempfile::tempdir().unwrap();
     let explicit = ConfigCaptureSeed::capture_with(
         CapturedCliInputs {
             config: Some(Path::new("explicit.toml")),
@@ -127,7 +128,7 @@ fn only_absent_implicit_base_selects_first_run_defaults() {
             profile_paths: None,
             overrides: &[],
         },
-        std::env::temp_dir(),
+        cwd.path().to_path_buf(),
         |_| None,
         Config::default,
     )
