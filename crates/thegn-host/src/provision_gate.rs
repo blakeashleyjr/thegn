@@ -352,7 +352,7 @@ fn attach_selection(
     match read {
         Ok(selected) => Ok(selected),
         Err(error) => Err(crate::agent::SandboxHalt {
-            env_name: String::new(),
+            env_name: "?".into(),
             placement: "provider".into(),
             reason: format!(
                 "the environment selection could not be read ({error:#}); retry once the state database is readable"
@@ -1218,7 +1218,10 @@ mod tests {
     #[test]
     fn attach_selection_halts_on_an_unreadable_selection() {
         match attach_selection(Err(anyhow::anyhow!("locked"))) {
-            Err(halt) => assert!(halt.reason.contains("could not be read")),
+            Err(halt) => {
+                assert_eq!(halt.env_name, "?");
+                assert!(halt.reason.contains("could not be read"));
+            }
             Ok(_) => panic!("unreadable selection must halt attach"),
         }
     }
