@@ -24,6 +24,7 @@
 
 use std::sync::atomic::Ordering;
 
+use futures::FutureExt;
 use tokio::sync::watch as tokio_watch;
 use tokio::time::MissedTickBehavior;
 
@@ -219,6 +220,9 @@ const CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(300)
 /// only a stream that survives this window earns a reset.
 const STREAM_STABILITY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Planner value: bounds one drain turn; each step is a non-blocking poll.
+const PUSH_DRAIN_MAX: usize = 256;
+
 /// A last-known-good badge may survive a short provider outage, but never
 /// longer than three poll periods or ten seconds, whichever is greater.
 fn stale_grace(period: std::time::Duration) -> std::time::Duration {
@@ -361,6 +365,21 @@ fn jitter_sample() -> u32 {
         return u32::MAX;
     }
     u32::from_le_bytes(bytes)
+}
+
+fn drain_ready_changes(
+    watch: &mut (dyn thegn_media::MediaWatch + Send),
+    max: usize,
+) -> (usize, bool) {
+    let mut drained: usize = 0;
+    while drained < max {
+        match watch.changed().now_or_never() {
+            Some(true) => drained += 1,
+            Some(false) => return (drained, true),
+            None => return (drained, false),
+        }
+    }
+    (drained, false)
 }
 
 async fn next_push_wake(
@@ -624,6 +643,10 @@ async fn run_with<R, F>(
                     if !changed {
                         break true; // signal stream ended → reconnect
                     }
+                    let (coalesced, ended) = drain_ready_changes(&mut *watch, PUSH_DRAIN_MAX);
+                    if coalesced > 0 {
+                        tracing::trace!(target: "thegn::media", coalesced, "coalesced ready media changes");
+                    }
                     match push_snapshot(&client, generation, &tx, &waker, active, &mut state).await
                     {
                         Some(a) => {
@@ -632,6 +655,9 @@ async fn run_with<R, F>(
                             active = a;
                         }
                         None => return, // receiver gone
+                    }
+                    if ended {
+                        break true; // drain observed stream end; reconnect after this snapshot
                     }
                 };
                 if stream_ended {
@@ -773,11 +799,11 @@ mod tests {
     use tokio::time::MissedTickBehavior;
 
     use super::{
-        FlapAction, Freshness, MediaConfig, MediaHealth, MediaSnapshotDelivery, STREAM_STABILITY,
-        WatchState, WatcherRegistry, WatcherStop, abort_and_join, backoff_after_stream,
-        drain_snapshots, failure_delivery, flap_action, interval, jittered, join_stops,
-        join_within, next_push_wake, offer, reset_probe_on_activation, run_with,
-        should_confirm_flap, should_deliver, stale_grace,
+        FlapAction, Freshness, MediaConfig, MediaHealth, MediaSnapshotDelivery, PUSH_DRAIN_MAX,
+        STREAM_STABILITY, WatchState, WatcherRegistry, WatcherStop, abort_and_join,
+        backoff_after_stream, drain_ready_changes, drain_snapshots, failure_delivery, flap_action,
+        interval, jittered, join_stops, join_within, next_push_wake, offer,
+        reset_probe_on_activation, run_with, should_confirm_flap, should_deliver, stale_grace,
     };
     use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState, Playlist};
 
@@ -1471,6 +1497,26 @@ mod tests {
         }
     }
 
+    struct BurstWatch {
+        ready: usize,
+        end_after: bool,
+    }
+
+    impl thegn_media::MediaWatch for BurstWatch {
+        fn changed(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            if self.ready > 0 {
+                self.ready -= 1;
+                Box::pin(std::future::ready(true))
+            } else if self.end_after {
+                Box::pin(std::future::ready(false))
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn liveness_silent_stream_wakes_on_the_probe_while_active() {
         let mut watch = SilentWatch;
@@ -1655,6 +1701,152 @@ mod tests {
         watch: fn() -> Box<dyn thegn_media::MediaWatch + Send>,
     ) -> thegn_media::MediaClient {
         Box::new(LoopFake { reads, watch })
+    }
+
+    #[test]
+    fn drain_ready_changes_stops_at_pending_end_and_cap() {
+        assert_eq!(
+            drain_ready_changes(
+                &mut BurstWatch {
+                    ready: 5,
+                    end_after: false,
+                },
+                PUSH_DRAIN_MAX,
+            ),
+            (5, false)
+        );
+        assert_eq!(
+            drain_ready_changes(
+                &mut BurstWatch {
+                    ready: 2,
+                    end_after: true,
+                },
+                PUSH_DRAIN_MAX,
+            ),
+            (2, true)
+        );
+        assert_eq!(
+            drain_ready_changes(
+                &mut BurstWatch {
+                    ready: 10,
+                    end_after: false,
+                },
+                4,
+            ),
+            (4, false)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loop_coalesces_a_backlog_of_changes_into_one_read() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, _rx) = watch::channel(None);
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_reads = reads.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_with(MediaConfig::default(), 1, tx, waker, move || {
+                let reads = client_reads.clone();
+                async move {
+                    Ok(loop_client(reads, || {
+                        Box::new(BurstWatch {
+                            ready: 200,
+                            end_after: false,
+                        })
+                    }))
+                }
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "the watcher should remain connected");
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "initial resolution read plus one read for the queued burst"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loop_backlog_larger_than_the_drain_cap_reads_once_per_chunk() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, _rx) = watch::channel(None);
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_reads = reads.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_with(MediaConfig::default(), 1, tx, waker, move || {
+                let reads = client_reads.clone();
+                async move {
+                    Ok(loop_client(reads, || {
+                        Box::new(BurstWatch {
+                            ready: 1000,
+                            end_after: false,
+                        })
+                    }))
+                }
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "the watcher should remain connected");
+        let measured = reads.load(std::sync::atomic::Ordering::Relaxed);
+        let expected = 1 + 1000_usize.div_ceil(PUSH_DRAIN_MAX + 1);
+        assert_eq!(
+            measured, expected,
+            "read count for capped burst drain: measured={measured}, expected={expected}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loop_burst_that_ends_reads_once_then_reconnects() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, _rx) = watch::channel(None);
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_reads = reads.clone();
+        let resolves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver_times = resolves.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(1400),
+            run_with(MediaConfig::default(), 1, tx, waker, move || {
+                resolver_times
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tokio::time::Instant::now());
+                let reads = client_reads.clone();
+                async move {
+                    Ok(loop_client(reads, || {
+                        Box::new(BurstWatch {
+                            ready: 3,
+                            end_after: true,
+                        })
+                    }))
+                }
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "the watcher should still be reconnecting");
+        let resolves = resolves
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let measured_reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(resolves.len(), 2, "resolver count: {}", resolves.len());
+        assert_eq!(
+            measured_reads,
+            2 * resolves.len(),
+            "each connection should perform an initial read and one coalesced burst read; reads={measured_reads}, resolves={}",
+            resolves.len()
+        );
     }
 
     #[tokio::test(start_paused = true)]
