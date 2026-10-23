@@ -147,30 +147,42 @@ pub(crate) fn host_call_check(spec: &PluginSpec, cap: &str) -> Result<(), RpcErr
     }
 }
 
-/// Enforce the canonical verb support/mode row before dispatch. A one-shot
-/// process can print any valid wire verb, but resident-only request/reply verbs
-/// must not become accidentally supported merely because decoding succeeds.
+/// Enforce the canonical verb support/mode row and declared API before dispatch.
+/// A one-shot process can print any valid wire verb, but resident-only
+/// request/reply verbs must not become accidentally supported merely because
+/// decoding succeeds; each verb's `since` version must also fit the manifest.
 fn host_verb_check(spec: &PluginSpec, verb: HostVerb) -> Result<(), RpcError> {
     let row = HOST_VERB_SUPPORT
         .iter()
         .find(|row| row.verb == verb)
         .expect("HostVerb::ALL and HOST_VERB_SUPPORT are pinned to the same set");
-    if row.state == SupportState::Wired && row.modes.contains(&spec.mode) {
-        return Ok(());
+    if row.state != SupportState::Wired || !row.modes.contains(&spec.mode) {
+        return Err(RpcError::new(
+            RpcErrorCode::Unsupported,
+            format!(
+                "{} is not supported for {} plugins; supported modes: {}",
+                verb.method_name(),
+                spec.mode.wire_name(),
+                row.modes
+                    .iter()
+                    .map(|mode| mode.wire_name())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ));
     }
-    Err(RpcError::new(
-        RpcErrorCode::Unsupported,
-        format!(
-            "{} is not supported for {} plugins; supported modes: {}",
-            verb.method_name(),
-            spec.mode.wire_name(),
-            row.modes
-                .iter()
-                .map(|mode| mode.wire_name())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-    ))
+    if row.since > spec.manifest.api {
+        return Err(RpcError::new(
+            RpcErrorCode::Unsupported,
+            format!(
+                "{} requires plugin API {}; this plugin declares {}",
+                verb.method_name(),
+                row.since,
+                spec.manifest.api
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Apply the pure scope decision and record it in the plugin runtime's audit
@@ -2864,6 +2876,89 @@ mod tests {
                 row.verb.method_name()
             );
         }
+    }
+
+    #[test]
+    fn host_verb_since_follows_the_canonical_support_matrix() {
+        for declared in [
+            ApiVersion::new(0, 1, 0),
+            ApiVersion::new(0, 2, 0),
+            API_VERSION,
+        ] {
+            for mode in [PluginMode::Resident, PluginMode::OneShot] {
+                let mut plugin = seg_spec("resident");
+                plugin.manifest.api = declared;
+                plugin.mode = mode;
+                for row in HOST_VERB_SUPPORT {
+                    assert_eq!(
+                        host_verb_check(&plugin, row.verb).is_ok(),
+                        row.state == SupportState::Wired
+                            && row.modes.contains(&plugin.mode)
+                            && row.since <= declared,
+                        "verb {}, mode {}, declared API {}",
+                        row.verb.method_name(),
+                        plugin.mode.wire_name(),
+                        declared
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_verb_since_refusal_is_typed_and_names_the_versions() {
+        let mut plugin = seg_spec("resident");
+        plugin.manifest.api = ApiVersion::new(0, 1, 0);
+        let refusal = host_verb_check(&plugin, HostVerb::StateGet)
+            .expect_err("state.get was introduced after plugin API 0.1.0");
+        assert_eq!(refusal.code, RpcErrorCode::Unsupported);
+        assert!(refusal.message.contains("state.get"));
+        assert!(refusal.message.contains("requires plugin API 0.2.0"));
+        assert!(refusal.message.contains("declares 0.1.0"));
+
+        plugin.manifest.api = ApiVersion::new(0, 2, 0);
+        assert!(host_verb_check(&plugin, HostVerb::StateGet).is_ok());
+    }
+
+    #[test]
+    fn host_verb_since_blocks_a_v0_1_state_set_at_dispatch() {
+        let mut plugin = seg_spec("p");
+        plugin.manifest.api = ApiVersion::new(0, 1, 0);
+        let mut state = state_with(vec![plugin]);
+        let pid = PluginId::new("p");
+        state
+            .plugins
+            .get_mut("p")
+            .expect("plugin entry")
+            .runtime
+            .state_set(pid.clone(), "cursor", serde_json::json!(3))
+            .expect("seed state through the runtime API");
+
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        tx.send(PluginMsg::Event {
+            plugin: "p".into(),
+            event: SessionEvent::Message(RpcMessage {
+                id: Some(22),
+                method: "state.set".into(),
+                params: serde_json::json!({"key": "cursor", "value": 7}),
+            }),
+        })
+        .unwrap();
+        drop(tx);
+
+        drain(&mut rx, &mut state, &mut model, None);
+        assert_eq!(
+            state
+                .plugins
+                .get_mut("p")
+                .expect("plugin entry")
+                .runtime
+                .state_get(pid, "cursor")
+                .expect("read seeded state"),
+            Some(serde_json::json!(3)),
+            "dispatch must refuse v0.1 state.set without mutating prior state"
+        );
     }
 
     #[test]
