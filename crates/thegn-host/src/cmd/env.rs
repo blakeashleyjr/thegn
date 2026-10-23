@@ -749,7 +749,10 @@ fn resolve_with_selection(
     read: anyhow::Result<Option<String>>,
 ) -> Result<thegn_core::env::Environment> {
     let selected = read.with_context(|| {
-        format!("could not read the environment selection for {wt}; refusing to fall back to the default environment")
+        format!(concat!(
+            "could not read the environment selection for {wt}; ",
+            "refusing to fall back to the default environment"
+        ))
     })?;
     Ok(cfg.resolve_env(repo_root, loc, Path::new(wt), selected.as_deref()))
 }
@@ -1177,5 +1180,6 @@ mod selection_tests {
         let actual = resolve_with_selection(&cfg, &wt, repo_root, &loc, Ok(Some("box".into())))
             .expect("selected env resolves");
         assert_eq!(actual.name, "box");
+        assert!(!actual.unresolved_selection);
     }
 }
