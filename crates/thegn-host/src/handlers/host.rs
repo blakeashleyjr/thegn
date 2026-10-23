@@ -412,10 +412,11 @@ pub(crate) fn stop_worktree_share(
     // deleting by it left the real rows behind (a "stopped" tunnel then
     // resurrected on the next launch).
     let stopped = share_supervisor.stop(&wt, None);
+    let status = crate::share::stop_status(&stopped, None);
     queue_stopped_share_deletes(wt.clone(), stopped.removed);
     queue_stopped_share_failures(wt, stopped.failed.clone());
     model.shares = crate::run::current_share_views(share_supervisor, session);
-    model.status = crate::share::stop_status(&stopped, None);
+    model.status = status;
 }
 
 pub(crate) fn queue_stopped_share_deletes(worktree: String, stopped: Vec<(u16, u64)>) {

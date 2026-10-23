@@ -23556,6 +23556,7 @@ async fn event_loop<T: Terminal>(
                             match target {
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
+                                    let status = crate::share::stop_status(&stopped, Some(port));
                                     crate::handlers::host::queue_stopped_share_deletes(
                                         wt.clone(),
                                         stopped.removed,
@@ -23565,7 +23566,7 @@ async fn event_loop<T: Terminal>(
                                         stopped.failed.clone(),
                                     );
                                     model.shares = current_share_views(&share_supervisor, &session);
-                                    model.status = crate::share::stop_status(&stopped, Some(port));
+                                    model.status = status;
                                 }
                                 None => model.status = "No share selected".into(),
                             }
