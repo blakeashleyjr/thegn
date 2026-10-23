@@ -149,7 +149,9 @@ surface-local actions.
 The machine-readable source for this classification is embedded in
 `docs/api/plugin-api-0.3.json` as `x-thegn-extension-support`; its companion
 `x-thegn-host-verb-support` table names verb authority and permitted modes, and
-`x-thegn-host-call-capabilities` is the exact set of dispatchable catalog ids.
+the API version each verb needs (a verb newer than the plugin's declared `api`
+is refused as unsupported). `x-thegn-host-call-capabilities` is the exact set
+of dispatchable catalog ids.
 `StatusBarSegment`, `NotificationSource`, and `PaletteAction` accept one-shot
 or resident plugins. `IssueProvider` is resident-only because provider calls
 need a reply channel. Palette actions and providers are on-demand; status and
