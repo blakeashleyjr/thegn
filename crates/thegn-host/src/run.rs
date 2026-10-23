@@ -718,9 +718,9 @@ pub async fn main(
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
-    let control_socket = crate::daemon::socket_path(&cfg.daemon);
+    let daemon_cfg = cfg.daemon.clone();
     tokio::task::spawn_blocking(move || {
-        crate::daemon::control_publish::publish_for_socket(&control_socket);
+        crate::daemon::control_publish::publish_for_config(&daemon_cfg);
     })
     .await?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
