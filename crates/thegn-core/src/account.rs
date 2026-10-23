@@ -430,11 +430,6 @@ fn resolved_entries(cfg: &Config, db: &Db, provider_id: &str) -> Vec<(String, Pa
     entries
 }
 
-/// Names participating in a shared physical directory. Existing directories
-/// are compared by filesystem identity (including symlinks, `..` spellings,
-/// and bind mounts); missing directories are compared by normalized path.
-/// Repeated records for the same exact logical name do not constitute a
-/// collision.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum DirKey {
     /// Same filesystem object (follows symlinks; catches bind mounts).
@@ -450,6 +445,12 @@ fn dir_key(dir: &Path) -> DirKey {
     }
 }
 
+/// Names participating in a shared physical directory. Existing directories
+/// are compared by filesystem identity (including symlinks, `..` spellings,
+/// and bind mounts); missing directories are compared by path components
+/// (`.` and trailing slashes are normalized; `..` and symlinks are not).
+/// Repeated records for the same exact logical name do not constitute a
+/// collision.
 fn shared_dirs(entries: &[(String, PathBuf)]) -> HashSet<String> {
     let mut owners: std::collections::HashMap<DirKey, HashSet<&str>> =
         std::collections::HashMap::new();
