@@ -40,6 +40,8 @@ pub enum AccountHomeError {
     MalformedManifest { path: PathBuf },
     /// A managed account row points somewhere other than its canonical home.
     RelocatedManagedHome { stored: PathBuf, expected: PathBuf },
+    /// A manifest-less legacy home may belong to another account with the same old slug.
+    AmbiguousLegacyHome { path: PathBuf, aliases: Vec<String> },
     /// The requested provider is not account-switchable.
     UnknownProvider { provider: String },
 }
@@ -68,6 +70,12 @@ impl std::fmt::Display for AccountHomeError {
                 "managed account home {} is not the expected managed home {}; log in to the account again to recreate it (the old directory is left untouched)",
                 stored.display(),
                 expected.display()
+            ),
+            Self::AmbiguousLegacyHome { path, aliases } => write!(
+                f,
+                "managed account home {} has no owner record and may hold the login of {} (older thegn versions used this directory for them too); refusing to claim it: move it aside, then log in again",
+                path.display(),
+                aliases.join(", ")
             ),
             Self::UnknownProvider { provider } => {
                 write!(f, "unknown account provider {provider:?}")
@@ -135,6 +143,14 @@ fn parse_owner_manifest(bytes: &[u8]) -> Option<(&str, String)> {
 /// Establish or verify the private, owner-bound credential home for an account.
 /// Legacy managed homes without a manifest are claimed on first use.
 pub fn ensure_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, AccountHomeError> {
+    ensure_managed_home_claiming(provider_id, name, &[])
+}
+
+fn ensure_managed_home_claiming(
+    provider_id: &str,
+    name: &str,
+    legacy_aliases: &[String],
+) -> Result<PathBuf, AccountHomeError> {
     if provider(provider_id).is_none() {
         return Err(AccountHomeError::UnknownProvider {
             provider: provider_id.to_owned(),
@@ -204,6 +220,21 @@ pub fn ensure_managed_home(provider_id: &str, name: &str) -> Result<PathBuf, Acc
             }
         }
         None => {
+            if !legacy_aliases.is_empty() {
+                let entries =
+                    private
+                        .file_names()
+                        .map_err(|error| AccountHomeError::UnsafePath {
+                            path: path.clone(),
+                            error: error.to_string(),
+                        })?;
+                if !entries.is_empty() {
+                    return Err(AccountHomeError::AmbiguousLegacyHome {
+                        path,
+                        aliases: legacy_aliases.to_vec(),
+                    });
+                }
+            }
             private
                 .write_owner_only_atomic(OWNER_MANIFEST, &owner_manifest(provider_id, name))
                 .map_err(|error| AccountHomeError::UnsafePath {
@@ -361,6 +392,7 @@ fn marked_authed(provider_id: &str, dir: &std::path::Path) -> bool {
 /// (adopted `dir`, or its managed dir), then the DB-managed table.
 pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Option<PathBuf> {
     let entries = resolved_entries(cfg, db, provider_id);
+    let aliases = legacy_aliases(&entries, name);
     let shared = shared_dirs(
         &entries
             .iter()
@@ -381,7 +413,7 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
         return None;
     }
     if managed {
-        match ensure_managed_home(provider_id, name) {
+        match ensure_managed_home_claiming(provider_id, name, &aliases) {
             Ok(verified) => Some(verified),
             Err(error) => {
                 crate::msg::warn(&format!(
@@ -393,6 +425,20 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
     } else {
         Some(dir)
     }
+}
+
+fn legacy_aliases(entries: &[(String, PathBuf, bool)], name: &str) -> Vec<String> {
+    let component = home_component(name);
+    let mut aliases: Vec<_> = entries
+        .iter()
+        .filter(|(other, _, managed)| {
+            other != name && *managed && util::slugify(other) == component
+        })
+        .map(|(other, _, _)| other.clone())
+        .collect();
+    aliases.sort();
+    aliases.dedup();
+    aliases
 }
 
 fn managed_home_check(
@@ -723,6 +769,130 @@ mod tests {
         db.put_account("codex", "db-only", "/var/creds", true, 1)
             .unwrap();
         assert_eq!(account_dir(&cfg, &db, "codex", "db-only"), None);
+    }
+
+    #[test]
+    fn legacy_home_with_a_slug_alias_is_not_claimed() {
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let private =
+            crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("accounts/codex/work"))
+                .unwrap();
+        let home = private.path().to_path_buf();
+        std::fs::write(home.join("auth.json"), b"credential bytes").unwrap();
+
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.extend([
+            Account {
+                name: "work".into(),
+                provider: "codex".into(),
+                dir: None,
+            },
+            Account {
+                name: "Work".into(),
+                provider: "codex".into(),
+                dir: None,
+            },
+        ]);
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "work"), None);
+        assert!(!home.join(OWNER_MANIFEST).exists());
+        assert!(matches!(
+            ensure_managed_home_claiming("codex", "work", &["Work".to_string()]),
+            Err(AccountHomeError::AmbiguousLegacyHome { aliases, .. })
+                if aliases == vec!["Work".to_string()]
+        ));
+    }
+
+    #[test]
+    fn legacy_home_alias_list_is_exact() {
+        let entries = [
+            ("work".to_string(), PathBuf::new(), true),
+            ("Work".to_string(), PathBuf::new(), true),
+            ("WORK".to_string(), PathBuf::new(), false),
+            ("work/x".to_string(), PathBuf::new(), true),
+        ];
+
+        assert_eq!(legacy_aliases(&entries, "work"), vec!["Work".to_string()]);
+    }
+
+    #[test]
+    fn legacy_home_without_aliases_is_still_claimed() {
+        let state = crate::testenv::IsolatedState::new();
+        let anchor = state.state_home().join("thegn");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let private =
+            crate::fsperm::ensure_private_dir_beneath(&anchor, Path::new("accounts/codex/work"))
+                .unwrap();
+        let home = private.path().to_path_buf();
+
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "work".into(),
+            provider: "codex".into(),
+            dir: None,
+        });
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "work"), Some(home.clone()));
+        assert_eq!(
+            std::fs::read(home.join(OWNER_MANIFEST)).unwrap(),
+            owner_manifest("codex", "work")
+        );
+    }
+
+    #[test]
+    fn legacy_home_alias_with_an_empty_new_home_is_claimed() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.extend([
+            Account {
+                name: "work".into(),
+                provider: "codex".into(),
+                dir: None,
+            },
+            Account {
+                name: "Work".into(),
+                provider: "codex".into(),
+                dir: None,
+            },
+        ]);
+
+        assert_eq!(
+            account_dir(&cfg, &db, "codex", "work"),
+            Some(managed_dir("codex", "work"))
+        );
+        assert_eq!(
+            std::fs::read(managed_dir("codex", "work").join(OWNER_MANIFEST)).unwrap(),
+            owner_manifest("codex", "work")
+        );
+    }
+
+    #[test]
+    fn legacy_home_with_a_manifest_and_an_alias_verifies() {
+        let _state = crate::testenv::IsolatedState::new();
+        let home = ensure_managed_home("codex", "work").unwrap();
+        std::fs::write(home.join("auth.json"), b"credential bytes").unwrap();
+
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.extend([
+            Account {
+                name: "work".into(),
+                provider: "codex".into(),
+                dir: None,
+            },
+            Account {
+                name: "Work".into(),
+                provider: "codex".into(),
+                dir: None,
+            },
+        ]);
+
+        assert_eq!(account_dir(&cfg, &db, "codex", "work"), Some(home));
     }
 
     #[test]
