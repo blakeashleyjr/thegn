@@ -701,7 +701,7 @@ check "forward list --json parses" \
 check "repo list --json parses" \
   "'$SZ' repo list --json | head -c1 | grep -q '\['"
 check "ci runs --json degrades gracefully" \
-  "'$SZ' ci runs --worktree '$WT' --json >/dev/null 2>&1"
+  "'$SZ' ci runs --worktree '$WT' --json 2>/dev/null | grep -q '\"reason\":\"no-provider\"'"
 
 # Grouped help + shell completions.
 check "--help shows the Projects & worktrees group" "'$SZ' --help | grep -q 'Projects & worktrees:'"
