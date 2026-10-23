@@ -12094,6 +12094,12 @@ async fn event_loop<T: Terminal>(
             if generation != hydration_gen {
                 continue;
             }
+            if next_model.panel.reconcile_pending_reads(&model.panel) {
+                next_model
+                    .sidebar_status
+                    .acked
+                    .extend(model.sidebar_status.acked.iter().cloned());
+            }
             // A failed hydration is a completion signal, not a replacement
             // model. Keep the last good sidebar/panel and stamp its typed DB
             // availability. In particular, a later generic outage cannot
@@ -23728,6 +23734,7 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
+                                let epoch = crate::hydrate_feed::issue_notification_write();
                                 let refresh = refresh_tx.clone();
                                 let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -23736,13 +23743,14 @@ async fn event_loop<T: Terminal>(
                                     {
                                         tracing::debug!(%error, "could not clear notification");
                                     }
+                                    crate::hydrate_feed::commit_notification_write(epoch);
                                     if refresh.send(RefreshKind::Model).is_ok()
                                         && let Err(error) = wake.wake()
                                     {
                                         tracing::debug!(%error, "could not wake after notification clear");
                                     }
                                 });
-                                model.panel.mark_read_where(|n| n.id == id);
+                                model.panel.mark_read_ids_at(epoch, [id]);
                                 hydration_gen += 1;
                             }
                             true
@@ -23784,12 +23792,7 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
-                                let selected = model
-                                    .panel
-                                    .notifications
-                                    .iter()
-                                    .find(|n| n.id == id)
-                                    .cloned();
+                                let epoch = crate::hydrate_feed::issue_notification_write();
                                 let refresh = refresh_tx.clone();
                                 let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -23798,28 +23801,14 @@ async fn event_loop<T: Terminal>(
                                     {
                                         tracing::debug!(%error, "could not delete notification");
                                     }
+                                    crate::hydrate_feed::commit_notification_write(epoch);
                                     if refresh.send(RefreshKind::Model).is_ok()
                                         && let Err(error) = wake.wake()
                                     {
                                         tracing::debug!(%error, "could not wake after notification delete");
                                     }
                                 });
-                                model.panel.notifications.retain(|n| n.id != id);
-                                if let Some(row) = selected.filter(|n| !n.read) {
-                                    match model.panel.priority_of(row.kind) {
-                                        thegn_core::notification::Priority::Alert => {
-                                            model.panel.alert_notifications =
-                                                model.panel.alert_notifications.saturating_sub(1);
-                                            model.panel.unread_notifications =
-                                                model.panel.unread_notifications.saturating_sub(1);
-                                        }
-                                        thegn_core::notification::Priority::Notice => {
-                                            model.panel.unread_notifications =
-                                                model.panel.unread_notifications.saturating_sub(1);
-                                        }
-                                        thegn_core::notification::Priority::Info => {}
-                                    }
-                                }
+                                model.panel.delete_notification_at(epoch, id);
                                 panel_ui.notifications_cursor =
                                     panel_ui.notifications_cursor.saturating_sub(1);
                                 panel_ui.cursor = panel_ui.notifications_cursor;

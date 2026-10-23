@@ -474,7 +474,6 @@ fn collect_attention_inner(
     // UPSERT when the user acks a new episode, the `del_worktree` cascade,
     // `ack_expired` for identity-less acks, and the age sweep in `Db::open`.
     status.acked.clear();
-    let now = thegn_core::util::now();
     for row in db.list_attention_acks().unwrap_or_default() {
         let Ok(reason) =
             serde_json::from_str::<thegn_core::attention::AttentionReason>(&row.reason)

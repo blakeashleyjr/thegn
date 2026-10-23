@@ -272,6 +272,8 @@ pub(crate) fn mark_all_read(
     // notifications read. The active repo root is resolved off-loop.
     let scope_all = crate::panel::scope::system_all();
     let active = active_worktree_path(model).map(std::path::PathBuf::from);
+    let read_ids: Vec<i64> = model.panel.notifications.iter().map(|row| row.id).collect();
+    let epoch = crate::hydrate_feed::issue_notification_write();
     let tx = tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
@@ -327,6 +329,7 @@ pub(crate) fn mark_all_read(
                 let _ = db.clear_session_attention_for_worktree(&p); // best-effort: cache write: the ack state drives the next hydration only
             }
         }
+        crate::hydrate_feed::commit_notification_write(epoch);
         if tx.send(RefreshKind::Model).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -336,7 +339,7 @@ pub(crate) fn mark_all_read(
     // set in the model now — the chip and the popup must drop on the next
     // frame, not seconds later when the rehydrate lands (that lag is what
     // made `a` read as a no-op).
-    model.panel.mark_read_where(|_| true);
+    model.panel.mark_read_ids_at(epoch, read_ids);
     for (p, _) in needs_user_for_ack(model) {
         model.sidebar_status.acked.insert(p);
     }
@@ -451,9 +454,8 @@ pub(crate) fn mark_read_ids(
     waker: &TerminalWaker,
 ) {
     let ids = ids.to_vec();
-    model
-        .panel
-        .mark_read_where(|notification| ids.contains(&notification.id));
+    let epoch = crate::hydrate_feed::issue_notification_write();
+    model.panel.mark_read_ids_at(epoch, ids.iter().copied());
     let worker_ids = ids.clone();
     let tx = tx.clone();
     let waker = waker.clone();
@@ -470,6 +472,7 @@ pub(crate) fn mark_read_ids(
                 tracing::debug!(target: "thegn::attention", %error, "could not open database for filtered notification clear");
             }
         }
+        crate::hydrate_feed::commit_notification_write(epoch);
         if tx.send(RefreshKind::Model).is_ok()
             && let Err(error) = waker.wake()
         {
@@ -560,6 +563,40 @@ mod tests {
 
         let unfiltered_ui = crate::panel::PanelUi::default();
         assert_eq!(filtered_unread_ids(&model.panel, &unfiltered_ui), None);
+    }
+
+    #[test]
+    fn stale_notification_hydration_keeps_optimistic_read_until_epoch_commits() {
+        let mut loop_panel = crate::panel::PanelData::default();
+        loop_panel.notifications = vec![notification(1, "cleared", false)];
+        loop_panel.mark_read_ids_at(7, [1]);
+        assert_eq!(loop_panel.unread_notifications, 0);
+
+        let mut stale_hydration = crate::panel::PanelData {
+            notifications: vec![
+                notification(1, "cleared", false),
+                notification(2, "new unread", false),
+            ],
+            notifications_epoch: 6,
+            ..Default::default()
+        };
+        assert!(stale_hydration.reconcile_pending_reads(&loop_panel));
+        assert!(stale_hydration.notifications[0].read);
+        assert!(!stale_hydration.notifications[1].read);
+        assert_eq!(stale_hydration.unread_notifications, 1);
+
+        let mut committed_hydration = crate::panel::PanelData {
+            notifications: vec![
+                notification(1, "cleared", true),
+                notification(3, "genuinely new", false),
+            ],
+            notifications_epoch: 7,
+            ..Default::default()
+        };
+        assert!(!committed_hydration.reconcile_pending_reads(&stale_hydration));
+        assert!(committed_hydration.notifications[0].read);
+        assert!(!committed_hydration.notifications[1].read);
+        assert_eq!(committed_hydration.unread_notifications, 1);
     }
 
     #[test]
