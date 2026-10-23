@@ -4933,7 +4933,7 @@ mod tests {
             _id: &'a str,
             path: &'a str,
         ) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
-            let entries = if path == "/" {
+            let entries = if path.is_empty() {
                 (0..300)
                     .map(|index| FileEntry {
                         name: format!("directory-{index}"),
@@ -5094,7 +5094,7 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *high_water = (*high_water).max(count);
             }
-            let entries = if path == "/" {
+            let entries = if path.is_empty() {
                 (0..300)
                     .map(|index| FileEntry {
                         name: format!("directory-{index}"),
