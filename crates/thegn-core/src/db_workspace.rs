@@ -299,32 +299,14 @@ impl WorkspaceStore for Db {
     /// `-2`, `-3`, … on collision with a *different* repo, then persists it.
     /// Two repos with the same basename therefore get distinct tab namespaces.
     fn slug_for_repo(&self, repo_path: &str, base: &str) -> Result<String> {
-        if let Some(slug) = self
-            .conn()
-            .query_row(
-                "SELECT slug FROM repo_slugs WHERE repo_path=?1",
-                params![repo_path],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-            .filter(|slug| !slug.is_empty())
-        {
+        if let Some(slug) = self.repo_slug_lookup(repo_path)? {
             return Ok(slug);
         }
 
         // Take the write lock before the recheck and uniqueness scan so two
         // processes cannot both pass the scan and claim the same slug.
         self.transaction_immediate(|db| {
-            if let Some(slug) = db
-                .conn()
-                .query_row(
-                    "SELECT slug FROM repo_slugs WHERE repo_path=?1",
-                    params![repo_path],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-                .filter(|slug| !slug.is_empty())
-            {
+            if let Some(slug) = db.repo_slug_lookup(repo_path)? {
                 return Ok(slug);
             }
             let taken: std::collections::HashSet<String> = {
@@ -3144,18 +3126,20 @@ mod tests {
         let thread_path = path.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
-        let started = Instant::now();
         let join = std::thread::spawn(move || {
             let db = Db::open_at(&thread_path).unwrap();
             started_tx.send(()).unwrap();
-            result_tx.send(db.slug_for_repo("/fresh", "fresh")).unwrap();
+            let started = Instant::now();
+            let result = db.slug_for_repo("/fresh", "fresh");
+            result_tx.send((result, started.elapsed())).unwrap();
         });
         started_rx.recv().unwrap();
         std::thread::sleep(Duration::from_millis(200));
         writer.conn().execute_batch("COMMIT;").unwrap();
 
-        assert_eq!(result_rx.recv().unwrap().unwrap(), "fresh");
-        assert!(started.elapsed() >= Duration::from_millis(150));
+        let (result, elapsed) = result_rx.recv().unwrap();
+        assert_eq!(result.unwrap(), "fresh");
+        assert!(elapsed >= Duration::from_millis(150));
         join.join().unwrap();
     }
 

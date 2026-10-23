@@ -4823,11 +4823,8 @@ pub(crate) fn repo_slug_checked(db: &Db, repo_root: &Path) -> anyhow::Result<Opt
         return Ok(None);
     };
     let base = file_name.to_string_lossy().into_owned();
-    let repo_path = repo_root.to_string_lossy();
-    if let Some(slug) = db.repo_slug_lookup(&repo_path)? {
-        return Ok(Some(slug));
-    }
-    db.slug_for_repo(&repo_path, &base).map(Some)
+    db.slug_for_repo(&repo_root.to_string_lossy(), &base)
+        .map(Some)
 }
 
 fn sandbox_candidates(

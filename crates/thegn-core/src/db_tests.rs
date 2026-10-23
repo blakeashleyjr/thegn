@@ -6233,6 +6233,56 @@ fn retry_transient_gives_up_after_its_budget() {
 }
 
 #[test]
+fn retry_transient_returns_final_non_lock_error_without_locked_context() {
+    let mut calls: usize = 0;
+    let result: Result<()> = retry_transient_with(
+        &[1],
+        |_| {},
+        || {
+            calls += 1;
+            if calls == 1 {
+                Err(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )))
+            } else {
+                Err(anyhow::anyhow!("disk I/O error"))
+            }
+        },
+    );
+    let Err(error) = result else {
+        panic!("the final non-lock failure must be returned");
+    };
+
+    assert_eq!(calls, 2);
+    assert!(format!("{error:#}").contains("disk I/O error"));
+    assert!(!format!("{error:#}").contains("still locked"));
+}
+
+#[test]
+fn retry_transient_does_not_retry_after_a_busy_timeout_wait() {
+    let mut calls: usize = 0;
+    let result: Result<()> = retry_transient_with(
+        &[1, 2],
+        |_| {},
+        || {
+            calls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(210));
+            Err(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )))
+        },
+    );
+    let Err(error) = result else {
+        panic!("a slow busy attempt must be returned without another wait");
+    };
+
+    assert_eq!(calls, 1);
+    assert!(format!("{error:#}").contains("still locked after 0 retries"));
+}
+
+#[test]
 fn is_transient_lock_classifies_busy_and_locked() {
     let sqlite_error = |code| {
         anyhow::Error::from(rusqlite::Error::SqliteFailure(
