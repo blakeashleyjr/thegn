@@ -1482,6 +1482,16 @@ impl WorktreeAuxStore for Db {
         Ok(())
     }
 
+    fn update_pr_detail(&self, key: &str, detail: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE pr_queue SET detail=?2, updated_at=?3 WHERE key=?1
+             AND (agent_claim_owner IS NULL OR agent_claim_lease_until_ms IS NULL
+                  OR agent_claim_lease_until_ms < ?4)",
+            params![key, detail, util::now(), util::now_ms()],
+        )?;
+        Ok(())
+    }
+
     fn set_pr_agent_attempts(&self, key: &str, attempts: u32) -> Result<()> {
         self.conn().execute(
             "UPDATE pr_queue SET agent_attempts=?2, updated_at=?3 WHERE key=?1
