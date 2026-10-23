@@ -77,7 +77,7 @@ pub fn checkpoint_on_close(worktree: &str) {
 }
 
 fn checkpoint_failed_message(name: &str, error: &dyn std::fmt::Display) -> String {
-    format!("auto-checkpoint on close failed for {name}: {error}")
+    format!("auto-checkpoint on close failed for {name}: {error:#}")
 }
 
 /// The env to checkpoint on close: `Ok(None)` = nothing selected, `Err` = unreadable (skip with a warning).
@@ -145,6 +145,7 @@ pub fn destroy_provider_sandbox_with(
 mod tests {
     use super::*;
     use crate::lifecycle::DeleteRecycle;
+    use anyhow::Context;
 
     #[test]
     fn pool_delete_destroy_failure_keeps_the_row() {
@@ -203,6 +204,11 @@ mod tests {
     fn checkpoint_failed_message_names_the_sandbox_and_cause() {
         let message = checkpoint_failed_message("sbx", &"provider unavailable");
         assert!(message.contains("auto-checkpoint on close failed for sbx"));
+        assert!(message.contains("provider unavailable"));
+
+        let error = anyhow::anyhow!("provider unavailable").context("checkpoint request failed");
+        let message = checkpoint_failed_message("sbx", &error);
+        assert!(message.contains("checkpoint request failed"));
         assert!(message.contains("provider unavailable"));
     }
 }
