@@ -105,10 +105,9 @@ impl TerminalRestore {
         // popping an empty stack is a documented no-op in the kitty spec, and
         // it is defensive against an inner app that pushed flags and died
         // without popping them. Leave the bytes.
-        const SEQ: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l";
-        if let Err(error) = nix::unistd::write(&self.tty, SEQ) {
-            tracing::debug!(target: "thegn::shutdown", %error, "best-effort panic terminal teardown write failed");
-        }
+        const SEQ: &[u8] =
+            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l\x1b[?2004l";
+        let _ = nix::unistd::write(&self.tty, SEQ); // best-effort: terminal teardown: the tty drops anyway
         // SAFETY: `tcsetattr` on our own controlling-terminal fd with a termios
         // we captured from it. Result ignored — this runs during a panic unwind
         // and must not itself panic.
@@ -261,7 +260,7 @@ mod terminal_teardown_tests {
 
     #[test]
     fn release_terminal_without_raw_restore_runs_termwiz_cleanup() {
-        let (master, slave) = pty();
+        let (mut master, slave) = pty();
         let before = unsafe {
             let mut value = std::mem::zeroed::<libc::termios>();
             assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut value), 0);
@@ -307,6 +306,58 @@ mod terminal_teardown_tests {
         assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut after) }, 0);
         assert_eq!(before.c_lflag, after.c_lflag);
         assert_eq!(before.c_iflag, after.c_iflag);
+    }
+
+    #[test]
+    fn restore_writes_alternate_screen_and_bracketed_paste_resets() {
+        let (mut master, slave) = pty();
+        let restore_fd: std::os::fd::OwnedFd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(slave_path(&slave))
+            .unwrap()
+            .into();
+        let restore = terminal_restore_from(restore_fd).unwrap();
+        let master_fd = master.as_raw_fd();
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let (stop_send, stop_receive) = mpsc::channel();
+        let (bytes_send, bytes_receive) = mpsc::channel();
+        let _reader = thegn_core::thread_name::try_spawn_named("thegn-test-tty", move || {
+            let mut bytes = [0_u8; 4096];
+            let mut output = Vec::new();
+            loop {
+                if stop_receive.try_recv().is_ok() {
+                    loop {
+                        match master.read(&mut bytes) {
+                            Ok(count) => output.extend_from_slice(&bytes[..count]),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("reading pty output: {error}"),
+                        }
+                    }
+                    bytes_send.send(output).unwrap();
+                    break;
+                }
+                match master.read(&mut bytes) {
+                    Ok(count) => output.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now()
+                    }
+                    Err(error) => panic!("reading pty output: {error}"),
+                }
+            }
+        })
+        .unwrap();
+
+        restore.restore();
+        stop_send.send(()).unwrap();
+        let output = bytes_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
+        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?2004l"));
     }
 }
 
