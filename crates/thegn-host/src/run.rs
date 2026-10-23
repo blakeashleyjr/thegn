@@ -756,6 +756,9 @@ pub async fn main(
         waker.clone(),
         refresh_tx.clone(),
         std::sync::Arc::clone(&heal_gate),
+        Some(std::path::PathBuf::from(thegn_core::util::expand_tilde(
+            &cfg.workspaces_dir,
+        ))),
     );
     tracing::info!(
         target: "thegn::startup",
