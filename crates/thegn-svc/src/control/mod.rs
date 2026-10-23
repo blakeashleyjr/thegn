@@ -523,7 +523,7 @@ pub struct CiRunsReply {
     pub discarded_rows: usize,
     pub source: String,
     pub fetched_at: i64,
-    /// Why a cached list was served after a failed or incomplete provider read (`source == "stale-cache").
+    /// Why a cached list was served after a failed or incomplete provider read (`source == "stale-cache"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_reason: Option<String>,
 }

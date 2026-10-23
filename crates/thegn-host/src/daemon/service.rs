@@ -1964,7 +1964,7 @@ impl ControlApi for DaemonService {
                     thegn_core::ci::decode_run_cache(&json)
                         .map(|cache| (cache, cached_branch, fetched_at))
                 });
-            if let Some((mut cache, cached_branch, fetched_at)) = cached.as_ref().cloned()
+            if let Some((mut cache, cached_branch, fetched_at)) = cached.clone()
                 && crate::ci_refresh::daemon_ci_cache_usable(
                     &cached_branch,
                     branch.as_deref(),
