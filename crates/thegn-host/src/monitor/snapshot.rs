@@ -162,6 +162,69 @@ fn frozen_overlay(tab: MonitorTab, screen: Rect) -> MonitorOverlay {
     MonitorOverlay::open(tab, Default::default(), &model, &ctx)
 }
 
+fn graph_overlay(tab: MonitorTab, screen: Rect) -> MonitorOverlay {
+    const NOW_MS: u64 = 1_767_268_800_000;
+    let stats = thegn_metrics::StatsSnapshot {
+        cpu_temp_c: Some(82.0),
+        temps: vec![("coretemp".into(), 82.0)],
+        net_bps: Some((18_000_000, 7_000_000)),
+        battery: Some((65, false)),
+        battery_power_w: Some(24.0),
+        power_present: true,
+        ..crate::e2e_freeze::stats()
+    };
+    let mut history = TelemetryHistory::default();
+    for age in (0..120_u64).rev() {
+        history.push(&stats, NOW_MS - age * 1000);
+    }
+    let model = crate::chrome::FrameModel {
+        stats,
+        ..Default::default()
+    };
+    let mut ctx = StatusCtx::new_for_test_on(&history, screen);
+    ctx.now_ms = NOW_MS as i64;
+    let mut overlay = MonitorOverlay::open(tab, Default::default(), &model, &ctx);
+    let mut frame = thegn_metrics::collect::frame::MonitorFrame::default();
+    frame.parts.hwmon.layout = Some(std::sync::Arc::new(
+        thegn_metrics::collect::model::hwmon::HwmonLayout {
+            generation: 1,
+            chips: vec![thegn_metrics::collect::model::hwmon::HwmonChip {
+                name: "coretemp".into(),
+                device: "cpu0".into(),
+                group: thegn_metrics::collect::model::hwmon::ChipGroup::Cpu,
+                ordinal: 0,
+                gated: false,
+            }],
+            sensors: vec![thegn_metrics::collect::model::hwmon::HwmonSensor {
+                key: "package".into(),
+                chip: 0,
+                kind: thegn_metrics::collect::model::hwmon::SensorKind::Temp,
+                channel: 1,
+                role: thegn_metrics::collect::model::hwmon::SensorRole::Input,
+                label: Some("Package".into()),
+                thresholds: thegn_metrics::collect::model::hwmon::Thresholds {
+                    max: Some(85.0),
+                    crit: Some(95.0),
+                    ..Default::default()
+                },
+                cost: thegn_metrics::collect::model::hwmon::CostClass::Fast,
+            }],
+        },
+    ));
+    frame
+        .parts
+        .hwmon
+        .values
+        .push(thegn_metrics::collect::model::hwmon::HwmonValue {
+            value: Some(82.0),
+            ..Default::default()
+        });
+    for _ in 0..120 {
+        overlay.ingest_frame(&frame);
+    }
+    overlay
+}
+
 fn snapshot(ov: &MonitorOverlay, w: usize, h: usize) -> (String, String) {
     let mut surface = Surface::new(w, h);
     ov.render(&mut surface, Rect::full(w, h));
@@ -340,11 +403,17 @@ mod tests {
                     "fixture palette must be the dark default"
                 );
                 assert_ne!(panel, dim);
-                let mut total_graph_cells = 0;
-                for tab in MonitorTab::visible_for(&crate::e2e_freeze::stats(), true, false) {
-                    let overlay = frozen_overlay(tab, Rect::full(100, 32));
+                for tab in [
+                    MonitorTab::Thermal,
+                    MonitorTab::Network,
+                    MonitorTab::Power,
+                    MonitorTab::Overview,
+                    MonitorTab::Cpu,
+                ] {
+                    let overlay = graph_overlay(tab, Rect::full(100, 32));
                     let mut surface = Surface::new(100, 32);
                     overlay.render(&mut surface, Rect::full(100, 32));
+                    let mut tab_graph_cells = 0;
                     for (y, line) in surface.screen_lines().iter().enumerate() {
                         for cell in line.visible_cells() {
                             let ch = cell.str().chars().next().unwrap_or(' ');
@@ -353,7 +422,7 @@ mod tests {
                             if !graph_glyph {
                                 continue;
                             }
-                            total_graph_cells += 1;
+                            tab_graph_cells += 1;
                             let x = cell.cell_index();
                             let attrs = cell.attrs();
                             let bg = crate::wire::color_spec(attrs.background(), depth);
@@ -368,7 +437,7 @@ mod tests {
                                     "{tab:?} ({x},{y}) blank graph background {bg:?}"
                                 );
                             }
-                            if ch != '\u{2800}' && ch != '░' {
+                            if ch != '\u{2800}' && ch != '\u{2591}' {
                                 assert!(
                                     fg != ColorSpec::Default && fg != text,
                                     "{tab:?} ({x},{y}) {ch:?} foreground {fg:?}"
@@ -376,11 +445,11 @@ mod tests {
                             }
                         }
                     }
+                    assert!(
+                        tab_graph_cells > 0,
+                        "seeded {tab:?} frame must paint graph cells"
+                    );
                 }
-                assert!(
-                    total_graph_cells > 0,
-                    "frozen monitor fixture must paint graphs"
-                );
             });
         }
     }

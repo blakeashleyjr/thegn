@@ -216,6 +216,29 @@ fn thermal_heatmap_raster_keeps_ramp_foreground_and_stacked_background() {
     }
 }
 
+#[test]
+fn thermal_core_swatch_stays_inside_the_panel_body() {
+    use crate::monitor::kit::panel::panel;
+
+    let mut grid = CellGrid::new(24, 4);
+    let body = panel(&mut grid, Rect::full(24, 4), "CPU cores", None).rect();
+    let corner_before = grid.get(0, 0).expect("panel top-left corner");
+    super::paint::cores(&mut grid, body, &[Some(90.0); 16]);
+
+    let corner_after = grid.get(0, 0).expect("panel top-left corner");
+    assert_eq!(
+        corner_after, corner_before,
+        "core 00 must preserve the panel corner"
+    );
+    let swatch = grid
+        .get(body.x, body.y)
+        .expect("core 00 swatch at the panel body origin");
+    assert_ne!(
+        swatch.ch, ' ',
+        "core 00 swatch must start inside the panel body"
+    );
+}
+
 fn fixture_with_fan() -> MonitorFrame {
     let mut frame = fixture();
     let mut layout = (**frame.parts.hwmon.layout.as_ref().expect("hwmon layout")).clone();

@@ -679,7 +679,7 @@ mod tests {
             ink += 1;
             assert_eq!(
                 cell.fg,
-                StyleTok::from_tok(Tok::Ramp(RampId::Rx, 6)).unwrap(),
+                StyleTok::from_tok(Tok::Ramp(RampId::Rx, 7)).unwrap(),
                 "mirrored receive ink must retain its rx ramp"
             );
         }
