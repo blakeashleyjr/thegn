@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 pub(crate) mod inbox;
 pub(crate) mod respawn;
 use inbox::PluginInbox;
+
+pub(crate) type SessionGen = u64;
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(crate) struct PluginTx {
@@ -60,8 +63,12 @@ impl PluginTx {
         message: PluginMsg,
     ) -> Result<(), Box<tokio_mpsc::error::SendError<PluginMsg>>> {
         match message {
-            PluginMsg::Event { plugin, event } => {
-                self.inbox.push(plugin, event);
+            PluginMsg::Event {
+                plugin,
+                session,
+                event,
+            } => {
+                self.inbox.push(plugin, session, event);
                 Ok(())
             }
             message => self.lifecycle.send(message).map_err(Box::new),
@@ -71,20 +78,32 @@ impl PluginTx {
 
 impl PluginRx {
     pub(crate) fn try_recv(&mut self) -> Result<PluginMsg, tokio_mpsc::error::TryRecvError> {
-        if let Some((plugin, event)) = self.inbox.pop_exit() {
-            return Ok(PluginMsg::Event { plugin, event });
+        if let Some((plugin, session, event)) = self.inbox.pop_exit() {
+            return Ok(PluginMsg::Event {
+                plugin,
+                session,
+                event,
+            });
         }
         match self.lifecycle.try_recv() {
             Ok(message) => Ok(message),
             Err(tokio_mpsc::error::TryRecvError::Disconnected) => self
                 .inbox
                 .pop()
-                .map(|(plugin, event)| PluginMsg::Event { plugin, event })
+                .map(|(plugin, session, event)| PluginMsg::Event {
+                    plugin,
+                    session,
+                    event,
+                })
                 .ok_or(tokio_mpsc::error::TryRecvError::Disconnected),
             Err(tokio_mpsc::error::TryRecvError::Empty) => self
                 .inbox
                 .pop()
-                .map(|(plugin, event)| PluginMsg::Event { plugin, event })
+                .map(|(plugin, session, event)| PluginMsg::Event {
+                    plugin,
+                    session,
+                    event,
+                })
                 .ok_or(tokio_mpsc::error::TryRecvError::Empty),
         }
     }
@@ -117,7 +136,11 @@ impl PluginRx {
             None => self
                 .inbox
                 .pop()
-                .map(|(plugin, event)| PluginMsg::Event { plugin, event }),
+                .map(|(plugin, session, event)| PluginMsg::Event {
+                    plugin,
+                    session,
+                    event,
+                }),
         }
     }
 }
@@ -133,6 +156,7 @@ pub(crate) enum PluginMsg {
     /// One resident session's stdout produced a line (or the session exited).
     Event {
         plugin: String,
+        session: SessionGen,
         event: SessionEvent,
     },
     /// One completed `spawn_ndjson` run of a one-shot plugin.
@@ -144,6 +168,7 @@ pub(crate) enum PluginMsg {
     /// respawn itself failed (the loop counts it like another crash).
     Respawned {
         plugin: String,
+        session: Option<SessionGen>,
         writer: Option<SessionWriter>,
     },
     RespawnWorkerStartFailed {
@@ -169,6 +194,8 @@ pub(crate) struct LoadedState {
     /// `Some` for resident plugins whose session spawned; `None` for one-shot
     /// plugins and for residents that failed to start.
     pub writer: Option<SessionWriter>,
+    /// Present exactly when `writer` owns the spawned resident session.
+    pub session: Option<SessionGen>,
 }
 
 /// Restart backoff: 1s / 5s / 25s, then give up (max 3 restarts). Pure so the
@@ -310,9 +337,10 @@ struct RespawnCtx {
 
 fn respawn_now(plugin: LoadedPlugin, ctx: &RespawnCtx) {
     let id = plugin.spec.manifest.id.as_str().to_string();
+    let mut session_gen = None;
     let writer = match thegn_svc::plugin::resolve_launch_env(&plugin, &ctx.state_anchor) {
         Ok(env) => match spawn_session(&ctx.supervisor, &plugin, &env, &ctx.tx, &ctx.waker) {
-            Ok(session) => {
+            Ok((session, generation)) => {
                 let writer = session.writer();
                 if let Err(session) =
                     admit_unless_stopped(&ctx.sessions, &ctx.stop.flag, id.clone(), session)
@@ -327,6 +355,7 @@ fn respawn_now(plugin: LoadedPlugin, ctx: &RespawnCtx) {
                     }
                     return;
                 }
+                session_gen = Some(generation);
                 Some(writer)
             }
             Err(error) => {
@@ -347,6 +376,7 @@ fn respawn_now(plugin: LoadedPlugin, ctx: &RespawnCtx) {
     let admitted = writer.is_some();
     if let Err(error) = ctx.tx.send(PluginMsg::Respawned {
         plugin: id.clone(),
+        session: session_gen,
         writer,
     }) {
         tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "plugin loop is gone before respawn publish; closing the respawned session");
@@ -745,7 +775,8 @@ fn spawn_session(
     env: &BTreeMap<String, String>,
     tx: &PluginTx,
     waker: &TerminalWaker,
-) -> Result<ResidentSession, PluginError> {
+) -> Result<(ResidentSession, SessionGen), PluginError> {
+    let generation = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let id = plugin.spec.manifest.id.as_str().to_string();
     let tx = tx.clone();
     let waker = waker.clone();
@@ -758,12 +789,13 @@ fn spawn_session(
         plugin.effective_cwd().as_deref(),
         move |event| {
             // best-effort: the loop may be gone during shutdown.
-            let (_, should_wake) = tx.inbox.push_with_wake(id.clone(), event);
+            let (_, should_wake) = tx.inbox.push_with_wake(id.clone(), generation, event);
             if should_wake && let Err(error) = waker.wake() {
                 tracing::debug!(target: "thegn::plugin", plugin = %id, %error, "session event waker pulse failed");
             }
         },
     )
+    .map(|session| (session, generation))
 }
 
 /// One one-shot run to start on a poll worker: an initial run or a due scheduled poll.
@@ -1064,7 +1096,7 @@ fn setup_and_schedule_with_waker(
                 continue;
             }
         };
-        let writer = match plugin.spec.mode {
+        let (writer, session_gen) = match plugin.spec.mode {
             PluginMode::Resident => match spawn_session(
                 &supervisor,
                 &plugin,
@@ -1072,29 +1104,30 @@ fn setup_and_schedule_with_waker(
                 &tx,
                 waker.as_ref().expect("runtime setup has a terminal waker"),
             ) {
-                Ok(session) => {
+                Ok((session, generation)) => {
                     let w = session.writer();
                     if let Err(session) =
                         admit_unless_stopped(&sessions, &stop.flag, id.clone(), session)
                     {
                         session.kill();
-                        None
+                        (None, None)
                     } else {
                         registered.push(id.clone());
-                        Some(w)
+                        (Some(w), Some(generation))
                     }
                 }
                 Err(e) => {
                     tracing::warn!(target: "thegn::plugin", plugin = %id, error = %e, "resident session failed to spawn");
-                    None
+                    (None, None)
                 }
             },
-            PluginMode::OneShot => None,
+            PluginMode::OneShot => (None, None),
         };
         resolved_envs.insert(id.clone(), env);
         loaded.push(LoadedState {
             plugin,
             negotiated,
+            session: session_gen,
             writer,
         });
     }
@@ -1583,6 +1616,7 @@ mod tests {
                 ..Default::default()
             },
             writer: None,
+            session: None,
         }
     }
 

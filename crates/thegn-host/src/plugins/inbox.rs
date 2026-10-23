@@ -4,6 +4,8 @@ use std::sync::{Mutex, MutexGuard};
 use thegn_core::plugin_api::RpcMessage;
 use thegn_svc::plugin::SessionEvent;
 
+use super::SessionGen;
+
 pub(crate) const MAX_QUEUED_EVENTS_PER_PLUGIN: usize = 1024;
 pub(crate) const MAX_QUEUED_EVENTS_TOTAL: usize = 8192;
 
@@ -25,18 +27,21 @@ pub(crate) struct PluginInboxCounts {
 #[derive(Debug, Clone)]
 pub(crate) struct RejectedRequest {
     pub plugin: String,
+    pub session: SessionGen,
     pub id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CoalesceKey {
     plugin: String,
+    session: SessionGen,
     method: String,
     target: String,
 }
 
 struct QueuedEvent {
     plugin: String,
+    session: SessionGen,
     event: SessionEvent,
     sequence: u64,
     key: Option<CoalesceKey>,
@@ -59,18 +64,24 @@ pub(crate) struct PluginInbox {
 }
 
 impl PluginInbox {
-    pub(crate) fn push(&self, plugin: String, event: SessionEvent) -> PushOutcome {
-        self.push_with_wake(plugin, event).0
+    pub(crate) fn push(
+        &self,
+        plugin: String,
+        session: SessionGen,
+        event: SessionEvent,
+    ) -> PushOutcome {
+        self.push_with_wake(plugin, session, event).0
     }
 
     pub(crate) fn push_with_wake(
         &self,
         plugin: String,
+        session: SessionGen,
         event: SessionEvent,
     ) -> (PushOutcome, bool) {
         let mut state = lock(&self.state);
         let was_empty = state.plugin_counts.get(&plugin).copied().unwrap_or(0) == 0;
-        let key = coalesce_key(&plugin, &event);
+        let key = coalesce_key(&plugin, session, &event);
         let mut replaced = false;
         if let Some(key) = &key
             && let Some(sequence) = state.coalesced.remove(key)
@@ -106,6 +117,7 @@ impl PluginInbox {
                 {
                     state.rejected.push_back(RejectedRequest {
                         plugin: plugin.clone(),
+                        session,
                         id,
                     });
                     *state
@@ -135,6 +147,7 @@ impl PluginInbox {
         }
         state.queue.push_back(QueuedEvent {
             plugin: plugin.clone(),
+            session,
             event,
             sequence,
             key,
@@ -150,7 +163,7 @@ impl PluginInbox {
         )
     }
 
-    pub(crate) fn pop(&self) -> Option<(String, SessionEvent)> {
+    pub(crate) fn pop(&self) -> Option<(String, SessionGen, SessionEvent)> {
         let mut state = lock(&self.state);
         let queued = state.queue.pop_front()?;
         decrement(&mut state.plugin_counts, &queued.plugin);
@@ -159,13 +172,13 @@ impl PluginInbox {
         {
             state.coalesced.remove(&key);
         }
-        Some((queued.plugin, queued.event))
+        Some((queued.plugin, queued.session, queued.event))
     }
 
     /// Exits participate in session lifecycle ordering even though ordinary
     /// session events use the bounded inbox. Drain them before lifecycle
     /// control messages such as `Respawned` from the separate channel.
-    pub(crate) fn pop_exit(&self) -> Option<(String, SessionEvent)> {
+    pub(crate) fn pop_exit(&self) -> Option<(String, SessionGen, SessionEvent)> {
         let mut state = lock(&self.state);
         let position = state
             .queue
@@ -178,7 +191,7 @@ impl PluginInbox {
         {
             state.coalesced.remove(&key);
         }
-        Some((queued.plugin, queued.event))
+        Some((queued.plugin, queued.session, queued.event))
     }
 
     pub(crate) fn pop_rejected(&self) -> Option<RejectedRequest> {
@@ -203,7 +216,7 @@ impl PluginInbox {
     }
 }
 
-fn coalesce_key(plugin: &str, event: &SessionEvent) -> Option<CoalesceKey> {
+fn coalesce_key(plugin: &str, session: SessionGen, event: &SessionEvent) -> Option<CoalesceKey> {
     let SessionEvent::Message(message) = event else {
         return None;
     };
@@ -217,6 +230,7 @@ fn coalesce_key(plugin: &str, event: &SessionEvent) -> Option<CoalesceKey> {
     };
     Some(CoalesceKey {
         plugin: plugin.to_string(),
+        session,
         method: message.method.clone(),
         target: target.to_string(),
     })
@@ -274,16 +288,18 @@ mod tests {
         for index in 0..10_000 {
             inbox.push(
                 "p".into(),
+                1,
                 update(Some("seg"), &format!("seg-{index}"), None),
             );
             inbox.push(
                 "p".into(),
+                1,
                 update(Some("other"), &format!("other-{index}"), None),
             );
         }
         assert_eq!(inbox.len(), 2);
-        let (_, first) = inbox.pop().unwrap();
-        let (_, second) = inbox.pop().unwrap();
+        let (_, _, first) = inbox.pop().unwrap();
+        let (_, _, second) = inbox.pop().unwrap();
         assert!(
             matches!(first, SessionEvent::Message(message) if message.params["view"]["spans"][0]["text"] == "seg-9999")
         );
@@ -295,22 +311,22 @@ mod tests {
     #[test]
     fn coalesced_update_moves_after_intervening_register() {
         let inbox = PluginInbox::default();
-        inbox.push("p".into(), update(Some("s1"), "v1", None));
-        inbox.push("p".into(), register());
-        inbox.push("p".into(), update(Some("s1"), "v2", None));
+        inbox.push("p".into(), 1, update(Some("s1"), "v1", None));
+        inbox.push("p".into(), 1, register());
+        inbox.push("p".into(), 1, update(Some("s1"), "v2", None));
         assert!(
-            matches!(inbox.pop().unwrap().1, SessionEvent::Message(RpcMessage { method, .. }) if method == "register")
+            matches!(inbox.pop().unwrap().2, SessionEvent::Message(RpcMessage { method, .. }) if method == "register")
         );
         assert!(
-            matches!(inbox.pop().unwrap().1, SessionEvent::Message(message) if message.params["view"]["spans"][0]["text"] == "v2")
+            matches!(inbox.pop().unwrap().2, SessionEvent::Message(message) if message.params["view"]["spans"][0]["text"] == "v2")
         );
     }
 
     #[test]
     fn requests_are_never_coalesced() {
         let inbox = PluginInbox::default();
-        inbox.push("p".into(), update(Some("seg"), "v1", Some(1)));
-        inbox.push("p".into(), update(Some("seg"), "v2", Some(2)));
+        inbox.push("p".into(), 1, update(Some("seg"), "v1", Some(1)));
+        inbox.push("p".into(), 1, update(Some("seg"), "v2", Some(2)));
         assert_eq!(inbox.len(), 2);
     }
 
@@ -320,6 +336,7 @@ mod tests {
         for _ in 0..MAX_QUEUED_EVENTS_PER_PLUGIN {
             inbox.push(
                 "p".into(),
+                1,
                 SessionEvent::Message(RpcMessage {
                     id: None,
                     method: "emit".into(),
@@ -330,6 +347,7 @@ mod tests {
         assert_eq!(
             inbox.push(
                 "p".into(),
+                1,
                 SessionEvent::Message(RpcMessage {
                     id: None,
                     method: "emit".into(),
@@ -341,6 +359,7 @@ mod tests {
         assert_eq!(
             inbox.push(
                 "p".into(),
+                1,
                 SessionEvent::Message(RpcMessage {
                     id: Some(42),
                     method: "io".into(),
@@ -351,17 +370,52 @@ mod tests {
         );
         assert_eq!(inbox.pop_rejected().unwrap().id, 42);
         assert_eq!(
-            inbox.push("p".into(), SessionEvent::Exit { code: None }),
+            inbox.push("p".into(), 1, SessionEvent::Exit { code: None }),
             PushOutcome::Queued
         );
-        assert_eq!(inbox.push("q".into(), register()), PushOutcome::Queued);
+        assert_eq!(inbox.push("q".into(), 1, register()), PushOutcome::Queued);
     }
 
     #[test]
     fn missing_target_is_not_coalesced() {
         let inbox = PluginInbox::default();
-        inbox.push("p".into(), update(None, "a", None));
-        inbox.push("p".into(), update(None, "b", None));
+        inbox.push("p".into(), 1, update(None, "a", None));
+        inbox.push("p".into(), 1, update(None, "b", None));
         assert_eq!(inbox.len(), 2);
+    }
+
+    #[test]
+    fn session_coalescing_never_merges_two_sessions() {
+        let inbox = PluginInbox::default();
+        inbox.push("p".into(), 1, update(Some("seg"), "old", None));
+        inbox.push("p".into(), 2, update(Some("seg"), "new", None));
+
+        assert_eq!(inbox.len(), 2);
+        let (first_plugin, first_session, first_event) = inbox.pop().unwrap();
+        let (second_plugin, second_session, second_event) = inbox.pop().unwrap();
+        assert_eq!((first_plugin.as_str(), first_session), ("p", 1));
+        assert_eq!((second_plugin.as_str(), second_session), ("p", 2));
+        assert!(
+            matches!(first_event, SessionEvent::Message(message) if message.params["view"]["spans"][0]["text"] == "old")
+        );
+        assert!(
+            matches!(second_event, SessionEvent::Message(message) if message.params["view"]["spans"][0]["text"] == "new")
+        );
+    }
+
+    #[test]
+    fn session_is_returned_by_pop_and_pop_exit() {
+        let inbox = PluginInbox::default();
+        inbox.push("p".into(), 7, register());
+        inbox.push("p".into(), 9, SessionEvent::Exit { code: Some(3) });
+
+        let (plugin, session, event) = inbox.pop_exit().unwrap();
+        assert_eq!((plugin.as_str(), session), ("p", 9));
+        assert!(matches!(event, SessionEvent::Exit { code: Some(3) }));
+        let (plugin, session, event) = inbox.pop().unwrap();
+        assert_eq!((plugin.as_str(), session), ("p", 7));
+        assert!(
+            matches!(event, SessionEvent::Message(RpcMessage { method, .. }) if method == "register")
+        );
     }
 }
