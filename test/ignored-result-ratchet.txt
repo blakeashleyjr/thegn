@@ -425,6 +425,5 @@ crates/thegn-host/src/mise_provider.rs
 # anything is being ignored.
 crates/thegn-host/src/cmd/automations.rs
 crates/thegn-host/src/platform/mod.rs
-crates/thegn-svc/src/git/submodule.rs
 # git_config_heal.rs (THE-371): best-effort lock-file cleanup on failure paths and a post-rename directory fsync; the original config is intact either way.
 crates/thegn-core/src/git_config_heal.rs
