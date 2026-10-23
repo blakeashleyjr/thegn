@@ -115,6 +115,54 @@ pub(crate) struct CiReader<'a> {
         &'a std::collections::HashMap<String, crate::worktree_snapshot::BranchObservation>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CachedCiSignals {
+    failing: bool,
+    running: bool,
+    episode: attention::Episode,
+    since: Option<i64>,
+}
+
+/// The newest run with a valid id decides. A cached failure counts as the
+/// last-known-good signal; cached Running/Pending counts only while the
+/// worktree's CI refresh is healthy, because a failing refresh has no live
+/// result backing it.
+fn cached_ci_signals(
+    cache: Option<&thegn_core::ci::CiRunCache>,
+    refresh_failing: bool,
+) -> CachedCiSignals {
+    let Some(latest) = cache.and_then(|cache| {
+        cache
+            .runs
+            .iter()
+            .find(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
+    }) else {
+        return CachedCiSignals::default();
+    };
+
+    // Identity + honest start time for the run, so an acknowledgement is
+    // released by the *next* run rather than by cache churn or a restart.
+    // Prefer the provider's run id; fall back to the commit sha.
+    let key = if latest.id.is_empty() {
+        &latest.sha
+    } else {
+        &latest.id
+    };
+    CachedCiSignals {
+        failing: latest.state.is_failure(),
+        running: !refresh_failing
+            && matches!(
+                latest.state,
+                thegn_core::ci::CiState::Running | thegn_core::ci::CiState::Pending
+            ),
+        episode: attention::episode_of(key),
+        since: latest
+            .started_at
+            .as_deref()
+            .and_then(thegn_core::ci::epoch_secs),
+    }
+}
+
 /// Compute `status.attention` / `attention_ranks` / `workspace_attention` for
 /// every registered + live worktree. All inputs are cheap DB/snapshot reads;
 /// the branching lives in `thegn_core::attention::score`.
@@ -362,8 +410,6 @@ fn collect_attention_inner(
             _ => (ActivityKind::None, None),
         };
         // Latest cached CI run (newest first in the cache), last-known-good.
-        let (mut ci_failing, mut ci_running) = (false, false);
-        let (mut ci_episode, mut ci_since) = (0u64, None);
         let cache =
             match ci {
                 Some(ci) => db.get_ci_cache_entry(path).ok().flatten().and_then(
@@ -392,31 +438,12 @@ fn collect_attention_inner(
                     .flatten()
                     .and_then(|(json, _)| thegn_core::ci::decode_run_cache(&json)),
             };
-        if let Some(cache) = cache
-            && let Some(latest) = cache
-                .runs
-                .iter()
-                .find(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok())
-        {
-            ci_failing = latest.state.is_failure();
-            ci_running = matches!(
-                latest.state,
-                thegn_core::ci::CiState::Running | thegn_core::ci::CiState::Pending
-            );
-            // Identity + honest start time for the run, so an acknowledgement is
-            // released by the *next* run rather than by cache churn or a restart.
-            // Prefer the provider's run id; fall back to the commit sha.
-            let key = if latest.id.is_empty() {
-                &latest.sha
-            } else {
-                &latest.id
-            };
-            ci_episode = attention::episode_of(key);
-            ci_since = latest
-                .started_at
-                .as_deref()
-                .and_then(thegn_core::ci::epoch_secs);
-        }
+        let refresh_failing = crate::ci_refresh::note_for(path).is_some();
+        let ci_signals = cached_ci_signals(cache.as_ref(), refresh_failing);
+        let ci_failing = ci_signals.failing;
+        let ci_running = ci_signals.running;
+        let ci_episode = ci_signals.episode;
+        let ci_since = ci_signals.since;
         // A real agent is bound iff `status.agent` has a non-shell entry: the
         // map is already tool-filtered in `hydrate` (yazi/lazygit/… skipped via
         // `tool_command`), so only the `"shell"`/`"local"` default sentinels
@@ -1334,5 +1361,78 @@ mod tests {
             status.attention["/wt/blocked"].reason,
             thegn_core::attention::AttentionReason::AgentNeedsInput
         );
+    }
+
+    fn cached_ci_run(state: thegn_core::ci::CiState) -> thegn_core::ci::CiRunCache {
+        thegn_core::ci::CiRunCache {
+            runs: vec![thegn_core::ci::CiRun {
+                id: "101".into(),
+                state,
+                started_at: Some("2026-06-25T10:00:00Z".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cached_ci_running_is_live_while_refresh_is_healthy() {
+        let signals = cached_ci_signals(
+            Some(&cached_ci_run(thegn_core::ci::CiState::Running)),
+            false,
+        );
+
+        assert!(signals.running);
+    }
+
+    #[test]
+    fn cached_ci_running_is_not_live_when_refresh_is_failing() {
+        for state in [
+            thegn_core::ci::CiState::Running,
+            thegn_core::ci::CiState::Pending,
+        ] {
+            let signals = cached_ci_signals(Some(&cached_ci_run(state)), true);
+
+            assert!(!signals.running);
+            assert!(!signals.failing);
+            assert_eq!(signals.episode, thegn_core::attention::episode_of("101"));
+        }
+    }
+
+    #[test]
+    fn cached_ci_failure_still_scores_when_refresh_is_failing() {
+        let signals = cached_ci_signals(Some(&cached_ci_run(thegn_core::ci::CiState::Fail)), true);
+
+        assert!(signals.failing);
+        assert_eq!(
+            signals.since,
+            thegn_core::ci::epoch_secs("2026-06-25T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn cached_ci_signals_skip_invalid_ids_and_empty_cache() {
+        assert_eq!(cached_ci_signals(None, false), CachedCiSignals::default());
+
+        let cache = thegn_core::ci::CiRunCache {
+            runs: vec![
+                thegn_core::ci::CiRun {
+                    id: "1 ".into(),
+                    state: thegn_core::ci::CiState::Fail,
+                    ..Default::default()
+                },
+                thegn_core::ci::CiRun {
+                    id: "102".into(),
+                    state: thegn_core::ci::CiState::Running,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let signals = cached_ci_signals(Some(&cache), false);
+
+        assert!(signals.running);
+        assert!(!signals.failing);
+        assert_eq!(signals.episode, thegn_core::attention::episode_of("102"));
     }
 }
