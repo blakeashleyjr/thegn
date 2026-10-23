@@ -1408,25 +1408,34 @@ pub fn install_shutdown_signal(flag: Arc<AtomicBool>, waker: termwiz::terminal::
     });
 }
 
-/// Daemon shutdown: notify `shutdown` on Ctrl+C / console close / system
-/// shutdown — the same graceful path as the shutdown RPC. Must be called
-/// inside a tokio runtime.
-pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
-    tokio::spawn(async move {
-        use tokio::signal::windows;
-        let (Ok(mut ctrl_c), Ok(mut close), Ok(mut shut)) = (
-            windows::ctrl_c(),
-            windows::ctrl_close(),
-            windows::ctrl_shutdown(),
-        ) else {
-            return;
-        };
-        tokio::select! {
-            _ = ctrl_c.recv() => {}
-            _ = close.recv() => {}
-            _ = shut.recv() => {}
+/// Register daemon console-control events synchronously before the pipe bind.
+pub fn register_shutdown_signal() -> impl std::future::Future<Output = ()> + Send {
+    let events = (
+        tokio::signal::windows::ctrl_c(),
+        tokio::signal::windows::ctrl_close(),
+        tokio::signal::windows::ctrl_shutdown(),
+    );
+    async move {
+        if let (Ok(mut ctrl_c), Ok(mut close), Ok(mut shut)) = events {
+            tokio::select! {
+                _ = ctrl_c.recv() => {}
+                _ = close.recv() => {}
+                _ = shut.recv() => {}
+            }
+        } else {
+            std::future::pending::<()>().await;
         }
-        shutdown.notify_waiters();
+    }
+}
+
+/// Forward a registered console-control event to the daemon shutdown token.
+pub fn spawn_shutdown_notifier(
+    shutdown: tokio_util::sync::CancellationToken,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        signal.await;
+        shutdown.cancel();
     });
 }
 

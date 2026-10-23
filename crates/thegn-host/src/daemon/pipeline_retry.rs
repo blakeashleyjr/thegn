@@ -863,7 +863,7 @@ mod tests {
             db: Arc::new(Mutex::new(Db::open_memory().expect("db"))),
             grace_ms: 0,
             idle_tx,
-            shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             config: Arc::new(config),
             profile_root: profile.path().to_path_buf(),
             endpoint: "/tmp/test.sock".into(),
