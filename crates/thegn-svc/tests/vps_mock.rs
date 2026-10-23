@@ -249,6 +249,13 @@ fn create_list_destroy_round_trip_with_ledger() {
         "registers OUR key: {}",
         key_create.body
     );
+    assert!(
+        key_create
+            .body
+            .contains("thegn-managed-ef034764f5154129dbb127b9c94ec413"),
+        "vendor key name: {}",
+        key_create.body
+    );
     let create = &reqs[2];
     assert_eq!(
         (create.method.as_str(), create.path.as_str()),
