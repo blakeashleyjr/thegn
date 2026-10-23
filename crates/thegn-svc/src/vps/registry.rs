@@ -499,8 +499,44 @@ fn read_in(root: &thegn_core::fsperm::PrivateDir, name: &str) -> Option<VpsRecor
     (rec.name == name).then_some(rec)
 }
 
+/// Lenient read for display and tests; lifecycle decisions use [`read_checked`].
 pub fn read(name: &str) -> Option<VpsRecord> {
     read_at(&dir(), name)
+}
+
+/// Read one ledger record without treating corruption or inaccessible state as absence.
+pub fn read_checked_at(d: &Path, name: &str) -> Result<Option<VpsRecord>> {
+    checked_name(name)?;
+    let Some(root) = open_root(d, false).context(
+        "vps registry: registry root is not an owned real directory; refusing to read the ledger",
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let mut file = match root.open_regular_nofollow(&format!("{name}.json")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("vps registry: ledger record {name} is unreadable"));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("vps registry: ledger record {name} is unreadable"))?;
+    let record: VpsRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("vps registry: ledger record {name} is malformed"))?;
+    anyhow::ensure!(
+        record.name == name,
+        "vps registry: ledger record {name}.json names another instance"
+    );
+    Ok(Some(record))
+}
+
+/// Read the process-local VPS record, refusing an unreadable ledger entry.
+pub fn read_checked(name: &str) -> Result<Option<VpsRecord>> {
+    read_checked_at(&dir(), name)
 }
 
 /// Remove a record (and the instance's known_hosts pin). Idempotent.
@@ -636,6 +672,78 @@ mod tests {
             owner: String::new(),
             account: String::new(),
         }
+    }
+
+    #[test]
+    fn read_checked_absent_root_and_absent_record_are_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert_eq!(read_checked_at(&missing, "x").unwrap(), None);
+
+        std::fs::create_dir(&missing).unwrap();
+        assert_eq!(read_checked_at(&missing, "x").unwrap(), None);
+    }
+
+    #[test]
+    fn read_checked_returns_a_valid_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = rec("a", "ready");
+        write_at(tmp.path(), &record).unwrap();
+
+        assert_eq!(read_checked_at(tmp.path(), "a").unwrap(), Some(record));
+    }
+
+    #[test]
+    fn read_checked_refuses_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.json"), b"not json").unwrap();
+
+        let error = read_checked_at(tmp.path(), "a").unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"));
+        assert!(read_at(tmp.path(), "a").is_none());
+    }
+
+    #[test]
+    fn read_checked_refuses_a_record_naming_another_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("b.json"),
+            serde_json::to_vec(&rec("c", "ready")).unwrap(),
+        )
+        .unwrap();
+
+        let error = read_checked_at(tmp.path(), "b").unwrap_err();
+        assert!(format!("{error:#}").contains("another instance"));
+    }
+
+    #[test]
+    fn read_checked_refuses_a_directory_in_place_of_the_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("a.json")).unwrap();
+
+        let error = read_checked_at(tmp.path(), "a").unwrap_err();
+        assert!(format!("{error:#}").contains("unreadable"));
+    }
+
+    #[test]
+    fn read_checked_refuses_a_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        write_at(&real, &rec("a", "ready")).unwrap();
+        if let Err(error) = thegn_core::fsperm::create_symlink(&real, &link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("could not create test symlink: {error}");
+        }
+
+        let error = read_checked_at(&link, "a").unwrap_err();
+        assert!(format!("{error:#}").contains("registry root"));
     }
 
     #[test]
