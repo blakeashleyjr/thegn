@@ -440,8 +440,6 @@ fn restore_snapshot_id(
     hibernation_enabled: bool,
     read: anyhow::Result<Option<HibernationRow>>,
 ) -> anyhow::Result<Option<String>> {
-    use anyhow::Context as _;
-
     match read {
         Ok(Some(row)) if row.state != "capturing" && !row.snapshot_id.is_empty() => {
             Ok(Some(row.snapshot_id))
@@ -457,10 +455,9 @@ fn restore_snapshot_id(
     }
 }
 
-/// If `worktree` has a restorable hibernation row, flip it to `restoring` and
-/// return the snapshot id the provision plan should overlay. `capturing`
-/// rows are not restorable (their snapshot never verified). An unreadable
-/// record is an error while hibernation is enabled for this environment.
+/// Read the snapshot id the provision plan should overlay. `capturing` rows
+/// are not restorable (their snapshot never verified). An unreadable record
+/// is an error while hibernation is enabled for this environment.
 pub(crate) fn begin_restore(
     worktree: &str,
     hibernation_enabled: bool,
@@ -470,13 +467,22 @@ pub(crate) fn begin_restore(
         Ok(db) => db.hibernation_for(worktree),
         Err(error) => Err(anyhow::anyhow!("open the state DB: {error:#}")),
     };
-    let snapshot = restore_snapshot_id(worktree, hibernation_enabled, read)?;
-    if snapshot.is_some()
-        && let Ok(db) = &db
-    {
-        let _ = db.set_hibernation_state(worktree, "restoring", None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    restore_snapshot_id(worktree, hibernation_enabled, read)
+}
+
+/// Mark a worktree as restoring once its restore plan is actually being built.
+/// This is a best-effort cache write; git/forge stays the source of truth.
+pub(crate) fn mark_restoring(worktree: &str) {
+    match thegn_core::db::Db::open() {
+        Ok(db) => {
+            if let Err(error) = db.set_hibernation_state(worktree, "restoring", None) {
+                tracing::debug!(target: "thegn::hibernate", worktree = %worktree, error = %format!("{error:#}"), "could not mark hibernation record as restoring");
+            }
+        }
+        Err(error) => {
+            tracing::debug!(target: "thegn::hibernate", worktree = %worktree, error = %format!("{error:#}"), "could not open state DB to mark hibernation record as restoring");
+        }
     }
-    Ok(snapshot)
 }
 
 /// Apply the `snapshot_restore` plan step: fetch the snapshot's artifacts from

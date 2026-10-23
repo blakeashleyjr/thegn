@@ -2678,6 +2678,9 @@ pub fn provision_provider_env_named(
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|b| !b.is_empty() && b != "HEAD")
     };
+    if snapshot_restore.is_some() {
+        crate::hibernator::mark_restoring(worktree);
+    }
     let opts = PlanOpts {
         workdir: workdir.clone(),
         origin: local_origin(&repo_root),
