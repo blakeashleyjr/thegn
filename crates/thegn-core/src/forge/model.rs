@@ -44,6 +44,15 @@ impl ReviewState {
             ReviewState::Comment => "--comment",
         }
     }
+
+    /// GitHub REST API event corresponding to this review state.
+    pub fn api_event(self) -> &'static str {
+        match self {
+            ReviewState::Approve => "APPROVE",
+            ReviewState::RequestChanges => "REQUEST_CHANGES",
+            ReviewState::Comment => "COMMENT",
+        }
+    }
 }
 
 /// The full panel feed for one worktree (flattened state + metadata).
