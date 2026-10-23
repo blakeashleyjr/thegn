@@ -3966,7 +3966,7 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # auto_provision = false                # create the VM on first open if missing
 # # auto_checkpoint = false               # snapshot (machine0 images) on worktree close
 # # max_instances = 5                     # hard cap on concurrently-managed VMs
-# # max_lifetime_secs = 0                 # reaper ceiling (0 = off)
+# # max_lifetime_secs = 0                 # NOT enforced for machine0 (no lifetime reaper; `config validate` warns)
 # # Wired axes: FILE-SYNC (`data = "sync"` over ssh), SNAPSHOT (`thegn env snapshot`
 # # → machine0 images; restore recreates from the image), SCALE-TO-ZERO (idle
 # # suspend). NOT available: native WSS exec / egress translation (the pane is ssh).
