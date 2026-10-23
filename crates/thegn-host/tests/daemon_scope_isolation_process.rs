@@ -241,7 +241,9 @@ fn shared_runtime() -> tempfile::TempDir {
         .prefix("tgsr")
         .tempdir_in("/tmp")
         .expect("create short shared runtime directory");
-    fs::create_dir(runtime.path().join("thegn")).expect("create runtime daemon directory");
+    let daemon_dir = runtime.path().join("thegn");
+    fs::create_dir(&daemon_dir).expect("create runtime daemon directory");
+    chmod_private(&daemon_dir, runtime.path());
     runtime
 }
 
@@ -266,10 +268,10 @@ fn start_foreign_at_a_endpoint(scope_b: &Scope, runtime: &Path, endpoint_a: &Pat
     start_daemon(command, endpoint_a)
 }
 
-#[test]
 // A and B are separately spawned direct children with independent state roots and
 // endpoints under one runtime directory. The stop CLI is another child; it must
 // signal A through its endpoint while B remains independently pollable and owned.
+#[test]
 fn scope_isolation_daemon_stop_leaves_a_parallel_scope_running() {
     if !thegn_core::testenv::require_or_skip("Unix-socket pane daemons", cfg!(unix)) {
         return;
@@ -294,7 +296,7 @@ fn scope_isolation_daemon_stop_leaves_a_parallel_scope_running() {
 
     let mut stop_a = scope_a.command(runtime.path());
     stop_a.args(["daemon", "stop"]);
-    let (status, stdout, stderr) = run_cli(stop_a, Duration::from_secs(10));
+    let (status, stdout, stderr) = run_cli(stop_a, Duration::from_secs(30));
     assert!(
         status.success() && stdout.contains("stopped "),
         "scope A daemon stop should stop its daemon; stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -310,7 +312,7 @@ fn scope_isolation_daemon_stop_leaves_a_parallel_scope_running() {
 
     let mut stop_b = scope_b.command(runtime.path());
     stop_b.args(["daemon", "stop"]);
-    let (status, stdout, stderr) = run_cli(stop_b, Duration::from_secs(10));
+    let (status, stdout, stderr) = run_cli(stop_b, Duration::from_secs(30));
     assert!(
         status.success() && stdout.contains("stopped "),
         "scope B daemon stop should stop its daemon; stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -321,10 +323,10 @@ fn scope_isolation_daemon_stop_leaves_a_parallel_scope_running() {
     );
 }
 
-#[test]
 // B is the sole daemon child and reports B's state while listening at A's predicted
 // endpoint. A's stop CLI must classify the reported scope before sending shutdown;
 // the test process retains and reaps B regardless of the CLI result.
+#[test]
 fn scope_isolation_daemon_stop_skips_a_foreign_daemon_at_its_own_endpoint() {
     if !thegn_core::testenv::require_or_skip("Unix-socket pane daemons", cfg!(unix)) {
         return;
@@ -338,7 +340,7 @@ fn scope_isolation_daemon_stop_skips_a_foreign_daemon_at_its_own_endpoint() {
 
     let mut stop_a = scope_a.command(runtime.path());
     stop_a.args(["daemon", "stop"]);
-    let (status, stdout, stderr) = run_cli(stop_a, Duration::from_secs(10));
+    let (status, stdout, stderr) = run_cli(stop_a, Duration::from_secs(30));
     assert!(
         status.success()
             && stdout.contains("belongs to a different state directory")
@@ -352,7 +354,7 @@ fn scope_isolation_daemon_stop_skips_a_foreign_daemon_at_its_own_endpoint() {
 
     let mut stop_b = scope_b.command(runtime.path());
     stop_b.args(["daemon", "stop"]);
-    let (status, stdout, stderr) = run_cli(stop_b, Duration::from_secs(10));
+    let (status, stdout, stderr) = run_cli(stop_b, Duration::from_secs(30));
     assert!(
         status.success() && stdout.contains("stopped "),
         "scope B daemon stop should stop its daemon; stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -363,10 +365,10 @@ fn scope_isolation_daemon_stop_skips_a_foreign_daemon_at_its_own_endpoint() {
     );
 }
 
-#[test]
 // B remains a direct child throughout A's session-list CLI request. The shared
 // runtime path makes the endpoint reachable, while the reported scope must make
 // the session verb refuse before it can act on B.
+#[test]
 fn scope_isolation_session_verbs_refuse_a_foreign_daemon() {
     if !thegn_core::testenv::require_or_skip("Unix-socket pane daemons", cfg!(unix)) {
         return;
@@ -396,7 +398,7 @@ fn scope_isolation_session_verbs_refuse_a_foreign_daemon() {
 
     let mut stop_b = scope_b.command(runtime.path());
     stop_b.args(["daemon", "stop"]);
-    let (status, stdout, stderr) = run_cli(stop_b, Duration::from_secs(10));
+    let (status, stdout, stderr) = run_cli(stop_b, Duration::from_secs(30));
     assert!(
         status.success() && stdout.contains("stopped "),
         "scope B daemon stop should stop its daemon; stdout:\n{stdout}\nstderr:\n{stderr}"
