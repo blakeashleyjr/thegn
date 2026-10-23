@@ -80,6 +80,8 @@ the reason; use `thegn land` to land that branch outside the queue.
   The row also records which repository and Git worktree registration the path
   belonged to; if the worktree is gone, now belongs to another repository, or
   has a different registration, the row is held the same way before any fold.
+  A row queued by an older thegn that did not record this identity is held the
+  same way until `thegn merge add` re-enqueues it.
   A worktree re-created at the same path in the same repository reuses its
   registration and is caught only by the branch-tip check above.
 - If a fixing agent does not start, the row is held `agent_blocked` with no
@@ -87,9 +89,11 @@ the reason; use `thegn land` to land that branch outside the queue.
 - If Git cannot read the queued branch or fixer's checkout during a drain, the
   row is held `agent_blocked` with a `candidate unreadable:` reason and Git's
   error, without spending an attempt. Retry it once Git is readable.
-- `thegn merge clear` removes unclaimed rows. Rows held by an active drain
-  stay queued, are named in the error, and require another clear after the
-  drain finishes.
+- When a drain holds a row, `thegn merge add` (re-enqueue) and `thegn merge rm`
+  refuse and name the drain; `thegn merge retry` and `thegn merge land` refuse;
+  `thegn merge clear` removes unclaimed rows, names kept claimed rows, and exits
+  non-zero; deleting the worktree keeps its row. The control API answers
+  `conflict` for a local row's claimed-row refusal on add and clear.
 - An unrecognised stored queue status is shown as such and has no land or
   retry key.
 - `thegn land` and `thegn integrate` can finish a land while an active drain

@@ -557,6 +557,7 @@ pub async fn main(
     // logging or report writing, so the terminal is always left usable. The
     // swap-once guard means hook and normal teardown never double-run it; it is
     // cleared in teardown below.
+    let raw_restore_owned = term_restore.is_some();
     if let Some(r) = term_restore {
         let r = std::sync::Arc::new(r);
         thegn_core::log_trace::register_panic_restore(move || r.restore());
@@ -717,12 +718,11 @@ pub async fn main(
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
-    if let Some(dir) = crate::daemon::socket_path(&cfg.daemon)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        thegn_core::sandbox_control_guard::publish_control_socket_dir(dir.to_path_buf());
-    }
+    let control_socket = crate::daemon::socket_path(&cfg.daemon);
+    tokio::task::spawn_blocking(move || {
+        crate::daemon::control_publish::publish_for_socket(&control_socket);
+    })
+    .await?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // The refresh channel is created HERE rather than at the ticker spawn below
@@ -1328,7 +1328,7 @@ pub async fn main(
         // no-op in the kitty spec, and it is defensive against an inner app
         // that pushed flags and died without popping them. Leave the bytes.
         let outcome = crate::frame_writer::write_terminal_teardown(
-            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h",
+            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l\x1b[?2004l",
         );
         if outcome != crate::frame_writer::TeardownWrite::Written {
             tracing::warn!(
@@ -1341,11 +1341,10 @@ pub async fn main(
     // Share the one restore path with the panic hook behind the swap-once guard:
     // if a panic already restored the terminal this is a no-op, and once this
     // runs a later panic-in-Drop won't double-restore. Then clear the callback
-    // (we no longer own the screen) before termwiz tears the buffer down.
+    // before releasing termwiz; the raw restore owns teardown when available.
     thegn_core::log_trace::run_panic_restore_once();
     thegn_core::log_trace::clear_panic_restore();
-    let _ = buf.terminal().exit_alternate_screen(); // best-effort: terminal teardown: the tty restores itself when the process drops
-    let _ = buf.terminal().set_cooked_mode(); // best-effort: terminal teardown: the tty restores itself when the process drops
+    crate::frame_write::release_terminal(buf, raw_restore_owned);
     // Frame is torn down; branded `msg::*` may print to stderr again.
     thegn_core::msg::set_tui_active(false);
     result
@@ -22454,42 +22453,40 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Share => {
-                                            // Enter copies the focused endpoint as data.
-                                            if let Some(url) = model
-                                                .shares
-                                                .get(panel_ui.cursor)
-                                                .and_then(crate::share::ShareView::copy_value)
+                                            if let Some(decision) =
+                                                crate::handlers::share_panel::share_enter(
+                                                    &model.shares,
+                                                    panel_ui.cursor,
+                                                )
                                             {
-                                                pending_clipboard_oob
-                                                    .offer(crate::copymode::osc52(&url), |bytes| {
-                                                        writer.try_submit_host_clipboard(bytes)
-                                                    });
-                                                model.status = match crate::clipboard::copy(&url) {
-                                                    Ok(()) => "Copying link to clipboard…".into(),
-                                                    Err(error) => {
-                                                        format!("Clipboard copy failed: {error}")
+                                                match decision {
+                                                    crate::handlers::share_panel::ShareEnter::Copy(
+                                                        url,
+                                                    ) => {
+                                                        pending_clipboard_oob.offer(
+                                                            crate::copymode::osc52(&url),
+                                                            |bytes| {
+                                                                writer
+                                                                    .try_submit_host_clipboard(
+                                                                        bytes,
+                                                                    )
+                                                            },
+                                                        );
+                                                        model.status =
+                                                            match crate::clipboard::copy(&url) {
+                                                                Ok(()) => {
+                                                                    "Copying link to clipboard…"
+                                                                        .into()
+                                                                }
+                                                                Err(error) => format!(
+                                                                    "Clipboard copy failed: {error}"
+                                                                ),
+                                                            };
                                                     }
-                                                };
-                                            } else if let Some(share) =
-                                                model.shares.get(panel_ui.cursor)
-                                            {
-                                                model.status = if share.stopping {
-                                                    format!("Share :{} is stopping", share.port)
-                                                } else if share.failed {
-                                                    format!(
-                                                        "Share :{} failed: {} — `x` clears it, `n` retries",
-                                                        share.port,
-                                                        share
-                                                            .error
-                                                            .as_deref()
-                                                            .unwrap_or("unknown error")
-                                                    )
-                                                } else {
-                                                    format!(
-                                                        "Share :{} is still starting…",
-                                                        share.port
-                                                    )
-                                                };
+                                                    crate::handlers::share_panel::ShareEnter::Status(
+                                                        status,
+                                                    ) => model.status = status,
+                                                }
                                             }
                                         }
                                         Section::Forward => {
@@ -23531,28 +23528,18 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- share: open in browser / stop the highlighted one.
                         (Section::Share, KeyCode::Char('o')) => {
-                            match model
-                                .shares
-                                .get(panel_ui.cursor)
-                                .and_then(|s| s.browser_url().map(str::to_owned))
-                            {
-                                Some(url) => {
+                            match crate::handlers::share_panel::share_open(
+                                &model.shares,
+                                panel_ui.cursor,
+                            ) {
+                                crate::handlers::share_panel::ShareOpen::Open(url) => {
                                     model.status = crate::actions::open_status(
                                         open_url_detached(&url),
                                         || "Opened share link in browser".to_string(),
                                     );
                                 }
-                                None => {
-                                    model.status = model.shares.get(panel_ui.cursor).map_or_else(
-                                        || "No share URL to open".into(),
-                                        |share| if share.stopping {
-                                            format!("Share :{} is stopping", share.port)
-                                        } else if share.failed {
-                                            format!("Share :{} failed: {} — `x` clears it, `n` retries", share.port, share.error.as_deref().unwrap_or("unknown error"))
-                                        } else {
-                                            format!("Share :{} is still starting…", share.port)
-                                        },
-                                    );
+                                crate::handlers::share_panel::ShareOpen::Status(status) => {
+                                    model.status = status;
                                 }
                             }
                             true

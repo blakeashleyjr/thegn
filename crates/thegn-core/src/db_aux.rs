@@ -8,8 +8,8 @@ use crate::attention::MqStatus;
 use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use crate::store::{
-    MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
-    MergeAttemptResult, MergeCandidate, MergeClaim, MergeClaimPhase, MergeClaimRequest,
+    MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX, MergeAttemptResult,
+    MergeCandidate, MergeClaim, MergeClaimActive, MergeClaimPhase, MergeClaimRequest,
     MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
     MergeOutcomeObservation, MergeOutcomeWrite, MergeRegistryIdentity, MergeRetryOutcome,
     MergeStatusFields, WorktreeAuxStore,
@@ -280,7 +280,9 @@ fn ensure_unclaimed(conn: &Connection, worktree: &str) -> Result<()> {
         [worktree],
         |row| row.get(0),
     )?;
-    anyhow::ensure!(!claimed, MERGE_CLAIM_ACTIVE);
+    if claimed {
+        return Err(anyhow::Error::new(MergeClaimActive));
+    }
     Ok(())
 }
 
@@ -395,7 +397,9 @@ impl Db {
                    WHERE merge_queue.claim_owner IS NULL"#,
                 params![worktree, branch, target_branch, now, location],
             )?;
-            anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
+            if changed != 1 {
+                return Err(anyhow::Error::new(MergeClaimActive));
+            }
             Ok(true)
         })();
         match &result {
@@ -460,7 +464,9 @@ fn enqueue_merge_row(
             identity.map(|value| value.admin_dir.as_str())
         ],
     )?;
-    anyhow::ensure!(changed == 1, MERGE_CLAIM_ACTIVE);
+    if changed != 1 {
+        return Err(anyhow::Error::new(MergeClaimActive));
+    }
     Ok(())
 }
 

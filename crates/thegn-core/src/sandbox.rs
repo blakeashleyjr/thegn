@@ -866,12 +866,17 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
 /// Every launch gate in one place: volume admission, the sealed deny filter and
 /// `$HOME` gate, and the OCI `-v` path syntax check.
 fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
-    launchable_with(spec, &crate::sandbox_control_guard::control_dirs())
+    launchable_guarded(
+        spec,
+        &crate::sandbox_control_guard::control_dirs(),
+        &crate::sandbox_control_guard::protected_dirs(),
+    )
 }
 
-fn launchable_with<'a>(
+fn launchable_guarded<'a>(
     spec: &'a SandboxSpec,
     control_dirs: &[std::path::PathBuf],
+    protected_dirs: &[std::path::PathBuf],
 ) -> Result<std::borrow::Cow<'a, SandboxSpec>, EnterError> {
     admit_volumes(spec)?;
     if let Some(message) = compose_policy_refusal(spec) {
@@ -889,7 +894,7 @@ fn launchable_with<'a>(
         ));
     }
     tunnel_admission(spec)?;
-    oci_control_socket_refusal(spec, control_dirs)?;
+    oci_control_socket_refusal(spec, control_dirs, protected_dirs)?;
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
         let mut owned = spec.clone();
         owned.compose = None;
@@ -976,9 +981,18 @@ fn launchable_with<'a>(
     Ok(view)
 }
 
+#[cfg(test)]
+fn launchable_with<'a>(
+    spec: &'a SandboxSpec,
+    control_dirs: &[std::path::PathBuf],
+) -> Result<std::borrow::Cow<'a, SandboxSpec>, EnterError> {
+    launchable_guarded(spec, control_dirs, &[])
+}
+
 fn oci_control_socket_refusal(
     spec: &SandboxSpec,
     control_dirs: &[std::path::PathBuf],
+    protected_dirs: &[std::path::PathBuf],
 ) -> Result<(), EnterError> {
     if spec.placement.is_local()
         && spec.backend.is_oci()
@@ -1016,6 +1030,48 @@ fn oci_control_socket_refusal(
                 Some(exposure.control_dir.display().to_string()),
                 format!(
                     "daemon control directory {} is visible through sandbox mount {}; OCI mounts are fixed when the container is created",
+                    exposure.control_dir.display(),
+                    exposure.visible_through.display()
+                ),
+            ));
+        }
+
+        let writable_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = spec
+            .mounts
+            .iter()
+            .filter(|mount| !mount.ro)
+            .map(|mount| {
+                (
+                    std::path::PathBuf::from(&mount.host),
+                    std::path::PathBuf::from(&mount.dest),
+                )
+            })
+            .collect();
+        let writable_refs: Vec<(&std::path::Path, &std::path::Path)> = writable_mounts
+            .iter()
+            .map(|(host, dest)| (host.as_path(), dest.as_path()))
+            .collect();
+        let (mapped_protected, unresolved_protected) =
+            crate::sandbox_control_guard::in_sandbox_paths(protected_dirs, &writable_refs);
+        let writable_roots: Vec<&std::path::Path> = writable_mounts
+            .iter()
+            .map(|(_, dest)| dest.as_path())
+            .collect();
+        if let Some(exposure) = unresolved_protected
+            .or_else(|| {
+                crate::sandbox_control_guard::mount_inside_control_dir(
+                    protected_dirs,
+                    &writable_refs,
+                )
+            })
+            .or_else(|| crate::sandbox_control_guard::exposure(&mapped_protected, &writable_roots))
+        {
+            return Err(refusal(
+                spec,
+                RefusalClass::ControlSocketReachable,
+                Some(exposure.control_dir.display().to_string()),
+                format!(
+                    "thegn state directory {} (the control locator) is writable through sandbox mount {}; OCI mounts are fixed when the container is created",
                     exposure.control_dir.display(),
                     exposure.visible_through.display()
                 ),
@@ -3319,6 +3375,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Result<Vec<String>, E
             resolver_dir: None,
             runtime_dir: systemd_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")),
             control_dirs: Vec::new(),
+            protected_dirs: Vec::new(),
         },
     )
 }
@@ -3331,6 +3388,7 @@ fn backend_enter_argv_guarded(spec: &SandboxSpec, script: &str) -> Result<EnterA
             resolver_dir: None,
             runtime_dir: systemd_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR")),
             control_dirs: crate::sandbox_control_guard::control_dirs(),
+            protected_dirs: crate::sandbox_control_guard::protected_dirs(),
         },
     )
 }
@@ -3357,6 +3415,7 @@ fn backend_enter_argv_with_resolver_dir(
             resolver_dir: resolved_resolver_dir.map(std::path::Path::to_path_buf),
             runtime_dir: None,
             control_dirs: Vec::new(),
+            protected_dirs: Vec::new(),
         },
     )
 }
@@ -3366,6 +3425,7 @@ struct SandboxArgvEnv {
     resolver_dir: Option<std::path::PathBuf>,
     runtime_dir: Option<std::path::PathBuf>,
     control_dirs: Vec<std::path::PathBuf>,
+    protected_dirs: Vec<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -3477,6 +3537,7 @@ fn backend_enter_argv_guarded_with_env(
                 hardcoded_parents.push(dir);
             }
             let mut emitted_mounts = Vec::new();
+            let mut writable_dests = Vec::new();
             for m in &spec.mounts {
                 // Skip mounts already covered by a hardcoded parent — bwrap
                 // cannot create a mount-point inside a read-only bind.
@@ -3502,6 +3563,9 @@ fn backend_enter_argv_guarded_with_env(
                 let flag = if m.ro { "--ro-bind" } else { "--bind" };
                 v.extend([flag.into(), m.host.clone(), m.dest.clone()]);
                 emitted_mounts.push((m.host.as_str(), m.dest.as_str()));
+                if !m.ro {
+                    writable_dests.push(m.dest.as_str());
+                }
             }
             if spec.placement.is_local()
                 && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
@@ -3597,6 +3661,75 @@ fn backend_enter_argv_guarded_with_env(
                             Some(exposure.control_dir.display().to_string()),
                             format!(
                                 "daemon control directory {} is visible through sandbox bind {}; bwrap could not mask it without hiding a bind, so move the socket directory or change the bind layout",
+                                exposure.control_dir.display(),
+                                exposure.visible_through.display()
+                            ),
+                        ));
+                    }
+                }
+
+                let (mapped_protected, unresolved_protected) =
+                    crate::sandbox_control_guard::in_sandbox_paths(
+                        &env.protected_dirs,
+                        &mount_refs,
+                    );
+                if let Some(exposure) = unresolved_protected {
+                    return Err(refusal(
+                        spec,
+                        RefusalClass::ControlSocketReachable,
+                        Some(exposure.control_dir.display().to_string()),
+                        format!(
+                            "thegn state directory {} (the control locator) may be visible through sandbox bind {}; its host path could not be canonicalized",
+                            exposure.control_dir.display(),
+                            exposure.visible_through.display()
+                        ),
+                    ));
+                }
+                if let Some(exposure) = crate::sandbox_control_guard::mount_inside_control_dir(
+                    &env.protected_dirs,
+                    &mount_refs,
+                ) {
+                    return Err(refusal(
+                        spec,
+                        RefusalClass::ControlSocketReachable,
+                        Some(exposure.control_dir.display().to_string()),
+                        format!(
+                            "thegn state directory {} (the control locator) would be writable through sandbox bind {}",
+                            exposure.control_dir.display(),
+                            exposure.visible_through.display()
+                        ),
+                    ));
+                }
+                let mut writable_roots: Vec<&std::path::Path> =
+                    writable_dests.iter().map(std::path::Path::new).collect();
+                writable_roots.push(&spec.worktree);
+                match crate::sandbox_control_guard::plan_protected(
+                    &mapped_protected,
+                    &visible_roots,
+                    &writable_roots,
+                    &bind_dests,
+                    &|path| {
+                        mount_refs.iter().any(|(host, dest)| {
+                            path.strip_prefix(dest).is_ok_and(|relative| {
+                                std::fs::metadata(host.join(relative))
+                                    .is_ok_and(|metadata| metadata.is_dir())
+                            })
+                        })
+                    },
+                ) {
+                    crate::sandbox_control_guard::MaskPlan::Clear => {}
+                    crate::sandbox_control_guard::MaskPlan::Mask(dirs) => {
+                        for dir in dirs {
+                            v.extend(["--tmpfs".into(), dir.display().to_string()]);
+                        }
+                    }
+                    crate::sandbox_control_guard::MaskPlan::Refuse(exposure) => {
+                        return Err(refusal(
+                            spec,
+                            RefusalClass::ControlSocketReachable,
+                            Some(exposure.control_dir.display().to_string()),
+                            format!(
+                                "thegn state directory {} (the control locator) could not be masked without hiding bind {}",
                                 exposure.control_dir.display(),
                                 exposure.visible_through.display()
                             ),
@@ -3745,6 +3878,29 @@ fn backend_enter_argv_guarded_with_env(
                     v.extend([
                         "-p".into(),
                         format!("InaccessiblePaths=-{}", control_dir.display()),
+                    ]);
+                }
+                for protected_dir in &env.protected_dirs {
+                    let hides_worktree = protected_dir.starts_with(&spec.worktree)
+                        || spec.worktree.starts_with(protected_dir);
+                    let hides_mount = spec.mounts.iter().any(|mount| {
+                        let dest = std::path::Path::new(&mount.dest);
+                        protected_dir.starts_with(dest) || dest.starts_with(protected_dir)
+                    });
+                    if hides_worktree || hides_mount {
+                        return Err(refusal(
+                            spec,
+                            RefusalClass::ControlSocketReachable,
+                            Some(protected_dir.display().to_string()),
+                            format!(
+                                "thegn state directory {} (the control locator) would hide the worktree or a carved-back sandbox mount",
+                                protected_dir.display()
+                            ),
+                        ));
+                    }
+                    v.extend([
+                        "-p".into(),
+                        format!("InaccessiblePaths=-{}", protected_dir.display()),
                     ]);
                 }
             }

@@ -2223,3 +2223,147 @@ fn bore_extra_args_without_secret_flags_still_launch() {
     let expected = ["--max-conn".to_owned(), "10".to_owned()];
     assert!(plan.args.ends_with(&expected));
 }
+
+#[cfg(unix)]
+#[test]
+fn group_stop_after_natural_exit_reports_already_exited_without_escalation() {
+    // THE-342 natural-exit bullet: the grouped shell exits on its own, and polling WNOWAIT
+    // leaves the leader unreaped until StopHandle checks it. Its private group cannot be reused.
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = group_stop_plan("echo 'public: done.example:443'; exit 0".into());
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let handle = running.stop_handle();
+    let (pid, counter) = {
+        let child = handle
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (child.pid, Arc::clone(&child.escalation_count))
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if crate::plugin::proc::leader_exited_nowait(pid).expect("observe natural exit") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "client did not exit naturally");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(handle.stop(), StopOutcome::AlreadyExited);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    let report = running.wait_verified();
+    assert_eq!(report.leaked_readers, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn group_stop_concurrent_with_natural_exit_is_bounded() {
+    // THE-342 concurrent-exit bullet: start_cancellable gives the shell its own process group;
+    // its 200 ms sleep and the stopper's 200 ms delay deliberately meet at natural exit.
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = group_stop_plan("echo 'public: race.example:443'; sleep 0.2".into());
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let handle = running.stop_handle();
+    let started = Instant::now();
+    let (report, outcome) = std::thread::scope(|scope| {
+        let stopper = scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            handle.stop()
+        });
+        let report = running.wait_verified();
+        let outcome = stopper.join().expect("stopper thread completes");
+        (report, outcome)
+    });
+
+    assert!(matches!(
+        outcome,
+        StopOutcome::Terminated | StopOutcome::AlreadyExited
+    ));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(report.leaked_readers, 0);
+    assert_eq!(handle.stop(), StopOutcome::AlreadyExited);
+}
+
+#[cfg(unix)]
+#[test]
+fn group_stop_escalation_never_reaches_a_restarted_generation() {
+    // THE-342 rapid-restart bullet: A's group is reaped before its 300 ms escalation; B gets a
+    // fresh process group immediately afterward, and remains alive after A's deadline passes.
+    let state_a = tempfile::tempdir().expect("private state for generation A");
+    let plan_a = group_stop_plan("echo 'public: a.example:443'; exec sleep 30".into());
+    let running_a = start_cancellable(
+        &plan_a,
+        state_a.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start generation A");
+    let handle_a = running_a.stop_handle();
+    assert_eq!(
+        handle_a.stop_with_grace(Duration::from_millis(300)),
+        StopOutcome::Terminated
+    );
+    let report_a = running_a.wait_verified();
+    assert_eq!(report_a.leaked_readers, 0);
+
+    let state_b = tempfile::tempdir().expect("private state for generation B");
+    let plan_b = group_stop_plan("echo 'public: b.example:443'; exec sleep 30".into());
+    let running_b = start_cancellable(
+        &plan_b,
+        state_b.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start generation B");
+    let handle_b = running_b.stop_handle();
+    let pid_b = handle_b
+        .child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pid;
+    std::thread::sleep(Duration::from_millis(600));
+    let generation_b_alive = matches!(crate::plugin::proc::leader_exited_nowait(pid_b), Ok(false));
+    let running_b_has_exited = running_b.has_exited();
+    let b_report = running_b.stop_verified();
+
+    assert!(
+        generation_b_alive,
+        "generation A escalation killed B's leader"
+    );
+    assert!(!running_b_has_exited);
+    assert_eq!(b_report.leaked_readers, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_now_after_reap_never_signals() {
+    // THE-342 repeated-immediate-stop bullet: stop_now kills the grouped leader, then
+    // wait_verified reaps it before the second stop_now observes the reaped flag.
+    let state = tempfile::tempdir().expect("private temporary state");
+    let plan = group_stop_plan("echo 'public: immediate.example:443'; exec sleep 30".into());
+    let running = start_cancellable(
+        &plan,
+        state.path(),
+        Duration::from_secs(3),
+        &AtomicBool::new(false),
+    )
+    .expect("start grouped client");
+    let handle = running.stop_handle();
+    assert_eq!(handle.stop_now(), StopOutcome::Terminated);
+    let report = running.wait_verified();
+
+    assert_eq!(report.leaked_readers, 0);
+    assert_eq!(handle.stop_now(), StopOutcome::AlreadyExited);
+}

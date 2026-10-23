@@ -2942,6 +2942,128 @@ async fn transp_ics_url_feed_round_trips_free_and_busy() {
     server.abort();
 }
 
+// THE-470 regression lock: expected to pass on main.
+#[tokio::test]
+async fn transp_caldav_report_round_trips_free_and_busy() {
+    let resource = |href: &str, uid: &str, transp: Option<&str>| {
+        let transp_line = transp.map_or_else(String::new, |value| format!("TRANSP:{value}\r\n"));
+        let calendar = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART:20260821T090000Z\r\nDTEND:20260821T093000Z\r\n{transp_line}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        format!(
+            "<d:response><d:href>{href}</d:href><d:propstat><d:prop><c:calendar-data>{calendar}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        )
+    };
+    let resources = [
+        resource("/cal/free.ics", "free", Some("TRANSPARENT")),
+        resource("/cal/opaque.ics", "opaque", Some("OPAQUE")),
+        resource("/cal/absent.ics", "absent", None),
+        resource("/cal/lower.ics", "lower", Some(" transparent ")),
+        resource("/cal/bad.ics", "bad", Some("MAYBE")),
+    ]
+    .join("");
+    let body = format!(
+        "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{resources}</d:multistatus>"
+    );
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        body,
+    )
+    .await;
+    let backend = caldav::CalDavBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/report"),
+            allow_private_network: true,
+            ..account("transp", CalendarProviderKind::CalDav)
+        },
+        adm(),
+    );
+    let page = backend
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap();
+    for uid in ["free", "opaque", "absent", "lower", "bad"] {
+        assert!(
+            page.events().iter().any(|event| event.uid == uid),
+            "CalDAV event {uid} should remain listed"
+        );
+    }
+    for uid in ["free", "lower"] {
+        let event = page.events().iter().find(|event| event.uid == uid).unwrap();
+        assert_eq!(event.busy, thegn_core::calendar::Busy::Free, "{uid}");
+    }
+    for uid in ["opaque", "absent", "bad"] {
+        let event = page.events().iter().find(|event| event.uid == uid).unwrap();
+        assert_eq!(event.busy, thegn_core::calendar::Busy::Busy, "{uid}");
+    }
+    let diagnostics = page.diagnostics();
+    assert_eq!(
+        diagnostics.total(),
+        1,
+        "only invalid TRANSP should be reported; diagnostics total={}",
+        diagnostics.total()
+    );
+    server.abort();
+}
+
+// THE-470 regression lock: expected to pass on main.
+#[tokio::test]
+async fn transp_caldav_override_carries_its_own_transparency() {
+    let calendar = concat!(
+        "BEGIN:VCALENDAR\r\n",
+        "VERSION:2.0\r\n",
+        "BEGIN:VEVENT\r\n",
+        "UID:series\r\n",
+        "DTSTART:20260810T090000Z\r\n",
+        "DTEND:20260810T093000Z\r\n",
+        "RRULE:FREQ=DAILY;COUNT=3\r\n",
+        "END:VEVENT\r\n",
+        "BEGIN:VEVENT\r\n",
+        "UID:series\r\n",
+        "RECURRENCE-ID:20260811T090000Z\r\n",
+        "DTSTART:20260811T090000Z\r\n",
+        "DTEND:20260811T093000Z\r\n",
+        "TRANSP:TRANSPARENT\r\n",
+        "END:VEVENT\r\n",
+        "END:VCALENDAR\r\n",
+    );
+    let body = format!(
+        "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/series.ics</d:href><d:propstat><d:prop><c:calendar-data>{calendar}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"
+    );
+    let (address, _hits, server) = serve_fixed(
+        axum::http::StatusCode::MULTI_STATUS,
+        "application/xml",
+        body,
+    )
+    .await;
+    let backend = caldav::CalDavBackend::new(
+        &CalendarAccount {
+            url: format!("http://{address}/report"),
+            allow_private_network: true,
+            ..account("transp-override", CalendarProviderKind::CalDav)
+        },
+        adm(),
+    );
+    let page = backend
+        .list_events(window().0, window().1, "")
+        .await
+        .unwrap();
+    let override_event = page
+        .events()
+        .iter()
+        .find(|event| event.recurrence_id.is_some())
+        .unwrap();
+    assert_eq!(override_event.busy, thegn_core::calendar::Busy::Free);
+    let master = page
+        .events()
+        .iter()
+        .find(|event| event.recurrence_id.is_none())
+        .unwrap();
+    assert_eq!(master.busy, thegn_core::calendar::Busy::Busy);
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_saturated_global_budget_refuses_before_any_request() {
     let (address, hits, server) =

@@ -1394,12 +1394,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             action: None
         }
     );
-    if !daemon_uses_socket_override
-        && let Some(dir) = crate::daemon::socket_path(&cfg.daemon)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-    {
-        thegn_core::sandbox_control_guard::publish_control_socket_dir(dir.to_path_buf());
+    if !daemon_uses_socket_override {
+        crate::daemon::control_publish::publish_for_socket(&crate::daemon::socket_path(
+            &cfg.daemon,
+        ));
     }
     crate::automation_runtime::install(&cfg);
     let config_path = cli

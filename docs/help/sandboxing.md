@@ -190,13 +190,19 @@ an owner-only locator under the state directory. A locator that does not name a
 valid owner-only directory is ignored, and the daemon replaces it on its next
 start.
 If a control socket directory is visible through a sandbox bind (for example,
-an explicit `[daemon] socket` or an `XDG_RUNTIME_DIR` under `$HOME` or the
-worktree), bwrap hides it with a tmpfs and systemd makes it inaccessible unless
-that would hide the worktree or a carved-back mount, in which case it refuses.
-Container backends refuse the launch (`control-socket-reachable`) because
-their mounts are fixed when the container is created. On bwrap,
-`file_access = "all"` or `"host"` exposes the host filesystem by design,
-including runtime paths; those modes do not hide the control socket.
+explicit `[daemon] socket` or `XDG_RUNTIME_DIR` under `$HOME` or the worktree),
+bwrap hides it with a tmpfs. systemd makes it inaccessible unless that would hide
+the worktree or a carved-back mount, in which case it refuses when
+`read_only_root = true`. OCI refuses any mount exposing it. The relocated
+private `/tmp` directory is guarded with the predictable fallback. State `run/`
+(locator and lock) is write-protected: bwrap hides it when present and refuses
+if it is absent under a writable bind; systemd makes it inaccessible only when
+`read_only_root = true`; OCI refuses writable mounts covering it while admitting
+read-only `$HOME`. With `[daemon] enabled = false`, the compositor prepares
+`run/` before launching panes, so writable-root profiles can mask it. The
+hardcoded writable parents are private tmpfs mounts at `/tmp` and the sealed
+`$HOME`; neither exposes host state. The `--dev-bind / /` used by `all` and
+`host` is excluded by the guard. Those access modes expose the host by design.
 
 Standard, hardened, and sealed panes do not inherit `DBUS_SESSION_BUS_ADDRESS`.
 Bwrap unsets it, and systemd panes also cannot reach `$XDG_RUNTIME_DIR/bus` or
@@ -655,6 +661,10 @@ the first and counting the rest. An unchanged set does not repeat it.
 A VPS or Fly `max_instances` cap
 counts sandboxes for the same provider account; records without an account or
 that cannot be read count against every account.
+On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
+(Hetzner and DigitalOcean). Providers without a lifetime reaper, such as
+machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
+is set. Destroy those instances yourself or set the value to `0`.
 
 On the dev channel, the Fly backend strictly parses an app's machine list and
 rejects malformed lists or duplicate machine IDs. If more than one live

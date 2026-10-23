@@ -757,7 +757,15 @@ fn rm(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let was_queued = db.list_merge_queue()?.iter().any(|r| r.worktree == wt_s);
     // Dequeue AND un-file from the lifecycle folder, so `rm` doesn't strand the
     // worktree in "Merging"/"Needs attention" (the sidebar/queue de-sync).
-    crate::merge_ops::dequeue_worktree(cfg, &db, &wt)?;
+    if let Err(error) = crate::merge_ops::dequeue_worktree(cfg, &db, &wt) {
+        if error
+            .chain()
+            .any(|cause| cause.is::<thegn_core::store::MergeClaimActive>())
+        {
+            anyhow::bail!("{}", rm_claimed_message(&wt_s));
+        }
+        return Err(error);
+    }
     if !was_queued {
         anyhow::bail!("{wt_s} was not in the queue.");
     }
@@ -768,9 +776,24 @@ fn rm(cfg: &Config, worktree: Option<String>) -> Result<()> {
 fn clear(cfg: &Config) -> Result<()> {
     let root = repo_root()?;
     let db = Db::open().map_err(queue_error_context)?;
-    let n = crate::merge_ops::clear_repo(cfg, &db, &root).map_err(queue_error_context)?;
+    let n = crate::merge_ops::clear_repo(cfg, &db, &root).map_err(clear_error_context)?;
     outln!("Queue cleared ({n} removed).");
     Ok(())
+}
+
+fn clear_error_context(err: anyhow::Error) -> anyhow::Error {
+    if err
+        .downcast_ref::<crate::merge_ops::ClearKeptClaimed>()
+        .is_some()
+    {
+        err
+    } else {
+        queue_error_context(err)
+    }
+}
+
+fn rm_claimed_message(wt: &str) -> String {
+    format!("{wt} is being worked by a drain; remove it after the drain finishes")
 }
 
 /// `merge sweep [--force] [--json]` — collect merged worktrees past their grace period.
@@ -977,8 +1000,8 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     for it in items {
         if let Err(error) = db.set_merge_target(&it.worktree, &target) {
             let active_error = error
-                .to_string()
-                .contains(thegn_core::store::MERGE_CLAIM_ACTIVE);
+                .chain()
+                .any(|cause| cause.is::<thegn_core::store::MergeClaimActive>());
             let observed = if active_error {
                 Some(db.observe_merge_claim(&it.worktree)?)
             } else {
@@ -1781,5 +1804,28 @@ mod list_claim_tests {
         let claim = claim_json(observed.as_ref(), util::now_ms()).unwrap();
         assert!(claim.live);
         assert_eq!(claim.owner_hint.as_deref(), Some("test-drain"));
+    }
+}
+
+#[cfg(test)]
+mod claim_conflict_tests {
+    use super::*;
+
+    #[test]
+    fn clear_keeps_the_kept_claimed_message_unwrapped() {
+        let kept = clear_error_context(anyhow::Error::new(crate::merge_ops::ClearKeptClaimed {
+            removed: 1,
+            kept: vec!["/r/a".into()],
+        }));
+        assert!(!kept.to_string().contains("merge queue unavailable"));
+        assert!(kept.to_string().contains("kept 1 claimed"));
+
+        let database = clear_error_context(anyhow::anyhow!("boom"));
+        assert!(database.to_string().contains("merge queue unavailable"));
+    }
+
+    #[test]
+    fn rm_names_the_drain() {
+        assert!(rm_claimed_message("/r/a").contains("being worked by a drain"));
     }
 }

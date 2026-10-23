@@ -29,6 +29,7 @@ pub mod issue;
 pub mod log;
 pub mod lsp;
 pub mod machine0;
+mod op_budget;
 #[cfg(test)]
 mod platform_ratchet_tests;
 pub mod plugin;

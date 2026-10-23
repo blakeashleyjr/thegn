@@ -87,7 +87,7 @@ impl Upstream {
         // Reader thread: one parsed JSON message per line onto the channel.
         let (tx, rx) = channel::<Value>();
         std::thread::Builder::new()
-            .name(format!("mcp-up-{name}"))
+            .name("thegn-mcp-up".into())
             .spawn(move || {
                 // Utility: this pump's lag lands on deadline-enforced MCP tool calls (a
                 // miss is a breaker-feeding transport failure), not on background scrapes.

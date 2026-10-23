@@ -271,10 +271,12 @@ On Unix, Ctrl-C or SIGTERM during `thegn ci rerun`, `ci trigger` or `ci cancel`
 stops the provider command and exits non-zero; the action may or may not have
 reached the provider. Check with `thegn ci runs`.
 
-`thegn ci runs --json` emits a JSON array on success. If provider fetching fails,
-or the provider returns a partial list containing malformed rows, it emits an
-error object (`error`, and `discarded_rows` for a partial list) and exits 0 so
-scripts can continue to consume the command's graceful-degradation result.
+`thegn ci runs --json` emits a JSON array on success, including `[]` when the
+provider has no runs. If no CI provider resolves, it emits an error object with
+`reason: "no-provider"`; a fetch failure or partial list containing malformed
+rows also emits an error object (`error`, and `discarded_rows` for a partial
+list). It exits 0 in all three cases so scripts can consume the
+graceful-degradation result.
 Only `thegn ci runs --branch <current branch>` refreshes the cached runs shown
 in the CI panel; other branches and the all-branch listing leave that cache
 alone.

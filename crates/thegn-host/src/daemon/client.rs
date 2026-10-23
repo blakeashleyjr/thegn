@@ -421,6 +421,9 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     let scan = startup_scan(dcfg).await;
     report_startup_scan(&scan);
     if let Some(client) = scan.found.as_ref() {
+        if let ControlAddr::Unix(path) = client.addr() {
+            super::control_publish::publish_for_socket(path);
+        }
         start_error_state_bridge(client);
         return Ok(client.clone());
     }
@@ -479,6 +482,7 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     match wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, probe).await {
         SpawnWait::Up => {
             let sock = probed_socket();
+            super::control_publish::publish_for_socket(&sock);
             let client = ControlClient::new(ControlAddr::Unix(sock));
             start_error_state_bridge(&client);
             Ok(client)
