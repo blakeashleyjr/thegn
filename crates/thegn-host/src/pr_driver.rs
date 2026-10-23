@@ -920,7 +920,7 @@ pub(crate) fn drive_queue(
                 };
                 step(PrqStatus::AgentRunning.as_str(), &note, &mut progress);
 
-                crate::agent_run::run_outcome_cancellable(
+                let verdict = crate::agent_run::run_outcome_cancellable(
                     &crate::agent_run::AgentTaskRun {
                         kind,
                         worktree: wt,
@@ -933,6 +933,10 @@ pub(crate) fn drive_queue(
                     },
                     guard.cancel_flag(),
                 );
+                if let Some(warning) = agent_not_started_warning(item.number, &verdict) {
+                    tracing::warn!(target: "thegn::prq", pr = item.number, "{warning}");
+                    out.warnings.push(warning);
+                }
 
                 let fresh = authorship.as_ref().and_then(|_| {
                     forge
@@ -1480,6 +1484,16 @@ fn format_threads(threads: &[ReviewThreadRow]) -> String {
         out.push_str("  (no unresolved threads found)\n");
     }
     out
+}
+
+/// The warning for a PR-queue agent that never started (an infrastructure failure, not a code result).
+fn agent_not_started_warning(
+    number: u64,
+    verdict: &crate::agent_run::AgentRunVerdict,
+) -> Option<String> {
+    verdict.not_started().map(|reason| {
+        format!("PR #{number}: agent did not start: {reason}; the attempt was still counted")
+    })
 }
 
 #[cfg(test)]
@@ -4081,5 +4095,46 @@ mod tests {
         assert_eq!(row.agent_attempts, 1);
         assert_eq!(out.warnings.len(), 1, "{out:?}");
         assert!(out.warnings[0].contains("lost its lease"), "{out:?}");
+    }
+
+    #[test]
+    fn agent_not_started_warning_names_the_reason() {
+        let warning = agent_not_started_warning(
+            7,
+            &crate::agent_run::AgentRunVerdict::NotStarted("sandbox entry refused".into()),
+        );
+
+        assert!(warning.is_some_and(|warning| {
+            warning.contains("PR #7: agent did not start: sandbox entry refused")
+        }));
+    }
+
+    #[test]
+    fn agent_not_started_warning_is_silent_for_runs_that_started() {
+        for verdict in [
+            crate::agent_run::AgentRunVerdict::Exited(Some(0)),
+            crate::agent_run::AgentRunVerdict::Exited(Some(1)),
+            crate::agent_run::AgentRunVerdict::Exited(None),
+            crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
+        ] {
+            assert_eq!(agent_not_started_warning(7, &verdict), None);
+        }
+    }
+
+    #[test]
+    fn agent_not_started_verdict_is_consumed_by_the_pr_queue() {
+        let source = include_str!("pr_driver.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test module boundary exists")
+            .0;
+        let run_call = production
+            .find("let verdict = crate::agent_run::run_outcome_cancellable(")
+            .expect("PR queue binds the agent run verdict");
+        let warning_call = production
+            .find("agent_not_started_warning(item.number, &verdict)")
+            .expect("PR queue turns NotStarted into a warning");
+
+        assert!(warning_call > run_call);
     }
 }
