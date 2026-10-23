@@ -344,7 +344,7 @@ impl Machine0Provider {
     /// works; `ssh_key_create_managed` would keep the private key server-side.
     async fn ensure_ssh_key(&self) -> Result<String> {
         let listed = self.call(tool::SSH_KEY_LIST, json!({})).await?;
-        if let Some((id, _)) = parse_ssh_key_list(&listed)
+        if let Some((id, _)) = parse_ssh_key_list(&listed)?
             .into_iter()
             .find(|(_, pk)| same_pubkey(pk, &self.spec.pubkey))
         {
@@ -453,13 +453,23 @@ impl Machine0Provider {
     /// machine0 says provisioning takes 1–3 min; bounded. Unifies the
     /// create-wait and the resume-on-claim wait.
     async fn ensure_running_vm(&self, name: &str) -> Result<Machine0Vm> {
-        let start = std::time::Instant::now();
-        let mut last: String;
+        let budget = crate::op_budget::OpBudget::start(VM_READY_BUDGET);
+        let mut last = "in-flight call exceeded the budget".to_owned();
         loop {
             // A transient control-plane blip (or brief post-create not-found from
             // eventual consistency) must not abort a multi-minute wait — poll
             // through it until the budget, surfacing the last state on timeout.
-            match self.vm_by_name(name).await {
+            // A cancelled MCP call drops its control-gate permit.
+            let vm_result = match budget.within(self.vm_by_name(name)).await {
+                Some(result) => result,
+                None => {
+                    return Err(anyhow!(
+                        "machine0: vm {name} not RUNNING after {}s (last {last})",
+                        VM_READY_BUDGET.as_secs(),
+                    ));
+                }
+            };
+            match vm_result {
                 Ok(Some(vm)) => {
                     if status_running(&vm.status) && vm.address.is_some() {
                         return Ok(vm);
@@ -473,22 +483,32 @@ impl Machine0Provider {
                     // mid-SUSPENDING) must not abort the wait; the next poll
                     // retries. Transitional states aren't startable, so this does
                     // not spam vm_start while the VM is booting.
-                    if should_attempt_start(vm.id.is_empty(), &vm.status)
-                        && let Err(e) = self.call(tool::VM_START, json!({ "id": vm.id })).await
-                    {
-                        last = format!("start-transient: {e}");
+                    if should_attempt_start(vm.id.is_empty(), &vm.status) {
+                        match budget
+                            .within(self.call(tool::VM_START, json!({ "id": vm.id })))
+                            .await
+                        {
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => last = format!("start-transient: {e}"),
+                            None => {
+                                return Err(anyhow!(
+                                    "machine0: vm {name} not RUNNING after {}s (last {last})",
+                                    VM_READY_BUDGET.as_secs(),
+                                ));
+                            }
+                        }
                     }
                 }
                 Ok(None) => last = "not-found".into(),
                 Err(e) => last = format!("transient: {e}"),
             }
-            if start.elapsed() >= VM_READY_BUDGET {
+            if budget.expired() {
                 return Err(anyhow!(
                     "machine0: vm {name} not RUNNING after {}s (last {last})",
                     VM_READY_BUDGET.as_secs(),
                 ));
             }
-            tokio::time::sleep(VM_READY_POLL).await;
+            budget.pause(VM_READY_POLL).await;
         }
     }
 
@@ -496,26 +516,13 @@ impl Machine0Provider {
     /// image). Bounded; `label` names the target state for the timeout error.
     async fn wait_status(&self, name: &str, pred: fn(&str) -> bool, label: &str) -> Result<()> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
-        let start = std::time::Instant::now();
-        let mut last: String;
-        loop {
-            match self.vm_by_name(name).await {
-                Ok(Some(vm)) => {
-                    if pred(&vm.status) {
-                        return Ok(());
-                    }
-                    last = vm.status.clone();
-                }
-                Ok(None) => last = "not-found".into(),
-                Err(e) => last = format!("transient: {e}"),
-            }
-            if start.elapsed() >= BUDGET {
-                return Err(anyhow!(
-                    "machine0: vm {name} not {label} after {}s (last {last})",
-                    BUDGET.as_secs(),
-                ));
-            }
-            tokio::time::sleep(VM_READY_POLL).await;
+        let budget = crate::op_budget::OpBudget::start(BUDGET);
+        match Self::poll_vm_status(&budget, VM_READY_POLL, || self.vm_by_name(name), pred).await {
+            Ok(()) => Ok(()),
+            Err(last) => Err(anyhow!(
+                "machine0: vm {name} not {label} after {}s (last {last})",
+                BUDGET.as_secs(),
+            )),
         }
     }
 
@@ -552,21 +559,56 @@ impl Machine0Provider {
             user: user.to_string(),
             key_path: self.spec.key_path.clone(),
         };
-        let start = std::time::Instant::now();
+        let budget = crate::op_budget::OpBudget::start(AUTH_BUDGET);
         loop {
-            if let Ok((0, _)) = shim
-                .run_exec(&["/bin/sh".into(), "-lc".into(), "true".into()], None, &[])
+            match budget
+                .within(shim.run_exec(&["/bin/sh".into(), "-lc".into(), "true".into()], None, &[]))
                 .await
             {
-                return Ok(());
+                Some(Ok((0, _))) => return Ok(()),
+                Some(Ok(_)) | Some(Err(_)) => {}
+                // SshShim kills the ssh child on drop, so cancelling this exec
+                // bounds the auth probe without leaving a process behind.
+                None => {
+                    return Err(anyhow!(
+                        "machine0: {name} ({ip}) ssh auth as {user} not ready after {}s",
+                        AUTH_BUDGET.as_secs()
+                    ));
+                }
             }
-            if start.elapsed() >= AUTH_BUDGET {
+            if budget.expired() {
                 return Err(anyhow!(
                     "machine0: {name} ({ip}) ssh auth as {user} not ready after {}s",
                     AUTH_BUDGET.as_secs()
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            budget.pause(std::time::Duration::from_secs(3)).await;
+        }
+    }
+
+    async fn poll_vm_status<F, Fut>(
+        budget: &crate::op_budget::OpBudget,
+        poll: std::time::Duration,
+        mut probe: F,
+        pred: fn(&str) -> bool,
+    ) -> std::result::Result<(), String>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Option<Machine0Vm>>>,
+    {
+        let mut last = "in-flight call exceeded the budget".to_owned();
+        loop {
+            match budget.within(probe()).await {
+                Some(Ok(Some(vm))) if pred(&vm.status) => return Ok(()),
+                Some(Ok(Some(vm))) => last = vm.status,
+                Some(Ok(None)) => last = "not-found".into(),
+                Some(Err(error)) => last = format!("transient: {error}"),
+                None => return Err(last),
+            }
+            if budget.expired() {
+                return Err(last);
+            }
+            budget.pause(poll).await;
         }
     }
 
@@ -1045,7 +1087,7 @@ impl ProviderCheckpoints for Machine0Provider {
     fn list_checkpoints<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<Vec<CheckpointInfo>>> {
         Box::pin(async move {
             let v = self.call(tool::IMAGE_LIST, json!({})).await?;
-            Ok(parse_image_list(&v))
+            parse_image_list(&v)
         })
     }
 
@@ -1271,6 +1313,7 @@ pub fn parse_vm_list(v: &Value) -> Result<Vec<String>> {
     let rows = strict_array_field(v, &["machines", "vms", "items"]).map_err(|_| {
         anyhow!("machine0: vm_list returned an unrecognised response shape; refusing to treat it as an empty VM list")
     })?;
+    let mut names = std::collections::HashSet::with_capacity(rows.len());
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
@@ -1283,32 +1326,55 @@ pub fn parse_vm_list(v: &Value) -> Result<Vec<String>> {
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
-            name.or(id)
+            let name = name
+                .or(id)
                 .map(str::to_string)
-                .ok_or_else(|| anyhow!("machine0: vm_list element {index} has no name or id"))
+                .ok_or_else(|| anyhow!("machine0: vm_list element {index} has no name or id"))?;
+            anyhow::ensure!(
+                names.insert(name.clone()),
+                "machine0: vm_list names {name} twice"
+            );
+            Ok(name)
         })
         .collect()
 }
 
 /// Parse an `image_list` response into checkpoints. The `id` is the image
 /// **name** (what `vm_create.imageName` / restore consumes). Pure.
-pub fn parse_image_list(v: &Value) -> Vec<CheckpointInfo> {
-    array_field(v, &["images", "items"])
-        .iter()
-        .filter_map(|e| {
-            let obj = e.get("image").unwrap_or(e);
+pub fn parse_image_list(v: &Value) -> Result<Vec<CheckpointInfo>> {
+    let rows = strict_array_field(v, &["images", "items"]).map_err(|_| {
+        anyhow!("machine0: image_list returned an unrecognised response shape; refusing to treat it as an empty image list")
+    })?;
+    let mut ids = std::collections::HashSet::with_capacity(rows.len());
+    rows.iter()
+        .enumerate()
+        .map(|(index, e)| {
+            let obj = e
+                .get("image")
+                .filter(|value| value.is_object())
+                .unwrap_or(e);
             let id = obj
                 .get("name")
-                .or_else(|| obj.get("id"))
-                .and_then(Value::as_str)?
-                .to_string();
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    obj.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                })
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("machine0: image_list element {index} has no name or id"))?;
+            anyhow::ensure!(
+                ids.insert(id.clone()),
+                "machine0: image_list names image {id} twice"
+            );
             let label = obj
                 .get("description")
                 .or_else(|| obj.get("label"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            Some(CheckpointInfo { id, label })
+            Ok(CheckpointInfo { id, label })
         })
         .collect()
 }
@@ -1365,12 +1431,29 @@ pub fn pick_size(sizes: &[Machine0Size], req: &SizeReq) -> Option<String> {
 }
 
 /// Parse an ssh-key list into `(id, publicKey)` pairs. Pure.
-pub fn parse_ssh_key_list(v: &Value) -> Vec<(String, String)> {
-    array_field(v, &["sshKeys", "keys", "items"])
-        .iter()
-        .filter_map(|e| {
-            let obj = e.get("sshKey").or_else(|| e.get("key")).unwrap_or(e);
-            let id = obj.get("id").and_then(Value::as_str)?.to_string();
+pub fn parse_ssh_key_list(v: &Value) -> Result<Vec<(String, String)>> {
+    let rows = strict_array_field(v, &["sshKeys", "keys", "items"]).map_err(|_| {
+        anyhow!("machine0: ssh_key_list returned an unrecognised response shape; refusing to treat it as an empty key list")
+    })?;
+    let mut ids = std::collections::HashSet::with_capacity(rows.len());
+    rows.iter()
+        .enumerate()
+        .map(|(index, e)| {
+            let obj = e
+                .get("sshKey")
+                .or_else(|| e.get("key"))
+                .filter(|value| value.is_object())
+                .unwrap_or(e);
+            let id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow!("machine0: ssh_key_list element {index} has no id"))?
+                .to_string();
+            anyhow::ensure!(
+                ids.insert(id.clone()),
+                "machine0: ssh_key_list repeats key id {id}"
+            );
             let pk = obj
                 .get("publicKey")
                 .or_else(|| obj.get("public_key"))
@@ -1378,7 +1461,7 @@ pub fn parse_ssh_key_list(v: &Value) -> Vec<(String, String)> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            Some((id, pk))
+            Ok((id, pk))
         })
         .collect()
 }
@@ -1401,7 +1484,7 @@ pub fn parse_created_id(v: &Value) -> Option<String> {
 }
 
 /// The first array under any of `keys` at the top level, or `v` itself if it is
-/// an array. Pure helper for the `parse_*_list` fns.
+/// an array. Pure helper for `parse_size_list`.
 fn array_field(v: &Value, keys: &[&str]) -> Vec<Value> {
     if let Some(a) = v.as_array() {
         return a.clone();
@@ -1414,7 +1497,7 @@ fn array_field(v: &Value, keys: &[&str]) -> Vec<Value> {
     Vec::new()
 }
 
-/// Borrow the VM rows only when the response has one recognized list shape.
+/// Borrow list rows only when the response has one recognized list shape.
 fn strict_array_field<'a>(v: &'a Value, keys: &[&str]) -> Result<&'a [Value]> {
     if let Some(rows) = v.as_array() {
         return Ok(rows);
@@ -1651,6 +1734,79 @@ fn flake_identity_for(tree_digest: Option<&str>, flake: &str) -> String {
 }
 
 #[cfg(test)]
+mod wait_budget_tests {
+    use super::{Machine0Provider, Machine0Vm};
+    use crate::op_budget::OpBudget;
+    use std::future;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_probe_ends_at_the_budget() {
+        let budget = OpBudget::start(Duration::from_secs(180));
+        let started = tokio::time::Instant::now();
+        let mut probe_calls: usize = 0;
+        let result = tokio::time::timeout(
+            Duration::from_secs(600),
+            Machine0Provider::poll_vm_status(
+                &budget,
+                Duration::from_secs(4),
+                || {
+                    probe_calls += 1;
+                    let stalled = probe_calls > 1;
+                    let vm = Machine0Vm {
+                        id: "vm-1".into(),
+                        name: "test-vm".into(),
+                        status: "STOPPING".into(),
+                        address: None,
+                        user: None,
+                    };
+                    async move {
+                        if stalled {
+                            future::pending::<anyhow::Result<Option<Machine0Vm>>>().await
+                        } else {
+                            Ok(Some(vm))
+                        }
+                    }
+                },
+                |status| status == "STOPPED",
+            ),
+        )
+        .await
+        .expect("stalled probe must be bounded by the operation budget");
+        let elapsed = started.elapsed();
+
+        assert_eq!(result, Err("STOPPING".into()));
+        assert!(
+            elapsed <= Duration::from_secs(180),
+            "budget elapsed {elapsed:?} exceeded 180s"
+        );
+        assert_eq!(elapsed, Duration::from_secs(180));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_reaching_the_state_returns_ok() {
+        let budget = OpBudget::start(Duration::from_secs(180));
+        let result = Machine0Provider::poll_vm_status(
+            &budget,
+            Duration::from_secs(4),
+            || async {
+                Ok(Some(Machine0Vm {
+                    id: "vm-1".into(),
+                    name: "test-vm".into(),
+                    status: "STOPPED".into(),
+                    address: None,
+                    user: None,
+                }))
+            },
+            |status| status == "STOPPED",
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1746,7 +1902,8 @@ mod tests {
     fn restore_checkpoint_present_guards_against_missing_image() {
         let images = parse_image_list(&json!({ "images": [
             { "name": "gm-1" }, { "name": "dev-1700" }
-        ]}));
+        ]}))
+        .unwrap();
         // Present ⇒ restore may proceed (destroy is safe).
         assert!(restore_checkpoint_present(&images, "gm-1"));
         assert!(restore_checkpoint_present(&images, "  dev-1700  ")); // trimmed
@@ -2108,7 +2265,7 @@ mod tests {
             { "name": "gm-1", "description": "golden" },
             { "id": "img-2" }
         ]});
-        let cps = parse_image_list(&v);
+        let cps = parse_image_list(&v).unwrap();
         assert_eq!(cps.len(), 2);
         assert_eq!(cps[0].id, "gm-1");
         assert_eq!(cps[0].label.as_deref(), Some("golden"));
@@ -2121,7 +2278,7 @@ mod tests {
         let list = json!({ "sshKeys": [
             { "id": "k1", "publicKey": "ssh-ed25519 AAA me@host" }
         ]});
-        let ks = parse_ssh_key_list(&list);
+        let ks = parse_ssh_key_list(&list).unwrap();
         assert_eq!(ks[0].0, "k1");
         assert!(same_pubkey(&ks[0].1, "ssh-ed25519 AAA other@comment"));
         assert!(!same_pubkey(&ks[0].1, "ssh-ed25519 BBB me@host"));
@@ -2356,5 +2513,94 @@ mod tests {
         let result = acquire_create_lock(third, std::time::Duration::ZERO).await;
         assert!(result.is_err(), "the returned file must hold the lock");
         drop(acquired);
+    }
+
+    #[test]
+    fn strict_inventory_image_list_refuses_unknown_shapes() {
+        for response in [
+            json!({ "data": [] }),
+            json!({ "images": [], "items": [] }),
+            json!("x"),
+        ] {
+            assert!(parse_image_list(&response).is_err(), "{response}");
+        }
+    }
+
+    #[test]
+    fn strict_inventory_image_list_refuses_unidentifiable_and_duplicate_rows() {
+        assert!(parse_image_list(&json!([{ "description": "x" }])).is_err());
+        assert!(
+            parse_image_list(&json!([
+                { "name": "a" },
+                { "image": { "name": "a" } }
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_inventory_ssh_key_list_refuses_unknown_shapes_and_bad_rows() {
+        assert!(parse_ssh_key_list(&json!({ "data": [] })).is_err());
+        assert!(parse_ssh_key_list(&json!([{ "publicKey": "ssh-ed25519 AAA" }])).is_err());
+        assert!(
+            parse_ssh_key_list(&json!([
+                { "id": "k1", "publicKey": "ssh-ed25519 AAA" },
+                { "key": { "id": "k1", "publicKey": "ssh-ed25519 BBB" } }
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_inventory_vm_list_refuses_duplicate_names() {
+        assert!(parse_vm_list(&json!([{ "name": "a" }, { "name": "a" }])).is_err());
+    }
+
+    #[test]
+    fn strict_inventory_accepts_todays_shapes() {
+        let expected_image = vec![CheckpointInfo {
+            id: "img-a".to_string(),
+            label: Some("label".to_string()),
+        }];
+        for response in [
+            json!([{ "name": "img-a", "label": "label" }]),
+            json!({ "images": [{ "image": { "name": "img-a", "label": "label" } }] }),
+            json!({ "items": [{ "id": "img-a", "label": "label" }] }),
+        ] {
+            assert_eq!(parse_image_list(&response).unwrap(), expected_image);
+        }
+        assert!(parse_image_list(&json!([])).unwrap().is_empty());
+        assert!(
+            parse_image_list(&json!({ "images": [] }))
+                .unwrap()
+                .is_empty()
+        );
+
+        let expected_key = vec![("k1".to_string(), "ssh-ed25519 AAA".to_string())];
+        for response in [
+            json!([{ "id": "k1", "publicKey": "ssh-ed25519 AAA" }]),
+            json!({ "sshKeys": [{ "sshKey": { "id": "k1", "publicKey": "ssh-ed25519 AAA" } }] }),
+            json!({ "keys": [{ "key": { "id": "k1", "public_key": "ssh-ed25519 AAA" } }] }),
+            json!({ "items": [{ "key": { "id": "k1", "key": "ssh-ed25519 AAA" } }] }),
+        ] {
+            assert_eq!(parse_ssh_key_list(&response).unwrap(), expected_key);
+        }
+        assert_eq!(
+            parse_ssh_key_list(&json!([
+                { "id": "k1", "key": "ssh-ed25519 AAA" }
+            ]))
+            .unwrap(),
+            expected_key
+        );
+        assert!(parse_ssh_key_list(&json!([])).unwrap().is_empty());
+        assert!(
+            parse_ssh_key_list(&json!({ "keys": [] }))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            parse_ssh_key_list(&json!([{ "id": "k2" }])).unwrap(),
+            vec![("k2".to_string(), String::new())]
+        );
     }
 }

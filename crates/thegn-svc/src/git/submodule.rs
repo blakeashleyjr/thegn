@@ -37,7 +37,7 @@ impl std::error::Error for RecursiveSubmoduleInitRefused {}
 /// using the tab separator used by the human-readable form: `header\0path\0`.
 /// Keep accepting the tab form for small fixture callers, but parse the real
 /// wire format as pairs so live gitlink diffs cannot disappear.
-pub(crate) fn parse_raw_diffs(output: &str) -> Vec<SubmoduleDiff> {
+pub(crate) fn parse_raw_diffs(output: &str) -> Result<Vec<SubmoduleDiff>> {
     let mut records = output.split('\0');
     let mut diffs = Vec::new();
     while let Some(record) = records.next() {
@@ -47,23 +47,46 @@ pub(crate) fn parse_raw_diffs(output: &str) -> Vec<SubmoduleDiff> {
         let (header, path) = if let Some((header, path)) = record.split_once('\t') {
             (header, path)
         } else {
-            let Some(path) = records.next() else { break };
+            let Some(path) = records.next() else {
+                anyhow::bail!("git diff --raw returned a truncated record")
+            };
             (record, path)
         };
         let is_nul_record = record.split_once('\t').is_none();
-        let status = header.split_whitespace().nth(4).unwrap_or_default();
+        let mut fields = header.split_whitespace();
+        let old_mode = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git diff --raw returned a short header"))?
+            .trim_start_matches(':');
+        let new_mode = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git diff --raw returned a short header"))?;
+        let old_sha = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git diff --raw returned a short header"))?;
+        let new_sha = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git diff --raw returned a short header"))?;
+        let status = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git diff --raw returned a short header"))?;
+        if fields.next().is_some() {
+            anyhow::bail!("git diff --raw returned a header with extra fields");
+        }
+        if path.is_empty() {
+            anyhow::bail!("git diff --raw returned an empty path record");
+        }
         let has_second_rename_path =
             is_nul_record && matches!(status.as_bytes().first(), Some(b'R' | b'C'));
-        let diff = (|| {
-            let mut fields = header.split_whitespace();
-            let old_mode = fields.next()?.trim_start_matches(':');
-            let new_mode = fields.next()?;
-            let old_sha = fields.next()?;
-            let new_sha = fields.next()?;
-            let status = fields.next()?;
-            if old_mode != "160000" && new_mode != "160000" {
-                return None;
+        if has_second_rename_path {
+            let Some(second_path) = records.next() else {
+                anyhow::bail!("git diff --raw returned a truncated rename/copy record")
+            };
+            if second_path.is_empty() {
+                anyhow::bail!("git diff --raw returned an empty rename/copy path");
             }
+        }
+        if old_mode == "160000" || new_mode == "160000" {
             let kind = if old_sha.chars().all(|c| c == '0') {
                 SubmoduleDiffKind::Added
             } else if new_sha.chars().all(|c| c == '0') {
@@ -72,27 +95,17 @@ pub(crate) fn parse_raw_diffs(output: &str) -> Vec<SubmoduleDiff> {
                 // A raw rename can carry two paths. Gitlinks are still atomic;
                 // retain the first path, which is the stable path used by the
                 // ordinary diff join. The status is otherwise not interpreted.
-                let _ = status;
                 SubmoduleDiffKind::Changed
             };
-            Some(SubmoduleDiff {
+            diffs.push(SubmoduleDiff {
                 path: path.to_string(),
                 old_sha: old_sha.to_string(),
                 new_sha: new_sha.to_string(),
                 kind,
-            })
-        })();
-        // A caller that supplies the non-`--no-renames` raw format has one
-        // extra pathname for R/C records. The production command below pins
-        // rename detection off, but consume that field here to keep parsing
-        // subsequent records aligned in tests/alternate providers.
-        if has_second_rename_path {
-            let _ = records.next();
+            });
         }
-        let Some(diff) = diff else { continue };
-        diffs.push(diff);
     }
-    diffs
+    Ok(diffs)
 }
 
 fn has_gitmodules(loc: &GitLoc) -> bool {
@@ -122,21 +135,44 @@ fn status_marks_submodule(status: &[FileStatus], path: &str) -> (bool, bool) {
     (dirty, untracked)
 }
 
-fn recorded_gitlinks(loc: &GitLoc) -> Result<HashMap<String, String>> {
-    let out = run(loc, &["ls-files", "--stage", "-z", "--"])?;
+fn parse_stage_gitlinks(out: &str) -> Result<HashMap<String, String>> {
     let mut result = HashMap::new();
-    for record in out.split('\0') {
-        let Some((meta, path)) = record.split_once('\t') else {
-            continue;
+    for (index, record) in out
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .enumerate()
+    {
+        let (meta, path) = record.split_once('\t').ok_or_else(|| {
+            anyhow::anyhow!("git ls-files --stage record {index} has no path separator")
+        })?;
+        let mut fields = meta.split(' ');
+        let (mode, sha, stage) = match (fields.next(), fields.next(), fields.next(), fields.next())
+        {
+            (Some(mode), Some(sha), Some(stage), None) => (mode, sha, stage),
+            _ => anyhow::bail!("git ls-files --stage record {index} has the wrong field count"),
         };
-        let mut fields = meta.split_whitespace();
-        let Some(mode) = fields.next() else { continue };
-        let Some(sha) = fields.next() else { continue };
+        if !valid_mode(mode) {
+            anyhow::bail!("git ls-files --stage record {index} has an invalid mode");
+        }
+        if !valid_oid(sha) {
+            anyhow::bail!("git ls-files --stage record {index} has an invalid object id");
+        }
+        if !matches!(stage, "0" | "1" | "2" | "3") {
+            anyhow::bail!("git ls-files --stage record {index} has an invalid stage");
+        }
+        if path.is_empty() {
+            anyhow::bail!("git ls-files --stage record {index} has an empty path");
+        }
         if mode == "160000" {
             result.insert(path.to_string(), sha.to_string());
         }
     }
     Ok(result)
+}
+
+fn recorded_gitlinks(loc: &GitLoc) -> Result<HashMap<String, String>> {
+    let out = run(loc, &["ls-files", "--stage", "-z", "--"])?;
+    parse_stage_gitlinks(&out)
 }
 
 /// Read recursive submodule state plus ordinary status evidence in one
@@ -216,7 +252,7 @@ pub(crate) fn diffs(loc: &GitLoc, base: &str) -> Result<Vec<SubmoduleDiff>> {
             base,
         ],
     )?;
-    Ok(parse_raw_diffs(&out))
+    parse_raw_diffs(&out)
 }
 
 fn ancestor(loc: &GitLoc, older: &str, newer: &str) -> Result<Option<bool>> {
@@ -481,7 +517,7 @@ mod tests {
     #[test]
     fn raw_parser_keeps_only_gitlinks_and_classifies_add_delete() {
         let out = ":100644 160000 0000000 bbbbbbb A\tvendor/lib\0:160000 0000000 aaaaaaa 0000000 D\tvendor/old\0:100644 100644 aaaaaaa bbbbbbb M\ttext\0";
-        let diffs = parse_raw_diffs(out);
+        let diffs = parse_raw_diffs(out).unwrap();
         assert_eq!(diffs.len(), 2);
         assert_eq!(diffs[0].kind, SubmoduleDiffKind::Added);
         assert_eq!(diffs[1].kind, SubmoduleDiffKind::Deleted);
@@ -490,7 +526,7 @@ mod tests {
     #[test]
     fn raw_parser_accepts_git_real_nul_header_path_pairs() {
         let out = ":100644 160000 0000000 bbbbbbb A\0vendor/lib\0:160000 0000000 aaaaaaa 0000000 D\0vendor/old\0";
-        let diffs = parse_raw_diffs(out);
+        let diffs = parse_raw_diffs(out).unwrap();
         assert_eq!(diffs.len(), 2);
         assert_eq!(diffs[0].path, "vendor/lib");
         assert_eq!(diffs[0].kind, SubmoduleDiffKind::Added);
@@ -588,5 +624,46 @@ mod tests {
                 theirs_sha: two,
             }]
         );
+    }
+
+    #[test]
+    fn strict_records_stage_list_rejects_a_truncated_record() {
+        let sha = "a".repeat(40);
+        let output = format!("160000 {sha} 0\tvendor/lib\0{} {sha}", "160000");
+        assert!(parse_stage_gitlinks(&output).is_err());
+    }
+
+    #[test]
+    fn strict_records_stage_list_rejects_a_bad_mode_or_oid() {
+        let sha = "a".repeat(40);
+        assert!(parse_stage_gitlinks(&format!("16x000 {sha} 0\tvendor/lib\0")).is_err());
+        assert!(parse_stage_gitlinks("160000 short 0\tvendor/lib\0").is_err());
+    }
+
+    #[test]
+    fn strict_records_raw_diff_rejects_a_header_without_its_path() {
+        let output = ":100644 160000 0000000 bbbbbbb A\0";
+        assert!(parse_raw_diffs(output).is_err());
+    }
+
+    #[test]
+    fn strict_records_stage_list_keeps_only_gitlinks() {
+        let sha1 = "a".repeat(40);
+        let sha256 = "b".repeat(64);
+        let output = format!(
+            "100644 {sha1} 0\ttext.txt\0{gitlink_mode} {sha256} 0\tvendor/lib\0",
+            gitlink_mode = "160000"
+        );
+        let got = parse_stage_gitlinks(&output).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["vendor/lib"], sha256);
+    }
+
+    #[test]
+    fn strict_records_stage_list_accepts_the_trailing_terminator() {
+        let sha = "a".repeat(40);
+        let output = format!("160000 {sha} 0\tvendor/lib\0");
+        let got = parse_stage_gitlinks(&output).unwrap();
+        assert_eq!(got["vendor/lib"], sha);
     }
 }

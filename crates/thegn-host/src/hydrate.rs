@@ -3020,6 +3020,30 @@ fn panel_diff_files(
         .collect()
 }
 
+fn ls_files_args(remote: bool) -> &'static [&'static str] {
+    if remote {
+        &["ls-files"]
+    } else {
+        &["ls-files", "-z"]
+    }
+}
+
+fn tracked_files_from_ls_files(stdout: &[u8], nul_framed: bool) -> Vec<String> {
+    if nul_framed {
+        stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|record| !record.is_empty())
+            .map(|record| String::from_utf8_lossy(record).into_owned())
+            .collect()
+    } else {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+}
+
 /// Build just the right-side panel for a worktree directory. This is the
 /// path-keyed core of model hydration: it touches only `cwd`/`db`/`hints`,
 /// never the session, so a background task can warm a not-yet-focused
@@ -3232,17 +3256,13 @@ pub(crate) fn build_panel(
         let h_ls = want_lsfiles.then(|| {
             s.spawn(|| {
                 let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
-                loc.git_command(&["ls-files"])
+                loc.git_command(ls_files_args(loc.is_remote()))
                     .output()
                     .ok()
                     .and_then(|out| {
-                        out.status.success().then(|| {
-                            String::from_utf8_lossy(&out.stdout)
-                                .lines()
-                                .filter(|l| !l.is_empty())
-                                .map(|l| l.to_string())
-                                .collect::<Vec<_>>()
-                        })
+                        out.status
+                            .success()
+                            .then(|| tracked_files_from_ls_files(&out.stdout, !loc.is_remote()))
                     })
             })
         });

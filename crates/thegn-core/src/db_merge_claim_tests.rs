@@ -204,44 +204,44 @@ fn release_and_legacy_writers_obey_claim_state() {
         db.enqueue_merge(WT, "feature", "other")
             .unwrap_err()
             .to_string()
-            .contains(MERGE_CLAIM_ACTIVE)
+            .contains(crate::store::MERGE_CLAIM_ACTIVE)
     );
     assert!(
         db.enqueue_merge_if_worktree_matches(WT, "feature", "/private/repo", "", "other")
             .unwrap_err()
             .to_string()
-            .contains(MERGE_CLAIM_ACTIVE)
+            .contains(crate::store::MERGE_CLAIM_ACTIVE)
     );
     assert!(
         db.update_merge_status(WT, "deferred", None, None, None)
             .unwrap_err()
             .to_string()
-            .contains(MERGE_CLAIM_ACTIVE)
+            .contains(crate::store::MERGE_CLAIM_ACTIVE)
     );
     assert!(
         db.replace_merge_status(WT, "deferred", &MergeStatusFields::default())
             .unwrap_err()
             .to_string()
-            .contains(MERGE_CLAIM_ACTIVE)
+            .contains(crate::store::MERGE_CLAIM_ACTIVE)
     );
     assert!(
         db.set_merge_target(WT, "other")
             .unwrap_err()
             .to_string()
-            .contains(MERGE_CLAIM_ACTIVE)
+            .contains(crate::store::MERGE_CLAIM_ACTIVE)
     );
     assert!(
         db.set_merge_agent_attempts(WT, 4)
             .unwrap_err()
             .to_string()
-            .contains(MERGE_CLAIM_ACTIVE)
+            .contains(crate::store::MERGE_CLAIM_ACTIVE)
     );
     assert!(!db.retry_merge_entry(WT).unwrap());
     assert!(
         db.remove_merge_entry(WT)
             .unwrap_err()
             .to_string()
-            .contains(MERGE_CLAIM_ACTIVE)
+            .contains(crate::store::MERGE_CLAIM_ACTIVE)
     );
     assert_eq!(db.list_merge_queue().unwrap(), before);
     assert!(
@@ -274,6 +274,44 @@ fn release_and_legacy_writers_obey_claim_state() {
             .generation,
         claim.generation + 1
     );
+}
+
+fn assert_claim_conflict<T>(result: anyhow::Result<T>) {
+    let error = match result {
+        Ok(_) => panic!("expected a claim conflict"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<crate::store::MergeClaimActive>())
+    );
+}
+
+#[test]
+fn claim_conflict_errors_are_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    db.admit_merge_claim(&request()).unwrap().unwrap();
+    let queue_before = db.list_merge_queue().unwrap();
+    let claim_before = db.observe_merge_claim(WT).unwrap();
+
+    assert_claim_conflict(db.enqueue_merge(WT, "feature", "other"));
+    assert_claim_conflict(db.enqueue_merge_if_worktree_matches(
+        WT,
+        "feature",
+        "/private/repo",
+        "",
+        "other",
+    ));
+    assert_claim_conflict(db.update_merge_status(WT, "deferred", None, None, None));
+    assert_claim_conflict(db.replace_merge_status(WT, "deferred", &MergeStatusFields::default()));
+    assert_claim_conflict(db.set_merge_target(WT, "other"));
+    assert_claim_conflict(db.set_merge_agent_attempts(WT, 4));
+    assert_claim_conflict(db.remove_merge_entry(WT));
+
+    assert_eq!(db.list_merge_queue().unwrap(), queue_before);
+    assert_eq!(db.observe_merge_claim(WT).unwrap(), claim_before);
 }
 
 #[test]

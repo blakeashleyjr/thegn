@@ -25,7 +25,7 @@ use thegn_svc::plugin::{LoadedPlugin, SessionEvent, SessionWriter};
 use crate::chrome::FrameModel;
 use crate::plugin_damage::PluginDamage;
 use crate::plugins::inbox::{PluginInbox, RejectedRequest};
-use crate::plugins::{LoadedState, OneShotStart, PluginMsg, PluginRx, PluginsHost};
+use crate::plugins::{LoadedState, OneShotStart, PluginMsg, PluginRx, PluginsHost, SessionGen};
 
 const MAX_PENDING_ALERTS_PER_PLUGIN: usize = 16;
 // The inbox/toast row is display text, so keep its stricter host-side cap.
@@ -50,6 +50,12 @@ pub(crate) struct FeedBridge {
 pub(crate) struct PluginEntry {
     pub plugin: LoadedPlugin,
     pub runtime: PluginRuntime,
+    /// Generation of the resident process whose writer and events are live.
+    pub session: Option<SessionGen>,
+    /// Highest generation whose exit or replacement has been observed.
+    pub retired: Option<SessionGen>,
+    /// Exit received before the worker published that generation's writer.
+    pub pending_exit: Option<SessionGen>,
     /// `Some` while a resident session is alive; `None` for one-shot plugins
     /// and dead residents.
     pub writer: Option<SessionWriter>,
@@ -263,6 +269,9 @@ fn build_entry(st: LoadedState) -> PluginEntry {
     PluginEntry {
         runtime: PluginRuntime::new(negotiated),
         plugin: st.plugin,
+        session: st.session,
+        retired: None,
+        pending_exit: None,
         writer: st.writer,
         feed_bridge: None,
         contributions,
@@ -580,21 +589,50 @@ fn drain_with_responder(
                 }
                 damage.merge(PluginDamage::Structural);
             }
-            PluginMsg::Event { plugin, event } => match event {
-                SessionEvent::Message(m) => damage.merge(apply_message(state, &plugin, m)),
-                SessionEvent::Response(r) => {
-                    // Provider replies are resolved by the owning session before
-                    // enqueueing host events. Never route an old session's id
-                    // against a replacement bridge with the same plugin name.
-                    tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "unroutable response from originating plugin session");
+            PluginMsg::Event {
+                plugin,
+                session,
+                event,
+            } => {
+                let Some(entry) = state.plugins.get(&plugin) else {
+                    tracing::debug!(target: "thegn::plugin", plugin = %plugin, session, "event from a replaced plugin session dropped");
+                    continue;
+                };
+                let is_current = entry.session == Some(session);
+                let is_queued_after_exit =
+                    entry.session.is_none() && entry.retired == Some(session);
+                // A future generation's Exit must survive the inbox-before-
+                // Respawned race. Other messages from that generation are
+                // pre-activation output and remain dropped until its writer is
+                // installed.
+                let is_future_exit = entry.session.is_none()
+                    && matches!(&event, SessionEvent::Exit { .. })
+                    && entry.retired.is_none_or(|retired| session > retired);
+                if !(is_current || is_queued_after_exit || is_future_exit) {
+                    tracing::debug!(target: "thegn::plugin", plugin = %plugin, session, "event from a replaced plugin session dropped");
+                    continue;
                 }
-                SessionEvent::Junk(line) => {
-                    tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
+                match event {
+                    SessionEvent::Message(m) => damage.merge(apply_message(state, &plugin, m)),
+                    SessionEvent::Response(r) => {
+                        // Provider replies are resolved by the owning session before
+                        // enqueueing host events. Never route an old session's id
+                        // against a replacement bridge with the same plugin name.
+                        tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "unroutable response from originating plugin session");
+                    }
+                    SessionEvent::Junk(line) => {
+                        tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
+                    }
+                    SessionEvent::Exit { code } => {
+                        if is_current {
+                            damage.merge(handle_exit(state, model, host, &plugin, code, false));
+                        } else if is_future_exit && let Some(entry) = state.plugins.get_mut(&plugin)
+                        {
+                            entry.pending_exit = Some(session);
+                        }
+                    }
                 }
-                SessionEvent::Exit { code } => {
-                    damage.merge(handle_exit(state, model, host, &plugin, code, false));
-                }
-            },
+            }
             PluginMsg::OneShot { plugin, run } => match run {
                 Ok(run) => {
                     for line in &run.junk {
@@ -611,13 +649,39 @@ fn drain_with_responder(
                     tracing::warn!(target: "thegn::plugin", plugin = %plugin, error = %e, "one-shot run failed");
                 }
             },
-            PluginMsg::Respawned { plugin, writer } => {
+            PluginMsg::Respawned {
+                plugin,
+                session,
+                writer,
+            } => {
                 if !state.plugins.contains_key(&plugin) {
                     continue;
                 }
                 match writer {
                     Some(w) => {
+                        let Some(session) = session else {
+                            tracing::debug!(target: "thegn::plugin", plugin = %plugin, "respawned writer has no session generation; dropping it");
+                            continue;
+                        };
+                        if state
+                            .plugins
+                            .get(&plugin)
+                            .is_some_and(|entry| entry.pending_exit == Some(session))
+                        {
+                            let entry = state.plugins.get_mut(&plugin).expect("checked above");
+                            entry.pending_exit = None;
+                            entry.session = Some(session);
+                            damage.merge(handle_exit(state, model, host, &plugin, None, false));
+                            continue;
+                        }
                         let entry = state.plugins.get_mut(&plugin).expect("checked above");
+                        if let Some(retired) = entry.session.take() {
+                            entry.retired = Some(
+                                entry
+                                    .retired
+                                    .map_or(retired, |previous| previous.max(retired)),
+                            );
+                        }
                         entry.runtime.begin_generation();
                         entry.feed_bridge = None;
                         if entry
@@ -631,6 +695,8 @@ fn drain_with_responder(
                             ));
                         }
                         entry.writer = Some(w);
+                        entry.session = Some(session);
+                        entry.pending_exit = None;
                         send_activate(entry);
                         sync_provider_registry(state);
                         damage.merge(PluginDamage::Structural);
@@ -664,7 +730,9 @@ fn answer_rejected(
     rejected: RejectedRequest,
     responder: &mut impl FnMut(&PluginEntry, RpcResponse),
 ) {
-    if let Some(entry) = state.plugins.get(&rejected.plugin) {
+    if let Some(entry) = state.plugins.get(&rejected.plugin)
+        && entry.session == Some(rejected.session)
+    {
         responder(
             entry,
             RpcResponse::err(
@@ -673,7 +741,7 @@ fn answer_rejected(
             ),
         );
     } else {
-        tracing::debug!(target: "thegn::plugin", plugin = %rejected.plugin, id = rejected.id, "rejected request has no live plugin entry");
+        tracing::debug!(target: "thegn::plugin", plugin = %rejected.plugin, session = rejected.session, id = rejected.id, "rejected request from a replaced plugin session dropped");
     }
 }
 
@@ -691,6 +759,13 @@ fn handle_exit(
         return PluginDamage::None;
     };
     entry.writer = None;
+    if let Some(session) = entry.session.take() {
+        entry.retired = Some(
+            entry
+                .retired
+                .map_or(session, |retired| retired.max(session)),
+        );
+    }
     entry.feed_bridge = None;
     entry.bridge = None;
     sync_provider_registry(state);
@@ -2085,6 +2160,7 @@ mod tests {
             },
             negotiated,
             writer: None,
+            session: None,
         }
     }
 
@@ -2092,7 +2168,10 @@ mod tests {
         let mut state = PluginsState::new(thegn_core::config::Config::default());
         for s in specs {
             let id = s.manifest.id.as_str().to_string();
-            state.plugins.insert(id, build_entry(loaded_state(s)));
+            let mut entry = build_entry(loaded_state(s));
+            // Test fixtures model an already-live resident without spawning a process.
+            entry.session = (entry.plugin.spec.mode == PluginMode::Resident).then_some(1);
+            state.plugins.insert(id, entry);
         }
         state
     }
@@ -2187,6 +2266,7 @@ mod tests {
                 &mut state,
                 &mut model,
                 PluginMsg::Event {
+                    session: 1,
                     plugin: "p".into(),
                     event: SessionEvent::Message(msg(
                         "subscribe",
@@ -2220,6 +2300,14 @@ mod tests {
         drain_messages(state, model, [m])
     }
 
+    fn event(plugin: &str, session: u64, event: SessionEvent) -> PluginMsg {
+        PluginMsg::Event {
+            plugin: plugin.into(),
+            session,
+            event,
+        }
+    }
+
     fn drain_messages(
         state: &mut PluginsState,
         model: &mut FrameModel,
@@ -2233,8 +2321,108 @@ mod tests {
         drain(&mut rx, state, model, None)
     }
 
+    #[test]
+    fn stale_session_exit_after_reload_keeps_the_live_session() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        state.plugins.get_mut("p").unwrap().session = Some(2);
+        let mut model = FrameModel::default();
+
+        drain_one(
+            &mut state,
+            &mut model,
+            event("p", 1, SessionEvent::Exit { code: None }),
+        );
+
+        let entry = &state.plugins["p"];
+        assert_eq!(entry.restarts, 0);
+        assert!(!entry.disabled);
+        assert_eq!(entry.session, Some(2));
+    }
+
+    #[test]
+    fn stale_session_message_does_not_change_the_live_session() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        state.plugins.get_mut("p").unwrap().session = Some(2);
+        let before = statusbar_views(&state);
+        let mut model = FrameModel::default();
+
+        let damage = drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "p",
+                1,
+                SessionEvent::Message(msg(
+                    "update",
+                    serde_json::json!({
+                        "surface": "p/seg",
+                        "view": {"spans": [{"text": "stale", "role": "Default"}]}
+                    }),
+                )),
+            ),
+        );
+
+        assert_eq!(statusbar_views(&state), before);
+        assert_eq!(damage, PluginDamage::None);
+    }
+
+    #[test]
+    fn stale_session_rejected_request_is_not_answered() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        state.plugins.get_mut("p").unwrap().session = Some(2);
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        for _ in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
+            rx.inbox().push(
+                "p".into(),
+                1,
+                SessionEvent::Message(msg("emit", serde_json::json!({}))),
+            );
+        }
+        assert_eq!(
+            rx.inbox().push(
+                "p".into(),
+                1,
+                SessionEvent::Message(RpcMessage {
+                    id: Some(88),
+                    method: "io".into(),
+                    params: serde_json::json!({}),
+                }),
+            ),
+            crate::plugins::inbox::PushOutcome::Rejected
+        );
+        drop(tx);
+        let mut model = FrameModel::default();
+        let mut answered: usize = 0;
+
+        drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {
+            answered += 1;
+        });
+
+        assert_eq!(
+            answered, 0,
+            "a rejected request from session 1 is never answered to session 2"
+        );
+    }
+
+    #[test]
+    fn stale_session_current_exit_still_restarts() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        state.plugins.get_mut("p").unwrap().session = Some(2);
+        let mut model = FrameModel::default();
+
+        drain_one(
+            &mut state,
+            &mut model,
+            event("p", 2, SessionEvent::Exit { code: None }),
+        );
+
+        assert_eq!(state.plugins["p"].restarts, 1);
+        assert_eq!(state.plugins["p"].session, None);
+    }
+
     fn update_message(text: String) -> PluginMsg {
         PluginMsg::Event {
+            session: 1,
             plugin: "p".into(),
             event: SessionEvent::Message(msg(
                 "update",
@@ -2253,6 +2441,7 @@ mod tests {
         let (tx, mut rx) = crate::plugins::plugin_channel();
         for index in 0..MAX_PLUGIN_MESSAGES_PER_DRAIN + 4 {
             tx.send(PluginMsg::Event {
+                session: 1,
                 plugin: "p".into(),
                 event: SessionEvent::Message(msg(
                     "emit",
@@ -2286,6 +2475,7 @@ mod tests {
         let (tx, mut rx) = crate::plugins::plugin_channel();
         for index in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
             tx.send(PluginMsg::Event {
+                session: 1,
                 plugin: "p".into(),
                 event: SessionEvent::Message(msg(
                     "emit",
@@ -2295,6 +2485,7 @@ mod tests {
             .unwrap();
         }
         tx.send(PluginMsg::Event {
+            session: 1,
             plugin: "p".into(),
             event: SessionEvent::Message(RpcMessage {
                 id: Some(77),
@@ -2334,12 +2525,14 @@ mod tests {
         for _ in 0..crate::plugins::inbox::MAX_QUEUED_EVENTS_PER_PLUGIN {
             rx.inbox().push(
                 "p".into(),
+                1,
                 SessionEvent::Message(msg("emit", serde_json::json!({}))),
             );
         }
         assert_eq!(
             rx.inbox().push(
                 "p".into(),
+                1,
                 SessionEvent::Message(RpcMessage {
                     id: Some(77),
                     method: "io".into(),
@@ -2349,12 +2542,14 @@ mod tests {
             crate::plugins::inbox::PushOutcome::Rejected
         );
         tx.send(PluginMsg::Event {
+            session: 1,
             plugin: "p".into(),
             event: SessionEvent::Exit { code: None },
         })
         .unwrap();
         tx.send(PluginMsg::Respawned {
             plugin: "p".into(),
+            session: None,
             writer: None,
         })
         .unwrap();
@@ -2433,6 +2628,7 @@ mod tests {
             &mut state,
             &mut model,
             PluginMsg::Event {
+                session: 1,
                 plugin: "p".into(),
                 event: SessionEvent::Message(msg(
                     "update",
@@ -2453,6 +2649,7 @@ mod tests {
             &mut state,
             &mut model,
             PluginMsg::Event {
+                session: 1,
                 plugin: "p".into(),
                 event: SessionEvent::Message(msg(
                     "update",
@@ -2470,6 +2667,7 @@ mod tests {
             &mut state,
             &mut model,
             PluginMsg::Event {
+                session: 1,
                 plugin: "p".into(),
                 event: SessionEvent::Message(msg(
                     "update",
@@ -2493,6 +2691,7 @@ mod tests {
             &mut model,
             [
                 PluginMsg::Event {
+                    session: 1,
                     plugin: "p".into(),
                     event: SessionEvent::Message(msg(
                         "update",
@@ -2503,6 +2702,7 @@ mod tests {
                     )),
                 },
                 PluginMsg::Event {
+                    session: 1,
                     plugin: "p".into(),
                     event: SessionEvent::Message(msg(
                         "update",
@@ -2562,6 +2762,7 @@ mod tests {
             &mut state,
             &mut model,
             PluginMsg::Event {
+                session: 1,
                 plugin: "n".into(),
                 event: SessionEvent::Message(msg(
                     "notify",
@@ -2596,6 +2797,7 @@ mod tests {
         let mut state = state_with(vec![source("n"), source("m")]);
         let mut model = FrameModel::default();
         let notify = |plugin: &str| PluginMsg::Event {
+            session: 1,
             plugin: plugin.into(),
             event: SessionEvent::Message(msg(
                 "notify",
@@ -2649,6 +2851,7 @@ mod tests {
             &mut state,
             &mut model,
             PluginMsg::Event {
+                session: 1,
                 plugin: "p".into(),
                 event: SessionEvent::Message(msg(
                     "notify",
@@ -2675,6 +2878,7 @@ mod tests {
             &mut state,
             &mut model,
             PluginMsg::Event {
+                session: 1,
                 plugin: "p".into(),
                 event: SessionEvent::Message(msg(
                     "state.set",
@@ -2700,6 +2904,7 @@ mod tests {
                 &mut state,
                 &mut model,
                 PluginMsg::Event {
+                    session: 1,
                     plugin: "p".into(),
                     event: SessionEvent::Message(msg(
                         "register",
@@ -2937,6 +3142,7 @@ mod tests {
         let mut model = FrameModel::default();
         let (tx, mut rx) = crate::plugins::plugin_channel();
         tx.send(PluginMsg::Event {
+            session: 1,
             plugin: "p".into(),
             event: SessionEvent::Message(RpcMessage {
                 id: Some(22),
@@ -3053,6 +3259,7 @@ mod tests {
                 &mut state,
                 &mut model,
                 PluginMsg::Event {
+                    session: 1,
                     plugin: plugin.into(),
                     event: SessionEvent::Message(msg(
                         "update",
@@ -3074,10 +3281,12 @@ mod tests {
         let mut state = state_with(vec![seg_spec("p")]);
         let mut model = FrameModel::default();
         for i in 1..=3u32 {
+            state.plugins.get_mut("p").unwrap().session = Some(u64::from(i));
             drain_one(
                 &mut state,
                 &mut model,
                 PluginMsg::Event {
+                    session: u64::from(i),
                     plugin: "p".into(),
                     event: SessionEvent::Exit { code: Some(1) },
                 },
@@ -3086,10 +3295,12 @@ mod tests {
             assert!(!state.plugins["p"].disabled);
         }
         // Fourth crash exceeds the cap: disabled + user-visible status.
+        state.plugins.get_mut("p").unwrap().session = Some(4);
         drain_one(
             &mut state,
             &mut model,
             PluginMsg::Event {
+                session: 4,
                 plugin: "p".into(),
                 event: SessionEvent::Exit { code: Some(1) },
             },
@@ -3100,6 +3311,50 @@ mod tests {
             statusbar_views(&state).is_empty(),
             "disabled plugins render nothing"
         );
+    }
+
+    #[test]
+    fn stale_session_exit_before_its_respawn_still_restarts() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let entry = state.plugins.get_mut("p").unwrap();
+        entry.session = None;
+        entry.retired = Some(4);
+        entry.restarts = 1;
+        let mut model = FrameModel::default();
+        let (_tx, mut rx) = crate::plugins::plugin_channel();
+        rx.inbox()
+            .push("p".into(), 5, SessionEvent::Exit { code: Some(1) });
+
+        drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {});
+
+        assert_eq!(state.plugins["p"].restarts, 1);
+        assert_eq!(state.plugins["p"].pending_exit, Some(5));
+        assert_eq!(state.plugins["p"].session, None);
+    }
+
+    #[test]
+    fn queued_message_from_just_exited_session_is_applied() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let (_tx, mut rx) = crate::plugins::plugin_channel();
+        rx.inbox().push(
+            "p".into(),
+            1,
+            SessionEvent::Message(msg(
+                "update",
+                serde_json::json!({
+                    "surface": "p/seg",
+                    "view": {"spans": [{"text": "final", "role": "Default"}]}
+                }),
+            )),
+        );
+        rx.inbox()
+            .push("p".into(), 1, SessionEvent::Exit { code: None });
+
+        drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {});
+
+        assert_eq!(statusbar_views(&state)[0].1.text_content(), "final");
+        assert_eq!(state.plugins["p"].session, None);
     }
 
     #[test]
@@ -3135,6 +3390,7 @@ mod tests {
                 &mut state,
                 &mut model,
                 PluginMsg::Event {
+                    session: 1,
                     plugin: "ghost".into(),
                     event: SessionEvent::Message(msg("update", serde_json::json!({}))),
                 }
@@ -3146,6 +3402,7 @@ mod tests {
                 &mut state,
                 &mut model,
                 PluginMsg::Event {
+                    session: 1,
                     plugin: "ghost".into(),
                     event: SessionEvent::Junk("println! debris".into()),
                 }

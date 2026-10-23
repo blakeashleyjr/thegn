@@ -4057,6 +4057,9 @@ fn source_control_report(cfg: &Config) {
     } else {
         outln!("  rerere        {} (queue-private cache)", yn(mq.rerere));
     }
+    for hazard in crate::build_cache::shared_target_hazards(cfg, &mq.gate_target_dir) {
+        outln!("  shared target {hazard}");
+    }
 }
 
 fn source_control_json(cfg: &Config) -> serde_json::Value {
@@ -4099,6 +4102,10 @@ fn source_control_json(cfg: &Config) -> serde_json::Value {
         "signing": signing,
         "rerere": mq.rerere,
         "rerere_cache": rerere_cache,
+        "shared_target_hazards": crate::build_cache::shared_target_hazards(
+            cfg,
+            &mq.gate_target_dir
+        ),
     })
 }
 
@@ -5828,8 +5835,29 @@ args = ["--verbose"]
         assert_eq!(v["sign_commits"], false);
         assert!(v["signing"].is_null(), "no probe when signing is off");
         assert!(v["rerere_cache"].is_null());
+        assert_eq!(v["shared_target_hazards"], serde_json::json!([]));
         assert!(v["custom_merge_drivers"].is_array());
         source_control_report(&Config::default());
+    }
+
+    #[test]
+    fn source_control_json_lists_shared_target_hazards() {
+        let cfg = Config {
+            disk: thegn_core::config::DiskConfig {
+                shared_target_dir: "/tmp/shared".into(),
+                ..Default::default()
+            },
+            merge_queue: thegn_core::config::MergeQueueConfig {
+                gate_target_dir: "/tmp/gate".into(),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let json = source_control_json(&cfg);
+        let hazards = json["shared_target_hazards"].as_array().unwrap();
+        assert_eq!(hazards.len(), 2);
+        assert!(hazards[0].as_str().unwrap().contains("shared_target_dir"));
+        assert!(hazards[1].as_str().unwrap().contains("gate_target_dir"));
     }
 
     #[test]

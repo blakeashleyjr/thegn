@@ -34,6 +34,9 @@ use crate::vpn::{OciRuntime, exec_in};
 
 pub type ConflictHook = Box<dyn FnOnce() + Send>;
 
+/// Group signals are sent only while the leader is unreaped; its zombie pins
+/// the pid and process-group identity. Once reaped, every stop returns
+/// `AlreadyExited` without a signal syscall.
 #[derive(Clone)]
 pub struct StopHandle {
     child: Arc<Mutex<ShareChild>>,
