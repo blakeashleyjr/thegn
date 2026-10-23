@@ -657,7 +657,7 @@ fn clear_rows(
             Err(error)
                 if error
                     .chain()
-                    .any(|cause| cause.to_string() == thegn_core::store::MERGE_CLAIM_ACTIVE) =>
+                    .any(|cause| cause.is::<thegn_core::store::MergeClaimActive>()) =>
             {
                 kept.push(row.worktree.clone());
             }
@@ -1444,7 +1444,7 @@ mod tests {
         let result = clear_rows(&rows, |row| {
             attempted.push(row.worktree.clone());
             if row.worktree == "/repo/claimed" {
-                anyhow::bail!(thegn_core::store::MERGE_CLAIM_ACTIVE);
+                return Err(anyhow::Error::new(thegn_core::store::MergeClaimActive));
             }
             Ok(())
         });
@@ -1455,6 +1455,65 @@ mod tests {
         assert_eq!(kept.kept, ["/repo/claimed"]);
         assert!(error.to_string().contains("cleared 2 queued branch(es)"));
         assert!(error.to_string().contains("/repo/claimed"));
+    }
+
+    #[test]
+    fn claim_conflict_clear_rows_matches_the_typed_refusal() {
+        let rows = [land_row("queued", None, "local", "claimed")];
+        let result = clear_rows(&rows, |_| {
+            Err(anyhow::Error::new(thegn_core::store::MergeClaimActive).context("dequeue"))
+        });
+        let error = result.unwrap_err();
+        let kept = error.downcast_ref::<ClearKeptClaimed>().unwrap();
+        assert_eq!(kept.kept, ["/repo/worktree"]);
+    }
+
+    #[test]
+    fn claim_conflict_clear_rows_ignores_a_lookalike_message() {
+        let rows = [land_row("queued", None, "local", "claimed")];
+        let result = clear_rows(&rows, |_| {
+            Err(anyhow::anyhow!(thegn_core::store::MERGE_CLAIM_ACTIVE))
+        });
+        assert!(
+            matches!(result, Err(error) if error.to_string() == thegn_core::store::MERGE_CLAIM_ACTIVE)
+        );
+    }
+
+    #[test]
+    fn claim_conflict_dequeue_of_a_claimed_row_is_typed_and_keeps_the_row() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree(
+            "feature",
+            "/private/repo",
+            "/private/repo/feature",
+            "feature",
+            None,
+            None,
+        )
+        .unwrap();
+        db.enqueue_merge("/private/repo/feature", "feature", "main")
+            .unwrap();
+        db.admit_merge_claim(&MergeClaimRequest {
+            worktree: "/private/repo/feature".into(),
+            branch: "feature".into(),
+            repo_root: "/private/repo".into(),
+            target_branch: "main".into(),
+            location: String::new(),
+            expected_status: "queued".into(),
+            lease_until_ms: util::now_ms() + 60_000,
+            owner_hint: Some("worker-a".into()),
+        })
+        .unwrap()
+        .unwrap();
+
+        let error = dequeue_worktree(&Config::default(), &db, Path::new("/private/repo/feature"))
+            .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<thegn_core::store::MergeClaimActive>())
+        );
+        assert_eq!(db.list_merge_queue().unwrap().len(), 1);
     }
 
     #[test]
