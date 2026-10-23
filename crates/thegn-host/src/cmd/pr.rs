@@ -169,16 +169,65 @@ fn forges() -> std::sync::Arc<thegn_svc::forge::ForgeSet> {
     crate::forge_handle::get()
 }
 
+fn registered_spelling(
+    resolved: &std::path::Path,
+    registered: &[String],
+    canonical: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if registered
+        .iter()
+        .any(|path| path == resolved.to_string_lossy().as_ref())
+    {
+        return None;
+    }
+
+    let target = canonical(resolved)?;
+    let mut matches = registered.iter().filter(|path| {
+        // Canonicalization is a best-effort identity probe; an unresolvable entry cannot match.
+        canonical(std::path::Path::new(path)).as_ref() == Some(&target)
+    });
+    let matched = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(matched))
+}
+
+fn registered_worktree_spelling(resolved: &std::path::Path) -> Option<std::path::PathBuf> {
+    use thegn_core::store::WorkspaceStore as _;
+
+    let rows = match Db::open().and_then(|db| db.worktrees()) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::debug!(target: "thegn::pr", %error, "registered worktree spelling unavailable");
+            return None;
+        }
+    };
+    let paths = rows
+        .into_iter()
+        .map(|row| row.worktree)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    // Canonicalization only probes identity; a missing or inaccessible entry cannot be mapped.
+    registered_spelling(resolved, &paths, |path| std::fs::canonicalize(path).ok())
+}
+
 /// The worktree a `thegn pr` verb acts on. Without `--worktree` this is the usual default; an explicit
 /// `--worktree` must be a directory inside a git worktree and resolves to that worktree's root, so a
 /// typo or a deleted path is refused before anything reaches the forge.
 fn target_worktree(arg: Option<String>) -> Result<std::path::PathBuf> {
-    target_worktree_with(
+    let explicit = arg.is_some();
+    let resolved = target_worktree_with(
         arg,
         resolve_worktree,
         thegn_core::repo::worktree_root_for_cwd,
         |path| !matches!(GitLoc::for_worktree(path), GitLoc::Local(_)),
-    )
+    )?;
+    Ok(if explicit {
+        registered_worktree_spelling(&resolved).unwrap_or(resolved)
+    } else {
+        resolved
+    })
 }
 
 fn target_worktree_with(
@@ -207,6 +256,12 @@ fn target_worktree_with(
             }
         }
     }
+}
+
+/// The location a mutating verb acts on; an unreadable location refuses before any forge call.
+fn mutation_loc(worktree: Option<String>, verb: &str) -> Result<GitLoc> {
+    let wt = target_worktree(worktree)?;
+    GitLoc::for_worktree_op(&wt, verb).map_err(anyhow::Error::msg)
 }
 
 fn status(worktree: Option<String>) -> Result<()> {
@@ -260,7 +315,7 @@ fn create(
     web: bool,
     fill: bool,
 ) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr create")?;
     let fill = fill || (title.is_none() && body.is_none() && !web);
     let opts = CreateOpts {
         title,
@@ -291,7 +346,7 @@ fn open(worktree: Option<String>) -> Result<()> {
 }
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr approve")?;
     let registry = forges();
     let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -328,7 +383,7 @@ fn merge(
     auto: bool,
     yes: bool,
 ) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr merge")?;
     let forges = forges();
     let forge = forges.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -461,7 +516,7 @@ pub(crate) fn merge_outcome_text(
 }
 
 fn rerun(worktree: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr rerun-checks")?;
     match forges().for_loc(&loc).rerun_failed(&loc, PrRef::Current) {
         Ok(0) => msg::info("no failed checks to re-run"),
         Ok(n) => msg::info(&format!("re-ran {n} failed workflow run(s)")),
@@ -480,7 +535,7 @@ fn reviews(worktree: Option<String>) -> Result<()> {
 }
 
 fn comment(worktree: Option<String>, body: String) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr comment")?;
     match forges().for_loc(&loc).comment(&loc, PrRef::Current, &body) {
         Ok(()) => msg::info("comment posted"),
         Err(e) => msg::die(&format!("pr comment failed: {}", e.describe())),
@@ -489,7 +544,7 @@ fn comment(worktree: Option<String>, body: String) -> Result<()> {
 }
 
 fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr review")?;
     let registry = forges();
     let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -537,7 +592,7 @@ fn diff(worktree: Option<String>, json: bool) -> Result<()> {
 }
 
 fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr ready")?;
     // `undo` converts the PR back to a draft; otherwise mark it ready.
     match forges().for_loc(&loc).set_draft(&loc, PrRef::Current, undo) {
         Ok(()) if undo => msg::info("PR converted to draft"),
@@ -548,7 +603,7 @@ fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
 }
 
 fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr auto-merge")?;
     match forges()
         .for_loc(&loc)
         .set_auto_merge(&loc, PrRef::Current, !disable, MergeMethod::Squash)
@@ -1006,6 +1061,64 @@ mod tests {
     }
 
     #[test]
+    fn registered_spelling_maps_a_symlink_to_the_registered_path() {
+        let registered = vec!["/data/wt".to_owned()];
+        let resolved =
+            super::registered_spelling(std::path::Path::new("/home/u/link"), &registered, |path| {
+                match path.to_str() {
+                    Some("/home/u/link") | Some("/data/wt") => Some(PathBuf::from("/data/wt")),
+                    _ => None,
+                }
+            });
+        assert_eq!(resolved, Some(PathBuf::from("/data/wt")));
+
+        let registered = vec!["/home/u/link".to_owned()];
+        let nested =
+            super::registered_spelling(std::path::Path::new("/data/wt"), &registered, |path| {
+                match path.to_str() {
+                    Some("/data/wt") | Some("/home/u/link") => Some(PathBuf::from("/data/wt")),
+                    _ => None,
+                }
+            });
+        assert_eq!(nested, Some(PathBuf::from("/home/u/link")));
+    }
+
+    #[test]
+    fn registered_spelling_keeps_an_already_registered_path() {
+        let registered = vec!["/data/wt".to_owned()];
+        let resolved =
+            super::registered_spelling(std::path::Path::new("/data/wt"), &registered, |_| {
+                panic!("canonicalization is unnecessary for an already-registered path")
+            });
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn registered_spelling_is_none_for_an_unregistered_or_ambiguous_root() {
+        let registered = vec!["/data/other".to_owned()];
+        let unregistered =
+            super::registered_spelling(std::path::Path::new("/data/wt"), &registered, |path| {
+                match path.to_str() {
+                    Some("/data/wt") => Some(PathBuf::from("/data/wt")),
+                    _ => None,
+                }
+            });
+        assert_eq!(unregistered, None);
+
+        let registered = vec!["/data/wt".to_owned(), "/home/u/link".to_owned()];
+        let ambiguous =
+            super::registered_spelling(std::path::Path::new("/resolved/wt"), &registered, |path| {
+                match path.to_str() {
+                    Some("/resolved/wt") | Some("/data/wt") | Some("/home/u/link") => {
+                        Some(PathBuf::from("/data/wt"))
+                    }
+                    _ => None,
+                }
+            });
+        assert_eq!(ambiguous, None);
+    }
+
+    #[test]
     fn no_worktree_flag_keeps_the_default_resolution() {
         let resolved = target_worktree_with(
             None,
@@ -1015,5 +1128,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/default"));
+    }
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "creates an isolated git worktree fixture"
+    )]
+    fn mutation_loc_refuses_when_the_location_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let output = thegn_core::util::git_cmd(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "commit.gpgsign=false", "init", "-q"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let result = super::mutation_loc(Some(repo.display().to_string()), "pr merge");
+        assert!(matches!(result, Err(error) if format!("{error:#}").contains("pr merge refused")));
     }
 }

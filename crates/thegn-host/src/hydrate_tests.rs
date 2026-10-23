@@ -1523,7 +1523,8 @@ fn devcontainer_status_ignores_repo_host_environment_that_weakens_backend() {
         repo.path(),
         None,
         &thegn_core::config_resolve::Approvals::deny_all(),
-    );
+    )
+    .expect("no failed read");
     assert_eq!(environment.name, "default");
     assert_eq!(environment.sandbox.backend, SandboxBackend::Bwrap);
     assert!(environment.allows_devcontainer());
@@ -3227,5 +3228,35 @@ fn startup_registration_missing_dir_is_never_registered() {
     assert_eq!(
         startup_registration(Err(anyhow::anyhow!("x")), false),
         StartupRegistration::NotADir
+    );
+}
+
+#[test]
+fn unreadable_env_chips_mark_the_chip_unknown() {
+    let cfg = thegn_core::config::Config {
+        env: std::collections::BTreeMap::from([(
+            "m0".into(),
+            thegn_core::config::EnvConfig {
+                placement: thegn_core::config::PlacementMode::Provider,
+                ..thegn_core::config::EnvConfig::default()
+            },
+        )]),
+        ..thegn_core::config::Config::default()
+    };
+    let (kind, label, backend) = unreadable_env_chips(&cfg, Some("database is locked")).unwrap();
+    assert_eq!(kind.as_deref(), Some("env?"));
+    assert!(label.unwrap().contains("database is locked"));
+    assert!(backend.is_empty());
+    assert!(unreadable_env_chips(&cfg, None).is_none());
+}
+
+#[test]
+fn unreadable_env_chips_keep_a_local_only_config() {
+    assert!(
+        unreadable_env_chips(
+            &thegn_core::config::Config::default(),
+            Some("database is locked"),
+        )
+        .is_none()
     );
 }

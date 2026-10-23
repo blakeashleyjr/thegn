@@ -419,10 +419,99 @@ fn try_reserve(
     )
 }
 
+fn with_fresh_host(mut hosts: Vec<HostSnapshot>, fresh: HostSnapshot) -> Vec<HostSnapshot> {
+    if !hosts.iter().any(|snapshot| snapshot.host == fresh.host) {
+        hosts.push(fresh);
+    }
+    hosts
+}
+
+fn fresh_host_unreserved(
+    on_exhaustion: OnExhaustion,
+    host_name: &str,
+    why: &str,
+) -> Result<Option<HostBinding>, HostFailure> {
+    let msg =
+        format!("placement: autoscale created {host_name} but {why}; not creating another host");
+    match on_exhaustion {
+        OnExhaustion::Error => Err(HostFailure {
+            step: HostStep::Connect,
+            error: msg,
+            retryable: true,
+        }),
+        OnExhaustion::Queue | OnExhaustion::Reject => {
+            thegn_core::msg::warn(&msg);
+            Ok(None)
+        }
+    }
+}
+
+fn fresh_provision_failure(
+    on_exhaustion: OnExhaustion,
+    lane: &str,
+    error: &str,
+) -> Result<Option<HostBinding>, HostFailure> {
+    let reason = format!("provisioning failed ({error})");
+    fresh_host_unreserved(on_exhaustion, lane, &reason)
+}
+
 /// Binding for a chosen host id (named hosts only — the engine never places
 /// onto anonymous or cloud hosts).
 fn binding_for(cfg: &Config, host: &HostId) -> Option<HostBinding> {
     cfg.host_binding(host.config_name()?)
+}
+
+/// Resolve a live tenancy against the loaded config first, then the DB-backed
+/// host catalog. A catalog read failure must never release a live reservation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "short-lived local result of one lookup; boxing buys nothing"
+)]
+enum StickyBinding {
+    Found(HostBinding),
+    Missing,
+    Unavailable,
+}
+
+fn sticky_binding(
+    cfg: &Config,
+    db: &Db,
+    tenancy: &TenancyRow,
+    on_exhaustion: OnExhaustion,
+) -> Result<StickyBinding, HostFailure> {
+    if let Some(binding) = binding_for(cfg, &tenancy.host) {
+        return Ok(StickyBinding::Found(binding));
+    }
+    let Some(name) = tenancy.host.config_name() else {
+        if let Err(error) = db.tenancy_release(&tenancy.sandbox, unix_now()) {
+            tracing::debug!(%error, "release tenancy for host missing from config");
+        }
+        return Ok(StickyBinding::Missing);
+    };
+    match crate::autoscale::db_host_def(db, name) {
+        Ok(Some((_, binding))) => Ok(StickyBinding::Found(binding)),
+        Ok(None) => {
+            if let Err(error) = db.tenancy_release(&tenancy.sandbox, unix_now()) {
+                tracing::debug!(%error, "release tenancy for host missing from config");
+            }
+            Ok(StickyBinding::Missing)
+        }
+        Err(error) => {
+            let message =
+                format!("placement: could not read host {name} for live tenancy: {error:#}");
+            match on_exhaustion {
+                OnExhaustion::Error => Err(HostFailure {
+                    step: HostStep::Connect,
+                    error: message,
+                    retryable: true,
+                }),
+                OnExhaustion::Queue | OnExhaustion::Reject => {
+                    thegn_core::msg::warn(&message);
+                    Ok(StickyBinding::Unavailable)
+                }
+            }
+        }
+    }
 }
 
 /// Engine placement for one worktree. `Ok(None)` ⇒ not engine-placed (caller
@@ -440,23 +529,22 @@ pub(crate) fn place(
     let Ok(db) = Db::open() else {
         return Ok(None); // no state DB ⇒ engine can't account: status quo
     };
+    let resolved = resolved_for(cfg, &db, worktree, envc);
     // Sticky: a live tenancy pins this worktree to its host across calls and
     // restarts (the decision is made once, not per resolve).
     if let Ok(Some(t)) = db.tenancy_for(worktree)
         && t.state != TenancyState::Released
     {
-        if let Some(b) = binding_for(cfg, &t.host) {
-            return Ok(Some(b));
+        match sticky_binding(cfg, &db, &t, resolved.on_exhaustion)? {
+            StickyBinding::Found(binding) => return Ok(Some(binding)),
+            StickyBinding::Missing => {}
+            StickyBinding::Unavailable => return Ok(None),
         }
-        // Host vanished from config: release the orphan row; a Commit caller
-        // re-decides below, a Query caller reports "not placed".
-        let _ = db.tenancy_release(worktree, unix_now()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     if intent == PlaceIntent::Query {
         return Ok(None);
     }
 
-    let resolved = resolved_for(cfg, &db, worktree, envc);
     if !resolved.enabled {
         return Ok(None);
     }
@@ -549,32 +637,67 @@ pub(crate) fn place(
                 record_event(&db, worktree, "provision", &template.lane_key(), &trace);
                 match crate::autoscale::provision_managed(cfg, &db, &template) {
                     Ok(host_name) => {
-                        // Reserve on the fresh host, then let ensure_ready
-                        // drive it (Unknown → Ready) like any other host.
-                        let hosts = build_snapshot(cfg, &db, &resolved, false);
-                        let id = HostId::named(&host_name);
+                        let (hc, binding) = match crate::autoscale::db_host_def(&db, &host_name) {
+                            Ok(Some(found)) => found,
+                            Ok(None) => {
+                                return fresh_host_unreserved(
+                                    resolved.on_exhaustion,
+                                    &host_name,
+                                    "its host definition is missing",
+                                );
+                            }
+                            Err(error) => {
+                                return fresh_host_unreserved(
+                                    resolved.on_exhaustion,
+                                    &host_name,
+                                    &format!("its host definition could not be read ({error:#})"),
+                                );
+                            }
+                        };
+                        // The loaded Config predates the create: add the fresh host to the
+                        // snapshot so the reservation can land on it.
+                        let fresh = snapshot_host(
+                            &db,
+                            &hc,
+                            &binding,
+                            &resolved,
+                            cfg.placement.independent_safety_pct,
+                            cfg.placement.headroom_ttl_secs,
+                            false,
+                        );
+                        let hosts =
+                            with_fresh_host(build_snapshot(cfg, &db, &resolved, false), fresh);
                         if try_reserve(
                             &db,
                             &hosts,
-                            &id,
+                            &binding.id,
                             worktree,
                             &zone,
                             TenancyMode::Packed,
                             &resolved,
-                        ) && let Some(b) = cfg
-                            .host_binding(&host_name)
-                            .or_else(|| crate::autoscale::db_host_binding(&host_name))
-                        {
-                            return Ok(Some(b));
+                        ) {
+                            record_event(
+                                &db,
+                                worktree,
+                                mode_tag(TenancyMode::Packed),
+                                binding.id.as_str(),
+                                &trace,
+                            );
+                            return Ok(Some(cfg.host_binding(&host_name).unwrap_or(binding)));
                         }
-                        continue;
+                        return fresh_host_unreserved(
+                            resolved.on_exhaustion,
+                            &host_name,
+                            "no slot could be reserved on it",
+                        );
                     }
                     Err(e) => {
+                        let error = format!("{e:#}");
+                        let lane = template.lane_key();
                         thegn_core::msg::warn(&format!(
-                            "placement: autoscale lane {} failed: {e}",
-                            template.lane_key()
+                            "placement: autoscale lane {lane} failed: {e}"
                         ));
-                        continue;
+                        return fresh_provision_failure(resolved.on_exhaustion, &lane, &error);
                     }
                 }
             }
@@ -893,6 +1016,7 @@ mod tests {
     use thegn_core::host::HostStep;
     use thegn_core::host_machine::HostState;
     use thegn_core::host_probe::Headroom;
+    use thegn_core::store::HostCapacityRow;
 
     fn spec(cpu_milli: u32, mem_mb: u64) -> HostSpec {
         HostSpec { cpu_milli, mem_mb }
@@ -915,6 +1039,29 @@ mod tests {
             cpu_milli,
             mem_mb,
             tenants: 0,
+        }
+    }
+
+    fn managed_snapshot(host: HostId) -> HostSnapshot {
+        HostSnapshot {
+            host,
+            ownership: HostOwnership::Managed,
+            capacity: HostCapacity {
+                ownership: HostOwnership::Managed,
+                spec: None,
+                overcommit_cpu_pct: 100,
+                overcommit_mem_pct: 100,
+                reserved: ReservedTotals::default(),
+                measured: None,
+            },
+            ready: false,
+            failed: false,
+            draining: false,
+            trust: TrustClass::T0HostShell,
+            arch: None,
+            tenant_zones: BTreeSet::new(),
+            tenants: 0,
+            has_dedicated_tenant: false,
         }
     }
 
@@ -1102,5 +1249,156 @@ mod tests {
             50,
         );
         assert_eq!(s.expect("spec").mem_mb, 2048);
+    }
+
+    #[test]
+    fn fresh_host_joins_the_reservation_snapshot() {
+        let first = managed_snapshot(HostId::named("host-a"));
+        let fresh = managed_snapshot(HostId::named("host-b"));
+
+        let joined = with_fresh_host(vec![first], fresh.clone());
+
+        assert_eq!(joined.len(), 2);
+        assert_eq!(joined.last(), Some(&fresh));
+    }
+
+    #[test]
+    fn fresh_host_is_not_duplicated_in_the_snapshot() {
+        let existing = managed_snapshot(HostId::named("host-a"));
+
+        let joined = with_fresh_host(vec![existing.clone()], existing.clone());
+
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined.first(), Some(&existing));
+    }
+
+    #[test]
+    fn fresh_managed_host_is_reservable_once_in_the_snapshot() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let name = "tg-auto-cx32-0000000000000001";
+        let hc = HostConfig {
+            reach: HostReach::Local,
+            ..HostConfig::default()
+        };
+        db.put_host_def(name, &hc, 1).unwrap();
+        db.capacity_put(&HostCapacityRow {
+            host: HostId::named(name),
+            ownership: HostOwnership::Managed,
+            spec: Some(HostSpec {
+                cpu_milli: 64_000,
+                mem_mb: 262_144,
+            }),
+            overcommit_cpu_pct: 0,
+            overcommit_mem_pct: 0,
+            provider: "hetzner".into(),
+            template: "cx32".into(),
+            created_at: Some(1),
+            measured: None,
+            updated_at: 1,
+        })
+        .unwrap();
+        let (hc, binding) = crate::autoscale::db_host_def(&db, name).unwrap().unwrap();
+        let resolved = resolve_placement(&Config::default(), None, None);
+
+        assert!(!try_reserve(
+            &db,
+            &[],
+            &binding.id,
+            "/wt/a",
+            "",
+            TenancyMode::Packed,
+            &resolved,
+        ));
+        let hosts = with_fresh_host(
+            Vec::new(),
+            snapshot_host(&db, &hc, &binding, &resolved, 100, 60, false),
+        );
+        assert!(try_reserve(
+            &db,
+            &hosts,
+            &binding.id,
+            "/wt/a",
+            "",
+            TenancyMode::Packed,
+            &resolved,
+        ));
+    }
+
+    #[test]
+    fn fresh_host_sticky_binding_survives_a_stale_config() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let name = "tg-auto-cx32-0000000000000001";
+        let host_config = HostConfig {
+            reach: HostReach::Local,
+            ..HostConfig::default()
+        };
+        db.put_host_def(name, &host_config, 1).unwrap();
+
+        let cfg = Config::default();
+        let resolved = resolve_placement(&cfg, None, None);
+        let tenancy = TenancyRow {
+            sandbox: "/wt/fresh".into(),
+            host: HostId::named(name),
+            worktree: "/wt/fresh".into(),
+            zone: String::new(),
+            mode: TenancyMode::Packed,
+            req: resolved.req,
+            state: TenancyState::Reserved,
+            reserved_at: 1,
+            activated_at: None,
+            released_at: None,
+        };
+        db.tenancy_force(&tenancy, 1).unwrap();
+
+        let binding = sticky_binding(&cfg, &db, &tenancy, resolved.on_exhaustion).unwrap();
+
+        assert!(matches!(binding, StickyBinding::Found(found) if found.id == tenancy.host));
+        assert_eq!(
+            db.tenancy_for("/wt/fresh").unwrap().unwrap().state,
+            TenancyState::Reserved
+        );
+    }
+
+    #[test]
+    fn fresh_host_unreserved_honours_on_exhaustion() {
+        let host_name = "tg-auto-cx32-0000000000000001";
+        let refused = fresh_host_unreserved(
+            OnExhaustion::Error,
+            host_name,
+            "provisioning failed (resolve fresh host ip)",
+        );
+        assert!(matches!(refused, Err(failure)
+            if failure.error.contains(host_name)
+                && failure.error.contains("provisioning failed")
+                && failure.error.contains("not creating another host")));
+
+        for policy in [OnExhaustion::Queue, OnExhaustion::Reject] {
+            assert!(matches!(
+                fresh_host_unreserved(policy, host_name, "provisioning failed"),
+                Ok(None)
+            ));
+        }
+    }
+
+    #[test]
+    fn fresh_provision_failure_returns_once_with_lane_context() {
+        let lane = "tpl:hetzner/cx32";
+        let refused = fresh_provision_failure(
+            OnExhaustion::Error,
+            lane,
+            "resolve fresh host ip: provider unavailable",
+        );
+        assert!(matches!(refused, Err(failure)
+            if failure.error.contains(lane)
+                && failure.error.contains("provisioning failed")
+                && failure.error.contains("provider unavailable")
+                && failure.error.contains("not creating another host")));
+
+        assert!(matches!(
+            fresh_provision_failure(OnExhaustion::Queue, lane, "provider unavailable"),
+            Ok(None)
+        ));
     }
 }

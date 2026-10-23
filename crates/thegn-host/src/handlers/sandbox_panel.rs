@@ -167,6 +167,45 @@ pub(crate) fn resolve_choice(
     }))
 }
 
+fn run_control(
+    cfg_sb: &SandboxConfig,
+    wt: &std::path::Path,
+    req: &ControlRequest,
+) -> (String, thegn_core::notification::Priority) {
+    // Preserve the lenient resolver's path spelling for non-UTF-8 worktrees,
+    // but keep the DB lookup checked so an unreadable location still refuses.
+    let worktree_path = wt.to_string_lossy();
+    match GitLoc::for_worktree_checked(std::path::Path::new(worktree_path.as_ref())) {
+        Err(error) => (
+            format!(
+                "{}: {} refused: cannot read where this worktree lives ({error})",
+                req.name, req.action
+            ),
+            thegn_core::notification::Priority::Alert,
+        ),
+        Ok(loc) => {
+            let ok = thegn_core::sandbox::container_control(
+                cfg_sb,
+                &loc,
+                req.backend,
+                &req.name,
+                req.action,
+            );
+            let message = if ok {
+                format!("{}: {} ✓", req.name, req.action)
+            } else {
+                format!("{}: {} failed", req.name, req.action)
+            };
+            let priority = if ok {
+                thegn_core::notification::Priority::Info
+            } else {
+                thegn_core::notification::Priority::Alert
+            };
+            (message, priority)
+        }
+    }
+}
+
 pub(crate) fn spawn_control(
     cfg_sb: SandboxConfig,
     wt: std::path::PathBuf,
@@ -175,24 +214,7 @@ pub(crate) fn spawn_control(
     waker: TerminalWaker,
 ) {
     tokio::task::spawn_blocking(move || {
-        let loc = GitLoc::for_worktree(&wt);
-        let ok = thegn_core::sandbox::container_control(
-            &cfg_sb,
-            &loc,
-            req.backend,
-            &req.name,
-            req.action,
-        );
-        let message = if ok {
-            format!("{}: {} ✓", req.name, req.action)
-        } else {
-            format!("{}: {} failed", req.name, req.action)
-        };
-        let priority = if ok {
-            thegn_core::notification::Priority::Info
-        } else {
-            thegn_core::notification::Priority::Alert
-        };
+        let (message, priority) = run_control(&cfg_sb, &wt, &req);
         if let Err(error) = refresh_tx.send(RefreshKind::Toast { message, priority }) {
             tracing::debug!(target: "thegn::sandbox", %error, "container action toast could not be delivered");
         }
@@ -210,6 +232,25 @@ mod tests {
     use super::*;
     use crate::menu::MenuOutcome;
     use termwiz::input::{KeyCode, Modifiers};
+
+    #[test]
+    fn control_refuses_when_the_location_is_unreadable() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+
+        let (message, priority) = run_control(
+            &SandboxConfig::default(),
+            std::path::Path::new("/wt/x"),
+            &ControlRequest {
+                name: "c1".into(),
+                backend: Backend::Podman,
+                action: "stop",
+            },
+        );
+
+        assert!(message.contains("c1: stop refused"));
+        assert_eq!(priority, thegn_core::notification::Priority::Alert);
+    }
 
     fn container(name: &str, ours: bool, backend: &str) -> ContainerInfo {
         ContainerInfo {

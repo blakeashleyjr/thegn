@@ -2902,3 +2902,65 @@ fn repo_slug_checked_is_none_without_a_directory_name() {
         Some("foo".to_string())
     );
 }
+
+#[test]
+fn configured_launch_survives_a_held_write_lock() {
+    with_temp_state("launch-held-slug-lock", || {
+        use std::time::Duration;
+        use thegn_core::store::WorkspaceStore;
+
+        let db = thegn_core::db::Db::open().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let wt = worktree.path().to_string_lossy().into_owned();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+
+        let state_db = thegn_core::util::xdg_state_home().join("thegn/thegn.db");
+        let writer = rusqlite::Connection::open(state_db).unwrap();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO repo_slugs(repo_path, slug) VALUES('/other','o');",
+            )
+            .unwrap();
+        let mut cfg = cfg_with(&[("worker", "claude")], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        cfg.sandbox.inject_devshell = false;
+
+        std::thread::scope(|scope| {
+            let commit = scope.spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                writer.execute_batch("COMMIT;").unwrap();
+            });
+            let result = launch_spec_full(
+                &cfg,
+                &wt,
+                None,
+                "worker",
+                true,
+                LaunchExtras {
+                    suppress_agent_record: true,
+                    ..Default::default()
+                },
+            );
+            assert!(result.is_ok(), "configured launch refused: {result:#?}");
+            commit.join().unwrap();
+        });
+    });
+}
+
+#[test]
+fn repo_slug_checked_reads_an_existing_slug_without_writing() {
+    use thegn_core::store::WorkspaceStore;
+
+    let db = Db::open_memory().unwrap();
+    assert_eq!(db.slug_for_repo("/x/app", "app").unwrap(), "app");
+
+    let existing = db
+        .transaction(|db| repo_slug_checked(db, Path::new("/x/app")))
+        .unwrap();
+    assert_eq!(existing, Some("app".into()));
+    assert_eq!(
+        db.repo_slug_rows().unwrap(),
+        vec![("/x/app".into(), "app".into())]
+    );
+}

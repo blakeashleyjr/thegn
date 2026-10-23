@@ -644,3 +644,143 @@ fn retry_and_remove_of_a_missing_row_record_nothing() {
     db.remove_merge_entry(WORKTREE).unwrap();
     assert!(db.merge_queue_events(WORKTREE, 10).unwrap().is_empty());
 }
+
+#[test]
+fn del_worktree_retires_the_events_of_an_unclaimed_row() {
+    let db = seeded();
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::Rearmed
+    );
+
+    db.del_worktree(WORKTREE).unwrap();
+
+    assert!(db.list_merge_queue().unwrap().is_empty());
+    assert!(db.merge_queue_events(WORKTREE, 10).unwrap().is_empty());
+}
+
+#[test]
+fn del_worktree_keeps_events_while_a_drain_holds_the_row() {
+    let db = seeded();
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::Rearmed
+    );
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET claim_owner='other-drain', claim_phase='claimed_no_child', \
+             claim_lease_until_ms=?2 WHERE worktree=?1",
+            params![WORKTREE, crate::util::now_ms() + 60_000],
+        )
+        .unwrap();
+
+    db.del_worktree(WORKTREE).unwrap();
+
+    assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+    assert_eq!(db.merge_queue_events(WORKTREE, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn del_worktree_retires_events_of_a_removed_row() {
+    let db = seeded();
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::Rearmed
+    );
+    db.remove_merge_entry(WORKTREE).unwrap();
+    assert_eq!(db.merge_queue_events(WORKTREE, 10).unwrap().len(), 2);
+
+    db.del_worktree(WORKTREE).unwrap();
+
+    assert!(db.merge_queue_events(WORKTREE, 10).unwrap().is_empty());
+}
+
+#[test]
+fn rename_retires_old_path_events_only_without_a_queue_row() {
+    let removed = seeded();
+    assert_eq!(
+        removed.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::Rearmed
+    );
+    removed.remove_merge_entry(WORKTREE).unwrap();
+    removed
+        .rename_worktree(
+            WORKTREE,
+            "/private/status-renamed",
+            "app/renamed",
+            "renamed",
+        )
+        .unwrap();
+    assert!(removed.merge_queue_events(WORKTREE, 10).unwrap().is_empty());
+
+    let queued = seeded();
+    assert_eq!(
+        queued.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::Rearmed
+    );
+    queued
+        .rename_worktree(
+            WORKTREE,
+            "/private/status-renamed",
+            "app/renamed",
+            "renamed",
+        )
+        .unwrap();
+    assert_eq!(queued.merge_queue_events(WORKTREE, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn rename_rolls_back_registry_update_when_event_retirement_fails() {
+    let db = seeded();
+    db.remove_merge_entry(WORKTREE).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO worktrees(worktree,location) VALUES(?1,'local')",
+            [WORKTREE],
+        )
+        .unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_merge_event_retirement
+             BEFORE DELETE ON merge_queue_events
+             BEGIN
+                 SELECT RAISE(ABORT, 'event retirement failed');
+             END;",
+        )
+        .unwrap();
+
+    assert!(
+        db.rename_worktree(
+            WORKTREE,
+            "/private/status-renamed",
+            "app/renamed",
+            "renamed",
+        )
+        .is_err()
+    );
+
+    let old_rows: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM worktrees WHERE worktree=?1",
+            [WORKTREE],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let new_rows: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM worktrees WHERE worktree='/private/status-renamed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_rows, 1,
+        "failed event retirement must roll back the rekey"
+    );
+    assert_eq!(
+        new_rows, 0,
+        "failed event retirement must leave no new registry row"
+    );
+}

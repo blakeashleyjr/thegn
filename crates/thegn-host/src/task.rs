@@ -1012,6 +1012,49 @@ fn infer_matcher(command: &str) -> String {
     .into()
 }
 
+/// Resolve the worktree placement before running a repository test task.
+pub fn run_task_resolved(
+    worktree: PathBuf,
+    generation: u64,
+    task: TestTask,
+    limits: &LimitsConfig,
+) -> TaskOutcome {
+    let loc = match GitLoc::for_worktree_op(&worktree, "test run") {
+        Ok(loc) => loc,
+        Err(error) => return failed_test_run_outcome(worktree, generation, task, error),
+    };
+    run_task(worktree, &loc, generation, task, limits)
+}
+
+/// Resolve the worktree placement before discovering repository test targets.
+pub fn discover_tests_resolved(
+    worktree: PathBuf,
+    generation: u64,
+    task: TestTask,
+    limits: &LimitsConfig,
+) -> DiscoveryOutcome {
+    let loc = match GitLoc::for_worktree_op(&worktree, "test discovery") {
+        Ok(loc) => loc,
+        Err(error) => return failed_test_discovery_outcome(worktree, generation, task, error),
+    };
+    discover_tests(worktree, &loc, generation, task, limits)
+}
+
+/// Resolve the worktree placement before running a job task.
+pub(crate) fn run_job_resolved(
+    worktree: PathBuf,
+    generation: u64,
+    task: TestTask,
+    limits: &LimitsConfig,
+    live: Option<JobLiveSink>,
+) -> TaskOutcome {
+    let loc = match GitLoc::for_worktree_op(&worktree, "job run") {
+        Ok(loc) => loc,
+        Err(error) => return failed_test_run_outcome(worktree, generation, task, error),
+    };
+    run_job(worktree, &loc, generation, task, limits, live)
+}
+
 pub fn run_task(
     worktree: PathBuf,
     loc: &GitLoc,
@@ -3036,6 +3079,46 @@ mod tests {
             "non-test funcs excluded: {labels:?}"
         );
         let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn run_task_resolved_refuses_when_the_location_is_unreadable() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let wt = private_temp_dir();
+        let task = TestTask::new("marker", "touch ran.marker", "generic");
+        let outcome = run_task_resolved(wt.path().to_path_buf(), 1, task, &uncapped());
+        assert_eq!(outcome.exit_code, None);
+        assert!(outcome.stdout_stderr.contains("test run refused"));
+        assert!(!wt.path().join("ran.marker").exists());
+    }
+
+    #[test]
+    fn run_job_resolved_refuses_when_the_location_is_unreadable() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let wt = private_temp_dir();
+        let task = TestTask::new("marker", "touch ran.marker", "generic");
+        let outcome = run_job_resolved(wt.path().to_path_buf(), 1, task, &uncapped(), None);
+        assert_eq!(outcome.exit_code, None);
+        assert!(outcome.stdout_stderr.contains("job run refused"));
+        assert!(!wt.path().join("ran.marker").exists());
+    }
+
+    #[test]
+    fn discover_tests_resolved_refuses_when_the_location_is_unreadable() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let wt = private_temp_dir();
+        let task = TestTask::new("marker", "touch ran.marker", "generic");
+        let outcome = discover_tests_resolved(wt.path().to_path_buf(), 1, task, &uncapped());
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("test discovery refused"))
+        );
+        assert!(outcome.nodes.is_empty());
     }
 }
 
