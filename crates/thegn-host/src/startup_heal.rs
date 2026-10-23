@@ -82,6 +82,7 @@ pub(crate) fn spawn(
     waker: TerminalWaker,
     refresh_tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
     gate: std::sync::Arc<HealGate>,
+    workspaces_dir: Option<PathBuf>,
 ) {
     let spawned = std::thread::Builder::new()
         .name("thegn-heal".into())
@@ -92,6 +93,21 @@ pub(crate) fn spawn(
             if healed {
                 let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: consumer may be gone
                 let _ = waker.wake(); // best-effort: loop may be gone
+            }
+            if let Some(dir) = workspaces_dir {
+                let reclaimed = crate::workspace_create::sweep_stale_clone_staging(
+                    &dir,
+                    std::process::id(),
+                    crate::platform::pid_alive,
+                );
+                if reclaimed > 0 {
+                    tracing::info!(
+                        target: "thegn::startup",
+                        reclaimed,
+                        path = %dir.display(),
+                        "reclaimed stale workspace clone staging"
+                    );
+                }
             }
         });
     if let Err(e) = spawned {
