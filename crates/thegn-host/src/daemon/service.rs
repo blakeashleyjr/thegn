@@ -108,7 +108,7 @@ pub(crate) struct DaemonService {
     /// bookkeeping consumes it.
     pub idle_tx: mpsc::UnboundedSender<IdleTransition>,
     /// Signals the daemon run loop to exit gracefully.
-    pub shutdown: Arc<tokio::sync::Notify>,
+    pub shutdown: tokio_util::sync::CancellationToken,
     /// The daemon's config. The merge verbs resolve `[merge_queue]` PER REPO
     /// from it (a daemon serves many repos, so a single `MergeQueueConfig`
     /// snapshot was already the wrong shape — it could not honor a
@@ -3131,7 +3131,7 @@ impl ControlApi for DaemonService {
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.shutdown_sessions().await;
-            self.shutdown.notify_waiters();
+            self.shutdown.cancel();
         })
     }
 }
@@ -3969,7 +3969,7 @@ mod tests {
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
             idle_tx,
-            shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             config: Arc::new(config),
             profile_root: std::env::temp_dir().join(format!(
                 "tg-daemon-service-{}-{}",
