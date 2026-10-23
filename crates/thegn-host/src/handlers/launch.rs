@@ -293,12 +293,14 @@ mod tests {
     use super::*;
     use crate::hydrate::RefreshKind;
 
-    fn setup() -> (
+    type Setup = (
         crate::testenv::IsolatedState,
         std::sync::Arc<crate::notify::NotifyState>,
         tokio::sync::mpsc::UnboundedReceiver<RefreshKind>,
         Vec<Box<dyn std::any::Any>>,
-    ) {
+    );
+
+    fn setup() -> Setup {
         let isolated = crate::testenv::IsolatedState::new();
         let (waker, keepalive_a, keepalive_b) =
             crate::platform::sound_process::test_support::test_waker();
