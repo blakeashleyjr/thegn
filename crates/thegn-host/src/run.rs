@@ -23529,11 +23529,20 @@ async fn event_loop<T: Terminal>(
                                     let did_stop =
                                         !stopped.removed.is_empty() || !stopped.pending.is_empty();
                                     crate::handlers::host::queue_stopped_share_deletes(
-                                        wt,
+                                        wt.clone(),
                                         stopped.removed,
                                     );
+                                    crate::handlers::host::queue_stopped_share_failures(
+                                        wt,
+                                        stopped.failed.clone(),
+                                    );
                                     model.shares = current_share_views(&share_supervisor, &session);
-                                    model.status = if !did_stop {
+                                    model.status = if let Some(failure) = stopped.failed.first() {
+                                        format!(
+                                            "Share :{port} could not be stopped: {}; press x to retry",
+                                            failure.error
+                                        )
+                                    } else if !did_stop {
                                         format!("Share :{port} was already down")
                                     } else {
                                         format!("Stopped share :{port}")

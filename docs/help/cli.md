@@ -251,6 +251,8 @@ If run detail is unavailable or the job is not listed, `ci logs` still prints
 the log without a job name or head, warns, and does not cache it. With `--json`,
 the warnings are in a `warnings` array (empty for a cached log); the control
 API's `ci.logs` reply carries the same field.
+The daemon/API `ci.logs` `tail_lines` argument can narrow `[ci] log_tail_lines`,
+but a larger value is clamped to that setting. A value of `0` is refused.
 
 When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
 `ci logs` warn that the list is incomplete and show the first jobs. Incomplete
@@ -318,6 +320,11 @@ that the record matches its package, version, binary path and current SHA-256.
 A missing record triggers a reinstall; when a record is mismatched, unreadable
 or readable by other users, the tool refuses it and names the install directory
 to remove before reinstalling.
+For each managed npm or cargo tool, `thegn doctor` shows `verified`, `no
+install record` (the next use reinstalls through the contained installer),
+`MISMATCH` (refused until reinstalled), `not installed`, or `n/a (release
+download)`. `doctor --json` includes `provenance` and `provenance_reason`. The
+check is the same one used before launch and does not change the install.
 
 `thegn supervise plan --all` and `thegn supervise status --all` read one
 newest-first roster page. `--limit` defaults to 2048 and is capped at 4096;
@@ -351,6 +358,10 @@ that occupy a slot. Both are terse by default and take `--json`.
 `thegn dispatch list` and `thegn dispatch status --all` show the newest 2048 rows by
 default; `--limit` sets the page size and `--before <row>` uses the cursor printed
 on stderr when older rows follow.
+The shared JSON output for `thegn dispatch list --json` and
+`thegn dispatch status --json` escapes terminal-sensitive controls and Unicode
+format characters with JSON escapes such as `\uXXXX`; ordinary Unicode remains
+readable.
 
 The dispatch roster closes its own loop: `thegn dispatch verify <id>` checks
 a finished row's artifact (exists under the worktree, tracked by git — exit

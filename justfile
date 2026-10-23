@@ -1423,18 +1423,18 @@ release-package-validate tag assets:
     python3 packaging/release.py render --tag "$tag" --assets-dir "$assets" --output-dir "$tmp/output"
     echo "release-package-validate: ok ($tag)"
 
-# Build the release archive + checksum for THIS machine's target, byte-for-byte
-# the way `.github/workflows/release.yml` does (taiki-e/upload-rust-binary-action):
+# Build the release archive + checksum for THIS machine's target, with the
+# workflow's archive layout and feature set. This does not reproduce the CI build:
+# a Nix-shell Linux build may use a /nix/store ELF interpreter and therefore runs
+# only on this host. Use `just release-verify <tag> host_only=1` to rehearse its
+# archive layout while allowing that host-only finding.
 # `cargo build --release --locked -p thegn-host --bin thegn --target <t>`, then a
 # tar.gz with the binary at the ROOT (no leading directory — the Homebrew formula
 # does `bin.install "thegn"`), plus `<archive>.sha256` holding `shasum -a 256`
 # output. The checksum filename deliberately has no `.tar.gz` infix, matching the
 # action and what RELEASING.md tells users to verify.
-#
-# Run this before tagging: with remote CI paused, it is the only way to find out
-# that a release build is broken BEFORE the tag is public. Output lands in
-# target/release-artifacts/.
-#   just release-artifacts v0.1.0-alpha.3
+# Output lands in target/release-artifacts/.
+#   just release-artifacts v<workspace version>
 release-artifacts tag:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1456,23 +1456,31 @@ release-artifacts tag:
     (cd "$out" && shasum -a 256 -c "$archive.sha256")
     echo "  $out/$archive.tar.gz"
     echo "  $out/$archive.sha256"
-    echo "sha256: $(cut -d' ' -f1 <"$out/$archive.sha256")   # paste into packaging/homebrew/thegn.rb"
+    echo "sha256: $(cut -d' ' -f1 <"$out/$archive.sha256")"
 
-# Verify a built release archive end to end: the layout the Homebrew formula
-# assumes, that the binary runs, and (on macOS) that it carries no quarantine
-# attribute. Catches a broken archive before a tag rather than after.
-release-verify tag:
+# Verify the archive with the package job's strict validator, check that its
+# binary is not tied to a Nix store interpreter, and run it on this host.
+release-verify tag host_only="":
     #!/usr/bin/env bash
     set -euo pipefail
+    tag_arg="{{tag}}"; tag="${tag_arg#tag=}"
+    host_only_arg="{{host_only}}"; host_only="${host_only_arg#host_only=}"
     target="$(rustc -vV | sed -n 's|host: ||p')"
-    out="$PWD/target/release-artifacts"; archive="thegn-{{tag}}-$target"
+    out="$PWD/target/release-artifacts"; archive="thegn-$tag-$target"
     (cd "$out" && shasum -a 256 -c "$archive.sha256")
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
     tar xzf "$out/$archive.tar.gz" -C "$tmp"
-    [ -x "$tmp/thegn" ] || { echo "archive has no root-level 'thegn' — the Homebrew formula's bin.install would fail" >&2; exit 1; }
-    for f in LICENSE-MIT LICENSE-APACHE; do
-      [ -f "$tmp/$f" ] || { echo "archive is missing $f — thegn is dual-licensed and the text must ship with the binary" >&2; exit 1; }
+    [ -x "$tmp/thegn" ] || { echo "release archive must contain an executable root-level 'thegn'" >&2; exit 1; }
+    for f in LICENSE-MIT LICENSE-APACHE README.md; do
+      [ -f "$tmp/$f" ] || { echo "archive is missing '$f' required by packaging/release.json" >&2; exit 1; }
     done
+    manager="$(python3 packaging/release_rehearsal.py manager --target "$target")"
+    python3 packaging/release.py validate --tag "$tag" --assets-dir "$out" --manager "$manager"
+    if [ -n "$host_only" ]; then
+      python3 packaging/release_rehearsal.py check-binary --binary "$tmp/thegn" --host-only
+    else
+      python3 packaging/release_rehearsal.py check-binary --binary "$tmp/thegn"
+    fi
     got="$("$tmp/thegn" --version)"
     echo "runs: $got"
     case "$(uname -s)" in

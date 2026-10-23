@@ -108,7 +108,7 @@ for the current job list and gates.
 The workflow uses this expression for Linux jobs:
 
 ```yaml
-runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }}
 ```
 
 ### Opt in to self-hosted Linux runners
@@ -118,6 +118,12 @@ Only after the security prerequisites above are met, run:
 ```sh
 gh variable set CI_RUNS_ON --body '["self-hosted", "ageless"]'
 ```
+
+Self-hosted runners are selected only for `workflow_dispatch` runs of
+`blakeashleyjr/thegn`; re-runs keep that event, and GitHub restricts dispatch and
+re-run to users with write access. Every other event and every fork uses
+GitHub-hosted `ubuntu-latest`, even if triggers such as `push`, `pull_request`,
+`pull_request_target`, or `schedule` are restored.
 
 ### Roll back to the GitHub-hosted default
 

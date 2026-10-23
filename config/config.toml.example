@@ -1100,7 +1100,8 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # that key. The profile git/gh/gnupg directories are mounted read-only in
 # sandboxes; a pane that must write them (for example `gh auth login` or GnuPG
 # signing) needs an explicit `[sandbox] mounts` grant. Startup refuses when the
-# profile state or credential directories cannot be created.
+# profile state or credential directories cannot be created. Startup also
+# refuses if `ssh/id` exists but is not an owner-only (chmod 600) regular file.
 #
 # CAVEAT: the firewall is only as strong as the loosest sandbox setting —
 # `[sandbox] file_access = "all"`, `network = "host"`, or SSH agent forwarding
@@ -3367,7 +3368,7 @@ ready_timeout_secs = 20
 # secret = "env:BORE_SECRET"    # shared HMAC (secrets-ref); must match the server
 # remote_port = 0               # port to bind on the relay; 0 = relay chooses
 # local_host = "127.0.0.1"      # interface the dev server listens on
-# extra_args = []               # extra `bore local` flags
+# extra_args = []               # extra `bore local` flags (never --secret/-s: use `secret`)
 
 # [share.frp]    # provider = "frp" — https://github.com/fatedier/frp (self-host)
 # server_addr = "frps.example.com"   # your frps host (required)

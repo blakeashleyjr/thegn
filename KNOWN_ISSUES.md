@@ -1,215 +1,90 @@
-# Known issues — 0.1.0-alpha.2
+# Known issues — public alpha
 
-This is a public **alpha**. The items below are known, tracked, and deferred to
-a later release — each is a narrow edge case or a deliberate design trade-off.
-The pre-alpha audit (73 verified findings) is otherwise fully remediated; full
-detail lives in
-[`docs/superpowers/specs/alpha-audit-2026-08.md`](docs/superpowers/specs/alpha-audit-2026-08.md).
-A second pass before `0.1.0-alpha.2` covered packaging, licensing, CI and gate
-coverage rather than runtime behavior — see that release's
-[`CHANGELOG.md`](CHANGELOG.md) entry. It left no known issues open.
+thegn is in public alpha. This page lists known limitations that can affect
+users; it is not a complete list of bugs or planned work. See the
+[`CHANGELOG.md`](CHANGELOG.md) for release changes and
+[`README.md`](README.md#install) for installation instructions. Please report
+reproducible problems that are not listed here.
 
-If you hit one of these it's a known limitation — but a reproducible report is
-still welcome.
+## Supported platforms and install channels
+
+- **Linux x86_64 is supported.** Install from the GitHub release tarball
+  (GNU or musl) or the Nix flake. See [README install](README.md#install) and
+  [release instructions](RELEASING.md).
+- **macOS on Apple silicon is best-effort.** An unsigned, unnotarized archive
+  is built, but the macOS test job is opt-in and has not completed a run; the
+  on-device checklist is unfinished. The `apple` sandbox backend has unit
+  tests but no automated runtime coverage, and macOS has no CPU caps.
+  Set Option as Meta/Alt in your terminal; `thegn doctor` names the setting.
+  See [terminal compatibility](docs/help/terminal-compatibility.md). For a
+  browser-downloaded archive, clear quarantine before first launch with
+  `xattr -dr com.apple.quarantine ./thegn`.
+- **Windows is deferred.** No Windows binary is published.
+- **Homebrew and AUR publication are pending owner setup.** They are not
+  install channels yet; see [RELEASING.md](RELEASING.md#deferred-release-channels).
+- Standalone `.deb` and `.rpm` assets are attached to releases, but their clean
+  system install, upgrade, and uninstall rehearsal is pending. They are not a
+  supported install channel. See the
+  [release install-path table](RELEASING.md#install-paths-this-enables).
 
 ## UI
 
-- **Tab strip overflow.** When the center tab strip is narrow (panel open at
-  ~100 columns) chips that don't fit are dropped from the strip without an
-  overflow indicator; the tabs exist and `Alt-Left/Right` reach them, and they
-  reappear when the strip widens. Tracked as tasks.md 745.
-- **Keys during a tab's bring-up are dropped.** Typing into a brand-new tab
-  before its shell has materialized loses the keys (by design — there is no
-  pane yet); host chords still dispatch. `32-resurrect` waits for the prompt.
+- **Tab-strip overflow.** When the center strip is too narrow, tabs that do
+  not fit are omitted without an overflow indicator. The tabs remain available
+  through navigation and return when the strip widens. Tracked in
+  [`tasks.md`](tasks.md) under “Tab-strip overflow indicator.”
+- **Keys typed before a pane launch spec is ready are dropped.** During lazy
+  materialization, input typed before the spec arrives does not reach the new
+  shell. This is most visible during sandbox or provider bring-up.
 
-## Performance (event loop)
+## Performance
 
-Idle CPU stays ~0% and pane bring-up (creation, crash respawn, the new-terminal
-wizard) resolves sandboxes off-thread — the seconds-to-minutes container work is
-gone from the loop. A few small, deliberately **synchronous** DB writes remain
-on structural events (this is the sanctioned best-effort-persist family; git,
-not the DB, is the source of truth):
+- The startup-shell watchdog's clean-shell fallback resolves a launch spec on
+  the event loop. This happens only after a new shell has produced no output by
+  its deadline.
 
-- `persist_session_layout` — a whole-session persist on structural changes
-  (documented; the lightweight focus-change persist already runs off-loop).
-  ~50–100 ms in release on a large session.
-- Tiny per-event upserts on the loop: the new-terminal wizard's terminal-row
-  persist and the sidebar `ui_state` write. Each is a single `Db::open` + one
-  small upsert (a few ms), bounded by the DB's 5 s busy-timeout ceiling under a
-  concurrent writer.
-- The startup-shell **watchdog's clean-shell fallback** (fired only when a
-  freshly materialized shell produces no output before its deadline) still
-  resolves its launch spec synchronously — an exceptional failure-recovery
-  path.
+## Daemon and remote serving
 
-None of these block indefinitely, and all are one-shot reactions to a
-user-driven structural change (a switch/open/close), not steady-state work.
-
-## Daemon / remote serving (`thegn serve`)
-
-`thegn serve` (remote thin clients) is the newest surface. Hardened
-substantially in `0.1.0-alpha.1` (loopback-default bind, owner-only socket + run-dir,
-control-plane worktree-path confinement, protocol version-skew handshake, no
-idle-exit while serving, no scrollback re-replay on reconnect, TOCTOU-safe
-socket election), and disabling the daemon with persisted daemon-backed panes
-now claims each persisted session exactly once (respawning it in-process and
-stopping the daemon copy) instead of duplicating panes.
-
-The September remote/client reconciliation records these known limitations:
-
-- TCP serving is plaintext; bearer tokens provide authorization, not
-  confidentiality. Use loopback, a VPN, or an SSH/TLS terminator.
-- Local unix-socket admin trust is protected by owner-only directory/socket
-  modes, not an independent peer-credential check; the chmod steps are
-  best-effort.
-- The default `route_to_host` merge path is not end-to-end complete for true
-  remote worktrees: control credential provisioning and target-host path
-  handling remain open.
-- The broad remote surface/parity audit is being decomposed under Linear
-  THE-41; RDP/VNC/Telnet/SFTP/serial/public-sharing/multi-user parity is not a
-  current product promise.
-
-Treat additional surprises on this surface as reportable bugs.
-
-Note: launching with `THEGN_NO_DAEMON=1` while daemon-backed sessions are
-persisted now actively stops those daemon sessions as it claims them (previously
-they were silently orphaned).
+- **Direct `thegn serve` traffic is plaintext.** Direct mode defaults to a
+  loopback bind and refuses non-loopback plaintext unless the explicit unsafe
+  override is enabled. Use a same-host TLS terminator or an encrypted tunnel
+  for remote access; bearer credentials do not provide confidentiality.
+- **`route_to_host` (dev channel) may hold off-host provider worktrees from
+  automatic draining.** If the host cannot verify the provider source, it holds
+  the row for review rather than folding it. See
+  [`docs/help/merge-queue.md`](docs/help/merge-queue.md#across-hosts).
+- Remote and provider surfaces remain under the deferred THE-41 audit; do not
+  treat RDP, VNC, Telnet, SFTP, serial, public sharing, or multi-user parity as
+  product promises.
 
 ## Concurrency
 
-- A few best-effort persists (focus / active-tab pointer, corner-pane parsing)
-  have benign unordered-writer races; last-writer-wins, no corruption. (The
-  merge-gate cross-process race is now fixed with an flock.)
-- Closing a **local** pane whose child both ignores `SIGHUP` and has stopped
-  reading its stdin (a wedged process with a full input queue) can leave its
-  per-pane writer thread parked on the final flush, holding one file descriptor,
-  until the child dies. Bounded (one thread + fd per such pane) and strictly
-  better than the pre-alpha behavior (which blocked the whole UI on that flush);
-  the daemon-backed transport (the default) is unaffected.
+- **Active-tab persistence can race across rapid switches.** Focus changes are
+  written by independent background tasks, so overlapping writes can finish
+  out of order. The in-memory selection is unaffected; after a crash or forced
+  kill, the restored active tab may be one switch stale. A clean quit re-persists
+  the full layout.
 
-## Platform
+## Security model limits
 
-- **x86_64 Linux is the supported platform.** Prebuilt binaries ship for
-  linux-gnu and linux-musl, and — from the next tagged release —
-  aarch64-apple-darwin.
-- **macOS is best-effort, Windows is unvalidated.** macOS has been run on a real
-  Mac and its CI job is re-enabled (opt-in) but has still never completed a run;
-  Windows has not been run interactively at all, and publishes no binaries.
-  - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and now compiles
-    and passes its tests. Until recently the repo could not even be _cloned_ on
-    Windows: `crates/thegn-core/src/store/aux.rs` used a reserved DOS device
-    name, so git refused it with `invalid path`. With that renamed,
-    `cargo check --workspace` passes on msvc; the named-pipe daemon IPC tests
-    pass (a bind through the pipe-name teardown window was mistaking its own
-    predecessor for a live daemon); and the Job-Object process-scoping tests
-    pass. What has **not** completed is the release build, which the opt-in
-    msvc job has so far run out of time on, and nobody has run thegn
-    interactively on Windows — so no binaries ship and it stays unsupported.
-    When it does land: native panes only (container sandboxing is a Linux/WSL2
-    feature) and a modern terminal is required (Windows Terminal; legacy
-    conhost is refused).
-  - **macOS** now builds, tests and runs on Apple silicon, but is not yet
-    validated enough to support. What has been done on a real M-series Mac:
-    `nix develop` builds (it previously could not be entered at all — `unar`,
-    a yazi archive-preview helper, fails to link on aarch64-darwin and took the
-    whole dev shell with it); `just build`/`test`/`lint`/`doc-check`/`smoke`/
-    `check-cross` all pass; the release binary launches and reaches first frame
-    in ~250-290ms; the pane daemon binds, serves and warm-reattaches; and the
-    `daemon_panes` e2e spec passes. A first pass of real-device bugs is fixed —
-    silent file-delivery corruption from GNU-only `stat -c`, host probes that
-    reported every Mac as an idle 0 KB box, pairing URLs that advertised
-    `localhost`, repo resolution broken by the `/tmp`→`/private/tmp` symlink, a
-    pane-daemon socket that could exceed `sun_path`, a sandbox chain that
-    selected stopped runtimes, and a `proc_listchildpids` count-vs-bytes bug
-    that meant the relaunch hint never captured a foreground job.
-    A second on-device pass fixed: the **`apple` sandbox backend, which could
-    never start a container** (`container image exists` / `container pull` are
-    both exit-64 non-commands — Apple puts image verbs under the `image` noun —
-    and `--security-opt`/`--pids-limit` are flags its `run` rejects outright);
-    a chain resolver that **re-walked the whole chain once per candidate**, so a
-    Mac with podman/docker/`container` installed-but-dormant printed six
-    identical host-fallback warnings per pane spawn; a **diff-watcher filter
-    that panicked** on any worktree under a symlinked prefix (`/tmp`,
-    `/var/folders`, `~/code → /Volumes/…`), because FSEvents delivers
-    canonicalized paths and `matched_path_or_any_parents` asserts its argument
-    is under the matcher root — taking the watcher thread down with it; a font
-    picker that **scanned only the top level** of the macOS font directories and
-    so found neither `/System/Library/Fonts/Supplemental` (290 faces) nor
-    nix-darwin's `Nix Fonts/<hash>-<pkg>/share/fonts/…`; the bundled Alacritty
-    profile **silently degrading itself** to 256-color/no-undercurl by forcing
-    `TERM` without also identifying the emulator; a charge-capped Mac reporting
-    **"not on AC"** while plugged in; and a host `timeout` call that failed with
-    a bare `ENOENT` on any Mac without GNU coreutils.
-    Added: thread QoS (`platform::qos`), so off-loop workers are eligible for
-    the efficiency cores instead of competing with the render loop; `LC_TERMINAL`
-    detection, the one terminal-identity signal that survives ssh; a macOS
-    section in `thegn doctor`; and a darwin arm for the idle-CPU perf harness,
-    which had never run on this platform at all.
-    **Set your terminal to send Alt for Option.** macOS composes characters
-    with Option by default, so thegn's Alt-based chords (`Alt-w`, `Alt-o`,
-    `Alt-s`, `Alt-.`, every `Ctrl-Alt` toggle) type `∑`-style glyphs instead
-    and read as dead keys. Terminal.app: Settings → Profiles → Keyboard → "Use
-    Option as Meta key"; Ghostty: `macos-option-as-alt = true`; Alacritty:
-    `[window] option_as_alt = "Both"`; kitty: `macos_option_as_alt yes`.
-    `thegn doctor` names the setting for the terminal you are in. The
-    profiles thegn ships now set this, so `tg --standalone` and the generated
-    `thegn.app` are fine — the setting is for the terminal you launch thegn in.
-    See the in-app help ([`docs/help/terminal-compatibility.md`](docs/help/terminal-compatibility.md)).
-    What is still missing: **the macOS CI job has still never completed a run.**
-    It was hard-disabled because it OOM-killed building `openspec`; that is fixed
-    (it runs on a lean `devShells.ci` — toolchain + just + nextest, no
-    openspec/muse), but it stays off by default on the same `extras` gate as
-    windows/e2e while remote CI is paused, so nothing is enforced until someone
-    runs `gh workflow run ci.yml --ref main -f extras=true`. **`just ci` also
-    does not pass on a Mac**: it includes `e2e`, and all 45 committed muse
-    baselines are `__linux` while `--ci` treats a missing baseline as a failure —
-    so darwin baselines need recording (`just e2e-update`) or the leg needs to
-    self-skip like `sandbox-e2e` does. The `apple` backend now emits correct
-    argv, but has no automated coverage beyond unit tests — it still wants an
-    on-device run with `container system start`. There are no CPU caps on macOS
-    at all — not because `nice` is missing but because the wrapper that would
-    apply it only ever wraps `bwrap` (Linux-only) or a local `Backend::None`
-    (which never produces a spec), so no macOS pane is ever wrapped; `doctor`
-    now reports that rather than naming a mechanism that cannot fire. Thermal
-    sensors and the allocator trim both work now (IOHID and
-    `malloc_zone_pressure_relief` respectively).
-    Binaries ship from the next tag; and the
-    interactive half of the
-    [on-device checklist](CONTRIBUTING.md#on-device-checklist) — resize by hand,
-    pane restore across a real quit, opening a PR in a browser, the media badge,
-    notifications and the chime firing visibly — still needs a human at a
-    terminal. `just check-cross` covers every crate that builds without a darwin
-    cross C toolchain, but `thegn-core`/`-svc`/`-host` still can't be checked
-    from Linux, because their build scripts (`ring`, bundled sqlite) need a real
-    darwin one.
-- Cloud execution providers, remote worktrees over SSH, the Observe dashboards,
-  the placement engine, and non-GitHub issue trackers are **dev-channel only** in
-  this release (`THEGN_CHANNEL=dev`).
-- **Docker Desktop and WSL/WSL2 sandbox binds are best-effort, not verified.**
-  The bind check and its remedies are tested on Linux (podman, docker) and macOS
-  (podman, docker via colima, Apple `container`); on Docker Desktop and WSL an
-  unshared bind falls through to the runtime's generic error.
+- From a source checkout, `just security-e2e` runs the sandbox-to-control
+  regression suite on Linux with `bwrap` and working user namespaces. It is not
+  part of `just ci` or the default CI gate.
+- `sealed-tunnel` refuses to launch when a VPN is configured because thegn
+  cannot yet enforce that the tunnel is the only network route. Docker Desktop
+  and WSL/WSL2 sandbox binds are best-effort and unverified.
+- Provider placements without an enforceable isolation request are reported as
+  `provider-managed (unverified)`; their isolation is not verified by thegn.
+- The `remote`, `providers`, `observe`, `placement`, and `voice` subsystems are
+  dev-channel only. Their hardening and behavior are not public-alpha promises.
 
 ## Distribution
 
-- Prebuilt binaries cover **x86_64 Linux (gnu + musl)** and
-  **aarch64-apple-darwin**. The darwin leg is back in the matrix now that the
-  target builds and the `macos` CI job is runnable again (opt-in per run with
-  `extras: true`, on a lean dev shell so it no longer OOMs building openspec). windows-msvc is still
-  out — that job has never executed. Nix
-  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` work on
-  every supported platform.
-- **macOS release archives are unsigned and unnotarized**, deliberately: see the
-  decision in [`RELEASING.md`](RELEASING.md). Homebrew, Nix and the locally
-  generated `thegn.app` are all unaffected (none of them quarantine). A tarball
-  downloaded through a **browser** is quarantined and needs
-  `xattr -dr com.apple.quarantine ./thegn` before its first launch.
-- The Homebrew formula (`packaging/homebrew/thegn.rb`) is ready but needs a
-  tagged release to point at: its `sha256` comes from the release's
-  `*-aarch64-apple-darwin.sha256` asset, and the `blakeashleyjr/homebrew-tap`
-  repo does not exist yet (RELEASING.md has the exact shape). Note that modern
-  Homebrew refuses to install a formula from a file path, so trying it before
-  the tap exists means `brew tap-new` + copying the formula in — the RELEASING
-  steps spell that out.
-- `crates.io` / `cargo binstall` need the workspace crates made publishable
-  first — see [`RELEASING.md`](RELEASING.md).
+- macOS release archives are unsigned and unnotarized. A browser download is
+  quarantined; remove the attribute with the command above before first launch.
+- Homebrew and AUR formula/package outputs are generated, but publication is
+  pending repository, environment, and key setup. The Homebrew formula is
+  rendered from `packaging/homebrew/thegn.rb.tmpl` during release packaging.
+- `.deb` and `.rpm` assets are unrehearsed, and crates.io / `cargo binstall`
+  remain deferred. Details are in
+  [RELEASING.md](RELEASING.md#install-paths-this-enables).

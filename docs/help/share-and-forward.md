@@ -20,9 +20,13 @@ stop-share action stops them all). Stopping a share also removes its saved
 entry, so it will not return on the next launch. A failed share shows its
 reason and can simply be retried. If a tailscale share's teardown cannot be
 confirmed, it stays in the list as failed with the reason and keeps its saved
-entry; stopping it again retries the teardown. At the panel's full width the
-list gains a detail column with the untruncated URL (or iroh consumer command),
-provider, and reach.
+entry; stopping it again retries the teardown. If thegn cannot stop a bore,
+frp or iroh client, that share also stays in the list as failed with the
+reason and keeps its saved entry (shown as `failed` in `thegn share list`;
+`"state": "failed"` with `--json`). A
+restart on that port is refused until stopping it again succeeds. At the
+panel's full width the list gains a detail column with the untruncated URL (or
+iroh consumer command), provider, and reach.
 The bottom status bar shows a `⇅` chip while anything is
 shared; activating it opens a detail popup listing the shares (the
 `open-shares` action opens the panel section instead).
@@ -44,11 +48,24 @@ TERM to the group, then KILL after a short grace period if processes remain.
 A Tailscale share cannot restart on a port whose previous share is still
 stopping; wait for teardown to finish first.
 
-Share clients receive secrets outside their command line. bore receives its
-secret through `BORE_SECRET`; frp reads its token from a generated `frpc.toml`
-in the share's private state directory (directory mode 0700, file mode 0600).
+Each share provider has a different credential channel and limit:
+
+- bore receives its secret through `BORE_SECRET`, never on the command line.
+  Other processes running as the same user may read that environment (for
+  example through `/proc/<pid>/environ`); `extra_args` containing `--secret` or
+  `-s` are refused.
+- frp reads its token from a generated `frpc.toml` in the share's private state
+  directory (directory mode 0700, file mode 0600).
+- Tailscale has no secret held or passed through thegn; the VPN sidecar's own
+  node identity serves the share.
+- iroh has no shared secret: its printed ticket is the capability, and anyone
+  holding it can connect.
+
 Clients start with a minimal environment that omits HOME, D-Bus, `IROH_SECRET`
-and provider credentials.
+and provider credentials (other than the client's own channel above). Literal
+`secret` or `token` values in `config.toml` are
+stored in plain text; move them to `"env:NAME"` or `"file:PATH"`. Move any bore
+secret passed through `extra_args` to `[share.bore] secret` instead.
 
 ## Auto port forwards (`[forward]`)
 

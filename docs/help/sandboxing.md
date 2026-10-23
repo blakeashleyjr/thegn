@@ -233,6 +233,11 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 > `isolation_floor = "off"`, `backend = "none"`, `enabled = false`, or run on
 > host; `bwrap`/`systemd` are Linux-only.
 
+> **Platform status:** the public alpha supports Linux on x86_64, where
+> `bwrap`, `systemd`, podman and docker are the backends to use. The `apple`
+> backend and macOS are best-effort; the Windows `jobobject` and `wsl` entries
+> are not supported in this alpha.
+
 `thegn doctor` reports which backends this machine actually has.
 
 ## Devcontainers
@@ -285,8 +290,9 @@ known credential environment families, keeping `SSH_AUTH_SOCK` only when the
 profile has `ssh/id`. Its git, gh and GnuPG directories are mounted read-only in
 sandboxes; a pane that needs to write them, such as `gh auth login` or GnuPG
 signing, needs an explicit `[sandbox] mounts` grant. Startup refuses if the
-profile state or credential directories cannot be created. The default profile
-is unchanged.
+profile state or credential directories cannot be created. Startup also
+refuses if `ssh/id` exists but is not an owner-only (chmod 600) regular file.
+The default profile is unchanged.
 `thegn doctor` lists denied and shared names, never values. The share list is
 read at startup.
 
@@ -381,6 +387,10 @@ When `systemd-run` and cgroup CPU delegation are available but no systemd user
 manager is reachable, the ceiling uses soft `nice` or no cap if `nice` is
 unavailable. With a CPU cap configured, `thegn doctor` prints a `cpu cap note`;
 `thegn doctor --json` includes the same text as `cpu_scope_note`.
+When the soft ceiling is in use, its label names missing hard-cap prerequisites:
+`systemd-run not found`, `no cgroup v2 cpu delegation`, and/or `no reachable
+systemd user manager`. `thegn doctor --json` reports the same reason as
+`cpu_soft_reason` (null when no soft cap applies).
 
 `thegn doctor` also lists sandbox execution routes such as worktree panes,
 queue agents, tests and gates, hooks, language services, and host extensions,
@@ -548,6 +558,11 @@ changes rather than treating the pool as empty.
 If the current warm-pool target cannot be read, reconciliation makes no pool
 changes rather than falling back to the configured size. The warm-pool keys
 report `warm pool: cannot read the current target: ...` and save nothing.
+Reconciliation halts, such as lease, ledger, target, or spare-read failures,
+appear as a status-line toast; the same halt is shown once until it clears or
+its message changes. When deleting a worktree cannot recycle a claimed spare,
+its ledger row remains until the provider confirms destruction, so a failed
+destroy leaves it listed for a later retry.
 Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
 A repo's `env =` setting is only a hint; if that environment would weaken
