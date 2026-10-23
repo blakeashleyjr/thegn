@@ -204,7 +204,7 @@ pub(crate) fn provider_for_named_with_key(
 
 /// Build the [`Machine0Provider`](thegn_svc::machine0::Machine0Provider) for a
 /// `provider = "machine0"` env config. `None` when the api key can't be resolved
-/// or the managed keypair can't be produced. Shared by the launch path and the
+/// or the managed keypair can't be produced. Shared by the launch path.
 /// machine0 is driven over its MCP endpoint (no CLI binary); the
 /// pane/exec/file plane rides ssh with thegn's managed key.
 pub(crate) fn machine0_provider_for(
