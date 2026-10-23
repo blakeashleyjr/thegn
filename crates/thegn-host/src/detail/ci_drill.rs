@@ -22,6 +22,8 @@ pub struct CiDetailPayload {
     pub origin: std::path::PathBuf,
     pub discarded_jobs: usize,
     pub incomplete: Option<String>,
+    /// Why the full run detail could not be fetched; the drill then shows the cached run.
+    pub detail_error: Option<String>,
     pub log_tail: Vec<String>,
     /// Cache metadata for each displayed failed-job excerpt.  The text is
     /// already bounded and redacted by the producer.
@@ -186,11 +188,17 @@ impl DetailOverlay {
         log_tail: Vec<String>,
         log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
         incomplete: Option<&str>,
+        detail_error: Option<&str>,
     ) {
         let origin = self.pending_ci.take().and_then(|pending| pending.origin);
         let now = thegn_core::util::now();
         let mut secs = vec![ci_header_section(run)];
         let mut note_parts = Vec::new();
+        if let Some(error) = detail_error {
+            note_parts.push(format!(
+                "job detail unavailable: {error}; showing the cached run"
+            ));
+        }
         if discarded_jobs > 0 {
             note_parts.push(format!("{discarded_jobs} malformed job row(s) omitted"));
         }
@@ -295,7 +303,7 @@ impl DetailOverlay {
         // its complete candidate identity is carried into the blocking worker.
         // Entries without text or a head SHA fail closed and never become UI
         // actions.
-        self.ci_autofix = if incomplete.is_some() {
+        self.ci_autofix = if incomplete.is_some() || detail_error.is_some() {
             Some(super::CiAutofixAvailability::Refused(
                 super::DetailRefusal::IncompleteCiJobList,
             ))
@@ -365,6 +373,7 @@ pub fn apply_ci_detail(slot: &mut Option<DetailOverlay>, payload: CiDetailPayloa
             payload.log_tail,
             payload.log_entries,
             payload.incomplete.as_deref(),
+            payload.detail_error.as_deref(),
         );
         return true;
     }
@@ -461,6 +470,7 @@ mod tests {
                 origin: "/wt/repo".into(),
                 discarded_jobs: 0,
                 incomplete: None,
+                detail_error: None,
                 log_tail: vec![],
                 log_entries: vec![],
             },
@@ -495,6 +505,7 @@ mod tests {
                 origin: "/wt/repo".into(),
                 discarded_jobs: 1,
                 incomplete: None,
+                detail_error: None,
                 log_tail: vec!["error: boom".into()],
                 log_entries: vec![thegn_core::ci_log::CiLogEntry {
                     worktree: "/wt/repo".into(),
@@ -563,7 +574,7 @@ mod tests {
         // While the first fetch is in flight, no repoll piles on.
         assert!(ov.live_ci_repoll().is_none());
         // A fill that's still running arms the live repoll…
-        ov.set_ci_detail(&running, 0, vec![], vec![], None);
+        ov.set_ci_detail(&running, 0, vec![], vec![], None, None);
         ov.scroll = 3;
         let (again, origin) = ov.live_ci_repoll().expect("running run repolls");
         assert_eq!(again.id, "7");
@@ -576,14 +587,14 @@ mod tests {
             "pending re-armed"
         );
         // …a live re-fill of the same run preserves the scroll position…
-        ov.set_ci_detail(&running, 0, vec![], vec![], None);
+        ov.set_ci_detail(&running, 0, vec![], vec![], None, None);
         assert_eq!(ov.scroll, 3);
         // …and a terminal fill stops the polling.
         let done = CiRun {
             state: CiState::Pass,
             ..running
         };
-        ov.set_ci_detail(&done, 0, vec![], vec![], None);
+        ov.set_ci_detail(&done, 0, vec![], vec![], None, None);
         assert!(
             ov.live_ci_repoll().is_none(),
             "terminal run stops repolling"
@@ -604,6 +615,7 @@ mod tests {
             origin: origin.into(),
             discarded_jobs: 0,
             incomplete: None,
+            detail_error: None,
             log_tail: Vec::new(),
             log_entries: Vec::new(),
         };
@@ -633,6 +645,7 @@ mod tests {
             origin: "/wt/any".into(),
             discarded_jobs: 0,
             incomplete: None,
+            detail_error: None,
             log_tail: Vec::new(),
             log_entries: Vec::new(),
         };
@@ -663,6 +676,7 @@ mod tests {
                 origin: "/wt/a".into(),
                 discarded_jobs: 0,
                 incomplete: None,
+                detail_error: None,
                 log_tail: Vec::new(),
                 log_entries: Vec::new(),
             }
@@ -721,6 +735,7 @@ mod tests {
                 origin: "/wt/repo".into(),
                 discarded_jobs: 0,
                 incomplete: Some("job list stopped after 50 pages (page budget)".into()),
+                detail_error: None,
                 log_tail: Vec::new(),
                 log_entries: vec![thegn_core::ci_log::CiLogEntry {
                     worktree: "/wt/repo".into(),
@@ -754,6 +769,80 @@ mod tests {
                 .notice()
                 .contains("job list is incomplete")
         );
+        assert_eq!(
+            overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
+            DetailOutcome::Refused(crate::detail::DetailRefusal::IncompleteCiJobList)
+        );
+    }
+
+    #[test]
+    fn detail_error_note_is_shown_and_autofix_refused() {
+        use thegn_core::ci::{CiJob, CiRun, CiState};
+        let run = CiRun {
+            id: "42".into(),
+            name: "CI".into(),
+            state: CiState::Running,
+            jobs: vec![CiJob {
+                id: "job-1".into(),
+                name: "build".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                ci_runs: vec![run.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut overlay = open_detail_for(
+            &BarItemId::Badge(BarBadge::Ci),
+            item_at(39),
+            &model,
+            &StatusCtx::new_for_test(&TelemetryHistory::default()),
+        )
+        .expect("ci badge opens");
+        assert!(matches!(
+            overlay.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::DrillCiRun { .. })
+        ));
+        assert!(overlay.bind_ci_origin("42", Path::new("/wt/repo")));
+        let mut slot = Some(overlay);
+        assert!(apply_ci_detail(
+            &mut slot,
+            CiDetailPayload {
+                run,
+                origin: "/wt/repo".into(),
+                discarded_jobs: 0,
+                incomplete: None,
+                detail_error: Some("CI provider unreachable".into()),
+                log_tail: Vec::new(),
+                log_entries: vec![thegn_core::ci_log::CiLogEntry {
+                    worktree: "/wt/repo".into(),
+                    run_id: "42".into(),
+                    job_id: "j1".into(),
+                    job_name: "build".into(),
+                    text: "error: boom\n".into(),
+                    truncated: false,
+                    redacted: true,
+                    policy_version: thegn_core::ci_log::REDACTION_POLICY_VERSION,
+                    fetched_at: 7,
+                    head_sha: "abc123".into(),
+                }],
+            }
+        ));
+        let mut overlay = slot.expect("overlay remains");
+        let DetailContent::Sections(detail) = &overlay.content else {
+            panic!("expected sections");
+        };
+        let Some(Section::Heading { label, note }) = detail.sections.get(1) else {
+            panic!("expected jobs heading");
+        };
+        assert_eq!(label, "jobs");
+        assert!(note.as_deref().is_some_and(|note| {
+            note.contains("job detail unavailable: CI provider unreachable")
+        }));
         assert_eq!(
             overlay.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
             DetailOutcome::Refused(crate::detail::DetailRefusal::IncompleteCiJobList)

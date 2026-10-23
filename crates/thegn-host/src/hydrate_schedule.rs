@@ -414,6 +414,7 @@ mod tests {
                 origin: Default::default(),
                 discarded_jobs: 0,
                 incomplete: None,
+                detail_error: None,
                 log_tail: Vec::new(),
                 log_entries: Vec::new(),
             }))
