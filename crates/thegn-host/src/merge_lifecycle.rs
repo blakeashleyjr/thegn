@@ -41,6 +41,18 @@ pub(crate) enum CleanupRefusal {
 }
 
 impl CleanupRefusal {
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::Identity => "identity",
+            Self::ClaimBusy => "claim_busy",
+            Self::Unsafe => "unsafe",
+            Self::Remote => "remote",
+            Self::Resources => "resources",
+            Self::Removal => "removal",
+        }
+    }
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Database => "database unavailable",

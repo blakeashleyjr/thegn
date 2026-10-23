@@ -166,6 +166,10 @@ else. A week is how long you have to notice.
   partly cleaned up, so scripts can tell. Existing THE-596 branch holds and
   rows that cannot be identified as belonging to this repository are reported
   as informational and do not change the exit status.
+  `thegn merge sweep --json` prints the same result as one JSON document; each
+  refused entry in `kept` has a stable `class` (`database`, `identity`,
+  `claim_busy`, `unsafe`, `remote`, `resources`, `removal`), and `incomplete`
+  matches the exit status.
 - A refused cleanup is retried with a growing delay (5 minutes, doubling up to
   a day). Until then it is reported as informational and does not make that
   sweep incomplete; `--force` retries immediately.
