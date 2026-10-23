@@ -1973,6 +1973,70 @@ pub(crate) fn verify_v94_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v95: durable usage-alert claims and one-time compaction of legacy inbox rows.
+pub(crate) fn migrate_v95(conn: &Connection, compact_legacy: bool) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usage_alert_claims (
+             claim_key TEXT PRIMARY KEY,
+             account_window TEXT NOT NULL,
+             notification_id INTEGER,
+             claimed_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_usage_alert_claims_window
+             ON usage_alert_claims(account_window);
+         CREATE INDEX IF NOT EXISTS idx_usage_alert_claims_claimed
+             ON usage_alert_claims(claimed_at);",
+    )?;
+    if compact_legacy {
+        conn.execute(
+            "DELETE FROM notifications
+             WHERE kind='usage_limit'
+               AND issue_id NOT LIKE 'model-proxy-budget:%'
+               AND id NOT IN (
+                   SELECT MAX(id) FROM notifications
+                   WHERE kind='usage_limit'
+                     AND issue_id NOT LIKE 'model-proxy-budget:%'
+                   GROUP BY issue_id
+               )",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE notifications SET read=1
+             WHERE kind='usage_limit'
+               AND issue_id NOT LIKE 'model-proxy-budget:%'
+               AND created_at_ms < ?1",
+            [crate::util::now() - 7 * 24 * 3600],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v95_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "claim_key",
+        "account_window",
+        "notification_id",
+        "claimed_at",
+    ] {
+        if !has_column(conn, "usage_alert_claims", column) {
+            bail!("schema v95 migration did not add usage_alert_claims.{column}");
+        }
+    }
+    for (name, column) in [
+        ("idx_usage_alert_claims_window", "account_window"),
+        ("idx_usage_alert_claims_claimed", "claimed_at"),
+    ] {
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info('{name}')"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if columns.iter().map(String::as_str).collect::<Vec<_>>() != [column] {
+            bail!("schema v95 migration did not add index {name} on {column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3172,6 +3236,94 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn v95_compacts_duplicate_usage_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v94.db");
+        let old = crate::util::now() - 8 * 24 * 3600;
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP INDEX idx_usage_alert_claims_window;
+                     DROP INDEX idx_usage_alert_claims_claimed;
+                     DROP TABLE usage_alert_claims;
+                     PRAGMA user_version=94;",
+                )
+                .unwrap();
+            for n in 0..20 {
+                db.conn().execute(
+                    "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read) VALUES('usage_limit','claude#a',?1,?2,0)",
+                    params![format!("legacy {n}"), old + n],
+                ).unwrap();
+            }
+            db.conn()
+                .execute(
+                    "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read) \
+                 VALUES('usage_limit','claude#b','old survivor',?1,0), \
+                       ('usage_limit','model-proxy-budget:scope','proxy',?1,0)",
+                    [old],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read) \
+                     VALUES('process_failed','shell','preserved',?1,0)",
+                    [old],
+                )
+                .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        super::migrate_v95(db.conn(), false).unwrap();
+        super::verify_v95_schema(db.conn()).unwrap();
+        let mut statement = db
+            .conn()
+            .prepare("SELECT issue_id, read, COUNT(*) FROM notifications WHERE kind='usage_limit' GROUP BY issue_id ORDER BY issue_id")
+            .unwrap();
+        let rows: Vec<(String, i64, i64)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("claude#a".to_string(), 1, 1));
+        assert_eq!(rows[1], ("claude#b".to_string(), 1, 1));
+        assert_eq!(rows[2], ("model-proxy-budget:scope".to_string(), 0, 1));
+        assert_eq!(
+            db.get_all_notifications(100)
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.kind.as_str() == "process_failed" && row.message == "preserved" && !row.read
+                })
+                .count(),
+            1
+        );
+        let version: i64 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v95_schema_verification_rejects_a_missing_claim_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(super::verify_v95_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn v95_schema_verification_rejects_a_misbound_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::migrate_v95(&conn, false).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_usage_alert_claims_window;
+             CREATE INDEX idx_usage_alert_claims_window ON usage_alert_claims(claim_key);",
+        )
+        .unwrap();
+        assert!(super::verify_v95_schema(&conn).is_err());
     }
 
     #[test]

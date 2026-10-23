@@ -36,7 +36,7 @@ use std::collections::HashMap;
 /// Something worth telling the user about one window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageAlertEvent {
-    /// The account's stable key — also the notification's dedup key.
+    /// The account's stable key, used by the in-process latch.
     pub account_key: String,
     /// Display label, for the message text.
     pub account_label: String,
@@ -55,10 +55,27 @@ pub struct UsageAlertEvent {
 }
 
 impl UsageAlertEvent {
-    /// The notification's dedup/thread key: one standing alert per window, so a
-    /// repeat updates the existing entry rather than filling the inbox.
+    /// The in-process latch key for one account window.
     pub fn key(&self) -> String {
         format!("{}#{}", self.account_key, self.window)
+    }
+
+    /// Durable inbox claim for one account window, level and reset period.
+    /// Reset timestamps are rounded to 15 minutes to absorb provider jitter.
+    pub fn claim_key(&self) -> String {
+        let level = match self.level {
+            AlertLevel::Warn => "warn",
+            AlertLevel::Critical => "critical",
+            AlertLevel::Ok => "ok",
+        };
+        let period = self.resets_at.map_or_else(
+            || "none".to_string(),
+            |at| ((at + 450) / 900 * 900).to_string(),
+        );
+        format!(
+            "usage:{}#{}#{}#{}",
+            self.account_key, self.window, level, period
+        )
     }
 
     /// Toast/inbox text, e.g.
@@ -90,7 +107,11 @@ struct Latch {
     since_ms: u64,
     last_fired_ms: u64,
     seen: bool,
+    missing_since_ms: Option<u64>,
+    reset_period: Option<i64>,
 }
+
+const PRUNE_GRACE_MS: u64 = 120_000;
 
 /// The rolling alert state. One per process; feed it every poll.
 #[derive(Debug, Clone, Default)]
@@ -164,6 +185,15 @@ impl UsageAlertState {
             };
 
             let l = self.latches.entry(key.clone()).or_default();
+            l.missing_since_ms = None;
+            let reset_period = w.resets_at.map(|at| (at + 450) / 900);
+            if l.seen && l.reset_period != reset_period {
+                l.fired = AlertLevel::Ok;
+                l.candidate = AlertLevel::Ok;
+                l.since_ms = now_ms;
+                l.last_fired_ms = now_ms;
+            }
+            l.reset_period = reset_period;
             // Rule 3: while an alert stands, "back to Ok" needs the retreat to
             // clear the threshold by `margin`, not merely to touch it.
             let effective = if l.fired > AlertLevel::Ok && now_level < l.fired {
@@ -227,11 +257,16 @@ impl UsageAlertState {
         // kept: that is a blip, not a removal.
         let live: std::collections::HashSet<&str> =
             observed.iter().map(|(k, _, _)| k.as_str()).collect();
-        self.latches.retain(|k, _| {
-            live.contains(k.as_str())
+        self.latches.retain(|k, latch| {
+            if live.contains(k.as_str())
                 || unreadable
                     .iter()
                     .any(|a| k.starts_with(&format!("{}#", a.key)))
+            {
+                return true;
+            }
+            let missing_since = latch.missing_since_ms.get_or_insert(now_ms);
+            now_ms.saturating_sub(*missing_since) < PRUNE_GRACE_MS
         });
         out
     }
@@ -386,15 +421,48 @@ mod tests {
     }
 
     #[test]
-    fn latches_are_pruned_when_an_account_goes_away() {
+    fn latches_are_pruned_after_an_account_stays_away() {
         let mut s = UsageAlertState::new();
         s.observe(&[account("a", 95.0), account("b", 95.0)], &cfg(), 0);
         assert_eq!(s.latches.len(), 2);
         // Account "b" removed from config entirely — its latch goes with it,
         // or the map grows for the life of the process.
         s.observe(&[account("a", 95.0)], &cfg(), 1000);
+        assert_eq!(s.latches.len(), 2);
+        s.observe(&[account("a", 95.0)], &cfg(), PRUNE_GRACE_MS + 1000);
         assert_eq!(s.latches.len(), 1);
         assert!(s.latches.contains_key("a#5h"));
+    }
+
+    #[test]
+    fn identity_flap_does_not_refire() {
+        let mut s = UsageAlertState::new();
+        assert_eq!(s.observe(&[account("identity", 80.0)], &cfg(), 0).len(), 1);
+        assert!(s.observe(&[account("home", 80.0)], &cfg(), 1000).is_empty());
+        let events = s.observe(&[account("identity", 80.0)], &cfg(), 2000);
+        assert!(
+            events.is_empty(),
+            "identity returning within grace keeps its fired latch"
+        );
+    }
+
+    #[test]
+    fn reset_period_change_fires_for_the_new_period() {
+        let mut s = UsageAlertState::new();
+        let first = AccountUsage::ok(
+            "claude",
+            "work",
+            None,
+            vec![UsageWindow::new("5h", 80.0, Some(1_700_000_000))],
+        );
+        assert_eq!(s.observe(&[first], &cfg(), 0).len(), 1);
+        let next = AccountUsage::ok(
+            "claude",
+            "work",
+            None,
+            vec![UsageWindow::new("5h", 80.0, Some(1_700_001_000))],
+        );
+        assert_eq!(s.observe(&[next], &cfg(), 1_000).len(), 1);
     }
 
     #[test]
@@ -445,6 +513,40 @@ mod tests {
             "blake@example.com (Acme): 7d window at 91% (limit 90%) \u{2014} resets in 2h 14m"
         );
         assert_eq!(ev.key(), "claude:acc/org#7d");
+        assert!(
+            ev.claim_key()
+                .starts_with("usage:claude:acc/org#7d#critical#")
+        );
+        let jittered = UsageAlertEvent {
+            used_percent: 99.0,
+            resets_at: Some(ev.resets_at.unwrap() + 300),
+            ..ev.clone()
+        };
+        assert_eq!(ev.claim_key(), jittered.claim_key());
+        let unknown_period = UsageAlertEvent {
+            level: AlertLevel::Warn,
+            resets_at: None,
+            ..ev.clone()
+        };
+        assert_eq!(
+            unknown_period.claim_key(),
+            "usage:claude:acc/org#7d#warn#none"
+        );
+        let cleared = UsageAlertEvent {
+            level: AlertLevel::Ok,
+            ..unknown_period
+        };
+        assert_eq!(cleared.claim_key(), "usage:claude:acc/org#7d#ok#none");
+        assert!(
+            ev.claim_key()
+                .starts_with("usage:claude:acc/org#7d#critical#")
+        );
+        let jittered = UsageAlertEvent {
+            used_percent: 99.0,
+            resets_at: Some(ev.resets_at.unwrap() + 300),
+            ..ev.clone()
+        };
+        assert_eq!(ev.claim_key(), jittered.claim_key());
         // No known reset → no dangling clause.
         let no_reset = UsageAlertEvent {
             resets_at: None,
