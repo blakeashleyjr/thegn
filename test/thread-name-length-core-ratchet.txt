@@ -1,4 +1,4 @@
 # Thread-name literals must start with thegn- and fit in Linux's 15-byte comm field.
 # Seeded from the violations at 13958491c0 (THE-931); every entry is debt: rename the thread (thegn- prefix, at most 15 bytes, via spawn_named/try_spawn_named) and delete the line.
 # SHRINK-ONLY. Enforced by `thread_names_fit_the_comm_limit_ratchet` in crates/thegn-core/src/platform_ratchet_tests.rs; regenerate with `just ratchet-update`.
-util.rs
+# RATCHET-EMPTY

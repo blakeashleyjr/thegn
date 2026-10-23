@@ -123,7 +123,7 @@ impl BridgeSupervisor {
         if let Ok(rx) = client.watch(workdir) {
             let on_event = self.inner.on_event.clone();
             std::thread::Builder::new()
-                .name("bridge-fswatch".into())
+                .name("thegn-brfswatch".into())
                 .spawn(move || {
                     // Housekeeping: an fs-watch event pump that lives as long as
                     // the client; nobody blocks on the notification it relays.
