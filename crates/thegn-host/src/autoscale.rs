@@ -286,7 +286,7 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
             &scale_down_blocked_message(
                 name,
                 &row.provider,
-                "its provider could not be built (API token unresolved or VPS ledger record unreadable; see the warning above)",
+                "its provider could not be built: the API token is unresolved or the VPS ledger record is unreadable",
             ),
         );
         return;
@@ -722,10 +722,13 @@ mod tests {
 
     #[test]
     fn scale_down_blocked_message_names_the_host_and_the_cost() {
-        let text = scale_down_blocked_message("tg-auto-test-message", "hetzner", "destroy failed");
+        let cause = "its provider could not be built: the API token is unresolved or the VPS ledger record is unreadable";
+        let text = scale_down_blocked_message("tg-auto-test-message", "hetzner", cause);
         assert!(text.contains("tg-auto-test-message"));
         assert!(text.contains("(hetzner)"));
         assert!(text.contains("was not scaled down"));
+        assert!(text.contains(cause));
+        assert!(!text.contains("see the warning above"));
         assert!(text.contains("keeps running and billing"));
     }
 
