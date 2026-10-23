@@ -190,7 +190,71 @@ impl Run {
             _ => None,
         }
     }
+
+    /// The typed failure, if this run did not succeed.
+    ///
+    /// Invariant: `error().is_none() == success()`.
+    pub fn error(&self) -> Option<ProcError> {
+        match (&self.end, &self.leader) {
+            (End::Spawn(error), _) => Some(ProcError::Spawn {
+                kind: error.kind(),
+                message: error.to_string(),
+            }),
+            (End::Supervise(error), _) => Some(ProcError::Supervise {
+                message: error.to_string(),
+            }),
+            (End::TimedOut, _) => Some(ProcError::TimedOut),
+            (End::Cancelled, _) => Some(ProcError::Cancelled),
+            (End::OutputLimit(which), _) => Some(ProcError::OutputLimit(*which)),
+            (End::LeaderExited, Leader::Reaped(status)) if status.success() => None,
+            (End::LeaderExited, Leader::Reaped(status)) => Some(ProcError::NonZero(*status)),
+            (End::LeaderExited, Leader::ReapFailed(error)) => Some(ProcError::Reap {
+                message: error.to_string(),
+            }),
+            (End::LeaderExited, Leader::Detached | Leader::NotSpawned) => Some(ProcError::Unreaped),
+        }
+    }
 }
+
+/// A typed failure from a bounded subprocess run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcError {
+    Spawn {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    TimedOut,
+    Cancelled,
+    OutputLimit(Which),
+    Supervise {
+        message: String,
+    },
+    NonZero(ExitStatus),
+    Reap {
+        message: String,
+    },
+    Unreaped,
+}
+
+impl std::fmt::Display for ProcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn { message, .. } => write!(formatter, "could not run: {message}"),
+            Self::TimedOut => formatter.write_str("timed out"),
+            Self::Cancelled => formatter.write_str("cancelled"),
+            Self::OutputLimit(Which::Stdout) => formatter.write_str("stdout exceeded its byte cap"),
+            Self::OutputLimit(Which::Stderr) => formatter.write_str("stderr exceeded its byte cap"),
+            Self::Supervise { message } => {
+                write!(formatter, "could not observe the process: {message}")
+            }
+            Self::NonZero(status) => write!(formatter, "exited with {status}"),
+            Self::Reap { message } => write!(formatter, "could not reap: {message}"),
+            Self::Unreaped => formatter.write_str("was not reaped within the kill budget"),
+        }
+    }
+}
+
+impl std::error::Error for ProcError {}
 
 /// Spawn `cmd` and run it to a bounded, fully reaped end. Overrides stdin (always null) and
 /// stdout/stderr (per `limits`); everything else (args, env, cwd) is the caller's. Unix: own
