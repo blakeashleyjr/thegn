@@ -118,7 +118,10 @@ fn drop_bytes(
     name: &str,
     bytes: &[u8],
 ) -> Result<(String, bool), String> {
-    let loc = GitLoc::for_worktree_checked(worktree).map_err(|error| {
+    // Match the old resolver's lossy path spelling while retaining the
+    // checked DB read. `for_worktree_checked` rejects non-UTF-8 paths itself.
+    let worktree_path = worktree.to_string_lossy();
+    let loc = GitLoc::for_worktree_checked(Path::new(worktree_path.as_ref())).map_err(|error| {
         format!(
             "paste refused: cannot read where this worktree lives ({error}); the image was not written"
         )
