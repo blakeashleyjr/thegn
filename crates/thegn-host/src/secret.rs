@@ -1051,12 +1051,26 @@ fn file_get_with(
             SecretError::denied(format!("open secret: {error}"))
         }
     })?;
-    if !thegn_core::fsperm::owned_by_current_user(
-        &file
-            .metadata()
-            .map_err(|e| SecretError::denied(e.to_string()))?,
-    ) {
+    let metadata = file
+        .metadata()
+        .map_err(|e| SecretError::denied(e.to_string()))?;
+    if !thegn_core::fsperm::owned_by_current_user(&metadata) {
         return Err(SecretError::denied("secret file is owned by another user"));
+    }
+    let path = private.path().join(token_name);
+    if thegn_core::fsperm::ensure_single_link_regular_file(&metadata).is_err() {
+        return Err(SecretError::denied(format!(
+            "secret file {} has other hard links; refusing to read it (remove the extra link, then store the secret again)",
+            path.display()
+        )));
+    }
+    if let Some(mode) = thegn_core::fsperm::mode_bits_from_metadata(&metadata)
+        && mode & 0o077 != 0
+    {
+        return Err(SecretError::denied(format!(
+            "secret file {} is accessible to other users (mode {mode:o}); refusing to read it (run `chmod 600` on it, or store the secret again)",
+            path.display()
+        )));
     }
     let mut bytes = Vec::new();
     file.take(MAX_SECRET_BYTES + 1)
@@ -2081,7 +2095,11 @@ mod tests {
 
         let oversized = token_path_in(temp.path(), "oversized").unwrap();
         std::fs::write(&oversized, vec![b'x'; (MAX_SECRET_BYTES + 1) as usize]).unwrap();
-        assert!(file_get_at(&oversized, "oversized").is_err());
+        thegn_core::fsperm::restrict_to_owner(&oversized).unwrap();
+        assert!(matches!(
+            file_get_at(&oversized, "oversized"),
+            Err(ref error) if error.message().contains("size limit")
+        ));
     }
 
     #[test]
@@ -2254,5 +2272,75 @@ mod tests {
         for n in 0..8 {
             assert!(names.contains(&format!("name-{n}")));
         }
+    }
+
+    #[test]
+    fn file_get_refuses_a_group_readable_token() {
+        let temp = private_temp();
+        file_set_at(temp.path(), "acct", "tok").unwrap();
+        let token = token_path_in(temp.path(), "acct").unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&token, 0o640) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("could not set fixture mode: {error}"),
+        }
+        let error = match file_get_in(temp.path(), "acct") {
+            Err(error) => error,
+            Ok(_) => panic!("group-readable token was accepted"),
+        };
+        assert!(error.message().contains("accessible to other users"));
+        assert!(!error.message().contains("tok"));
+        assert!(error.message().contains("chmod 600"));
+
+        thegn_core::fsperm::set_mode_for_test(&token, 0o600).unwrap();
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
+    }
+
+    #[test]
+    fn file_get_refuses_a_hard_linked_token() {
+        let temp = private_temp();
+        file_set_at(temp.path(), "acct", "tok").unwrap();
+        let token = token_path_in(temp.path(), "acct").unwrap();
+        let extra_link = temp.path().join("extra-link");
+        match std::fs::hard_link(&token, &extra_link) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not create hard-link fixture: {error}"),
+        }
+        let error = match file_get_in(temp.path(), "acct") {
+            Err(error) => error,
+            Ok(_) => panic!("multiply linked token was accepted"),
+        };
+        assert!(error.message().contains("other hard links"));
+        assert!(!error.message().contains("tok"));
+        assert!(error.message().contains("remove the extra link"));
+
+        std::fs::remove_file(extra_link).unwrap();
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
+    }
+
+    #[test]
+    fn file_get_refuses_a_world_writable_token() {
+        let temp = private_temp();
+        file_set_at(temp.path(), "acct", "tok").unwrap();
+        let token = token_path_in(temp.path(), "acct").unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&token, 0o602) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("could not set fixture mode: {error}"),
+        }
+        let error = match file_get_in(temp.path(), "acct") {
+            Err(error) => error,
+            Ok(_) => panic!("world-writable token was accepted"),
+        };
+        assert!(error.message().contains("accessible to other users"));
+        assert!(!error.message().contains("tok"));
     }
 }
