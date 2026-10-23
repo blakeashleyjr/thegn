@@ -14,6 +14,39 @@ use crate::config::ForwardConfig;
 use std::collections::BTreeSet;
 
 impl ForwardConfig {
+    /// Refuse empty binds and non-loopback binds unless explicitly opted in.
+    /// The eventual socket bind remains responsible for resolving hostnames.
+    pub fn bind_check(&self) -> Result<(), ForwardBindRefusal> {
+        let bind = self.bind.trim();
+        if bind.is_empty() {
+            return Err(ForwardBindRefusal::Unparsable(self.bind.clone()));
+        }
+
+        let unbracketed = bind
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(bind);
+        if unbracketed.eq_ignore_ascii_case("localhost")
+            || unbracketed
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+        {
+            return Ok(());
+        }
+
+        let is_ip = unbracketed.parse::<std::net::IpAddr>().is_ok();
+        let is_hostname = valid_bind_hostname(unbracketed);
+        if is_ip || is_hostname {
+            return if self.allow_external_bind {
+                Ok(())
+            } else {
+                Err(ForwardBindRefusal::NonLoopback(self.bind.clone()))
+            };
+        }
+
+        Err(ForwardBindRefusal::Unparsable(self.bind.clone()))
+    }
+
     /// Whether a newly-detected `container_port` should be auto-forwarded:
     /// `auto` is on, the port is not in `ignore`, and (if `only` is set) it is
     /// allow-listed. (Inherent methods may live in any module of the defining
@@ -34,6 +67,43 @@ impl ForwardConfig {
             (lo != 0 && hi >= lo).then_some((lo, hi))
         };
         parsed().unwrap_or((8000, 8999))
+    }
+}
+
+fn valid_bind_hostname(value: &str) -> bool {
+    let hostname = value.strip_suffix('.').unwrap_or(value);
+    !hostname.is_empty()
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+        })
+}
+
+/// Why a configured forward bind was refused before opening a socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardBindRefusal {
+    /// The value is empty or contains only whitespace.
+    Unparsable(String),
+    /// The value is not loopback and external binds were not enabled.
+    NonLoopback(String),
+}
+
+impl std::fmt::Display for ForwardBindRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unparsable(value) => write!(
+                formatter,
+                "forward bind {value:?} is empty or unparsable; set [forward] bind to a loopback address, or allow_external_bind = true"
+            ),
+            Self::NonLoopback(value) => write!(
+                formatter,
+                "forward bind {value:?} is not loopback; set [forward] bind to a loopback address, or allow_external_bind = true"
+            ),
+        }
     }
 }
 
@@ -132,6 +202,87 @@ mod tests {
 
     fn cfg() -> ForwardConfig {
         ForwardConfig::default()
+    }
+
+    #[test]
+    fn bind_check_accepts_loopback_spellings() {
+        for bind in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LocalHost",
+        ] {
+            let config = ForwardConfig {
+                bind: bind.to_string(),
+                ..ForwardConfig::default()
+            };
+            assert_eq!(config.bind_check(), Ok(()), "{bind} should be accepted");
+        }
+    }
+
+    #[test]
+    fn bind_check_refuses_non_loopback_without_opt_in() {
+        for bind in ["0.0.0.0", "::", "192.168.1.5", "example.com"] {
+            let config = ForwardConfig {
+                bind: bind.to_string(),
+                ..ForwardConfig::default()
+            };
+            assert_eq!(
+                config.bind_check(),
+                Err(ForwardBindRefusal::NonLoopback(bind.to_string())),
+                "{bind} should require the explicit opt-in"
+            );
+            let refusal = config.bind_check().expect_err("external bind is refused");
+            assert!(refusal.to_string().contains("allow_external_bind = true"));
+        }
+        for bind in ["", "  "] {
+            let config = ForwardConfig {
+                bind: bind.to_string(),
+                ..ForwardConfig::default()
+            };
+            assert_eq!(
+                config.bind_check(),
+                Err(ForwardBindRefusal::Unparsable(bind.to_string())),
+                "{bind:?} must always be refused"
+            );
+            let refusal = config.bind_check().expect_err("empty bind is refused");
+            assert!(refusal.to_string().contains("allow_external_bind = true"));
+        }
+        for bind in ["bad host", "[]"] {
+            let config = ForwardConfig {
+                bind: bind.to_string(),
+                allow_external_bind: true,
+                ..ForwardConfig::default()
+            };
+            assert_eq!(
+                config.bind_check(),
+                Err(ForwardBindRefusal::Unparsable(bind.to_string())),
+                "malformed bind {bind:?} remains invalid with the opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_check_opt_in_allows_external_but_not_empty() {
+        for bind in ["0.0.0.0", "::", "192.168.1.5", "example.com"] {
+            let config = ForwardConfig {
+                bind: bind.to_string(),
+                allow_external_bind: true,
+                ..ForwardConfig::default()
+            };
+            assert_eq!(config.bind_check(), Ok(()), "{bind} should be allowed");
+        }
+        let config = ForwardConfig {
+            bind: "  ".into(),
+            allow_external_bind: true,
+            ..ForwardConfig::default()
+        };
+        assert!(matches!(
+            config.bind_check(),
+            Err(ForwardBindRefusal::Unparsable(_))
+        ));
     }
 
     #[test]
