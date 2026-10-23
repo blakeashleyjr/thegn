@@ -587,16 +587,33 @@ pub(crate) fn queue_account_add(
     });
 }
 
+const MAX_NEW_ACCOUNT_PROBES: usize = 64;
+
 fn add_account(db: &thegn_core::db::Db, provider: &str) -> anyhow::Result<(String, String)> {
     if thegn_core::account::provider(provider).is_none() {
         anyhow::bail!("unknown account provider \"{provider}\"");
     }
-    let count = db.list_accounts(provider)?.len();
-    let name = format!("acct{}", count + 1);
-    let dir = thegn_core::account::ensure_managed_home(provider, &name)?;
-    let dir_string = dir.to_string_lossy().into_owned();
-    db.put_account(provider, &name, &dir_string, true, thegn_core::util::now())?;
-    Ok((name, dir_string))
+    let taken: std::collections::HashSet<String> = db
+        .list_accounts(provider)?
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+    let attempts = taken.len() + MAX_NEW_ACCOUNT_PROBES;
+    for n in 1..=attempts {
+        let name = format!("acct{n}");
+        if taken.contains(&name) {
+            continue;
+        }
+        let dir = match thegn_core::account::create_managed_home(provider, &name) {
+            Ok(dir) => dir,
+            Err(thegn_core::account::AccountHomeError::HomeExists { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let dir_string = dir.to_string_lossy().into_owned();
+        db.put_account(provider, &name, &dir_string, true, thegn_core::util::now())?;
+        return Ok((name, dir_string));
+    }
+    anyhow::bail!("no free managed account name for {provider} after {attempts} attempts")
 }
 
 pub(crate) fn persist_account_binding(worktree: String, provider: String, name: String) {
@@ -875,6 +892,47 @@ mod tests {
         let db = thegn_core::db::Db::open_at(&dir.path().join("thegn.db")).unwrap();
         let error = add_account(&db, "not-a-provider").unwrap_err();
         assert!(error.to_string().contains("unknown account provider"));
+    }
+
+    #[test]
+    fn account_add_skips_a_name_whose_row_exists() {
+        let state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open_at(&state.root().join("accounts.db")).unwrap();
+        let existing_dir = thegn_core::account::ensure_managed_home("claude", "acct2").unwrap();
+        let existing_dir_string = existing_dir.to_string_lossy().into_owned();
+        db.put_account("claude", "acct2", &existing_dir_string, true, 1)
+            .unwrap();
+
+        let (name, _) = add_account(&db, "claude").unwrap();
+
+        assert_eq!(name, "acct1");
+        let accounts = db.list_accounts("claude").unwrap();
+        assert!(accounts.iter().any(|(name, _, _)| name == "acct1"));
+        assert!(accounts.iter().any(|(name, _, _)| name == "acct2"));
+    }
+
+    #[test]
+    fn account_add_never_adopts_a_forgotten_home() {
+        let state = crate::testenv::IsolatedState::new();
+        let db = thegn_core::db::Db::open_at(&state.root().join("accounts.db")).unwrap();
+        let forgotten = thegn_core::account::ensure_managed_home("claude", "acct1").unwrap();
+
+        let (name, dir) = add_account(&db, "claude").unwrap();
+
+        assert_eq!(name, "acct2");
+        let expected_dir = thegn_core::account::managed_dir("claude", "acct2");
+        assert_eq!(std::path::PathBuf::from(dir), expected_dir);
+        assert_eq!(
+            db.list_accounts("claude").unwrap(),
+            vec![(
+                "acct2".to_owned(),
+                thegn_core::account::managed_dir("claude", "acct2")
+                    .to_string_lossy()
+                    .into_owned(),
+                true,
+            )]
+        );
+        assert!(forgotten.join(".thegn-account-owner").is_file());
     }
 
     #[test]
