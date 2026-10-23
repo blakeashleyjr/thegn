@@ -3084,7 +3084,7 @@ mod tests {
         let ticket = gate.try_begin("late").unwrap();
         let mut failed = BTreeSet::new();
         let mut job = poll_job("late");
-        job.command = vec!["sh".into(), "-c".into(), "sleep 0.3".into()];
+        job.command = vec!["sh".into(), "-c".into(), "sleep 1".into()];
         job.timeout = Duration::from_secs(2);
         start_poll_worker(ticket, job, &tx, None, &mut failed, &guard);
         assert!(!guard.stop.stop());
