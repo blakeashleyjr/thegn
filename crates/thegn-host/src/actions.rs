@@ -465,7 +465,13 @@ pub(crate) fn spawn_ci_action(
             thegn_core::msg::warn("ci: thegn is quitting; CI action not started");
             return;
         };
-        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let loc = match thegn_core::remote::GitLoc::for_worktree_op(&wt, "ci action") {
+            Ok(loc) => loc,
+            Err(error) => {
+                thegn_core::msg::warn(&error);
+                return;
+            }
+        };
         let Some(client) = thegn_svc::ci::provider_for_cancellable(&loc, &cfg, mutation.cancel())
         else {
             thegn_core::msg::warn("ci: no provider for this worktree");
@@ -1023,7 +1029,21 @@ pub(crate) fn run_pr_view_action(
     let tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let loc = match thegn_core::remote::GitLoc::for_worktree_op(&wt, label) {
+            Ok(loc) => loc,
+            Err(error) => {
+                thegn_core::msg::warn(&error);
+                if let Err(send_error) = tx.send(RefreshKind::PrActionStatus(error.clone())) {
+                    tracing::debug!(%send_error, "PR action refusal status was not delivered");
+                }
+                if tx.send(RefreshKind::Pr).is_ok()
+                    && let Err(wake_error) = waker.wake()
+                {
+                    tracing::debug!(%wake_error, "terminal wake after PR action refusal failed");
+                }
+                return;
+            }
+        };
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let cur = PrRef::Current;
@@ -1292,7 +1312,13 @@ pub(crate) fn run_pr_create(
     let tx = refresh_tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let loc = match thegn_core::remote::GitLoc::for_worktree_op(&wt, "pr create") {
+            Ok(loc) => loc,
+            Err(error) => {
+                thegn_core::msg::warn(&error);
+                return;
+            }
+        };
         let opts = thegn_core::forge::model::CreateOpts {
             title: None,
             body: None,

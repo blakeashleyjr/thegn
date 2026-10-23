@@ -137,8 +137,10 @@ fn cancellable_client(
     cfg: &Config,
     worktree: Option<String>,
     cancel: Arc<AtomicBool>,
+    verb: &str,
 ) -> Result<(GitLoc, CiClient)> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc =
+        GitLoc::for_worktree_op(&resolve_worktree(worktree), verb).map_err(anyhow::Error::msg)?;
     match provider_for_cancellable(&loc, &cfg.ci, cancel) {
         Some(c) => Ok((loc, c)),
         None => bail!("no CI provider for this worktree (set [ci] provider, or check the remote)"),
@@ -583,7 +585,7 @@ fn rerun(
 ) -> Result<()> {
     validate_id_at_cli(run_id)?;
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag))?;
+    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag), "ci rerun")?;
     let scope = match rerun_scope(&client.caps(), failed, failed_or_canceled) {
         Ok(scope) => scope,
         Err(message) => msg::die(message),
@@ -624,7 +626,7 @@ fn trigger(
     let inputs = thegn_svc::ci::parse_trigger_inputs(&input)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag))?;
+    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag), "ci trigger")?;
     if !client.caps().trigger {
         msg::die("this provider can't trigger workflows");
     }
@@ -652,7 +654,7 @@ fn trigger(
 fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     validate_id_at_cli(run_id)?;
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag))?;
+    let (loc, client) = cancellable_client(cfg, worktree, Arc::clone(&cancel_flag), "ci cancel")?;
     if !client.caps().cancel {
         msg::die("this provider can't cancel runs");
     }
@@ -977,6 +979,20 @@ mod tests {
         assert!(message.contains("may or may not"));
         assert!(!message.contains("cancelled\n"));
         assert!(!message.contains("done"));
+    }
+
+    #[test]
+    fn cancellable_client_refuses_when_the_location_is_unreadable() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = cancellable_client(
+            &Config::default(),
+            Some(dir.path().display().to_string()),
+            Arc::new(AtomicBool::new(false)),
+            "ci cancel",
+        );
+        assert!(matches!(result, Err(error) if format!("{error:#}").contains("ci cancel refused")));
     }
 
     #[test]
