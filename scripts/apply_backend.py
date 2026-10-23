@@ -31,8 +31,6 @@ def _read_regular(path: Path, message: str) -> bytes | None:
     except FileNotFoundError:
         return None
     except OSError as error:
-        if error.errno in (getattr(os, "ELOOP", 40),):
-            raise Refusal(message) from error
         raise Refusal(message) from error
     try:
         info = os.fstat(fd)
@@ -51,15 +49,15 @@ def _overlay_bytes(path: Path) -> bytes | None:
         return None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise Refusal(f"{path} is a symlink or non-regular file — refusing to modify it")
-    try:
-        return _read_regular(
-            path, f"{path} is a symlink or non-regular file — refusing to modify it"
-        )
-    except Refusal:
-        raise
+    return _read_regular(
+        path, f"{path} is a symlink or non-regular file — refusing to modify it"
+    )
 
 
 def _config_bytes(path: Path) -> bytes | None:
+    # Match the recipe's `[ -e ]` check: a dangling symlink is treated as absent.
+    if not path.exists():
+        return None
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -155,7 +153,11 @@ def _repo_root() -> Path:
             capture_output=True,
             text=True,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        raise Refusal(f"could not find the repository root: {error}{detail}") from error
+    except OSError as error:
         raise Refusal(f"could not find the repository root: {error}") from error
     common = Path(result.stdout.strip())
     if common.name == ".git":
@@ -179,9 +181,8 @@ def _apply(backend: str) -> None:
     overlay = root / ".thegn.toml"
     cfg_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     cfg = Path(cfg_home) / "thegn" / "config.toml"
-    if backend != "sprites":
-        _config_bytes(cfg)
     overlay_before = _overlay_bytes(overlay)
+    cfg_original = _config_bytes(cfg)
     known = {f'[sandbox]\nbackend = "{name}"'.encode() + b"\n" for name in BACKENDS[1:]}
     known.add(b'env = "sprites"\n')
     if overlay_before is not None and overlay_before not in known:
@@ -196,27 +197,34 @@ def _apply(backend: str) -> None:
     cfg_stage: Path | None = None
     cfg_backup: Path | None = None
     overlay_stage: Path | None = None
-    cfg_original: bytes | None = None
     cfg_mode = 0o600
     cfg_installed = False
     scaffold = False
     overlay_install_attempted = False
     try:
         if backend == "sprites":
-            try:
-                cfg.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                raise Refusal(f"could not create config directory for {cfg}") from error
-            lock_fd = _lock_config_writer(cfg)
-            cfg_original = _config_bytes(cfg)
             has_sprites = cfg_original is not None and re.search(
                 rb"(?m)^\[env\.sprites\]", cfg_original
             ) is not None
             scaffold = not has_sprites
+            if scaffold:
+                if cfg_original is not None:
+                    try:
+                        tomllib.loads(cfg_original.decode("utf-8"))
+                    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+                        raise Refusal(f"{cfg} is not valid TOML — not modified") from error
+                    cfg_mode = stat.S_IMODE(cfg.stat().st_mode)
+                try:
+                    cfg.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as error:
+                    raise Refusal(f"could not create config directory for {cfg}") from error
+                lock_fd = _lock_config_writer(cfg)
+                cfg_locked = _config_bytes(cfg)
+                if cfg_locked != cfg_original:
+                    raise Refusal(f"{cfg} changed while staging — not modified")
             if overlay_current and not scaffold:
                 return
         if scaffold:
-            assert cfg_original is None or isinstance(cfg_original, bytes)
             if shutil.which("sprite") is None:
                 print(
                     "note: sprite CLI not on PATH — fine for native exec (the default exec=auto attaches over the WSS API with just SPRITES_TOKEN); the CLI is only the fallback transport",
@@ -224,15 +232,8 @@ def _apply(backend: str) -> None:
                 )
             if cfg_original is not None:
                 try:
-                    tomllib.loads(cfg_original.decode("utf-8"))
-                except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
-                    raise Refusal(f"{cfg} is not valid TOML — not modified") from error
-                cfg_mode = stat.S_IMODE(cfg.stat().st_mode)
-            else:
-                cfg_original = None
-            if cfg_original is not None:
-                try:
                     cfg_backup = _stage(cfg.parent, ".config.toml.restore.", cfg_original, cfg_mode)
+                    shutil.copystat(cfg, cfg_backup)
                 except OSError as error:
                     raise Refusal(f"could not stage a restore copy of {cfg}") from error
             try:
@@ -285,13 +286,20 @@ def _apply(backend: str) -> None:
                 raise Refusal(f"{overlay} changed while staging — not modified")
 
             overlay_install_attempted = True
-            if (
-                cfg_installed
-                and os.environ.get("THEGN_APPLY_BACKEND_FAIL") == "overlay-install"
-            ):
+            if os.environ.get("THEGN_APPLY_BACKEND_FAIL") == "overlay-install":
                 raise OSError("injected overlay install failure")
-            _install(overlay_stage, overlay)
+            os.replace(overlay_stage, overlay)
             overlay_stage = None
+            try:
+                if os.environ.get("THEGN_APPLY_BACKEND_FAIL") == "overlay-dir-fsync":
+                    raise OSError("injected overlay directory fsync failure")
+                _fsync_dir(overlay.parent)
+            except OSError as error:
+                print(
+                    "warning: overlay was installed but its directory could not be synced: "
+                    f"{error}",
+                    file=sys.stderr,
+                )
             print(f"set {overlay} -> {overlay_body.decode()} (applies to all worktrees under {root})")
     except Refusal:
         if cfg_installed:
@@ -311,7 +319,9 @@ def _apply(backend: str) -> None:
             raise Refusal(
                 f"could not install staged overlay {overlay}; restored the prior config state"
             ) from error
-        raise Refusal(f"could not install staged overlay {overlay}: {error}") from error
+        raise Refusal(
+            f"could not install staged overlay {overlay}; restored the prior config state"
+        ) from error
     finally:
         _cleanup(cfg_stage, cfg_backup, overlay_stage)
         if lock_fd is not None:
