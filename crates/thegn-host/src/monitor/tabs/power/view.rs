@@ -456,7 +456,7 @@ fn rail_drawn_peak(model: &PowerModel) -> f32 {
 }
 fn draw_graph_label(surface: &mut Surface, x: usize, y: usize, width: usize, label: &str) {
     let line = crate::seg::Line::segs(vec![crate::seg::seg(
-        crate::seg::Tok::Slot(crate::chrome::S::Panel),
+        crate::seg::Tok::Slot(crate::chrome::S::Dim),
         label,
     )]);
     crate::seg::draw_line(
