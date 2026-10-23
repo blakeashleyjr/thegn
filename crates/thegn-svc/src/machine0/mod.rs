@@ -507,6 +507,63 @@ impl Machine0Provider {
         }
     }
 
+    async fn finish_ready(&self, name: &str, vm: Machine0Vm) -> Result<SandboxHandle> {
+        self.ensure_provisioned(name).await?;
+        let host = vm.address.unwrap_or_default();
+        thegn_core::managed_ssh::record_authorized(
+            "machine0",
+            &thegn_core::managed_ssh::account_label(&self.spec.key_path),
+            name,
+            &self.spec.key_path,
+            &self.spec.pubkey,
+        )
+        .context("machine0: record managed SSH key custody")?;
+        Ok(SandboxHandle {
+            id: name.to_string(),
+            exec: ExecKind::Ssh(SshTarget::plain(host, 22, false)),
+        })
+    }
+
+    pub(crate) async fn adopt_listed_pending(&self, name: &str) -> Result<()> {
+        let names = tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
+            .await
+            .context("machine0: pending create listing worker failed")?;
+        match listed_pending_action(&names, name) {
+            ListedPending::Settled => return Ok(()),
+            ListedPending::Unknown => {
+                tracing::warn!(
+                    target: "thegn::provider",
+                    sandbox = name,
+                    "machine0: pending create records unreadable; a pending reservation for this VM, if any, is kept"
+                );
+                return Ok(());
+            }
+            ListedPending::Adopt => {}
+        }
+
+        let guard = create_lock().await?;
+        let names = tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
+            .await
+            .context("machine0: pending create listing worker failed")?;
+        let action = listed_pending_action(&names, name);
+        if action != ListedPending::Adopt {
+            drop(guard);
+            if action == ListedPending::Unknown {
+                tracing::warn!(
+                    target: "thegn::provider",
+                    sandbox = name,
+                    "machine0: pending create records unreadable; a pending reservation for this VM, if any, is kept"
+                );
+            }
+            return Ok(());
+        }
+
+        let vm = self.adopt(name).await;
+        drop(guard);
+        let vm = vm?;
+        self.finish_ready(name, vm).await.map(|_| ())
+    }
+
     /// The ssh user for a VM: the configured `ssh_user`, else the VM's own
     /// `defaultSSHUsername` (e.g. `ubuntu` for ubuntu images, `root` for NixOS),
     /// else `root`.
@@ -1021,6 +1078,25 @@ fn retire_pending_after_create_error_at(
     }
 }
 
+/// What warm-on-open does with a machine0 VM that is already listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListedPending {
+    /// No pending create from this machine: the VM simply exists.
+    Settled,
+    /// This machine's create for it never finished: adopt it.
+    Adopt,
+    /// The pending store cannot be read: keep any record, adopt nothing.
+    Unknown,
+}
+
+fn listed_pending_action(pending_names: &Result<Vec<String>>, name: &str) -> ListedPending {
+    match pending_names {
+        Ok(names) if names.iter().any(|pending_name| pending_name == name) => ListedPending::Adopt,
+        Ok(_) => ListedPending::Settled,
+        Err(_) => ListedPending::Unknown,
+    }
+}
+
 /// Refuse creation when live or pending capacity is unknown or already at the cap.
 /// Provider error text is intentionally excluded because it may contain a
 /// credential or endpoint.
@@ -1120,20 +1196,7 @@ impl RemoteProvider for Machine0Provider {
             // NixOS flake apply (no-op unless `provision_flake` is set). Attestation-gated
             // so a failed apply here is re-attempted on the next wake rather than
             // leaving a permanently half-provisioned VM.
-            self.ensure_provisioned(&name).await?;
-            let host = vm.address.unwrap_or_default();
-            thegn_core::managed_ssh::record_authorized(
-                "machine0",
-                &thegn_core::managed_ssh::account_label(&self.spec.key_path),
-                &name,
-                &self.spec.key_path,
-                &self.spec.pubkey,
-            )
-            .context("machine0: record managed SSH key custody")?;
-            Ok(SandboxHandle {
-                id: name,
-                exec: ExecKind::Ssh(SshTarget::plain(host, 22, false)),
-            })
+            self.finish_ready(&name, vm).await
         })
     }
 
@@ -2155,6 +2218,34 @@ mod tests {
     fn an_unreadable_pending_store_refuses_creation() {
         let error = admit_create(Ok(vec![]), Err(anyhow!("boom")), "dev", 5).unwrap_err();
         assert!(error.to_string().contains("pending create reservations"));
+    }
+
+    #[test]
+    fn listed_pending_without_a_record_is_settled() {
+        assert_eq!(
+            listed_pending_action(&Ok(vec!["other".to_string()]), "dev"),
+            ListedPending::Settled
+        );
+        assert_eq!(
+            listed_pending_action(&Ok(vec![]), "dev"),
+            ListedPending::Settled
+        );
+    }
+
+    #[test]
+    fn listed_pending_with_a_record_adopts() {
+        assert_eq!(
+            listed_pending_action(&Ok(vec!["dev".to_string(), "web".to_string()]), "dev"),
+            ListedPending::Adopt
+        );
+    }
+
+    #[test]
+    fn listed_pending_with_an_unreadable_store_is_unknown() {
+        assert_eq!(
+            listed_pending_action(&Err(anyhow!("boom")), "dev"),
+            ListedPending::Unknown
+        );
     }
 
     #[test]
