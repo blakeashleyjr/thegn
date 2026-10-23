@@ -389,9 +389,10 @@ With `gate_reuse_worktree = true` (the default), the gate reuses a stable
 per-repository target under thegn's state directory. An explicit
 `gate_target_dir` is split into a per-repository directory, so repositories do
 not share a target. A gate that does not reuse its worktree always builds in a
-private target and ignores `gate_target_dir`. `thegn doctor` warns when
-`[disk] shared_target_dir` or `gate_target_dir` is set, because Cargo can reuse
-a crate built from another worktree's source.
+private target and ignores `gate_target_dir`. `thegn doctor` warns that
+`[disk] shared_target_dir` can let Cargo reuse a crate built from another
+worktree's source. When `gate_target_dir` is set, doctor reports its
+`<dir>/repo-<id>` layout.
 
 Pressing Ctrl-C or sending SIGTERM during `thegn integrate`, `thegn land`, or
 `thegn merge drain` cancels the fold without blaming a branch. If cancellation

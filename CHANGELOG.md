@@ -13,21 +13,22 @@ All notable changes to **thegn** are documented here. The format follows
 
 - When an active drain holds merge-queue rows, `thegn merge add`, `merge rm`,
   `merge retry` and `merge land` refuse them; `merge clear` removes unclaimed
-  rows, names the rows it keeps and exits with an error. The control API returns
-  a conflict response. A row queued by an older thegn without a worktree identity is
-  held until `thegn merge add` re-enqueues it. `thegn ci runs --json` returns a
-  `no-provider` error object when no provider is configured; `[]` means a
-  configured provider returned no runs.
-- Reused merge gates use a stable target per repository. An explicit
-  `[merge_queue] gate_target_dir` is split per repository; isolated gates use
-  private targets. `thegn doctor` warns about `[disk] shared_target_dir` and
-  `gate_target_dir`. In the share panel, `o` explains when a share has no
-  browser link, and `↵` copies its endpoint.
-- On the dev channel, machine0 inventory lists reject unrecognised shapes,
-  unidentifiable rows and duplicates. Machine0 readiness, status and SSH-auth
-  waits, and Fly's sshd probe, count in-flight requests against their total
-  time budget. A failing local `tar` or `git` producer fails a host transfer
-  instead of sending a partial stream.
+  rows, names the rows it keeps and exits with an error. The control API
+  answers `conflict` for these refusals on add and clear. A row queued by an
+  older thegn without a worktree identity is held until `thegn merge add`
+  re-enqueues it.
+  `thegn ci runs --json` returns a `no-provider` error object when no provider
+  is configured; `[]` means a configured provider returned no runs.
+- An explicit `[merge_queue] gate_target_dir` is split per repository;
+  isolated gates use private targets. `thegn doctor` warns about
+  `[disk] shared_target_dir` and reports the `gate_target_dir` layout. In the
+  share panel, `o` explains when a share has no browser link, and `↵` copies
+  its endpoint.
+- Machine0 inventory lists reject unrecognised shapes, unidentifiable rows
+  and duplicates. Machine0 readiness, status and SSH-auth waits, and Fly's
+  sshd probe, count in-flight requests against their total time budget. A
+  failing local `tar` or `git` producer fails a host transfer instead of
+  sending a partial stream (dev channel).
 
 ### Fixed
 
@@ -40,11 +41,13 @@ All notable changes to **thegn** are documented here. The format follows
 ### Security
 
 - Sandbox mount guards protect thegn's control-socket directories and state
-  `run/` directory: bwrap hides them, systemd makes them inaccessible or
-  refuses the affected profile, and container backends refuse mounts that
-  expose a control directory or writable mounts covering `run/`. Read-only
-  `$HOME` mounts remain allowed; `all` and `host` profiles expose the host by
-  design.
+  `run/` directory: bwrap hides them; systemd makes them inaccessible in
+  read-only-root profiles (hardened, sealed) and refuses a profile if the
+  mask would hide the worktree or a carved-back mount; container backends
+  refuse every mount exposing a control-socket directory and refuse only
+  writable mounts covering the state `run/` directory (a read-only `$HOME`
+  mount over `run/` stays allowed). The `all` and `host` file-access modes
+  expose the host by design.
 - Thegn's info, warning and error output, including the final error line,
   replaces control and invisible formatting characters so hostile names or
   messages cannot inject terminal escape sequences.
