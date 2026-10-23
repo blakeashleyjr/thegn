@@ -36,4 +36,5 @@
 - [x] 5. Keep sidebar help explicit about `g` and complete focused rendering
      and OpenSpec validation.
      Evidence: `docs/help/sidebar.md` documents `g` and the clickable header
-     chip. Focused validation is part of the batch precheck.
+     chip. `just openspec-validate` and `just delivery-check` run in the
+     batch-71 precheck.
