@@ -1732,9 +1732,9 @@ pub fn provider_proxy_target(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let selected_env = env_selection_or_refuse(worktree, "provider proxy target", read)?;
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -1885,9 +1885,9 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let selected_env = env_selection_or_refuse(worktree, "native exec", read)?;
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -1997,9 +1997,11 @@ pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let Some(selected_env) = env_selection_or_refuse(worktree, "provision check", read) else {
+        return false;
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -2127,9 +2129,12 @@ pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let Some(selected_env) = env_selection_or_refuse(worktree, "native exec cooldown clear", read)
+    else {
+        return;
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -2188,9 +2193,9 @@ pub fn provision_worktree(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
+    let selected_env = provision_selection(read)?;
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -2207,6 +2212,84 @@ pub fn provision_worktree(
     // spare (and clear the splash) under this run — see `provision_gate`.
     let _live = crate::provision_gate::worktree_live_guard(worktree);
     provision_provider_env(cfg, worktree, &environment.name, progress)
+}
+
+/// The env selection for a provider exec/proxy/cooldown decision. `None` when
+/// it cannot be read: the caller refuses instead of resolving the default env.
+fn env_selection_or_refuse(
+    worktree: &str,
+    what: &str,
+    read: anyhow::Result<Option<String>>,
+) -> Option<Option<String>> {
+    match read {
+        Ok(selected) => Some(selected),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::provider",
+                worktree,
+                error = %format!("{error:#}"),
+                "{what} refused: the environment selection could not be read"
+            );
+            None
+        }
+    }
+}
+
+/// The env selection for provisioning: a failed read is an error naming the cause.
+fn provision_selection(read: anyhow::Result<Option<String>>) -> anyhow::Result<Option<String>> {
+    read.context(
+        "provisioning refused: the environment selection could not be read (the default environment is never used instead)",
+    )
+}
+
+#[cfg(test)]
+mod env_selection_tests {
+    use super::{env_selection_or_refuse, provision_selection};
+
+    #[test]
+    fn env_selection_or_refuse_refuses_an_unreadable_selection() {
+        assert_eq!(
+            env_selection_or_refuse(
+                "/wt",
+                "native exec",
+                Err(anyhow::anyhow!("database is locked")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn env_selection_or_refuse_passes_a_read_through() {
+        assert_eq!(
+            env_selection_or_refuse("/wt", "native exec", Ok(Some("box".into()))),
+            Some(Some("box".into()))
+        );
+        assert_eq!(
+            env_selection_or_refuse("/wt", "native exec", Ok(None)),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn provision_selection_errors_on_an_unreadable_selection() {
+        let result = provision_selection(Err(anyhow::anyhow!("database is locked")));
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("selection read must be refused"),
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("provisioning refused"));
+        assert!(message.contains("database is locked"));
+    }
+
+    #[test]
+    fn provision_selection_passes_a_read_through() {
+        assert_eq!(provision_selection(Ok(None)).unwrap(), None);
+        assert_eq!(
+            provision_selection(Ok(Some("box".into()))).unwrap(),
+            Some("box".into())
+        );
+    }
 }
 
 /// Make a sandbox/remote env "just work" like local, by reproducing the repo's
