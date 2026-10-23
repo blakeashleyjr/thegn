@@ -143,6 +143,10 @@ to log in again; the old directory is left untouched. A configured agent or
 tool also refuses to launch if its bundle HOME cannot be prepared. A plain
 shell warns and launches without the bundle HOME.
 
+Adding a managed account picks the lowest available `acct<N>` name with no
+account row and no existing home directory. Thegn never reuses an existing
+home for a new account, so it cannot adopt a forgotten account's login.
+
 The automatic build caches (`~/.cargo/registry`, sccache, nix, `~/.m2`,
 gradle) stay writable: that is an _integrity_ exposure (a sealed pane could
 poison a shared cache), not a confidentiality one. The allowlist and every
@@ -583,6 +587,15 @@ destroy leaves it listed for a later retry.
 A stale or released spare is recycled from its base checkpoint only when the
 provider's checkpoint list confirms that checkpoint exists; if the list cannot
 be read, the spare is destroyed instead.
+
+If a worktree's environment selection cannot be read from the state database,
+thegn never falls back to the default environment. `thegn env` verbs report an
+error; worktree deletion refuses before removing anything; closing a tab does
+path-only cleanup and warns that an SSH sandbox container may remain. On the
+dev channel, provider SSH connect, warm-pool operations, hibernation,
+provisioning and host placement are refused or skipped with the reason. The
+close auto-checkpoint is also skipped with a warning on the dev channel.
+
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and
 quarantined spares under `Warm pool (provider spares needing review)`; it will
@@ -672,6 +685,14 @@ On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
 (Hetzner and DigitalOcean). Providers without a lifetime reaper, such as
 machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
 is set. Destroy those instances yourself or set the value to `0`.
+
+On the dev channel, an unreadable or malformed VPS or Fly ledger record is
+refused rather than treated as absent. Destroy, retarget, address lookup,
+`vps-ssh` and managed-key selection refuse it; a refused destroy keeps SSH
+custody and tells you to fix or remove the record before retrying. SSH keys
+registered with Hetzner, DigitalOcean and machine0 use `thegn-managed-`
+followed by the first 32 hexadecimal characters of the SHA-256 digest of the
+decoded public key. An invalid OpenSSH public key is refused.
 
 On the dev channel, the Fly backend strictly parses an app's machine list and
 rejects malformed lists or duplicate machine IDs. If more than one live
