@@ -1,9 +1,40 @@
 //! Notification-feed population for model hydration (extracted from the
 //! size-capped `hydrate.rs`). Runs on the hydration worker, never the loop.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::db::Db;
 use thegn_core::notification::Notification;
 use thegn_core::store::{NotificationStore, WorkspaceStore};
+
+static NOTIFY_WRITE_ISSUED: AtomicU64 = AtomicU64::new(0);
+static NOTIFY_WRITE_COMMITTED: AtomicU64 = AtomicU64::new(0);
+static NOTIFY_WRITE_FINISHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+pub(crate) fn issue_notification_write() -> u64 {
+    NOTIFY_WRITE_ISSUED.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+pub(crate) fn commit_notification_write(epoch: u64) {
+    let mut finished = NOTIFY_WRITE_FINISHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    finished.push(epoch);
+    let mut committed = NOTIFY_WRITE_COMMITTED.load(Ordering::Relaxed);
+    while let Some(next) = committed.checked_add(1)
+        && let Some(index) = finished
+            .iter()
+            .position(|finished_epoch| *finished_epoch == next)
+    {
+        finished.remove(index);
+        committed = next;
+    }
+    NOTIFY_WRITE_COMMITTED.store(committed, Ordering::Release);
+}
+
+pub(crate) fn committed_notification_epoch() -> u64 {
+    NOTIFY_WRITE_COMMITTED.load(Ordering::Acquire)
+}
 
 /// The ERROR count carried by the most recent existing `log:thegn`
 /// notification, parsed from its `"{n} error(s) in thegn.log"` message.
@@ -84,6 +115,7 @@ pub(crate) fn populate_notifications(
     app_cfg: &thegn_core::config::Config,
     panel: &mut crate::panel::PanelData,
 ) {
+    panel.notifications_epoch = committed_notification_epoch();
     // Scope BEFORE capping: with the cap applied first, a noisy sibling repo
     // (50+ rows in the window) pushed this repo's rows out entirely — the
     // ⚑/✉ chips read 0 while the ✋ chip and the sidebar badge still counted.
