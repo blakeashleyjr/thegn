@@ -2321,10 +2321,14 @@ mod tests {
     fn teardown_write_reports_written_and_the_exact_bytes() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let sink_bytes = Arc::clone(&written);
-        let outcome = write_teardown_with(b"restore", WRITER_SHUTDOWN_BOUND, move |bytes| {
-            sink_bytes.lock().unwrap().extend_from_slice(bytes);
-            Ok(())
-        });
+        let outcome = write_teardown_with(
+            b"restore",
+            std::time::Duration::from_secs(10),
+            move |bytes| {
+                sink_bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(())
+            },
+        );
 
         assert_eq!(outcome, TeardownWrite::Written);
         assert_eq!(written.lock().unwrap().as_slice(), b"restore");
@@ -2332,7 +2336,7 @@ mod tests {
 
     #[test]
     fn teardown_write_reports_a_failed_sink_kind() {
-        let outcome = write_teardown_with(b"", WRITER_SHUTDOWN_BOUND, |_| {
+        let outcome = write_teardown_with(b"", std::time::Duration::from_secs(10), |_| {
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
         });
 
