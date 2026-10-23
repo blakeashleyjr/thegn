@@ -591,10 +591,10 @@ be read, the spare is destroyed instead.
 If a worktree's environment selection cannot be read from the state database,
 thegn never falls back to the default environment. `thegn env` verbs report an
 error; worktree deletion refuses before removing anything; closing a tab does
-path-only cleanup, warns that an SSH sandbox container may remain, and skips
-the close auto-checkpoint with a warning. On the dev channel, provider SSH
-connect, warm-pool operations, hibernation, provisioning and host placement
-are refused or skipped with the reason.
+path-only cleanup and warns that an SSH sandbox container may remain. On the
+dev channel, provider SSH connect, warm-pool operations, hibernation,
+provisioning and host placement are refused or skipped with the reason. The
+close auto-checkpoint is also skipped with a warning on the dev channel.
 
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and

@@ -243,8 +243,8 @@ is a new episode and does raise the signal again.
 
 While a worktree's CI refresh is failing, a cached running or pending run no
 longer counts as "CI running" toward working attention because no live result
-backs it. A cached failed run still counts. This working-tier signal does not
-count toward the `✋` needs-you chip.
+backs it (pending PR checks still count). A cached failed run still counts.
+This working-tier signal does not count toward the `✋` needs-you chip.
 
 ## AI account usage
 

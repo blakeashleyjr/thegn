@@ -71,7 +71,7 @@ promotes the staged clone relative to that directory without replacing an
 existing destination. If the parent is replaced during the clone, promotion
 is refused and the staging directory is left for the startup sweep. A
 configured workspace directory that is itself a symlink still works; thegn
-resolves it first.
+resolves it first. The parent directory must be owned by you.
 
 Lifecycle hooks apply to every creation door, including the wizard, `wt new`,
 issue dispatch, and the daemon's `worktrees.create` request. A blocking
