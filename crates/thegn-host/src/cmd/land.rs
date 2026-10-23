@@ -79,7 +79,8 @@ pub(crate) fn land_branch_pinned(
     let target = integrate::resolve_target(&mq, &root);
     // `thegn land` lands the branch checked out in `worktree`; its loc tells
     // attempt_land whether that worktree is on this host (no ingest) or remote.
-    let branch_loc = thegn_core::remote::GitLoc::for_worktree(worktree);
+    let branch_loc = thegn_core::remote::GitLoc::for_worktree_op(worktree, "land")
+        .map_err(anyhow::Error::msg)?;
     let outcome = match expected_tip {
         Some(tip) => integrate::attempt_land_pinned(&mq, &root, &branch, &branch_loc, tip)?,
         None => integrate::attempt_land(&mq, &root, &branch, &branch_loc)?,
@@ -493,5 +494,88 @@ mod landed_row_tests {
              fix the gate environment (see `[merge_queue] gate_setup_command`) \
              and re-run."
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "creates an isolated git worktree fixture"
+    )]
+    fn land_refuses_when_the_location_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let wt = temp.path().join("wt");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = thegn_core::util::git_cmd(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(
+            &repo,
+            &["-c", "commit.gpgsign=false", "init", "-q", "-b", "main"],
+        );
+        git(
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "base",
+            ],
+        );
+        let root_head = git(&repo, &["rev-parse", "main"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+            ],
+        );
+        git(
+            &wt,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "feature",
+            ],
+        );
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let result = super::land_branch_pinned(&thegn_core::config::Config::default(), &wt, None);
+        assert!(matches!(result, Err(error) if format!("{error:#}").contains("land refused")));
+        assert_eq!(git(&repo, &["rev-parse", "main"]), root_head);
     }
 }
