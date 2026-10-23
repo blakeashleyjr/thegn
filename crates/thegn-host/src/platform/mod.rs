@@ -328,7 +328,6 @@ pub(crate) mod open_beneath;
 pub(crate) mod bundle_custody;
 
 /// Directory rename that refuses to replace an existing destination where supported.
-pub(crate) mod rename_noreplace;
 
 #[cfg(all(test, unix))]
 #[path = "../../../../test/support/owned_test_child.rs"]
