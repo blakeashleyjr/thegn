@@ -42,14 +42,25 @@ impl ServerChild {
 }
 
 impl Drop for ServerChild {
+    #[allow(
+        clippy::disallowed_macros,
+        reason = "best-effort test teardown reporting"
+    )]
     fn drop(&mut self) {
         if !self.finished {
+            let unwinding = std::thread::panicking();
             let pid = self.child.id();
             // SAFETY: pid is the live child owned by this guard.
             if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
-                    panic!("failed to signal owned serve child: {error}");
+                    if unwinding {
+                        eprintln!(
+                            "best-effort: failed to signal owned serve child during test unwind: {error}"
+                        );
+                    } else {
+                        eprintln!("best-effort: failed to signal owned serve child: {error}");
+                    }
                 }
             }
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -66,9 +77,25 @@ impl Drop for ServerChild {
                         if let Err(error) = self.child.kill()
                             && error.kind() != std::io::ErrorKind::InvalidInput
                         {
-                            panic!("failed to kill owned serve child: {error}");
+                            if unwinding {
+                                eprintln!(
+                                    "best-effort: failed to kill owned serve child during test unwind: {error}"
+                                );
+                            } else {
+                                eprintln!("best-effort: failed to kill owned serve child: {error}");
+                            }
                         }
-                        self.child.wait().unwrap();
+                        if let Err(error) = self.child.wait() {
+                            if unwinding {
+                                eprintln!(
+                                    "best-effort: failed to wait for owned serve child during test unwind: {error}"
+                                );
+                            } else {
+                                eprintln!(
+                                    "best-effort: failed to wait for owned serve child: {error}"
+                                );
+                            }
+                        }
                         self.finished = true;
                         break;
                     }
@@ -156,7 +183,7 @@ async fn cli_serve_tcp_pairs_and_requires_a_token() {
     let stdout = child.child.stdout.take().expect("serve stdout is piped");
     let (line_tx, line_rx) = mpsc::channel();
     let reader = std::thread::Builder::new()
-        .name("thegn-t-serveout".into())
+        .name("thegn-t-srvout".into())
         .spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 match line {
@@ -206,9 +233,16 @@ async fn cli_serve_tcp_pairs_and_requires_a_token() {
         .health()
         .await
         .expect("health is intentionally unauthenticated");
-    assert!(
-        empty.me().await.is_err(),
-        "the identity route requires a bearer token"
+    let unauthorized = empty
+        .me()
+        .await
+        .expect_err("identity requires a bearer token");
+    assert_eq!(
+        unauthorized
+            .downcast_ref::<thegn_svc::control::client::ControlRequestError>()
+            .map(thegn_svc::control::client::ControlRequestError::status),
+        Some(401),
+        "the server refuses the missing bearer token with HTTP 401"
     );
 
     let pair = empty
