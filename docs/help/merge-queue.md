@@ -80,6 +80,8 @@ the reason; use `thegn land` to land that branch outside the queue.
   The row also records which repository and Git worktree registration the path
   belonged to; if the worktree is gone, now belongs to another repository, or
   has a different registration, the row is held the same way before any fold.
+  A row queued by an older thegn that did not record this identity is held the
+  same way until `thegn merge add` re-enqueues it.
   A worktree re-created at the same path in the same repository reuses its
   registration and is caught only by the branch-tip check above.
 - If a fixing agent does not start, the row is held `agent_blocked` with no
