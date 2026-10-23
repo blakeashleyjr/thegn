@@ -14,6 +14,20 @@ pub(crate) fn route(placement: &Placement) -> Route {
     }
 }
 
+/// The env selection a background close tears down; an unreadable selection
+/// produces a warning because path-only cleanup can leave a remote sandbox running.
+fn close_selection(
+    path: &str,
+    read: anyhow::Result<Option<String>>,
+) -> Result<Option<String>, String> {
+    match read {
+        Ok(selected) => Ok(selected),
+        Err(error) => Err(format!(
+            "Environment selection could not be read while closing {path}; path-only cleanup may leave its SSH sandbox container running ({error:#})"
+        )),
+    }
+}
+
 pub(crate) fn sandbox_teardown(
     cfg: &thegn_core::config::Config,
     env: &thegn_core::env::Environment,
@@ -53,16 +67,28 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
     let loc = GitLoc::for_worktree(worktree);
     let repo_root =
         thegn_core::repo::main_worktree(worktree).unwrap_or_else(|| worktree.to_path_buf());
-    let selected = thegn_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(&worktree.to_string_lossy(), &repo_root.to_string_lossy()));
+    let read = thegn_core::db::Db::open().and_then(|db| {
+        db.effective_env_checked(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
+    });
+    let selected = match close_selection(path, read) {
+        Ok(selected) => selected,
+        Err(warning) => {
+            tracing::warn!(target: "thegn::lifecycle", worktree = path, %warning,
+                "environment selection unreadable during close; tearing down by path only");
+            if let Some(notify) = crate::notify::global() {
+                notify.emit_toast(&warning, thegn_core::notification::Priority::Notice);
+            }
+            thegn_core::sandbox::teardown_by_path(path);
+            return;
+        }
+    };
     let env = cfg.resolve_env(&repo_root, &loc, worktree, selected.as_deref());
     sandbox_teardown(cfg, &env, &loc, path);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, route};
+    use super::{Route, close_selection, route};
     use thegn_core::placement::{Placement, ProviderPlacement, SshPlacement, TransportKind};
 
     #[test]
@@ -88,5 +114,23 @@ mod tests {
         });
         assert!(matches!(route(&Placement::Local), Route::LocalByPath));
         assert!(matches!(route(&provider), Route::LocalByPath));
+    }
+
+    #[test]
+    fn close_selection_refuses_an_unreadable_selection() {
+        let Err(warning) = close_selection("/wt", Err(anyhow::anyhow!("unavailable"))) else {
+            panic!("unreadable selection must report the possible remote residual");
+        };
+        assert!(warning.contains("SSH sandbox container running"));
+        assert!(warning.contains("unavailable"));
+    }
+
+    #[test]
+    fn close_selection_passes_a_read_through() {
+        assert_eq!(
+            close_selection("/wt", Ok(Some("box".into()))),
+            Ok(Some("box".into()))
+        );
+        assert_eq!(close_selection("/wt", Ok(None)), Ok(None));
     }
 }
