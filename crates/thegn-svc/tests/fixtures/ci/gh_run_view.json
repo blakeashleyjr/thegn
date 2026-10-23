@@ -1,0 +1,72 @@
+{
+  "databaseId": 22345678901,
+  "name": "CI",
+  "displayTitle": "Preserve decoding details",
+  "headBranch": "feature/ci-golden",
+  "headSha": "89abcdef0123456789abcdef0123456789abcdef",
+  "event": "pull_request",
+  "status": "completed",
+  "conclusion": "failure",
+  "number": 342,
+  "createdAt": "2026-10-01T13:00:00Z",
+  "updatedAt": "2026-10-01T13:07:45Z",
+  "url": "https://github.com/owner/repo/actions/runs/22345678901",
+  "workflowName": "CI",
+  "jobs": [
+    {
+      "databaseId": 7100000001,
+      "name": "linux-tests",
+      "status": "completed",
+      "conclusion": "failure",
+      "startedAt": "2026-10-01T13:01:00Z",
+      "completedAt": "2026-10-01T13:06:00Z",
+      "url": "https://github.com/owner/repo/actions/runs/22345678901/job/7100000001",
+      "steps": [
+        {
+          "name": "Checkout",
+          "number": 1,
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-10-01T13:01:01Z",
+          "completedAt": "2026-10-01T13:01:04Z"
+        },
+        {
+          "name": "Run tests",
+          "number": 2,
+          "status": "completed",
+          "conclusion": "failure",
+          "startedAt": "2026-10-01T13:01:05Z",
+          "completedAt": "2026-10-01T13:05:58Z"
+        },
+        {
+          "name": "Upload coverage",
+          "number": 3,
+          "status": "completed",
+          "conclusion": "skipped",
+          "startedAt": "2026-10-01T13:05:59Z",
+          "completedAt": "2026-10-01T13:05:59Z"
+        }
+      ]
+    },
+    {
+      "databaseId": 7100000002,
+      "name": "format-check",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-01T13:01:00Z",
+      "completedAt": "2026-10-01T13:03:00Z",
+      "url": "https://github.com/owner/repo/actions/runs/22345678901/job/7100000002",
+      "steps": []
+    },
+    {
+      "databaseId": 7100000003,
+      "name": "windows-tests",
+      "status": "completed",
+      "conclusion": "skipped",
+      "startedAt": "2026-10-01T13:01:00Z",
+      "completedAt": "2026-10-01T13:01:00Z",
+      "url": "https://github.com/owner/repo/actions/runs/22345678901/job/7100000003",
+      "steps": []
+    }
+  ]
+}
