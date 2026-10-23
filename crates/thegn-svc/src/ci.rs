@@ -3455,6 +3455,500 @@ esac
         assert_eq!(std::fs::metadata(&capture).unwrap().len(), before);
     }
 
+    fn golden(name: &str) -> &'static str {
+        match name {
+            "gh_run_list.json" => include_str!("../tests/fixtures/ci/gh_run_list.json"),
+            "gh_run_view.json" => include_str!("../tests/fixtures/ci/gh_run_view.json"),
+            "gitlab_pipelines.json" => {
+                include_str!("../tests/fixtures/ci/gitlab_pipelines.json")
+            }
+            "gitlab_pipeline.json" => {
+                include_str!("../tests/fixtures/ci/gitlab_pipeline.json")
+            }
+            "gitlab_jobs.json" => include_str!("../tests/fixtures/ci/gitlab_jobs.json"),
+            _ => panic!("unknown CI golden fixture {name:?}"),
+        }
+    }
+
+    fn golden_setup() -> (tempfile::TempDir, GitLoc, GitLoc, String, bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture_dir = temp.path().join("fixtures");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in [
+            "gh_run_list.json",
+            "gh_run_view.json",
+            "gitlab_pipelines.json",
+            "gitlab_pipeline.json",
+            "gitlab_jobs.json",
+        ] {
+            std::fs::write(fixture_dir.join(name), golden(name)).unwrap();
+        }
+
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            r##"#!/bin/sh
+case " $* " in
+  *" run list "*) cat "$CI_GOLDEN_DIR/gh_run_list.json" ;;
+  *" run view "*) cat "$CI_GOLDEN_DIR/gh_run_view.json" ;;
+  *) printf '[]\n' ;;
+esac
+"##,
+        )
+        .unwrap();
+        let glab = bin.join("glab");
+        std::fs::write(
+            &glab,
+            r##"#!/bin/sh
+endpoint=
+for arg in "$@"; do endpoint=$arg; done
+case "$endpoint" in
+  */pipelines/*/jobs?*)
+    case "$endpoint" in
+      *page=1*) cat "$CI_GOLDEN_DIR/gitlab_jobs.json" ;;
+      *) printf '[]\n' ;;
+    esac ;;
+  */pipelines/801234568) cat "$CI_GOLDEN_DIR/gitlab_pipeline.json" ;;
+  */pipelines?per_page=*) cat "$CI_GOLDEN_DIR/gitlab_pipelines.json" ;;
+  *) printf '[]\n' ;;
+esac
+"##,
+        )
+        .unwrap();
+        let shell_available = thegn_core::fsperm::make_executable_for_test(&gh).is_ok()
+            && thegn_core::fsperm::make_executable_for_test(&glab).is_ok();
+
+        let github_repo = temp.path().join("github-repo");
+        let gitlab_repo = temp.path().join("gitlab-repo");
+        for (repo, remote) in [
+            (&github_repo, "https://github.com/owner/repo.git"),
+            (&gitlab_repo, "https://gitlab.com/group/repo.git"),
+        ] {
+            std::fs::create_dir_all(repo).unwrap();
+            assert!(
+                thegn_core::util::git_cmd(repo)
+                    .args(["init", "-q"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                thegn_core::util::git_cmd(repo)
+                    .args(["remote", "add", "origin", remote])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        (
+            temp,
+            GitLoc::Local(github_repo),
+            GitLoc::Local(gitlab_repo),
+            path,
+            shell_available,
+        )
+    }
+
+    fn golden_env(path: &str, temp: &tempfile::TempDir) -> thegn_core::testenv::EnvGuard {
+        let fixture_dir = temp.path().join("fixtures");
+        let fixture_dir = fixture_dir.to_string_lossy().into_owned();
+        thegn_core::testenv::EnvGuard::mutate_pairs(&[
+            ("PATH", Some(path)),
+            ("CI_GOLDEN_DIR", Some(&fixture_dir)),
+        ])
+    }
+
+    #[test]
+    fn golden_github_run_list_decodes_every_field() {
+        // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
+        let (temp, loc, _, path, shell_available) = golden_setup();
+        if !shell_available {
+            return;
+        }
+        let _env = golden_env(&path, &temp);
+        let client = GithubCi {
+            remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let result = client.runs(&loc, None, 10).unwrap();
+        assert_eq!(result.discarded_rows, 0);
+        assert_eq!(
+            result.runs,
+            vec![
+                CiRun {
+                    id: "11234567890".into(),
+                    name: "CI".into(),
+                    title: "Add provider fixture coverage".into(),
+                    event: "push".into(),
+                    branch: "main".into(),
+                    sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    state: CiState::Pass,
+                    status_raw: "completed".into(),
+                    conclusion_raw: Some("success".into()),
+                    url: "https://github.com/owner/repo/actions/runs/11234567890".into(),
+                    run_number: Some(341),
+                    started_at: Some("2026-10-01T12:00:00Z".into()),
+                    finished_at: Some("2026-10-01T12:04:12Z".into()),
+                    jobs: vec![],
+                },
+                CiRun {
+                    id: "22345678901".into(),
+                    name: "CI".into(),
+                    title: "Preserve decoding details".into(),
+                    event: "pull_request".into(),
+                    branch: "feature/ci-golden".into(),
+                    sha: "89abcdef0123456789abcdef0123456789abcdef".into(),
+                    state: CiState::Fail,
+                    status_raw: "completed".into(),
+                    conclusion_raw: Some("failure".into()),
+                    url: "https://github.com/owner/repo/actions/runs/22345678901".into(),
+                    run_number: Some(342),
+                    started_at: Some("2026-10-01T13:00:00Z".into()),
+                    finished_at: Some("2026-10-01T13:07:45Z".into()),
+                    jobs: vec![],
+                },
+                CiRun {
+                    id: "32345678901".into(),
+                    name: "CI".into(),
+                    title: "Build in progress".into(),
+                    event: "push".into(),
+                    branch: "feature/ci-golden".into(),
+                    sha: "fedcba9876543210fedcba9876543210fedcba98".into(),
+                    state: CiState::Running,
+                    status_raw: "in_progress".into(),
+                    conclusion_raw: None,
+                    url: "https://github.com/owner/repo/actions/runs/32345678901".into(),
+                    run_number: Some(343),
+                    started_at: Some("2026-10-01T14:00:00Z".into()),
+                    finished_at: None,
+                    jobs: vec![],
+                },
+                CiRun {
+                    id: "42345678901".into(),
+                    name: "CI".into(),
+                    title: "Queued build".into(),
+                    event: "schedule".into(),
+                    branch: "release/alpha".into(),
+                    sha: "00112233445566778899aabbccddeeff00112233".into(),
+                    state: CiState::Pending,
+                    status_raw: "queued".into(),
+                    conclusion_raw: None,
+                    url: "https://github.com/owner/repo/actions/runs/42345678901".into(),
+                    run_number: Some(344),
+                    started_at: Some("2026-10-01T15:00:00Z".into()),
+                    finished_at: None,
+                    jobs: vec![],
+                },
+                CiRun {
+                    id: "52345678901".into(),
+                    name: "Release".into(),
+                    title: "Cancel obsolete release run".into(),
+                    event: "workflow_dispatch".into(),
+                    branch: "release/alpha".into(),
+                    sha: "aabbccddeeff00112233445566778899aabbccdd".into(),
+                    state: CiState::Cancelled,
+                    status_raw: "completed".into(),
+                    conclusion_raw: Some("cancelled".into()),
+                    url: "https://github.com/owner/repo/actions/runs/52345678901".into(),
+                    run_number: Some(345),
+                    started_at: Some("2026-10-01T16:00:00Z".into()),
+                    finished_at: Some("2026-10-01T16:01:05Z".into()),
+                    jobs: vec![],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_github_run_detail_decodes_jobs_and_steps() {
+        // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
+        let (temp, loc, _, path, shell_available) = golden_setup();
+        if !shell_available {
+            return;
+        }
+        let _env = golden_env(&path, &temp);
+        let client = GithubCi {
+            remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let detail = client.run_detail(&loc, "22345678901").unwrap();
+        assert!(detail.is_complete());
+        assert_eq!(detail.discarded_jobs, 0);
+        assert_eq!(
+            detail.run,
+            CiRun {
+                id: "22345678901".into(),
+                name: "CI".into(),
+                title: "Preserve decoding details".into(),
+                event: "pull_request".into(),
+                branch: "feature/ci-golden".into(),
+                sha: "89abcdef0123456789abcdef0123456789abcdef".into(),
+                state: CiState::Fail,
+                status_raw: "completed".into(),
+                conclusion_raw: Some("failure".into()),
+                url: "https://github.com/owner/repo/actions/runs/22345678901".into(),
+                run_number: Some(342),
+                started_at: Some("2026-10-01T13:00:00Z".into()),
+                finished_at: Some("2026-10-01T13:07:45Z".into()),
+                jobs: vec![
+                    CiJob {
+                        id: "7100000001".into(),
+                        name: "linux-tests".into(),
+                        state: CiState::Fail,
+                        url: Some(
+                            "https://github.com/owner/repo/actions/runs/22345678901/job/7100000001"
+                                .into()
+                        ),
+                        started_at: Some("2026-10-01T13:01:00Z".into()),
+                        finished_at: Some("2026-10-01T13:06:00Z".into()),
+                        steps: vec![
+                            CiStep {
+                                name: "Checkout".into(),
+                                number: Some(1),
+                                state: CiState::Pass,
+                                started_at: Some("2026-10-01T13:01:01Z".into()),
+                                finished_at: Some("2026-10-01T13:01:04Z".into())
+                            },
+                            CiStep {
+                                name: "Run tests".into(),
+                                number: Some(2),
+                                state: CiState::Fail,
+                                started_at: Some("2026-10-01T13:01:05Z".into()),
+                                finished_at: Some("2026-10-01T13:05:58Z".into())
+                            },
+                            CiStep {
+                                name: "Upload coverage".into(),
+                                number: Some(3),
+                                state: CiState::Skipped,
+                                started_at: Some("2026-10-01T13:05:59Z".into()),
+                                finished_at: Some("2026-10-01T13:05:59Z".into())
+                            },
+                        ]
+                    },
+                    CiJob {
+                        id: "7100000002".into(),
+                        name: "format-check".into(),
+                        state: CiState::Pass,
+                        url: Some(
+                            "https://github.com/owner/repo/actions/runs/22345678901/job/7100000002"
+                                .into()
+                        ),
+                        started_at: Some("2026-10-01T13:01:00Z".into()),
+                        finished_at: Some("2026-10-01T13:03:00Z".into()),
+                        steps: vec![]
+                    },
+                    CiJob {
+                        id: "7100000003".into(),
+                        name: "windows-tests".into(),
+                        state: CiState::Skipped,
+                        url: Some(
+                            "https://github.com/owner/repo/actions/runs/22345678901/job/7100000003"
+                                .into()
+                        ),
+                        started_at: Some("2026-10-01T13:01:00Z".into()),
+                        finished_at: Some("2026-10-01T13:01:00Z".into()),
+                        steps: vec![]
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn golden_gitlab_pipelines_decode_every_field() {
+        // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
+        let (temp, _, loc, path, shell_available) = golden_setup();
+        if !shell_available {
+            return;
+        }
+        let _env = golden_env(&path, &temp);
+        let result = GitlabCi::default().runs(&loc, None, 10).unwrap();
+        assert_eq!(result.discarded_rows, 0);
+        assert_eq!(
+            result.runs,
+            vec![
+                CiRun {
+                    id: "801234567".into(),
+                    name: "pipeline #801234567".into(),
+                    title: "main".into(),
+                    event: "push".into(),
+                    branch: "main".into(),
+                    sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    state: CiState::Pass,
+                    status_raw: "success".into(),
+                    conclusion_raw: None,
+                    url: "https://gitlab.com/group/repo/-/pipelines/801234567".into(),
+                    run_number: Some(41),
+                    started_at: Some("2026-10-02T09:00:00.000Z".into()),
+                    finished_at: Some("2026-10-02T09:04:12.000Z".into()),
+                    jobs: vec![]
+                },
+                CiRun {
+                    id: "801234568".into(),
+                    name: "Nightly".into(),
+                    title: "feature/ci-golden".into(),
+                    event: "merge_request_event".into(),
+                    branch: "feature/ci-golden".into(),
+                    sha: "89abcdef0123456789abcdef0123456789abcdef".into(),
+                    state: CiState::Fail,
+                    status_raw: "failed".into(),
+                    conclusion_raw: None,
+                    url: "https://gitlab.com/group/repo/-/pipelines/801234568".into(),
+                    run_number: Some(42),
+                    started_at: Some("2026-10-02T10:00:00.000Z".into()),
+                    finished_at: Some("2026-10-02T10:07:45.000Z".into()),
+                    jobs: vec![]
+                },
+                CiRun {
+                    id: "801234569".into(),
+                    name: "CI".into(),
+                    title: "feature/ci-golden".into(),
+                    event: "push".into(),
+                    branch: "feature/ci-golden".into(),
+                    sha: "fedcba9876543210fedcba9876543210fedcba98".into(),
+                    state: CiState::Running,
+                    status_raw: "running".into(),
+                    conclusion_raw: None,
+                    url: "https://gitlab.com/group/repo/-/pipelines/801234569".into(),
+                    run_number: Some(43),
+                    started_at: Some("2026-10-02T11:00:00.000Z".into()),
+                    finished_at: None,
+                    jobs: vec![]
+                },
+                CiRun {
+                    id: "801234570".into(),
+                    name: "Release".into(),
+                    title: "release/alpha".into(),
+                    event: "web".into(),
+                    branch: "release/alpha".into(),
+                    sha: "00112233445566778899aabbccddeeff00112233".into(),
+                    state: CiState::Cancelled,
+                    status_raw: "canceled".into(),
+                    conclusion_raw: None,
+                    url: "https://gitlab.com/group/repo/-/pipelines/801234570".into(),
+                    run_number: Some(44),
+                    started_at: Some("2026-10-02T12:00:00.000Z".into()),
+                    finished_at: Some("2026-10-02T12:01:05.000Z".into()),
+                    jobs: vec![]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_gitlab_pipeline_detail_decodes_jobs() {
+        // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
+        let (temp, _, loc, path, shell_available) = golden_setup();
+        if !shell_available {
+            return;
+        }
+        let _env = golden_env(&path, &temp);
+        let detail = GitlabCi::default().run_detail(&loc, "801234568").unwrap();
+        assert!(detail.is_complete());
+        assert_eq!(detail.discarded_jobs, 0);
+        assert_eq!(
+            detail.run,
+            CiRun {
+                id: "801234568".into(),
+                name: "Nightly".into(),
+                title: "feature/ci-golden".into(),
+                event: "merge_request_event".into(),
+                branch: "feature/ci-golden".into(),
+                sha: "89abcdef0123456789abcdef0123456789abcdef".into(),
+                state: CiState::Fail,
+                status_raw: "failed".into(),
+                conclusion_raw: None,
+                url: "https://gitlab.com/group/repo/-/pipelines/801234568".into(),
+                run_number: Some(42),
+                started_at: Some("2026-10-02T10:00:00.000Z".into()),
+                finished_at: Some("2026-10-02T10:07:45.000Z".into()),
+                jobs: vec![
+                    CiJob {
+                        id: "990000001".into(),
+                        name: "linux-tests".into(),
+                        state: CiState::Fail,
+                        url: Some("https://gitlab.com/group/repo/-/jobs/990000001".into()),
+                        started_at: Some("2026-10-02T10:01:00.000Z".into()),
+                        finished_at: Some("2026-10-02T10:06:00.000Z".into()),
+                        steps: vec![]
+                    },
+                    CiJob {
+                        id: "990000002".into(),
+                        name: "format-check".into(),
+                        state: CiState::Pass,
+                        url: Some("https://gitlab.com/group/repo/-/jobs/990000002".into()),
+                        started_at: Some("2026-10-02T10:00:10.000Z".into()),
+                        finished_at: Some("2026-10-02T10:00:40.000Z".into()),
+                        steps: vec![]
+                    },
+                    CiJob {
+                        id: "990000003".into(),
+                        name: "deploy-preview".into(),
+                        state: CiState::Skipped,
+                        url: Some("https://gitlab.com/group/repo/-/jobs/990000003".into()),
+                        started_at: None,
+                        finished_at: None,
+                        steps: vec![]
+                    },
+                    CiJob {
+                        id: "990000004".into(),
+                        name: "deploy-production".into(),
+                        state: CiState::Skipped,
+                        url: Some("https://gitlab.com/group/repo/-/jobs/990000004".into()),
+                        started_at: None,
+                        finished_at: None,
+                        steps: vec![]
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn golden_run_lists_round_trip_the_cache_envelope() {
+        // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
+        let (temp, github_loc, gitlab_loc, path, shell_available) = golden_setup();
+        if !shell_available {
+            return;
+        }
+        let _env = golden_env(&path, &temp);
+        let github = GithubCi {
+            remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+        .runs(&github_loc, None, 10)
+        .unwrap();
+        let gitlab = GitlabCi::default().runs(&gitlab_loc, None, 10).unwrap();
+        for (system, origin, list) in [
+            (
+                CiSystem::GithubActions,
+                "https://github.com/owner/repo.git",
+                github,
+            ),
+            (
+                CiSystem::GitlabCi,
+                "https://gitlab.com/group/repo.git",
+                gitlab,
+            ),
+        ] {
+            assert_eq!(list.discarded_rows, 0);
+            let cache = thegn_core::ci::CiRunCache {
+                runs: list.runs,
+                discarded_rows: 0,
+                context: cache_context_for(system, origin).unwrap(),
+            };
+            let encoded = serde_json::to_string(&cache).unwrap();
+            assert_eq!(thegn_core::ci::decode_run_cache(&encoded), Some(cache));
+        }
+    }
+
     #[test]
     fn rejected_identifiers_never_reach_request_construction() {
         let mut authenticated_requests = 0;
