@@ -1403,13 +1403,9 @@ fn reconcile_action(
     local: Option<&[u8; 32]>,
     remote: &[u8; 32],
 ) -> ReconcileAction {
-    if base == Some(remote) {
+    if base == Some(remote) || local == Some(remote) {
         ReconcileAction::Skip
-    } else if local == Some(remote) {
-        ReconcileAction::Skip
-    } else if base.is_some() && local == base {
-        ReconcileAction::Publish
-    } else if base.is_none() && local.is_none() {
+    } else if (base.is_some() && local == base) || (base.is_none() && local.is_none()) {
         ReconcileAction::Publish
     } else {
         ReconcileAction::Conflict
@@ -1660,18 +1656,18 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
 
-    let root: thegn_core::fsperm::RootedDir = thegn_core::fsperm::open_rooted_dir(local)
-        .with_context(|| {
+    let root: Arc<thegn_core::fsperm::RootedDir> =
+        Arc::new(thegn_core::fsperm::open_rooted_dir(local).with_context(|| {
             format!(
                 "download destination is not a real directory: {}",
                 local.display()
             )
-        })?;
+        })?);
     let mut stack: Vec<(
         String,
         Option<Arc<thegn_core::fsperm::RootedDir>>,
         Option<String>,
-    )> = vec![(String::new(), Some(Arc::new(root)), None)];
+    )> = vec![(String::new(), Some(root.clone()), None)];
     let mut seen = std::collections::HashSet::new();
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
@@ -1724,8 +1720,9 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
                 seen.insert(child.clone()),
                 "provider returned a repeated path"
             );
+            let child_depth = depth + 1;
             anyhow::ensure!(
-                depth + 1 <= DOWNLOAD_MAX_DEPTH,
+                child_depth <= DOWNLOAD_MAX_DEPTH,
                 "provider listing exceeded maximum directory depth"
             );
         }
@@ -1780,6 +1777,9 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
             let local_digest = local_data
                 .as_ref()
                 .map(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)));
+            if local_path_is_ignored(local, &child)? {
+                continue;
+            }
             match reconcile_action(baseline.get(&child), local_digest.as_ref(), &remote_digest) {
                 ReconcileAction::Skip => {}
                 ReconcileAction::Publish => publishes.push((child, data)),
@@ -1792,42 +1792,46 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
         return Err(SyncConflict { paths: conflicts }.into());
     }
 
-    let mut directories = HashMap::new();
-    directories.insert(
-        String::new(),
-        Arc::new(thegn_core::fsperm::open_rooted_dir(local).with_context(|| {
-            format!(
-                "download destination is not a real directory: {}",
-                local.display()
-            )
-        })?),
-    );
+    publishes.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut ancestry = vec![(String::new(), root)];
     for (child, data) in publishes {
         let (parent_rel, name) = child.rsplit_once('/').unwrap_or(("", child.as_str()));
-        let mut current_rel = String::new();
-        for component in parent_rel.split('/').filter(|part| !part.is_empty()) {
+        let components: Vec<&str> = parent_rel
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        let mut shared: usize = 0;
+        while shared < components.len()
+            && shared < ancestry.len().saturating_sub(1)
+            && ancestry[shared + 1].0.rsplit('/').next() == Some(components[shared])
+        {
+            shared += 1;
+        }
+        ancestry.truncate(shared + 1);
+        for component in components.iter().skip(shared) {
+            let current_rel = ancestry.last().expect("root directory retained").0.clone();
             let next_rel = if current_rel.is_empty() {
-                component.to_string()
+                (*component).to_string()
             } else {
                 format!("{current_rel}/{component}")
             };
-            if !directories.contains_key(&next_rel) {
-                let parent = directories
-                    .get(&current_rel)
-                    .expect("parent directory cached");
-                let opened = parent.ensure_child_dir(component).with_context(|| {
-                    format!(
-                        "open download destination directory {}",
-                        local.join(&next_rel).display()
-                    )
-                })?;
-                directories.insert(next_rel.clone(), Arc::new(opened));
-            }
-            current_rel = next_rel;
+            let parent = ancestry
+                .last()
+                .expect("parent directory retained")
+                .1
+                .clone();
+            let opened = parent.ensure_child_dir(component).with_context(|| {
+                format!(
+                    "open download destination directory {}",
+                    local.join(&next_rel).display()
+                )
+            })?;
+            ancestry.push((next_rel, Arc::new(opened)));
         }
-        directories
-            .get(&current_rel)
-            .expect("publish directory cached")
+        ancestry
+            .last()
+            .expect("publish directory retained")
+            .1
             .publish_file(name, &data)
             .with_context(|| {
                 format!(
@@ -1837,6 +1841,32 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
             })?;
     }
     Ok(())
+}
+
+/// Apply the local `.gitignore` files along a path's ancestry. This mirrors the
+/// upload's gitignore behavior for existing local files without walking ignored
+/// build trees during reconciliation.
+fn local_path_is_ignored(root: &Path, rel: &str) -> Result<bool> {
+    use ignore::gitignore::GitignoreBuilder;
+
+    let mut builder = GitignoreBuilder::new(root);
+    let mut parent = root.to_path_buf();
+    let candidate = root.join(rel);
+    let components: Vec<&str> = rel.split('/').collect();
+    for component in &components {
+        let ignore_file = parent.join(".gitignore");
+        if ignore_file.is_file()
+            && let Some(error) = builder.add(&ignore_file)
+        {
+            return Err(error).with_context(|| format!("read {}", ignore_file.display()));
+        }
+        parent.push(component);
+    }
+    let matcher = builder
+        .build()
+        .map_err(anyhow::Error::msg)
+        .context("parse local .gitignore rules")?;
+    Ok(matcher.matched(&candidate, false).is_ignore())
 }
 
 impl SpritesProvider {
@@ -5752,7 +5782,7 @@ mod tests {
                         size,
                     });
             }
-            let entries = children.into_values().collect();
+            let entries: Vec<FileEntry> = children.into_values().collect();
             Box::pin(async move { Ok(entries) })
         }
 
@@ -5872,5 +5902,25 @@ mod tests {
         assert_eq!(std::fs::read(temp.path().join("a.txt")).unwrap(), b"mine");
         assert_eq!(std::fs::read(temp.path().join("d/b.txt")).unwrap(), b"two");
         assert!(!temp.path().join("z").exists());
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_keeps_ignored_local_build_output() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/x"), b"local build output").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"sandbox build output");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(temp.path().join("out/x")).unwrap(),
+            b"local build output",
+            "ignored local output is excluded from upload conflicts and stays local"
+        );
     }
 }
