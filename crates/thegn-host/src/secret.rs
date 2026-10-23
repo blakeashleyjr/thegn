@@ -1696,7 +1696,15 @@ mod tests {
         let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("keyring read failed"), "{log}");
         assert!(log.contains(r#"outcome="denied""#), "{log}");
-        assert!(!log.contains("media-mpd-test-account"), "{log}");
+        let read_failure = log
+            .lines()
+            .find(|line| line.contains("keyring read failed"))
+            .expect("keyring read failure is logged");
+        assert!(read_failure.contains("reason=locked"), "{read_failure}");
+        assert!(
+            !read_failure.contains("media-mpd-test-account"),
+            "{read_failure}"
+        );
     }
 
     #[test]
