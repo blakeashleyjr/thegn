@@ -482,7 +482,7 @@ fn every_canonical_status_is_writable() {
 fn operator_table_matches_the_database_cell_by_cell() {
     use crate::attention::{MqOperation, MqStatus, MqTransition};
 
-    for operation in [MqOperation::Retry, MqOperation::Remove] {
+    for operation in MqOperation::ALL {
         for status in MqStatus::ALL {
             for claimed in [false, true] {
                 let db = seeded();
@@ -491,6 +491,12 @@ fn operator_table_matches_the_database_cell_by_cell() {
                     ..Default::default()
                 };
                 db.replace_merge_status(WORKTREE, status.as_str(), &fields)
+                    .unwrap();
+                db.conn()
+                    .execute(
+                        "UPDATE merge_queue SET candidate_oid='candidate-oid' WHERE worktree=?1",
+                        [WORKTREE],
+                    )
                     .unwrap();
                 if claimed {
                     db.conn()
@@ -511,7 +517,7 @@ fn operator_table_matches_the_database_cell_by_cell() {
                         );
                         assert_eq!(row(&db).status, "queued", "{cell}");
                     }
-                    (MqTransition::Delete, MqOperation::Remove) => {
+                    (MqTransition::Delete, MqOperation::Remove | MqOperation::Clear) => {
                         db.remove_merge_entry(WORKTREE).unwrap();
                         assert!(db.list_merge_queue().unwrap().is_empty(), "{cell}");
                     }
@@ -526,7 +532,7 @@ fn operator_table_matches_the_database_cell_by_cell() {
                         );
                         assert_eq!(row(&db), before, "{cell}");
                     }
-                    (MqTransition::Refuse, MqOperation::Remove) => {
+                    (MqTransition::Refuse, MqOperation::Remove | MqOperation::Clear) => {
                         let result = db.remove_merge_entry(WORKTREE);
                         assert_eq!(
                             result.unwrap_err().to_string(),
@@ -539,7 +545,72 @@ fn operator_table_matches_the_database_cell_by_cell() {
                         panic!("unexpected table cell {operation:?} / {status:?}: {transition:?}");
                     }
                 }
+                let events = db.merge_queue_events(WORKTREE, 10).unwrap();
+                assert_eq!(events.len(), 1, "{cell}: {events:?}");
+                let event = &events[0];
+                let (expected_operation, expected_outcome, expected_new_status) =
+                    match operation.transition(status, claimed) {
+                        MqTransition::Requeue => ("retry", "rearmed", Some("queued")),
+                        MqTransition::Delete => ("remove", "deleted", None),
+                        MqTransition::Refuse if claimed => (
+                            if operation == MqOperation::Retry {
+                                "retry"
+                            } else {
+                                "remove"
+                            },
+                            "claimed",
+                            None,
+                        ),
+                        MqTransition::Refuse => ("retry", "not_retryable", None),
+                    };
+                assert_eq!(event.operation, expected_operation, "{cell}");
+                assert_eq!(event.outcome, expected_outcome, "{cell}");
+                assert_eq!(event.old_status, status.as_str(), "{cell}");
+                assert_eq!(event.new_status.as_deref(), expected_new_status, "{cell}");
+                assert_eq!(event.row_updated_at, before.updated_at, "{cell}");
+                assert_eq!(
+                    event.candidate_oid.as_deref(),
+                    Some("candidate-oid"),
+                    "{cell}"
+                );
+                assert_eq!(event.result_oid, before.result_oid, "{cell}");
+                assert_eq!(
+                    event.actor,
+                    format!("thegn pid {}", std::process::id()),
+                    "{cell}"
+                );
             }
         }
     }
+}
+
+#[test]
+fn merge_queue_events_are_bounded_per_worktree() {
+    let db = seeded();
+    for _ in 0..205 {
+        assert_eq!(
+            db.retry_held_merge_entry(WORKTREE).unwrap(),
+            MergeRetryOutcome::Rearmed
+        );
+        db.replace_merge_status(WORKTREE, "deferred", &MergeStatusFields::default())
+            .unwrap();
+    }
+    let events = db
+        .merge_queue_events(WORKTREE, crate::store::MERGE_QUEUE_EVENTS_PER_WORKTREE + 1)
+        .unwrap();
+    assert_eq!(events.len(), crate::store::MERGE_QUEUE_EVENTS_PER_WORKTREE);
+    assert_eq!(events[0].outcome, "rearmed");
+    assert_eq!(events[0].new_status.as_deref(), Some("queued"));
+    assert!(events.iter().all(|event| event.worktree == WORKTREE));
+}
+
+#[test]
+fn retry_and_remove_of_a_missing_row_record_nothing() {
+    let db = Db::open_memory().unwrap();
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::NotQueued
+    );
+    db.remove_merge_entry(WORKTREE).unwrap();
+    assert!(db.merge_queue_events(WORKTREE, 10).unwrap().is_empty());
 }

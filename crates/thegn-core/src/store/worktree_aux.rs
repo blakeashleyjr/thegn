@@ -30,6 +30,28 @@ pub enum MergeRetryOutcome {
     Claimed,
 }
 
+/// Rows kept per worktree in `merge_queue_events`; older rows are pruned in the writing transaction.
+pub const MERGE_QUEUE_EVENTS_PER_WORKTREE: usize = 200;
+
+/// One operator transition on a merge-queue row. `operation` is "retry" or "remove"
+/// (`thegn merge clear` removes row by row and is recorded as "remove"); `outcome` is
+/// "rearmed", "not_retryable", "claimed" or "deleted"; `new_status` is "queued" for a
+/// re-arm and None otherwise; `row_updated_at` is the row's `updated_at` before the
+/// transition (its version).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeQueueEvent {
+    pub worktree: String,
+    pub operation: String,
+    pub outcome: String,
+    pub old_status: String,
+    pub new_status: Option<String>,
+    pub row_updated_at: i64,
+    pub candidate_oid: Option<String>,
+    pub result_oid: Option<String>,
+    pub actor: String,
+    pub at_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeClaimPhase {
     ClaimedNoChild,
@@ -404,6 +426,9 @@ pub trait WorktreeAuxStore {
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).
     fn remove_merge_entry(&self, worktree: &str) -> Result<()>;
+
+    /// Read an operator-event history newest first, limited to at most `limit` rows.
+    fn merge_queue_events(&self, worktree: &str, limit: usize) -> Result<Vec<MergeQueueEvent>>;
 
     /// Install only the fixed branch-retained cleanup marker if every decoded
     /// field still matches this landed observation. Preserve timestamps and
