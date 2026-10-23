@@ -454,12 +454,11 @@ impl Machine0Provider {
     /// create-wait and the resume-on-claim wait.
     async fn ensure_running_vm(&self, name: &str) -> Result<Machine0Vm> {
         let budget = crate::op_budget::OpBudget::start(VM_READY_BUDGET);
-        let mut last: String;
+        let mut last = "in-flight call exceeded the budget".to_owned();
         loop {
             // A transient control-plane blip (or brief post-create not-found from
             // eventual consistency) must not abort a multi-minute wait — poll
             // through it until the budget, surfacing the last state on timeout.
-            last = "in-flight call exceeded the budget".into();
             // A cancelled MCP call drops its control-gate permit.
             let vm_result = match budget.within(self.vm_by_name(name)).await {
                 Some(result) => result,
@@ -492,7 +491,6 @@ impl Machine0Provider {
                             Some(Ok(_)) => {}
                             Some(Err(e)) => last = format!("start-transient: {e}"),
                             None => {
-                                last = "in-flight call exceeded the budget".into();
                                 return Err(anyhow!(
                                     "machine0: vm {name} not RUNNING after {}s (last {last})",
                                     VM_READY_BUDGET.as_secs(),
@@ -519,7 +517,7 @@ impl Machine0Provider {
     async fn wait_status(&self, name: &str, pred: fn(&str) -> bool, label: &str) -> Result<()> {
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
         let budget = crate::op_budget::OpBudget::start(BUDGET);
-        match poll_vm_status(&budget, VM_READY_POLL, || self.vm_by_name(name), pred).await {
+        match Self::poll_vm_status(&budget, VM_READY_POLL, || self.vm_by_name(name), pred).await {
             Ok(()) => Ok(()),
             Err(last) => Err(anyhow!(
                 "machine0: vm {name} not {label} after {}s (last {last})",
