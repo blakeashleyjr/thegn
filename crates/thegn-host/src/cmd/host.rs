@@ -4,7 +4,7 @@
 //! and one started in the TUI arbitrate via the DB heartbeat (the second
 //! attaches instead of double-driving).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::host_machine::HostState;
@@ -275,21 +275,22 @@ fn resolve_add_name(
 
 /// Whether `name` came from the DB (merge inserts it into cfg.host, so the
 /// config map alone can't distinguish; ask the DB).
-fn is_db_host(name: &str) -> bool {
-    Db::open()
-        .ok()
-        .and_then(|db| db.host_defs().ok())
-        .is_some_and(|defs| defs.iter().any(|(n, _)| n == name))
+fn is_db_host(db: &Db, name: &str) -> Result<bool> {
+    Ok(db
+        .host_defs()
+        .context("could not read the saved host definitions")?
+        .iter()
+        .any(|(n, _)| n == name))
 }
 
 fn rm(cfg: &Config, name: &str, force: bool) -> Result<()> {
-    if !is_db_host(name) {
+    let db = Db::open()?;
+    if !is_db_host(&db, name)? {
         if cfg.host.contains_key(name) {
             anyhow::bail!("[host.{name}] is config-defined — remove it from config.toml");
         }
         anyhow::bail!("no DB-added host named {name}");
     }
-    let db = Db::open()?;
     let id = thegn_core::host::HostId::named(name);
     // Live placement tenants: never kill someone's running sandboxes on a
     // machine thegn is a guest on — drain (park out of every lane) and
@@ -297,28 +298,31 @@ fn rm(cfg: &Config, name: &str, force: bool) -> Result<()> {
     // (the sandboxes themselves are the owner's to stop).
     let tenants = {
         use thegn_core::store::PlacementStore;
-        db.tenants_of(&id).unwrap_or_default()
+        db.tenants_of(&id).map(|rows| {
+            rows.into_iter()
+                .map(|tenant| tenant.sandbox)
+                .collect::<Vec<String>>()
+        })
     };
-    if !tenants.is_empty() && !force {
-        drain(cfg, name)?;
-        outln!(
-            "host {name} still has {} live placement tenant(s): {}",
-            tenants.len(),
-            tenants
-                .iter()
-                .map(|t| t.sandbox.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        outln!("draining instead — re-run `thegn host rm {name}` once they release,");
-        outln!("or `--force` to release the ledger rows now (sandboxes keep running).");
-        return Ok(());
-    }
-    if force {
-        use thegn_core::store::PlacementStore;
-        for t in &tenants {
-            let _ = db.tenancy_release(&t.sandbox, now()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    match rm_decision(name, tenants, force)? {
+        RmDecision::Drain(names) => {
+            drain(cfg, name)?;
+            outln!(
+                "host {name} still has {} live placement tenant(s): {}",
+                names.len(),
+                names.join(", ")
+            );
+            outln!("draining instead — re-run `thegn host rm {name}` once they release,");
+            outln!("or `--force` to release the ledger rows now (sandboxes keep running).");
+            return Ok(());
         }
+        RmDecision::ReleaseThenDelete(names) => {
+            use thegn_core::store::PlacementStore;
+            for name in &names {
+                let _ = db.tenancy_release(name, now()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
+        }
+        RmDecision::Delete => {}
     }
     {
         use thegn_core::store::PlacementStore;
@@ -330,6 +334,26 @@ fn rm(cfg: &Config, name: &str, force: bool) -> Result<()> {
         "on-host images/volumes are labelled thegn.managed — reclaim them with `thegn sandbox prune --host {name}` (while the host is still reachable)"
     );
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RmDecision {
+    Drain(Vec<String>),
+    ReleaseThenDelete(Vec<String>),
+    Delete,
+}
+
+fn rm_decision(name: &str, tenants: Result<Vec<String>>, force: bool) -> Result<RmDecision> {
+    let tenants = tenants.map_err(|error| {
+        anyhow::anyhow!(
+            "could not read host {name}'s placement tenants ({error:#}); nothing was removed"
+        )
+    })?;
+    Ok(match (tenants.is_empty(), force) {
+        (true, _) => RmDecision::Delete,
+        (false, false) => RmDecision::Drain(tenants),
+        (false, true) => RmDecision::ReleaseThenDelete(tenants),
+    })
 }
 
 /// Park a host out of every placement lane (durable `draining` state):
@@ -769,5 +793,43 @@ mod tests {
     fn missing_host_is_a_config_error() {
         let cfg = Config::default();
         assert!(binding_for(&cfg, "nope").is_err());
+    }
+
+    #[test]
+    fn rm_decision_refuses_when_the_tenancy_ledger_cannot_be_read() {
+        for force in [false, true] {
+            let error =
+                rm_decision("box", Err(anyhow::anyhow!("database is locked")), force).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("could not read host box's placement tenants"));
+            assert!(message.contains("database is locked"));
+            assert!(message.contains("nothing was removed"));
+        }
+    }
+
+    #[test]
+    fn rm_decision_drains_live_tenants_without_force() {
+        assert_eq!(
+            rm_decision("box", Ok(vec!["sb-1".into()]), false).unwrap(),
+            RmDecision::Drain(vec!["sb-1".into()])
+        );
+    }
+
+    #[test]
+    fn rm_decision_releases_then_deletes_with_force() {
+        assert_eq!(
+            rm_decision("box", Ok(vec!["sb-1".into()]), true).unwrap(),
+            RmDecision::ReleaseThenDelete(vec!["sb-1".into()])
+        );
+    }
+
+    #[test]
+    fn rm_decision_deletes_a_host_with_no_tenants() {
+        for force in [false, true] {
+            assert_eq!(
+                rm_decision("box", Ok(vec![]), force).unwrap(),
+                RmDecision::Delete
+            );
+        }
     }
 }
