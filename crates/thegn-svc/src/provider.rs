@@ -4999,6 +4999,10 @@ mod tests {
 
     #[tokio::test]
     async fn download_dir_rooted_swap_between_listing_and_read_cannot_escape() {
+        if !cfg!(unix) {
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
         let outside = temp.path().join("outside");
@@ -5112,6 +5116,10 @@ mod tests {
     /// Regression gate for the fd bound: opening siblings only when popped keeps descriptors bounded by depth.
     #[tokio::test]
     async fn download_dir_open_handles_stay_bounded_by_depth() {
+        if !cfg!(unix) {
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
         std::fs::create_dir(&root).unwrap();
