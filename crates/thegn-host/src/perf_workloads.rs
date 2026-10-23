@@ -51,7 +51,8 @@ fn controlled_perf_workload() {
                     &path,
                     Some(""),
                     &approvals,
-                );
+                )
+                .expect("fixture DB is readable");
                 std::hint::black_box(env);
             }
             resolve_times.push(t.elapsed().as_micros());

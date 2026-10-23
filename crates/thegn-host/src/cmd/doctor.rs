@@ -303,14 +303,27 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
         .as_ref()
         .map(|db| crate::handlers::repo_trust::approvals_for(db, &root.to_string_lossy()))
         .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
-    let environment = crate::handlers::repo_trust::effective_environment_for_worktree(
+    let environment = match crate::handlers::repo_trust::effective_environment_for_worktree(
         cfg,
         db.as_ref(),
         &root,
         &worktree,
         None,
         &approvals,
-    );
+    ) {
+        Ok(environment) => environment,
+        Err(error) => {
+            let reason = format!("{error:#}");
+            return serde_json::json!({
+                "mode": cfg.sandbox.devcontainer.as_str(),
+                "repo": root.display().to_string(),
+                "candidates": [],
+                "selected": null,
+                "error": reason.clone(),
+                "status": { "variant": "", "state": "unknown", "reason": reason }
+            });
+        }
+    };
     let sandbox = environment.sandbox.clone();
     if sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
         return serde_json::json!({
