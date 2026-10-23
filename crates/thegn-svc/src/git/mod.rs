@@ -1289,6 +1289,91 @@ pub(crate) fn parse_numstat_z(out: &[u8]) -> Result<Vec<DiffEntry>> {
     Ok(entries)
 }
 
+/// A full SHA-1 or SHA-256 object id in lowercase or uppercase hex.
+fn worktree_head_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Strictly parse `git worktree list --porcelain -z` (THE-376 slice d).
+///
+/// Every field ends with NUL and every record ends with an empty field, so a complete listing ends with two NULs.
+/// A record opens with `worktree <path>`; `HEAD <oid>`, `branch <ref>`, `detached`, `bare`, `locked[ <reason>]` and
+/// `prunable[ <reason>]` follow. Unknown field labels are accepted and ignored for forward compatibility with newer git.
+/// The head maps as the line parser did: `branch` -> Branch (refs/heads/ stripped), `detached` -> Detached, otherwise
+/// Unborn (including a bare entry).
+pub(crate) fn parse_worktrees_z(out: &[u8]) -> Result<Vec<WorktreeInfo>> {
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(out.ends_with(b"\0\0"), "truncated worktree list");
+
+    let mut worktrees = Vec::new();
+    let mut current: Option<WorktreeInfo> = None;
+    let mut has_head = false;
+    let mut has_branch = false;
+    let mut has_detached = false;
+    for field in out[..out.len() - 1].split(|byte| *byte == 0) {
+        let field = std::str::from_utf8(field).context("worktree list contains non-UTF-8 field")?;
+        if field.is_empty() {
+            let worktree = current
+                .take()
+                .context("malformed worktree list: empty record")?;
+            worktrees.push(worktree);
+            has_head = false;
+            has_branch = false;
+            has_detached = false;
+            continue;
+        }
+        if let Some(path) = field.strip_prefix("worktree ") {
+            anyhow::ensure!(
+                current.is_none(),
+                "malformed worktree list: nested worktree record"
+            );
+            anyhow::ensure!(!path.is_empty(), "malformed worktree list: empty path");
+            current = Some(WorktreeInfo {
+                path: path.to_string(),
+                head: WorktreeHead::Unborn,
+            });
+            continue;
+        }
+        anyhow::ensure!(
+            field != "worktree",
+            "malformed worktree list: missing worktree path"
+        );
+        let worktree = current
+            .as_mut()
+            .context("malformed worktree list: field before worktree record")?;
+        anyhow::ensure!(field != "HEAD", "malformed worktree HEAD object id");
+        if let Some(oid) = field.strip_prefix("HEAD ") {
+            anyhow::ensure!(!has_head, "duplicate worktree HEAD field");
+            anyhow::ensure!(worktree_head_oid(oid), "malformed worktree HEAD object id");
+            has_head = true;
+        } else if let Some(branch) = field.strip_prefix("branch ") {
+            anyhow::ensure!(
+                !has_branch && !has_detached,
+                "duplicate worktree head field"
+            );
+            anyhow::ensure!(!branch.is_empty(), "malformed worktree branch field");
+            let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            anyhow::ensure!(!branch.is_empty(), "malformed worktree branch field");
+            worktree.head = WorktreeHead::Branch(branch.to_string());
+            has_branch = true;
+        } else if field == "branch" {
+            anyhow::bail!("malformed worktree branch field");
+        } else if field == "detached" {
+            anyhow::ensure!(
+                !has_detached && !has_branch,
+                "duplicate worktree head field"
+            );
+            worktree.head = WorktreeHead::Detached;
+            has_detached = true;
+        }
+    }
+    anyhow::ensure!(current.is_none(), "truncated worktree record");
+    anyhow::ensure!(!worktrees.is_empty(), "malformed worktree list");
+    Ok(worktrees)
+}
+
 fn quote_c_path(bytes: &[u8]) -> String {
     let mut quoted = String::from("\"");
     for byte in bytes {
@@ -2528,6 +2613,15 @@ impl GitBackend for CliGit {
 
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>> {
         let loc = GitLoc::for_worktree(root);
+        if local_cli(&loc) {
+            let out = run_status_bytes(&loc, &["worktree", "list", "--porcelain", "-z"], true)?;
+            anyhow::ensure!(
+                out.status.success(),
+                "git worktree list -z failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return parse_worktrees_z(&out.stdout);
+        }
         let out = run(&loc, &["worktree", "list", "--porcelain"])?;
         let mut v = Vec::new();
         let mut cur: Option<WorktreeInfo> = None;
@@ -4028,6 +4122,93 @@ mod tests {
                 .map(|p| p == canon)
                 .unwrap_or(false)
         }));
+    }
+
+    #[test]
+    fn worktree_list_z_parses_every_real_record_shape() {
+        let sha1 = "a".repeat(40);
+        let sha256 = "b".repeat(64);
+        let listing = format!(
+            "worktree /r\0HEAD {sha1}\0branch refs/heads/main\0\0\
+             worktree /r/wt\0HEAD {sha1}\0detached\0\0\
+             worktree /r.git\0bare\0\0\
+             worktree /w\0HEAD {sha1}\0branch refs/heads/x\0locked held\nby ci\0\0\
+             worktree /gone\0HEAD {sha1}\0detached\0prunable gitdir file points to non-existent location\0\0\
+             worktree /sha256\0HEAD {sha256}\0detached\0\0\
+             worktree /unborn\0HEAD {}\0branch refs/heads/main\0\0",
+            "0".repeat(40)
+        );
+        let worktrees = parse_worktrees_z(listing.as_bytes()).unwrap();
+        assert_eq!(worktrees.len(), 7);
+        assert_eq!(worktrees[0].path, "/r");
+        assert_eq!(worktrees[0].head, WorktreeHead::Branch("main".into()));
+        assert_eq!(worktrees[1].path, "/r/wt");
+        assert_eq!(worktrees[1].head, WorktreeHead::Detached);
+        assert_eq!(worktrees[2].path, "/r.git");
+        assert_eq!(worktrees[2].head, WorktreeHead::Unborn);
+        assert_eq!(worktrees[3].path, "/w");
+        assert_eq!(worktrees[3].head, WorktreeHead::Branch("x".into()));
+        assert_eq!(worktrees[4].path, "/gone");
+        assert_eq!(worktrees[4].head, WorktreeHead::Detached);
+        assert_eq!(worktrees[5].path, "/sha256");
+        assert_eq!(worktrees[5].head, WorktreeHead::Detached);
+        assert_eq!(worktrees[6].path, "/unborn");
+        assert_eq!(worktrees[6].head, WorktreeHead::Branch("main".into()));
+        assert!(parse_worktrees_z(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn worktree_list_z_rejects_malformed_framing() {
+        let oid = "a".repeat(40);
+        let cases = [
+            format!("worktree /r\0HEAD {oid}\0detached\0"),
+            format!("HEAD {oid}\0worktree /r\0detached\0\0"),
+            format!("worktree /r\0worktree /s\0HEAD {oid}\0detached\0\0"),
+            format!("worktree \0HEAD {oid}\0detached\0\0"),
+            format!("worktree /r\0HEAD {}\0detached\0\0", "a".repeat(39)),
+            format!("worktree /r\0HEAD {oid}\0branch refs/heads/a\0branch refs/heads/b\0\0"),
+            format!("worktree /r\0HEAD {oid}\0branch refs/heads/a\0detached\0\0"),
+            format!("worktree /r\0HEAD {oid}\0branch \0\0"),
+        ];
+        for bad in cases {
+            assert!(
+                parse_worktrees_z(bad.as_bytes()).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        let mut non_utf8_path = b"worktree /a\xff\0HEAD ".to_vec();
+        non_utf8_path.extend_from_slice(oid.as_bytes());
+        non_utf8_path.extend_from_slice(b"\0detached\0\0");
+        assert!(parse_worktrees_z(&non_utf8_path).is_err());
+    }
+
+    #[test]
+    fn worktree_list_z_keeps_a_newline_path_as_one_worktree() {
+        let repo = testutil::TestRepo::new("wt-newline");
+        repo.commit_file("f.txt", "one\n", "c0");
+        let wt = repo.dir.join("nl\nworktree fake");
+        if let Err(error) = CliGit.add_worktree(&repo.dir, "nl", "main", &wt) {
+            assert!(
+                !error.to_string().is_empty(),
+                "worktree add refusal is reported"
+            );
+            return;
+        }
+
+        let worktrees = CliGit.worktrees(&repo.dir).unwrap();
+        let matching: Vec<_> = worktrees
+            .iter()
+            .filter(|worktree| {
+                std::path::Path::new(&worktree.path).canonicalize().ok() == wt.canonicalize().ok()
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "newline path must be one exact entry");
+        assert_eq!(matching[0].head, WorktreeHead::Branch("nl".into()));
+        assert!(
+            !worktrees.iter().any(|worktree| {
+                worktree.path.ends_with("worktree fake") || worktree.path == "nl"
+            })
+        );
     }
 
     #[test]
