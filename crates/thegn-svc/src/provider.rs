@@ -2827,6 +2827,9 @@ impl Provider {
     /// Idempotently ensure a sandbox named `name` exists — the warm-on-open
     /// lifecycle. Returns `true` if it created one, `false` if it already existed.
     /// (List-then-create; a provider with a truly idempotent create can override.)
+    /// For machine0, a listed VM that still holds this machine's pending create
+    /// record is adopted (readiness, provisioning, custody) and the record retired;
+    /// an adoption failure is an error and keeps the record.
     pub async fn ensure_exists(&self, name: &str) -> Result<bool> {
         if let Some(owner) = self.binding_owner() {
             let name = name.to_owned();
@@ -2835,6 +2838,9 @@ impl Provider {
                 .await??;
         }
         if self.list().await?.iter().any(|n| n == name) {
+            if let Provider::Machine0(provider) = self {
+                provider.adopt_listed_pending(name).await?;
+            }
             return Ok(false);
         }
         self.create().await?;
