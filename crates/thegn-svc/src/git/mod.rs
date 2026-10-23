@@ -4188,11 +4188,7 @@ mod tests {
         repo.commit_file("f.txt", "one\n", "c0");
         let wt = repo.dir.join("nl\nworktree fake");
         if let Err(error) = CliGit.add_worktree(&repo.dir, "nl", "main", &wt) {
-            assert!(
-                !error.to_string().is_empty(),
-                "worktree add refusal is reported"
-            );
-            return;
+            panic!("could not create newline-path worktree fixture: {error}");
         }
 
         let worktrees = CliGit.worktrees(&repo.dir).unwrap();
@@ -4204,10 +4200,24 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1, "newline path must be one exact entry");
         assert_eq!(matching[0].head, WorktreeHead::Branch("nl".into()));
+        assert_eq!(
+            worktrees.len(),
+            2,
+            "listing must contain root plus nl worktree"
+        );
+        let truncated = repo
+            .dir
+            .join("nl")
+            .canonicalize()
+            .unwrap_or_else(|_| repo.dir.join("nl"));
+        let truncated_unresolved = repo.dir.join("nl");
         assert!(
             !worktrees.iter().any(|worktree| {
-                worktree.path.ends_with("worktree fake") || worktree.path == "nl"
-            })
+                worktree.path == "fake"
+                    || std::path::Path::new(&worktree.path) == truncated.as_path()
+                    || std::path::Path::new(&worktree.path) == truncated_unresolved.as_path()
+            }),
+            "listing must not contain the old line parser's truncated entries"
         );
     }
 
