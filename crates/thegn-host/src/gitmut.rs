@@ -473,6 +473,50 @@ pub fn execute_at(op: GitOp, loc: &GitLoc, worktree_key: &str, override_gpg: boo
     )
 }
 
+/// Resolve the worktree placement before allowing a panel git mutation to run.
+pub(crate) fn execute_for_worktree(
+    op: GitOp,
+    worktree: &std::path::Path,
+    override_gpg: bool,
+) -> GitOpResult {
+    let loc = match GitLoc::for_worktree_op(worktree, op.label()) {
+        Ok(loc) => loc,
+        Err(error) => return GitOpResult::Err(error),
+    };
+    execute_at(
+        op,
+        &loc,
+        &GitLoc::worktree_cache_key(worktree),
+        override_gpg,
+    )
+}
+
+/// Resolve the worktree placement before staging paths through the control API.
+pub(crate) fn control_stage(worktree: &std::path::Path, paths: &[String]) -> anyhow::Result<()> {
+    let loc = GitLoc::for_worktree_op(worktree, "git stage").map_err(anyhow::Error::msg)?;
+    for path in paths {
+        CliGit.stage(&loc, path)?;
+    }
+    Ok(())
+}
+
+/// Resolve the worktree placement before committing through the control API.
+pub(crate) fn control_commit(worktree: &std::path::Path, message: &str) -> anyhow::Result<String> {
+    let loc = GitLoc::for_worktree_op(worktree, "git commit").map_err(anyhow::Error::msg)?;
+    CliGit.commit(&loc, message, false, None)?;
+    // The new HEAD is the commit we just made (git_cmd scrubs GIT_* env; inside
+    // spawn_blocking, so the wait is off-loop).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "inside spawn_blocking — off-loop child wait is the sanctioned pattern"
+    )]
+    let out = thegn_core::util::git_cmd(worktree)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    anyhow::ensure!(out.status.success(), "rev-parse HEAD failed");
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn execute_at_with_db(
     op: GitOp,
     loc: &GitLoc,
@@ -1656,6 +1700,71 @@ timeout_secs = 1
                 .lines()
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn execute_for_worktree_refuses_when_the_location_is_unreadable() {
+        let dir = tmp_repo("loc-unreadable");
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let result = execute_for_worktree(
+            GitOp::StageFile {
+                path: "new.txt".into(),
+                unstage: false,
+            },
+            &dir,
+            false,
+        );
+        assert!(matches!(result, GitOpResult::Err(message) if message.contains("refused")));
+        assert!(git_out(&dir, &["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[test]
+    fn control_stage_refuses_when_the_location_is_unreadable() {
+        let dir = tmp_repo("stage-loc-unreadable");
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let result = control_stage(&dir, &["new.txt".into()]);
+        assert!(matches!(result, Err(error) if format!("{error:#}").contains("git stage refused")));
+        assert!(git_out(&dir, &["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[test]
+    fn control_commit_refuses_when_the_location_is_unreadable() {
+        let dir = tmp_repo("commit-loc-unreadable");
+        std::fs::write(dir.join("f.txt"), "changed\n").unwrap();
+        git_out(&dir, &["add", "f.txt"]);
+        let head = git_out(&dir, &["rev-parse", "HEAD"]);
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let result = control_commit(&dir, "msg");
+        assert!(
+            matches!(result, Err(error) if format!("{error:#}").contains("git commit refused"))
+        );
+        assert_eq!(git_out(&dir, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn execute_for_worktree_runs_on_a_readable_local_worktree() {
+        let _state = crate::testenv::IsolatedState::new();
+        thegn_core::db::Db::open().unwrap();
+        let dir = tmp_repo("loc-readable");
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let result = execute_for_worktree(
+            GitOp::StageFile {
+                path: "new.txt".into(),
+                unstage: false,
+            },
+            &dir,
+            false,
+        );
+        assert!(matches!(result, GitOpResult::Ok(_)));
+        assert_eq!(
+            git_out(&dir, &["diff", "--cached", "--name-only"]),
+            "new.txt"
         );
     }
 }
