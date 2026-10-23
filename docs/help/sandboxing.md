@@ -189,6 +189,10 @@ permissions, the daemon uses a random owner-only sibling and records its name in
 an owner-only locator under the state directory. A locator that does not name a
 valid owner-only directory is ignored, and the daemon replaces it on its next
 start.
+At startup, the daemon removes same-state random siblings the locator no longer
+names only when they are owner-only directories containing no entries beyond a
+socket that refuses connections (or is absent) and an unlocked, owner-owned
+lock file (if present). Unproven siblings are left in place.
 If a control socket directory is visible through a sandbox bind (for example,
 explicit `[daemon] socket` or `XDG_RUNTIME_DIR` under `$HOME` or the worktree),
 bwrap hides it with a tmpfs. systemd makes it inaccessible unless that would hide
