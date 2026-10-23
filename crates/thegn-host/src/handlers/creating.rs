@@ -1136,8 +1136,11 @@ mod tests {
         // splash would resolve THIS key to that provider.
         let mut cfg = thegn_core::config::Config::default();
         cfg.sandbox.default_env = "machine0".into();
-        let root = std::env::temp_dir();
-        let w = crate::wizard::NewWorktreeWizard::new_isolated_for_test(root.clone(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let w = crate::wizard::NewWorktreeWizard::new_isolated_for_test(
+            root.path().to_path_buf(),
+            &cfg,
+        );
         let progress = CreationProgress::new("tg-lively-orbit".to_string());
         let key = (
             thegn_core::repo::branch_tab(&w.repo_slug, &progress.branch),
