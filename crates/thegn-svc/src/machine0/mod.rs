@@ -321,7 +321,7 @@ impl Machine0Provider {
         let v = self.mcp.call_tool(name, args).await?;
         if let Some(err) = v.get("error").and_then(Value::as_str) {
             let msg = v.get("message").and_then(Value::as_str).unwrap_or(err);
-            return Err(anyhow!("machine0 {name}: {err}: {msg}"));
+            return Err(mcp::DefiniteRefusal::new(format!("machine0 {name}: {err}: {msg}")).into());
         }
         Ok(v)
     }
@@ -427,10 +427,29 @@ impl Machine0Provider {
         .await
         .context("machine0: pending create record worker failed")??;
 
-        let _create_response = self
-            .call(tool::VM_CREATE, args)
-            .await
-            .with_context(|| pending_outcome_unknown(name))?;
+        if let Err(error) = self.call(tool::VM_CREATE, args).await {
+            if mcp::is_definite_refusal(&error) {
+                let registry = crate::vps::registry::dir();
+                let name = name.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    retire_pending_after_create_error_at(&registry, &name, true)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(removal_error)) => tracing::warn!(
+                        %removal_error,
+                        "machine0: failed to remove refused pending create record"
+                    ),
+                    Err(join_error) => tracing::warn!(
+                        %join_error,
+                        "machine0: pending create refusal cleanup worker failed"
+                    ),
+                }
+                return Err(error);
+            }
+            return Err(error).with_context(|| pending_outcome_unknown(name));
+        }
         let vm = self
             .await_created_vm(name)
             .await
@@ -931,17 +950,12 @@ impl Machine0Provider {
         self.ensure_provisioned(name).await
     }
 
-    async fn retire_local_state(&self, name: &str) {
+    async fn retire_local_state(&self, name: &str) -> Result<()> {
         let root = thegn_core::util::thegn_dir();
         let name = name.to_string();
         match tokio::task::spawn_blocking(move || retire_local_state_in(&root, &name)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "machine0: failed to retire local VM state (attestation / known_hosts pin)")
-            }
-            Err(error) => {
-                tracing::warn!(%error, "machine0: local VM state retirement worker failed")
-            }
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -977,10 +991,33 @@ async fn after_vm_create<T>(
     ready.await
 }
 
-fn pending_outcome_unknown(name: &str) -> String {
-    format!(
-        "machine0: create outcome unknown; the pending reservation for {name} keeps counting against max_instances until a retry adopts the VM or destroy retires it"
-    )
+#[derive(Debug)]
+struct PendingOutcomeUnknown(String);
+
+impl std::fmt::Display for PendingOutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PendingOutcomeUnknown {}
+
+fn pending_outcome_unknown(name: &str) -> PendingOutcomeUnknown {
+    PendingOutcomeUnknown(format!(
+        "machine0: the create outcome for {name} is still unknown (pending reservation); retry later, or destroy {name} to retire the reservation"
+    ))
+}
+
+fn retire_pending_after_create_error_at(
+    registry: &Path,
+    name: &str,
+    definite_refusal: bool,
+) -> Result<()> {
+    if definite_refusal {
+        pending::remove_at(registry, name)
+    } else {
+        Ok(())
+    }
 }
 
 /// Refuse creation when live or pending capacity is unknown or already at the cap.
@@ -1014,13 +1051,18 @@ fn admit_create(
             "machine0: a VM named {name} already exists but this machine has no pending create for it; refusing to create a duplicate (destroy it or pick another sandbox name)"
         ));
     }
+    if pending_names
+        .iter()
+        .any(|pending_name| pending_name == name)
+    {
+        return Ok(pending::Admission::Unresolved);
+    }
     let pending_unlisted = pending_names
         .iter()
         .filter(|pending_name| {
-            *pending_name != name
-                && !listed
-                    .iter()
-                    .any(|listed_name| listed_name == *pending_name)
+            !listed
+                .iter()
+                .any(|listed_name| listed_name == *pending_name)
         })
         .collect::<Vec<_>>();
     let occupied: usize = listed.len() + pending_unlisted.len();
@@ -1067,6 +1109,10 @@ impl RemoteProvider for Machine0Provider {
             let spawned = match admission {
                 pending::Admission::Create => self.spawn(&name, &self.spec.image).await,
                 pending::Admission::Adopt => self.adopt(&name).await,
+                pending::Admission::Unresolved => match self.vm_by_name(&name).await {
+                    Ok(Some(_)) => self.adopt(&name).await,
+                    Ok(None) | Err(_) => Err(pending_outcome_unknown(&name).into()),
+                },
             };
             drop(create_guard);
             let vm = spawned?;
@@ -1096,7 +1142,7 @@ impl RemoteProvider for Machine0Provider {
             thegn_core::managed_ssh::read("machine0", &custody_account, id)
                 .context("machine0: validate managed SSH custody before destroy")?;
             let Some(vm) = self.vm_by_name_for_destroy(id).await? else {
-                self.retire_local_state(id).await;
+                self.retire_local_state(id).await?;
                 thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                     .context("machine0: retire managed SSH custody")?;
                 return Ok(()); // already gone
@@ -1104,12 +1150,12 @@ impl RemoteProvider for Machine0Provider {
             *self.endpoint.lock().unwrap() = None;
             match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
                 Ok(_) => {
-                    self.retire_local_state(id).await;
+                    self.retire_local_state(id).await?;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                         .context("machine0: retire managed SSH custody")
                 }
                 Err(e) if is_not_found(&e.to_string()) => {
-                    self.retire_local_state(id).await;
+                    self.retire_local_state(id).await?;
                     thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
                         .context("machine0: retire managed SSH custody")
                 }
@@ -2053,6 +2099,48 @@ mod tests {
             )
             .unwrap(),
             pending::Admission::Adopt
+        );
+    }
+
+    #[test]
+    fn an_unlisted_pending_create_is_unresolved_not_created_again() {
+        assert_eq!(
+            admit_create(Ok(vec![]), Ok(vec!["dev".to_string()]), "dev", 5,).unwrap(),
+            pending::Admission::Unresolved
+        );
+        let refusal: anyhow::Error = pending_outcome_unknown("dev").into();
+        assert!(refusal.downcast_ref::<PendingOutcomeUnknown>().is_some());
+        assert!(refusal.to_string().contains("retry later, or destroy dev"));
+    }
+
+    #[test]
+    fn definite_create_refusal_retires_the_reservation_but_ambiguous_error_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("vps");
+        pending::record_at(&registry, "definite").unwrap();
+        let refusal = mcp::DefiniteRefusal::new("machine0 vm_create: invalid image".to_string());
+        let refusal: anyhow::Error = refusal.into();
+        assert!(mcp::is_definite_refusal(&refusal));
+        retire_pending_after_create_error_at(
+            &registry,
+            "definite",
+            mcp::is_definite_refusal(&refusal),
+        )
+        .unwrap();
+        assert!(pending::names_at(&registry).unwrap().is_empty());
+
+        pending::record_at(&registry, "ambiguous").unwrap();
+        let ambiguous = anyhow!("machine0 vm_create: transport timeout");
+        assert!(!mcp::is_definite_refusal(&ambiguous));
+        retire_pending_after_create_error_at(
+            &registry,
+            "ambiguous",
+            mcp::is_definite_refusal(&ambiguous),
+        )
+        .unwrap();
+        assert_eq!(
+            pending::names_at(&registry).unwrap(),
+            vec!["ambiguous".to_string()]
         );
     }
 
