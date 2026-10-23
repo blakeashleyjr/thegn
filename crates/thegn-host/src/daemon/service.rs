@@ -1959,9 +1959,12 @@ impl ControlApi for DaemonService {
                 })
                 .await
                 .ok()
-                .flatten();
-            if let Some((json, cached_branch, fetched_at)) = cached
-                && let Some(mut cache) = thegn_core::ci::decode_run_cache(&json)
+                .flatten()
+                .and_then(|(json, cached_branch, fetched_at)| {
+                    thegn_core::ci::decode_run_cache(&json)
+                        .map(|cache| (cache, cached_branch, fetched_at))
+                });
+            if let Some((mut cache, cached_branch, fetched_at)) = cached.clone()
                 && crate::ci_refresh::daemon_ci_cache_usable(
                     &cached_branch,
                     branch.as_deref(),
@@ -1983,34 +1986,56 @@ impl ControlApi for DaemonService {
                     discarded_rows: cache.discarded_rows,
                     source: "cache".into(),
                     fetched_at,
+                    stale_reason: None,
                 });
             }
+
+            let last_good = cached.and_then(|(cache, cached_branch, fetched_at)| {
+                crate::ci_refresh::daemon_ci_cache_last_good(
+                    &cached_branch,
+                    branch.as_deref(),
+                    &cache.context,
+                    context.as_deref(),
+                )
+                .then_some(crate::ci_refresh::LastGoodRuns { cache, fetched_at })
+            });
 
             let cfg = self.config.ci.clone();
             let provider_path = path.clone();
             let provider_branch = branch.clone();
             let fetched = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
-                let (client, context) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
-                    .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
-                let fetched = client
-                    .runs(&loc, provider_branch.as_deref(), requested)
-                    .map_err(|error| anyhow::anyhow!("CI provider: {error}"))?;
-                Ok::<_, anyhow::Error>((fetched, context))
+                match thegn_svc::ci::provider_and_context_for(&loc, &cfg) {
+                    Some((client, context)) => (
+                        client
+                            .runs(&loc, provider_branch.as_deref(), requested)
+                            .map_err(|error| anyhow::anyhow!("CI provider: {error}"))
+                            .map_err(|error| format!("{error:#}")),
+                        context,
+                    ),
+                    None => (Err("no CI provider for this worktree".to_string()), None),
+                }
             })
             .await
-            .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?
-            .map_err(ControlError::Internal)?;
-            let (fetched, context) = fetched;
-            let fetched_at = thegn_core::util::now();
-            if let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
-                runs: fetched.runs.clone(),
-                discarded_rows: fetched.discarded_rows,
-                context: context.clone().unwrap_or_default(),
-            }) {
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?;
+            let (fetched, provider_context) = fetched;
+            let reply = crate::ci_refresh::daemon_runs_after_provider(
+                fetched,
+                last_good,
+                thegn_core::util::now(),
+                requested,
+            )
+            .map_err(|message| ControlError::Internal(anyhow::Error::msg(message)))?;
+            if reply.write_cache
+                && let Ok(json) = serde_json::to_string(&thegn_core::ci::CiRunCache {
+                    runs: reply.runs.clone(),
+                    discarded_rows: reply.discarded_rows,
+                    context: provider_context.clone().unwrap_or_default(),
+                })
+            {
                 let key_for_write = key.clone();
                 let branch_for_write = branch.clone();
-                let context_for_write = context.clone();
+                let context_for_write = provider_context.clone();
                 let _ = self
                     .with_db(move |db| {
                         crate::ci_refresh::put_ci_cache_with_context(
@@ -2026,12 +2051,16 @@ impl ControlApi for DaemonService {
                     })
                     .await;
             }
+            if let Some(reason) = reply.stale_reason.as_deref() {
+                tracing::warn!(target: "thegn::ci", reason = %reason, "ci.runs served the last good cached list");
+            }
             Ok(thegn_svc::control::CiRunsReply {
                 worktree: path_string,
-                runs: serde_json::to_value(fetched.runs).unwrap_or_default(),
-                discarded_rows: fetched.discarded_rows,
-                source: "provider".into(),
-                fetched_at,
+                runs: serde_json::to_value(reply.runs).unwrap_or_default(),
+                discarded_rows: reply.discarded_rows,
+                source: reply.source.into(),
+                fetched_at: reply.fetched_at,
+                stale_reason: reply.stale_reason,
             })
         })
     }

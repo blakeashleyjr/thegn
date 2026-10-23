@@ -540,6 +540,108 @@ pub(crate) fn daemon_ci_runs_limit(limit: usize, max_runs: usize) -> Result<usiz
     }
 }
 
+/// A cached run list the daemon may fall back to: recorded for the same known
+/// branch and the same known provider context as the request, at any age.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LastGoodRuns {
+    pub(crate) cache: thegn_core::ci::CiRunCache,
+    pub(crate) fetched_at: i64,
+}
+
+/// A daemon reply for CI runs. `source` is `cache`, `provider`, or `stale-cache`;
+/// `write_cache` is true only for a complete provider list that may replace the cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonRunsReply {
+    pub(crate) runs: Vec<thegn_core::ci::CiRun>,
+    pub(crate) discarded_rows: usize,
+    pub(crate) source: &'static str,
+    pub(crate) fetched_at: i64,
+    pub(crate) stale_reason: Option<String>,
+    pub(crate) write_cache: bool,
+}
+
+/// Whether a cached list matches the request's known branch and provider context;
+/// last-good eligibility has no age check.
+pub(crate) fn daemon_ci_cache_last_good(
+    cached_branch: &str,
+    current_branch: Option<&str>,
+    cached_context: &str,
+    current_context: Option<&str>,
+) -> bool {
+    thegn_core::ci::cache_branch_matches(cached_branch, current_branch)
+        && thegn_core::ci::cache_context_matches(cached_context, current_context)
+}
+
+/// Resolve provider outcomes: (a) complete lists are returned and cacheable;
+/// (b) partial lists use last-good when available; (c) otherwise partial lists
+/// are returned with their discarded count; (d) errors use last-good when
+/// available; (e) errors without last-good remain errors.
+pub(crate) fn daemon_runs_after_provider(
+    fetched: Result<thegn_svc::ci::CiRunList, String>,
+    last_good: Option<LastGoodRuns>,
+    now: i64,
+    requested: usize,
+) -> Result<DaemonRunsReply, String> {
+    fn stale_reply(
+        mut last_good: LastGoodRuns,
+        reason: String,
+        requested: usize,
+    ) -> DaemonRunsReply {
+        let before = last_good.cache.runs.len();
+        last_good
+            .cache
+            .runs
+            .retain(|run| thegn_svc::ci::validate_ci_id(&run.id).is_ok());
+        last_good.cache.discarded_rows += before - last_good.cache.runs.len();
+        last_good.cache.runs.truncate(requested);
+        DaemonRunsReply {
+            runs: last_good.cache.runs,
+            discarded_rows: last_good.cache.discarded_rows,
+            source: "stale-cache",
+            fetched_at: last_good.fetched_at,
+            stale_reason: Some(reason),
+            write_cache: false,
+        }
+    }
+
+    match fetched {
+        Ok(list) if list.discarded_rows == 0 => Ok(DaemonRunsReply {
+            runs: list.runs,
+            discarded_rows: 0,
+            source: "provider",
+            fetched_at: now,
+            stale_reason: None,
+            write_cache: true,
+        }),
+        Ok(list) => match last_good {
+            Some(last_good) => Ok(stale_reply(
+                last_good,
+                format!(
+                    "CI provider returned an incomplete run list ({} malformed row(s)); showing the last complete list",
+                    list.discarded_rows
+                ),
+                requested,
+            )),
+            None => Ok(DaemonRunsReply {
+                runs: list.runs,
+                discarded_rows: list.discarded_rows,
+                source: "provider",
+                fetched_at: now,
+                stale_reason: None,
+                write_cache: false,
+            }),
+        },
+        Err(error) => match last_good {
+            Some(last_good) => Ok(stale_reply(
+                last_good,
+                format!("{error}; showing cached runs"),
+                requested,
+            )),
+            None => Err(error),
+        },
+    }
+}
+
 pub(crate) fn ci_detail_warnings(detail: &thegn_svc::ci::CiRunDetail) -> Vec<String> {
     let mut warnings = Vec::new();
     if detail.discarded_jobs > 0 {
@@ -2506,5 +2608,185 @@ mod tests {
         assert_eq!(identity.job_name, "build");
         assert_eq!(identity.head_sha, "abc");
         assert!(identity.warnings.is_empty());
+    }
+
+    fn daemon_last_good(ids: &[&str], discarded_rows: usize) -> LastGoodRuns {
+        LastGoodRuns {
+            cache: thegn_core::ci::CiRunCache {
+                runs: ids.iter().map(|id| ci_run(id, "sha")).collect(),
+                discarded_rows,
+                context: "github:github.com/o/r".into(),
+            },
+            fetched_at: 100,
+        }
+    }
+
+    #[test]
+    fn daemon_runs_complete_provider_list_replaces_the_cache() {
+        let reply = daemon_runs_after_provider(
+            Ok(thegn_svc::ci::CiRunList {
+                runs: vec![ci_run("1", "sha")],
+                discarded_rows: 0,
+            }),
+            Some(daemon_last_good(&["old"], 0)),
+            120,
+            10,
+        )
+        .expect("complete provider list");
+
+        assert_eq!(reply.runs, vec![ci_run("1", "sha")]);
+        assert_eq!(reply.source, "provider");
+        assert_eq!(reply.fetched_at, 120);
+        assert_eq!(reply.stale_reason, None);
+        assert!(reply.write_cache);
+    }
+
+    #[test]
+    fn daemon_runs_partial_list_never_replaces_the_cache_and_serves_last_good() {
+        let last_good = daemon_last_good(&["1"], 3);
+        let reply = daemon_runs_after_provider(
+            Ok(thegn_svc::ci::CiRunList {
+                runs: vec![ci_run("2", "sha")],
+                discarded_rows: 2,
+            }),
+            Some(last_good.clone()),
+            120,
+            10,
+        )
+        .expect("last good cache");
+
+        assert_eq!(reply.source, "stale-cache");
+        assert_eq!(reply.runs, last_good.cache.runs);
+        assert_eq!(reply.fetched_at, 100);
+        assert!(
+            reply
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("2 malformed row(s)"))
+        );
+        assert!(!reply.write_cache);
+    }
+
+    #[test]
+    fn daemon_runs_partial_list_without_last_good_is_returned_marked() {
+        let reply = daemon_runs_after_provider(
+            Ok(thegn_svc::ci::CiRunList {
+                runs: vec![ci_run("2", "sha")],
+                discarded_rows: 2,
+            }),
+            None,
+            120,
+            10,
+        )
+        .expect("partial provider list");
+
+        assert_eq!(reply.runs, vec![ci_run("2", "sha")]);
+        assert_eq!(reply.discarded_rows, 2);
+        assert_eq!(reply.source, "provider");
+        assert_eq!(reply.fetched_at, 120);
+        assert_eq!(reply.stale_reason, None);
+        assert!(!reply.write_cache);
+    }
+
+    #[test]
+    fn daemon_runs_provider_error_serves_labelled_last_good() {
+        let reply = daemon_runs_after_provider(
+            Err("CI provider: HTTP 502".into()),
+            Some(daemon_last_good(&["1"], 0)),
+            120,
+            10,
+        )
+        .expect("last good cache");
+
+        assert_eq!(reply.source, "stale-cache");
+        assert!(
+            reply
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("CI provider: HTTP 502"))
+        );
+        assert_eq!(reply.fetched_at, 100);
+        assert!(!reply.write_cache);
+    }
+
+    #[test]
+    fn daemon_runs_provider_error_without_last_good_stays_an_error() {
+        assert_eq!(
+            daemon_runs_after_provider(Err("CI provider: HTTP 502".into()), None, 120, 10),
+            Err("CI provider: HTTP 502".into())
+        );
+    }
+
+    #[test]
+    fn daemon_runs_stale_list_drops_malformed_ids_and_truncates() {
+        let reply = daemon_runs_after_provider(
+            Err("provider unavailable".into()),
+            Some(daemon_last_good(&["01", "1", "2", "3"], 4)),
+            120,
+            2,
+        )
+        .expect("last good cache");
+
+        assert_eq!(
+            reply
+                .runs
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2"]
+        );
+        assert_eq!(reply.discarded_rows, 5);
+    }
+
+    #[test]
+    fn daemon_runs_last_good_requires_known_branch_and_context() {
+        assert!(daemon_ci_cache_last_good(
+            "main",
+            Some("main"),
+            "github:github.com/o/r",
+            Some("github:github.com/o/r")
+        ));
+        for (cached_branch, current_branch, cached_context, current_context) in [
+            (
+                "",
+                Some("main"),
+                "github:github.com/o/r",
+                Some("github:github.com/o/r"),
+            ),
+            (
+                "other",
+                Some("main"),
+                "github:github.com/o/r",
+                Some("github:github.com/o/r"),
+            ),
+            (
+                "main",
+                None,
+                "github:github.com/o/r",
+                Some("github:github.com/o/r"),
+            ),
+            (
+                "main",
+                Some("HEAD"),
+                "github:github.com/o/r",
+                Some("github:github.com/o/r"),
+            ),
+            ("main", Some("main"), "", Some("github:github.com/o/r")),
+            (
+                "main",
+                Some("main"),
+                "github:github.com/o/r",
+                Some("github:github.com/o/other"),
+            ),
+            ("main", Some("main"), "github:github.com/o/r", None),
+            ("main", Some("main"), "github:github.com/o/r", Some("")),
+        ] {
+            assert!(!daemon_ci_cache_last_good(
+                cached_branch,
+                current_branch,
+                cached_context,
+                current_context
+            ));
+        }
     }
 }
