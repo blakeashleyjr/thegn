@@ -34,3 +34,8 @@ and `action_timeout_secs`. Outcomes remain visible as audit rows and as
 `automation` / `automation_failed` inbox notifications. Events caused by an
 automation carry an origin marker and remain visible, but cannot trigger more
 automation rules.
+
+Event enrichment matches the registered worktree by exact path, then by
+resolved filesystem identity, so a symlinked path or one with `.`/`..`
+components enriches the same way. If that alias matches worktrees in more than
+one repository, the repo, branch and workspace are left empty.
