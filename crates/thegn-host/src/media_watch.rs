@@ -643,6 +643,7 @@ async fn run_with<R, F>(
                     if !changed {
                         break true; // signal stream ended → reconnect
                     }
+                    // Timer wakes also poll here; a pending changed() future is safe to drop.
                     let (coalesced, ended) = drain_ready_changes(&mut *watch, PUSH_DRAIN_MAX);
                     if coalesced > 0 {
                         tracing::trace!(target: "thegn::media", coalesced, "coalesced ready media changes");
