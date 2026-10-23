@@ -12,7 +12,7 @@ pub(crate) fn run_dir(state_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn publish(socket: &Path, state_dir: &Path) {
-    publish_to(&mut GuardSink, socket, state_dir);
+    publish_socket_to(&mut GuardSink, socket, state_dir);
 }
 
 trait PublishSink {
@@ -39,6 +39,27 @@ fn publish_to(sink: &mut dyn PublishSink, socket: &Path, state_dir: &Path) {
     sink.protected_state_dir(run_dir(state_dir));
 }
 
+fn publish_socket_to(sink: &mut dyn PublishSink, socket: &Path, state_dir: &Path) {
+    publish_socket_candidates_to(
+        sink,
+        socket.to_path_buf(),
+        super::private_tmp_socket_path(state_dir, super::effective_uid()),
+        state_dir,
+    );
+}
+
+fn publish_socket_candidates_to(
+    sink: &mut dyn PublishSink,
+    socket: PathBuf,
+    predictable: PathBuf,
+    state_dir: &Path,
+) {
+    let candidates = control_socket_candidates_from(socket, predictable);
+    for candidate in candidates {
+        publish_to(sink, &candidate, state_dir);
+    }
+}
+
 pub(crate) fn publish_for_socket(socket: &Path) {
     let state_dir = thegn_core::util::xdg_state_home().join("thegn");
     publish_for_socket_at(socket, &state_dir, &mut GuardSink);
@@ -48,7 +69,7 @@ fn publish_for_socket_at(socket: &Path, state_dir: &Path, sink: &mut dyn Publish
     if let Err(error) = prepare_run_dir(state_dir) {
         tracing::warn!(target: "thegn::sandbox", path = %state_dir.display(), %error, "could not create the private control locator directory; writable-root panes may be refused");
     }
-    publish_to(sink, socket, state_dir);
+    publish_socket_to(sink, socket, state_dir);
 }
 
 /// The control sockets this process must publish for `dcfg`: the resolved endpoint and, when it is a relocated
@@ -119,7 +140,7 @@ pub(crate) fn prepare_run_dir(state_dir: &Path) -> std::io::Result<()> {
 mod tests {
     use super::{
         control_socket_candidates_from, prepare_run_dir, publish_candidates_at,
-        publish_for_socket_at, publish_to, run_dir, socket_dir,
+        publish_for_socket_at, publish_socket_candidates_to, run_dir, socket_dir,
     };
     use std::path::{Path, PathBuf};
 
@@ -223,9 +244,6 @@ mod tests {
         let relocated =
             PathBuf::from("/tmp/thegn-1000-abcd-0123456789abcdef0123456789abcdef/daemon.sock");
         let candidates = control_socket_candidates_from(relocated.clone(), predictable.clone());
-        let candidates_before_locator =
-            control_socket_candidates_from(predictable.clone(), predictable.clone());
-
         let mut compositor = RecordingSink::default();
         publish_candidates_at(&candidates, &state_dir, &mut compositor);
         publish_for_socket_at(&relocated, &state_dir, &mut compositor);
@@ -234,8 +252,7 @@ mod tests {
         publish_candidates_at(&candidates, &state_dir, &mut cli);
 
         let mut daemon = RecordingSink::default();
-        publish_candidates_at(&candidates_before_locator, &state_dir, &mut daemon);
-        publish_to(&mut daemon, &relocated, &state_dir);
+        publish_socket_candidates_to(&mut daemon, relocated, predictable.clone(), &state_dir);
 
         let mut expected_sockets = vec![
             PathBuf::from("/tmp/thegn-1000-abcd"),
