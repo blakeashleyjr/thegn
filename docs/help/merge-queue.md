@@ -61,8 +61,10 @@ are midway through, and a land is awkward to walk back even with the
 grace period below. Prefer `thegn merge add`.
 
 `thegn merge land` and the section's `l` action land only a local, unclaimed
-`ready` queue row with a gate result for the checked-out branch. Otherwise they
-refuse with the reason; use `thegn land` to land that branch outside the queue.
+`ready` queue row with a gate result for the checked-out branch, and the branch
+must still point at the commit the queue verified. A branch that moved after
+`ready` is refused until the next drain verifies it. Otherwise they refuse with
+the reason; use `thegn land` to land that branch outside the queue.
 
 - A blocked branch is re-attempted by the next drain automatically. Once
   it has burned its `agent_max_attempts` the agent stops being
