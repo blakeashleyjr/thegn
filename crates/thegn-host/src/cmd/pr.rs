@@ -998,7 +998,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         let resolved = resolve_local_target(Some(nested.display().to_string())).unwrap();
-        assert_eq!(resolved, std::fs::canonicalize(repo).unwrap());
+        assert_eq!(resolved, std::fs::canonicalize(&repo).unwrap());
 
         let explicit_root = repo.display().to_string();
         let resolved_root = resolve_local_target(Some(explicit_root.clone())).unwrap();
