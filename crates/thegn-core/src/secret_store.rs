@@ -67,6 +67,15 @@ impl SecretError {
             msg: msg.into(),
         }
     }
+    /// A mutation started but did not return, so whether it took effect is unknown.
+    /// Classed transient: callers must not fall through, retry, or publish a
+    /// conflicting index entry while the operation may still be in flight.
+    pub fn outcome_unknown(msg: impl Into<String>) -> Self {
+        SecretError {
+            class: ErrorClass::Transient,
+            msg: msg.into(),
+        }
+    }
     /// The named account / variable / file is unset.
     pub fn not_found(msg: impl Into<String>) -> Self {
         SecretError {
@@ -159,6 +168,15 @@ mod tests {
         assert!(!SecretError::denied("locked").falls_through());
         assert!(!SecretError::not_found("unset").falls_through());
         assert_eq!(SecretError::not_found("x").class(), ErrorClass::NotFound);
+    }
+
+    #[test]
+    fn outcome_unknown_is_transient_and_never_falls_through() {
+        let error = SecretError::outcome_unknown("keyring outcome unknown");
+        assert_eq!(error.class(), ErrorClass::Transient);
+        assert!(error.is_transient());
+        assert!(!error.falls_through());
+        assert_eq!(error.message(), "keyring outcome unknown");
     }
 
     #[test]
