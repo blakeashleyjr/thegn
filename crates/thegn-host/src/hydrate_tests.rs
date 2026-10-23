@@ -3124,3 +3124,66 @@ fn across_keeps_ci_cached_for_the_current_branch() {
 
     assert!(!across.is_empty());
 }
+
+#[test]
+fn ls_files_nul_framed_keeps_a_newline_filename_once() {
+    assert_eq!(
+        tracked_files_from_ls_files(b"a\nb\0c.rs\0", true),
+        vec!["a\nb", "c.rs"]
+    );
+}
+
+#[test]
+fn ls_files_local_argv_is_nul_framed_and_remote_is_unchanged() {
+    assert_eq!(ls_files_args(false), &["ls-files", "-z"]);
+    assert_eq!(ls_files_args(true), &["ls-files"]);
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test drives and reaps a real git fixture"
+)]
+fn ls_files_run_git(dir: &std::path::Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+}
+
+#[test]
+fn ls_files_real_git_lists_a_newline_filename_exactly() {
+    if cfg!(windows) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    match ls_files_run_git(dir.path(), &["--version"]) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!("skipping real-git ls-files fixture: git is unavailable");
+            return;
+        }
+        Err(error) => panic!("failed to start git: {error}"),
+    }
+    let init = ls_files_run_git(dir.path(), &["init", "-q"]).unwrap();
+    assert!(init.status.success(), "git init failed: {:?}", init.stderr);
+    std::fs::write(dir.path().join("a\nb"), b"newline path\n").unwrap();
+    std::fs::write(dir.path().join("é.txt"), b"unicode path\n").unwrap();
+    let add = ls_files_run_git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "add", "--", "a\nb", "é.txt"],
+    )
+    .unwrap();
+    assert!(add.status.success(), "git add failed: {:?}", add.stderr);
+    let listed = ls_files_run_git(dir.path(), ls_files_args(false)).unwrap();
+    assert!(
+        listed.status.success(),
+        "git ls-files failed: {:?}",
+        listed.stderr
+    );
+    let mut paths = tracked_files_from_ls_files(&listed.stdout, true);
+    paths.sort();
+    assert_eq!(paths, vec!["a\nb", "é.txt"]);
+}
