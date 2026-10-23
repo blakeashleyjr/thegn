@@ -1768,6 +1768,36 @@ pub fn provider_proxy_target(
     Some((provider, id, workdir, provider_kind, custody_account))
 }
 
+/// Builds the `sprite-proxy` refusal message after [`provider_proxy_target`]
+/// returned `None`. This is a second, best-effort read of the selection, not a
+/// diagnosis of the refusal's own cause: a state-database or environment-
+/// selection read failure is named as such (the refusal itself only reaches
+/// tracing, which has no sink in a ProxyCommand child); otherwise the generic
+/// reasons stand.
+pub(crate) fn provider_proxy_refusal(worktree: &str) -> String {
+    let read = Db::open().and_then(|db| {
+        let repo_root: PathBuf = db
+            .repo_root_for(worktree)?
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| repo::main_worktree(Path::new(worktree)))
+            .unwrap_or_else(|| PathBuf::from(worktree));
+        db.effective_env_checked(worktree, &repo_root.to_string_lossy())
+    });
+    proxy_refusal_reason(worktree, read)
+}
+
+fn proxy_refusal_reason(worktree: &str, read: anyhow::Result<Option<String>>) -> String {
+    match read {
+        Err(error) => format!(
+            "sprite-proxy: {worktree}: the environment selection could not be read ({error:#}); refusing rather than resolving the default environment"
+        ),
+        Ok(_) => format!(
+            "sprite-proxy: {worktree} has no provider proxy target: it is not a provider env, its API token is unset, or its warm-pool binding or custody record could not be read"
+        ),
+    }
+}
+
 pub(crate) use crate::agent_ssh::{
     SPRITE_SSHD_PORT, SpriteSshCustody, generate_managed_keypair_at, managed_ssh_keypair,
     mosh_setup_script, sprite_ssh_argv, sprite_ssh_argv_for_custody, sprite_ssh_connect,
@@ -2277,7 +2307,7 @@ fn clear_configured_provider_cooldowns(cfg: &Config) {
 mod env_selection_tests {
     use super::{
         ProvisionSelection, clear_configured_provider_cooldowns, env_selection_or_refuse,
-        native_exec_healthy, native_exec_report, provision_selection,
+        native_exec_healthy, native_exec_report, provision_selection, proxy_refusal_reason,
     };
     use thegn_core::config::{Config, EnvConfig, PlacementMode};
 
@@ -2375,6 +2405,20 @@ mod env_selection_tests {
         assert!(!native_exec_healthy("env-selection-test-provider"));
         clear_configured_provider_cooldowns(&cfg);
         assert!(native_exec_healthy("env-selection-test-provider"));
+    }
+
+    #[test]
+    fn proxy_refusal_reason_names_an_unreadable_selection() {
+        let message = proxy_refusal_reason("/wt", Err(anyhow::anyhow!("database is locked")));
+        assert!(message.contains("could not be read"));
+        assert!(message.contains("database is locked"));
+        assert!(!message.contains("not a provider env"));
+    }
+
+    #[test]
+    fn proxy_refusal_reason_keeps_the_generic_reason() {
+        assert!(proxy_refusal_reason("/wt", Ok(None)).contains("not a provider env"));
+        assert!(proxy_refusal_reason("/wt", Ok(Some("box".into()))).contains("not a provider env"));
     }
 }
 
