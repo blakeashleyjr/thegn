@@ -69,9 +69,10 @@ pub(crate) fn plugin_channel() -> (PluginTx, PluginRx) {
 
 impl PluginTx {
     pub(crate) fn for_host(&self, host: HostGen) -> PluginTx {
-        let mut tx = self.clone();
-        tx.host = host;
-        tx
+        PluginTx {
+            host,
+            ..self.clone()
+        }
     }
 
     pub(crate) fn send(
@@ -1356,6 +1357,27 @@ mod tests {
             rx.try_recv(),
             Ok(PluginMsg::RespawnWorkerStartFailed { plugin }) if plugin == "b"
         ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio_mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn host_generation_receiver_drops_other_hosts_retry_respawn() {
+        let (tx, mut rx) = plugin_channel();
+        rx.bind_host(7);
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("p");
+        let plugin = LoadedPlugin {
+            spec,
+            dir: None,
+            trusted_native_ignored: false,
+        };
+        tx.for_host(6)
+            .send(PluginMsg::RetryRespawn { plugin })
+            .unwrap();
+
         assert!(matches!(
             rx.try_recv(),
             Err(tokio_mpsc::error::TryRecvError::Empty)

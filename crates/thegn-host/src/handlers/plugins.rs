@@ -2333,7 +2333,7 @@ mod tests {
         rx.bind_host(102);
         old.send(PluginMsg::OneShot {
             plugin: "p".into(),
-            run: Ok(PluginRun {
+            run: Ok(thegn_svc::plugin::PluginRun {
                 messages: vec![msg(
                     "update",
                     serde_json::json!({
