@@ -5041,7 +5041,10 @@ pub(crate) fn set_config_source(overrides: Vec<String>, config: Option<std::path
 /// legacy tolerant layered load.
 pub(crate) fn load_hydration_config() -> thegn_core::config::Config {
     if let Some(admitted) = crate::config_startup::display() {
-        return admitted.config().clone();
+        return crate::channel_state::runtime_config(
+            admitted.config().clone(),
+            crate::channel_state::current(),
+        );
     }
     let (overrides, path) = CONFIG_SOURCE.get().cloned().unwrap_or_default();
     let mut cfg = thegn_core::config::Config::try_load_layered(
@@ -5051,7 +5054,7 @@ pub(crate) fn load_hydration_config() -> thegn_core::config::Config {
     )
     .unwrap_or_default();
     thegn_core::host_config::merge_db_hosts(&mut cfg);
-    cfg
+    crate::channel_state::runtime_config(cfg, crate::channel_state::current())
 }
 
 /// The set of worktree paths belonging to a repo (`repo_root`), from the DB

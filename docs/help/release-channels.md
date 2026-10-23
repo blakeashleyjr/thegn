@@ -21,13 +21,13 @@ every gated feature. Set `THEGN_CHANNEL=dev` to switch for one run.
 If you read about one of these elsewhere in this help and cannot find it,
 this is why:
 
-| Feature     | Covers                                                                     | Config             |
-| ----------- | -------------------------------------------------------------------------- | ------------------ |
-| `remote`    | worktrees on another machine over SSH/mosh                                 | `[sandbox.remote]` |
-| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`         |
-| `observe`   | the Observe dashboards and fleet-view tab                                  | `[observe]`        |
-| `placement` | the multi-host placement engine                                            | `[placement]`      |
-| `voice`     | command-backed voice mode                                                  | `[voice]`          |
+| Feature     | Covers                                                                     | Config                                          |
+| ----------- | -------------------------------------------------------------------------- | ----------------------------------------------- |
+| `remote`    | worktrees on another machine over SSH/mosh                                 | `[sandbox.remote]`, `[env.*] placement = "ssh"` |
+| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs             |
+| `observe`   | the Observe dashboards and fleet-view tab                                  | `[observe]`                                     |
+| `placement` | the multi-host placement engine                                            | `[placement]`                                   |
+| `voice`     | command-backed voice mode                                                  | `[voice]`                                       |
 
 Issue trackers including Linear, Jira, Kaneo, and GitHub are available in both
 channels. GitHub PR viewing is also stable. See [[review-a-pr]].
