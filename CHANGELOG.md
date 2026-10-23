@@ -19,17 +19,19 @@ All notable changes to **thegn** are documented here. The format follows
 - Merge-queue rows are held for review if the worktree's repository identity
   changes before the drain. PR-queue failure prompts can include a bounded,
   redacted log excerpt for that PR head. One-shot plugin runs give the
-  least-recently-started work priority.
+  least-recently-started work priority, and results from a plugin disabled,
+  reloaded or stopped mid-run are dropped.
 
 ### Fixed
 
 - Partial or failed CI run lists no longer replace the last good list; the
   cached list is labelled stale, and unavailable job details stay visible.
   Repository discovery skips roots nested inside another configured root.
-- Exit restores the terminal even if a frame write is stuck. Font changes
-  report when the file was applied but its directory was not synced.
+- Exit no longer hangs when a frame write is stuck; terminal settings are
+  still restored. Font changes report when the file was applied but its
+  directory was not synced.
   Projection rollback timeouts report a transport failure instead of claiming
-  that the projection is not mounted.
+  that the projection is not mounted (dev channel).
 - Fly machine lists reject malformed entries and multiple live managed
   machines rather than choosing one (dev channel). Machine0 MCP calls use the
   shared provider control gate (dev channel).
@@ -37,11 +39,11 @@ All notable changes to **thegn** are documented here. The format follows
 ### Security
 
 - `thegn session` and `thegn logs tail` keep untrusted text from emitting
-  terminal control or formatting sequences. File-backed secrets reject files
-  with group or other access, or extra hard links.
-- Sandbox mounts that expose or hide a daemon control-socket directory are
-  refused, including for Compose. Media labels strip invisible formatting
-  characters, and font family names with invisible or bidirectional
+  terminal control or formatting sequences. The managed file secret store
+  refuses token files with group or other access, or extra hard links.
+- Sandbox mounts whose source lies inside a daemon control-socket directory
+  are refused, including for OCI and Compose. Media labels strip invisible
+  formatting characters, and font family names with invisible or bidirectional
   characters are refused.
 - Invalid VPS names are refused instead of sharing a fallback `known_hosts`
   pin (dev channel).
@@ -75,8 +77,7 @@ All notable changes to **thegn** are documented here. The format follows
 
 - Release publication requires an annotated, version-matching tag admitted
   through a protected environment; release checkouts do not persist GitHub
-  credentials. Self-hosted CI runners are limited to manual runs in the main
-  repository.
+  credentials.
 - Named-profile directories and profile SSH keys must be owner-only. Plugin
   launch fields are validated and bounded, and bore secrets in
   `[share.bore] extra_args` are refused without echoing the value.
