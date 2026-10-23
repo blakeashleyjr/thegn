@@ -2353,10 +2353,10 @@ fi
 mkdir "$TMP/sock-real"
 ln -s "$TMP/sock-real" "$TMP/sock-link"
 EP_SYMLINK_RC=0
-timeout 20 "$SZ" daemon --socket "$TMP/sock-link/d.sock" \
+timeout -k 5 20 "$SZ" daemon --socket "$TMP/sock-link/d.sock" \
   >"$TMP/sock-link.out" 2>&1 || EP_SYMLINK_RC=$?
 EP_SYMLINK_REFUSED=0
-[[ $EP_SYMLINK_RC -ne 0 ]] &&
+[[ $EP_SYMLINK_RC -ne 0 && $EP_SYMLINK_RC -ne 124 ]] &&
   grep -Fq 'move [daemon] socket into a private directory' "$TMP/sock-link.out" &&
   EP_SYMLINK_REFUSED=1
 check "daemon refuses a symlinked socket parent" "[[ $EP_SYMLINK_REFUSED -eq 1 ]]"
