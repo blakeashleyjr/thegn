@@ -118,10 +118,10 @@ pub(crate) fn provision_worktree_on_host(
     //    exist on the host — detect over exec, parse with the pure core fn).
     let home =
         container_home(runner.exec_in_container(&container, "printf %s \"$HOME\"", secs(30)));
-    let (req, detect_error) =
+    let (req, toolchain_digest, detect_error) =
         match crate::mise_provider::detect_on_target(runner, &container, worktree) {
-            Ok(req) => (req, None),
-            Err(reason) => (envplan::detect_from_probe(""), Some(reason)),
+            Ok((req, digest)) => (req, digest, None),
+            Err(reason) => (envplan::detect_from_probe(""), None, Some(reason)),
         };
 
     // 4. The plan: toolchain tier + personal layer; no clone/workspace (the
@@ -163,10 +163,11 @@ pub(crate) fn provision_worktree_on_host(
         );
     }
     // Trust-gated devcontainer steps, appended after the toolchain tier and
-    // covered by the same provision marker (so they run exactly once):
+    // re-run when the plan generation changes (including once after upgrade):
     //   1. feature installs (ordered), then
     //   2. one-time lifecycle commands (onCreate → updateContent → postCreate),
-    //      which may depend on the features.
+    //      which may depend on the features. Lifecycle commands may therefore
+    //      run again on a live container after a plan change.
     // Both empty without a devcontainer.json (or until their category is approved).
     plan.steps
         .extend(crate::handlers::repo_trust::devcontainer_feature_steps(
@@ -177,7 +178,7 @@ pub(crate) fn provision_worktree_on_host(
             &repo_root, worktree, worktree,
         ));
 
-    let marker_generation = provision_generation(&plan);
+    let marker_generation = provision_generation(&plan, toolchain_digest.as_deref());
     let marker_value = thegn_core::util::sh_quote(&marker_generation);
     let already = if let Ok(home) = &home {
         let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
@@ -339,13 +340,18 @@ fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
-fn provision_generation(plan: &EnvPlan) -> String {
+fn provision_generation(plan: &EnvPlan, toolchain_digest: Option<&str>) -> String {
     let mut hash = Sha256::new();
     hash.update(b"thegn.host-provision.v1\0");
     for step in &plan.steps {
         hash.update(step.id.as_bytes());
         hash.update([0_u8]);
         hash.update(format!("{:?}", step.kind).as_bytes());
+        hash.update([0_u8]);
+    }
+    if let Some(digest) = toolchain_digest {
+        hash.update(b"toolchain-config\0");
+        hash.update(digest.as_bytes());
         hash.update([0_u8]);
     }
     let digest = hash.finalize();
@@ -486,7 +492,10 @@ fn attest_delivery(
     let script = attestation_script(home, rels);
     match runner.exec_in_container(container, &script, secs(30)) {
         Ok((true, out, _)) => check_delivery(&out, rels),
-        Ok((false, _, err)) => Err(err.lines().last().unwrap_or("failed").to_string()),
+        Ok((false, _, err)) => Err(format!(
+            "delivery attestation requires `stat -c '%F|%a|%u'` and successful file checks: {}",
+            err.lines().last().unwrap_or("failed")
+        )),
         Err(error) => Err(error),
     }
 }
@@ -723,13 +732,30 @@ mod tests {
         let renamed = make_plan(".zshrc", "Dotfiles", false);
         let relabeled = make_plan(".gitconfig", "Personal files", false);
         let added_step = make_plan(".gitconfig", "Dotfiles", true);
-        let generation = provision_generation(&first);
+        let generation = provision_generation(&first, Some("toolchain-v1"));
 
         assert!(generation.starts_with("2:"), "{generation}");
-        assert_eq!(generation, provision_generation(&same));
-        assert_eq!(generation, provision_generation(&relabeled));
-        assert_ne!(generation, provision_generation(&renamed));
-        assert_ne!(generation, provision_generation(&added_step));
+        assert_eq!(
+            generation,
+            provision_generation(&same, Some("toolchain-v1"))
+        );
+        assert_eq!(
+            generation,
+            provision_generation(&relabeled, Some("toolchain-v1"))
+        );
+        assert_ne!(
+            generation,
+            provision_generation(&renamed, Some("toolchain-v1"))
+        );
+        assert_ne!(
+            generation,
+            provision_generation(&added_step, Some("toolchain-v1"))
+        );
+        assert_ne!(
+            generation,
+            provision_generation(&first, Some("toolchain-v2")),
+            "changing declared toolchain contents invalidates the provision marker"
+        );
     }
 
     #[test]
