@@ -1872,7 +1872,26 @@ pub(crate) fn detect_host_agents() -> Vec<String> {
 }
 
 pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
+    native_exec_for(cfg, worktree, None).into_option()
+}
+
+pub(crate) fn native_shell_exec_for_pane(cfg: &Config, worktree: &str) -> PaneNativeExec {
     native_exec_for(cfg, worktree, None)
+}
+
+pub(crate) enum PaneNativeExec {
+    Ready(Box<NativeShell>),
+    Unavailable,
+    AccountReadRefused(String),
+}
+
+impl PaneNativeExec {
+    fn into_option(self) -> Option<NativeShell> {
+        match self {
+            Self::Ready(native) => Some(*native),
+            Self::Unavailable | Self::AccountReadRefused(_) => None,
+        }
+    }
 }
 
 /// Like [`native_shell_exec`] but runs the AGENT `choice`'s command in the sandbox
@@ -1882,12 +1901,18 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
 /// choice (use [`native_shell_exec`]) or a non-native-exec env. The agent inherits
 /// the same in-sprite env as the shell (host secrets + proxy routing when set), so
 /// e.g. the managed pi snippet's `$HOME/.thegn/pi` resolves to the sprite home.
-pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<NativeShell> {
+pub(crate) fn native_agent_exec_for_pane(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+) -> PaneNativeExec {
     if choice.is_empty() || choice == SHELL || choice == "clean-shell" {
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     // Only real agents (not tools) route through here.
-    cfg.agent_command(choice)?;
+    if cfg.agent_command(choice).is_none() {
+        return PaneNativeExec::Unavailable;
+    }
     // A grant the harness cannot take refuses the AGENT pane (THE-440) — the
     // caller falls back to a plain login shell, which runs no agent under the
     // wrong policy. Visible, never silent.
@@ -1896,7 +1921,7 @@ pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<N
         Err(why) => {
             tracing::warn!(target: "thegn::agent", agent = %choice, "{why}");
             thegn_core::msg::warn(&format!("{why}; no agent pane was started"));
-            return None;
+            return PaneNativeExec::Unavailable;
         }
     };
     native_exec_for(cfg, worktree, Some(cmd))
@@ -1905,7 +1930,7 @@ pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<N
 /// Shared body: build a [`NativeShell`] for a native-exec provider worktree. With
 /// `agent_cmd = None` the inner command is the login shell; with `Some(cmd)` it's
 /// that agent command (run via the same `cd workdir; <cmd>` wrapper).
-fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> Option<NativeShell> {
+fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> PaneNativeExec {
     use thegn_core::config::ProviderExecMode;
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
@@ -1917,7 +1942,10 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         .unwrap_or_else(|| PathBuf::from(worktree));
     let read =
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
-    let selected_env = env_selection_or_refuse(worktree, "native exec", read)?;
+    let selected_env = match env_selection_or_refuse(worktree, "native exec", read) {
+        Some(selected_env) => selected_env,
+        None => return PaneNativeExec::Unavailable,
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -1925,9 +1953,12 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         selected_env.as_deref(),
     );
     let thegn_core::placement::Placement::Provider(p) = &environment.placement else {
-        return None;
+        return PaneNativeExec::Unavailable;
     };
-    let pc = &cfg.env.get(&environment.name)?.provider;
+    let Some(env_cfg) = cfg.env.get(&environment.name) else {
+        return PaneNativeExec::Unavailable;
+    };
+    let pc = &env_cfg.provider;
     if let Some(request) =
         thegn_core::sandbox_floor::provider_explicit_request(&environment.sandbox)
     {
@@ -1937,19 +1968,21 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
             request = %request.describe(),
             "provider pane refused: explicit isolation request"
         );
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     if pc.exec == ProviderExecMode::Cli || !thegn_svc::provider::exec_api_by_name(&pc.provider) {
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     // Auto backs off to the CLI pane during a provider's failure cooldown; api
     // always tries native.
     if pc.exec == ProviderExecMode::Auto && !native_exec_healthy(&pc.provider) {
-        return None;
+        return PaneNativeExec::Unavailable;
     }
     // Token missing ⇒ no provider built ⇒ fall back to the CLI path (which has
     // its own behavior when unconfigured); don't silently spawn a dead session.
-    let provider = provider_for(pc)?;
+    let Some(provider) = provider_for(pc) else {
+        return PaneNativeExec::Unavailable;
+    };
     // The host's absolute $SHELL path won't exist in the sandbox, so use the
     // basename form (in_oci = true), honoring an explicit env shell override.
     let sb_shell = environment.sandbox.shell.trim().to_string();
@@ -1961,10 +1994,15 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         None => shell_inner_override(&sb_shell),
     };
     // Point each agent CLI at the ACTIVE account's uploaded credential home.
+    let exports = match crate::agent_configs::account_exports_or_refuse(
+        crate::agent_configs::account_pane_env_exports(cfg, worktree),
+    ) {
+        Ok(exports) => exports,
+        Err(reason) => return PaneNativeExec::AccountReadRefused(reason),
+    };
     let inner = format!(
-        "{}{}{inner}",
-        crate::remote_enqueue_auth::source_prefix(worktree),
-        crate::agent_configs::account_pane_env_exports(cfg, worktree)
+        "{}{exports}{inner}",
+        crate::remote_enqueue_auth::source_prefix(worktree)
     );
     // Carry the host's passthrough secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) into
     // the provider exec so the in-sprite shell + any agent it spawns (pi, claude
@@ -1994,21 +2032,21 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "native exec refused: warm-pool sandbox binding unreadable");
-            return None;
+            return PaneNativeExec::Unavailable;
         }
     };
     // Resolve the pane cwd against the sandbox's cached `$HOME` (the workspace lives
     // under the login user's home — see `provider_workdir`), so `cd {workdir}` lands
     // in the repo and not a nonexistent `/workspace`.
     let workdir = crate::provider_workdir::resolve(pc, &sandbox_id);
-    Some(NativeShell {
+    PaneNativeExec::Ready(Box::new(NativeShell {
         provider,
         provider_name: pc.provider.clone(),
         sandbox_id,
         inner,
         workdir,
         env,
-    })
+    }))
 }
 
 /// Whether `worktree`'s provider env still needs its one-time provisioning: a
