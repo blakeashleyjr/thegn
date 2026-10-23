@@ -12,7 +12,7 @@ All notable changes to **thegn** are documented here. The format follows
 ### Added
 
 - `[forward] allow_external_bind = true` opts in to forwarding ports on a
-  non-loopback address (dev channel). `thegn config validate` warns when
+  non-loopback address. `thegn config validate` warns when
   `max_lifetime_secs` is set for a provider without a lifetime reaper (dev
   channel).
 
@@ -20,16 +20,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 - Usage alerts keep one inbox entry per account, window, alert level and reset
   period. Repeats update it in place, and a dismissed alert stays dismissed
-  until the window resets or usage recovers. A `Needs you` process failure
+  until the window resets or usage recovers; existing duplicate alerts are
+  merged when the state database is upgraded. A `Needs you` process failure
   clears when acknowledged, when the same program later exits cleanly, when
   its worktree is removed, or after seven days.
 - Stopping a bore, frp or iroh share remains `stopping…` until its tunnel
   client exits. `thegn merge land` and the panel's land key require the branch
   to still point at the commit the queue verified. With the `rebase` strategy,
-  unsupported merge histories are held for review instead of being replayed.
+  a branch whose history is unrelated to the target or contains a root commit
+  is held for a human before replay instead of failing the fold.
 - A plugin host call newer than the plugin's declared API is refused as
   unsupported. On the stable channel, SSH and provider `[env.*]` environments
-  are removed, and a worktree selecting one halts with a hint to set
+  are removed, and a worktree selecting one halts by default (or prompts with
+  `ask`) with a hint to set
   `THEGN_CHANNEL=dev`. The README and help clarify the alpha's limits,
   including plugin isolation, sandbox access to `$HOME`, and MCP write scopes.
 
