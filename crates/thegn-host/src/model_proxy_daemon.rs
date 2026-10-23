@@ -355,6 +355,7 @@ fn write_config(cfg: &ModelProxyConfig) -> Result<PathBuf> {
 /// with the authenticated identity probe before deciding whether to reuse it.
 /// Returns `true` if a process was spawned (it may still lose the bind race).
 pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
+    ensure_spawn_slot()?;
     let config_file = write_config(cfg)?;
     let secret_file = secret_path();
     let _secret = host_secret()?;
@@ -380,6 +381,9 @@ pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
         let _ = child.kill();
         return Err(error).with_context(|| format!("write {}", pid_path().display()));
     }
+    *SPAWNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
     Ok(true)
 }
 
@@ -690,8 +694,21 @@ impl DesiredCell {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.0 > seen
     }
+
+    /// Wait until a newer desired generation is published, without polling.
+    fn wait_newer_forever(&self, seen: u64) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _state = self
+            .changed
+            .wait_while(state, |(generation, _)| *generation <= seen)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
 }
 
+static SPAWNED: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
 static DESIRED: DesiredCell = DesiredCell::new();
 static SUPERVISOR_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -721,6 +738,71 @@ fn supervisor_step(
     }
 }
 
+fn reap_spawned_child() -> bool {
+    let mut spawned = SPAWNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let status = match spawned.as_mut() {
+        Some(child) => child.try_wait(),
+        None => return false,
+    };
+    match status {
+        Ok(Some(_status)) => {
+            *spawned = None;
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(target: "thegn::proxy", %error, "could not check model-proxy child status");
+            false
+        }
+    }
+}
+
+fn ensure_spawn_slot() -> Result<()> {
+    let mut spawned = SPAWNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let status = match spawned.as_mut() {
+        Some(child) => child.try_wait(),
+        None => return Ok(()),
+    };
+    match status {
+        Ok(Some(_status)) => {
+            *spawned = None;
+            Ok(())
+        }
+        Ok(None) => Err(anyhow::anyhow!("previous tgproxy child has not exited")),
+        Err(error) => Err(error).context("check prior tgproxy child before spawning"),
+    }
+}
+
+fn wait_for_proxy_exit(old_cfg: &ModelProxyConfig) -> bool {
+    for _ in 0..50 {
+        if reap_spawned_child() || matches!(probe(old_cfg), ProbeState::Down) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    reap_spawned_child() || matches!(probe(old_cfg), ProbeState::Down)
+}
+
+fn supervisor_wait(step: SupervisorStep, failures: u32) -> Option<Duration> {
+    if step == SupervisorStep::Idle {
+        None
+    } else if failures == 0 {
+        Some(Duration::from_secs(15))
+    } else {
+        Some(
+            thegn_core::backoff::calculate_backoff(
+                thegn_core::backoff::ExhaustionKind::ServerError,
+                failures,
+            )
+            .min(Duration::from_secs(120)),
+        )
+    }
+}
+
 /// Publishes the desired configuration and starts the background supervisor
 /// once. Safe to call again on every successful config reload; the supervisor
 /// applies changes off the UI loop and restarts crashes on a backoff schedule.
@@ -738,60 +820,89 @@ pub fn spawn_supervisor(cfg: &Config) {
             let mut applied: Option<ModelProxyConfig> = None;
             let mut failures: u32 = 0;
             loop {
+                reap_spawned_child();
                 let (seen, desired) = DESIRED.snapshot();
                 let desired = desired.unwrap_or_default();
-                match supervisor_step(&desired, applied.as_ref()) {
+                let step = supervisor_step(&desired, applied.as_ref());
+                match step {
                     SupervisorStep::Stop => {
-                        if let Err(error) = stop(&desired) {
-                            tracing::warn!(target: "thegn::proxy", %error, "could not stop the disabled model proxy");
+                        match stop(&desired) {
+                            Ok(true) => {
+                                if let Some(old) = applied.as_ref()
+                                    && !wait_for_proxy_exit(old)
+                                {
+                                    tracing::warn!(target: "thegn::proxy", "model proxy did not exit after being disabled");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(target: "thegn::proxy", %error, "could not stop the disabled model proxy");
+                            }
                         }
                         applied = None;
                         failures = 0;
                     }
                     SupervisorStep::Restart => {
-                        if let Err(error) = stop(&desired) {
-                            tracing::warn!(target: "thegn::proxy", %error, "could not stop model proxy before applying reloaded config");
-                        }
-                        match ensure_running(&desired) {
-                            Ok(true) => failures = 0,
-                            Ok(false) => {
-                                failures = failures.saturating_add(1);
-                                tracing::warn!(target: "thegn::proxy", "model proxy did not become ready after config reload");
-                            }
+                        let old = applied.as_ref().expect("Restart has an applied config");
+                        let stopped = match stop(&desired) {
+                            Ok(true) => wait_for_proxy_exit(old),
+                            Ok(false) => true,
                             Err(error) => {
-                                failures = failures.saturating_add(1);
-                                tracing::warn!(target: "thegn::proxy", %error, "could not apply reloaded model-proxy config");
+                                tracing::warn!(target: "thegn::proxy", %error, "could not stop model proxy before applying reloaded config");
+                                true
                             }
+                        };
+                        if !stopped {
+                            failures = failures.saturating_add(1);
+                            if failures == 1 {
+                                tracing::warn!(target: "thegn::proxy", "model proxy did not exit after config reload");
+                            }
+                        } else {
+                            match ensure_running(&desired) {
+                                Ok(true) => failures = 0,
+                                Ok(false) => {
+                                    failures = failures.saturating_add(1);
+                                    if failures == 1 {
+                                        tracing::warn!(target: "thegn::proxy", "model proxy did not become ready after config reload");
+                                    }
+                                }
+                                Err(error) => {
+                                    failures = failures.saturating_add(1);
+                                    if failures == 1 {
+                                        tracing::warn!(target: "thegn::proxy", %error, "could not apply reloaded model-proxy config");
+                                    }
+                                }
+                            }
+                            applied = Some(desired.clone());
                         }
-                        applied = Some(desired.clone());
                     }
                     SupervisorStep::Ensure => {
                         match ensure_running(&desired) {
                             Ok(true) => failures = 0,
                             Ok(false) => {
                                 failures = failures.saturating_add(1);
-                                tracing::warn!(target: "thegn::proxy", "model proxy did not become ready");
+                                if failures == 1 {
+                                    tracing::warn!(target: "thegn::proxy", "model proxy did not become ready");
+                                }
                             }
                             Err(error) => {
                                 failures = failures.saturating_add(1);
-                                tracing::warn!(target: "thegn::proxy", %error, "could not ensure model proxy is running");
+                                if failures == 1 {
+                                    tracing::warn!(target: "thegn::proxy", %error, "could not ensure model proxy is running");
+                                }
                             }
                         }
                         applied = Some(desired.clone());
                     }
                     SupervisorStep::Idle => {}
                 }
-                // Steady re-check cadence when healthy; backoff after failures.
-                let wait = if failures == 0 {
-                    Duration::from_secs(15)
-                } else {
-                    thegn_core::backoff::calculate_backoff(
-                        thegn_core::backoff::ExhaustionKind::ServerError,
-                        failures,
-                    )
-                    .min(Duration::from_secs(120))
-                };
-                DESIRED.wait_newer(seen, wait);
+                if step == SupervisorStep::Stop || step == SupervisorStep::Idle {
+                    DESIRED.wait_newer_forever(seen);
+                    continue;
+                }
+                if let Some(wait) = supervisor_wait(step, failures) {
+                    DESIRED.wait_newer(seen, wait);
+                }
             }
         })
         // best-effort: a supervisor that never starts must not stop the
@@ -1166,6 +1277,58 @@ mod tests {
         assert_eq!(
             supervisor_step(&ModelProxyConfig::default(), None),
             SupervisorStep::Idle
+        );
+    }
+
+    #[test]
+    fn supervisor_wait_has_no_timeout_only_for_idle() {
+        assert_eq!(supervisor_wait(SupervisorStep::Idle, 0), None);
+        assert_eq!(
+            supervisor_wait(SupervisorStep::Ensure, 0),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            supervisor_wait(SupervisorStep::Stop, 0),
+            Some(Duration::from_secs(15))
+        );
+        let expected_backoff = thegn_core::backoff::calculate_backoff(
+            thegn_core::backoff::ExhaustionKind::ServerError,
+            2,
+        )
+        .min(Duration::from_secs(120));
+        assert_eq!(
+            supervisor_wait(SupervisorStep::Restart, 2),
+            Some(expected_backoff)
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "spawn a short-lived child to verify supervisor reaping"
+    )]
+    fn reap_spawned_child_clears_an_exited_child() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn short-lived fixture child");
+        let mut stdout = child.stdout.take().expect("capture fixture stdout");
+        std::io::Read::read_to_end(&mut stdout, &mut Vec::new())
+            .expect("wait for fixture child stdout to close");
+        *SPAWNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
+
+        assert!(reap_spawned_child(), "one reap pass clears an exited child");
+        assert!(
+            SPAWNED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
         );
     }
 
