@@ -685,6 +685,16 @@ response shape, an unidentifiable row or a duplicate entry fails the operation
 instead of being treated as an empty or shorter list. Machine0 readiness,
 status and SSH-auth waits, and Fly's sshd probe, count each in-flight request
 against their total time budget.
+Machine0 records a pending reservation before creating a VM, and reservations
+count toward `max_instances`. If the create outcome is unknown, such as after a
+lost response, the reservation remains; retrying the same sandbox adopts its
+VM instead of creating a duplicate. The error says to retry later or destroy
+the sandbox to retire the reservation. A VM with that name and no pending
+create from this machine is refused. The Sprites list follows every page and
+refuses results over its page or row limit, or an ambiguous continuation,
+rather than treating a partial list as complete. Configured provider ids at
+`env.<name>.provider.id` must be lowercase for Sprites, Hetzner, DigitalOcean,
+Fly and machine0; validation refuses uppercase ids.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or
