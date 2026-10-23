@@ -1931,10 +1931,13 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
         None => shell_inner_override(&sb_shell),
     };
     // Point each agent CLI at the ACTIVE account's uploaded credential home.
+    let exports = crate::agent_configs::account_exports_or_refuse(
+        worktree,
+        crate::agent_configs::account_pane_env_exports(cfg, worktree),
+    )?;
     let inner = format!(
-        "{}{}{inner}",
-        crate::remote_enqueue_auth::source_prefix(worktree),
-        crate::agent_configs::account_pane_env_exports(cfg, worktree)
+        "{}{exports}{inner}",
+        crate::remote_enqueue_auth::source_prefix(worktree)
     );
     // Carry the host's passthrough secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) into
     // the provider exec so the in-sprite shell + any agent it spawns (pi, claude
