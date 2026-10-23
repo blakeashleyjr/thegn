@@ -115,7 +115,8 @@ familiar IDE chords._
 ### Nix / home-manager (recommended)
 
 On x86_64 Linux, the flake is a supported install path alongside the release
-tarball. `nix profile install` works from any Git ref.
+tarball (once published; see [Prebuilt binary](#prebuilt-binary-no-nix)).
+`nix profile install` works from any Git ref.
 
 ```nix
 # flake.nix inputs
@@ -262,9 +263,9 @@ SSH integration where native support has gaps. Diff highlighting is built in;
 `lazygit` (the embedded Git UI) is optional.
 
 **On macOS, prefer Nix or a local source build.** Homebrew and AUR publication
-are pending owner setup and a clean-host rehearsal. The macOS archive is
-deliberately unsigned, and
-a tarball downloaded through a browser is quarantined by Gatekeeper — it needs
+are pending owner setup and a clean-host rehearsal. If a macOS archive is
+published, it is deliberately unsigned, and a tarball downloaded through a
+browser is quarantined by Gatekeeper — it needs
 `xattr -dr com.apple.quarantine ./thegn` before it will launch. Homebrew formula
 downloads, if published, Nix store paths, and the locally generated `thegn.app`
 are not quarantined, so none of them hit that. The reasoning is in
@@ -343,8 +344,8 @@ Reports from either platform are welcome.
 - **Fully event-driven.** The loop blocks on terminal input with no tick or
   timeout; PTY readers, hydration, and fs-watchers wake it over channels. A
   damage-region render planner repaints only what changed — pane output costs
-  a bounded diff, not a chrome recompose. The loop has no tick or timeout,
-  so idle cost is near zero (measured, not guaranteed).
+  a bounded diff, not a chrome recompose. Idle cost is therefore near zero
+  (measured with `just bench-idle`, not guaranteed).
 - **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL): repos,
   workspaces, worktrees, PR cache, layouts, session state. **git is the source
   of truth** for worktrees; the DB is a cache + resurrection layer. Restarting
@@ -420,21 +421,24 @@ environment and exactly which features are enabled vs degraded.
 ## Sandboxing worktrees
 
 By default each worktree's interactive process (agent / shell / tools) runs
-inside a container or sandbox. It cannot modify files outside the worktree, but
-`$HOME` remains readable, credentials included. Use `sealed` for confidentiality
-(see the [sandboxing help page](docs/help/sandboxing.md)). The worktree stays on
-the host and is **bind-mounted at its real path**, so host-side git reads
-(sidebar, panel, PR) keep working.
+inside a container or sandbox. With the default `standard` profile, files
+outside the worktree are read-only apart from a few carved-back state
+directories (see the [sandboxing help page](docs/help/sandboxing.md)); `$HOME`
+remains readable, credentials included. Use `sealed` for confidentiality. The
+worktree stays on the host and is **bind-mounted at its real path**, so host-side
+git reads (sidebar, panel, PR) keep working.
 
 - **Backends** (`[sandbox] backend`): `auto` walks `backend_chain` —
   `podman-rootless` → `podman-rootful` → `docker` → `apple` (macOS `container`)
   → `bwrap` → `jobobject` (Windows Job Objects). `apple` and `jobobject` probe
   absent off their respective OSes. There is no host fallback; a launch with
-  no usable backend refuses. Hardening presets: `open` / `standard` (default)
+  no usable backend refuses. `systemd` and `wsl` are also selectable
+  explicitly. Hardening presets: `open` / `standard` (default)
   / `sealed` (no network, read-only root, all caps dropped).
 - **Named environments** (`[env.<name>]`) place a worktree locally, over
   `ssh`, on Kubernetes, or on a managed provider; `thegn env` inspects and
-  selects them. _(Non-local placement is **dev channel only** — see Channels.)_
+  selects them. _(SSH and managed-provider placement are **dev channel only** —
+  see Channels.)_
 - **Remote** (`[sandbox.remote]`) runs worktrees on another machine — the
   interactive pane over **mosh** by default, git reads and lifecycle over
   **ssh**; composes with the container backends. _(**Dev channel only.**)_
@@ -449,7 +453,8 @@ Linux x86_64 Nix flake — ships the shell described above. A source checkout ca
 also build and install it with `./install.sh`. A set of experimental
 subsystems is compiled in but **clamped off** outside the dev channel:
 
-- remote worktrees over SSH and named non-local environments,
+- remote worktrees over SSH and named environments over SSH or managed
+  providers,
 - cloud execution providers and the managed pool,
 - the Observe dashboards,
 - the placement engine,
