@@ -1314,7 +1314,7 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
                 },
             ) {
                 anyhow::bail!(
-                    "ref advanced, bookkeeping failed: target {target}, old OID {commit}, new OID {commit}; verify the target ref and rerun `thegn merge drain` to reconcile. DB error: {error}"
+                    "target already contains {commit}, but bookkeeping failed; verify the target ref and rerun `thegn merge drain` to reconcile. DB error: {error}"
                 );
             }
             lifecycle(LifecycleEvent::Landed);
