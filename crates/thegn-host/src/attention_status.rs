@@ -254,7 +254,7 @@ fn collect_attention_inner(
     for n in db.get_unread_notifications().unwrap_or_default() {
         if n.worktree_path.is_empty()
             || thegn_core::attention::note_is_stale(
-                &n.kind,
+                n.kind.as_str(),
                 n.created_at_ms,
                 now,
                 thegn_core::attention::FAILURE_ATTENTION_TTL_SECS,
