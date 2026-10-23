@@ -219,10 +219,13 @@ fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str, loc: &Git
     let thegn_core::placement::Placement::Provider(p) = &env.placement else {
         return;
     };
-    let id = thegn_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten())
-        .unwrap_or_else(|| p.id.clone());
+    let id = match crate::provider_factory::sandbox_id_for(worktree, &p.id) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::debug!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "explicit park skipped: binding unreadable");
+            return;
+        }
+    };
     let Some(provider) = crate::provider_factory::provider_for_named(pc, &id) else {
         return;
     };

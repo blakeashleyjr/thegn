@@ -75,8 +75,16 @@ pub fn destroy_provider_sandbox_with(
         return Ok(());
     };
     let pc = &env.provider;
-    let Some(name) = provider_sandbox_name(cfg, worktree, env_name).filter(|s| !s.is_empty())
-    else {
+    let name = match crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name)
+    {
+        Ok(name) => name,
+        Err(error) => {
+            return Err(format!(
+                "resolve the worktree's provider sandbox: {error:#}"
+            ));
+        }
+    };
+    let Some(name) = name.filter(|s| !s.is_empty()) else {
         return Ok(());
     };
     // Revoke before recycle/destroy. If SQLite is unavailable, fail closed and

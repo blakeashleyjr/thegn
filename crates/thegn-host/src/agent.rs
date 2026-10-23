@@ -1748,10 +1748,13 @@ pub fn provider_proxy_target(
     // Bound-aware id (like `native_exec_for`/`provider_sandbox_name`): a claimed
     // warm-pool spare targets that spare, not the derived husk the pool flow
     // destroyed — else the ssh proxy + p2p push relay into the wrong sandbox.
-    let id = Db::open()
-        .ok()
-        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten())
-        .unwrap_or_else(|| p.id.clone());
+    let id = match crate::provider_factory::sandbox_id_for(worktree, &p.id) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "provider proxy refused: warm-pool sandbox binding unreadable");
+            return None;
+        }
+    };
     let provider = provider_for_named(pc, &id)?;
     let workdir = crate::provider_workdir::resolve(pc, &id);
     let provider_kind = pc.provider.trim().to_string();
@@ -1957,10 +1960,13 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     // A claimed warm-pool spare overrides the derived id (same rule as
     // `provider_sandbox_name`): the pane must attach to the sandbox the
     // worktree is actually bound to, not the derived husk.
-    let bound = Db::open()
-        .ok()
-        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
-    let sandbox_id = bound.unwrap_or_else(|| p.id.clone());
+    let sandbox_id = match crate::provider_factory::sandbox_id_for(worktree, &p.id) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "native exec refused: warm-pool sandbox binding unreadable");
+            return None;
+        }
+    };
     // Resolve the pane cwd against the sandbox's cached `$HOME` (the workspace lives
     // under the login user's home — see `provider_workdir`), so `cd {workdir}` lands
     // in the repo and not a nonexistent `/workspace`.
