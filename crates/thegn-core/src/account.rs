@@ -1436,6 +1436,36 @@ mod tests {
     }
 
     #[test]
+    fn active_name_checked_names_workspace_and_global_read_failures() {
+        let cfg = Config::default();
+        let workspace_db = Db::open_memory().unwrap();
+        workspace_db
+            .conn()
+            .execute(
+                "INSERT INTO ui_state(scope, key, value) VALUES (?1, 'active', X'FF')",
+                [&scope_ws("codex", "repo")],
+            )
+            .unwrap();
+        let workspace_error =
+            active_name_checked(&cfg, &workspace_db, "/wt", Some("repo"), "codex").unwrap_err();
+        assert!(
+            format!("{workspace_error:#}")
+                .contains("read the codex account pinned to workspace repo")
+        );
+
+        let global_db = Db::open_memory().unwrap();
+        global_db
+            .conn()
+            .execute(
+                "INSERT INTO ui_state(scope, key, value) VALUES (?1, 'active', X'FF')",
+                [&scope_global("codex")],
+            )
+            .unwrap();
+        let global_error = active_name_checked(&cfg, &global_db, "/wt", None, "codex").unwrap_err();
+        assert!(format!("{global_error:#}").contains("read the global codex account"));
+    }
+
+    #[test]
     fn active_name_checked_matches_active_name_on_a_readable_db() {
         let db = Db::open_memory().unwrap();
         let cfg = Config::default();

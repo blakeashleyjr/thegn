@@ -537,6 +537,22 @@ pub(crate) struct Panes {
     test_daemon_spawn: Option<TestDaemonSpawn>,
 }
 
+enum NativeRestoreAction {
+    UseNative(Box<crate::agent::NativeShell>),
+    OpenPlainShell(String),
+    ProviderFallback,
+}
+
+fn native_restore_action(attempt: crate::agent::PaneNativeExec) -> NativeRestoreAction {
+    match attempt {
+        crate::agent::PaneNativeExec::Ready(native) => NativeRestoreAction::UseNative(native),
+        crate::agent::PaneNativeExec::AccountReadRefused(reason) => {
+            NativeRestoreAction::OpenPlainShell(reason)
+        }
+        crate::agent::PaneNativeExec::Unavailable => NativeRestoreAction::ProviderFallback,
+    }
+}
+
 impl Panes {
     #[cfg(test)]
     pub(crate) fn new(tx: tokio_mpsc::Sender<PaneEvent>) -> Self {
@@ -1177,7 +1193,7 @@ impl Panes {
             // would otherwise need isn't installed on the host). The remembered
             // choice (set by `launch_spec` at create) drives it; absent / "shell" ⇒
             // the login shell.
-            let native = if worktree.is_empty() {
+            let remembered_agent = if worktree.is_empty() {
                 None
             } else {
                 thegn_core::db::Db::open()
@@ -1186,18 +1202,54 @@ impl Panes {
                     // A remembered tool drawer (yazi/…) is not the worktree's
                     // agent — fall through to the shell rather than resuming it.
                     .filter(|c| cfg.tool_command(c).is_none())
-                    .as_deref()
-                    .and_then(|c| {
-                        crate::agent::native_agent_exec(cfg, worktree, c).map(|n| {
-                            // Label the pane with the agent, not the exec's
-                            // `/bin/sh -lc` wrapper.
-                            let cmd = cfg.agent_command(c).unwrap_or(c);
-                            (n, crate::pane::agent_program_name(cmd, c))
+            };
+            let native_attempt = match remembered_agent.as_deref() {
+                Some(choice) => {
+                    match crate::agent::native_agent_exec_for_pane(cfg, worktree, choice) {
+                        ready @ crate::agent::PaneNativeExec::Ready(_) => ready,
+                        refused @ crate::agent::PaneNativeExec::AccountReadRefused(_) => refused,
+                        crate::agent::PaneNativeExec::Unavailable => {
+                            crate::agent::native_shell_exec_for_pane(cfg, worktree)
+                        }
+                    }
+                }
+                None if !worktree.is_empty() => {
+                    crate::agent::native_shell_exec_for_pane(cfg, worktree)
+                }
+                None => crate::agent::PaneNativeExec::Unavailable,
+            };
+            let native = match native_restore_action(native_attempt) {
+                NativeRestoreAction::UseNative(n) => {
+                    let program = remembered_agent
+                        .as_deref()
+                        .and_then(|choice| {
+                            cfg.agent_command(choice)
+                                .map(|cmd| crate::pane::agent_program_name(cmd, choice))
                         })
-                    })
-                    .or_else(|| {
-                        crate::agent::native_shell_exec(cfg, worktree).map(|n| (n, "sh".into()))
-                    })
+                        .unwrap_or_else(|| "sh".into());
+                    Some((*n, program))
+                }
+                NativeRestoreAction::OpenPlainShell(reason) => {
+                    let notice = format!(
+                        "provider pane was not started because its active account could not be read: {reason}; opened a plain shell instead"
+                    );
+                    crate::launch_notice::post(worktree, &notice);
+                    let (shell, args) = pane_shell_argv(cfg, "");
+                    let mut argv = vec![shell];
+                    argv.extend(args);
+                    match self.spawn_argv(&argv, cwd.as_deref(), center) {
+                        Ok(fresh) => {
+                            map.insert(*old, fresh);
+                            continue;
+                        }
+                        Err(e) => {
+                            let line = spawn_failure_line(&e);
+                            tracing::warn!(target: "thegn::startup", "plain shell after account-read refusal failed to spawn: {line}");
+                            continue;
+                        }
+                    }
+                }
+                NativeRestoreAction::ProviderFallback => None,
             };
             if let Some((n, program)) = native {
                 let session = tab.pane_sessions.get(old).map(|s| s.session.clone());
@@ -1464,6 +1516,20 @@ mod tests {
     use super::*;
     use crate::layout;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn account_read_refusal_opens_plain_shell_instead_of_provider_fallback() {
+        match native_restore_action(crate::agent::PaneNativeExec::AccountReadRefused(
+            "database is locked".into(),
+        )) {
+            NativeRestoreAction::OpenPlainShell(reason) => {
+                assert!(reason.contains("database is locked"));
+            }
+            NativeRestoreAction::UseNative(_) | NativeRestoreAction::ProviderFallback => {
+                panic!("an account-read refusal must not reach the provider CLI fallback")
+            }
+        }
+    }
 
     fn one_tab_session() -> Session {
         Session {

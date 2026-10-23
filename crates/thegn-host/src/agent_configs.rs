@@ -922,28 +922,10 @@ fn account_exports_for(
     Ok(out)
 }
 
-/// The provider pane's account exports, or `None` when the selection cannot
-/// be read: the caller must not start the pane on another account's (or the
-/// default) credentials. The refusal is logged and shown.
-pub(crate) fn account_exports_or_refuse(
-    worktree: &str,
-    read: anyhow::Result<String>,
-) -> Option<String> {
-    match read {
-        Ok(exports) => Some(exports),
-        Err(error) => {
-            tracing::warn!(
-                target: "thegn::provider",
-                worktree,
-                error = %format!("{error:#}"),
-                "provider pane refused: the active coding-agent account could not be read"
-            );
-            thegn_core::msg::warn(&format!(
-                "provider pane for {worktree} not started: the active coding-agent account could not be read ({error:#})"
-            ));
-            None
-        }
-    }
+/// Preserve the selection failure for the pane spawner to report through the
+/// running UI loop instead of logging a warning that may have no sink.
+pub(crate) fn account_exports_or_refuse(read: anyhow::Result<String>) -> Result<String, String> {
+    read.map_err(|error| format!("{error:#}"))
 }
 
 fn account_export(home_env: &str, provider_id: &str, name: &str) -> String {
@@ -1111,20 +1093,20 @@ mod tests {
     #[test]
     fn account_exports_or_refuse_refuses_an_unreadable_selection() {
         assert_eq!(
-            account_exports_or_refuse("/wt", Err(anyhow::anyhow!("database is locked"))),
-            None
+            account_exports_or_refuse(Err(anyhow::anyhow!("database is locked"))),
+            Err("database is locked".into())
         );
     }
 
     #[test]
     fn account_exports_or_refuse_passes_exports_through() {
         assert_eq!(
-            account_exports_or_refuse("/wt", Ok("export X=1; ".into())),
-            Some("export X=1; ".into())
+            account_exports_or_refuse(Ok("export X=1; ".into())),
+            Ok("export X=1; ".into())
         );
         assert_eq!(
-            account_exports_or_refuse("/wt", Ok(String::new())),
-            Some(String::new())
+            account_exports_or_refuse(Ok(String::new())),
+            Ok(String::new())
         );
     }
 
