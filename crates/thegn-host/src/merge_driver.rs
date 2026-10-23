@@ -479,6 +479,10 @@ pub(crate) fn drive_queue(
                         }
                     }
                 }
+                #[cfg(test)]
+                {
+                    typed_read_tests::run_drain_land_test_hook();
+                }
                 land_verified(cfg, repo_root, branch, location, verified_tip.as_deref())
             },
             floor: |worktree: &str| {
@@ -3364,12 +3368,29 @@ mod tests {
 
 #[cfg(test)]
 mod typed_read_tests {
+    use std::cell::RefCell;
+
     use super::{
         CandidateUnreadable, Config, DriveActions, Failure, MergeCandidate, MergeQueueConfig,
-        QueueItem, classify_oid, drive_queue_with, land_verified, local_git_text,
-        unreadable_detail, verified_land_pin,
+        QueueItem, classify_oid, drive_queue, drive_queue_with, local_git_text, unreadable_detail,
+        verified_land_pin,
     };
     use thegn_core::git_run::{GitOutcome, GitTextError};
+
+    thread_local! {
+        static DRAIN_LAND_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    fn set_drain_land_test_hook(hook: impl FnOnce() + 'static) {
+        DRAIN_LAND_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run_drain_land_test_hook() {
+        let hook = DRAIN_LAND_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 
     #[test]
     fn classify_oid_keeps_exit_one_as_absent_and_everything_else_as_failure() {
@@ -3577,7 +3598,9 @@ mod typed_read_tests {
     }
 
     #[test]
-    fn drain_land_refuses_a_tip_that_moved_after_verification() {
+    fn drain_passes_verified_tip_when_branch_moves_before_landing() {
+        use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+
         #[expect(clippy::disallowed_methods, reason = "create an isolated Git fixture")]
         fn git(dir: &std::path::Path, args: &[&str]) {
             let status = thegn_core::util::git_cmd(dir)
@@ -3588,7 +3611,8 @@ mod typed_read_tests {
             assert!(status.success(), "git {args:?} failed with {status}");
         }
 
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let tmp_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = tempfile::tempdir_in(tmp_root).unwrap();
         git(dir.path(), &["init", "-q", "-b", "main"]);
         git(dir.path(), &["config", "user.email", "t@e"]);
         git(dir.path(), &["config", "user.name", "t"]);
@@ -3618,51 +3642,82 @@ mod typed_read_tests {
             ],
         );
 
-        let verified = local_git_text(dir.path(), &["rev-parse", "refs/heads/feat"])
-            .unwrap()
-            .trim()
-            .to_owned();
         let main_before = local_git_text(dir.path(), &["rev-parse", "refs/heads/main"])
             .unwrap()
             .trim()
             .to_owned();
-        git(
-            dir.path(),
-            &[
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "second feature commit",
-            ],
-        );
+        let worktree = dir.path().to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("feat", &worktree, &worktree, "feat", None, None)
+            .unwrap();
+        db.enqueue_merge_candidate_with_identity(
+            &worktree,
+            "feat",
+            "main",
+            &MergeCandidate {
+                branch_ref: "refs/heads/feat".into(),
+                candidate_oid: local_git_text(dir.path(), &["rev-parse", "refs/heads/feat"])
+                    .unwrap()
+                    .trim()
+                    .to_owned(),
+            },
+            &crate::merge_ops::local_enqueue_identity(dir.path()).unwrap(),
+        )
+        .unwrap();
 
-        let outcome = land_verified(
+        // This runs after drive_queue verifies the queued candidate and just
+        // before it calls the production land path, reproducing a concurrent
+        // branch advance at the boundary the pin protects.
+        let hook_dir = dir.path().to_path_buf();
+        set_drain_land_test_hook(move || {
+            git(
+                &hook_dir,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "second feature commit",
+                ],
+            );
+        });
+
+        let outcome = drive_queue(
             &MergeQueueConfig {
+                target_branch: "main".into(),
                 organize_folders: false,
                 ..MergeQueueConfig::default()
             },
+            &Config::default(),
             dir.path(),
-            "feat",
-            &thegn_core::remote::GitLoc::Local(dir.path().to_path_buf()),
-            Some(&verified),
+            &db,
+            vec![QueueItem {
+                worktree,
+                branch: "feat".into(),
+                location: String::new(),
+            }],
+            |_| {},
         );
         assert!(
-            matches!(
-                outcome,
-                Ok(super::AttemptOutcome::GateError {
-                    class: crate::integrate::GateErrorClass::SourceMoved,
-                    ..
-                })
-            ),
+            outcome.gate_error == ["feat"],
             "expected moved branch to be refused, got {outcome:?}"
         );
+        let expected_class = if thegn_core::sandbox_backend::host_os()
+            == thegn_core::sandbox_backend::HostOs::Windows
+        {
+            "preparation"
+        } else {
+            "source_moved"
+        };
+        assert_eq!(outcome.gate_verdicts[0].class, expected_class);
         let main_after = local_git_text(dir.path(), &["rev-parse", "refs/heads/main"])
             .unwrap()
             .trim()
             .to_owned();
         assert_eq!(main_after, main_before, "refused landing changed main");
+        let row = db.list_merge_queue().unwrap().remove(0);
+        assert_eq!(row.status, "gate_error");
     }
 }
