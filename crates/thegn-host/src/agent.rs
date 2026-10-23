@@ -4507,22 +4507,45 @@ pub fn launch_spec_full(
     // the host store isn't mounted). See [`devenv`].
     let devshell = (!loc.is_remote() && !outcome.is_remote)
         .then(|| {
+            if db.is_none() && !cfg.env.is_empty() {
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    worktree,
+                    "devshell injection skipped: the state database could not be opened"
+                );
+                return false;
+            }
             let approvals = db
                 .as_ref()
                 .map(|db| {
                     crate::handlers::repo_trust::approvals_for(db, &repo_root.to_string_lossy())
                 })
                 .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
-            crate::handlers::repo_trust::effective_environment_for_worktree(
+            match crate::handlers::repo_trust::effective_environment_for_worktree(
                 cfg,
                 db.as_ref(),
                 &repo_root,
                 Path::new(worktree),
                 None,
                 &approvals,
-            )
-            .sandbox
-            .inject_devshell
+            ) {
+                Ok(environment) => environment.sandbox.inject_devshell,
+                Err(error) => {
+                    crate::launch_notice::post(
+                        worktree,
+                        &format!(
+                            "devshell injection skipped: the environment could not be resolved: {error:#}"
+                        ),
+                    );
+                    tracing::warn!(
+                        target: "thegn::sandbox",
+                        worktree,
+                        error = %format!("{error:#}"),
+                        "devshell injection skipped: the environment could not be resolved"
+                    );
+                    false
+                }
+            }
         })
         .filter(|enabled| *enabled)
         .and_then(|_| devenv::cached(&repo_root));

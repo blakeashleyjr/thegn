@@ -58,7 +58,9 @@ pub(crate) fn approvals_for(db: &Db, repo_root: &str) -> Approvals {
 /// Resolve the same effective environment used by pane launch for a registered
 /// worktree. Read-only status/provisioning callers must not stop at the base
 /// repo sandbox: doing so drops the workspace/worktree env selection and its
-/// `[env.<name>.sandbox]` overlay.
+/// `[env.<name>.sandbox]` overlay. A failed location or selection read is an
+/// error, except that a failed selection read can use the implicit default
+/// when no named environments are configured. `db: None` performs no reads.
 pub(crate) fn effective_environment_for_worktree(
     cfg: &Config,
     db: Option<&Db>,
@@ -66,16 +68,50 @@ pub(crate) fn effective_environment_for_worktree(
     worktree: &Path,
     location: Option<&str>,
     approvals: &Approvals,
-) -> Environment {
+) -> anyhow::Result<Environment> {
     let worktree_s = worktree.to_string_lossy();
     let repo_s = repo_root.to_string_lossy();
-    let persisted_location = location
-        .map(str::to_string)
-        .or_else(|| db.and_then(|db| db.location_for(&worktree_s).ok().flatten()));
-    let loc = GitLoc::from_db(&worktree_s, persisted_location.as_deref());
-    let selected = db.and_then(|db| db.effective_env(&worktree_s, &repo_s));
-    cfg.resolve_env_with(repo_root, &loc, worktree, selected.as_deref(), approvals)
-        .0
+    let location_read = match (location, db) {
+        (Some(location), _) => Ok(Some(location.to_string())),
+        (None, Some(db)) => db.location_for(&worktree_s),
+        (None, None) => Ok(None),
+    };
+    let selection_read = match db {
+        Some(db) => db.effective_env_checked(&worktree_s, &repo_s),
+        None => Ok(None),
+    };
+    environment_from_reads(
+        cfg,
+        repo_root,
+        worktree,
+        location_read,
+        selection_read,
+        approvals,
+    )
+}
+
+/// Resolve from already-performed reads; any failed read is an error.
+fn environment_from_reads(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    location: anyhow::Result<Option<String>>,
+    selected: anyhow::Result<Option<String>>,
+    approvals: &Approvals,
+) -> anyhow::Result<Environment> {
+    use anyhow::Context;
+    let location = location.context("the worktree's recorded location could not be read")?;
+    let selected = match selected {
+        Ok(selected) => selected,
+        Err(_) if cfg.env.is_empty() => None,
+        Err(error) => {
+            return Err(error).context("the worktree's environment selection could not be read");
+        }
+    };
+    let loc = GitLoc::from_db(&worktree.to_string_lossy(), location.as_deref());
+    Ok(cfg
+        .resolve_env_with(repo_root, &loc, worktree, selected.as_deref(), approvals)
+        .0)
 }
 
 /// Resolve the effective [`Environment`] for a worktree honouring persisted
@@ -269,14 +305,26 @@ pub(crate) fn devcontainer_lifecycle_steps(
         return Vec::new();
     };
     let approvals = approvals_for(&db, &repo_root.to_string_lossy());
-    let env = effective_environment_for_worktree(
+    let env = match effective_environment_for_worktree(
         &cfg,
         Some(&db),
         repo_root,
         Path::new(worktree),
         None,
         &approvals,
-    );
+    ) {
+        Ok(env) => env,
+        Err(error) => {
+            crate::launch_notice::post(
+                worktree,
+                &format!("devcontainer lifecycle steps skipped: {error:#}"),
+            );
+            thegn_core::msg::warn(&format!(
+                "devcontainer lifecycle steps skipped for {worktree}: {error:#}"
+            ));
+            return Vec::new();
+        }
+    };
     if !env.allows_devcontainer() {
         return Vec::new();
     }
@@ -309,14 +357,26 @@ pub(crate) fn devcontainer_feature_steps(
         return Vec::new();
     };
     let approvals = approvals_for(&db, &repo_root.to_string_lossy());
-    let env = effective_environment_for_worktree(
+    let env = match effective_environment_for_worktree(
         &cfg,
         Some(&db),
         repo_root,
         Path::new(worktree),
         None,
         &approvals,
-    );
+    ) {
+        Ok(env) => env,
+        Err(error) => {
+            crate::launch_notice::post(
+                worktree,
+                &format!("devcontainer feature steps skipped: {error:#}"),
+            );
+            thegn_core::msg::warn(&format!(
+                "devcontainer feature steps skipped for {worktree}: {error:#}"
+            ));
+            return Vec::new();
+        }
+    };
     if !env.allows_devcontainer() {
         return Vec::new();
     }
@@ -422,7 +482,96 @@ fn local_env_admitted(
 
 #[cfg(test)]
 mod tests {
-    use super::local_env_admitted;
+    use super::{environment_from_reads, local_env_admitted};
+
+    #[test]
+    fn environment_from_reads_refuses_an_unreadable_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = thegn_core::config::Config {
+            env: std::collections::BTreeMap::from([(
+                "box".into(),
+                thegn_core::config::EnvConfig {
+                    placement: thegn_core::config::PlacementMode::Local,
+                    ..thegn_core::config::EnvConfig::default()
+                },
+            )]),
+            ..thegn_core::config::Config::default()
+        };
+        let error = environment_from_reads(
+            &cfg,
+            root.path(),
+            root.path(),
+            Ok(None),
+            Err(anyhow::anyhow!("database is locked")),
+            &thegn_core::config_resolve::Approvals::deny_all(),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("environment selection could not be read"));
+        assert!(message.contains("database is locked"));
+    }
+
+    #[test]
+    fn environment_from_reads_uses_default_when_unconfigured_selection_is_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = environment_from_reads(
+            &thegn_core::config::Config::default(),
+            root.path(),
+            root.path(),
+            Ok(None),
+            Err(anyhow::anyhow!("database is locked")),
+            &thegn_core::config_resolve::Approvals::deny_all(),
+        )
+        .unwrap();
+
+        assert_eq!(environment.name, "default");
+    }
+
+    #[test]
+    fn environment_from_reads_refuses_an_unreadable_location() {
+        let root = tempfile::tempdir().unwrap();
+        let error = environment_from_reads(
+            &thegn_core::config::Config::default(),
+            root.path(),
+            root.path(),
+            Err(anyhow::anyhow!("disk I/O error")),
+            Ok(None),
+            &thegn_core::config_resolve::Approvals::deny_all(),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("recorded location could not be read"));
+        assert!(message.contains("disk I/O error"));
+    }
+
+    #[test]
+    fn environment_from_reads_resolves_a_read_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = thegn_core::config::Config {
+            env: std::collections::BTreeMap::from([(
+                "box".into(),
+                thegn_core::config::EnvConfig {
+                    placement: thegn_core::config::PlacementMode::Local,
+                    ..thegn_core::config::EnvConfig::default()
+                },
+            )]),
+            ..thegn_core::config::Config::default()
+        };
+        let environment = environment_from_reads(
+            &cfg,
+            root.path(),
+            root.path(),
+            Ok(None),
+            Ok(Some("box".into())),
+            &thegn_core::config_resolve::Approvals::deny_all(),
+        )
+        .unwrap();
+
+        assert_eq!(environment.name, "box");
+    }
+
     #[test]
     fn named_profile_does_not_substitute_unshared_credential() {
         let allowed = vec!["ANTHROPIC_API_KEY".to_owned(), "SSH_AUTH_SOCK".to_owned()];

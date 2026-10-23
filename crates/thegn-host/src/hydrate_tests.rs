@@ -1523,7 +1523,8 @@ fn devcontainer_status_ignores_repo_host_environment_that_weakens_backend() {
         repo.path(),
         None,
         &thegn_core::config_resolve::Approvals::deny_all(),
-    );
+    )
+    .expect("no failed read");
     assert_eq!(environment.name, "default");
     assert_eq!(environment.sandbox.backend, SandboxBackend::Bwrap);
     assert!(environment.allows_devcontainer());
