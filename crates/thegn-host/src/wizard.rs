@@ -1939,7 +1939,8 @@ mod tests {
     #[test]
     fn wizard_walkthrough_generated_name() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         assert!(w.candidate().starts_with(&cfg.branch_prefix));
         assert!(w.candidate().len() > cfg.branch_prefix.len());
 
@@ -2036,7 +2037,8 @@ mod tests {
     #[test]
     fn enter_advances_on_edit_fields_and_creates_only_on_program() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
 
         // Walk up to the Name field (Program → Sandbox → Host → Name).
         key(&mut w, KeyCode::UpArrow);
@@ -2066,7 +2068,8 @@ mod tests {
     #[test]
     fn typing_marks_edited_and_blocks_suggestion() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         // Focus starts on Program; walk up to the Name field (Sandbox, Host,
         // Name — a local default host keeps the Sandbox row in the ring).
         key(&mut w, KeyCode::UpArrow);
@@ -2096,7 +2099,8 @@ mod tests {
     #[test]
     fn pristine_field_adopts_suggestion() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         w.apply_name_suggestion("tg/calm-otter-3");
         assert_eq!(w.candidate(), "tg/calm-otter-3");
     }
@@ -2104,7 +2108,8 @@ mod tests {
     #[test]
     fn empty_name_refuses_to_advance() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         // Walk up to the Name field.
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
@@ -2128,7 +2133,8 @@ mod tests {
         let cfg = test_cfg();
         // Escape cancels from every field along the focus ring.
         for ups in 0..=3 {
-            let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+            let root = tempfile::tempdir().unwrap();
+            let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
             for _ in 0..ups {
                 key(&mut w, KeyCode::UpArrow);
             }
@@ -2136,7 +2142,8 @@ mod tests {
         }
 
         // Ctrl+c cancels regardless of focus.
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         assert_eq!(
             w.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
             WizardOutcome::Cancel
@@ -2146,7 +2153,8 @@ mod tests {
     #[test]
     fn host_defaults_and_cycles() {
         let cfg = test_cfg();
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         // No named envs ⇒ the default host is the implicit "default".
         assert_eq!(w.host_key(), "default");
         assert!(w.host_is_local());
@@ -2176,7 +2184,8 @@ mod tests {
             },
         );
 
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         assert_eq!(w.host_key(), "host");
         assert_eq!(w.sandbox_key(), "host");
 
@@ -2209,7 +2218,8 @@ mod tests {
         // Make the ssh env the default host so it opens selected.
         cfg.sandbox.default_env = "remote".into();
 
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root.path().to_path_buf(), &cfg);
         assert_eq!(w.host_key(), "remote");
         assert!(!w.host_is_local(), "ssh host is non-local");
         // Program → up skips Sandbox and lands on Host directly.
@@ -2246,7 +2256,9 @@ mod tests {
 
     #[test]
     fn failed_wizard_stays_visible_and_cannot_submit_or_prepare() {
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &test_cfg());
+        let root0 = tempfile::tempdir().unwrap();
+        let mut w =
+            NewWorktreeWizard::new_isolated_for_test(root0.path().to_path_buf(), &test_cfg());
         w.focus = Field::Name;
         let candidate = w.candidate();
         w.set_failure("resolve base: \x1b[31mfatal: Needed a single revision\x1b[0m");
@@ -2618,7 +2630,8 @@ mod tests {
                 .join("\n")
         };
 
-        let w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root1 = tempfile::tempdir().unwrap();
+        let w = NewWorktreeWizard::new_isolated_for_test(root1.path().to_path_buf(), &cfg);
         let mut s = Surface::new(80, 24);
         w.render(&mut s, screen);
         let frame = text(&mut s);
@@ -2633,7 +2646,8 @@ mod tests {
         // Host-readiness badge (hosts-as-resources): rendered dim after the
         // selected env's label when the launcher provided one; absent otherwise.
         assert!(!frame.contains("✓ ready"), "no badge without a map");
-        let mut w = NewWorktreeWizard::new_isolated_for_test(std::env::temp_dir(), &cfg);
+        let root2 = tempfile::tempdir().unwrap();
+        let mut w = NewWorktreeWizard::new_isolated_for_test(root2.path().to_path_buf(), &cfg);
         w.set_host_badges(std::collections::HashMap::from([(
             w.host_key(),
             "✓ ready".to_string(),
