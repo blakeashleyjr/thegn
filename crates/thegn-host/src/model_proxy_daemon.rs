@@ -1291,15 +1291,19 @@ mod tests {
             supervisor_wait(SupervisorStep::Stop, 0),
             Some(Duration::from_secs(15))
         );
+        // Three failures reach the backoff ceiling, which carries no jitter;
+        // fewer failures draw jitter from the wall clock per call.
         let expected_backoff = thegn_core::backoff::calculate_backoff(
             thegn_core::backoff::ExhaustionKind::ServerError,
-            2,
+            3,
         )
         .min(Duration::from_secs(120));
         assert_eq!(
-            supervisor_wait(SupervisorStep::Restart, 2),
+            supervisor_wait(SupervisorStep::Restart, 3),
             Some(expected_backoff)
         );
+        let jittered = supervisor_wait(SupervisorStep::Restart, 1).expect("restart waits");
+        assert!(jittered > Duration::ZERO && jittered <= Duration::from_secs(120));
     }
 
     #[test]
