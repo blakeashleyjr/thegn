@@ -696,7 +696,6 @@ mod tests {
     #[test]
     fn read_checked_refuses_malformed_json() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path()).unwrap();
         std::fs::write(tmp.path().join("a.json"), b"not json").unwrap();
 
         let error = read_checked_at(tmp.path(), "a").unwrap_err();
@@ -707,7 +706,6 @@ mod tests {
     #[test]
     fn read_checked_refuses_a_record_naming_another_instance() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path()).unwrap();
         std::fs::write(
             tmp.path().join("b.json"),
             serde_json::to_vec(&rec("c", "ready")).unwrap(),
@@ -721,7 +719,6 @@ mod tests {
     #[test]
     fn read_checked_refuses_a_directory_in_place_of_the_record() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path()).unwrap();
         std::fs::create_dir(tmp.path().join("a.json")).unwrap();
 
         let error = read_checked_at(tmp.path(), "a").unwrap_err();
