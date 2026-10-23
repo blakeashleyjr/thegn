@@ -1405,6 +1405,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_history_cells_dispatch_like_a_current_head_and_unknown_heads_hold() {
+        let cells = [
+            ("NULL last head", None),
+            ("empty last head", Some("empty")),
+            ("current last head", Some("current")),
+            ("unknown older last head", Some("unknown")),
+        ];
+        let mut failures = Vec::new();
+
+        for (cell, recorded) in cells {
+            for mode in [CiAutofixMode::Auto, CiAutofixMode::Suggest] {
+                for human_authorized in [false, true] {
+                    let fixture = Fixture::new();
+                    let handoff = handoff(&fixture, mode, &fixture.pr.head_ref_oid);
+
+                    if let Some(recorded) = recorded {
+                        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+                        let unknown_head = "0".repeat(40);
+                        let head = match recorded {
+                            "empty" => "",
+                            "current" => fixture.pr.head_ref_oid.as_str(),
+                            "unknown" => unknown_head.as_str(),
+                            _ => unreachable!("test case has a known recorded-head marker"),
+                        };
+                        handoff
+                            .db
+                            .update_pr_status(&row.key, &row.status, None, None, Some(head))
+                            .unwrap();
+                    }
+
+                    consider(&handoff, human_authorized);
+
+                    let held = cell == "unknown older last head";
+                    let dispatched = !held && (mode == CiAutofixMode::Auto || human_authorized);
+                    let expected_attempts = u32::from(dispatched);
+                    let ran = handoff.sentinel.exists();
+                    if ran != dispatched {
+                        failures.push(format!(
+                            "{cell}, mode={mode:?}, human={human_authorized}: ran={ran}, expected={dispatched}"
+                        ));
+                    }
+
+                    let attempts = handoff.db.list_pr_queue().unwrap()[0].agent_attempts;
+                    if attempts != expected_attempts {
+                        failures.push(format!(
+                            "{cell}, mode={mode:?}, human={human_authorized}: attempts={attempts}, expected={expected_attempts}"
+                        ));
+                    }
+
+                    let claimable = handoff
+                        .db
+                        .claim_ci_autofix(&handoff.entry.candidate())
+                        .unwrap();
+                    let expected_claimable = !dispatched;
+                    if claimable != expected_claimable {
+                        failures.push(format!(
+                            "{cell}, mode={mode:?}, human={human_authorized}: claimable={claimable}, expected={}",
+                            expected_claimable
+                        ));
+                    }
+
+                    let expected_notice = if held {
+                        Some("someone else pushed")
+                    } else if mode == CiAutofixMode::Suggest && !human_authorized {
+                        Some("ready for a PR-agent handoff")
+                    } else {
+                        None
+                    };
+                    if let Some(expected_notice) = expected_notice {
+                        let notified = handoff
+                            .db
+                            .get_unread_notifications()
+                            .unwrap()
+                            .iter()
+                            .any(|notification| notification.message.contains(expected_notice));
+                        if !notified {
+                            failures.push(format!(
+                                "{cell}, mode={mode:?}, human={human_authorized}: missing notification `{expected_notice}`"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "missing-history policy cells failed:\n{}",
+            failures.join("\n")
+        );
+    }
+
     fn enqueue_pr(db: &thegn_core::db::Db, path: &str, number: u64, url: &str) {
         db.enqueue_bound_pr(path, number, Some(path), "fixture", "main", "github", url)
             .unwrap();
