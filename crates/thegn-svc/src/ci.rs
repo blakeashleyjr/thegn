@@ -3470,7 +3470,7 @@ esac
         }
     }
 
-    fn golden_setup() -> (tempfile::TempDir, GitLoc, GitLoc, String, bool) {
+    fn golden_setup() -> (tempfile::TempDir, String, bool) {
         let temp = tempfile::tempdir().unwrap();
         let fixture_dir = temp.path().join("fixtures");
         let bin = temp.path().join("bin");
@@ -3507,7 +3507,7 @@ for arg in "$@"; do endpoint=$arg; done
 case "$endpoint" in
   */pipelines/*/jobs?*)
     case "$endpoint" in
-      *page=1*) cat "$CI_GOLDEN_DIR/gitlab_jobs.json" ;;
+      *"&page=1") cat "$CI_GOLDEN_DIR/gitlab_jobs.json" ;;
       *) printf '[]\n' ;;
     esac ;;
   */pipelines/801234568) cat "$CI_GOLDEN_DIR/gitlab_pipeline.json" ;;
@@ -3520,6 +3520,15 @@ esac
         let shell_available = thegn_core::fsperm::make_executable_for_test(&gh).is_ok()
             && thegn_core::fsperm::make_executable_for_test(&glab).is_ok();
 
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        (temp, path, shell_available)
+    }
+
+    fn golden_repos(temp: &tempfile::TempDir) -> (GitLoc, GitLoc) {
         let github_repo = temp.path().join("github-repo");
         let gitlab_repo = temp.path().join("gitlab-repo");
         for (repo, remote) in [
@@ -3542,18 +3551,7 @@ esac
                     .success()
             );
         }
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        (
-            temp,
-            GitLoc::Local(github_repo),
-            GitLoc::Local(gitlab_repo),
-            path,
-            shell_available,
-        )
+        (GitLoc::Local(github_repo), GitLoc::Local(gitlab_repo))
     }
 
     fn golden_env(path: &str, temp: &tempfile::TempDir) -> thegn_core::testenv::EnvGuard {
@@ -3568,10 +3566,11 @@ esac
     #[test]
     fn golden_github_run_list_decodes_every_field() {
         // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
-        let (temp, loc, _, path, shell_available) = golden_setup();
+        let (temp, path, shell_available) = golden_setup();
         if !shell_available {
             return;
         }
+        let (loc, _) = golden_repos(&temp);
         let _env = golden_env(&path, &temp);
         let client = GithubCi {
             remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
@@ -3669,10 +3668,11 @@ esac
     #[test]
     fn golden_github_run_detail_decodes_jobs_and_steps() {
         // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
-        let (temp, loc, _, path, shell_available) = golden_setup();
+        let (temp, path, shell_available) = golden_setup();
         if !shell_available {
             return;
         }
+        let (loc, _) = golden_repos(&temp);
         let _env = golden_env(&path, &temp);
         let client = GithubCi {
             remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
@@ -3764,10 +3764,11 @@ esac
     #[test]
     fn golden_gitlab_pipelines_decode_every_field() {
         // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
-        let (temp, _, loc, path, shell_available) = golden_setup();
+        let (temp, path, shell_available) = golden_setup();
         if !shell_available {
             return;
         }
+        let (_, loc) = golden_repos(&temp);
         let _env = golden_env(&path, &temp);
         let result = GitlabCi::default().runs(&loc, None, 10).unwrap();
         assert_eq!(result.discarded_rows, 0);
@@ -3845,10 +3846,11 @@ esac
     #[test]
     fn golden_gitlab_pipeline_detail_decodes_jobs() {
         // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
-        let (temp, _, loc, path, shell_available) = golden_setup();
+        let (temp, path, shell_available) = golden_setup();
         if !shell_available {
             return;
         }
+        let (_, loc) = golden_repos(&temp);
         let _env = golden_env(&path, &temp);
         let detail = GitlabCi::default().run_detail(&loc, "801234568").unwrap();
         assert!(detail.is_complete());
@@ -3914,10 +3916,11 @@ esac
     #[test]
     fn golden_run_lists_round_trip_the_cache_envelope() {
         // golden fixture: passes at 793ebbab8 unless a real decode bug exists.
-        let (temp, github_loc, gitlab_loc, path, shell_available) = golden_setup();
+        let (temp, path, shell_available) = golden_setup();
         if !shell_available {
             return;
         }
+        let (github_loc, gitlab_loc) = golden_repos(&temp);
         let _env = golden_env(&path, &temp);
         let github = GithubCi {
             remote: Some(parse_github_remote("https://github.com/owner/repo.git").unwrap()),
