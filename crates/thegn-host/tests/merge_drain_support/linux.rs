@@ -124,6 +124,17 @@ impl Fixture {
         fs::write(root.path().join("gitconfig"), "").unwrap();
         fs::write(root.path().join("empty-rc"), "").unwrap();
         let shell = root.path().join("bin/sh");
+        let fixture_shell = root.path().join("fixture-shell");
+        fs::write(
+            &fixture_shell,
+            format!(
+                "#!{}\n[ \"$#\" -eq 2 ] && {{ [ \"$1\" = -c ] || [ \"$1\" = -lc ]; }} || exit 97\nexec {} -c \"$2\"\n",
+                shell.display(),
+                shell.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fixture_shell, fs::Permissions::from_mode(0o700)).unwrap();
         let sentinel = root.path().join("agent-sentinel");
         fs::write(&sentinel, format!("#!{}\n[ \"$#\" -eq 1 ] || exit 91\nprintf 'unexpected-agent\\n' > \"$1\"\nexit 92\n", shell.display())).unwrap();
         fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o700)).unwrap();
@@ -312,7 +323,7 @@ agent_on_floor_miss = "fail"
             .env("GIT_CONFIG_GLOBAL", self.root.path().join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("SHELL", self.root.path().join("bin/sh"))
+            .env("SHELL", self.root.path().join("fixture-shell"))
             .env("ENV", self.root.path().join("empty-rc"))
             .env("BASH_ENV", self.root.path().join("empty-rc"));
         cmd
@@ -645,6 +656,10 @@ fn wait_gate_count(root: &Path, log_name: &str, event: &str, expected: usize) {
 }
 
 fn one_row_fixture(options: FixtureOpts) -> Fixture {
+    one_row_fixture_with_red_gate(options, false)
+}
+
+fn one_row_fixture_with_red_gate(options: FixtureOpts, red_gate: bool) -> Fixture {
     let mut fixture = Fixture::with(options);
     let repo = fixture.repo.clone();
     let feature = fixture.held.clone();
@@ -681,69 +696,39 @@ fn one_row_fixture(options: FixtureOpts) -> Fixture {
         ],
     );
     fs::write(feature.join("feature.txt"), "feature\n").unwrap();
-    fixture.git(&feature, &["add", "feature.txt"]);
-    fixture.git(&feature, &["commit", "-qm", "feature"]);
+    if red_gate {
+        fs::write(feature.join("red-gate-marker"), "always red\n").unwrap();
+        fixture.git(&feature, &["add", "feature.txt", "red-gate-marker"]);
+    } else {
+        fixture.git(&feature, &["add", "feature.txt"]);
+    }
+    if red_gate {
+        fixture.git(
+            &feature,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "feature with red gate marker",
+            ],
+        );
+    } else {
+        fixture.git(&feature, &["commit", "-qm", "feature"]);
+    }
     fixture.cli(&["merge", "add", feature.to_str().unwrap()]);
     fixture
 }
 
 fn agent_row_fixture() -> Fixture {
-    let mut fixture = Fixture::with(FixtureOpts {
-        gate: GATE.to_owned(),
-        auto_land: false,
-        agent: AgentMode::HostFifo,
-    });
-    let repo = fixture.repo.clone();
-    let feature = fixture.held.clone();
-    fixture.git(&repo, &["init", "-q", "-b", "main"]);
-    for (key, value) in [
-        ("user.name", "private-drain"),
-        ("user.email", "private@example.invalid"),
-        ("commit.gpgsign", "false"),
-        ("core.fsmonitor", "false"),
-        ("gc.auto", "0"),
-        ("maintenance.auto", "false"),
-    ] {
-        fixture.git(&repo, &["config", key, value]);
-    }
-    fixture.git(
-        &repo,
-        &[
-            "config",
-            "core.hooksPath",
-            fixture.root.path().join("hooks").to_str().unwrap(),
-        ],
+    let mut fixture = one_row_fixture_with_red_gate(
+        FixtureOpts {
+            gate: GATE.to_owned(),
+            auto_land: false,
+            agent: AgentMode::HostFifo,
+        },
+        true,
     );
-    fs::write(repo.join("base.txt"), "base\n").unwrap();
-    fixture.git(&repo, &["add", "base.txt"]);
-    fixture.git(
-        &repo,
-        &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
-    );
-    fixture.git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "-qb",
-            "feature",
-            feature.to_str().unwrap(),
-        ],
-    );
-    fs::write(feature.join("feature.txt"), "feature\n").unwrap();
-    fs::write(feature.join("red-gate-marker"), "always red\n").unwrap();
-    fixture.git(&feature, &["add", "feature.txt", "red-gate-marker"]);
-    fixture.git(
-        &feature,
-        &[
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "feature with red gate marker",
-        ],
-    );
-    fixture.cli(&["merge", "add", feature.to_str().unwrap()]);
     make_gate_fifo(fixture.root.path(), "agent-hold");
     fixture.agent_guard = Some(GateReleaseGuard::new(
         fixture.root.path(),
