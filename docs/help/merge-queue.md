@@ -108,9 +108,9 @@ for a branch already merged. Within that, `[merge_queue]` lets you shape it:
   (`linear`; the branch's own commits replayed one at a time, keeping
   their original author). `land_message` templates the merge/squash
   subject (`{branch}`, `{target}`, `{subjects}`).
-  With `rebase`, a branch containing merge commits is held `needs_human` before
-  replay starts; no fixing agent runs. Land it with the merge or squash
-  strategy, or linearize the branch.
+  With `rebase`, a branch containing merge commits or history unrelated to the
+  target is held `needs_human` before replay starts; no fixing agent runs. Land
+  it with the merge or squash strategy, or linearize the branch.
 - **`sign_commits`** — sign the fold/land commits thegn creates. Signing
   is always non-interactive: a locked agent, a missing key, or anything
   that would prompt stops the drain as an _infrastructure_ error with a
