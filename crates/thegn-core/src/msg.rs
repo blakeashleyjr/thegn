@@ -9,6 +9,7 @@
 #![allow(clippy::disallowed_macros)] // this module is the stderr fallback
 
 use crate::theme;
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -49,7 +50,33 @@ fn tag(hue: &str) -> String {
     }
 }
 
+/// The stderr render boundary for diagnostics (THE-507); multi-line messages keep their newlines.
+pub fn terminal_safe(s: &str) -> Cow<'_, str> {
+    let mut output = None::<String>;
+    let mut copied_until = 0;
+
+    for (byte_index, c) in s.char_indices() {
+        if (c.is_control() && c != '\n' && c != '\t')
+            || crate::pipeline_report::is_format_control(c)
+        {
+            let escaped = output.get_or_insert_with(|| String::with_capacity(s.len()));
+            escaped.push_str(&s[copied_until..byte_index]);
+            escaped.push('\u{fffd}');
+            copied_until = byte_index + c.len_utf8();
+        }
+    }
+
+    match output {
+        Some(mut output) => {
+            output.push_str(&s[copied_until..]);
+            Cow::Owned(output)
+        }
+        None => Cow::Borrowed(s),
+    }
+}
+
 pub fn info(s: &str) {
+    let s = terminal_safe(s);
     if crate::log_trace::ready() || tui_active() {
         tracing::info!("{s}");
     } else {
@@ -58,6 +85,7 @@ pub fn info(s: &str) {
 }
 
 pub fn warn(s: &str) {
+    let s = terminal_safe(s);
     if crate::log_trace::ready() || tui_active() {
         tracing::warn!("{s}");
     } else {
@@ -66,6 +94,7 @@ pub fn warn(s: &str) {
 }
 
 pub fn error(s: &str) {
+    let s = terminal_safe(s);
     if crate::log_trace::ready() || tui_active() {
         tracing::error!("{s}");
     } else {
@@ -76,6 +105,60 @@ pub fn error(s: &str) {
 /// Print an error and exit non-zero. Always goes straight to stderr (branded),
 /// regardless of the subscriber or level filter — a fatal must be seen.
 pub fn die(s: &str) -> ! {
+    let s = terminal_safe(s);
     eprintln!("{} {s}", tag(theme::RED));
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_safe;
+    use std::borrow::Cow;
+
+    #[test]
+    fn terminal_safe_replaces_escape_c1_and_format_controls() {
+        let input = "before\u{1b}]52;c;SGVsbG8=\u{7} mid \u{1b}[2J c1 \u{9b}\u{9d} del \u{7f} bidi \u{202e}\u{2066} zero \u{200b} sep \u{2028} after";
+        let expected = "before\u{fffd}]52;c;SGVsbG8=\u{fffd} mid \u{fffd}[2J c1 \u{fffd}\u{fffd} del \u{fffd} bidi \u{fffd}\u{fffd} zero \u{fffd} sep \u{fffd} after";
+        let safe = terminal_safe(input);
+
+        assert_eq!(safe, expected);
+        for hostile in [
+            '\u{1b}', '\u{7}', '\u{9b}', '\u{9d}', '\u{7f}', '\u{202e}', '\u{2066}', '\u{200b}',
+            '\u{2028}',
+        ] {
+            assert!(
+                !safe.contains(hostile),
+                "hostile character {hostile:?} survived"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_safe_keeps_newlines_tabs_and_borrows_clean_text() {
+        for input in ["a\tb\nc", "plain ascii / ünïcödé"] {
+            let safe = terminal_safe(input);
+            assert_eq!(safe, input);
+            assert!(matches!(safe, Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn terminal_safe_handles_every_c0_and_c1_control() {
+        let mut failures = Vec::new();
+        for codepoint in (0x00..=0x1f).chain([0x7f]).chain(0x80..=0x9f) {
+            let character = char::from_u32(codepoint).expect("control codepoint is a scalar");
+            let text = character.to_string();
+            let safe = terminal_safe(&text);
+            let expected = if character == '\n' || character == '\t' {
+                character
+            } else {
+                '\u{fffd}'
+            };
+            if safe != expected.to_string() {
+                failures.push(codepoint);
+            }
+        }
+
+        assert!(failures.is_empty(), "controls not handled: {failures:?}");
+    }
 }
