@@ -257,8 +257,9 @@ fn read_git_pointer(path: &Path) -> Result<String, String> {
 
 fn repository_common_dir(root: &Path) -> Result<PathBuf, String> {
     let dot_git = root.join(".git");
-    if std::fs::symlink_metadata(&dot_git).is_ok_and(|metadata| metadata.is_dir()) {
-        return Ok(dot_git);
+    if std::fs::metadata(&dot_git).is_ok_and(|metadata| metadata.is_dir()) {
+        return std::fs::canonicalize(&dot_git)
+            .map_err(|error| format!("{}: {error}", dot_git.display()));
     }
 
     let pointer = read_git_pointer(&dot_git)?;
@@ -273,6 +274,8 @@ fn repository_common_dir(root: &Path) -> Result<PathBuf, String> {
     } else {
         root.join(gitdir_path)
     };
+    let gitdir =
+        std::fs::canonicalize(&gitdir).map_err(|error| format!("{}: {error}", gitdir.display()))?;
     if !std::fs::metadata(&gitdir).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(format!("gitdir {} is not a directory", gitdir.display()));
     }
@@ -287,6 +290,8 @@ fn repository_common_dir(root: &Path) -> Result<PathBuf, String> {
             } else {
                 gitdir.join(common_path)
             };
+            let common = std::fs::canonicalize(&common)
+                .map_err(|error| format!("{}: {error}", common.display()))?;
             if !std::fs::metadata(&common).is_ok_and(|metadata| metadata.is_dir()) {
                 return Err(format!("commondir {} is not a directory", common.display()));
             }
@@ -359,6 +364,7 @@ fn untrusted_roots_for(previewed: &Path) -> Result<Vec<PathBuf>, RendererLookup>
         } else {
             admin_entry.join(gitdir_path)
         };
+        let gitdir = gitdir.canonicalize().unwrap_or(gitdir);
         let worktree = gitdir.parent().ok_or_else(|| {
             RendererLookup::Unverifiable(format!(
                 "{} does not name a worktree git directory",
@@ -788,6 +794,24 @@ mod tests {
             resolve_renderer("pdftoppm", Some(&path), &roots),
             Err(RendererLookup::Shadowed(shadow))
         );
+    }
+
+    #[test]
+    fn renderer_resolution_accepts_a_symlinked_git_directory() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let git_dir = temp.path().join("git-dir");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(repo.join("doc.pdf"), b"pdf").unwrap();
+        crate::platform::test_symlink(&git_dir, &repo.join(".git")).unwrap();
+
+        let roots = untrusted_roots_for(&repo.join("doc.pdf")).unwrap();
+
+        assert!(roots.iter().any(|root| root == &git_dir));
     }
 
     #[test]
