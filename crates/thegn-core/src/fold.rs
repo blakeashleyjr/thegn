@@ -326,15 +326,19 @@ fn fold_one(git: &impl FoldGit, tip: &str, b: &Branch, opts: &LandOpts) -> Resul
 }
 
 /// Replay a linear branch's commits one at a time onto `tip` (a plumbing
-/// cherry-pick per commit). Merge-containing history is held before replay;
-/// any conflicting step also defers the WHOLE branch — no commit lands until
-/// every one replays clean, exactly like a conflicting merge fold.
+/// cherry-pick per commit). Unrelated history and histories containing root
+/// or merge commits are held before replay; any conflicting step also defers
+/// the WHOLE branch — no commit lands until every one replays clean, exactly
+/// like a conflicting merge fold.
 fn rebase_replay(git: &impl FoldGit, tip: &str, b: &Branch) -> Result<One> {
-    let base = git
-        .merge_base(tip, &b.tip)?
-        .unwrap_or_else(|| tip.to_string());
+    let Some(base) = git.merge_base(tip, &b.tip)? else {
+        return Ok(One::UnsupportedMergeHistory);
+    };
     let commits = git.commits(&base, &b.tip)?;
-    if commits.iter().any(|commit| commit.parents.len() > 1) {
+    if commits
+        .iter()
+        .any(|commit| commit.parents.is_empty() || commit.parents.len() > 1)
+    {
         return Ok(One::UnsupportedMergeHistory);
     }
     let mut running = tip.to_string();
@@ -452,6 +456,7 @@ mod tests {
         // per-commit-oid conflict on replay.
         commits: HashMap<String, Vec<CommitMeta>>,
         replay_conflict: HashMap<String, Vec<String>>,
+        no_merge_base: bool,
         landed: RefCell<BTreeSet<String>>,
         n: Cell<u32>,
         merge_calls: RefCell<Vec<(String, String)>>,
@@ -466,6 +471,7 @@ mod tests {
                 names: HashMap::new(),
                 commits: HashMap::new(),
                 replay_conflict: HashMap::new(),
+                no_merge_base: false,
                 landed: RefCell::new(BTreeSet::new()),
                 n: Cell::new(0),
                 merge_calls: RefCell::new(Vec::new()),
@@ -513,6 +519,10 @@ mod tests {
                 .and_then(|commits| commits.iter_mut().find(|commit| commit.oid == oid))
                 .expect("fixture merge commit exists");
             commit.parents.push(second_parent.to_string());
+            self
+        }
+        fn unrelated(mut self) -> Self {
+            self.no_merge_base = true;
             self
         }
         /// Mark commit `oid` as conflicting when replayed (rebase).
@@ -587,7 +597,7 @@ mod tests {
             Ok(format!("R{}", self.n.get()))
         }
         fn merge_base(&self, _a: &str, _b: &str) -> Result<Option<String>> {
-            Ok(Some("base".to_string()))
+            Ok((!self.no_merge_base).then(|| "base".to_string()))
         }
         fn commits(&self, _base_excl: &str, tip: &str) -> Result<Vec<CommitMeta>> {
             Ok(self.commits.get(tip).cloned().unwrap_or_default())
@@ -1018,6 +1028,56 @@ mod tests {
             git.merge_calls.borrow().is_empty(),
             "no replay merge attempted"
         );
+    }
+
+    #[test]
+    fn rebase_unrelated_history_is_held_before_any_replay_object() {
+        let git = Fake::new()
+            .branch("feat", None)
+            .with_commits("feat", &[("c1", "one"), ("c2", "two")])
+            .unrelated();
+        let plan = fold(
+            &git,
+            "base",
+            vec![br("feat")],
+            &[],
+            &opts(LandStrategy::Rebase, ""),
+        )
+        .unwrap();
+
+        assert!(plan.landed.is_empty());
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].kind, ConflictKind::UnsupportedMergeHistory);
+        assert_eq!(plan.final_tip, "base");
+        assert!(git.commit_parents.borrow().is_empty());
+        assert!(git.merge_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn rebase_root_commit_in_range_is_held() {
+        let mut git = Fake::new()
+            .branch("feat", None)
+            .with_commits("feat", &[("root", "root"), ("child", "child")]);
+        let commits = git.commits.get_mut("tfeat").expect("fixture commits exist");
+        commits[0].parent.clear();
+        commits[0].parents.clear();
+        commits[1].parent = "root".to_string();
+        commits[1].parents = vec!["root".to_string()];
+        let plan = fold(
+            &git,
+            "base",
+            vec![br("feat")],
+            &[],
+            &opts(LandStrategy::Rebase, ""),
+        )
+        .unwrap();
+
+        assert!(plan.landed.is_empty());
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].kind, ConflictKind::UnsupportedMergeHistory);
+        assert_eq!(plan.final_tip, "base");
+        assert!(git.commit_parents.borrow().is_empty());
+        assert!(git.merge_calls.borrow().is_empty());
     }
 
     #[test]
