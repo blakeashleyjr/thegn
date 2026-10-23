@@ -673,6 +673,11 @@ thegn-managed machine is present, it refuses to choose one.
 Machine0 creates and restores are serialized across thegn processes by an
 owner-only lock in the VPS registry. A create that cannot get the lock within
 the six-minute readiness budget is refused with a busy message.
+Machine0 image, SSH-key and VM lists are parsed strictly: an unrecognised
+response shape, an unidentifiable row or a duplicate entry fails the operation
+instead of being treated as an empty or shorter list. Machine0 readiness,
+status and SSH-auth waits, and Fly's sshd probe, count each in-flight request
+against their total time budget.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or

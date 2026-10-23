@@ -385,6 +385,15 @@ keep its quarantined lease held. The matching environment overrides are
 `THEGN_MERGE_QUEUE_GATE_SETUP_TIMEOUT_SECS` and
 `THEGN_MERGE_QUEUE_GATE_TIMEOUT_SECS`.
 
+With `gate_reuse_worktree = true` (the default), the gate reuses a stable
+per-repository target under thegn's state directory. An explicit
+`gate_target_dir` is split into a per-repository directory, so repositories do
+not share a target. A gate that does not reuse its worktree always builds in a
+private target and ignores `gate_target_dir`. `thegn doctor` warns that
+`[disk] shared_target_dir` can let Cargo reuse a crate built from another
+worktree's source. When `gate_target_dir` is set, doctor reports its
+`<dir>/repo-<id>` layout.
+
 Pressing Ctrl-C or sending SIGTERM during `thegn integrate`, `thegn land`, or
 `thegn merge drain` cancels the fold without blaming a branch. If cancellation
 stops a gate already running for a row, that row is recorded as `gate_error`;
