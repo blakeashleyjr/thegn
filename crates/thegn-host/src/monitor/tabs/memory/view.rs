@@ -2,7 +2,14 @@ use crate::{
     compositor::Rect,
     monitor::{
         board::TabView,
-        kit::{self, emit::Emitter, grid::CellGrid, meter::Meter, panel::panel},
+        kit::{
+            self,
+            emit::Emitter,
+            grid::CellGrid,
+            meter::Meter,
+            panel::panel,
+            raster::{RasterStyle, draw_raster},
+        },
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
     },
     seg::{StyleTok, Tok},
@@ -727,6 +734,8 @@ fn draw_runs(
                 },
                 &raster,
                 RasterStyle::Ramp(ramp),
+                table,
+                false,
             );
         }
     }
@@ -1160,6 +1169,8 @@ impl MemoryView<'_> {
                     chart,
                     &raster,
                     RasterStyle::Series(&[SeriesRole::MemAnon, SeriesRole::MemFree]),
+                    crate::monitor::graphs::table(),
+                    false,
                 );
             }
         }
@@ -1435,6 +1446,8 @@ impl MemoryView<'_> {
                     },
                     &raster,
                     RasterStyle::Series(&[SeriesRole::MemAnon, SeriesRole::MemFree]),
+                    table,
+                    false,
                 );
             }
         }
@@ -1891,55 +1904,6 @@ fn min_numeric_limit(
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(limit), None) | (None, Some(limit)) => Some(limit),
         (None, None) => None,
-    }
-}
-
-#[derive(Clone, Copy)]
-enum RasterStyle<'a> {
-    Series(&'a [SeriesRole]),
-    Ramp(RampId),
-}
-
-fn draw_raster(grid: &mut CellGrid, rect: Rect, raster: &CellBuf, style: RasterStyle<'_>) {
-    for y in 0..rect.rows.min(raster.height()) {
-        for x in 0..rect.cols.min(raster.width()) {
-            let cell = raster.row(y)[x];
-            let (fg, bg) = match style {
-                RasterStyle::Series(roles) => (
-                    roles
-                        .get(usize::from(cell.fg))
-                        .copied()
-                        .map(Tok::Series)
-                        .and_then(StyleTok::from_tok)
-                        .unwrap_or(StyleTok::INHERIT),
-                    cell.bg
-                        .and_then(|index| roles.get(usize::from(index)).copied())
-                        .map(Tok::Series)
-                        .and_then(StyleTok::from_tok)
-                        .unwrap_or(StyleTok::INHERIT),
-                ),
-                RasterStyle::Ramp(ramp) => (
-                    StyleTok::from_tok(Tok::Ramp(ramp, cell.fg)).unwrap_or(StyleTok::INHERIT),
-                    StyleTok::INHERIT,
-                ),
-            };
-            grid.view(Rect {
-                x: rect.x + x,
-                y: rect.y + y,
-                cols: 1,
-                rows: 1,
-            })
-            .put(
-                0,
-                0,
-                crate::monitor::kit::grid::CellStyle {
-                    ch: cell.ch,
-                    fg,
-                    bg,
-                    ..Default::default()
-                },
-            );
-        }
     }
 }
 

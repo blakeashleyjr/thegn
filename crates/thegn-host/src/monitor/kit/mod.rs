@@ -10,6 +10,7 @@ pub(crate) mod history_rect;
 pub(crate) mod legend;
 pub(crate) mod meter;
 pub(crate) mod panel;
+pub(crate) mod raster;
 pub(crate) mod table;
 
 pub(crate) fn edge_fmt(fmt: thegn_core::numfmt::NumFmt) -> thegn_core::numfmt::NumFmt {
