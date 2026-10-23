@@ -105,21 +105,22 @@ pub fn generate_managed_keypair_at(key: &Path, comment: &str) -> anyhow::Result<
 
 /// Idempotent in-sandbox setup for the SSH-over-WSS transport (run during
 /// provisioning when `connect = "ssh"`): install openssh, generate a user-owned
-/// host key, authorize `pubkey`, and write a minimal sshd_config listening on
+/// host key, authorize `pubkey` through the decoded-key script shared with
+/// managed SSH rotation, and write a minimal sshd_config listening on
 /// `127.0.0.1:SPRITE_SSHD_PORT`. Pure (shell string).
-pub fn sprite_sshd_setup_script(pubkey: &str) -> String {
-    let pk = thegn_core::util::sh_quote(pubkey);
-    format!(
+pub fn sprite_sshd_setup_script(pubkey: &str) -> anyhow::Result<String> {
+    let key_id = crate::managed_ssh_rotation::key_id(pubkey)?;
+    let authorize = crate::managed_ssh_rotation::authorize_script(pubkey, &key_id)?;
+    let authorize_q = thegn_core::util::sh_quote(&authorize);
+    Ok(format!(
         "command -v sshd >/dev/null 2>&1 || nix profile install nixpkgs#openssh 2>/dev/null || \
            (export DEBIAN_FRONTEND=noninteractive; sudo apt-get update -y && sudo apt-get install -y openssh-server) 2>/dev/null || true; \
          command -v sshd >/dev/null 2>&1 || exit 73; \
-         mkdir -p \"$HOME/.ssh\" || exit 73; chmod 700 \"$HOME/.ssh\" || exit 73; \
-         touch \"$HOME/.ssh/authorized_keys\" || exit 73; chmod 600 \"$HOME/.ssh/authorized_keys\" || exit 73; \
-         grep -qF {pk} \"$HOME/.ssh/authorized_keys\" 2>/dev/null || printf '%s\\n' {pk} >> \"$HOME/.ssh/authorized_keys\" || exit 73; \
+         sh -c {authorize_q} || exit 73; \
          [ -f \"$HOME/.ssh/sprite_host_ed25519\" ] || ssh-keygen -t ed25519 -N '' -q -f \"$HOME/.ssh/sprite_host_ed25519\" || exit 73; \
          printf 'Port {port}\\nListenAddress 127.0.0.1\\nHostKey %s/.ssh/sprite_host_ed25519\\nAuthorizedKeysFile %s/.ssh/authorized_keys\\nPasswordAuthentication no\\nPidFile %s/.ssh/sprite_sshd.pid\\nPrintMotd no\\n' \"$HOME\" \"$HOME\" \"$HOME\" > \"$HOME/.ssh/sprite_sshd_config\" || exit 73",
         port = SPRITE_SSHD_PORT,
-    )
+    ))
 }
 
 /// Idempotent in-sandbox setup for the mosh transport (`[env.<name>.provider]

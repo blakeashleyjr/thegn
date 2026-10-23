@@ -945,18 +945,24 @@ fn sprite_ssh_argv_wraps_proxycommand_and_remote_shell() {
 
 #[test]
 fn sprite_sshd_setup_script_authorizes_key_and_writes_config() {
-    let s = sprite_sshd_setup_script("ssh-ed25519 AAAA... thegn-sprite");
+    let s = sprite_sshd_setup_script("ssh-ed25519 AAAATESTKEY thegn-sprite").unwrap();
     assert!(s.contains("authorized_keys"));
-    assert!(s.contains("ssh-ed25519 AAAA")); // the pubkey is embedded (quoted)
+    assert!(s.contains("ssh-ed25519 AAAATESTKEY")); // the pubkey is embedded (quoted)
     assert!(s.contains(&format!("Port {SPRITE_SSHD_PORT}")));
     assert!(s.contains("sprite_host_ed25519") && s.contains("sprite_sshd_config"));
-    assert!(s.contains("mkdir -p \"$HOME/.ssh\" || exit 73"));
-    assert!(s.contains("chmod 700 \"$HOME/.ssh\" || exit 73"));
-    assert!(s.contains("chmod 600 \"$HOME/.ssh/authorized_keys\" || exit 73"));
+    assert!(s.contains("mkdir -p \"$HOME/.ssh\""));
+    assert!(s.contains("chmod 700 \"$HOME/.ssh\""));
+    assert!(s.contains("TG-AUTHKEYS-ERROR"));
+    assert!(!s.contains("grep -qF"));
     assert!(
         !s.ends_with("true"),
         "a final true must not mask setup failure"
     );
+}
+
+#[test]
+fn sprite_sshd_setup_script_refuses_an_unparsable_key() {
+    assert!(sprite_sshd_setup_script("not-a-key").is_err());
 }
 
 #[test]
