@@ -1993,10 +1993,12 @@ pub(crate) fn migrate_v95(conn: &Connection, compact_legacy: bool) -> Result<()>
              WHERE kind='usage_limit'
                AND issue_id NOT LIKE 'model-proxy-budget:%'
                AND id NOT IN (
-                   SELECT MAX(id) FROM notifications
-                   WHERE kind='usage_limit'
-                     AND issue_id NOT LIKE 'model-proxy-budget:%'
-                   GROUP BY issue_id
+                   SELECT newest.id FROM notifications AS newest
+                   WHERE newest.kind='usage_limit'
+                     AND newest.issue_id=notifications.issue_id
+                     AND newest.issue_id NOT LIKE 'model-proxy-budget:%'
+                   ORDER BY newest.created_at_ms DESC, newest.id DESC
+                   LIMIT 1
                )",
             [],
         )?;
@@ -2005,7 +2007,7 @@ pub(crate) fn migrate_v95(conn: &Connection, compact_legacy: bool) -> Result<()>
              WHERE kind='usage_limit'
                AND issue_id NOT LIKE 'model-proxy-budget:%'
                AND created_at_ms < ?1",
-            [crate::util::now() - 7 * 24 * 3600],
+            [crate::util::now_ms() - 7 * 24 * 3600 * 1000],
         )?;
     }
     Ok(())
@@ -3242,7 +3244,7 @@ mod tests {
     fn v95_compacts_duplicate_usage_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v94.db");
-        let old = crate::util::now() - 8 * 24 * 3600;
+        let old = crate::util::now_ms() - 8 * 24 * 3600 * 1000;
         {
             let db = Db::open_at(&path).unwrap();
             db.conn()
@@ -3256,7 +3258,9 @@ mod tests {
             for n in 0..20 {
                 db.conn().execute(
                     "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read) VALUES('usage_limit','claude#a',?1,?2,0)",
-                    params![format!("legacy {n}"), old + n],
+                    // Insert order differs from event time: v95 must retain the
+                    // newest timestamp, not simply the last inserted row.
+                    params![format!("legacy {n}"), old + (19 - n)],
                 ).unwrap();
             }
             db.conn()
@@ -3280,27 +3284,44 @@ mod tests {
         super::verify_v95_schema(db.conn()).unwrap();
         let mut statement = db
             .conn()
-            .prepare("SELECT issue_id, read, COUNT(*) FROM notifications WHERE kind='usage_limit' GROUP BY issue_id ORDER BY issue_id")
+            .prepare("SELECT issue_id, read, COUNT(*), (SELECT message FROM notifications AS newest WHERE newest.kind=notifications.kind AND newest.issue_id=notifications.issue_id ORDER BY newest.created_at_ms DESC, newest.id DESC LIMIT 1) FROM notifications WHERE kind='usage_limit' GROUP BY issue_id ORDER BY issue_id")
             .unwrap();
-        let rows: Vec<(String, i64, i64)> = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        let rows: Vec<(String, i64, i64, String)> = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], ("claude#a".to_string(), 1, 1));
-        assert_eq!(rows[1], ("claude#b".to_string(), 1, 1));
-        assert_eq!(rows[2], ("model-proxy-budget:scope".to_string(), 0, 1));
         assert_eq!(
-            db.get_all_notifications(100)
-                .unwrap()
-                .iter()
-                .filter(|row| {
-                    row.kind.as_str() == "process_failed" && row.message == "preserved" && !row.read
-                })
-                .count(),
-            1
+            rows[0],
+            ("claude#a".to_string(), 1, 1, "legacy 0".to_string())
         );
+        assert_eq!(
+            rows[1],
+            ("claude#b".to_string(), 1, 1, "old survivor".to_string())
+        );
+        assert_eq!(
+            rows[2],
+            (
+                "model-proxy-budget:scope".to_string(),
+                0,
+                1,
+                "proxy".to_string()
+            )
+        );
+        let preserved: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notifications \
+                 WHERE kind='process_failed' AND issue_id='shell' \
+                   AND message='preserved' AND read=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
         let version: i64 = db
             .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
