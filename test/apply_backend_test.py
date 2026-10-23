@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import tomllib
@@ -126,8 +127,10 @@ def main() -> None:
         invalid_cfg.write_bytes(b"[broken\n")
         result = run_backend(invalid_repo, invalid_home, "sprites", sprites_env)
         assert result.returncode != 0, result.stdout + result.stderr
+        assert "Traceback" not in result.stderr
         assert invalid_cfg.read_bytes() == b"[broken\n"
         assert not (invalid_repo / ".thegn.toml").exists()
+        assert not list(invalid_cfg.parent.glob(".config.toml.*"))
         print("apply-backend sprites invalid-config refusal passed")
 
         duplicate_root = root / "sprites-duplicate-table"
@@ -141,6 +144,7 @@ def main() -> None:
         assert result.returncode != 0, result.stdout + result.stderr
         assert duplicate_cfg.read_bytes() == duplicate_bytes
         assert not (duplicate_repo / ".thegn.toml").exists()
+        assert not list(duplicate_cfg.parent.glob(".config.toml.*"))
         print("apply-backend sprites duplicate-table refusal passed")
 
         if os.geteuid() == 0:
@@ -155,6 +159,7 @@ def main() -> None:
                 assert result.returncode != 0, result.stdout + result.stderr
                 readonly_cfg = readonly_home / ".config" / "thegn" / "config.toml"
                 assert not readonly_cfg.exists()
+                assert not list(readonly_cfg.parent.glob(".config.toml.*"))
                 print("apply-backend sprites overlay-stage failure leaves config absent")
             finally:
                 os.chmod(readonly_repo, 0o755)
@@ -183,6 +188,7 @@ def main() -> None:
         assert valid_overlay.read_bytes() == overlay_bytes
         assert valid_cfg.stat().st_mtime_ns == cfg_mtime
         assert valid_overlay.stat().st_mtime_ns == overlay_mtime
+        assert not list(valid_cfg.parent.glob(".config.toml.*"))
         print("apply-backend sprites valid-config and identical-rerun passed")
 
         absent_root = root / "sprites-absent-config"
@@ -192,6 +198,8 @@ def main() -> None:
         assert result.returncode == 0, result.stdout + result.stderr
         absent_cfg = absent_home / ".config" / "thegn" / "config.toml"
         assert tomllib.loads(absent_cfg.read_text())["env"]["sprites"]["provider"]["provider"] == "sprites"
+        assert stat.S_IMODE(absent_cfg.stat().st_mode) == 0o600
+        assert not list(absent_cfg.parent.glob(".config.toml.*"))
         print("apply-backend sprites absent-config scaffold passed")
 
         symlink_root = root / "sprites-symlink-config"
@@ -208,6 +216,7 @@ def main() -> None:
         assert symlink_cfg.is_symlink()
         assert config_target.read_bytes() == config_bytes
         assert not (symlink_repo / ".thegn.toml").exists()
+        assert not list(symlink_cfg.parent.glob(".config.toml.*"))
         print("apply-backend sprites symlink-config refusal passed")
 
         assert os.path.lexists(REAL_REPO_OVERLAY) == real_overlay_was_present
