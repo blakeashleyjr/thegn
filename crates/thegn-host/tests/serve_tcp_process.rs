@@ -12,6 +12,10 @@ struct ServerChild {
 }
 
 impl ServerChild {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test teardown reaps the owned serve child it spawned"
+    )]
     fn terminate(&mut self) -> Option<ExitStatus> {
         if self.finished {
             return None;
@@ -45,6 +49,10 @@ impl Drop for ServerChild {
     #[allow(
         clippy::disallowed_macros,
         reason = "best-effort test teardown reporting"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test teardown reaps the owned serve child it spawned"
     )]
     fn drop(&mut self) {
         if !self.finished {
