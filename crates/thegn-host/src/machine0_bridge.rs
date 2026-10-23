@@ -219,7 +219,9 @@ fn local_mosh_ok() -> bool {
 // Bridge subprocess (off the event loop); `.output()` captures the probe's stdio.
 #[expect(clippy::disallowed_methods)]
 fn mosh_server_present(shim: &ssh_shim::SshShim) -> bool {
-    let mut argv = shim.base_argv();
+    let Ok(mut argv) = shim.base_argv() else {
+        return false;
+    };
     argv.push("--".into());
     argv.push("command -v mosh-server >/dev/null 2>&1".into());
     std::process::Command::new(&argv[0])
@@ -234,8 +236,8 @@ fn mosh_server_present(shim: &ssh_shim::SshShim) -> bool {
 /// user@ip [-- cmd]` — the inner ssh carries the managed key + pinned host key +
 /// multiplex options (all but the trailing `user@ip`, which becomes mosh's host).
 /// mosh allocates its own PTY (no `-tt`). Pure over the shim's argv.
-fn mosh_argv(shim: &ssh_shim::SshShim, cmd: &[String]) -> Vec<String> {
-    let base = shim.base_argv();
+fn mosh_argv(shim: &ssh_shim::SshShim, cmd: &[String]) -> Result<Vec<String>> {
+    let base = shim.base_argv()?;
     // base = ["ssh", <opts…>, "user@ip"]; split the host off the end.
     let (host, opts) = base.split_last().expect("ssh base argv is non-empty");
     let ssh_opts = opts
@@ -252,14 +254,14 @@ fn mosh_argv(shim: &ssh_shim::SshShim, cmd: &[String]) -> Vec<String> {
         argv.push("--".into());
         argv.extend(cmd.iter().cloned());
     }
-    argv
+    Ok(argv)
 }
 
 /// Build the plain-ssh interactive/exec argv (the non-mosh branch): `ssh [-tt]
 /// <opts…> user@ip [-- cmd]`. Interactive panes force PTY allocation (`-tt`);
 /// captured control reads stay non-tty. Pure over the shim's argv.
-fn ssh_argv(shim: &ssh_shim::SshShim, cmd: &[String], interactive: bool) -> Vec<String> {
-    let mut argv = shim.base_argv();
+fn ssh_argv(shim: &ssh_shim::SshShim, cmd: &[String], interactive: bool) -> Result<Vec<String>> {
+    let mut argv = shim.base_argv()?;
     if interactive {
         // We own a PTY ⇒ force allocation; captured control reads stay non-tty.
         argv.insert(1, "-tt".into());
@@ -268,7 +270,7 @@ fn ssh_argv(shim: &ssh_shim::SshShim, cmd: &[String], interactive: bool) -> Vec<
         argv.push("--".into());
         argv.extend(cmd.iter().cloned());
     }
-    argv
+    Ok(argv)
 }
 
 /// Undo terminal state a failed mosh client may have left before we exec ssh into
@@ -315,7 +317,7 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
         && mosh_server_present(&shim);
 
     if try_mosh {
-        let margv = mosh_argv(&shim, cmd);
+        let margv = mosh_argv(&shim, cmd)?;
         // SPAWN (not exec) so we survive a mosh failure and can fall back to ssh
         // in this same live pane. mosh owns our stdio/TTY while it runs; this
         // bridge is an off-loop CLI process, so a blocking child wait is fine.
@@ -347,7 +349,7 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
 
     // Plain ssh: chosen up front (non-mosh transport, mosh-less image, or a
     // non-tty control read), or reached by falling back from a failed mosh attach.
-    let argv = ssh_argv(&shim, cmd, interactive);
+    let argv = ssh_argv(&shim, cmd, interactive)?;
     // CLI bridge process: hand the PTY/stdio to ssh from here.
     exec_ssh(&argv)
 }
@@ -403,12 +405,12 @@ mod tests {
             key_path: "/state/ssh/id".into(),
         };
         // Interactive: -tt injected right after "ssh"; host trails.
-        let argv = ssh_argv(&shim, &[], true);
+        let argv = ssh_argv(&shim, &[], true).unwrap();
         assert_eq!(argv[0], "ssh");
         assert_eq!(argv[1], "-tt");
         assert_eq!(argv.last().map(String::as_str), Some("root@203.0.113.9"));
         // Non-interactive control read: no forced PTY.
-        let argv = ssh_argv(&shim, &[], false);
+        let argv = ssh_argv(&shim, &[], false).unwrap();
         assert!(
             !argv.iter().any(|a| a == "-tt"),
             "no -tt when non-tty: {argv:?}"
@@ -418,7 +420,8 @@ mod tests {
             &shim,
             &["/bin/sh".into(), "-lc".into(), "echo hi".into()],
             true,
-        );
+        )
+        .unwrap();
         let dd = argv.iter().position(|a| a == "--").expect("-- present");
         assert_eq!(&argv[dd + 1..], &["/bin/sh", "-lc", "echo hi"]);
     }
@@ -431,7 +434,7 @@ mod tests {
             user: "root".into(),
             key_path: "/state/ssh/id".into(),
         };
-        let argv = mosh_argv(&shim, &[]);
+        let argv = mosh_argv(&shim, &[]).unwrap();
         assert_eq!(argv[0], "mosh");
         assert!(argv[1].starts_with("--ssh="));
         assert!(argv[1].contains("ssh"), "inner ssh opts present: {argv:?}");
@@ -441,8 +444,21 @@ mod tests {
         );
         assert_eq!(argv[2], "root@203.0.113.9");
         // With a command, it is appended after `--`.
-        let argv = mosh_argv(&shim, &["/bin/sh".into(), "-lc".into(), "echo hi".into()]);
+        let argv = mosh_argv(&shim, &["/bin/sh".into(), "-lc".into(), "echo hi".into()]).unwrap();
         let dd = argv.iter().position(|a| a == "--").expect("-- present");
         assert_eq!(&argv[dd + 1..], &["/bin/sh", "-lc", "echo hi"]);
+    }
+
+    #[test]
+    fn argv_builders_refuse_an_invalid_name() {
+        let shim = ssh_shim::SshShim {
+            name: "../m0".into(),
+            ip: "203.0.113.9".into(),
+            user: "root".into(),
+            key_path: "/state/ssh/id".into(),
+        };
+
+        assert!(ssh_argv(&shim, &[], true).is_err());
+        assert!(mosh_argv(&shim, &[]).is_err());
     }
 }
