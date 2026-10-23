@@ -14026,13 +14026,15 @@ async fn event_loop<T: Terminal>(
                         .parent()
                         .map(std::path::Path::to_path_buf)
                         .unwrap_or_default();
-                    plugins_host = Some(crate::plugins::spawn_plugins_host(
+                    let host = crate::plugins::spawn_plugins_host(
                         resident_supervisor.clone(),
                         current_config.plugins.clone(),
                         plugin_config_dir,
                         plugin_tx.clone(),
                         waker.clone(),
-                    ));
+                    );
+                    plugin_rx.bind_host(host.generation());
+                    plugins_host = Some(host);
                     need_relayout = true;
                 }
                 Err(e) => {
@@ -16633,13 +16635,15 @@ async fn event_loop<T: Terminal>(
                         .parent()
                         .map(std::path::Path::to_path_buf)
                         .unwrap_or_default();
-                    plugins_host = Some(crate::plugins::spawn_plugins_host(
+                    let host = crate::plugins::spawn_plugins_host(
                         resident_supervisor.clone(),
                         current_config.plugins.clone(),
                         config_dir,
                         plugin_tx.clone(),
                         waker.clone(),
-                    ));
+                    );
+                    plugin_rx.bind_host(host.generation());
+                    plugins_host = Some(host);
                 }
                 dirty = true;
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
