@@ -159,6 +159,11 @@ quota gauge, so it never blocks a frame, and it is **absent entirely when the
 proxy is disabled**. The numbers are the same rollup `thegn proxy stats` prints
 and the daemon's `/stats` endpoint serves — one calculation, three surfaces.
 
+While thegn's UI runs, it supervises the proxy. Editing `[model_proxy]` applies
+on config reload: `enabled = false` stops it, enabling starts it, and any other
+change restarts it. Requests in flight during a restart are cut and retried by
+the agent's client.
+
 Only metadata is ever recorded: route, backend, model, token counts (including
 prompt-cache reads/writes), cost, and timings — **never any prompt or response
 text**. Subscription/flat-rate lanes account at `$0`, so the spend figure
