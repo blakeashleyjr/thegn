@@ -114,6 +114,8 @@ fn run_children(fixture: RaceFixture<'_>) -> Vec<(String, String)> {
     let mut children = Children(Vec::with_capacity(fixture.child_count));
     for index in 0..fixture.child_count {
         let name = format!("race-{index}");
+        let stderr = fs::File::create(fixture.report_dir.join(format!("{name}.stderr")))
+            .unwrap_or_else(|error| panic!("failed to create child {name} stderr file: {error}"));
         let child = Command::new(&executable)
             .args([
                 "--exact",
@@ -130,7 +132,7 @@ fn run_children(fixture: RaceFixture<'_>) -> Vec<(String, String)> {
             .env(FIXTURE_REPORT, fixture.report_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .unwrap_or_else(|error| panic!("failed to spawn capacity race child {name}: {error}"));
         children.0.push(ChildProcess { name, child });
@@ -147,6 +149,23 @@ fn run_children(fixture: RaceFixture<'_>) -> Vec<(String, String)> {
             .collect();
         if missing.is_empty() {
             break;
+        }
+        for process in &mut children.0 {
+            if !fixture.report_dir.join(&process.name).is_file() {
+                match process.child.try_wait() {
+                    Ok(Some(status)) => panic!(
+                        "capacity race child {} exited without a report: {status}; stderr: {}",
+                        process.name,
+                        child_stderr(fixture.report_dir, &process.name)
+                    ),
+                    Ok(None) => {}
+                    Err(error) => panic!(
+                        "failed checking child {} before its report: {error}; stderr: {}",
+                        process.name,
+                        child_stderr(fixture.report_dir, &process.name)
+                    ),
+                }
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -173,8 +192,9 @@ fn run_children(fixture: RaceFixture<'_>) -> Vec<(String, String)> {
         };
         assert!(
             status.success(),
-            "capacity race child {} failed: {status}",
-            process.name
+            "capacity race child {} failed: {status}; stderr: {}",
+            process.name,
+            child_stderr(fixture.report_dir, &process.name)
         );
         let result =
             fs::read_to_string(fixture.report_dir.join(&process.name)).unwrap_or_else(|error| {
@@ -183,6 +203,12 @@ fn run_children(fixture: RaceFixture<'_>) -> Vec<(String, String)> {
         results.push((process.name.clone(), result));
     }
     results
+}
+
+fn child_stderr(report_dir: &Path, name: &str) -> String {
+    let path = report_dir.join(format!("{name}.stderr"));
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| format!("<failed to read {}: {error}>", path.display()))
 }
 
 fn temporary_paths() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
