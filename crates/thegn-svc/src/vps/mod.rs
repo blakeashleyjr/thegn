@@ -703,7 +703,11 @@ impl VpsProvider {
                 && let Some(instance) = inventory.iter().find(|instance| instance.name == name)
             {
                 let listed_id = instance.id.clone();
-                if let Some(mut record) = registry::read(name) {
+                if let Some(mut record) = registry::read_checked(name).with_context(|| {
+                    format!(
+                        "vps destroy {name}: cannot read the ledger record; keeping it and SSH custody"
+                    )
+                })? {
                     record.instance_id.clone_from(&listed_id);
                     registry::write(&record)
                         .context("vps: retarget registry record to listed instance")?;
@@ -761,15 +765,20 @@ impl VpsProvider {
     /// Resolve the instance's public IP: cache → registry → API (then persist).
     pub async fn resolve_ip(&self, name: &str) -> Result<String> {
         registry::checked_name(name)?;
+        let existing = registry::read_checked(name).with_context(|| {
+            format!(
+                "vps: the ledger record for {name} is unreadable; refusing to resolve or rewrite it"
+            )
+        })?;
         if let Some(ip) = self.ip.lock().unwrap().clone().filter(|i| !i.is_empty()) {
             return Ok(ip);
         }
-        if let Some(rec) = registry::read(name)
+        if let Some(rec) = existing.as_ref()
             && rec.state == "ready"
             && !rec.ip.is_empty()
         {
             *self.ip.lock().unwrap() = Some(rec.ip.clone());
-            return Ok(rec.ip);
+            return Ok(rec.ip.clone());
         }
         let inst = self
             .find_by_name(name)
@@ -785,7 +794,6 @@ impl VpsProvider {
                 String::new()
             }
         };
-        let existing = registry::read(name);
         let can_write_cache = may_write_resolve_cache(existing.as_ref(), &account);
         if can_write_cache
             && let Err(error) = registry::write(&registry::VpsRecord {
@@ -1289,7 +1297,13 @@ impl RemoteProvider for VpsProvider {
             thegn_core::managed_ssh::read(self.spec.kind.as_str(), &custody_account, id)
                 .context("vps: validate managed SSH custody before destroy")?;
             // Resolve name → vendor instance id (registry first, then the API).
-            let instance_id = match registry::read(id).filter(|r| !r.instance_id.is_empty()) {
+            let record = registry::read_checked(id).with_context(|| {
+                format!(
+                    "vps destroy {id}: the ledger record is unreadable; fix or remove it under {} and retry (keeping SSH custody)",
+                    registry::dir().display()
+                )
+            })?;
+            let instance_id = match record.filter(|r| !r.instance_id.is_empty()) {
                 Some(r) => Some(r.instance_id),
                 None => self
                     .find_by_name(id)
