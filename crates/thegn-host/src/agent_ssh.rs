@@ -162,9 +162,10 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let selected_env = ssh_connect_selection(
+        worktree,
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
+    )?;
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -244,6 +245,26 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
         .map(|id| crate::provider_workdir::resolve(pc, &id))
         .unwrap_or_else(|| pc.sync_workdir());
     Some((key, "sprite".to_string(), workdir))
+}
+
+/// The env selection for an ssh pane connect. `None` when it cannot be read:
+/// the caller then refuses the connect instead of resolving the default env.
+fn ssh_connect_selection(
+    worktree: &str,
+    read: anyhow::Result<Option<String>>,
+) -> Option<Option<String>> {
+    match read {
+        Ok(selected) => Some(selected),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::sandbox",
+                worktree,
+                error = %format!("{error:#}"),
+                "ssh connect refused: the environment selection could not be read"
+            );
+            None
+        }
+    }
 }
 
 /// Build the local `ssh` argv for the SSH-over-WSS pane: a real ssh client whose
@@ -362,4 +383,23 @@ fn sprite_ssh_argv_inner(
         remote,
     ]);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_connect_selection_refuses_an_unreadable_selection() {
+        assert!(ssh_connect_selection("/wt", Err(anyhow::anyhow!("locked"))).is_none());
+    }
+
+    #[test]
+    fn ssh_connect_selection_passes_a_readable_selection_through() {
+        assert_eq!(
+            ssh_connect_selection("/wt", Ok(Some("box".into()))),
+            Some(Some("box".into()))
+        );
+        assert_eq!(ssh_connect_selection("/wt", Ok(None)), Some(None));
+    }
 }
