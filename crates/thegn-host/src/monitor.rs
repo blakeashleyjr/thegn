@@ -1093,7 +1093,7 @@ pub fn spawn_clean(
 ) -> std::io::Result<()> {
     let shown = path.display().to_string();
     std::thread::Builder::new()
-        .name("thegn-monitor-clean".into())
+        .name("thegn-mon-clean".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             match thegn_core::worktree::clean_target(&path) {

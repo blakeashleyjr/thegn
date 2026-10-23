@@ -370,7 +370,7 @@ fn identity_reaper() -> Result<&'static mpsc::SyncSender<IdentityReapJob>, Strin
         .get_or_init(|| {
             let (sender, receiver) = mpsc::sync_channel::<IdentityReapJob>(IDENTITY_CAPTURE_SLOTS);
             std::thread::Builder::new()
-                .name("thegn-git-identity-reaper".into())
+                .name("thegn-gitid-rp".into())
                 .spawn(move || {
                     while let Ok((mut child, budget)) = receiver.recv() {
                         // This is the one shared reaper for the capture lane.
@@ -432,7 +432,7 @@ type IdentityReaderSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>
 
 fn spawn_identity_reader(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     std::thread::Builder::new()
-        .name("thegn-git-identity-reader".into())
+        .name("thegn-gitid-rd".into())
         .spawn(task)
         .map(drop)
 }
