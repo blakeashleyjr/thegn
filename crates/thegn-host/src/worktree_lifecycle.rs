@@ -1040,9 +1040,14 @@ fn teardown_runtime(
 ) -> Result<(), String> {
     #[cfg(test)]
     teardown_fixture::refuse_observed_path(worktree)?;
-    let selected = teardown_selection(db.map(|db| {
-        db.effective_env_checked(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
-    }))?;
+    let selected = teardown_selection(match db {
+        Some(db) => {
+            db.effective_env_checked(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
+        }
+        None => Db::open().and_then(|db| {
+            db.effective_env_checked(&worktree.to_string_lossy(), &repo_root.to_string_lossy())
+        }),
+    })?;
     let loc = thegn_core::remote::GitLoc::for_worktree(worktree);
     let env = cfg.resolve_env(repo_root, &loc, worktree, selected.as_deref());
     let path = worktree.to_string_lossy().into_owned();
@@ -1095,14 +1100,10 @@ fn teardown_runtime(
 
 /// The env selection explicit teardown acts on. A failed read refuses the
 /// teardown: resolving the default env would destroy the wrong sandbox.
-/// `None` (no DB handle) keeps the historical fall-through.
-fn teardown_selection(
-    read: Option<anyhow::Result<Option<String>>>,
-) -> Result<Option<String>, String> {
+fn teardown_selection(read: anyhow::Result<Option<String>>) -> Result<Option<String>, String> {
     match read {
-        None => Ok(None),
-        Some(Ok(selected)) => Ok(selected),
-        Some(Err(error)) => Err(format!(
+        Ok(selected) => Ok(selected),
+        Err(error) => Err(format!(
             "the environment selection could not be read ({error:#}); runtime teardown refused so another environment's sandbox is never torn down — retry when the state database is readable"
         )),
     }
@@ -2634,8 +2635,7 @@ mod tests {
 
     #[test]
     fn teardown_selection_refuses_an_unreadable_selection() {
-        let Err(message) = teardown_selection(Some(Err(anyhow::anyhow!("database is locked"))))
-        else {
+        let Err(message) = teardown_selection(Err(anyhow::anyhow!("database is locked"))) else {
             panic!("unreadable selection must refuse runtime teardown");
         };
 
@@ -2646,10 +2646,9 @@ mod tests {
 
     #[test]
     fn teardown_selection_passes_a_read_through() {
-        assert_eq!(teardown_selection(None), Ok(None));
-        assert_eq!(teardown_selection(Some(Ok(None))), Ok(None));
+        assert_eq!(teardown_selection(Ok(None)), Ok(None));
         assert_eq!(
-            teardown_selection(Some(Ok(Some("box".into())))),
+            teardown_selection(Ok(Some("box".into()))),
             Ok(Some("box".into()))
         );
     }
