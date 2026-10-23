@@ -5,7 +5,7 @@
 //! counterpart of the (upcoming) Hosts-panel capacity rows; also the smoke
 //! test's assertion surface.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
@@ -170,10 +170,18 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
             continue;
         };
         let id = binding.id.clone();
-        let row = db.host_get(&id).ok().flatten();
-        let cap = db.capacity_get(&id).ok().flatten();
-        let reserved = db.reserved_totals(&id).unwrap_or_default();
-        let tenants = db.tenants_of(&id).unwrap_or_default();
+        let row = db
+            .host_get(&id)
+            .with_context(|| format!("placement: could not read host {id}'s recorded state"))?;
+        let cap = db
+            .capacity_get(&id)
+            .with_context(|| format!("placement: could not read host {id}'s capacity record"))?;
+        let reserved = db
+            .reserved_totals(&id)
+            .with_context(|| format!("placement: could not read host {id}'s reserved totals"))?;
+        let tenants = db
+            .tenants_of(&id)
+            .with_context(|| format!("placement: could not read host {id}'s placement tenants"))?;
         let spec = cap.as_ref().and_then(|c| c.spec).or(binding.declared_spec);
         let ownership = cap
             .as_ref()
