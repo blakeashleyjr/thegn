@@ -3409,10 +3409,11 @@ allow_external_urls = false  # THEGN_PREVIEW_ALLOW_EXTERNAL_URLS; localhost-only
 
 # ── Automatic port forwarding / browser preview (`[forward]`) ───────────────
 # The outbound-localhost sibling of [share]: when a dev server binds a port INSIDE
-# a worktree's sandbox (container / ssh host / k8s pod), thegn auto-detects it
+# a worktree's local container sandbox (podman or docker), thegn auto-detects it
 # and forwards it to the host so it's previewable at http://localhost:<port>.
 # Active forwards appear in the System panel; press `o` to open the focused one in
-# your browser. On by default — forwards bind loopback only, so this is safe.
+# your browser. Forwards use `bind` (loopback by default); non-loopback binds are
+# refused unless `allow_external_bind = true`.
 [forward]
 auto = true            # auto-detect + forward newly-bound sandbox ports
 range = "8000-8999"    # host-port range for remaps when a port's own number is taken
@@ -3425,6 +3426,7 @@ reverse_lifetime_secs = 86400 # close a tunnelled connection after this long in 
 ignore = []            # container ports never to forward, e.g. [5432, 22]
 only = []              # if non-empty, ONLY forward these container ports
 bind = "127.0.0.1"     # host interface to bind forwards on (loopback = host-local)
+allow_external_bind = false # permit a non-loopback bind (exposes forwarded ports on that interface)
 poll_secs = 2          # how often the sandbox is scanned for new listening ports
 browser = ""           # argv template, quoted args, `%s` = URL (appended if absent), no shell, e.g. "firefox --new-window %s".
                        # An explicit value is final (no fallback). "" = $BROWSER (':'-separated fallback list), then the OS opener.
