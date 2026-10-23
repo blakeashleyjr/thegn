@@ -145,7 +145,6 @@ pub fn destroy_provider_sandbox_with(
 mod tests {
     use super::*;
     use crate::lifecycle::DeleteRecycle;
-    use anyhow::Context;
 
     #[test]
     fn pool_delete_destroy_failure_keeps_the_row() {
