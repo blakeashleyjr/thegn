@@ -125,10 +125,6 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the fixture child is owned by a reaping guard"
-    )]
     fn spawn_lease_fixture(
         lock_dir: &Path,
         report_dir: &Path,
@@ -186,11 +182,19 @@ mod tests {
         reason = "fixture children are reaped on every path"
     )]
     fn reap_fixture(child: &mut FixtureChild, kill: bool) {
-        child.stdin.take();
         if kill {
             child.child.kill().expect("kill pool lease fixture");
+            let status = child.child.wait().expect("reap pool lease fixture");
+            assert!(
+                !status.success(),
+                "killed pool lease fixture exited successfully"
+            );
+            drop(child.stdin.take());
+        } else {
+            drop(child.stdin.take());
+            let status = child.child.wait().expect("reap pool lease fixture");
+            assert!(status.success(), "pool lease fixture exited unsuccessfully");
         }
-        child.child.wait().expect("reap pool lease fixture");
     }
 
     #[test]
@@ -235,10 +239,6 @@ mod tests {
     // The child owns the OS file lock independently of this test process. Its report is
     // published only after acquisition, and stdin EOF is the clean-release signal.
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "every fixture child is reaped on every path"
-    )]
     fn pool_lease_held_by_another_process_is_busy_until_it_dies() {
         let root = tempfile::tempdir().unwrap();
         let lock_dir = root.path().join("locks");
@@ -258,10 +258,6 @@ mod tests {
     // A live fixture keeps its lock while blocked on stdin; closing stdin lets normal
     // process teardown drop the file lock before the parent retries it.
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "every fixture child is reaped on every path"
-    )]
     fn pool_lease_clean_exit_releases_the_lease() {
         let root = tempfile::tempdir().unwrap();
         let lock_dir = root.path().join("locks");
@@ -281,10 +277,6 @@ mod tests {
     // Four independent processes start against one shared pool key. File-lock acquisition
     // is exclusive, reports are unordered, and only the holder remains blocked on stdin.
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "every fixture child is reaped on every path"
-    )]
     fn pool_lease_racing_processes_have_exactly_one_holder() {
         let root = tempfile::tempdir().unwrap();
         let lock_dir = root.path().join("locks");
@@ -329,10 +321,6 @@ mod tests {
     // Lease keys include the resource kind and name; a different spare and a pool
     // namespace must remain independently acquirable while the child holds spare "a".
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "every fixture child is reaped on every path"
-    )]
     fn pool_lease_other_process_key_does_not_contend() {
         let root = tempfile::tempdir().unwrap();
         let lock_dir = root.path().join("locks");
