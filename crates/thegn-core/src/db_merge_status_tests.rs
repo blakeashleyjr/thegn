@@ -728,3 +728,59 @@ fn rename_retires_old_path_events_only_without_a_queue_row() {
         .unwrap();
     assert_eq!(queued.merge_queue_events(WORKTREE, 10).unwrap().len(), 1);
 }
+
+#[test]
+fn rename_rolls_back_registry_update_when_event_retirement_fails() {
+    let db = seeded();
+    db.remove_merge_entry(WORKTREE).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO worktrees(worktree,location) VALUES(?1,'local')",
+            [WORKTREE],
+        )
+        .unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_merge_event_retirement
+             BEFORE DELETE ON merge_queue_events
+             BEGIN
+                 SELECT RAISE(ABORT, 'event retirement failed');
+             END;",
+        )
+        .unwrap();
+
+    assert!(
+        db.rename_worktree(
+            WORKTREE,
+            "/private/status-renamed",
+            "app/renamed",
+            "renamed",
+        )
+        .is_err()
+    );
+
+    let old_rows: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM worktrees WHERE worktree=?1",
+            [WORKTREE],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let new_rows: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM worktrees WHERE worktree='/private/status-renamed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_rows, 1,
+        "failed event retirement must roll back the rekey"
+    );
+    assert_eq!(
+        new_rows, 0,
+        "failed event retirement must leave no new registry row"
+    );
+}
