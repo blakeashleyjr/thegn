@@ -716,8 +716,16 @@ pub(crate) fn install(cfg: &Config, worktree: &Path, repo_root: &Path) -> Result
     if !worktree.is_dir() {
         return Err("active worktree is unavailable".into());
     }
-    if GitLoc::for_worktree(worktree).is_remote() {
-        return Err("selected worktree is remote; install its toolchain there".into());
+    match GitLoc::for_worktree_checked(worktree) {
+        Ok(loc) if loc.is_remote() => {
+            return Err("selected worktree is remote; install its toolchain there".into());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot read where this worktree lives ({error}); install refused so a remote worktree's toolchain is never installed on this host"
+            ));
+        }
     }
     if cfg.toolchain.mise.inject == MiseInject::Off {
         return Err("toolchain activation is off ([toolchain.mise] inject = \"off\")".into());
@@ -1564,5 +1572,18 @@ mod tests {
             64,
         );
         assert!(missing.unwrap_err().contains("start"));
+    }
+
+    #[test]
+    fn install_refuses_when_the_location_is_unreadable() {
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let wt = tempfile::tempdir().unwrap();
+
+        let result = install(&Config::default(), wt.path(), wt.path());
+
+        assert!(
+            matches!(result, Err(ref message) if message.contains("cannot read where this worktree lives"))
+        );
     }
 }
