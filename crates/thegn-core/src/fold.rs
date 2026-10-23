@@ -1167,6 +1167,44 @@ mod tests {
     }
 
     #[test]
+    fn rebase_walk_replay_parent_mismatch_fails() {
+        for index in [0, 1] {
+            let mut git = Fake::new()
+                .branch("feat", None)
+                .with_commits("feat", &[("c1", "one"), ("tfeat", "two")]);
+            git.commits.get_mut("tfeat").expect("fixture commits exist")[index].parent =
+                "elsewhere".to_string();
+
+            let result = fold(
+                &git,
+                "base",
+                vec![br("feat")],
+                &[],
+                &opts(LandStrategy::Rebase, ""),
+            );
+            let error = match result {
+                Ok(_) => panic!("replay parent mismatch at index {index} must fail"),
+                Err(error) => error,
+            };
+            assert_incoherent_walk(&error, "feat");
+            let expected_reason = if index == 0 {
+                "commit at index 0 expected replay parent base, found elsewhere"
+            } else {
+                "commit at index 1 expected replay parent c1, found elsewhere"
+            };
+            assert_eq!(
+                error
+                    .downcast_ref::<IncoherentCommitWalk>()
+                    .expect("incoherent walk error is typed")
+                    .reason,
+                expected_reason
+            );
+            assert!(git.merge_calls.borrow().is_empty());
+            assert!(git.commit_parents.borrow().is_empty());
+        }
+    }
+
+    #[test]
     fn rebase_walk_empty_but_tip_differs_fails() {
         let git = Fake::new().branch("feat", None);
         let result = fold(
