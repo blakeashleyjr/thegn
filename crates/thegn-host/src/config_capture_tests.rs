@@ -128,7 +128,7 @@ fn only_absent_implicit_base_selects_first_run_defaults() {
             profile_paths: None,
             overrides: &[],
         },
-        cwd.path(),
+        cwd.path().to_path_buf(),
         |_| None,
         Config::default,
     )
