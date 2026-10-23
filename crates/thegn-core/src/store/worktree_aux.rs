@@ -574,6 +574,15 @@ pub trait WorktreeAuxStore {
         lease: &crate::pr_queue::PrAgentLease,
         finished: Option<(&str, &str)>,
     ) -> Result<bool>;
+    /// Give back the attempt this lease's admission spent and hold the row, in one write fenced on
+    /// the live lease (owner, generation, unexpired) and on the attempt count the admission
+    /// produced. Returns false (and changes nothing) for a stale, expired or already-refunded lease.
+    fn refund_pr_agent_attempt(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        status: &str,
+        detail: &str,
+    ) -> Result<bool>;
     /// Record the head an admitted agent produced, fenced on the live lease
     /// generation and on the admitted head still being the row's last head.
     /// Returns false when the lease is no longer this one or the row moved.
