@@ -15,7 +15,7 @@ use thegn_core::config::Config;
 use thegn_core::outln;
 
 pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
-    let env = super::env::resolve_for(cfg, worktree);
+    let env = super::env::resolve_for(cfg, worktree)?;
     let envc = cfg
         .env
         .get(&env.name)
