@@ -2348,6 +2348,58 @@ if [[ ! -d "/run/user/$(id -u)" ]]; then
     "[[ \"$FALLBACK_ENDPOINT\" == *\"thegn-$(id -u)-\"* ]]"
 fi
 
+# Daemon endpoint safety: reject a symlinked parent, harden an owned writable
+# parent, and bind the same default endpoint that doctor resolves.
+mkdir "$TMP/sock-real"
+ln -s "$TMP/sock-real" "$TMP/sock-link"
+EP_SYMLINK_RC=0
+timeout -k 5 20 "$SZ" daemon --socket "$TMP/sock-link/d.sock" \
+  >"$TMP/sock-link.out" 2>&1 || EP_SYMLINK_RC=$?
+EP_SYMLINK_REFUSED=0
+[[ $EP_SYMLINK_RC -ne 0 && $EP_SYMLINK_RC -ne 124 ]] &&
+  grep -Fq 'move [daemon] socket into a private directory' "$TMP/sock-link.out" &&
+  EP_SYMLINK_REFUSED=1
+check "daemon refuses a symlinked socket parent" "[[ $EP_SYMLINK_REFUSED -eq 1 ]]"
+check "a refused daemon binds nothing" "[[ ! -S '$TMP/sock-real/d.sock' ]]"
+
+mkdir "$TMP/sock-gw"
+chmod 0770 "$TMP/sock-gw"
+EP_GW_SOCKET="$TMP/sock-gw/d.sock"
+"$SZ" daemon --socket "$EP_GW_SOCKET" &
+EP_GW_PID=$!
+track_daemon "$EP_GW_PID" "$EP_GW_SOCKET"
+EP_WAIT=0
+while [[ $EP_WAIT -lt 40 && ! -S $EP_GW_SOCKET ]]; do
+  sleep 0.1
+  EP_WAIT=$((EP_WAIT + 1))
+done
+check "daemon binds under a hardened private parent" "[[ -S '$EP_GW_SOCKET' ]]"
+EP_GW_MODE="$(stat -c %a "$TMP/sock-gw" 2>/dev/null || stat -f %Lp "$TMP/sock-gw")"
+check "daemon tightens its socket parent to 0700" "[[ '$EP_GW_MODE' == 700 ]]"
+stop_fixture_daemon "$EP_GW_PID" "$EP_GW_SOCKET" \
+  "hardened-parent daemon exits and unlinks its socket"
+
+"$SZ" daemon &
+EP_DEFAULT_PID=$!
+track_daemon "$EP_DEFAULT_PID" "$DEFAULT_ENDPOINT"
+EP_WAIT=0
+while [[ $EP_WAIT -lt 40 && (-z $DEFAULT_ENDPOINT || ! -S $DEFAULT_ENDPOINT) ]]; do
+  sleep 0.1
+  EP_WAIT=$((EP_WAIT + 1))
+done
+check "daemon binds the default-resolved endpoint" \
+  "[[ -n \"$DEFAULT_ENDPOINT\" && -S \"$DEFAULT_ENDPOINT\" ]]"
+EP_RUNNING_ENDPOINT="$("$SZ" doctor --json | sed -n 's/.*"endpoint"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p' | head -n 1)"
+check "doctor reports the same endpoint while the daemon runs" \
+  "[[ -n \"$DEFAULT_ENDPOINT\" && \"$EP_RUNNING_ENDPOINT\" == \"$DEFAULT_ENDPOINT\" ]]"
+stop_fixture_daemon "$EP_DEFAULT_PID" "$DEFAULT_ENDPOINT" \
+  "default-endpoint daemon exits and unlinks its socket"
+if command -v sqlite3 >/dev/null 2>&1; then
+  EP_DEFAULT_ROWS="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" \
+    'SELECT count(*) FROM daemons' 2>/dev/null || echo 1)"
+  check "default-endpoint daemon registry row is removed" "[[ '$EP_DEFAULT_ROWS' -eq 0 ]]"
+fi
+
 # Explicit close kills: DELETE on a session ends its child (the close-a-pane
 # contract at the API level). The row itself lingers briefly — `daemon/
 # tombstone.rs` keeps a corpse on purpose so a supervisor can read a session's
