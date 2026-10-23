@@ -427,10 +427,10 @@ damaged host row) the configuration is still admitted — without the stored
 hosts — and a statusbar banner says so; agent and tool launches are refused
 until it is fixed.
 If the database cannot be opened at all when a pane launches, configured
-agents and tools are refused because their saved sandbox override and
+agents and tools are refused because the worktree's saved sandbox override and
 credential-overlay gate cannot be checked. A plain shell, including the
-`clean-shell` fallback, still starts with a warning that it launches without
-the saved override.
+`clean-shell` fallback, still starts without the worktree's saved sandbox
+override, and the reason is logged as a warning.
 
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,

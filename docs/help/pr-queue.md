@@ -206,4 +206,4 @@ now · `o` open in a browser. CLI equivalents for queue rows are
 Removing or clearing the queue keeps any row whose PR agent is running.
 `thegn pr queue rm <n>` refuses with an error; `clear` removes the other rows,
 reports how many it removed, names the kept PRs and exits with an error. The
-section’s `x` and `c` actions report the same result in the status line.
+section's `x` and `c` actions report the same result in the status line.
