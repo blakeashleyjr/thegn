@@ -1947,6 +1947,17 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
     crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
 }
 
+fn shutdown_shares(share_supervisor: &mut crate::share::ShareSupervisor) {
+    for (worktree, port, generation) in share_supervisor.shutdown_all() {
+        let op = crate::share::SharePersist::DeleteIfOwned {
+            worktree,
+            port,
+            generation,
+        };
+        crate::db_task::persist_critical(move |db| crate::share::apply_share_persist(db, op));
+    }
+}
+
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
 /// kept) and close them. Home groups are never deletable. Returns the status
 /// line summarizing what happened.
@@ -9199,10 +9210,11 @@ async fn event_loop<T: Terminal>(
             }
         }
         if session.worktrees.is_empty() {
+            shutdown_shares(&mut share_supervisor);
             return Ok(()); // last worktree closed
         }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            share_supervisor.shutdown_all();
+            shutdown_shares(&mut share_supervisor);
             forward_supervisor.shutdown_all();
             // Deactivate + kill resident plugin sessions. Every other loop
             // exit is covered by PluginsHost's Drop; this explicit call keeps
@@ -9253,6 +9265,7 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             crate::frame_writer::WriterStatus::Fatal(e) => {
+                shutdown_shares(&mut share_supervisor);
                 let note = match clipboard_outcome {
                     Some(outcome) => format!(
                         "; {}",
@@ -15160,10 +15173,21 @@ async fn event_loop<T: Terminal>(
         // update the supervisor, and re-sync the model so the badge + Share
         // panel repaint (a chrome change ⇒ Full frame).
         while let Ok(ev) = share_rx.try_recv() {
+            let stopping_generation = match &ev {
+                crate::share::ShareEvent::Down {
+                    worktree,
+                    port,
+                    generation,
+                } => share_supervisor.is_stopping(worktree, *port, *generation),
+                _ => false,
+            };
             if share_supervisor.on_event(ev.clone()) {
                 // Surface an accepted failure where the user is looking.
                 if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
                     model.status = format!("Share :{port} failed: {error}");
+                }
+                if stopping_generation && let crate::share::ShareEvent::Down { port, .. } = &ev {
+                    model.status = format!("Stopped share :{port}");
                 }
                 let replaced_generation_is_live = match &ev {
                     crate::share::ShareEvent::Down {
@@ -20991,6 +21015,7 @@ async fn event_loop<T: Terminal>(
                                     // Action::Quit keybind (audit run.rs:13511):
                                     // otherwise pane/split/focus changes made since
                                     // the last periodic persist are lost on relaunch.
+                                    shutdown_shares(&mut share_supervisor);
                                     persist_session_layout(&mut session, &panes);
                                     crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                         &session, &panes,
@@ -23537,8 +23562,7 @@ async fn event_loop<T: Terminal>(
                             match target {
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
-                                    let did_stop =
-                                        !stopped.removed.is_empty() || !stopped.pending.is_empty();
+                                    let status = crate::share::stop_status(&stopped, Some(port));
                                     crate::handlers::host::queue_stopped_share_deletes(
                                         wt.clone(),
                                         stopped.removed,
@@ -23548,16 +23572,7 @@ async fn event_loop<T: Terminal>(
                                         stopped.failed.clone(),
                                     );
                                     model.shares = current_share_views(&share_supervisor, &session);
-                                    model.status = if let Some(failure) = stopped.failed.first() {
-                                        format!(
-                                            "Share :{port} could not be stopped: {}; press x to retry",
-                                            failure.error
-                                        )
-                                    } else if !did_stop {
-                                        format!("Share :{port} was already down")
-                                    } else {
-                                        format!("Stopped share :{port}")
-                                    };
+                                    model.status = status;
                                 }
                                 None => model.status = "No share selected".into(),
                             }
@@ -24816,6 +24831,7 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Quit | Action::Detach => {
+                                shutdown_shares(&mut share_supervisor);
                                 persist_session_layout(&mut session, &panes);
                                 // Quit is a detach: daemon-backed center panes
                                 // keep running; the next launch reattaches. Cover
@@ -24833,6 +24849,7 @@ async fn event_loop<T: Terminal>(
                                 return Ok(());
                             }
                             Action::QuitKill => {
+                                shutdown_shares(&mut share_supervisor);
                                 persist_session_layout(&mut session, &panes);
                                 // One-time bounded wait on the quit path so the
                                 // kills land before shutdown_background() aborts
