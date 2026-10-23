@@ -186,8 +186,10 @@ fn find_tgproxy_in(
     self_dir: Option<&std::path::Path>,
     path_var: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
+    // Match `tgproxy_exe`: runtime selection is based on existence, even when
+    // the sibling cannot be executed. Report that path instead of a PATH copy.
     if let Some(sibling) = self_dir.map(|dir| dir.join("tgproxy"))
-        && executable_regular_file(&sibling)
+        && sibling.exists()
     {
         return Some(sibling);
     }
@@ -213,7 +215,13 @@ pub fn tgproxy_status_line(found: Option<&std::path::Path>) -> String {
         || {
             "not installed (source-build-only in this alpha: cargo install --path crates/thegn-proxy, then put tgproxy beside thegn or on PATH)".to_string()
         },
-        |path| path.display().to_string(),
+        |path| {
+            if executable_regular_file(path) {
+                path.display().to_string()
+            } else {
+                format!("{} (present but not executable)", path.display())
+            }
+        },
     )
 }
 
@@ -929,6 +937,27 @@ mod tests {
         let path_var = std::env::join_paths([first_dir.path(), second_dir.path()]).unwrap();
 
         assert_eq!(find_tgproxy_in(None, Some(&path_var)), Some(expected));
+    }
+
+    #[test]
+    fn find_tgproxy_reports_non_executable_sibling_before_path_copy() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let sibling = make_tgproxy(sibling_dir.path(), 0o644);
+        make_tgproxy(path_dir.path(), 0o755);
+        let path_var = std::env::join_paths([path_dir.path()]).unwrap();
+
+        let found = find_tgproxy_in(Some(sibling_dir.path()), Some(&path_var)).unwrap();
+        assert_eq!(found, sibling);
+        assert_eq!(
+            tgproxy_status_line(Some(&found)),
+            format!("{} (present but not executable)", sibling.display()),
+            "doctor must identify the unusable sibling the runtime selects"
+        );
     }
 
     #[test]
