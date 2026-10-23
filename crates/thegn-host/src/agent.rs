@@ -651,10 +651,12 @@ pub fn prepare_sandbox_env(
     {
         match block_on_provider(|| async {
             provider
-                .upload_dir(&id, std::path::Path::new(worktree), &workdir)
+                .upload_dir_with_baseline(&id, std::path::Path::new(worktree), &workdir)
                 .await
         }) {
-            Ok(()) => register_provider_sync(worktree, &env_name),
+            Ok(baseline) => {
+                register_provider_sync(worktree, &env_name, Some(std::sync::Arc::new(baseline)))
+            }
             Err(e) => {
                 warnings.push(format!("provider sync upload failed: {e}"));
                 thegn_core::msg::warn(&format!("provider sync upload failed for {worktree}: {e}"));
@@ -3738,6 +3740,8 @@ where
 struct ProviderSyncRecord {
     env_name: String,
     in_flight: bool,
+    /// What the upload sent; `None` = no baseline, the close sync overlays as before.
+    baseline: Option<std::sync::Arc<thegn_svc::provider::SyncBaseline>>,
 }
 
 fn provider_sync_registry()
@@ -3748,13 +3752,18 @@ fn provider_sync_registry()
     REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn register_provider_sync(worktree: &str, env_name: &str) {
+fn register_provider_sync(
+    worktree: &str,
+    env_name: &str,
+    baseline: Option<std::sync::Arc<thegn_svc::provider::SyncBaseline>>,
+) {
     if let Ok(mut r) = provider_sync_registry().lock() {
         r.insert(
             worktree.to_string(),
             ProviderSyncRecord {
                 env_name: env_name.to_string(),
                 in_flight: false,
+                baseline,
             },
         );
     }
@@ -3770,7 +3779,7 @@ pub(crate) fn forget_provider_sync(worktree: &str) {
 /// provider `data = "sync"` env. A failed pull is surfaced and retained in the
 /// in-process registry so a later close can retry it.
 pub(crate) fn deprovision_sync(path: &str) -> Result<(), String> {
-    let env_name = {
+    let (env_name, baseline) = {
         let mut registry = provider_sync_registry()
             .lock()
             .map_err(|_| "provider sync registry unavailable".to_string())?;
@@ -3781,14 +3790,19 @@ pub(crate) fn deprovision_sync(path: &str) -> Result<(), String> {
             return Err("provider sync is already in progress".into());
         }
         record.in_flight = true;
-        record.env_name.clone()
+        (record.env_name.clone(), record.baseline.clone())
     };
     let cfg = crate::config_startup::cleanup_config();
     let result = if let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) {
         let p = path.to_string();
         block_on_provider(|| async {
             provider
-                .download_dir(&id, &workdir, std::path::Path::new(&p))
+                .download_dir_reconciled(
+                    &id,
+                    &workdir,
+                    std::path::Path::new(&p),
+                    baseline.as_deref(),
+                )
                 .await
         })
         .map_err(|error| format!("{error:#}"))
