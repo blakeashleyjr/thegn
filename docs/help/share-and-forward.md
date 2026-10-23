@@ -12,12 +12,15 @@ Two ways a worktree's dev server reaches a browser.
 
 ## Ingress shares (`[share]`)
 
-`Alt-Shift-S` (share-worktree-port) exposes a port from the focused
-worktree at a public URL. The [[panel]]'s **system → share** section
+`Alt-Shift-S` (share-worktree-port) shares a port from the focused
+worktree at a URL or ticket whose reach depends on the provider: bore and
+frp are public, a Tailscale share is tailnet-only unless `funnel = true`,
+and an iroh share is a peer-to-peer ticket. The [[panel]]'s **system → share** section
 lists every active share: `↵` copies the URL, `o` opens it in the
 browser, `n` starts a share, and `x` stops the highlighted share (the
-stop-share action stops them all). Stopping a share also removes its saved
-entry, so it will not return on the next launch. A failed share shows its
+stop-share action stops them all). The row stays `stopping…` until the tunnel
+client exits; then its saved entry is removed, so it will not return on the
+next launch. A failed share shows its
 reason and can simply be retried. If a tailscale share's teardown cannot be
 confirmed, it stays in the list as failed with the reason and keeps its saved
 entry; stopping it again retries the teardown. If thegn cannot stop a bore,
@@ -44,7 +47,8 @@ verify teardown; restarting the worktree sandbox lets thegn record the runtime.
 Stopping a share in thegn while it is still starting cancels the start, so
 the tunnel does not come up after the stop request.
 A share client started by thegn runs in its own process group. Stopping it sends
-TERM to the group, then KILL after a short grace period if processes remain.
+TERM to the group, then KILL after a short grace period if processes remain; the
+row stays `stopping…` until the group has exited.
 A Tailscale share cannot restart on a port whose previous share is still
 stopping; wait for teardown to finish first.
 
@@ -69,9 +73,10 @@ secret passed through `extra_args` to `[share.bore] secret` instead.
 
 ## Auto port forwards (`[forward]`)
 
-For sandboxed worktrees ([[sandboxing]]), dev-server ports detected
-inside the container are forwarded to the host's loopback automatically
-for local browser preview. The **system → forward** section lists the
+For sandboxed worktrees ([[sandboxing]]), dev-server ports detected inside
+the local container sandbox (podman or docker) are forwarded to the host for
+local browser preview. `bind` defaults to loopback; a non-loopback bind is
+refused unless `[forward] allow_external_bind = true`. The **system → forward** section lists the
 active forwards: `↵` copies the preview URL, `o` opens it, `n` starts
 watching a port, and `x` removes a forward.
 

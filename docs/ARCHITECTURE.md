@@ -367,6 +367,11 @@ than silently degrading.
 **Gate:** `openspec/specs/sandbox` (32 requirements), `just sandbox-e2e-dns`
 / `-db` in `just ci`.
 
+The local Unix control endpoint trusts the daemon's effective uid, an owner-only
+parent, and the connected peer-uid check; the sandbox control-socket guard
+contains it. See `thegn_svc::ipc` and [Daemon and sessions](help/daemon-and-sessions.md)
+for the enforced boundary and token-only migration path.
+
 ## Adding things
 
 Step-by-step recipes, each ending with the gate that fails if you skip a

@@ -49,6 +49,11 @@ user owns it or it has extra hard links, and explains why.
 For the Alacritty config, the picker writes through a staging file beside it
 and leaves the config unchanged if staging fails.
 
+If the config is replaced but syncing its directory fails, the status line
+reports the applied font with a `warning:` suffix; the change may not survive a
+crash. Family names with invisible or bidirectional formatting characters are
+refused and are not offered by the picker.
+
 Run `thegn doctor` in that window to verify the terminal and resolved
 capabilities. The derivation is build-tested on x86_64 Linux; clean-host
 interactive evidence is still required before additional hosts are called

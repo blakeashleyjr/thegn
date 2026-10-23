@@ -1037,10 +1037,25 @@ impl Forge for GithubCli {
         pr: PrRef,
         state: ReviewState,
         body: Option<&str>,
+        expected_head: Option<&str>,
     ) -> Result<(), GhError> {
-        match pr {
-            PrRef::Current => submit_review(loc, state, body),
-            PrRef::Number(n) => {
+        match (pr, expected_head) {
+            (PrRef::Current, Some(_)) => Err(GhError::Unsupported("submit_review expected head")),
+            (PrRef::Current, None) => submit_review(loc, state, body),
+            (PrRef::Number(number), Some(head)) => {
+                let identity = origin_identity(loc)?;
+                let repo = self.repo_ref(loc).ok_or_else(|| {
+                    GhError::Other(
+                        "could not resolve the PR's repository; nothing was submitted".into(),
+                    )
+                })?;
+                let host = (!identity.host.eq_ignore_ascii_case("github.com"))
+                    .then_some(identity.host.as_str());
+                let args = review_api_args(&repo, host, number, head, state, body)?;
+                let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                gh_run(loc, &args)
+            }
+            (PrRef::Number(n), None) => {
                 if !matches!(state, ReviewState::Approve) && body.is_none() {
                     return Err(GhError::Other(
                         "a body is required for request-changes / comment reviews".into(),
@@ -1184,6 +1199,46 @@ fn merge_args(
         args.push("--auto".into());
     }
     args
+}
+
+fn review_api_args(
+    repo: &RepoRef,
+    host: Option<&str>,
+    number: u64,
+    head: &str,
+    state: ReviewState,
+    body: Option<&str>,
+) -> Result<Vec<String>, GhError> {
+    if !matches!(head.len(), 40 | 64) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(GhError::Other("PR head is not a valid commit id".into()));
+    }
+    if number == 0 {
+        return Err(GhError::Other("PR number must be greater than zero".into()));
+    }
+    if !matches!(state, ReviewState::Approve) && body.is_none() {
+        return Err(GhError::Other(
+            "a body is required for request-changes / comment reviews".into(),
+        ));
+    }
+
+    let mut args = vec!["api".into()];
+    if let Some(host) = host {
+        args.extend(["--hostname".into(), host.to_owned()]);
+    }
+    args.extend([
+        "-X".into(),
+        "POST".into(),
+        format!("repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.repo),
+        "-f".into(),
+        format!("commit_id={head}"),
+        "-f".into(),
+        format!("event={}", state.api_event()),
+    ]);
+    if let Some(body) = body {
+        args.push("-f".into());
+        args.push(format!("body={body}"));
+    }
+    Ok(args)
 }
 #[cfg(test)]
 mod numbered_rerun_tests {
@@ -1428,5 +1483,98 @@ mod merge_args_tests {
                 "--auto".to_owned(),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod review_args_tests {
+    use super::{GithubCli, review_api_args};
+    use crate::forge::Forge;
+    use crate::forge::model::ReviewState;
+    use crate::forge::{ForgeError, RepoRef};
+    use crate::remote::GitLoc;
+    use std::path::PathBuf;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn pinned_review_posts_commit_id_and_mapped_event() {
+        let repo = RepoRef {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        for (host, state, body, event) in [
+            (None, ReviewState::Approve, None, "APPROVE"),
+            (None, ReviewState::Approve, Some("looks good"), "APPROVE"),
+            (
+                None,
+                ReviewState::RequestChanges,
+                Some("please revise"),
+                "REQUEST_CHANGES",
+            ),
+            (None, ReviewState::Comment, Some("note"), "COMMENT"),
+            (Some("ghe.example"), ReviewState::Approve, None, "APPROVE"),
+        ] {
+            let mut expected = vec!["api".to_owned()];
+            if let Some(host) = host {
+                expected.extend(["--hostname".to_owned(), host.to_owned()]);
+            }
+            expected.extend([
+                "-X".to_owned(),
+                "POST".to_owned(),
+                "repos/o/r/pulls/7/reviews".to_owned(),
+                "-f".to_owned(),
+                format!("commit_id={HEAD}"),
+                "-f".to_owned(),
+                format!("event={event}"),
+            ]);
+            if let Some(body) = body {
+                expected.push("-f".to_owned());
+                expected.push(format!("body={body}"));
+            }
+            assert_eq!(
+                review_api_args(&repo, host, 7, HEAD, state, body).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_review_refuses_a_malformed_head_or_missing_body() {
+        let repo = RepoRef {
+            owner: "o".into(),
+            repo: "r".into(),
+        };
+        for head in ["", "1234567", "0123456789abcdef0123456789abcdef0123456g"] {
+            assert!(matches!(
+                review_api_args(&repo, None, 7, head, ReviewState::Approve, None),
+                Err(ForgeError::Other(_))
+            ));
+        }
+        assert!(matches!(
+            review_api_args(&repo, None, 0, HEAD, ReviewState::Approve, None),
+            Err(ForgeError::Other(_))
+        ));
+        assert!(matches!(
+            review_api_args(&repo, None, 7, HEAD, ReviewState::Comment, None),
+            Err(ForgeError::Other(_))
+        ));
+        assert!(review_api_args(&repo, None, 7, HEAD, ReviewState::Comment, Some("   ")).is_ok());
+    }
+
+    #[test]
+    fn current_pr_with_expected_head_is_unsupported() {
+        let forge = GithubCli::new();
+        let loc = GitLoc::Local(PathBuf::from("/nonexistent"));
+        assert!(matches!(
+            forge.submit_review(
+                &loc,
+                crate::forge::PrRef::Current,
+                ReviewState::Approve,
+                None,
+                Some(HEAD)
+            ),
+            Err(ForgeError::Unsupported("submit_review expected head"))
+        ));
     }
 }

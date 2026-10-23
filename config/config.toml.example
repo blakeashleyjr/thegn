@@ -3409,10 +3409,11 @@ allow_external_urls = false  # THEGN_PREVIEW_ALLOW_EXTERNAL_URLS; localhost-only
 
 # ── Automatic port forwarding / browser preview (`[forward]`) ───────────────
 # The outbound-localhost sibling of [share]: when a dev server binds a port INSIDE
-# a worktree's sandbox (container / ssh host / k8s pod), thegn auto-detects it
+# a worktree's local container sandbox (podman or docker), thegn auto-detects it
 # and forwards it to the host so it's previewable at http://localhost:<port>.
 # Active forwards appear in the System panel; press `o` to open the focused one in
-# your browser. On by default — forwards bind loopback only, so this is safe.
+# your browser. Forwards use `bind` (loopback by default); non-loopback binds are
+# refused unless `allow_external_bind = true`.
 [forward]
 auto = true            # auto-detect + forward newly-bound sandbox ports
 range = "8000-8999"    # host-port range for remaps when a port's own number is taken
@@ -3425,6 +3426,7 @@ reverse_lifetime_secs = 86400 # close a tunnelled connection after this long in 
 ignore = []            # container ports never to forward, e.g. [5432, 22]
 only = []              # if non-empty, ONLY forward these container ports
 bind = "127.0.0.1"     # host interface to bind forwards on (loopback = host-local)
+allow_external_bind = false # permit a non-loopback bind (exposes forwarded ports on that interface)
 poll_secs = 2          # how often the sandbox is scanned for new listening ports
 browser = ""           # argv template, quoted args, `%s` = URL (appended if absent), no shell, e.g. "firefox --new-window %s".
                        # An explicit value is final (no fallback). "" = $BROWSER (':'-separated fallback list), then the OS opener.
@@ -3966,7 +3968,7 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # # auto_provision = false                # create the VM on first open if missing
 # # auto_checkpoint = false               # snapshot (machine0 images) on worktree close
 # # max_instances = 5                     # hard cap on concurrently-managed VMs
-# # max_lifetime_secs = 0                 # reaper ceiling (0 = off)
+# # max_lifetime_secs = 0                 # NOT enforced for machine0 (no lifetime reaper; `config validate` warns)
 # # Wired axes: FILE-SYNC (`data = "sync"` over ssh), SNAPSHOT (`thegn env snapshot`
 # # → machine0 images; restore recreates from the image), SCALE-TO-ZERO (idle
 # # suspend). NOT available: native WSS exec / egress translation (the pane is ssh).
@@ -4213,9 +4215,9 @@ unsafe_allow_plaintext_non_loopback = false
 # is the credential.
 require_approval = false
 # Local unix-socket peers get implicit admin only when native peer credentials
-# match the daemon's effective uid. The 0700 run-dir and 0600 socket are strict
-# startup invariants in this mode. Set false to require scoped bearer tokens on
-# Unix too (useful where peer credentials or filesystem modes are unavailable).
+# match the daemon's effective uid. The owner-only 0700 parent and 0600 socket
+# are enforced in both modes; setting false requires scoped bearer tokens on
+# Unix too and does not relax these invariants.
 # Tokens are always required on TCP.
 local_admin = true
 # Cross-origin allowlist for a browser-hosted thin client. Empty (default) = NO
@@ -4847,12 +4849,14 @@ history_days = 14
 enabled = true
 # Also record to the notification inbox, not just an in-app toast. On by default
 # here (unlike [stats.alerts]): a quota you are about to exhaust is worth finding
-# later, and it fires at most a handful of times a week.
+# later. Each reset period and alert level keeps one inbox row, updated in place.
 notify = true
 # Seconds past a threshold before firing. Usage moves in poll-sized steps, so
 # this is mostly a guard against one bad API response.
 sustain_secs = 0
-# Minimum seconds between repeats of a standing alert. 0 disables repeats.
+# Minimum seconds between in-app toast reminders for a standing alert. Inbox
+# repeats update the existing row in place without changing its read state.
+# 0 disables reminders.
 repeat_secs = 3600
 # Fractional retreat below the threshold required before an alert clears, so a
 # window hovering on the line cannot flap.

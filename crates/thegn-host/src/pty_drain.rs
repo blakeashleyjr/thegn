@@ -1395,6 +1395,17 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         return;
                     }
                     // Non-agent pane: route per policy.
+                    if let Err(error) =
+                        supersede_clean_process_failure(&db, exit_code, &wt, &program)
+                    {
+                        tracing::debug!(
+                            target: "thegn::attention",
+                            worktree = %wt,
+                            program = %program,
+                            %error,
+                            "could not retire process failure after clean rerun"
+                        );
+                    }
                     let Some(outcome) = outcome else {
                         return;
                     };
@@ -1693,6 +1704,18 @@ fn detach_exited_terminal(
     closed
 }
 
+fn supersede_clean_process_failure(
+    db: &thegn_core::db::Db,
+    exit_code: Option<i32>,
+    worktree: &str,
+    program: &str,
+) -> anyhow::Result<()> {
+    if exit_code == Some(0) {
+        db.mark_notification_read_by_source("process_failed", program, worktree)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1701,6 +1724,17 @@ mod tests {
     use thegn_core::db::Db;
     use thegn_core::issue::{AgentDispatchStatus, DispatchRunRef, NewDispatch};
     use thegn_core::store::NotificationStore;
+
+    #[test]
+    fn clean_rerun_supersedes_failure() {
+        let db = Db::open_memory().unwrap();
+        db.put_notification("process_failed", "make", "failed", "/wt/a")
+            .unwrap();
+
+        supersede_clean_process_failure(&db, Some(0), "/wt/a", "make").unwrap();
+
+        assert!(db.get_unread_notifications().unwrap().is_empty());
+    }
 
     #[test]
     fn fast_fail_placement_known_local_only_skips_known_local_active_groups() {

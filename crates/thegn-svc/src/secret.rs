@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 use thegn_core::secretref::{BareAs, SecretRef};
 
+// Keep in sync with the host broker's MAX_SECRET_BYTES cap.
+const MAX_FILE_SECRET_BYTES: u64 = 64 * 1024;
+
 /// The host broker callback. A function pointer keeps the process-global seam
 /// allocation-free and `Send + Sync`; first installation wins.
 pub type Resolver = fn(&SecretRef, &str) -> Option<String>;
@@ -78,7 +81,17 @@ fn resolve_local(reference: &SecretRef) -> Option<String> {
         SecretRef::Env { var } => std::env::var(var).ok(),
         SecretRef::File { path } => {
             let path = thegn_core::util::expand_tilde(path);
-            std::fs::read_to_string(path).ok()
+            match thegn_core::fsperm::read_owner_only_secret_file(
+                std::path::Path::new(&path),
+                MAX_FILE_SECRET_BYTES,
+            ) {
+                Ok(value) => Some(value),
+                Err(thegn_core::fsperm::SecretFileError::NotFound) => None,
+                Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
+                    tracing::debug!(target: "thegn::secret", %reason, "file secret refused");
+                    None
+                }
+            }
         }
         SecretRef::Literal(value) => Some(value.expose().to_string()),
         SecretRef::Keyring { .. } => None,
@@ -102,6 +115,29 @@ mod tests {
             None
         );
         assert_eq!(resolve("", BareAs::Literal, "test"), None);
+    }
+
+    #[test]
+    fn local_fallback_refuses_a_loose_file_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("token");
+        std::fs::write(&path, "svc-token").unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
+        if thegn_core::fsperm::mode_bits(&path).unwrap().is_none() {
+            return;
+        }
+        let reference = format!("file:{}", path.display());
+
+        assert_eq!(resolve(&reference, BareAs::Literal, "test"), None);
+        thegn_core::fsperm::restrict_to_owner(&path).unwrap();
+        assert_eq!(
+            resolve(&reference, BareAs::Literal, "test").as_deref(),
+            Some("svc-token")
+        );
     }
 
     #[test]

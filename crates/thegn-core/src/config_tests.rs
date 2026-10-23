@@ -15,6 +15,14 @@ fn forward_reverse_tunnel_caps_default_to_shipped_limits_and_parse() {
 }
 
 #[test]
+fn forward_allow_external_bind_defaults_off_and_parses() {
+    assert!(!ForwardConfig::default().allow_external_bind);
+
+    let config: Config = toml::from_str("[forward]\nallow_external_bind = true\n").unwrap();
+    assert!(config.forward.allow_external_bind);
+}
+
+#[test]
 fn forward_reverse_tunnel_deadlines_default_parse_and_zero_rules() {
     let defaults = ForwardConfig::default();
     assert_eq!(defaults.reverse_write_stall_secs, 60);
@@ -3339,6 +3347,114 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     assert!(!cfg.voice.enabled);
     // Every gated feature reports as clamped.
     assert_eq!(clamped.len(), Feature::ALL.len());
+}
+
+#[test]
+fn clamp_to_channel_drops_ssh_and_provider_envs_in_stable() {
+    use crate::channel::{Channel, Feature};
+    use crate::config::{EnvConfig, PlacementMode};
+
+    let mut cfg = Config {
+        env: BTreeMap::from([
+            (
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Ssh,
+                    ssh: EnvSshConfig {
+                        host: "box.example".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "fly".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "hinted".into(),
+                EnvConfig {
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            ("plain".into(), EnvConfig::default()),
+            (
+                "pod".into(),
+                EnvConfig {
+                    placement: PlacementMode::K8s,
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+
+    let clamped = cfg.clamp_to_channel(Channel::Stable);
+    assert_eq!(
+        cfg.env.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["plain", "pod"]
+    );
+    assert!(clamped.contains(&Feature::Remote));
+    assert!(clamped.contains(&Feature::Providers));
+
+    let mut dev = Config {
+        env: BTreeMap::from([
+            (
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Ssh,
+                    ssh: EnvSshConfig {
+                        host: "box.example".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "fly".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "hinted".into(),
+                EnvConfig {
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            ("plain".into(), EnvConfig::default()),
+            (
+                "pod".into(),
+                EnvConfig {
+                    placement: PlacementMode::K8s,
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
+    assert_eq!(dev.env.len(), 5);
 }
 
 #[test]

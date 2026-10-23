@@ -102,6 +102,35 @@ fn fixture() -> MonitorFrame {
     });
     frame
 }
+
+#[test]
+fn graph_label_uses_dim_foreground_on_panel_background() {
+    use crate::{chrome, wire};
+
+    caps::test_override::with_color(ColorDepth::Truecolor, || {
+        let mut surface = Surface::new(12, 1);
+        super::draw_graph_label(&mut surface, 0, 0, 12, "power graph");
+        let cell = &surface.screen_cells()[0][0];
+        let (dim, panel) = chrome::with_palette(|palette| {
+            (
+                wire::color_spec(chrome::theme_color(&palette.dim), ColorDepth::Truecolor),
+                wire::color_spec(chrome::theme_color(&palette.panel), ColorDepth::Truecolor),
+            )
+        });
+        assert_eq!(
+            wire::color_spec(cell.attrs().foreground(), ColorDepth::Truecolor),
+            dim
+        );
+        assert_eq!(
+            wire::color_spec(cell.attrs().background(), ColorDepth::Truecolor),
+            panel
+        );
+        assert_ne!(
+            dim, panel,
+            "fixture colors must distinguish label from its surface"
+        );
+    });
+}
 fn text(surface: &mut Surface) -> String {
     surface.screen_chars_to_string()
 }

@@ -209,7 +209,8 @@ pub struct Machine0Spec {
     /// Hard cap on concurrently-managed VMs (0 ⇒ default 5) — the spend
     /// guardrail enforced at create.
     pub max_instances: u32,
-    /// Ceiling on a VM's lifetime in seconds (0 ⇒ off). Reserved for the reaper.
+    /// Ceiling on a VM's lifetime in seconds (0 ⇒ off). Not enforced: machine0
+    /// has no lifetime reaper.
     pub max_lifetime_secs: u64,
     /// Test hook: skip the readiness/reachability wait after create (mock
     /// endpoints can't answer ssh). Never set outside tests.

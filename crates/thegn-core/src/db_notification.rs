@@ -11,6 +11,84 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params, params_from_iter};
 
 impl NotificationStore for Db {
+    fn record_usage_alert(
+        &self,
+        claim_key: &str,
+        account_window: &str,
+        message: &str,
+    ) -> Result<crate::store::UsageAlertWrite> {
+        let tx = self.conn().unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM usage_alert_claims WHERE claimed_at < ?1",
+            [util::now() - 30 * 24 * 3600],
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO usage_alert_claims(claim_key,account_window,notification_id,claimed_at) VALUES(?1,?2,NULL,?3)",
+            params![claim_key, account_window, util::now()],
+        )?;
+        if inserted == 0 {
+            let updated = tx.execute(
+                "UPDATE notifications SET message=?2 WHERE id=(SELECT notification_id FROM usage_alert_claims WHERE claim_key=?1)",
+                params![claim_key, message],
+            )?;
+            tx.commit()?;
+            return Ok(if updated == 1 {
+                crate::store::UsageAlertWrite::Updated
+            } else {
+                crate::store::UsageAlertWrite::Suppressed
+            });
+        }
+        // New periods retire old claims; escalation also retires the prior
+        // level's unread row for the same account window.
+        tx.execute(
+            "UPDATE notifications SET read=1 WHERE id IN (SELECT notification_id FROM usage_alert_claims WHERE account_window=?1 AND claim_key<>?2 AND notification_id IS NOT NULL)",
+            params![account_window, claim_key],
+        )?;
+        tx.execute(
+            "DELETE FROM usage_alert_claims WHERE account_window=?1 AND claim_key<>?2",
+            params![account_window, claim_key],
+        )?;
+        tx.execute(
+            "INSERT INTO notifications(kind,issue_id,message,created_at_ms,read,worktree_path) VALUES('usage_limit',?1,?2,?3,0,'')",
+            params![account_window, message, util::now()],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE usage_alert_claims SET notification_id=?2 WHERE claim_key=?1",
+            params![claim_key, id],
+        )?;
+        tx.commit()?;
+        Ok(crate::store::UsageAlertWrite::Inserted(id))
+    }
+
+    fn rearm_usage_alerts(&self, account_window: &str, keep_claim_key: Option<&str>) -> Result<()> {
+        let tx = self.conn().unchecked_transaction()?;
+        match keep_claim_key {
+            Some(key) => {
+                tx.execute(
+                    "UPDATE notifications SET read=1 WHERE id IN (SELECT notification_id FROM usage_alert_claims WHERE account_window=?1 AND claim_key<>?2 AND notification_id IS NOT NULL)",
+                    params![account_window, key],
+                )?;
+                tx.execute(
+                    "DELETE FROM usage_alert_claims WHERE account_window=?1 AND claim_key<>?2",
+                    params![account_window, key],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE notifications SET read=1 WHERE id IN (SELECT notification_id FROM usage_alert_claims WHERE account_window=?1 AND notification_id IS NOT NULL)",
+                    params![account_window],
+                )?;
+                tx.execute(
+                    "DELETE FROM usage_alert_claims WHERE account_window=?1",
+                    params![account_window],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn has_cleanup_dispatch(&self, worktree_path: &str) -> Result<bool> {
         let mut statement = self.conn().prepare(
             "SELECT status, pending_worktree_path FROM agent_dispatches WHERE worktree_path=?1 OR pending_worktree_path=?1",
@@ -126,6 +204,25 @@ impl NotificationStore for Db {
         self.conn()
             .execute("UPDATE notifications SET read=1 WHERE id=?1", params![id])?;
         Ok(())
+    }
+
+    fn mark_notification_read_by_source(
+        &self,
+        kind: &str,
+        source_ref: &str,
+        worktree_path: &str,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE notifications SET read=1 WHERE kind=?1 AND issue_id=?2 AND worktree_path=?3 AND read=0",
+            params![kind, source_ref, worktree_path],
+        )?)
+    }
+
+    fn expire_failures(&self, cutoff: i64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE notifications SET read=1 WHERE read=0 AND kind IN ('process_failed','agent_failed','test_failed') AND created_at_ms < ?1",
+            params![cutoff],
+        )?)
     }
 
     /// Mark all notifications as read.
@@ -974,6 +1071,100 @@ fn map_dispatch_base(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::Ag
 mod tests {
     use super::*;
     use crate::store::NotificationStore;
+
+    #[test]
+    fn usage_alert_claim_updates_without_unreading_and_suppresses_deleted_rows() {
+        let db = Db::open_memory().unwrap();
+        let claim = "usage:claude:a#weekly#warn#1700000100";
+        let window = "claude:a#weekly";
+        let crate::store::UsageAlertWrite::Inserted(id) = db
+            .record_usage_alert(claim, window, "weekly at 80%")
+            .unwrap()
+        else {
+            panic!("first claim inserts a notification row");
+        };
+        let original = db.get_all_notifications(10).unwrap().remove(0);
+        db.mark_notification_read(id).unwrap();
+        assert_eq!(
+            db.record_usage_alert(claim, window, "weekly at 85%")
+                .unwrap(),
+            crate::store::UsageAlertWrite::Updated
+        );
+        let updated = db.get_all_notifications(10).unwrap().remove(0);
+        assert_eq!(updated.id, id);
+        assert_eq!(updated.created_at_ms, original.created_at_ms);
+        assert!(updated.read);
+        assert_eq!(updated.message, "weekly at 85%");
+
+        db.rearm_usage_alerts(window, Some(claim)).unwrap();
+        assert_eq!(
+            db.record_usage_alert(claim, window, "weekly at 86%")
+                .unwrap(),
+            crate::store::UsageAlertWrite::Updated
+        );
+
+        db.delete_notification(id).unwrap();
+        assert_eq!(
+            db.record_usage_alert(claim, window, "weekly at 90%")
+                .unwrap(),
+            crate::store::UsageAlertWrite::Suppressed
+        );
+        assert!(db.get_all_notifications(10).unwrap().is_empty());
+        db.rearm_usage_alerts(window, None).unwrap();
+        assert!(matches!(
+            db.record_usage_alert(claim, window, "weekly at 90%")
+                .unwrap(),
+            crate::store::UsageAlertWrite::Inserted(_)
+        ));
+    }
+
+    #[test]
+    fn expire_failures_marks_old_unread_failures_read() {
+        let db = Db::open_memory().unwrap();
+        let cutoff = 10_000;
+        let old = db
+            .put_notification("process_failed", "cargo", "old", "/wt")
+            .unwrap();
+        let recent = db
+            .put_notification("process_failed", "cargo", "recent", "/wt")
+            .unwrap();
+        let other = db
+            .put_notification("usage_limit", "weekly", "other", "/wt")
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE notifications SET created_at_ms=?1 WHERE id=?2",
+                params![cutoff - 1, old],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE notifications SET created_at_ms=?1 WHERE id=?2",
+                params![cutoff, recent],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE notifications SET created_at_ms=?1 WHERE id=?2",
+                params![cutoff - 1, other],
+            )
+            .unwrap();
+
+        assert_eq!(db.expire_failures(cutoff).unwrap(), 1);
+        let rows = db.get_all_notifications(10).unwrap();
+        assert!(
+            rows.iter().find(|n| n.id == old).unwrap().read,
+            "old failure must expire"
+        );
+        assert!(
+            !rows.iter().find(|n| n.id == recent).unwrap().read,
+            "cutoff is exclusive"
+        );
+        assert!(
+            !rows.iter().find(|n| n.id == other).unwrap().read,
+            "non-failure kinds are retained"
+        );
+    }
 
     #[test]
     fn equal_timestamps_list_newest_id_first() {

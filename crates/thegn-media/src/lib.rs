@@ -78,6 +78,10 @@ pub use platform::linux::mpris_cli::MprisCli;
 /// always finishes before the host gives up.
 pub const MEDIA_OP_BUDGET: Duration = Duration::from_secs(5);
 
+/// Budget for one snapshot read, whether performed by a host transport
+/// preflight/post-operation read or by one aggregate child.
+pub const MEDIA_READ_BUDGET: Duration = Duration::from_secs(2);
+
 /// What went wrong talking to a player. Callers can distinguish a healthy empty
 /// listing from a transport or provider failure and surface this display text.
 /// Hand-rolled `Display` (no `thiserror` dep), mirroring `thegn_core::ci::CiError`.

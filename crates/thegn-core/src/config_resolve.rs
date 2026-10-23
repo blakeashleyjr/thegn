@@ -1083,9 +1083,10 @@ impl Config {
     /// Called by the host immediately after config load, once the release
     /// channel is resolved. In the stable channel this forces every dev-only
     /// feature's master toggle off — mirroring the repo-overlay clamp above —
-    /// so an experimental key left in a user's config is inert rather than
-    /// silently half-active. Returns the features actually changed, so the
-    /// caller can surface a one-line status note.
+    /// and removes dev-only `[env.*]` placements, so selecting one resolves as
+    /// an unresolved env (Local fallback, flagged) rather than reaching the
+    /// dev-only subsystem. Returns the features actually changed, so the caller
+    /// can surface a one-line status note.
     pub fn clamp_to_channel(
         &mut self,
         channel: crate::channel::Channel,
@@ -1100,12 +1101,20 @@ impl Config {
                 Feature::Remote => {
                     let was = !self.sandbox.remote.host.is_empty();
                     self.sandbox.remote.host.clear();
-                    was
+                    let env_count = self.env.len();
+                    self.env
+                        .retain(|_, env| env.placement != crate::config::PlacementMode::Ssh);
+                    was || self.env.len() != env_count
                 }
                 Feature::Providers => {
                     let was = !self.host.is_empty();
                     self.host.clear();
-                    was
+                    let env_count = self.env.len();
+                    self.env.retain(|_, env| {
+                        env.placement != crate::config::PlacementMode::Provider
+                            && env.provider.provider.trim().is_empty()
+                    });
+                    was || self.env.len() != env_count
                 }
                 Feature::Observe => {
                     let was = self.observe.enabled;
@@ -1567,7 +1576,7 @@ pub fn resolve_environment(
             let unresolved = name != "default";
             if unresolved {
                 crate::config::config_warn(&format!(
-                    "execution environment {name:?} is not defined under [env.{name}]; using the default"
+                    "execution environment {name:?} is not defined under [env.{name}] or is dev-channel only; using the default"
                 ));
             }
             let data = crate::config::data_mode_from_remote(base.remote.mode);
@@ -2418,6 +2427,42 @@ mod tests {
             &Approvals::deny_all(),
         );
         assert_eq!(env.name, "default");
+        assert!(!env.unresolved_selection);
+    }
+
+    #[test]
+    fn stable_clamp_turns_a_dev_only_default_env_into_an_unresolved_selection() {
+        use crate::channel::{Channel, Feature};
+        use crate::placement::Placement;
+
+        let source = "[sandbox]\ndefault_env = \"box\"\n[env.box]\nplacement = \"ssh\"\n[env.box.ssh]\nhost = \"box.example\"\n";
+        let mut stable: Config = toml::from_str(source).unwrap();
+        let clamped = stable.clamp_to_channel(Channel::Stable);
+        assert!(clamped.contains(&Feature::Remote));
+        let loc = GitLoc::Local(std::path::PathBuf::from("/wt/x"));
+        let (env, _) = resolve_environment(
+            &stable,
+            std::path::Path::new("/repo"),
+            &loc,
+            std::path::Path::new("/wt/x"),
+            None,
+            &Approvals::deny_all(),
+        );
+        assert_eq!(env.name, "box");
+        assert!(env.placement.is_local());
+        assert!(env.unresolved_selection);
+
+        let mut dev: Config = toml::from_str(source).unwrap();
+        assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
+        let (env, _) = resolve_environment(
+            &dev,
+            std::path::Path::new("/repo"),
+            &loc,
+            std::path::Path::new("/wt/x"),
+            None,
+            &Approvals::deny_all(),
+        );
+        assert!(matches!(env.placement, Placement::Ssh(_)));
         assert!(!env.unresolved_selection);
     }
 

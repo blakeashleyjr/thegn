@@ -503,6 +503,23 @@ pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
     errors
 }
 
+/// Warn when a configured lifetime ceiling has no scheduled destroy reaper.
+pub fn unenforced_lifetime_warnings(cfg: &crate::config::Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (env_name, env) in &cfg.env {
+        let provider = env.provider.provider.trim();
+        if !provider.is_empty()
+            && env.provider.max_lifetime_secs > 0
+            && !crate::config::EnvProviderKind::of(provider).lifetime_reaped()
+        {
+            warnings.push(format!(
+                "env.{env_name}.provider.max_lifetime_secs: not enforced for provider `{provider}` (only the Fly and VPS reapers destroy instances past a lifetime ceiling); destroy instances yourself or set it to 0"
+            ));
+        }
+    }
+    warnings
+}
+
 pub fn validate_metadata(
     metadata: &BTreeMap<String, String>,
 ) -> Result<(), ProviderAdmissionError> {

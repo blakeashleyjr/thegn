@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use thegn_core::channel::Feature;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::remote::GitLoc;
@@ -106,9 +107,10 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
             return Some(SandboxHalt {
                 env_name: environment.name.clone(),
                 placement: format!("env {}", environment.name),
-                reason: format!(
-                    "env '{}' is not defined ([env.{}] missing); its selection was dropped",
-                    environment.name, environment.name
+                reason: unresolved_env_reason(
+                    &environment.name,
+                    crate::channel_state::clamped(Feature::Remote)
+                        || crate::channel_state::clamped(Feature::Providers),
                 ),
                 ask: matches!(mode, thegn_core::config::FailoverMode::Ask),
                 dormant: None,
@@ -174,4 +176,30 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
         tracing::debug!(target: "thegn::sandbox", env = %environment.name, "env_halt_reason: provider OK, no halt");
     }
     None
+}
+
+fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
+    if channel_clamped {
+        format!(
+            "env '{name}' is not available on the stable channel (ssh and provider environments are dev-only: set THEGN_CHANNEL=dev), or [env.{name}] is missing; its selection was dropped"
+        )
+    } else {
+        format!("env '{name}' is not defined ([env.{name}] missing); its selection was dropped")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unresolved_env_reason;
+
+    #[test]
+    fn unresolved_reason_names_the_stable_channel_when_clamped() {
+        let stable = unresolved_env_reason("box", true);
+        assert!(stable.contains("stable channel"));
+        assert!(stable.contains("THEGN_CHANNEL=dev"));
+        assert_eq!(
+            unresolved_env_reason("box", false),
+            "env 'box' is not defined ([env.box] missing); its selection was dropped"
+        );
+    }
 }
