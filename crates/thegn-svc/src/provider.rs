@@ -623,7 +623,17 @@ impl SpritesProvider {
     /// Parse one list page (an array, or `{ "sprites": [...] }`).
     fn parse_list_page(v: &serde_json::Value) -> Result<SpritesListPage> {
         let next = match v.get("has_more") {
-            None | Some(serde_json::Value::Bool(false)) => None,
+            None | Some(serde_json::Value::Bool(false)) => {
+                if v.get("next_continuation_token")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|token| !token.is_empty())
+                {
+                    return Err(anyhow!(
+                        "sprites: GET /sprites returned a continuation token without has_more; refusing an ambiguous inventory"
+                    ));
+                }
+                None
+            }
             Some(serde_json::Value::Bool(true)) => {
                 let token = v
                     .get("next_continuation_token")
@@ -843,7 +853,7 @@ impl RemoteProvider for SpritesProvider {
                     for name in page.names {
                         if !seen_names.insert(name.clone()) {
                             return Err(anyhow!(
-                                "sprites list returned duplicate sprite name {name}"
+                                "sprites list returned duplicate sprite name {name} (the continuation token may have been ignored)"
                             ));
                         }
                         names.push(name);
@@ -862,7 +872,10 @@ impl RemoteProvider for SpritesProvider {
             tokio::time::timeout(crate::vps::INVENTORY_BUDGET, listing)
                 .await
                 .map_err(|_| {
-                    anyhow!("sprites list exceeded the 120 second budget; refusing a partial list")
+                    anyhow!(
+                        "sprites list exceeded the {} second budget; refusing a partial list",
+                        crate::vps::INVENTORY_BUDGET.as_secs()
+                    )
                 })?
         })
     }
@@ -3646,6 +3659,21 @@ mod tests {
             "has_more": true
         }));
         assert!(result.unwrap_err().to_string().contains("has_more"));
+    }
+
+    #[test]
+    fn sprites_list_page_refuses_token_without_has_more() {
+        let result = SpritesProvider::parse_list_page(&serde_json::json!({
+            "sprites": [],
+            "has_more": false,
+            "next_continuation_token": "t1"
+        }));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("continuation token without has_more")
+        );
     }
 
     #[tokio::test]
