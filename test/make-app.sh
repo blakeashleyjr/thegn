@@ -134,11 +134,12 @@ run_make_app --dest "$dry_dest" --dry-run >"$tmp/dry-run.out" || fail "dry-run f
 
 # Environment values stay data through the launcher, including shell syntax and newlines.
 probe=$'a;b $(touch '"$tmp"$'/pwned) `touch '"$tmp"$'/pwned2` \'q\' "d" \\ %s\nline2 *?[x]'
+test_user="${USER:-tester}"
 probe_apps="$tmp/probe-apps"
 run_make_app --bin "$mac_bin/envdump" --dest "$probe_apps" --env "TG_PROBE=$probe" --env TG_EMPTY= >/dev/null ||
   fail "hostile environment bundle generation failed"
 probe_bundle="$probe_apps/thegn.app"
-ENVDUMP_OUT="$tmp/envdump.out" bash "$probe_bundle/Contents/Resources/thegn.command" || fail "environment launcher failed"
+ENVDUMP_OUT="$tmp/envdump.out" USER="$test_user" bash "$probe_bundle/Contents/Resources/thegn.command" || fail "environment launcher failed"
 printf '%s' "$probe" >"$tmp/probe.expected"
 cmp -s "$tmp/probe.expected" "$tmp/envdump.out" || fail "environment value changed in transit"
 [[ ! -s "$tmp/envdump.out.empty" ]] || fail "empty environment value was not preserved"
@@ -153,6 +154,7 @@ if grep -Fq 'TG_PROBE' "$probe_bundle/Contents/Resources/common.sh"; then
 fi
 # shellcheck source=/dev/null
 command_text="$(
+  export USER="$test_user"
   . "$probe_bundle/Contents/Resources/common.sh"
   thegn_command /x/thegn /x/ghostty
 )"
@@ -164,9 +166,18 @@ fi
 tampered_bundle="$tmp/tampered.app"
 cp -R "$probe_bundle" "$tampered_bundle"
 printf 'BAD;KEY=x\0' >>"$tampered_bundle/Contents/Resources/env"
-if ENVDUMP_OUT="$tmp/tampered.out" bash "$tampered_bundle/Contents/Resources/thegn.command" >"$tmp/tampered.stdout" 2>"$tmp/tampered.stderr"; then
+if ENVDUMP_OUT="$tmp/tampered.out" USER="$test_user" bash "$tampered_bundle/Contents/Resources/thegn.command" >"$tmp/tampered.stdout" 2>"$tmp/tampered.stderr"; then
   fail "tampered environment key was accepted"
 fi
 [[ ! -e "$tmp/tampered.out" ]] || fail "tampered environment reached the target process"
+
+# A record without '=' is malformed even though its text resembles a valid key.
+no_value_bundle="$tmp/no-value.app"
+cp -R "$probe_bundle" "$no_value_bundle"
+printf 'FOO\0' >>"$no_value_bundle/Contents/Resources/env"
+if ENVDUMP_OUT="$tmp/no-value.out" USER="$test_user" bash "$no_value_bundle/Contents/Resources/thegn.command" >"$tmp/no-value.stdout" 2>"$tmp/no-value.stderr"; then
+  fail "environment record without '=' was accepted"
+fi
+[[ ! -e "$tmp/no-value.out" ]] || fail "malformed environment record reached the target process"
 
 echo "make-app tests passed"
