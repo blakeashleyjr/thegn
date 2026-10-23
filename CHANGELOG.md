@@ -9,6 +9,57 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.35] — 2026-10-23 (maintenance batch 72)
 
+### Added
+
+- `[forward] allow_external_bind = true` opts in to forwarding ports on a
+  non-loopback address (dev channel). `thegn config validate` warns when
+  `max_lifetime_secs` is set for a provider without a lifetime reaper (dev
+  channel).
+
+### Changed
+
+- Usage alerts keep one inbox entry per account, window, alert level and reset
+  period. Repeats update it in place, and a dismissed alert stays dismissed
+  until the window resets or usage recovers. A `Needs you` process failure
+  clears when acknowledged, when the same program later exits cleanly, when
+  its worktree is removed, or after seven days.
+- Stopping a bore, frp or iroh share remains `stopping…` until its tunnel
+  client exits. `thegn merge land` and the panel's land key require the branch
+  to still point at the commit the queue verified. With the `rebase` strategy,
+  unsupported merge histories are held for review instead of being replayed.
+- A plugin host call newer than the plugin's declared API is refused as
+  unsupported. On the stable channel, SSH and provider `[env.*]` environments
+  are removed, and a worktree selecting one halts with a hint to set
+  `THEGN_CHANNEL=dev`. The README and help clarify the alpha's limits,
+  including plugin isolation, sandbox access to `$HOME`, and MCP write scopes.
+
+### Fixed
+
+- Clearing an inbox row no longer lets an older background refresh restore it.
+  Media controls are not sent when the player's state cannot be read, and a
+  slow read after a control no longer reports that control as timed out.
+- System-monitor graphs retain their colours, including the Thermal and
+  Network ramps, dim Power labels, and the background of stacked graphs.
+  Staging directories left by a crashed URL clone are cleaned up on a later
+  clone. Daemon startup no longer waits indefinitely on a held control-runtime
+  allocation lock. Language servers log one warning when a configured CPU cap
+  cannot be applied. `just release-artifacts` honours `CARGO_TARGET_DIR`.
+- Accounts that resolve to the same credential directory through a symlink or
+  `..` path are refused.
+
+### Security
+
+- GitHub reviews are pinned to the head commit shown by the panel; a forge that
+  cannot pin a review refuses to submit it. `file:` secrets are read only
+  from a regular file owned by you or root, with no world access, one hard
+  link and at most 64 KiB; final-component symlinks are followed and checked,
+  and group access produces a one-time warning. Keyring reads distinguish
+  missing, denied and unavailable secrets.
+- `thegn session move` refuses bundles over 4 MiB, pane metadata deeper than
+  32 levels, or objects with duplicate keys before listing or stopping
+  sessions. Non-loopback `[forward] bind` values are refused unless
+  `allow_external_bind = true`.
+
 ## [0.1.0-alpha.34] — 2026-10-22 (maintenance batch 71)
 
 ### Added

@@ -61,6 +61,10 @@ A pasted git URL is cloned into a private staging directory beside the
 destination, then renamed into place only after the clone validates. A failed
 or cancelled clone leaves no destination; a destination with an origin but no
 HEAD is refused as an incomplete clone (`remove it and retry`).
+If a clone crashed and left its staging directory behind, a later clone to the
+same destination reclaims it only when its process is gone and the directory
+is owned by you. Live clones, symlinks and other paths are left alone, and a
+failed cleanup does not fail the new clone.
 
 Lifecycle hooks apply to every creation door, including the wizard, `wt new`,
 issue dispatch, and the daemon's `worktrees.create` request. A blocking
