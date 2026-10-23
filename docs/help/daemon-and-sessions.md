@@ -251,6 +251,19 @@ verbs need no token; tokens are always required over TCP. Set
 `thegn pair approve <id>` — otherwise possession of the pairing URL _is_
 the credential.
 
+The local Unix control endpoint is bound to the daemon's effective uid in its
+filesystem namespace. Its parent directory is owner-only (`0700`) and its
+socket is `0600` in both `[serve] local_admin` modes. Before sending a token,
+the client checks the parent and verifies that the connected socket peer has
+the same uid; lock acquisition and stale-socket probing are bounded and fail
+closed. Sandboxes cannot access the control directory; see Sandboxing. This
+does not distinguish another same-uid process that can reach the parent: it is
+the same filesystem principal, and there is no cryptographic server identity.
+For token-only setups (`[serve] local_admin = false`) with a custom
+`[daemon] socket`, move the socket into `$XDG_RUNTIME_DIR` or the default
+private location. Never use a shared, group-writable, or sandbox-mounted
+directory; the daemon refuses an unsafe parent at startup.
+
 ## Lifetimes
 
 `[daemon] lease_grace_secs` decides how long a session's PTY stays warm
