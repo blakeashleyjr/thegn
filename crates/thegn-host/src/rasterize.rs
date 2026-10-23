@@ -7,7 +7,7 @@
 //! terminal without graphics) never breaks the preview — it just shows text.
 //! No AI/agent dependency anywhere.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -189,7 +189,83 @@ where
     allowed
 }
 
-fn renderer_command(program: &str, stage: &RenderStage) -> Command {
+/// Why a renderer binary was not used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RendererLookup {
+    /// No absolute PATH entry holds the program.
+    Missing,
+    /// Every candidate lives inside the previewed repository (first refused candidate kept for the message).
+    Shadowed(PathBuf),
+}
+
+impl RendererLookup {
+    fn describe(&self, program: &str) -> String {
+        match self {
+            RendererLookup::Missing => format!("{program} not found on PATH"),
+            RendererLookup::Shadowed(path) => format!(
+                "{program} at {} is inside the previewed repository; refusing to run it",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// The nearest ancestor of `previewed` (a file) that holds a `.git` entry (directory or gitfile):
+/// the repository or worktree whose content is being previewed. `None` outside any repository.
+fn untrusted_root_for(previewed: &Path) -> Option<PathBuf> {
+    let start = previewed.canonicalize().ok()?;
+    let dir = start.parent()?;
+    dir.ancestors()
+        .find(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
+        .map(Path::to_path_buf)
+}
+
+/// Resolve `program` through absolute PATH entries, skipping candidates in the untrusted repository.
+fn resolve_renderer(
+    program: &str,
+    path_var: Option<&OsStr>,
+    untrusted_root: Option<&Path>,
+) -> Result<PathBuf, RendererLookup> {
+    let Some(path_var) = path_var else {
+        return Err(RendererLookup::Missing);
+    };
+    let root =
+        untrusted_root.map(|root| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
+    let mut first_shadowed = None;
+    for entry in std::env::split_paths(path_var).filter(|entry| entry.is_absolute()) {
+        let candidate = entry.join(program);
+        if !std::fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        let entry_canon = entry.canonicalize().unwrap_or_else(|_| entry.clone());
+        let is_shadowed = root
+            .as_ref()
+            .is_some_and(|root| canonical.starts_with(root) || entry_canon.starts_with(root));
+        if is_shadowed {
+            first_shadowed.get_or_insert(candidate);
+            continue;
+        }
+        return Ok(candidate);
+    }
+    match first_shadowed {
+        Some(path) => Err(RendererLookup::Shadowed(path)),
+        None => Err(RendererLookup::Missing),
+    }
+}
+
+fn renderer_for(program: &str, previewed: &Path) -> Result<PathBuf, RendererLookup> {
+    resolve_renderer(
+        program,
+        std::env::var_os("PATH").as_deref(),
+        untrusted_root_for(previewed).as_deref(),
+    )
+}
+
+/// `program` is resolved by `renderer_for`, which refuses a renderer inside the previewed repository.
+fn renderer_command(program: &Path, stage: &RenderStage) -> Command {
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -348,7 +424,9 @@ pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     let stage = RenderStage::new()?;
     let staged = stage_input(&stage, path, "input.pdf", MAX_PREVIEW_FILE_BYTES)
         .map_err(|e| format!("preview staging failed: {e}"))?;
-    let mut cmd = renderer_command("pdftoppm", &stage);
+    let program = renderer_for("pdftoppm", path)
+        .map_err(|e| format!("pdftoppm: {}", e.describe("pdftoppm")))?;
+    let mut cmd = renderer_command(&program, &stage);
     cmd.args(pdftoppm_args(&staged));
     let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
         .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
@@ -377,7 +455,12 @@ pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let stage = RenderStage::new()?;
     let staged = stage_input(&stage, path, "input.pdf", MAX_PREVIEW_FILE_BYTES)
         .map_err(|e| format!("preview staging failed: {e}"))?;
-    let mut cmd = renderer_command("pdftotext", &stage);
+    let program = match renderer_for("pdftotext", path) {
+        Ok(program) => program,
+        Err(RendererLookup::Missing) => return Err("no text extractor available".to_string()),
+        Err(error) => return Err(error.describe("pdftotext")),
+    };
+    let mut cmd = renderer_command(&program, &stage);
     cmd.args(pdftotext_args(&staged));
     match crate::preview_jobs::run_renderer(&mut cmd, cancel) {
         Ok(out) | Err(C::Capped(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
@@ -399,7 +482,9 @@ pub fn mermaid(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
     let staged = stage_input(&stage, path, "input.mmd", MAX_MERMAID_INPUT_BYTES)
         .map_err(|e| format!("preview staging failed: {e}"))?;
     let tmp = stage.path().join("render.png");
-    let mut cmd = renderer_command("mmdc", &stage);
+    let program =
+        renderer_for("mmdc", path).map_err(|e| format!("mmdc: {}", e.describe("mmdc")))?;
+    let mut cmd = renderer_command(&program, &stage);
     cmd.args(mermaid_args(&staged, &tmp));
     match crate::preview_jobs::run_renderer_quiet(&mut cmd, cancel) {
         Ok(()) => read_mermaid_output(stage.path(), "render.png", MAX_MERMAID_OUTPUT_BYTES),
@@ -450,6 +535,137 @@ fn capture_err(e: &crate::preview_jobs::CaptureError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RendererFixture {
+        repo: PathBuf,
+        repo_bin: PathBuf,
+        system: PathBuf,
+        other: PathBuf,
+    }
+
+    fn renderer_fixture(root: &Path) -> RendererFixture {
+        let repo = root.join("repo");
+        let repo_bin = repo.join("bin");
+        let system = root.join("system");
+        let other = root.join("other");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&repo_bin).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(repo_bin.join("pdftoppm"), b"repo renderer").unwrap();
+        std::fs::write(system.join("pdftoppm"), b"system renderer").unwrap();
+        std::fs::write(other.join("pdftoppm"), b"other renderer").unwrap();
+        std::fs::write(repo.join("doc.pdf"), b"pdf").unwrap();
+        RendererFixture {
+            repo,
+            repo_bin,
+            system,
+            other,
+        }
+    }
+
+    #[test]
+    fn renderer_resolution_skips_a_shadow_inside_the_previewed_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = renderer_fixture(temp.path());
+        let path = std::env::join_paths([fixture.repo_bin.as_os_str(), fixture.system.as_os_str()])
+            .unwrap();
+        let root = untrusted_root_for(&fixture.repo.join("doc.pdf"));
+        assert_eq!(
+            resolve_renderer("pdftoppm", Some(&path), root.as_deref()),
+            Ok(fixture.system.join("pdftoppm"))
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_refuses_when_only_a_repo_shadow_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = renderer_fixture(temp.path());
+        let path = std::env::join_paths([fixture.repo_bin.as_os_str()]).unwrap();
+        let result = resolve_renderer(
+            "pdftoppm",
+            Some(&path),
+            untrusted_root_for(&fixture.repo.join("doc.pdf")).as_deref(),
+        );
+        assert_eq!(
+            result,
+            Err(RendererLookup::Shadowed(fixture.repo_bin.join("pdftoppm")))
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .describe("pdftoppm")
+                .contains("inside the previewed repository")
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_refuses_a_symlink_into_the_repo() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = renderer_fixture(temp.path());
+        let system = temp.path().join("symlink-bin");
+        std::fs::create_dir(&system).unwrap();
+        let link = system.join("pdftoppm");
+        if crate::platform::test_symlink(&fixture.repo_bin.join("pdftoppm"), &link).is_err() {
+            return;
+        }
+        let path = std::env::join_paths([system.as_os_str()]).unwrap();
+        assert_eq!(
+            resolve_renderer(
+                "pdftoppm",
+                Some(&path),
+                untrusted_root_for(&fixture.repo.join("doc.pdf")).as_deref()
+            ),
+            Err(RendererLookup::Shadowed(link))
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_untrusted_root_is_the_nearest_git_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let nested = repo.join("a/b");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let doc = nested.join("doc.pdf");
+        std::fs::write(&doc, b"pdf").unwrap();
+        assert_eq!(untrusted_root_for(&doc), Some(repo.canonicalize().unwrap()));
+
+        let repo_with_gitfile = temp.path().join("repo-with-gitfile");
+        std::fs::create_dir_all(&repo_with_gitfile).unwrap();
+        std::fs::write(repo_with_gitfile.join(".git"), b"gitdir: /elsewhere").unwrap();
+        let gitfile_doc = repo_with_gitfile.join("doc.pdf");
+        std::fs::write(&gitfile_doc, b"pdf").unwrap();
+        assert_eq!(
+            untrusted_root_for(&gitfile_doc),
+            Some(repo_with_gitfile.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_without_a_root_uses_the_first_absolute_entry() {
+        // Positive control: without a repository root, the first absolute PATH hit remains selected.
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = renderer_fixture(temp.path());
+        let path = std::env::join_paths([
+            std::ffi::OsStr::new("relative/bin"),
+            fixture.system.as_os_str(),
+            fixture.other.as_os_str(),
+        ])
+        .unwrap();
+        assert_eq!(
+            resolve_renderer("pdftoppm", Some(&path), None),
+            Ok(fixture.system.join("pdftoppm"))
+        );
+        let missing_path = std::env::join_paths([temp.path().as_os_str()]).unwrap();
+        assert_eq!(
+            resolve_renderer("absent-renderer", Some(&missing_path), None),
+            Err(RendererLookup::Missing)
+        );
+    }
 
     #[test]
     fn renderer_env_drops_credentials_and_stages_home() {
@@ -544,7 +760,7 @@ mod tests {
             return;
         }
         let stage = RenderStage::new().unwrap();
-        let mut command = renderer_command("sh", &stage);
+        let mut command = renderer_command(Path::new("/bin/sh"), &stage);
         command.arg("-c").arg("pwd; env");
         let output =
             crate::preview_jobs::run_renderer(&mut command, &AtomicBool::new(false)).unwrap();
