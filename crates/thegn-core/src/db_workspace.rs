@@ -593,6 +593,14 @@ impl WorkspaceStore for Db {
                 "kept the merge-queue row of a removed worktree: claimed by an active drain"
             );
         }
+        // Audit events follow their queue row: a row kept above (claimed by a
+        // drain, or a retained cleanup hold) keeps its events; otherwise the
+        // path's events go with the worktree.
+        self.conn().execute(
+            "DELETE FROM merge_queue_events WHERE worktree=?1 \
+             AND NOT EXISTS (SELECT 1 FROM merge_queue WHERE worktree=?1)",
+            params![wt],
+        )?;
         Ok(())
     }
 
@@ -635,6 +643,11 @@ impl WorkspaceStore for Db {
         self.conn().execute(
             "UPDATE worktrees SET worktree=?2, tab_name=?3, branch=?4 WHERE worktree=?1",
             params![old_path, new_path, new_tab, new_branch],
+        )?;
+        self.conn().execute(
+            "DELETE FROM merge_queue_events WHERE worktree=?1 \
+             AND NOT EXISTS (SELECT 1 FROM merge_queue WHERE worktree=?1)",
+            params![old_path],
         )?;
         Ok(())
     }
