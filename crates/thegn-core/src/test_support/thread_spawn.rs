@@ -19,6 +19,22 @@ pub fn spawns_unnamed_thread(code: &str) -> bool {
         .is_match(&code)
 }
 
+/// Return whether production code constructs a thread with `thread::Builder`.
+///
+/// Production threads go through `thegn_core::thread_name::spawn_named` or
+/// `try_spawn_named`; a direct Builder is debt because those helpers are the
+/// naming chokepoint (and `thread_name.rs` is excluded from this ratchet).
+pub fn builds_thread_directly(code: &str) -> bool {
+    let mut code = crate::test_support::ratchet::code_only(code);
+    if let Some(test_module) = inline_test_module_start(&code) {
+        code.truncate(test_module);
+    }
+
+    Regex::new(r"(?:^|[^A-Za-z0-9_])thread::Builder::new\s*\(")
+        .expect("thread builder predicate regex is valid")
+        .is_match(&code)
+}
+
 /// Return whether a source file is a whole-file test module excluded from
 /// production thread scans.
 pub fn is_test_module_file(key: &str) -> bool {
@@ -27,8 +43,9 @@ pub fn is_test_module_file(key: &str) -> bool {
 }
 
 /// Return thread-name literals that lack the `thegn-` prefix or exceed Linux's
-/// 15-byte comm limit. Non-literal names (such as `format!(..)`, variables, or
-/// constants) are not checked because a lexical scan cannot evaluate them.
+/// 15-byte comm limit. For `format!` names, the literal prefix before the
+/// first `{` is checked. Variables, constants and helper-returned names remain
+/// unchecked because a lexical scan cannot evaluate them.
 pub fn bad_thread_name_literals(code: &str) -> Vec<String> {
     let mut code = crate::test_support::ratchet::code_only(code);
     if let Some(test_module) = inline_test_module_start(&code) {
@@ -36,12 +53,20 @@ pub fn bad_thread_name_literals(code: &str) -> Vec<String> {
     }
 
     Regex::new(
-        r#"(?:\bthread::Builder::new\(\)\s*\.name|\.thread_name|\bspawn_named|\btry_spawn_named)\s*\(\s*"([^"\\]*)""#,
+        r#"(?:\bthread::Builder::new\(\)\s*\.name|\.thread_name|\bspawn_named|\btry_spawn_named)\s*\(\s*(?:"([^"\\]*)"|&?\s*format!\s*\(\s*"([^"\\]*)")"#,
     )
     .expect("thread name literal regex is valid")
     .captures_iter(&code)
-    .filter_map(|captures| captures.get(1).map(|name| name.as_str()))
-    .filter(|name| name.len() > 15 || !name.starts_with("thegn-"))
+    .filter_map(|captures| {
+        captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .map(|name| name.as_str())
+    })
+    .filter(|name| {
+        let prefix = name.split_once('{').map_or(*name, |(prefix, _)| prefix);
+        prefix.len() > 15 || !prefix.starts_with("thegn-")
+    })
     .map(str::to_owned)
     .collect()
 }
@@ -66,7 +91,28 @@ fn inline_test_module_start(code: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bad_thread_name_literals, is_test_module_file, spawns_unnamed_thread};
+    use super::{
+        bad_thread_name_literals, builds_thread_directly, is_test_module_file,
+        spawns_unnamed_thread,
+    };
+
+    #[test]
+    fn builds_thread_directly_finds_production_builders() {
+        let cases = [
+            ("std::thread::Builder::new().spawn(f);", true),
+            (
+                "#[cfg(test)]\nmod tests { std::thread::Builder::new(); }",
+                false,
+            ),
+            ("// thread::Builder::new()", false),
+            ("spawn_named(\"thegn-worker\", f);", false),
+            ("tokio::runtime::Builder::new_multi_thread();", false),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(builds_thread_directly(source), expected, "{source}");
+        }
+    }
 
     #[test]
     fn test_module_files_are_recognized_by_basename() {
@@ -112,7 +158,7 @@ mod tests {
 
     #[test]
     fn bad_thread_name_literals_cover_builder_and_spawn_named_shapes() {
-        let cases: [(&str, &[&str]); 11] = [
+        let cases: [(&str, &[&str]); 14] = [
             (
                 r#"std::thread::Builder::new().name("thegn-plugin-once".into()).spawn(f);"#,
                 &["thegn-plugin-once"],
@@ -140,7 +186,13 @@ mod tests {
             ),
             (
                 r#"std::thread::Builder::new().name(format!("mcp-up-{n}"))"#,
-                &[],
+                &["mcp-up-{n}"],
+            ),
+            (r#"spawn_named(format!("thegn-x-{n}"), f)"#, &[]),
+            (r#"spawn_named(format!("thegn-mcp-{n}"), f)"#, &[]),
+            (
+                r#"try_spawn_named(&format!("thegn-a-very-long-{n}"), f)"#,
+                &["thegn-a-very-long-{n}"],
             ),
             (
                 r#"clap::Arg::new("x").name("a-very-long-argument-name")"#,

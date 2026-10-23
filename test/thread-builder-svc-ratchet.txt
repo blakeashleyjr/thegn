@@ -1,0 +1,11 @@
+# Rule: direct production `thread::Builder::new` sites are debt; route them through `spawn_named` / `try_spawn_named` and delete the line.
+# Seeded from the Builder sites at 9d160e2b5 (THE-931); every entry is debt: route the thread through spawn_named/try_spawn_named and delete the line.
+# SHRINK-ONLY. Enforced by `thread_builders_go_through_spawn_named_ratchet` in crates/thegn-svc/src/platform_ratchet_tests.rs; regenerate with `just ratchet-update`.
+
+bridge/mod.rs
+ci.rs
+forge/native.rs
+git/filter_process.rs
+lsp/mod.rs
+plugin/platform/windows.rs
+voice.rs
