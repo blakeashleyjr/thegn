@@ -1440,10 +1440,11 @@ mod tests {
                         .db
                         .claim_ci_autofix(&handoff.entry.candidate())
                         .unwrap();
-                    if claimable != !dispatched {
+                    let expected_claimable = !dispatched;
+                    if claimable != expected_claimable {
                         failures.push(format!(
                             "{cell}, mode={mode:?}, human={human_authorized}: claimable={claimable}, expected={}",
-                            !dispatched
+                            expected_claimable
                         ));
                     }
 
