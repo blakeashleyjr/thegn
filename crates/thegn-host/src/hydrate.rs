@@ -2839,8 +2839,11 @@ pub(crate) fn build_model(
     // Use the EFFECTIVE env selection (per-worktree override, else the
     // workspace default) — the same source the loading splash's
     // `agent::loading_context` uses. Reading raw `worktree_env` here missed the
-    // workspace-default case. An unreadable selection shows the `env?` chip,
-    // see `unreadable_env_chips`.
+    // workspace-default case: a worktree created under a workspace whose default
+    // env is a provider (e.g. `sprites`) has no per-worktree row, so the tab bar
+    // resolved it as Local — no `[sprites]` chip and a bogus `(bwrap)` chip —
+    // while the splash correctly showed the provider placement. An unreadable
+    // selection shows the `env?` chip, see `unreadable_env_chips`.
     let selection = db.effective_env_checked(&active_path, &active_repo);
     let selection_error: Option<String> =
         selection.as_ref().err().map(|error| format!("{error:#}"));
@@ -2886,7 +2889,7 @@ pub(crate) fn build_model(
     // provider/ssh location) must never show a local backend chip, even when
     // env resolution degrades to Local (missing `[env.*]`, config drift).
     // (`loc_is_local` was bound above for the placement-chip degrade check.)
-    if active_env.placement.is_local() && !loc_is_local {
+    if selection_error.is_none() && active_env.placement.is_local() && !loc_is_local {
         tracing::warn!(
             worktree = %active_path,
             env = %active_env.name,

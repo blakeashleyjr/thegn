@@ -1768,10 +1768,12 @@ pub fn provider_proxy_target(
     Some((provider, id, workdir, provider_kind, custody_account))
 }
 
-/// Why [`provider_proxy_target`] returned `None`, for the `sprite-proxy` error:
-/// a state-database or environment-selection read failure is named as such
-/// (the refusal itself only reaches tracing, which has no sink in a
-/// ProxyCommand child); otherwise the generic reasons stand.
+/// Builds the `sprite-proxy` refusal message after [`provider_proxy_target`]
+/// returned `None`. This is a second, best-effort read of the selection, not a
+/// diagnosis of the refusal's own cause: a state-database or environment-
+/// selection read failure is named as such (the refusal itself only reaches
+/// tracing, which has no sink in a ProxyCommand child); otherwise the generic
+/// reasons stand.
 pub(crate) fn provider_proxy_refusal(worktree: &str) -> String {
     let read = Db::open().and_then(|db| {
         let repo_root: PathBuf = db

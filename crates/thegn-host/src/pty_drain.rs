@@ -123,7 +123,8 @@ fn fast_fail_placement_known_local(
     active_placement_kind: Option<&str>,
     force_host: bool,
 ) -> bool {
-    is_active_group && (active_placement_kind.is_none() || force_host)
+    is_active_group
+        && (active_placement_kind.is_none() || active_placement_kind == Some("env?") || force_host)
 }
 
 /// Raw, unparsed PTY chunks awaiting their parse slice, per pane, FIFO within
@@ -1764,6 +1765,7 @@ mod tests {
     fn fast_fail_placement_known_local_only_skips_known_local_active_groups() {
         let cases = [
             (true, None, false, true),
+            (true, Some("env?"), false, true),
             (true, Some("ssh"), false, false),
             (true, Some("ssh"), true, true),
             (false, None, false, false),
@@ -2625,7 +2627,7 @@ mod tests {
     #[test]
     fn connect_failure_selection_skips_an_unreadable_selection() {
         assert!(
-            connect_failure_selection("/wt", Err(anyhow::anyhow!("database is locked")),).is_none()
+            connect_failure_selection("/wt", Err(anyhow::anyhow!("database is locked"))).is_none()
         );
     }
 
