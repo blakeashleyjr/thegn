@@ -1574,11 +1574,13 @@ mod tests {
     // Positive control: URL rows are rendered in the normal panel and sanitized at the segment boundary.
     #[test]
     fn share_normal_row_shows_sanitized_url_endpoint() {
-        let mut view = share_view(
-            thegn_svc::share::PublicEndpoint::parse_url("https://safe.example")
-                .expect("valid URL endpoint"),
-        );
-        view.url = Some("https://safe.example\u{1b}[31m".into());
+        let view = crate::share::ShareView {
+            url: Some("https://safe.example\u{1b}[31m".into()),
+            ..share_view(
+                thegn_svc::share::PublicEndpoint::parse_url("https://safe.example")
+                    .expect("valid URL endpoint"),
+            )
+        };
         let rendered = render_share(PanelWidth::Normal, view);
         assert!(rendered.contains("https://safe.example"));
         assert!(!rendered.chars().any(char::is_control));
@@ -1634,11 +1636,13 @@ mod tests {
     // Positive control: URL rows are rendered in the full panel and sanitized at the segment boundary.
     #[test]
     fn share_full_row_shows_sanitized_url_endpoint() {
-        let mut view = share_view(
-            thegn_svc::share::PublicEndpoint::parse_url("https://safe.example")
-                .expect("valid URL endpoint"),
-        );
-        view.url = Some("https://safe.example\u{1b}[31m".into());
+        let view = crate::share::ShareView {
+            url: Some("https://safe.example\u{1b}[31m".into()),
+            ..share_view(
+                thegn_svc::share::PublicEndpoint::parse_url("https://safe.example")
+                    .expect("valid URL endpoint"),
+            )
+        };
         let rendered = render_share(PanelWidth::Full, view);
         assert!(rendered.contains("https://safe.example"));
         assert!(!rendered.chars().any(char::is_control));
