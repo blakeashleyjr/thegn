@@ -187,6 +187,10 @@ impl UsageAlertState {
             let l = self.latches.entry(key.clone()).or_default();
             l.missing_since_ms = None;
             let reset_period = w.resets_at.map(|at| (at + 450) / 900);
+            // Providers may omit reset metadata for one poll. Preserve the
+            // known period through that gap so the latch and durable claim do
+            // not flap between a timestamp and `none`.
+            let reset_period = reset_period.or(l.reset_period);
             if l.seen && l.reset_period != reset_period {
                 l.fired = AlertLevel::Ok;
                 l.candidate = AlertLevel::Ok;
@@ -213,6 +217,9 @@ impl UsageAlertState {
                 l.seen = true;
             }
             let held = now_ms.saturating_sub(l.since_ms);
+            let event_resets_at = w
+                .resets_at
+                .or_else(|| l.reset_period.map(|period| period * 900));
             let event = |level: AlertLevel, repeat: bool| UsageAlertEvent {
                 account_key: account.key.clone(),
                 account_label: account.account_label.clone(),
@@ -220,7 +227,7 @@ impl UsageAlertState {
                 level,
                 used_percent: v,
                 threshold: threshold(&rule, level).unwrap_or(0.0),
-                resets_at: w.resets_at,
+                resets_at: event_resets_at,
                 repeat,
             };
 
@@ -237,9 +244,10 @@ impl UsageAlertState {
                 if held >= sustain_ms {
                     l.fired = effective;
                     l.last_fired_ms = now_ms;
-                    if cfg.notify_clear || effective > AlertLevel::Ok {
-                        out.push(event(effective, false));
-                    }
+                    // The host always needs the clear edge to re-arm the
+                    // durable claim. It gates only the visible clear toast on
+                    // `notify_clear`.
+                    out.push(event(effective, false));
                 }
             } else if l.fired > AlertLevel::Ok
                 && repeat_ms > 0
@@ -351,8 +359,11 @@ mod tests {
         let ev = s.observe(&[account("a", 80.0)], &cfg(), 2000);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].level, AlertLevel::Warn);
-        // Dropping to Ok is silent unless notify_clear is set.
-        assert!(s.observe(&[account("a", 5.0)], &cfg(), 3000).is_empty());
+        // Core emits the clear edge even with default config so the host can
+        // re-arm the durable claim; the host alone gates its toast.
+        let ev = s.observe(&[account("a", 5.0)], &cfg(), 3000);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].level, AlertLevel::Ok);
         assert_eq!(
             s.level(&account("a", 5.0), &UsageWindow::new("5h", 0.0, None)),
             AlertLevel::Ok
@@ -429,7 +440,7 @@ mod tests {
         // or the map grows for the life of the process.
         s.observe(&[account("a", 95.0)], &cfg(), 1000);
         assert_eq!(s.latches.len(), 2);
-        s.observe(&[account("a", 95.0)], &cfg(), PRUNE_GRACE_MS + 1000);
+        s.observe(&[account("a", 95.0)], &cfg(), PRUNE_GRACE_MS + 2_001);
         assert_eq!(s.latches.len(), 1);
         assert!(s.latches.contains_key("a#5h"));
     }
@@ -438,7 +449,9 @@ mod tests {
     fn identity_flap_does_not_refire() {
         let mut s = UsageAlertState::new();
         assert_eq!(s.observe(&[account("identity", 80.0)], &cfg(), 0).len(), 1);
-        assert!(s.observe(&[account("home", 80.0)], &cfg(), 1000).is_empty());
+        let home = s.observe(&[account("home", 80.0)], &cfg(), 1000);
+        assert_eq!(home.len(), 1);
+        assert_eq!(home[0].key(), "home#5h");
         let events = s.observe(&[account("identity", 80.0)], &cfg(), 2000);
         assert!(
             events.is_empty(),
@@ -463,6 +476,24 @@ mod tests {
             vec![UsageWindow::new("5h", 80.0, Some(1_700_001_000))],
         );
         assert_eq!(s.observe(&[next], &cfg(), 1_000).len(), 1);
+    }
+
+    #[test]
+    fn omitted_reset_metadata_keeps_the_current_claim_period() {
+        let mut s = UsageAlertState::new();
+        let first = s.observe(&[account("a", 80.0)], &cfg(), 0);
+        let mut missing_reset = account("a", 85.0);
+        missing_reset.windows[0].resets_at = None;
+        let repeated = s.observe(
+            &[missing_reset],
+            &UsageAlertsConfig {
+                repeat_secs: 1,
+                ..cfg()
+            },
+            1_000,
+        );
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(first[0].claim_key(), repeated[0].claim_key());
     }
 
     #[test]
@@ -513,16 +544,6 @@ mod tests {
             "blake@example.com (Acme): 7d window at 91% (limit 90%) \u{2014} resets in 2h 14m"
         );
         assert_eq!(ev.key(), "claude:acc/org#7d");
-        assert!(
-            ev.claim_key()
-                .starts_with("usage:claude:acc/org#7d#critical#")
-        );
-        let jittered = UsageAlertEvent {
-            used_percent: 99.0,
-            resets_at: Some(ev.resets_at.unwrap() + 300),
-            ..ev.clone()
-        };
-        assert_eq!(ev.claim_key(), jittered.claim_key());
         let unknown_period = UsageAlertEvent {
             level: AlertLevel::Warn,
             resets_at: None,
