@@ -199,9 +199,10 @@ fn resolve_binding(
         .map(std::path::PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(worktree)))
         .unwrap_or_else(|| std::path::PathBuf::from(worktree));
-    let selected = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let selected = binding_selection(
+        Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
+        cfg,
+    )?;
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -227,6 +228,28 @@ fn resolve_binding(
         return Ok(Some((environment.name, binding)));
     }
     Ok(None)
+}
+
+fn binding_selection(
+    read: anyhow::Result<Option<String>>,
+    cfg: &Config,
+) -> Result<Option<String>, HostFailure> {
+    match read {
+        Ok(selected) => Ok(selected),
+        Err(_)
+            if !cfg.placement.enabled
+                && !cfg.env.values().any(|env| !env.host.trim().is_empty()) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(HostFailure {
+            step: HostStep::Connect,
+            error: format!(
+                "the environment selection could not be read ({error:#}); refusing to place the worktree on the default environment's host"
+            ),
+            retryable: true,
+        }),
+    }
 }
 
 /// Quick prewarm/eager gate: does this worktree target a host that is NOT yet
@@ -1711,5 +1734,72 @@ mod tests {
             retryable: false,
         };
         assert!(!failure_reason(&fatal).contains("retry from"));
+    }
+
+    #[test]
+    fn binding_selection_refuses_an_unreadable_selection() {
+        let cfg = Config {
+            env: [(
+                "remote".into(),
+                thegn_core::config::EnvConfig {
+                    host: "builder".into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Config::default()
+        };
+        match binding_selection(Err(anyhow::anyhow!("locked")), &cfg) {
+            Err(failure) => {
+                assert_eq!(failure.step, HostStep::Connect);
+                assert!(failure.retryable);
+                assert!(failure.error.contains("could not be read"));
+            }
+            Ok(_) => panic!("unreadable selection must refuse placement"),
+        }
+    }
+
+    #[test]
+    fn binding_selection_passes_a_read_through() {
+        assert_eq!(
+            binding_selection(Ok(Some("picked".into())), &Config::default()).unwrap(),
+            Some("picked".into())
+        );
+    }
+
+    #[test]
+    fn binding_selection_allows_local_only_shell_on_unreadable_selection() {
+        assert_eq!(
+            binding_selection(Err(anyhow::anyhow!("locked")), &Config::default()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn binding_selection_refuses_unreadable_selection_when_host_may_apply() {
+        let cfg = Config {
+            env: [(
+                "remote".into(),
+                thegn_core::config::EnvConfig {
+                    host: "builder".into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Config::default()
+        };
+        assert!(binding_selection(Err(anyhow::anyhow!("locked")), &cfg).is_err());
+    }
+
+    #[test]
+    fn binding_selection_refuses_unreadable_selection_when_placement_is_enabled() {
+        let cfg = Config {
+            placement: thegn_core::config_placement::PlacementConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        assert!(binding_selection(Err(anyhow::anyhow!("locked")), &cfg).is_err());
     }
 }
