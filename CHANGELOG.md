@@ -9,6 +9,40 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.38] — 2026-10-23 (maintenance batch 75)
 
+### Changed
+
+- PR queue and CI autofix report why an agent did not start instead of treating
+  a refused launch as an ordinary agent failure. The attempt is still counted.
+- `thegn forward list`, `thegn forward stop` and `thegn placement list` report
+  unreadable recorded state as an error. `forward stop` says when no record
+  exists. `thegn placement list` reports unreadable placement state as an
+  error; `thegn host rm` refuses removal when it cannot read placement tenants
+  (dev channel).
+
+### Fixed
+
+- The merge-queue drain lands the commit it verified; it refuses a branch that
+  moved after verification. A failed PR fetch no longer changes the queue
+  row's status. Local worktree listing preserves paths containing newlines.
+- A workspace with an unreadable removal record starts as a temporary
+  workspace with a warning instead of being registered again. Late lifecycle
+  messages from a reloaded plugin no longer change the new plugin's state.
+- The Sprites list follows every page and refuses incomplete results; warm-pool
+  recycle destroys a spare when its base checkpoint cannot be confirmed.
+  Machine0 creates keep a pending reservation across an unknown outcome, count
+  it toward `max_instances`, and adopt the VM on retry (dev channel).
+
+### Security
+
+- Configured agents and tools are refused when the repository root or selected
+  execution environment cannot be read from state; a plain shell still starts
+  with a warning. PDF and Mermaid previews refuse renderers in any worktree of
+  the previewed repository, and refuse when its worktree list is unreadable.
+- Configured provider ids for Sprites, Hetzner, DigitalOcean, Fly and machine0
+  must be lowercase (dev channel). Host provisioning checks staged files
+  inside the container and marks provisioning complete only for the applied
+  plan (dev channel).
+
 ## [0.1.0-alpha.37] — 2026-10-23 (maintenance batch 74)
 
 ### Changed
