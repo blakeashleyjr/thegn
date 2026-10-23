@@ -419,6 +419,33 @@ fn try_reserve(
     )
 }
 
+fn with_fresh_host(mut hosts: Vec<HostSnapshot>, fresh: HostSnapshot) -> Vec<HostSnapshot> {
+    if !hosts.iter().any(|snapshot| snapshot.host == fresh.host) {
+        hosts.push(fresh);
+    }
+    hosts
+}
+
+fn fresh_host_unreserved(
+    on_exhaustion: OnExhaustion,
+    host_name: &str,
+    why: &str,
+) -> Result<Option<HostBinding>, HostFailure> {
+    let msg =
+        format!("placement: autoscale created {host_name} but {why}; not creating another host");
+    match on_exhaustion {
+        OnExhaustion::Error => Err(HostFailure {
+            step: HostStep::Connect,
+            error: msg,
+            retryable: true,
+        }),
+        OnExhaustion::Queue | OnExhaustion::Reject => {
+            thegn_core::msg::warn(&msg);
+            Ok(None)
+        }
+    }
+}
+
 /// Binding for a chosen host id (named hosts only — the engine never places
 /// onto anonymous or cloud hosts).
 fn binding_for(cfg: &Config, host: &HostId) -> Option<HostBinding> {
@@ -549,25 +576,59 @@ pub(crate) fn place(
                 record_event(&db, worktree, "provision", &template.lane_key(), &trace);
                 match crate::autoscale::provision_managed(cfg, &db, &template) {
                     Ok(host_name) => {
-                        // Reserve on the fresh host, then let ensure_ready
-                        // drive it (Unknown → Ready) like any other host.
-                        let hosts = build_snapshot(cfg, &db, &resolved, false);
-                        let id = HostId::named(&host_name);
+                        let (hc, binding) = match crate::autoscale::db_host_def(&db, &host_name) {
+                            Ok(Some(found)) => found,
+                            Ok(None) => {
+                                return fresh_host_unreserved(
+                                    resolved.on_exhaustion,
+                                    &host_name,
+                                    "its host definition is missing",
+                                );
+                            }
+                            Err(error) => {
+                                return fresh_host_unreserved(
+                                    resolved.on_exhaustion,
+                                    &host_name,
+                                    &format!("its host definition could not be read ({error:#})"),
+                                );
+                            }
+                        };
+                        // The loaded Config predates the create: add the fresh host to the
+                        // snapshot so the reservation can land on it.
+                        let fresh = snapshot_host(
+                            &db,
+                            &hc,
+                            &binding,
+                            &resolved,
+                            cfg.placement.independent_safety_pct,
+                            cfg.placement.headroom_ttl_secs,
+                            false,
+                        );
+                        let hosts =
+                            with_fresh_host(build_snapshot(cfg, &db, &resolved, false), fresh);
                         if try_reserve(
                             &db,
                             &hosts,
-                            &id,
+                            &binding.id,
                             worktree,
                             &zone,
                             TenancyMode::Packed,
                             &resolved,
-                        ) && let Some(b) = cfg
-                            .host_binding(&host_name)
-                            .or_else(|| crate::autoscale::db_host_binding(&host_name))
-                        {
-                            return Ok(Some(b));
+                        ) {
+                            record_event(
+                                &db,
+                                worktree,
+                                mode_tag(TenancyMode::Packed),
+                                binding.id.as_str(),
+                                &trace,
+                            );
+                            return Ok(Some(cfg.host_binding(&host_name).unwrap_or(binding)));
                         }
-                        continue;
+                        return fresh_host_unreserved(
+                            resolved.on_exhaustion,
+                            &host_name,
+                            "no slot could be reserved on it",
+                        );
                     }
                     Err(e) => {
                         thegn_core::msg::warn(&format!(
@@ -893,6 +954,7 @@ mod tests {
     use thegn_core::host::HostStep;
     use thegn_core::host_machine::HostState;
     use thegn_core::host_probe::Headroom;
+    use thegn_core::store::HostCapacityRow;
 
     fn spec(cpu_milli: u32, mem_mb: u64) -> HostSpec {
         HostSpec { cpu_milli, mem_mb }
@@ -915,6 +977,29 @@ mod tests {
             cpu_milli,
             mem_mb,
             tenants: 0,
+        }
+    }
+
+    fn managed_snapshot(host: HostId) -> HostSnapshot {
+        HostSnapshot {
+            host,
+            ownership: HostOwnership::Managed,
+            capacity: HostCapacity {
+                ownership: HostOwnership::Managed,
+                spec: None,
+                overcommit_cpu_pct: 100,
+                overcommit_mem_pct: 100,
+                reserved: ReservedTotals::default(),
+                measured: None,
+            },
+            ready: false,
+            failed: false,
+            draining: false,
+            trust: TrustClass::T0HostShell,
+            arch: None,
+            tenant_zones: BTreeSet::new(),
+            tenants: 0,
+            has_dedicated_tenant: false,
         }
     }
 
@@ -1102,5 +1187,95 @@ mod tests {
             50,
         );
         assert_eq!(s.expect("spec").mem_mb, 2048);
+    }
+
+    #[test]
+    fn fresh_host_joins_the_reservation_snapshot() {
+        let first = managed_snapshot(HostId::named("host-a"));
+        let fresh = managed_snapshot(HostId::named("host-b"));
+
+        let joined = with_fresh_host(vec![first], fresh.clone());
+
+        assert_eq!(joined.len(), 2);
+        assert_eq!(joined.last(), Some(&fresh));
+    }
+
+    #[test]
+    fn fresh_host_is_not_duplicated_in_the_snapshot() {
+        let existing = managed_snapshot(HostId::named("host-a"));
+
+        let joined = with_fresh_host(vec![existing.clone()], existing.clone());
+
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined.first(), Some(&existing));
+    }
+
+    #[test]
+    fn fresh_managed_host_is_reservable_once_in_the_snapshot() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().unwrap();
+        let name = "tg-auto-cx32-0000000000000001";
+        let hc = HostConfig {
+            reach: HostReach::Local,
+            ..HostConfig::default()
+        };
+        db.put_host_def(name, &hc, 1).unwrap();
+        db.capacity_put(&HostCapacityRow {
+            host: HostId::named(name),
+            ownership: HostOwnership::Managed,
+            spec: Some(HostSpec {
+                cpu_milli: 64_000,
+                mem_mb: 262_144,
+            }),
+            overcommit_cpu_pct: 0,
+            overcommit_mem_pct: 0,
+            provider: "hetzner".into(),
+            template: "cx32".into(),
+            created_at: Some(1),
+            measured: None,
+            updated_at: 1,
+        })
+        .unwrap();
+        let (hc, binding) = crate::autoscale::db_host_def(&db, name).unwrap().unwrap();
+        let resolved = resolve_placement(&Config::default(), None, None);
+
+        assert!(!try_reserve(
+            &db,
+            &[],
+            &binding.id,
+            "/wt/a",
+            "",
+            TenancyMode::Packed,
+            &resolved,
+        ));
+        let hosts = with_fresh_host(
+            Vec::new(),
+            snapshot_host(&db, &hc, &binding, &resolved, 100, 60, false),
+        );
+        assert!(try_reserve(
+            &db,
+            &hosts,
+            &binding.id,
+            "/wt/a",
+            "",
+            TenancyMode::Packed,
+            &resolved,
+        ));
+    }
+
+    #[test]
+    fn fresh_host_unreserved_honours_on_exhaustion() {
+        let host_name = "tg-auto-cx32-0000000000000001";
+        let refused = fresh_host_unreserved(OnExhaustion::Error, host_name, "no slot");
+        assert!(matches!(refused, Err(failure)
+            if failure.error.contains(host_name)
+                && failure.error.contains("not creating another host")));
+
+        for policy in [OnExhaustion::Queue, OnExhaustion::Reject] {
+            assert!(matches!(
+                fresh_host_unreserved(policy, host_name, "no slot"),
+                Ok(None)
+            ));
+        }
     }
 }
