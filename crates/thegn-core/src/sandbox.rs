@@ -869,10 +869,10 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
     launchable_with(spec, &crate::sandbox_control_guard::control_dirs())
 }
 
-fn launchable_with(
-    spec: &SandboxSpec,
+fn launchable_with<'a>(
+    spec: &'a SandboxSpec,
     control_dirs: &[std::path::PathBuf],
-) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
+) -> Result<std::borrow::Cow<'a, SandboxSpec>, EnterError> {
     admit_volumes(spec)?;
     if let Some(message) = compose_policy_refusal(spec) {
         return Err(refusal(spec, RefusalClass::ComposePolicy, None, message));
