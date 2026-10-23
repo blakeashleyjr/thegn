@@ -156,10 +156,11 @@ pub fn dir() -> PathBuf {
 
 /// The per-instance known_hosts file for the ssh transport: fresh VPSes mean
 /// fresh host keys, so each sandbox gets its own file (`accept-new` pins the
-/// first key) instead of polluting the global known_hosts. Removed on destroy.
-pub fn known_hosts_path(name: &str) -> PathBuf {
-    let safe = checked_name(name).unwrap_or("invalid..");
-    dir().join("known_hosts.d").join(safe)
+/// first key) instead of polluting the global known_hosts. Invalid names are
+/// refused; there is no shared fallback pin. Removed on destroy.
+pub fn known_hosts_path(name: &str) -> Result<PathBuf> {
+    let safe = checked_name(name)?;
+    Ok(dir().join("known_hosts.d").join(safe))
 }
 
 /// Accept only a single provider name component using the RFC 1123 hostname
@@ -807,10 +808,130 @@ mod tests {
         remove_at(&d, "../victim");
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
 
-        let root = dir().join("known_hosts.d");
-        let path = known_hosts_path("../../x");
-        assert!(path.starts_with(root));
-        assert!(path.ends_with("invalid.."));
+        // Invalid names are refused outright, which is stronger than mapping
+        // them beneath an owned root to a pin shared with other invalid names.
+        assert!(known_hosts_path("../../x").is_err());
+    }
+
+    #[test]
+    fn known_hosts_path_refuses_every_invalid_name() {
+        let too_long_multibyte = format!("{}é", "a".repeat(62));
+        let too_long = "a".repeat(64);
+        let names = [
+            "".to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            "../x".to_string(),
+            "/abs".to_string(),
+            "a/b".to_string(),
+            "a\\b".to_string(),
+            "a\0b".to_string(),
+            "a\nb".to_string(),
+            "a\u{7f}b".to_string(),
+            "é".to_string(),
+            "ａ".to_string(),
+            "a\u{202e}b".to_string(),
+            "-a".to_string(),
+            "a-".to_string(),
+            "a..b".to_string(),
+            ".a".to_string(),
+            "a.".to_string(),
+            "a_b".to_string(),
+            "a b".to_string(),
+            too_long,
+            too_long_multibyte,
+        ];
+
+        for name in names {
+            assert!(
+                known_hosts_path(&name).is_err(),
+                "accepted invalid name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_hosts_path_keeps_valid_names_beneath_the_pin_root() {
+        let max_name = "a".repeat(63);
+        for name in ["tg-dev-x1", max_name.as_str(), "a.b-c"] {
+            let path = known_hosts_path(name).unwrap();
+            assert!(path.starts_with(dir().join("known_hosts.d")));
+            assert_eq!(path.file_name().and_then(|part| part.to_str()), Some(name));
+        }
+    }
+
+    #[test]
+    fn checked_name_matrix_matches_the_known_hosts_matrix() {
+        let too_long_multibyte = format!("{}é", "a".repeat(62));
+        let too_long = "a".repeat(64);
+        let names = [
+            "".to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            "../x".to_string(),
+            "/abs".to_string(),
+            "a/b".to_string(),
+            "a\\b".to_string(),
+            "a\0b".to_string(),
+            "a\nb".to_string(),
+            "a\u{7f}b".to_string(),
+            "é".to_string(),
+            "ａ".to_string(),
+            "a\u{202e}b".to_string(),
+            "-a".to_string(),
+            "a-".to_string(),
+            "a..b".to_string(),
+            ".a".to_string(),
+            "a.".to_string(),
+            "a_b".to_string(),
+            "a b".to_string(),
+            too_long,
+            too_long_multibyte,
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("registry");
+
+        for name in names {
+            assert!(
+                checked_name(&name).is_err(),
+                "checked_name accepted {name:?}"
+            );
+            assert!(
+                write_at(&root, &rec(&name, "creating")).is_err(),
+                "write_at accepted {name:?}"
+            );
+            assert!(
+                !root.exists(),
+                "invalid name {name:?} created registry files"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_provider_ids_pass_the_registry_grammar() {
+        let wt = Path::new("/work/repo/main");
+        let repeated_non_ascii = "é".repeat(40);
+        let long = "x".repeat(200);
+        let configured = [
+            "",
+            "{worktree}",
+            "{repo}-{worktree}-{hash}",
+            "/etc/passwd",
+            "../x",
+            "a\0b",
+            "a\u{202e}b",
+            "my_sprite",
+            repeated_non_ascii.as_str(),
+            long.as_str(),
+        ];
+
+        for config in configured {
+            let id = thegn_core::envbuild::effective_provider_id(config, wt, Some("repo"));
+            assert!(
+                checked_name(&id).is_ok(),
+                "effective id {id:?} from {config:?}"
+            );
+        }
     }
 
     #[test]
