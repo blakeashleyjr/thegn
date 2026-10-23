@@ -2433,6 +2433,7 @@ mod tests {
     #[test]
     fn set_mode_for_test_round_trips_mode_bits() {
         let temp = tempfile::tempdir().unwrap();
+        restrict_dir_to_owner(temp.path()).unwrap();
         let path = temp.path().join("mode-test");
         std::fs::write(&path, b"fixture").unwrap();
         match set_mode_for_test(&path, 0o640) {

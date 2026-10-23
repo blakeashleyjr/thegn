@@ -2276,8 +2276,10 @@ mod tests {
 
     #[test]
     fn file_get_refuses_a_group_readable_token() {
+        const VALUE: &str = "s3cret-value-Zq9";
+
         let temp = private_temp();
-        file_set_at(temp.path(), "acct", "tok").unwrap();
+        file_set_at(temp.path(), "acct", VALUE).unwrap();
         let token = token_path_in(temp.path(), "acct").unwrap();
         match thegn_core::fsperm::set_mode_for_test(&token, 0o640) {
             Ok(()) => {}
@@ -2289,17 +2291,19 @@ mod tests {
             Ok(_) => panic!("group-readable token was accepted"),
         };
         assert!(error.message().contains("accessible to other users"));
-        assert!(!error.message().contains("tok"));
+        assert!(!error.message().contains(VALUE));
         assert!(error.message().contains("chmod 600"));
 
         thegn_core::fsperm::set_mode_for_test(&token, 0o600).unwrap();
-        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), VALUE);
     }
 
     #[test]
     fn file_get_refuses_a_hard_linked_token() {
+        const VALUE: &str = "s3cret-value-Zq9";
+
         let temp = private_temp();
-        file_set_at(temp.path(), "acct", "tok").unwrap();
+        file_set_at(temp.path(), "acct", VALUE).unwrap();
         let token = token_path_in(temp.path(), "acct").unwrap();
         let extra_link = temp.path().join("extra-link");
         match std::fs::hard_link(&token, &extra_link) {
@@ -2319,17 +2323,19 @@ mod tests {
             Ok(_) => panic!("multiply linked token was accepted"),
         };
         assert!(error.message().contains("other hard links"));
-        assert!(!error.message().contains("tok"));
+        assert!(!error.message().contains(VALUE));
         assert!(error.message().contains("remove the extra link"));
 
         std::fs::remove_file(extra_link).unwrap();
-        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), "tok");
+        assert_eq!(file_get_in(temp.path(), "acct").unwrap(), VALUE);
     }
 
     #[test]
     fn file_get_refuses_a_world_writable_token() {
+        const VALUE: &str = "s3cret-value-Zq9";
+
         let temp = private_temp();
-        file_set_at(temp.path(), "acct", "tok").unwrap();
+        file_set_at(temp.path(), "acct", VALUE).unwrap();
         let token = token_path_in(temp.path(), "acct").unwrap();
         match thegn_core::fsperm::set_mode_for_test(&token, 0o602) {
             Ok(()) => {}
@@ -2341,6 +2347,6 @@ mod tests {
             Ok(_) => panic!("world-writable token was accepted"),
         };
         assert!(error.message().contains("accessible to other users"));
-        assert!(!error.message().contains("tok"));
+        assert!(!error.message().contains(VALUE));
     }
 }
