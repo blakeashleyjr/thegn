@@ -436,6 +436,18 @@ impl Drop for OneShotTicket {
     }
 }
 
+#[derive(Clone)]
+struct LateResultGuard {
+    disabled: Disabled,
+    stop: Arc<StopSignal>,
+}
+
+impl LateResultGuard {
+    fn drops(&self, plugin: &str) -> bool {
+        self.stop.is_stopped() || lock(&self.disabled).contains(plugin)
+    }
+}
+
 /// Admit a live session only while shutdown has not begun. Checking under the
 /// same lock used by shutdown makes insertion atomic with the final drain.
 fn admit_unless_stopped<T>(
@@ -629,6 +641,10 @@ impl PluginsHost {
         let tx = self.tx.clone();
         let waker = self.waker.clone();
         let state_anchor = self.state_anchor.clone();
+        let late = LateResultGuard {
+            disabled: self.disabled.clone(),
+            stop: self.stop.clone(),
+        };
         let spawn = thegn_core::thread_name::try_spawn_named("thegn-plug-once", move || {
             // Utility: the user just invoked this one-shot and is waiting on its result.
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
@@ -652,6 +668,10 @@ impl PluginsHost {
                 }
             };
             drop(ticket);
+            if late.drops(&id) {
+                tracing::debug!(target: "thegn::plugin", plugin = %id, "one-shot result dropped: plugin disabled or host stopped while it ran");
+                return;
+            }
             // best-effort: the loop may be shutting down.
             let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -768,6 +788,8 @@ struct SchedEntry {
     contribution: ContributionId,
     interval: Duration,
     next: Instant,
+    /// When this one-shot entry last started a poll; used for fair admission.
+    last_started: Option<Instant>,
     skipped: u64,
     overloaded: u64,
 }
@@ -806,6 +828,7 @@ fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
                 interval,
                 // Due immediately: the first poll doubles as the initial view.
                 next: now,
+                last_started: None,
                 skipped: 0,
                 overloaded: 0,
             });
@@ -814,6 +837,11 @@ fn build_schedule(loaded: &[LoadedState], now: Instant) -> Vec<SchedEntry> {
     sched
 }
 
+/// Fire due entries with fixed delay from this pass (`next = now + interval`).
+/// Ticks missed while the scheduler slept or a run was in flight coalesce into
+/// one fire and are never replayed. Busy ticks are skipped and counted;
+/// overloaded ticks are counted and retried at the next interval. Due one-shot
+/// entries run least-recently-started first so the global cap rotates fairly.
 fn run_due(
     sched: &mut [SchedEntry],
     now: Instant,
@@ -822,7 +850,10 @@ fn run_due(
     gate: &OneShotGate,
     spawn_poll: &mut dyn FnMut(OneShotTicket, &SchedEntry),
 ) {
-    for entry in sched {
+    let mut order: Vec<usize> = (0..sched.len()).collect();
+    order.sort_by_key(|&index| sched[index].last_started);
+    for index in order {
+        let entry = &mut sched[index];
         if entry.next > now || lock(disabled).contains(&entry.plugin) {
             continue;
         }
@@ -846,7 +877,10 @@ fn run_due(
                 }
             }
             PluginMode::OneShot => match gate.try_begin(&entry.plugin) {
-                Ok(ticket) => spawn_poll(ticket, entry),
+                Ok(ticket) => {
+                    entry.last_started = Some(now);
+                    spawn_poll(ticket, entry);
+                }
                 Err(GateRefusal::Busy) => {
                     entry.skipped += 1;
                     tracing::debug!(
@@ -900,6 +934,7 @@ fn start_poll_worker(
     tx: &PluginTx,
     waker: Option<&TerminalWaker>,
     failed_poll_starts: &mut BTreeSet<String>,
+    late: &LateResultGuard,
 ) {
     let plugin = job.plugin.clone();
     let command = job.command;
@@ -908,10 +943,15 @@ fn start_poll_worker(
     let timeout = job.timeout;
     let worker_tx = tx.clone();
     let worker_waker = waker.cloned();
+    let worker_late = late.clone();
     match thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let run = thegn_svc::plugin::spawn_ndjson(&command, &env, cwd.as_deref(), timeout);
         drop(ticket);
+        if worker_late.drops(&plugin) {
+            tracing::debug!(target: "thegn::plugin", plugin = %plugin, "one-shot result dropped: plugin disabled or host stopped while it ran");
+            return;
+        }
         // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = worker_tx.send(PluginMsg::OneShot { plugin, run });
         if let Some(waker) = &worker_waker {
@@ -1133,12 +1173,23 @@ fn setup_and_schedule_with_waker(
             .max(SCHED_MIN_WAIT)
     };
     let mut failed_poll_starts = BTreeSet::new();
+    let late = LateResultGuard {
+        disabled: disabled.clone(),
+        stop: stop.clone(),
+    };
     loop {
         if stop.is_stopped() {
             return;
         }
         admit_initial_runs(&mut pending, &disabled, &gate, &mut |ticket, job| {
-            start_poll_worker(ticket, job, &tx, waker.as_ref(), &mut failed_poll_starts);
+            start_poll_worker(
+                ticket,
+                job,
+                &tx,
+                waker.as_ref(),
+                &mut failed_poll_starts,
+                &late,
+            );
         });
         run_due(
             &mut sched,
@@ -1159,6 +1210,7 @@ fn setup_and_schedule_with_waker(
                     &tx,
                     waker.as_ref(),
                     &mut failed_poll_starts,
+                    &late,
                 );
             },
         );
@@ -2943,5 +2995,188 @@ mod tests {
         ));
         assert!(rx.try_recv().is_err());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn sched_fair_overloaded_one_shots_rotate_without_starvation() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        let count = MAX_INFLIGHT_ONE_SHOTS + 2;
+        let states: Vec<_> = (0..count)
+            .map(|index| {
+                let mut spec = example_spec();
+                spec.manifest.id = PluginId::new(format!("fair-{index}"));
+                spec.mode = PluginMode::OneShot;
+                spec.manifest.contributions.truncate(1);
+                spec.manifest.contributions[0].cadence = CadenceHint::Interval { millis: 1000 };
+                loaded_state(spec)
+            })
+            .collect();
+        let mut schedule = build_schedule(&states, now);
+        let gate = OneShotGate::default();
+        let disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let sessions = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut passes = Vec::new();
+
+        for pass in 0..6 {
+            let mut started = Vec::new();
+            let mut tickets = Vec::new();
+            run_due(
+                &mut schedule,
+                now + interval * pass,
+                &disabled,
+                &sessions,
+                &gate,
+                &mut |ticket, entry| {
+                    started.push(entry.plugin.clone());
+                    tickets.push(ticket);
+                },
+            );
+            passes.push(started);
+            drop(tickets);
+        }
+
+        assert!(
+            passes
+                .iter()
+                .all(|started| started.len() == MAX_INFLIGHT_ONE_SHOTS),
+            "each pass must start exactly the cap; starts by pass: {passes:?}"
+        );
+        for pair in passes.chunks_exact(2) {
+            let started: BTreeSet<_> = pair.iter().flatten().cloned().collect();
+            let expected: BTreeSet<_> = (0..count).map(|index| format!("fair-{index}")).collect();
+            assert_eq!(
+                started, expected,
+                "every plugin must start in each pair of passes; starts by pass: {passes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_result_guard_drops_disabled_and_stopped_plugins() {
+        let disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let stop = Arc::new(StopSignal::default());
+        let guard = LateResultGuard {
+            disabled: disabled.clone(),
+            stop: stop.clone(),
+        };
+
+        assert!(!guard.drops("p"));
+        lock(&disabled).insert("p".to_string());
+        assert!(guard.drops("p"));
+        assert!(!guard.drops("q"));
+        assert!(!stop.stop());
+        assert!(guard.drops("q"));
+    }
+
+    #[test]
+    fn late_result_scheduled_poll_after_stop_is_not_delivered() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        // The sleep keeps the child in flight while stop is set; ticket release
+        // happens before the late-result guard suppresses delivery.
+        let gate = OneShotGate::default();
+        let (tx, mut rx) = plugin_channel();
+        let disabled = Arc::new(Mutex::new(BTreeSet::new()));
+        let stop = Arc::new(StopSignal::default());
+        let guard = LateResultGuard { disabled, stop };
+        let ticket = gate.try_begin("late").unwrap();
+        let mut failed = BTreeSet::new();
+        let mut job = poll_job("late");
+        job.command = vec!["sh".into(), "-c".into(), "sleep 0.3".into()];
+        job.timeout = Duration::from_secs(2);
+        start_poll_worker(ticket, job, &tx, None, &mut failed, &guard);
+        assert!(!guard.stop.stop());
+
+        assert!(recv_within(&mut rx, Duration::from_secs(2)).is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let released = loop {
+            match gate.try_begin("late") {
+                Ok(ticket) => break ticket,
+                Err(GateRefusal::Busy) => {
+                    assert!(Instant::now() < deadline, "poll ticket must be released");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(GateRefusal::Overloaded) => panic!("one poll cannot fill the global cap"),
+            }
+        };
+        drop(released);
+
+        // Positive control: the same worker delivers when its host stays live.
+        let control_gate = OneShotGate::default();
+        let (control_tx, mut control_rx) = plugin_channel();
+        let control_guard = LateResultGuard {
+            disabled: Arc::new(Mutex::new(BTreeSet::new())),
+            stop: Arc::new(StopSignal::default()),
+        };
+        let mut control_failed = BTreeSet::new();
+        start_poll_worker(
+            control_gate.try_begin("late").unwrap(),
+            poll_job("late"),
+            &control_tx,
+            None,
+            &mut control_failed,
+            &control_guard,
+        );
+        assert!(matches!(
+            recv_within(&mut control_rx, Duration::from_secs(2)),
+            Some(PluginMsg::OneShot { plugin, .. }) if plugin == "late"
+        ));
+    }
+
+    #[test]
+    fn late_result_palette_run_after_shutdown_is_not_delivered() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(tmp.path()).unwrap();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = plugin_channel();
+        let host = PluginsHost {
+            stop: Arc::new(StopSignal::default()),
+            supervisor: ResidentSupervisor::new(runtime.handle().clone()),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            disabled: Arc::new(Mutex::new(BTreeSet::new())),
+            tx,
+            waker,
+            one_shot_gate: OneShotGate::default(),
+            state_anchor: tmp.path().join("state"),
+            respawns: Arc::new(RespawnTimers::default()),
+            retry_runtime: runtime.handle().clone(),
+        };
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("late-palette");
+        spec.command = vec!["sh".into(), "-c".into(), "sleep 0.3".into()];
+        spec.timeout_secs = 2;
+        let plugin = LoadedPlugin {
+            spec,
+            dir: Some(tmp.path().to_path_buf()),
+            trusted_native_ignored: false,
+        };
+
+        assert_eq!(host.run_one_shot(plugin), OneShotStart::Started);
+        host.shutdown();
+        assert!(recv_within(&mut rx, Duration::from_secs(2)).is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let released = loop {
+            match host.one_shot_gate.try_begin("late-palette") {
+                Ok(ticket) => break ticket,
+                Err(GateRefusal::Busy) => {
+                    assert!(Instant::now() < deadline, "palette ticket must be released");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(GateRefusal::Overloaded) => {
+                    panic!("one palette run cannot fill the global cap");
+                }
+            }
+        };
+        drop(released);
     }
 }
