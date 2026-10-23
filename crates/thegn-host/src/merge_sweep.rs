@@ -38,6 +38,13 @@ pub(crate) fn safe_display(value: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SweepKept {
+    pub(crate) branch: String,
+    pub(crate) class: crate::merge_lifecycle::CleanupRefusal,
+    pub(crate) reason: String,
+}
+
 /// What one sweep did, for the caller to report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -60,7 +67,7 @@ pub struct SweepReport {
     /// Informational notes for held branches, foreign rows, and deferred cleanup retries.
     pub informational: Vec<(String, String)>,
     /// Refused or failed physical cleanup, with an actionable reason.
-    pub kept: Vec<(String, String)>,
+    pub(crate) kept: Vec<SweepKept>,
     /// Enumeration and sweep-level bookkeeping failures, never "collected".
     pub bookkeeping_errors: Vec<String>,
 }
@@ -169,13 +176,13 @@ pub(crate) fn report_lines(report: &SweepReport) -> Vec<(Priority, String)> {
             ),
         ));
     }
-    for (branch, reason) in &report.kept {
+    for kept in &report.kept {
         lines.push((
             Priority::Alert,
             format!(
                 "merge cleanup: kept {} — {}",
-                safe_display(branch),
-                safe_display(reason)
+                safe_display(&kept.branch),
+                safe_display(&kept.reason)
             ),
         ));
     }
@@ -183,6 +190,48 @@ pub(crate) fn report_lines(report: &SweepReport) -> Vec<(Priority, String)> {
         lines.push((Priority::Alert, safe_display(error)));
     }
     lines
+}
+
+pub(crate) fn sweep_json(report: &SweepReport) -> serde_json::Value {
+    serde_json::json!({
+        "collected": report.collected,
+        "collected_partial": report.collected_partial.iter().map(|(branch, errors)| {
+            serde_json::json!({"branch": branch, "errors": errors})
+        }).collect::<Vec<_>>(),
+        "held_branches": report.held_branches,
+        "informational": report.informational.iter().map(|(branch, note)| {
+            serde_json::json!({"branch": branch, "note": note})
+        }).collect::<Vec<_>>(),
+        "kept_dirty": report.kept_dirty,
+        "kept_changed": report.kept_changed,
+        "kept": report.kept.iter().map(|kept| {
+            serde_json::json!({
+                "branch": kept.branch,
+                "class": kept.class.id(),
+                "label": kept.class.label(),
+                "reason": kept.reason,
+            })
+        }).collect::<Vec<_>>(),
+        "discarded_build_state": report.discarded_build_state,
+        "discarded_tool_state": report.discarded_tool_state,
+        "cleared_rows": report.cleared_rows,
+        "bookkeeping_errors": report.bookkeeping_errors,
+        "incomplete": report.is_incomplete(),
+        "skipped": serde_json::Value::Null,
+        "counts": {
+            "collected": report.collected.len(),
+            "collected_partial": report.collected_partial.len(),
+            "held_branches": report.held_branches.len(),
+            "informational": report.informational.len(),
+            "kept_dirty": report.kept_dirty.len(),
+            "kept_changed": report.kept_changed.len(),
+            "kept": report.kept.len(),
+            "discarded_build_state": report.discarded_build_state.len(),
+            "discarded_tool_state": report.discarded_tool_state.len(),
+            "cleared_rows": report.cleared_rows.len(),
+            "bookkeeping_errors": report.bookkeeping_errors.len(),
+        }
+    })
 }
 
 pub(crate) fn deliver_toast_lines(
@@ -285,10 +334,11 @@ fn record_cleanup(
         }
         CleanupOutcome::KeptDirty => report.kept_dirty.push(entry_branch.to_string()),
         CleanupOutcome::KeptChanged => report.kept_changed.push(entry_branch.to_string()),
-        CleanupOutcome::Refused { class, reason } => report.kept.push((
-            entry_branch.to_string(),
-            format!("{entry_worktree}: {}: {reason}", class.label()),
-        )),
+        CleanupOutcome::Refused { class, reason } => report.kept.push(SweepKept {
+            branch: entry_branch.to_string(),
+            class,
+            reason: format!("{entry_worktree}: {}: {reason}", class.label()),
+        }),
     }
 }
 
@@ -464,10 +514,11 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             Ok(canonical) if canonical == Path::new(&row.worktree) => {}
             Ok(_) | Err(_) => {
                 if force {
-                    report.kept.push((
-                        row.branch.clone(),
-                        "noncanonical or aliased worktree path; row left untouched".into(),
-                    ));
+                    report.kept.push(SweepKept {
+                        branch: row.branch.clone(),
+                        class: crate::merge_lifecycle::CleanupRefusal::Unsafe,
+                        reason: "noncanonical or aliased worktree path; row left untouched".into(),
+                    });
                 } else {
                     tracing::debug!(branch = %row.branch, worktree = %row.worktree, "landed row has noncanonical or aliased worktree path; leaving it untouched");
                 }
@@ -513,27 +564,30 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             let derived = match derive_missing_landed_oid(repo_root, &row.branch, &target) {
                 Ok(derived) => derived,
                 Err(error) => {
-                    report.kept.push((
-                        entry.branch.clone(),
-                        format!("landed commit identity could not be derived: {error}"),
-                    ));
+                    report.kept.push(SweepKept {
+                        branch: entry.branch.clone(),
+                        class: crate::merge_lifecycle::CleanupRefusal::Identity,
+                        reason: format!("landed commit identity could not be derived: {error}"),
+                    });
                     continue;
                 }
             };
             match db.backfill_landed_result_oid(&row, &derived) {
                 Ok(true) => {}
                 Ok(false) => {
-                    report.kept.push((
-                        entry.branch.clone(),
-                        "landed queue row changed during identity backfill".into(),
-                    ));
+                    report.kept.push(SweepKept {
+                        branch: entry.branch.clone(),
+                        class: crate::merge_lifecycle::CleanupRefusal::Identity,
+                        reason: "landed queue row changed during identity backfill".into(),
+                    });
                     continue;
                 }
                 Err(error) => {
-                    report.kept.push((
-                        entry.branch.clone(),
-                        format!("landed identity backfill failed: {error}"),
-                    ));
+                    report.kept.push(SweepKept {
+                        branch: entry.branch.clone(),
+                        class: crate::merge_lifecycle::CleanupRefusal::Database,
+                        reason: format!("landed identity backfill failed: {error}"),
+                    });
                     continue;
                 }
             }
@@ -544,36 +598,42 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
                         && candidate.target_branch == row.target_branch
                 }),
                 Err(error) => {
-                    report.kept.push((
-                        entry.branch.clone(),
-                        format!("landed queue row reload failed after identity backfill: {error}"),
-                    ));
+                    report.kept.push(SweepKept {
+                        branch: entry.branch.clone(),
+                        class: crate::merge_lifecycle::CleanupRefusal::Database,
+                        reason: format!(
+                            "landed queue row reload failed after identity backfill: {error}"
+                        ),
+                    });
                     continue;
                 }
             };
             let Some(reloaded) = reloaded else {
-                report.kept.push((
-                    entry.branch.clone(),
-                    "landed queue row unavailable after identity backfill".into(),
-                ));
+                report.kept.push(SweepKept {
+                    branch: entry.branch.clone(),
+                    class: crate::merge_lifecycle::CleanupRefusal::Identity,
+                    reason: "landed queue row unavailable after identity backfill".into(),
+                });
                 continue;
             };
             if reloaded.status != "landed"
                 || reloaded.result_oid.as_deref() != Some(derived.as_str())
             {
-                report.kept.push((
-                    entry.branch.clone(),
-                    "landed queue row changed after identity backfill".into(),
-                ));
+                report.kept.push(SweepKept {
+                    branch: entry.branch.clone(),
+                    class: crate::merge_lifecycle::CleanupRefusal::Identity,
+                    reason: "landed queue row changed after identity backfill".into(),
+                });
                 continue;
             }
             row = reloaded;
         }
         let Some(landed) = row.result_oid.as_deref().filter(|oid| !oid.is_empty()) else {
-            report.kept.push((
-                entry.branch.clone(),
-                "landed commit identity is missing after backfill".into(),
-            ));
+            report.kept.push(SweepKept {
+                branch: entry.branch.clone(),
+                class: crate::merge_lifecycle::CleanupRefusal::Identity,
+                reason: "landed commit identity is missing after backfill".into(),
+            });
             continue;
         };
         let outcome = crate::merge_lifecycle::remove_landed_with_config(
@@ -1077,7 +1137,11 @@ mod tests {
             report
                 .kept
                 .iter()
-                .any(|(branch, reason)| { branch == "feature" && reason.contains("aliased") })
+                .any(|kept| { kept.branch == "feature" && kept.reason.contains("aliased") })
+        );
+        assert_eq!(
+            report.kept[0].class,
+            crate::merge_lifecycle::CleanupRefusal::Unsafe
         );
         assert!(wt.exists());
         assert!(
@@ -1161,7 +1225,11 @@ mod tests {
                 report
                     .kept
                     .iter()
-                    .any(|(_, reason)| { reason.contains("not an ancestor") })
+                    .any(|kept| kept.reason.contains("not an ancestor"))
+            );
+            assert_eq!(
+                report.kept[0].class,
+                crate::merge_lifecycle::CleanupRefusal::Identity
             );
             assert!(wt.exists());
             assert!(
@@ -1517,7 +1585,7 @@ mod tests {
             assert_eq!(report.kept.len(), 1, "force={force}");
             assert!(
                 report.kept[0]
-                    .1
+                    .reason
                     .contains("active session requires explicit cleanup"),
                 "force={force}: {report:?}"
             );
@@ -1579,7 +1647,7 @@ mod tests {
                 assert_eq!(report.kept.len(), 1, "{hold}, force={force}");
                 assert!(
                     report.kept[0]
-                        .1
+                        .reason
                         .contains("runtime tenancy or dispatch ownership"),
                     "{hold}, force={force}: {report:?}"
                 );
@@ -1717,7 +1785,7 @@ mod tests {
             report
                 .kept
                 .iter()
-                .any(|(_, why)| why.contains("cached repository"))
+                .any(|kept| kept.reason.contains("cached repository"))
         );
         assert_eq!(db.list_merge_queue().unwrap(), before);
         assert!(wt.join("tracked").exists());
@@ -1771,7 +1839,7 @@ mod tests {
         assert_eq!(report.kept.len(), 1);
         assert!(
             report.kept[0]
-                .1
+                .reason
                 .contains("worktree cache identity unavailable")
         );
         assert_eq!(refs(), before_refs);
@@ -1851,7 +1919,7 @@ mod tests {
             assert_eq!(report.kept.len(), 1, "{kind}");
             assert!(
                 report.kept[0]
-                    .1
+                    .reason
                     .contains("runtime tenancy or dispatch ownership"),
                 "{kind}: {report:?}"
             );
@@ -1980,7 +2048,7 @@ mod tests {
             LateCleanupMutation::UnknownDispatch => {
                 assert!(
                     report.kept[0]
-                        .1
+                        .reason
                         .contains("runtime tenancy or dispatch ownership"),
                     "{report:?}"
                 );
@@ -1995,7 +2063,7 @@ mod tests {
             LateCleanupMutation::MalformedRegistry => {
                 let decode_error = db.worktree_record(wt.to_str().unwrap()).unwrap_err();
                 assert!(
-                    report.kept[0].1.contains(&decode_error.to_string()),
+                    report.kept[0].reason.contains(&decode_error.to_string()),
                     "{report:?}"
                 );
                 assert!(
@@ -2185,13 +2253,84 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_class_ids_are_stable_and_distinct() {
+        let classes = [
+            (crate::merge_lifecycle::CleanupRefusal::Database, "database"),
+            (crate::merge_lifecycle::CleanupRefusal::Identity, "identity"),
+            (
+                crate::merge_lifecycle::CleanupRefusal::ClaimBusy,
+                "claim_busy",
+            ),
+            (crate::merge_lifecycle::CleanupRefusal::Unsafe, "unsafe"),
+            (crate::merge_lifecycle::CleanupRefusal::Remote, "remote"),
+            (
+                crate::merge_lifecycle::CleanupRefusal::Resources,
+                "resources",
+            ),
+            (crate::merge_lifecycle::CleanupRefusal::Removal, "removal"),
+        ];
+        let ids: Vec<_> = classes.iter().map(|(class, _)| class.id()).collect();
+        for (class, expected) in classes {
+            assert_eq!(class.id(), expected);
+        }
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), classes.len());
+    }
+
+    #[test]
+    fn sweep_json_reports_typed_kept_classes_and_incomplete() {
+        let report = SweepReport {
+            collected: vec!["a".into()],
+            kept_dirty: vec!["d".into()],
+            kept: vec![
+                SweepKept {
+                    branch: "busy".into(),
+                    class: crate::merge_lifecycle::CleanupRefusal::ClaimBusy,
+                    reason: "busy reason verbatim".into(),
+                },
+                SweepKept {
+                    branch: "removed".into(),
+                    class: crate::merge_lifecycle::CleanupRefusal::Removal,
+                    reason: "removal reason verbatim".into(),
+                },
+            ],
+            collected_partial: vec![("partial".into(), vec!["write failed".into()])],
+            ..SweepReport::default()
+        };
+        let doc = sweep_json(&report);
+
+        assert_eq!(doc["kept"][0]["class"], "claim_busy");
+        assert_eq!(doc["kept"][1]["class"], "removal");
+        assert_eq!(doc["kept"][0]["label"], "cleanup already in progress");
+        assert_eq!(doc["kept"][1]["label"], "removal failed");
+        assert_eq!(doc["kept"][0]["reason"], "busy reason verbatim");
+        assert_eq!(doc["kept"][1]["reason"], "removal reason verbatim");
+        assert_eq!(doc["collected_partial"][0]["branch"], "partial");
+        assert_eq!(doc["collected_partial"][0]["errors"][0], "write failed");
+        assert!(doc["incomplete"].as_bool().unwrap());
+        assert_eq!(doc["counts"]["collected"], 1);
+        assert_eq!(doc["counts"]["collected_partial"], 1);
+        assert_eq!(doc["counts"]["kept_dirty"], 1);
+        assert_eq!(doc["counts"]["kept"], 2);
+        assert!(doc["skipped"].is_null());
+        assert!(
+            !sweep_json(&SweepReport::default())["incomplete"]
+                .as_bool()
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn an_empty_report_is_empty_only_with_neither_list() {
         assert!(SweepReport::default().is_empty());
         assert!(!report(&["a"], &[]).is_empty());
         assert!(!report(&[], &["a"]).is_empty());
         assert!(
             !SweepReport {
-                kept: vec![("a".into(), "refused".into())],
+                kept: vec![SweepKept {
+                    branch: "a".into(),
+                    class: crate::merge_lifecycle::CleanupRefusal::Removal,
+                    reason: "refused".into(),
+                }],
                 ..Default::default()
             }
             .is_empty()
@@ -2275,10 +2414,14 @@ mod tests {
         );
 
         assert_eq!(sweep_report.kept.len(), 1);
-        assert_eq!(sweep_report.kept[0].0, "feature");
+        assert_eq!(sweep_report.kept[0].branch, "feature");
+        assert_eq!(
+            sweep_report.kept[0].class,
+            crate::merge_lifecycle::CleanupRefusal::ClaimBusy
+        );
         assert!(
             sweep_report.kept[0]
-                .1
+                .reason
                 .contains("cleanup is already in progress")
         );
         assert!(sweep_report.is_incomplete());
@@ -2325,7 +2468,11 @@ mod status_route_tests {
             kept_changed: vec!["changed".into()],
             discarded_build_state: vec!["build".into()],
             discarded_tool_state: vec!["tool".into()],
-            kept: vec![("kept".into(), "refused".into())],
+            kept: vec![SweepKept {
+                branch: "kept".into(),
+                class: crate::merge_lifecycle::CleanupRefusal::Removal,
+                reason: "refused".into(),
+            }],
             bookkeeping_errors: vec!["bookkeeping error".into()],
             ..Default::default()
         };
@@ -2555,6 +2702,10 @@ mod retry_tests {
         let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&fixture.worktree).unwrap();
         let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
         assert_eq!(report.kept.len(), 1);
+        assert_eq!(
+            report.kept[0].class,
+            crate::merge_lifecycle::CleanupRefusal::ClaimBusy
+        );
         assert_eq!(fixture.db.list_merge_queue().unwrap(), before);
         drop(claim);
     }
