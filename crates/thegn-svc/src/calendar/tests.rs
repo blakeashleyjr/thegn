@@ -2998,9 +2998,10 @@ async fn transp_caldav_report_round_trips_free_and_busy() {
         assert_eq!(event.busy, thegn_core::calendar::Busy::Busy, "{uid}");
     }
     let diagnostics = page.diagnostics();
-    assert!(
-        !diagnostics.is_empty(),
-        "invalid TRANSP should be reported; diagnostics total={}",
+    assert_eq!(
+        diagnostics.total(),
+        1,
+        "only invalid TRANSP should be reported; diagnostics total={}",
         diagnostics.total()
     );
     server.abort();
