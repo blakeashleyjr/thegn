@@ -186,7 +186,9 @@ variable unset, it uses a vetted private runtime directory, then a private
 panes run in-process. It does not place a new control socket under sandbox state.
 If that predictable `/tmp` directory belongs to another user or has the wrong
 permissions, the daemon uses a random owner-only sibling and records its name in
-an owner-only locator under the state directory. An unusable locator is refused.
+an owner-only locator under the state directory. A locator that does not name a
+valid owner-only directory is ignored, and the daemon replaces it on its next
+start.
 If a control socket directory is visible through a sandbox bind (for example,
 an explicit `[daemon] socket` or an `XDG_RUNTIME_DIR` under `$HOME` or the
 worktree), bwrap hides it with a tmpfs and systemd makes it inaccessible unless
@@ -294,11 +296,10 @@ profile has `ssh/id`. Its git, gh and GnuPG directories are mounted read-only in
 sandboxes; a pane that needs to write them, such as `gh auth login` or GnuPG
 signing, needs an explicit `[sandbox] mounts` grant. Startup refuses if the
 profile state or credential directories cannot be created. Startup also
-refuses if `ssh/id` exists but is not an owner-only (chmod 600) regular file.
+refuses if `ssh/id` exists but its target is not a regular file owned by you
+with no group or other access.
 The default profile is unchanged.
 Named profile directories are created owner-only without following symlinks.
-If `ssh/id` exists, its target must be a regular file owned by you with no
-group or other access; otherwise the profile refuses to start.
 `thegn doctor` lists denied and shared names, never values. The share list is
 read at startup.
 
@@ -571,7 +572,7 @@ its ledger row remains until the provider confirms destruction, so a failed
 destroy leaves it listed for a later retry.
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and
-quarantined spares under “Warm pool (provider spares needing review)”; it will
+quarantined spares under `Warm pool (provider spares needing review)`; it will
 not destroy them on its own. `thegn doctor --json` includes the same report in
 `warm_pool`.
 `[sandbox] default_env` picks the environment new worktrees use.
@@ -648,8 +649,9 @@ quarantines that record and does not delete it.
 The Fly reaper also quarantines records for another account without revoking or
 destroying them. If it cannot determine the current account, it quarantines
 every record before making provider calls.
-When the set of resources a VPS or Fly reaper keeps for review changes, thegn
-raises one alert toast for that provider; an unchanged set does not repeat it.
+If the UI is running, a change to the non-empty set of resources a VPS or
+Fly reaper keeps for review raises one alert toast for that provider, naming
+the first and counting the rest. An unchanged set does not repeat it.
 A VPS or Fly `max_instances` cap
 counts sandboxes for the same provider account; records without an account or
 that cannot be read count against every account.

@@ -36,6 +36,6 @@ automation carry an origin marker and remain visible, but cannot trigger more
 automation rules.
 
 Event enrichment matches the registered worktree by exact path, then by
-resolved filesystem identity, so symlink and relative-path aliases enrich the
-same way. If an alias matches more than one registered worktree, the event is
-left unenriched.
+resolved filesystem identity, so a symlinked path or one with `.`/`..`
+components enriches the same way. If that alias matches worktrees in more than
+one repository, the repo, branch and workspace are left empty.
