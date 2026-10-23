@@ -1957,6 +1957,8 @@ command = "git diff"
 # shared_target_dir = ""       # one CARGO_TARGET_DIR shared across a repo's worktrees.
 #                              #   Biggest disk win, BUT cargo's per-target build lock
 #                              #   SERIALIZES concurrent builds across worktrees — opt-in.
+#                              #   Hazard: Cargo can reuse a crate compiled from another
+#                              #   worktree's source; doctor warns while this is set.
 #                              #   "" = off; ~ expands to home; relative paths resolve to the repo root.
 
 # Lines-of-code counting (tokei) behind the bottom-bar LOC chip, its detail
@@ -4336,7 +4338,9 @@ gate_on = true                # run gate_command before advancing main
 gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target dir between folds
                               # (warm incremental rebuild instead of a cold from-scratch compile).
                               # false = throwaway /tmp worktree each fold (cold; use for concurrent gates)
-gate_target_dir = ""          # CARGO_TARGET_DIR for the gate; "" = $XDG_STATE_HOME/thegn/gate/<repo>/target
+gate_target_dir = ""          # CARGO_TARGET_DIR; "" = $XDG_STATE_HOME/thegn/gate/<repo>/target
+                              # a set dir is used as <dir>/repo-<id> by the reused gate only;
+                              # isolated gates always build privately
 bisect_on_red = true          # on a red gate, defer just the offending branch
 diagnosis_max_gates = 8       # maximum gate attempts to localize a red batch; 0 disables diagnosis
 diagnosis_timeout_secs = 3600 # aggregate diagnosis wall-time cap; 0 disables diagnosis
