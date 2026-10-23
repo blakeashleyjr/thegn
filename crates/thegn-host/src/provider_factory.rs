@@ -3,8 +3,14 @@
 //! `agent.rs` (kept flat); re-exported from `crate::agent` so call
 //! sites are unchanged.
 
+use anyhow::Context;
 use thegn_svc::fly::{FlyProvider, FlySpec};
 use thegn_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
+
+const UNREADABLE_BINDING_CONTEXT: &str = concat!(
+    "the worktree's warm-pool sandbox binding is unreadable; ",
+    "refusing to fall back to the derived sandbox id",
+);
 
 static MANAGED_KEY_SCOPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
@@ -407,16 +413,37 @@ pub(crate) fn provider_sandbox_name(
     worktree: &str,
     env_name: &str,
 ) -> Option<String> {
-    let (env, bound) = resolve_provider_env(cfg, worktree, env_name)?;
+    match provider_sandbox_name_checked(cfg, worktree, env_name) {
+        Ok(name) => name,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::provider",
+                error = %format!("{error:#}"),
+                worktree,
+                "provider sandbox binding unreadable; no sandbox target"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn provider_sandbox_name_checked(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+    env_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some((env, bound)) = resolve_provider_env(cfg, worktree, env_name)? else {
+        return Ok(None);
+    };
     match env.placement {
         thegn_core::placement::Placement::Provider(p) => {
             // If this worktree CLAIMED a warm-pool spare, its sandbox is that
             // spare's name (a DB binding), which overrides the derived id — so all
             // lifecycle/exec calls target the handed-over sandbox. Else the derived
             // `effective_provider_id`.
-            Some(bound.unwrap_or(p.id))
+            Ok(Some(bound.unwrap_or(p.id)))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -425,7 +452,14 @@ pub(crate) fn provider_sandbox_owner(
     worktree: &str,
     env_name: &str,
 ) -> Option<String> {
-    let (env, bound) = resolve_provider_env(cfg, worktree, env_name)?;
+    let (env, bound) = match resolve_provider_env(cfg, worktree, env_name) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(target: "thegn::provider", error = %format!("{error:#}"), worktree, "provider sandbox owner binding unreadable");
+            return None;
+        }
+    };
     let configured = configured_provider_id(cfg, &env.name);
     derived_owner(configured, bound.is_some(), worktree)
 }
@@ -441,18 +475,12 @@ fn resolve_provider_env(
     cfg: &thegn_core::config::Config,
     worktree: &str,
     env_name: &str,
-) -> Option<(thegn_core::env::Environment, Option<String>)> {
+) -> anyhow::Result<Option<(thegn_core::env::Environment, Option<String>)>> {
     use std::path::{Path, PathBuf};
     use thegn_core::store::{PoolStore, WorkspaceStore};
     let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
-    let db = match thegn_core::db::Db::open() {
-        Ok(db) => Some(db),
-        Err(error) => {
-            tracing::debug!(target: "thegn::provider", %error, "provider sandbox database open failed");
-            None
-        }
-    };
-    let repo_root = match db.as_ref() {
+    let db = thegn_core::db::Db::open();
+    let repo_root = match db.as_ref().ok() {
         Some(db) => match db.repo_root_for(worktree) {
             Ok(Some(root)) if !root.is_empty() => PathBuf::from(root),
             Ok(_) => thegn_core::repo::main_worktree(Path::new(worktree))
@@ -471,19 +499,35 @@ fn resolve_provider_env(
         &env.placement,
         thegn_core::placement::Placement::Provider(_)
     ) {
-        return None;
+        return Ok(None);
     }
-    let bound = match db.as_ref() {
-        Some(db) => match db.worktree_provider_sandbox(worktree) {
-            Ok(bound) => bound,
-            Err(error) => {
-                tracing::debug!(target: "thegn::provider", %error, "provider sandbox binding lookup failed");
-                None
-            }
-        },
-        None => None,
-    };
-    Some((env, bound))
+    let db = db.context("open the state database to read the warm-pool sandbox binding")?;
+    let bound = db
+        .worktree_provider_sandbox(worktree)
+        .context(UNREADABLE_BINDING_CONTEXT)?;
+    Ok(Some((env, bound)))
+}
+
+pub(crate) fn bound_provider_sandbox(worktree: &str) -> anyhow::Result<Option<String>> {
+    use thegn_core::store::PoolStore;
+    let db = thegn_core::db::Db::open()
+        .context("open the state database to read the warm-pool sandbox binding")?;
+    db.worktree_provider_sandbox(worktree)
+}
+
+fn sandbox_id_from(
+    binding: anyhow::Result<Option<String>>,
+    derived: &str,
+) -> anyhow::Result<String> {
+    match binding {
+        Ok(Some(bound)) => Ok(bound),
+        Ok(None) => Ok(derived.to_string()),
+        Err(error) => Err(error.context(UNREADABLE_BINDING_CONTEXT)),
+    }
+}
+
+pub(crate) fn sandbox_id_for(worktree: &str, derived: &str) -> anyhow::Result<String> {
+    sandbox_id_from(bound_provider_sandbox(worktree), derived)
 }
 
 fn derived_owner(configured_id: &str, claimed: bool, worktree: &str) -> Option<String> {
@@ -550,5 +594,23 @@ mod tests {
         let configured = configured_provider_id(&cfg, "remote");
         assert_eq!(configured, "{repo}-{worktree}-{hash}");
         assert!(derived_owner(configured, false, "/w/a").is_some());
+    }
+
+    #[test]
+    fn sandbox_id_prefers_the_bound_spare_and_refuses_an_unreadable_binding() {
+        assert_eq!(
+            sandbox_id_from(Ok(Some("spare-1".into())), "derived").unwrap(),
+            "spare-1"
+        );
+        assert_eq!(sandbox_id_from(Ok(None), "derived").unwrap(), "derived");
+        let error = sandbox_id_from(Err(anyhow::anyhow!("disk I/O error")), "derived").unwrap_err();
+        assert!(format!("{error:#}").contains("refusing to fall back"));
+    }
+
+    #[test]
+    fn bound_provider_sandbox_reports_an_unopenable_database() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        assert!(bound_provider_sandbox("/w/x").is_err());
     }
 }
