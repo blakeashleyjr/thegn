@@ -1056,7 +1056,7 @@ impl WorktreeAuxStore for Db {
             None
         };
         let conn: &Connection = tx.as_deref().unwrap_or(base);
-        let row: Option<(String, Option<String>, i64, Option<String>, Option<String>)> = conn
+        let row: Option<MergeRowSnapshot> = conn
             .query_row(
                 "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
                  FROM merge_queue WHERE worktree=?1",
@@ -1184,7 +1184,7 @@ impl WorktreeAuxStore for Db {
             None
         };
         let conn: &Connection = tx.as_deref().unwrap_or(base);
-        let row: Option<(String, Option<String>, i64, Option<String>, Option<String>)> = conn
+        let row: Option<MergeRowSnapshot> = conn
             .query_row(
                 "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
                  FROM merge_queue WHERE worktree=?1",
@@ -2205,3 +2205,6 @@ impl WorktreeAuxStore for Db {
         Ok(n)
     }
 }
+
+/// `(status, claim_owner, updated_at, candidate_oid, result_oid)` of one merge-queue row.
+type MergeRowSnapshot = (String, Option<String>, i64, Option<String>, Option<String>);
