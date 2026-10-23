@@ -119,7 +119,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("token");
         std::fs::write(&path, "svc-token").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_readonly(false)).unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
         if thegn_core::fsperm::mode_bits(&path).unwrap().is_none() {
             return;
         }
