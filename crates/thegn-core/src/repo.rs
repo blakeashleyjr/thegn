@@ -305,9 +305,24 @@ pub struct DiscoveryReport {
     pub cancelled: bool,
 }
 
+fn nested_roots(canonical_roots: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    canonical_roots
+        .iter()
+        .filter(|root| {
+            canonical_roots
+                .iter()
+                .any(|other| root != &other && root.starts_with(other))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Bounded, cancellable discovery. `emit` receives batches no larger than the
-/// budget and returns false when its consumer has gone away. Repositories are
-/// deduplicated by filesystem identity within one scan (first spelling wins).
+/// budget and returns false when its consumer has gone away. A configured root
+/// nested inside another is walked by its own walk; the enclosing walk skips
+/// it, so repositories beneath it keep the nested root's spelling. Repositories
+/// reached through unrelated spellings are deduplicated by filesystem identity
+/// within one scan (first spelling wins).
 pub fn discover_repos_bounded(
     cfg: &Config,
     budget: DiscoveryBudget,
@@ -326,6 +341,12 @@ pub fn discover_repos_bounded(
     let mut batch = Vec::with_capacity(budget.batch_size.min(256));
     let mut roots = std::collections::HashSet::new();
     let mut seen_repos: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let canonical_roots: Vec<PathBuf> = cfg
+        .repo_roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    let nested = nested_roots(&canonical_roots);
     for raw_root in &cfg.repo_roots {
         if cancel.load(Ordering::Relaxed) {
             report.cancelled = true;
@@ -382,6 +403,15 @@ pub fn discover_repos_bounded(
                 }
             };
             report.visited_entries += 1;
+            if !nested.is_empty()
+                && entry.depth() > 0
+                && entry.file_type().is_dir()
+                && let Ok(rel) = entry.path().strip_prefix(raw)
+                && nested.contains(&root.join(rel))
+            {
+                walker.skip_current_dir();
+                continue;
+            }
             if entry.file_type().is_dir()
                 && entry.file_name() == ".git"
                 && let Some(parent) = entry.path().parent()
@@ -831,9 +861,125 @@ mod tests {
                 },
             );
 
-            assert_eq!(found, vec![repo.to_string_lossy().into_owned()]);
+            // A nested configured root owns discovery of its subtree.
+            assert_eq!(found, vec![link.join("r").to_string_lossy().into_owned()]);
             assert_eq!(report.repositories, 1);
         }
+    }
+
+    fn nested_root_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let a = base.path().join("a");
+        let sub = a.join("sub");
+        let repo = sub.join("r");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for index in 0..20 {
+            std::fs::create_dir(sub.join(format!("d{index:02}"))).unwrap();
+        }
+        (base, a, sub, repo)
+    }
+
+    #[test]
+    fn discovery_skips_the_walk_of_a_nested_root() {
+        let (_base, a, sub, repo) = nested_root_fixture();
+        let cfg = Config {
+            repo_roots: vec![
+                a.to_string_lossy().into_owned(),
+                sub.to_string_lossy().into_owned(),
+            ],
+            repo_scan_depth: 4,
+            ..Config::default()
+        };
+        let mut found = Vec::new();
+        let report = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget::default(),
+            &AtomicBool::new(false),
+            |batch| {
+                found.extend(batch);
+                true
+            },
+        );
+
+        assert_eq!(found, vec![repo.to_string_lossy().into_owned()]);
+        assert_eq!(report.repositories, 1);
+        assert_eq!(report.visited_entries, 25, "{report:?}");
+    }
+
+    #[test]
+    fn discovery_nested_root_order_does_not_change_the_result() {
+        let (_base, a, sub, repo) = nested_root_fixture();
+        let cfg = Config {
+            repo_roots: vec![
+                sub.to_string_lossy().into_owned(),
+                a.to_string_lossy().into_owned(),
+            ],
+            repo_scan_depth: 4,
+            ..Config::default()
+        };
+        let mut found = Vec::new();
+        let report = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget::default(),
+            &AtomicBool::new(false),
+            |batch| {
+                found.extend(batch);
+                true
+            },
+        );
+
+        assert_eq!(found, vec![repo.to_string_lossy().into_owned()]);
+        assert_eq!(report.repositories, 1);
+        assert_eq!(report.visited_entries, 25, "{report:?}");
+    }
+
+    #[test]
+    fn discovery_nested_roots_match_by_component() {
+        let roots = [
+            PathBuf::from("/x/a"),
+            PathBuf::from("/x/a/sub"),
+            PathBuf::from("/x/ab"),
+            PathBuf::from("/y"),
+        ];
+        assert_eq!(
+            nested_roots(&roots),
+            std::collections::HashSet::from([PathBuf::from("/x/a/sub")])
+        );
+        assert!(nested_roots(&[PathBuf::from("/x/a"), PathBuf::from("/x/a")]).is_empty());
+    }
+
+    #[test]
+    fn discovery_cancel_from_emit_stops_before_the_next_batch() {
+        // Positive control: callback cancellation already works without nested roots.
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        for index in 0..5 {
+            std::fs::create_dir_all(root.join(format!("r{index}/.git"))).unwrap();
+        }
+        let cfg = Config {
+            repo_roots: vec![root.to_string_lossy().into_owned()],
+            repo_scan_depth: 4,
+            ..Config::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let mut batches = Vec::new();
+        let report = discover_repos_bounded(
+            &cfg,
+            DiscoveryBudget {
+                batch_size: 1,
+                ..DiscoveryBudget::default()
+            },
+            &cancel,
+            |batch| {
+                batches.push(batch);
+                cancel.store(true, Ordering::Relaxed);
+                true
+            },
+        );
+
+        assert!(report.cancelled);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(report.repositories, 1);
     }
 
     #[test]
