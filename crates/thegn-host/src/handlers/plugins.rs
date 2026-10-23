@@ -710,8 +710,13 @@ fn drain_with_responder(
                 damage.merge(handle_exit(state, model, host, &plugin, None, true));
             }
             PluginMsg::RetryRespawn { plugin } => {
-                if let Some(host) = host {
+                let id = plugin.spec.manifest.id.as_str().to_string();
+                if let Some(host) = host
+                    && state.plugins.get(&id).is_some_and(|entry| !entry.disabled)
+                {
                     host.respawn(plugin, std::time::Duration::ZERO);
+                } else {
+                    tracing::debug!(target: "thegn::plugin", plugin = %id, "delayed restart ignored because plugin is absent, disabled, or host is unavailable");
                 }
             }
         }
@@ -2294,6 +2299,127 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    #[test]
+    fn host_generation_stale_loaded_after_reload_is_dropped() {
+        let mut state = state_with(Vec::new());
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        let old = tx.for_host(101);
+        let new = tx.for_host(102);
+        rx.bind_host(102);
+        old.send(PluginMsg::Loaded(vec![loaded_state(seg_spec("gone"))]))
+            .unwrap();
+        new.send(PluginMsg::Loaded(vec![loaded_state(seg_spec("p"))]))
+            .unwrap();
+        drop(tx);
+        drop(old);
+        drop(new);
+
+        drain(&mut rx, &mut state, &mut model, None);
+
+        assert!(state.plugins.contains_key("p"));
+        assert!(!state.plugins.contains_key("gone"));
+    }
+
+    #[test]
+    fn host_generation_stale_one_shot_does_not_update_the_new_entry() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        let old = tx.for_host(101);
+        let new = tx.for_host(102);
+        rx.bind_host(102);
+        old.send(PluginMsg::OneShot {
+            plugin: "p".into(),
+            run: Ok(PluginRun {
+                messages: vec![msg(
+                    "update",
+                    serde_json::json!({
+                        "surface": "p/seg",
+                        "view": {"spans": [{"text": "stale", "role": "Accent"}]}
+                    }),
+                )],
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+        drop(tx);
+        drop(old);
+        drop(new);
+
+        assert_eq!(
+            drain(&mut rx, &mut state, &mut model, None),
+            PluginDamage::None
+        );
+
+        assert!(
+            statusbar_views(&state)
+                .iter()
+                .all(|(_, view)| !view.text_content().contains("stale"))
+        );
+    }
+
+    #[test]
+    fn host_generation_stale_failed_respawn_is_not_a_crash() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        let old = tx.for_host(101);
+        let new = tx.for_host(102);
+        rx.bind_host(102);
+        old.send(PluginMsg::Respawned {
+            plugin: "p".into(),
+            session: None,
+            writer: None,
+        })
+        .unwrap();
+        drop(tx);
+        drop(old);
+
+        drain(&mut rx, &mut state, &mut model, None);
+
+        assert_eq!(state.plugins["p"].restarts, 0);
+        assert!(!state.plugins["p"].disabled);
+        new.send(PluginMsg::Respawned {
+            plugin: "p".into(),
+            session: None,
+            writer: None,
+        })
+        .unwrap();
+        drop(new);
+        drain(&mut rx, &mut state, &mut model, None);
+
+        assert_eq!(state.plugins["p"].restarts, 1);
+        assert!(!state.plugins["p"].disabled);
+    }
+
+    #[test]
+    fn host_generation_stale_refusal_keeps_the_status() {
+        let mut state = state_with(Vec::new());
+        let mut model = FrameModel {
+            status: "before".into(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        let old = tx.for_host(101);
+        let new = tx.for_host(102);
+        rx.bind_host(102);
+        old.send(PluginMsg::Refused(vec![
+            thegn_svc::plugin::loader::SpecProblem {
+                plugin: "p".into(),
+                problem: "old".into(),
+            },
+        ]))
+        .unwrap();
+        drop(tx);
+        drop(old);
+        drop(new);
+
+        drain(&mut rx, &mut state, &mut model, None);
+
+        assert_eq!(model.status, "before");
     }
 
     fn drain_one(state: &mut PluginsState, model: &mut FrameModel, m: PluginMsg) -> PluginDamage {
