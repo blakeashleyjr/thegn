@@ -598,6 +598,8 @@ mod tests {
                 failure_notification(3, "genuinely new", false),
             ],
             notifications_epoch: 7,
+            // What hydration computed for this snapshot; a committed epoch is taken as-is.
+            unread_notifications: 1,
             ..Default::default()
         };
         assert!(!committed_hydration.reconcile_pending_reads(&stale_hydration));
