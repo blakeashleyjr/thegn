@@ -65,7 +65,8 @@
     },
     {
       "change": "add-ci-logs-and-autofix",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-22-add-ci-logs-and-autofix/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -73,7 +74,7 @@
           "project": "Agent & Workflow Platform"
         }
       ],
-      "summary": "Redacted CI-log caching, failure windows, guarded autofix, PR-queue log excerpts, retention docs and the cache-first CLI smoke are delivered; the pre-PR gate remains."
+      "summary": "Redacted CI-log caching, failure windows, guarded autofix, PR-queue log excerpts, retention docs and cache-first CLI smoke are delivered; archived in batch 72 with the pre-PR gate superseded."
     },
     {
       "change": "add-crash-reporting-and-traceability",
@@ -867,11 +868,11 @@
       "disposition": "strategic-unstarted",
       "owners": [
         {
-          "issue": "THE-829",
+          "issue": "THE-1362",
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "System monitor framework contract is recorded; implementation lanes remain unstarted."
+      "summary": "Framework layers shipped in batches 42-49; the task ledger is re-owned to THE-1362 for evidence ticks and the X-2/X-3/SPEC-1 cleanup."
     },
     {
       "change": "monitor-overview",
@@ -1018,7 +1019,8 @@
     },
     {
       "change": "repair-performance-evidence-and-log-tail",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-22-repair-performance-evidence-and-log-tail/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1038,7 +1040,8 @@
     },
     {
       "change": "repair-resident-plugin-lifecycle",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-22-repair-resident-plugin-lifecycle/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1050,7 +1053,8 @@
     },
     {
       "change": "repair-session-recovery-and-terminal-teardown",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-10-22-repair-session-recovery-and-terminal-teardown/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
