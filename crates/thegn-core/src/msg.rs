@@ -147,7 +147,8 @@ mod tests {
         let mut failures = Vec::new();
         for codepoint in (0x00..=0x1f).chain([0x7f]).chain(0x80..=0x9f) {
             let character = char::from_u32(codepoint).expect("control codepoint is a scalar");
-            let safe = terminal_safe(&character.to_string());
+            let text = character.to_string();
+            let safe = terminal_safe(&text);
             let expected = if character == '\n' || character == '\t' {
                 character
             } else {
