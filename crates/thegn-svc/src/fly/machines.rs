@@ -12,7 +12,7 @@
 //! the container-native analogue of Hetzner labels / DO tags; `list()` filters
 //! on it client-side (the Machines list endpoint has no server-side selector).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const DEFAULT_API_BASE: &str = "https://api.machines.dev/v1";
 pub const DEFAULT_TOKEN_ENV: &str = "FLY_API_TOKEN";
@@ -268,17 +268,43 @@ pub fn reaper_creation_time(
         .ok_or("provider creation time is missing or invalid")
 }
 
-/// Parse a list response (`[ {machine}, … ]`), keeping only thegn-managed
-/// machines (client-side metadata filter — the endpoint has no selector).
-pub fn parse_machine_list(v: &serde_json::Value) -> Vec<FlyMachine> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(parse_machine)
-                .filter(|m| m.metadata.get(MANAGED_KEY).map(String::as_str) == Some(MANAGED_VAL))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Parse a list response (`[ {machine}, … ]`), refusing incomplete or
+/// conflicting inventories before keeping only thegn-managed machines
+/// (client-side metadata filter — the endpoint has no selector).
+pub fn parse_machine_list(v: &serde_json::Value) -> Result<Vec<FlyMachine>, &'static str> {
+    let rows = v.as_array().ok_or("machine inventory is malformed")?;
+    let mut ids = BTreeSet::new();
+    let mut managed = Vec::new();
+    for row in rows {
+        let id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("machine inventory contains a malformed machine")?;
+        if !ids.insert(id) {
+            return Err("machine inventory contains a duplicate machine id");
+        }
+        let machine = parse_machine(row).ok_or("machine inventory contains a malformed machine")?;
+        if machine.metadata.get(MANAGED_KEY).map(String::as_str) == Some(MANAGED_VAL) {
+            managed.push(machine);
+        }
+    }
+    Ok(managed)
+}
+
+/// Return the sole live thegn-managed machine in an app inventory.
+pub fn single_live_managed_machine(v: &serde_json::Value) -> Result<Option<FlyMachine>, String> {
+    let managed = parse_machine_list(v).map_err(str::to_string)?;
+    let live: Vec<FlyMachine> = managed
+        .into_iter()
+        .filter(|machine| machine.state != "destroyed" && machine.state != "destroying")
+        .collect();
+    match live.len() {
+        0 => Ok(None),
+        1 => Ok(live.into_iter().next()),
+        count => Err(format!(
+            "machine inventory has {count} live thegn-managed machines; refusing to pick one"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -522,10 +548,68 @@ mod tests {
             { "id": "c", "name": "unmanaged", "state": "started" }
         ]);
         let names: Vec<String> = parse_machine_list(&list)
+            .unwrap()
             .into_iter()
             .map(|m| m.name)
             .collect();
         assert_eq!(names, vec!["mine"]);
+    }
+
+    #[test]
+    fn machine_list_refuses_a_non_array_envelope() {
+        assert_eq!(
+            parse_machine_list(&serde_json::json!({"error":"x"})),
+            Err("machine inventory is malformed")
+        );
+    }
+
+    #[test]
+    fn machine_list_refuses_an_element_without_an_id() {
+        let inventory = serde_json::json!([
+            { "id": "a", "config": { "metadata": { "managed-by": "thegn" } } },
+            { "name": "broken" }
+        ]);
+        assert_eq!(
+            parse_machine_list(&inventory),
+            Err("machine inventory contains a malformed machine")
+        );
+    }
+
+    #[test]
+    fn machine_list_refuses_duplicate_machine_ids() {
+        let inventory = serde_json::json!([
+            { "id": "a", "config": { "metadata": { "managed-by": "thegn" } } },
+            { "id": "a", "config": { "metadata": { "managed-by": "thegn" } } }
+        ]);
+        assert_eq!(
+            parse_machine_list(&inventory),
+            Err("machine inventory contains a duplicate machine id")
+        );
+    }
+
+    #[test]
+    fn single_live_managed_machine_picks_the_only_live_one() {
+        let inventory = serde_json::json!([
+            { "id": "live", "state": "started", "config": { "metadata": { "managed-by": "thegn" } } },
+            { "id": "destroyed", "state": "destroyed", "config": { "metadata": { "managed-by": "thegn" } } },
+            { "id": "unmanaged", "state": "started", "config": { "metadata": { "managed-by": "other" } } }
+        ]);
+        let machine = single_live_managed_machine(&inventory).unwrap().unwrap();
+        assert_eq!(machine.id, "live");
+        assert_eq!(
+            single_live_managed_machine(&serde_json::json!([])).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn single_live_managed_machine_refuses_two_live_machines() {
+        let inventory = serde_json::json!([
+            { "id": "started", "state": "started", "config": { "metadata": { "managed-by": "thegn" } } },
+            { "id": "stopped", "state": "stopped", "config": { "metadata": { "managed-by": "thegn" } } }
+        ]);
+        let error = single_live_managed_machine(&inventory).unwrap_err();
+        assert!(error.contains("2 live thegn-managed machines"));
     }
 
     #[test]
