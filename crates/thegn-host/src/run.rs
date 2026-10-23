@@ -1947,6 +1947,17 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
     crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
 }
 
+fn shutdown_shares(share_supervisor: &mut crate::share::ShareSupervisor) {
+    for (worktree, port, generation) in share_supervisor.shutdown_all() {
+        let op = crate::share::SharePersist::DeleteIfOwned {
+            worktree,
+            port,
+            generation,
+        };
+        crate::db_task::persist_critical(move |db| crate::share::apply_share_persist(db, op));
+    }
+}
+
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
 /// kept) and close them. Home groups are never deletable. Returns the status
 /// line summarizing what happened.
@@ -9199,10 +9210,11 @@ async fn event_loop<T: Terminal>(
             }
         }
         if session.worktrees.is_empty() {
+            shutdown_shares(&mut share_supervisor);
             return Ok(()); // last worktree closed
         }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            share_supervisor.shutdown_all();
+            shutdown_shares(&mut share_supervisor);
             forward_supervisor.shutdown_all();
             // Deactivate + kill resident plugin sessions. Every other loop
             // exit is covered by PluginsHost's Drop; this explicit call keeps
@@ -9253,6 +9265,7 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             crate::frame_writer::WriterStatus::Fatal(e) => {
+                shutdown_shares(&mut share_supervisor);
                 let note = match clipboard_outcome {
                     Some(outcome) => format!(
                         "; {}",
@@ -20996,6 +21009,7 @@ async fn event_loop<T: Terminal>(
                                     // Action::Quit keybind (audit run.rs:13511):
                                     // otherwise pane/split/focus changes made since
                                     // the last periodic persist are lost on relaunch.
+                                    shutdown_shares(&mut share_supervisor);
                                     persist_session_layout(&mut session, &panes);
                                     crate::handlers::daemon_lifecycle::mark_session_panes_detached(
                                         &session, &panes,
@@ -24812,6 +24826,7 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Quit | Action::Detach => {
+                                shutdown_shares(&mut share_supervisor);
                                 persist_session_layout(&mut session, &panes);
                                 // Quit is a detach: daemon-backed center panes
                                 // keep running; the next launch reattaches. Cover
@@ -24829,6 +24844,7 @@ async fn event_loop<T: Terminal>(
                                 return Ok(());
                             }
                             Action::QuitKill => {
+                                shutdown_shares(&mut share_supervisor);
                                 persist_session_layout(&mut session, &panes);
                                 // One-time bounded wait on the quit path so the
                                 // kills land before shutdown_background() aborts

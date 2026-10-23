@@ -681,8 +681,8 @@ impl ShareSupervisor {
         }
     }
 
-    /// Stop shares on `worktree`: a specific `port`, or all (`None`). `removed`
-    /// `removed` pairs have no running supervisor and can be deleted now;
+    /// Stop shares on `worktree`: a specific `port`, or all (`None`). Removed
+    /// pairs have no running supervisor and can be deleted now;
     /// `pending` pairs stay until that generation's terminal event owns both
     /// the row delete and removal from the live list.
     pub(crate) fn stop(&mut self, worktree: &str, port: Option<u16>) -> StopShares {
@@ -754,11 +754,24 @@ impl ShareSupervisor {
     }
 
     /// Immediately kill every child (teardown on quit).
-    pub fn shutdown_all(&mut self) {
+    pub fn shutdown_all(&mut self) -> Vec<(String, u16, u64)> {
+        let stopping = self
+            .instances
+            .iter()
+            .filter(|instance| matches!(instance.state, ShareState::Stopping))
+            .map(|instance| {
+                (
+                    instance.worktree.clone(),
+                    instance.port,
+                    instance.generation,
+                )
+            })
+            .collect();
         for i in &self.instances {
             i.kill_now();
         }
         self.instances.clear();
+        stopping
     }
 
     fn find_mut(
@@ -1859,6 +1872,54 @@ mod tests {
         };
         apply_share_persist(&db, share_persist_for(&down));
         assert!(db.list_shares().expect("list saved shares").is_empty());
+    }
+
+    #[test]
+    fn stopping_share_is_deleted_on_quit_before_down_and_not_restored() {
+        let db = thegn_core::db::Db::open_memory().expect("in-memory database");
+        let generation = 102;
+        apply_share_persist(
+            &db,
+            SharePersist::Upsert {
+                worktree: "/wt".into(),
+                port: 3000,
+                generation,
+                provider: "bore".into(),
+                url: "https://a.test".into(),
+            },
+        );
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(PublicEndpoint::parse_url("https://a.test").expect("valid URL")),
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        let stopped = sup.stop_with("/wt", Some(3000), |_| Ok(()));
+        assert_eq!(stopped.pending, vec![(3000, generation)]);
+
+        // Quit may run before the worker's Down reaches the loop. shutdown_all
+        // returns exactly the stopping owner, and startup only restores "up" rows.
+        let stopping = sup.shutdown_all();
+        assert_eq!(stopping, vec![("/wt".to_string(), 3000, generation)]);
+        for (worktree, port, generation) in stopping {
+            apply_share_persist(
+                &db,
+                SharePersist::DeleteIfOwned {
+                    worktree,
+                    port,
+                    generation,
+                },
+            );
+        }
+        let rows = db.list_shares().expect("list saved shares");
+        assert!(!rows.iter().any(|row| row.state == "up"));
     }
 
     #[test]
