@@ -1693,7 +1693,7 @@ mod tests {
         let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("keyring read failed"), "{log}");
         assert!(log.contains(r#"outcome="denied""#), "{log}");
-        assert!(!log.contains("secret-value-sentinel"), "{log}");
+        assert!(!log.contains("media-mpd-test-account"), "{log}");
     }
 
     #[test]
@@ -1775,7 +1775,11 @@ mod tests {
         thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
         let path = temp.path().join("token");
         std::fs::write(&path, "loose-token").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_readonly(false)).unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
         if thegn_core::fsperm::mode_bits(&path).unwrap().is_none() {
             return;
         }
@@ -1794,7 +1798,7 @@ mod tests {
         });
         assert_eq!(denied, Err(SecretResolveFailure::Denied));
         let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(log.contains("accessible to other users"), "{log}");
+        assert!(log.contains("world-accessible"), "{log}");
         assert!(log.contains(r#"outcome="denied""#), "{log}");
         assert!(!log.contains("loose-token"), "{log}");
 
@@ -1806,21 +1810,30 @@ mod tests {
     }
 
     #[test]
-    fn file_ref_symlink_is_denied() {
+    fn file_ref_symlink_to_owner_only_target_is_accepted() {
         let temp = tempfile::tempdir().unwrap();
         thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
         let target = temp.path().join("token");
         std::fs::write(&target, "symlink-token").unwrap();
         thegn_core::fsperm::restrict_to_owner(&target).unwrap();
         let link = temp.path().join("token-link");
-        if thegn_core::fsperm::create_symlink(&target, &link, false).is_err() {
-            return;
+        match thegn_core::fsperm::create_symlink(&target, &link, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("fixture symlink: {error}"),
         }
         let result = resolve_ref_for_outcome(
             &SecretRef::parse(&format!("file:{}", link.display()), BareAs::Literal),
             "test",
         );
-        assert_eq!(result, Err(SecretResolveFailure::Denied));
+        assert_eq!(result, Ok(Some("symlink-token".into())));
     }
 
     #[test]

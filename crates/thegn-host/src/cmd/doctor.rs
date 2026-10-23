@@ -2720,10 +2720,15 @@ fn key_ref_state(raw: &str) -> String {
     }
     if let Some(path) = raw.strip_prefix("file:") {
         let path = path.trim();
-        return if std::path::Path::new(path).exists() {
-            format!("file:{path} (present)")
-        } else {
-            format!("file:{path} (MISSING)")
+        let expanded = thegn_core::util::expand_tilde(path);
+        return match thegn_core::fsperm::read_owner_only_secret_file(&expanded, 64 * 1024) {
+            Ok(_) => format!("file:{path} (present; policy accepted)"),
+            Err(thegn_core::fsperm::SecretFileError::NotFound) => {
+                format!("file:{path} (MISSING)")
+            }
+            Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
+                format!("file:{path} (REFUSED — {reason})")
+            }
         };
     }
     "INVALID — must be env:VAR or file:PATH".to_string()
@@ -5185,6 +5190,23 @@ fn summary(c: &TermCaps) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_reports_refusal_for_world_readable_file_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("doctor-token");
+        std::fs::write(&path, b"doctor-secret-value").unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
+
+        let status = key_ref_state(&format!("file:{}", path.display()));
+        assert!(status.contains("REFUSED"), "{status}");
+        assert!(status.contains("world-accessible"), "{status}");
+        assert!(!status.contains("doctor-secret-value"), "{status}");
+    }
 
     #[test]
     fn cpu_cap_limits_json_carries_the_soft_reason_key() {

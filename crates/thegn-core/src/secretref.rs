@@ -87,9 +87,10 @@ pub enum SecretRef {
     Keyring { account: String },
     /// `env:VAR` (and bare-as-env-name fields) — an environment variable.
     Env { var: String },
-    /// `file:PATH` — a file owned by you with no group/other permission bits (mode 0600 or 0400) and a single link;
-    /// the final path component must not be a symlink (a symlinked parent directory such as agenix's /run/agenix is
-    /// fine). `~` is expanded by the broker at read time; a file that fails these checks is refused, not read.
+    /// `file:PATH` — follows final symlinks and checks the resolved target: a regular file owned by you or root,
+    /// with no world permission bits, one link, and a maximum size of 64 KiB. Group permissions are allowed with a
+    /// one-time path-only warning; world access, extra hard links, dangling links and non-regular targets are refused.
+    /// `~` is expanded by the broker at read time.
     File { path: String },
     /// A legacy literal value pasted into config plaintext (deprecated).
     Literal(LiteralSecret),
