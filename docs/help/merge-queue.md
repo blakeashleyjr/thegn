@@ -100,9 +100,10 @@ the reason; use `thegn land` to land that branch outside the queue.
   claims the row, but they do not record the landed row and report that it was
   not recorded.
 - Deleting a worktree keeps its queue row while an active drain has claimed it.
-- Renaming a worktree while an active drain holds its queue row is refused,
-  naming the drain; nothing is renamed. If the queue cannot be read, the rename
-  is refused too.
+- Renaming a worktree that has a merge-queue row is refused, and nothing is
+  renamed. While a drain holds the row the refusal names the drain; otherwise
+  run `thegn merge rm` first. If the queue cannot be read, the rename is refused
+  too.
 
 ## Land strategy, signing, drivers
 

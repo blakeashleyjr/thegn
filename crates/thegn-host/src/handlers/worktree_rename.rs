@@ -150,8 +150,9 @@ pub(crate) fn request(
     let tx = tx.clone();
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let root = std::path::Path::new(&repo_root);
         use thegn_core::store::WorktreeAuxStore;
+
+        let root = std::path::Path::new(&repo_root);
         let observed = thegn_core::db::Db::open().and_then(|db| db.observe_merge_claim(&old_path));
         if let Some(reason) = merge_claim_refusal(observed, &old_branch) {
             // A closed channel means the consumer is going away; the refusal still must not run Git.
@@ -221,8 +222,8 @@ pub(crate) fn registry_failure_status(want: &str, error: &str) -> String {
     format!("Renamed to {want} (registry update failed: {error})")
 }
 
-/// Why a rename must not start: the worktree's merge-queue row is held by a
-/// drain, or the queue could not be read. `None` lets the rename proceed.
+/// Why a rename must not start: the worktree has a merge-queue row (held by a
+/// drain or not), or the queue could not be read. `None` lets the rename proceed.
 fn merge_claim_refusal(
     observed: anyhow::Result<Option<thegn_core::store::MergeClaimView>>,
     old_branch: &str,
@@ -237,7 +238,11 @@ fn merge_claim_refusal(
             view.owner_hint.as_deref().unwrap_or("owner unknown"),
             view.phase
         )),
-        Ok(None | Some(_)) => None,
+        Ok(Some(view)) => Some(format!(
+            "refusing to rename {old_branch}: it has a merge-queue row ({}); run `thegn merge rm` on it first; nothing was changed",
+            view.phase
+        )),
+        Ok(None) => None,
     }
 }
 
@@ -638,8 +643,12 @@ mod tests {
     }
 
     #[test]
-    fn rename_proceeds_for_an_unqueued_or_unclaimed_worktree() {
+    fn rename_proceeds_for_an_unqueued_worktree() {
         assert!(merge_claim_refusal(Ok(None), "feature").is_none());
+    }
+
+    #[test]
+    fn rename_refuses_an_unclaimed_queued_worktree() {
         let unclaimed = MergeClaimView {
             worktree: "/wt/a".into(),
             generation: 3,
@@ -647,11 +656,14 @@ mod tests {
             lease_until_ms: None,
             owner_hint: None,
         };
-        assert!(merge_claim_refusal(Ok(Some(unclaimed)), "feature").is_none());
+        let refusal = merge_claim_refusal(Ok(Some(unclaimed)), "feature")
+            .expect("unclaimed queued row refuses rename");
+        assert!(refusal.contains("thegn merge rm"));
+        assert!(refusal.contains("nothing was changed"));
     }
 
     #[test]
-    fn rename_claim_check_reads_a_real_claimed_row() {
+    fn rename_claim_check_reads_real_claimed_and_unclaimed_rows() {
         let db = thegn_core::db::Db::open_memory().unwrap();
         db.put_worktree(
             "feature",
@@ -681,8 +693,20 @@ mod tests {
             merge_claim_refusal(db.observe_merge_claim("/private/repo/feature"), "feature")
                 .expect("real claimed row refuses rename");
         assert!(refusal.contains("worker-a"));
+
+        db.enqueue_merge("/private/repo/other", "other", "main")
+            .unwrap();
+        let unclaimed_refusal =
+            merge_claim_refusal(db.observe_merge_claim("/private/repo/other"), "other")
+                .expect("real unclaimed row refuses rename");
+        assert!(unclaimed_refusal.contains("thegn merge rm"));
+
         assert!(
-            merge_claim_refusal(db.observe_merge_claim("/private/repo/other"), "other").is_none()
+            merge_claim_refusal(
+                db.observe_merge_claim("/private/repo/never-enqueued"),
+                "never-enqueued"
+            )
+            .is_none()
         );
     }
 }
