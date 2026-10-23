@@ -321,7 +321,7 @@ fn deprovision(
             .provider
             .clone(),
         None => {
-            let resolved = resolve_for(cfg, worktree.clone());
+            let resolved = resolve_for(cfg, worktree.clone())?;
             cfg.env
                 .get(&resolved.name)
                 .ok_or_else(|| anyhow::anyhow!("the default env has no API provider configured"))?
@@ -415,7 +415,7 @@ fn test(cfg: &Config, name: &str) -> Result<()> {
 /// worktree's resolved env, or explain why not.
 fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::provider::Provider> {
     use thegn_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
-    let env = resolve_for(cfg, worktree);
+    let env = resolve_for(cfg, worktree)?;
     let envc = cfg
         .env
         .get(&env.name)
@@ -525,7 +525,7 @@ fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::pro
 /// provider can translate egress and the env declares a network allow/block
 /// list, verify the lowered policy before admitting the sandbox.
 fn provision(cfg: &Config, worktree: Option<String>) -> Result<()> {
-    let env = resolve_for(cfg, worktree.clone());
+    let env = resolve_for(cfg, worktree.clone())?;
     let provider = api_provider(cfg, worktree)?;
     let rt = tokio::runtime::Runtime::new()?;
     let handle = rt.block_on(provider.create())?;
@@ -591,7 +591,7 @@ fn provider_and_id(
     cfg: &Config,
     worktree: Option<String>,
 ) -> Result<(thegn_svc::provider::Provider, String)> {
-    let env = resolve_for(cfg, worktree.clone());
+    let env = resolve_for(cfg, worktree.clone())?;
     // The resolved placement carries the per-worktree sandbox id.
     let id = match &env.placement {
         thegn_core::placement::Placement::Provider(p) => p.id.clone(),
@@ -652,7 +652,7 @@ enum Lifecycle {
 
 /// Resolve a worktree's environment and bring it up / tear it down.
 fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Result<()> {
-    let env = resolve_for(cfg, worktree.clone());
+    let env = resolve_for(cfg, worktree.clone())?;
     match action {
         Lifecycle::Up => {
             outln!("bringing up env {} ({})…", env.name, env.placement.label());
@@ -700,7 +700,7 @@ fn sshfs(env: &thegn_core::env::Environment, mount: bool) -> Result<()> {
 
 /// Forward a port from the resolved environment to localhost (foreground).
 fn forward(cfg: &Config, worktree: Option<String>, spec: &str) -> Result<()> {
-    let env = resolve_for(cfg, worktree);
+    let env = resolve_for(cfg, worktree)?;
     let Some(argv) = env.placement.port_forward_argv(spec) else {
         anyhow::bail!(
             "env {} ({}) does not support port forwarding",
@@ -722,18 +722,36 @@ fn forward(cfg: &Config, worktree: Option<String>, spec: &str) -> Result<()> {
 }
 
 /// Resolve the [`Environment`](thegn_core::env::Environment) for a worktree
-/// (cwd default), honouring the DB worktree/workspace selection.
-pub(crate) fn resolve_for(cfg: &Config, worktree: Option<String>) -> thegn_core::env::Environment {
+/// (cwd default), honouring the DB worktree/workspace selection. A failed
+/// selection read is an error.
+pub(crate) fn resolve_for(
+    cfg: &Config,
+    worktree: Option<String>,
+) -> Result<thegn_core::env::Environment> {
     // Shared resolver: arg → $THEGN_WORKTREE → git toplevel → cwd (returns PathBuf).
     let wt = super::resolve_worktree(worktree)
         .to_string_lossy()
         .into_owned();
     let loc = GitLoc::for_worktree(Path::new(&wt));
     let repo_root = repo_root_for(&wt);
-    let selected = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(&wt, &repo_root.to_string_lossy()));
-    cfg.resolve_env(&repo_root, &loc, Path::new(&wt), selected.as_deref())
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
+    resolve_with_selection(cfg, &wt, &repo_root, &loc, read)
+}
+
+/// Resolve `wt`'s environment from an already-performed selection read. A
+/// failed read is an error naming the worktree, never the default environment.
+fn resolve_with_selection(
+    cfg: &Config,
+    wt: &str,
+    repo_root: &Path,
+    loc: &GitLoc,
+    read: anyhow::Result<Option<String>>,
+) -> Result<thegn_core::env::Environment> {
+    let selected = read.with_context(|| {
+        format!("could not read the environment selection for {wt}; refusing to fall back to the default environment")
+    })?;
+    Ok(cfg.resolve_env(repo_root, loc, Path::new(wt), selected.as_deref()))
 }
 
 fn list(cfg: &Config, json: bool) -> Result<()> {
@@ -817,10 +835,9 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
         .into_owned();
     let loc = GitLoc::for_worktree(Path::new(&wt));
     let repo_root = repo_root_for(&wt);
-    let selected = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(&wt, &repo_root.to_string_lossy()));
-    let env = cfg.resolve_env(&repo_root, &loc, Path::new(&wt), selected.as_deref());
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
+    let env = resolve_with_selection(cfg, &wt, &repo_root, &loc, read)?;
     outln!("worktree: {wt}");
     outln!("env:      {}", env.name);
     outln!("placement: {}", env.placement.label());
@@ -1094,5 +1111,71 @@ mod egress_tests {
                 })
         );
         assert_eq!(steps.calls(), ["apply:sandbox-1", "destroy:sandbox-1"]);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use thegn_core::config::{EnvConfig, PlacementMode};
+
+    #[test]
+    fn resolve_with_selection_refuses_an_unreadable_selection() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().expect("temporary worktree");
+        let wt = dir.path().to_string_lossy().into_owned();
+        let repo_root = dir.path();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+
+        let result = resolve_with_selection(
+            &Config::default(),
+            &wt,
+            repo_root,
+            &loc,
+            Err(anyhow::anyhow!("database is locked")),
+        );
+        let Err(error) = result else {
+            panic!("unreadable selection must refuse env resolution");
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains("could not read the environment selection for"));
+        assert!(error.contains(&wt));
+        assert!(error.contains("database is locked"));
+    }
+
+    #[test]
+    fn resolve_with_selection_keeps_the_default_when_nothing_is_selected() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().expect("temporary worktree");
+        let wt = dir.path().to_string_lossy().into_owned();
+        let repo_root = dir.path();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let cfg = Config::default();
+        let expected = cfg.resolve_env(repo_root, &loc, dir.path(), None);
+
+        let actual = resolve_with_selection(&cfg, &wt, repo_root, &loc, Ok(None))
+            .expect("no selection keeps default resolution");
+        assert_eq!(actual.name, expected.name);
+    }
+
+    #[test]
+    fn resolve_with_selection_uses_the_selected_env_name() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().expect("temporary worktree");
+        let wt = dir.path().to_string_lossy().into_owned();
+        let repo_root = dir.path();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "box".into(),
+            EnvConfig {
+                placement: PlacementMode::Local,
+                ..Default::default()
+            },
+        );
+
+        let actual = resolve_with_selection(&cfg, &wt, repo_root, &loc, Ok(Some("box".into())))
+            .expect("selected env resolves");
+        assert_eq!(actual.name, "box");
     }
 }
