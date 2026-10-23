@@ -370,14 +370,22 @@ pub trait Forge: Probe + Send + Sync {
         unsupported!("comment")
     }
 
+    /// When `expected_head` is `Some`, record the review against exactly that
+    /// commit or return `ForgeError::Unsupported("submit_review expected head")`
+    /// without submitting. `None` keeps the provider's ordinary PR selection.
     fn submit_review(
         &self,
         _loc: &GitLoc,
         _pr: PrRef,
         _state: ReviewState,
         _body: Option<&str>,
+        expected_head: Option<&str>,
     ) -> Result<(), ForgeError> {
-        unsupported!("submit_review")
+        if expected_head.is_some() {
+            unsupported!("submit_review expected head")
+        } else {
+            unsupported!("submit_review")
+        }
     }
 
     fn reply_thread(&self, _loc: &GitLoc, _thread_id: &str, _body: &str) -> Result<(), ForgeError> {

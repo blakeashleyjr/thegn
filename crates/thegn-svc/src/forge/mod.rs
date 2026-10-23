@@ -178,9 +178,15 @@ impl Forge for Ladder<dyn Forge> {
         pr: PrRef,
         state: ReviewState,
         body: Option<&str>,
+        expected_head: Option<&str>,
     ) -> Result<(), ForgeError> {
-        forward!(self, "submit_review", |l| l
-            .submit_review(loc, pr, state, body))
+        forward!(self, "submit_review", |l| l.submit_review(
+            loc,
+            pr,
+            state,
+            body,
+            expected_head
+        ))
     }
     fn reply_thread(&self, loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), ForgeError> {
         forward!(self, "reply_thread", |l| l
