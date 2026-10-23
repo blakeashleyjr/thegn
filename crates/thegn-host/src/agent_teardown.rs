@@ -31,7 +31,7 @@ pub fn checkpoint_on_close(worktree: &str) {
     let db = match Db::open() {
         Ok(db) => db,
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            crate::close_teardown::warn_visible(&format!(
                 "auto-checkpoint on close skipped: the environment selection could not be read: {error:#}"
             ));
             return;
@@ -46,7 +46,7 @@ pub fn checkpoint_on_close(worktree: &str) {
         Ok(Some(name)) => name,
         Ok(None) => return,
         Err(message) => {
-            thegn_core::msg::warn(&message);
+            crate::close_teardown::warn_visible(&message);
             return;
         }
     };
@@ -70,8 +70,14 @@ pub fn checkpoint_on_close(worktree: &str) {
     }
     match block_on_provider(|| async { provider.checkpoint(&name, Some("auto-close")).await }) {
         Ok(id) => thegn_core::msg::info(&format!("checkpointed {name} on close: {id}")),
-        Err(e) => thegn_core::msg::warn(&format!("auto-checkpoint on close failed: {e}")),
+        Err(error) => {
+            crate::close_teardown::warn_visible(&checkpoint_failed_message(&name, &error))
+        }
     }
+}
+
+fn checkpoint_failed_message(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!("auto-checkpoint on close failed for {name}: {error:#}")
 }
 
 /// The env to checkpoint on close: `Ok(None)` = nothing selected, `Err` = unreadable (skip with a warning).
@@ -191,5 +197,17 @@ mod tests {
             Ok(Some("box".into()))
         );
         assert_eq!(checkpoint_selection(Ok(None)), Ok(None));
+    }
+
+    #[test]
+    fn checkpoint_failed_message_names_the_sandbox_and_cause() {
+        let message = checkpoint_failed_message("sbx", &"provider unavailable");
+        assert!(message.contains("auto-checkpoint on close failed for sbx"));
+        assert!(message.contains("provider unavailable"));
+
+        let error = anyhow::anyhow!("provider unavailable").context("checkpoint request failed");
+        let message = checkpoint_failed_message("sbx", &error);
+        assert!(message.contains("checkpoint request failed"));
+        assert!(message.contains("provider unavailable"));
     }
 }
