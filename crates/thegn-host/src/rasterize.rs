@@ -61,6 +61,10 @@ const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MERMAID_INPUT_BYTES: u64 = 2 * 1024 * 1024;
 /// Bound generated Mermaid PNGs independently of the decoder's pixel budget.
 const MAX_MERMAID_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+/// Bound how many linked-worktree admin entries renderer resolution inspects.
+const MAX_WORKTREE_ADMIN_ENTRIES: usize = 4096;
+/// Bound `.git`, `commondir`, and linked-worktree `gitdir` pointer files.
+const MAX_GIT_POINTER_BYTES: u64 = 4096;
 
 /// Owns all files visible to one renderer process. The tempdir is private and
 /// removed when the renderer has returned and this value is dropped.
@@ -194,8 +198,10 @@ where
 enum RendererLookup {
     /// No absolute PATH entry holds the program.
     Missing,
-    /// Every candidate lives inside the previewed repository (first refused candidate kept for the message).
+    /// Every candidate lives inside the previewed repository or one of its worktrees (first refused candidate kept for the message).
     Shadowed(PathBuf),
+    /// The previewed repository's worktree set could not be established, so no candidate can be cleared.
+    Unverifiable(String),
 }
 
 impl RendererLookup {
@@ -203,8 +209,11 @@ impl RendererLookup {
         match self {
             RendererLookup::Missing => format!("{program} not found on PATH"),
             RendererLookup::Shadowed(path) => format!(
-                "{program} at {} is inside the previewed repository; refusing to run it",
+                "{program} at {} is inside the previewed repository or one of its worktrees; refusing to run it",
                 path.display()
+            ),
+            RendererLookup::Unverifiable(reason) => format!(
+                "cannot verify {program}: the previewed repository's worktrees are unreadable ({reason}); refusing to run it"
             ),
         }
     }
@@ -220,17 +229,160 @@ fn untrusted_root_for(previewed: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Resolve `program` through absolute PATH entries, skipping candidates in the untrusted repository.
+fn read_git_pointer(path: &Path) -> Result<String, String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_GIT_POINTER_BYTES {
+        return Err(format!(
+            "{} exceeds the {MAX_GIT_POINTER_BYTES} byte limit",
+            path.display()
+        ));
+    }
+    let mut content =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if content.ends_with('\n') {
+        content.pop();
+        if content.ends_with('\r') {
+            content.pop();
+        }
+    }
+    if content.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(content)
+}
+
+fn repository_common_dir(root: &Path) -> Result<PathBuf, String> {
+    let dot_git = root.join(".git");
+    if std::fs::symlink_metadata(&dot_git).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(dot_git);
+    }
+
+    let pointer = read_git_pointer(&dot_git)?;
+    let gitdir_value = pointer
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{} has no gitdir: pointer", dot_git.display()))?;
+    let gitdir_path = Path::new(gitdir_value);
+    let gitdir = if gitdir_path.is_absolute() {
+        gitdir_path.to_path_buf()
+    } else {
+        root.join(gitdir_path)
+    };
+    if !std::fs::metadata(&gitdir).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(format!("gitdir {} is not a directory", gitdir.display()));
+    }
+
+    let commondir_file = gitdir.join("commondir");
+    match std::fs::symlink_metadata(&commondir_file) {
+        Ok(_) => {
+            let pointer = read_git_pointer(&commondir_file)?;
+            let common_path = Path::new(&pointer);
+            let common = if common_path.is_absolute() {
+                common_path.to_path_buf()
+            } else {
+                gitdir.join(common_path)
+            };
+            if !std::fs::metadata(&common).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err(format!("commondir {} is not a directory", common.display()));
+            }
+            Ok(common)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(gitdir),
+        Err(error) => Err(format!("{}: {error}", commondir_file.display())),
+    }
+}
+
+fn untrusted_roots_for(previewed: &Path) -> Result<Vec<PathBuf>, RendererLookup> {
+    let Some(nearest) = untrusted_root_for(previewed) else {
+        return Ok(Vec::new());
+    };
+    let common = repository_common_dir(&nearest).map_err(RendererLookup::Unverifiable)?;
+    let mut roots = vec![nearest, common.clone()];
+    if common.file_name() == Some(OsStr::new(".git"))
+        && let Some(main_worktree) = common.parent()
+    {
+        roots.push(main_worktree.to_path_buf());
+    }
+
+    let admin = common.join("worktrees");
+    let entries = match std::fs::read_dir(&admin) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(roots),
+        Err(error) => {
+            return Err(RendererLookup::Unverifiable(format!(
+                "{}: {error}",
+                admin.display()
+            )));
+        }
+    };
+    let mut seen: usize = 0;
+    for entry in entries {
+        seen += 1;
+        if seen > MAX_WORKTREE_ADMIN_ENTRIES {
+            return Err(RendererLookup::Unverifiable(format!(
+                "more than {MAX_WORKTREE_ADMIN_ENTRIES} worktree entries"
+            )));
+        }
+        let entry = entry.map_err(|error| {
+            RendererLookup::Unverifiable(format!("{}: {error}", admin.display()))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| {
+                RendererLookup::Unverifiable(format!("{}: {error}", entry.path().display()))
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+        let admin_entry = entry.path();
+        let gitdir_file = admin_entry.join("gitdir");
+        match std::fs::symlink_metadata(&gitdir_file) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(RendererLookup::Unverifiable(format!(
+                    "{}: {error}",
+                    gitdir_file.display()
+                )));
+            }
+            Ok(_) => {}
+        }
+        let pointer = read_git_pointer(&gitdir_file).map_err(RendererLookup::Unverifiable)?;
+        let gitdir_path = Path::new(&pointer);
+        let gitdir = if gitdir_path.is_absolute() {
+            gitdir_path.to_path_buf()
+        } else {
+            admin_entry.join(gitdir_path)
+        };
+        let worktree = gitdir.parent().ok_or_else(|| {
+            RendererLookup::Unverifiable(format!(
+                "{} does not name a worktree git directory",
+                gitdir_file.display()
+            ))
+        })?;
+        roots.push(worktree.to_path_buf());
+    }
+    Ok(roots)
+}
+
+/// Resolve `program` through absolute PATH entries, skipping candidates in any untrusted worktree.
 fn resolve_renderer(
     program: &str,
     path_var: Option<&OsStr>,
-    untrusted_root: Option<&Path>,
+    untrusted_roots: &[PathBuf],
 ) -> Result<PathBuf, RendererLookup> {
     let Some(path_var) = path_var else {
         return Err(RendererLookup::Missing);
     };
-    let root =
-        untrusted_root.map(|root| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
+    let roots: Vec<PathBuf> = untrusted_roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect();
     let mut first_shadowed = None;
     for entry in std::env::split_paths(path_var).filter(|entry| entry.is_absolute()) {
         let candidate = entry.join(program);
@@ -246,9 +398,9 @@ fn resolve_renderer(
             continue;
         };
         let entry_canon = entry.canonicalize().unwrap_or_else(|_| entry.clone());
-        let is_shadowed = root
-            .as_ref()
-            .is_some_and(|root| canonical.starts_with(root) || entry_canon.starts_with(root));
+        let is_shadowed = roots
+            .iter()
+            .any(|root| canonical.starts_with(root) || entry_canon.starts_with(root));
         if is_shadowed {
             first_shadowed.get_or_insert(candidate);
             continue;
@@ -262,14 +414,11 @@ fn resolve_renderer(
 }
 
 fn renderer_for(program: &str, previewed: &Path) -> Result<PathBuf, RendererLookup> {
-    resolve_renderer(
-        program,
-        std::env::var_os("PATH").as_deref(),
-        untrusted_root_for(previewed).as_deref(),
-    )
+    let roots = untrusted_roots_for(previewed)?;
+    resolve_renderer(program, std::env::var_os("PATH").as_deref(), &roots)
 }
 
-/// `program` is resolved by `renderer_for`, which refuses a renderer inside the previewed repository.
+/// `program` is resolved by `renderer_for`, which refuses a renderer inside any worktree of the previewed repository.
 fn renderer_command(program: &Path, stage: &RenderStage) -> Command {
     let mut command = Command::new(program);
     command
@@ -572,15 +721,167 @@ mod tests {
         }
     }
 
+    fn linked_layout(t: &Path, relative: bool) -> (PathBuf, PathBuf) {
+        let main = t.join("main");
+        let sib = t.join("sib");
+        let admin_entry = main.join(".git/worktrees/sib");
+        std::fs::create_dir_all(&admin_entry).unwrap();
+        std::fs::create_dir_all(&sib).unwrap();
+        std::fs::write(main.join("doc.pdf"), b"pdf").unwrap();
+        std::fs::write(sib.join("doc.pdf"), b"pdf").unwrap();
+        std::fs::write(
+            sib.join(".git"),
+            format!("gitdir: {}\n", admin_entry.display()),
+        )
+        .unwrap();
+        std::fs::write(admin_entry.join("commondir"), "../..\n").unwrap();
+        let gitdir = if relative {
+            "../../../../sib/.git".to_string()
+        } else {
+            sib.join(".git").display().to_string()
+        };
+        std::fs::write(admin_entry.join("gitdir"), format!("{gitdir}\n")).unwrap();
+        (main, sib)
+    }
+
+    fn executable_renderer(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"renderer").unwrap();
+        crate::platform::set_owner_executable(path).unwrap();
+    }
+
+    #[test]
+    fn renderer_resolution_refuses_a_shadow_in_a_sibling_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let (main, sib) = linked_layout(temp.path(), false);
+        let shadow_dir = sib.join("node_modules/.bin");
+        let shadow = shadow_dir.join("pdftoppm");
+        executable_renderer(&shadow);
+        let system = temp.path().join("system");
+        let system_renderer = system.join("pdftoppm");
+        executable_renderer(&system_renderer);
+        let roots = untrusted_roots_for(&main.join("doc.pdf")).unwrap();
+
+        let shadow_path = std::env::join_paths([shadow_dir.as_os_str()]).unwrap();
+        assert_eq!(
+            resolve_renderer("pdftoppm", Some(&shadow_path), &roots),
+            Err(RendererLookup::Shadowed(shadow))
+        );
+        let path = std::env::join_paths([shadow_dir.as_os_str(), system.as_os_str()]).unwrap();
+        assert_eq!(
+            resolve_renderer("pdftoppm", Some(&path), &roots),
+            Ok(system_renderer)
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_refuses_a_main_worktree_shadow_from_a_linked_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let (main, sib) = linked_layout(temp.path(), false);
+        let shadow_dir = main.join("bin");
+        let shadow = shadow_dir.join("pdftoppm");
+        executable_renderer(&shadow);
+        let roots = untrusted_roots_for(&sib.join("doc.pdf")).unwrap();
+        let path = std::env::join_paths([shadow_dir.as_os_str()]).unwrap();
+
+        assert_eq!(
+            resolve_renderer("pdftoppm", Some(&path), &roots),
+            Err(RendererLookup::Shadowed(shadow))
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_honours_a_relative_worktree_gitdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let (main, sib) = linked_layout(temp.path(), true);
+        let shadow_dir = sib.join("node_modules/.bin");
+        let shadow = shadow_dir.join("pdftoppm");
+        executable_renderer(&shadow);
+        let roots = untrusted_roots_for(&main.join("doc.pdf")).unwrap();
+        let path = std::env::join_paths([shadow_dir.as_os_str()]).unwrap();
+
+        assert_eq!(
+            resolve_renderer("pdftoppm", Some(&path), &roots),
+            Err(RendererLookup::Shadowed(shadow))
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_refuses_when_the_worktree_registry_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let bad_gitfile_repo = temp.path().join("missing-gitdir");
+        std::fs::create_dir_all(&bad_gitfile_repo).unwrap();
+        std::fs::write(
+            bad_gitfile_repo.join(".git"),
+            format!("gitdir: {}\n", temp.path().join("missing").display()),
+        )
+        .unwrap();
+        let bad_gitfile_doc = bad_gitfile_repo.join("doc.pdf");
+        std::fs::write(&bad_gitfile_doc, b"pdf").unwrap();
+        let missing_gitdir = untrusted_roots_for(&bad_gitfile_doc);
+        assert!(matches!(
+            &missing_gitdir,
+            Err(RendererLookup::Unverifiable(_))
+        ));
+        assert!(
+            missing_gitdir
+                .unwrap_err()
+                .describe("pdftoppm")
+                .contains("refusing")
+        );
+
+        let bad_admin_repo = temp.path().join("bad-admin");
+        std::fs::create_dir_all(&bad_admin_repo).unwrap();
+        std::fs::create_dir_all(bad_admin_repo.join(".git")).unwrap();
+        std::fs::write(bad_admin_repo.join(".git/worktrees"), b"not a directory").unwrap();
+        let bad_admin_doc = bad_admin_repo.join("doc.pdf");
+        std::fs::write(&bad_admin_doc, b"pdf").unwrap();
+        assert!(matches!(
+            untrusted_roots_for(&bad_admin_doc),
+            Err(RendererLookup::Unverifiable(_))
+        ));
+
+        let empty_gitdir_repo = temp.path().join("empty-gitdir");
+        let admin_entry = empty_gitdir_repo.join(".git/worktrees/empty");
+        std::fs::create_dir_all(&admin_entry).unwrap();
+        std::fs::write(empty_gitdir_repo.join("doc.pdf"), b"pdf").unwrap();
+        std::fs::write(admin_entry.join("gitdir"), b"").unwrap();
+        assert!(matches!(
+            untrusted_roots_for(&empty_gitdir_repo.join("doc.pdf")),
+            Err(RendererLookup::Unverifiable(_))
+        ));
+    }
+
+    #[test]
+    fn renderer_resolution_untrusted_roots_without_linked_worktrees_are_the_repo() {
+        // Positive control: repositories without linked worktrees still resolve the same way.
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = renderer_fixture(temp.path());
+        let roots = untrusted_roots_for(&fixture.repo.join("doc.pdf")).unwrap();
+        let repo = fixture.repo.canonicalize().unwrap();
+        assert!(!roots.is_empty());
+        assert!(roots.iter().all(|root| {
+            root.canonicalize()
+                .unwrap_or_else(|_| root.to_path_buf())
+                .starts_with(&repo)
+        }));
+        let outside = temp.path().join("outside.pdf");
+        std::fs::write(&outside, b"pdf").unwrap();
+        assert_eq!(
+            untrusted_roots_for(&outside).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
     #[test]
     fn renderer_resolution_skips_a_shadow_inside_the_previewed_repo() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = renderer_fixture(temp.path());
         let path = std::env::join_paths([fixture.repo_bin.as_os_str(), fixture.system.as_os_str()])
             .unwrap();
-        let root = untrusted_root_for(&fixture.repo.join("doc.pdf"));
+        let roots = untrusted_roots_for(&fixture.repo.join("doc.pdf")).unwrap();
         assert_eq!(
-            resolve_renderer("pdftoppm", Some(&path), root.as_deref()),
+            resolve_renderer("pdftoppm", Some(&path), &roots),
             Ok(fixture.system.join("pdftoppm"))
         );
     }
@@ -590,11 +891,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = renderer_fixture(temp.path());
         let path = std::env::join_paths([fixture.repo_bin.as_os_str()]).unwrap();
-        let result = resolve_renderer(
-            "pdftoppm",
-            Some(&path),
-            untrusted_root_for(&fixture.repo.join("doc.pdf")).as_deref(),
-        );
+        let roots = untrusted_roots_for(&fixture.repo.join("doc.pdf")).unwrap();
+        let result = resolve_renderer("pdftoppm", Some(&path), &roots);
         assert_eq!(
             result,
             Err(RendererLookup::Shadowed(fixture.repo_bin.join("pdftoppm")))
@@ -625,7 +923,7 @@ mod tests {
             resolve_renderer(
                 "pdftoppm",
                 Some(&path),
-                untrusted_root_for(&fixture.repo.join("doc.pdf")).as_deref()
+                &untrusted_roots_for(&fixture.repo.join("doc.pdf")).unwrap()
             ),
             Err(RendererLookup::Shadowed(link))
         );
@@ -665,12 +963,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            resolve_renderer("pdftoppm", Some(&path), None),
+            resolve_renderer("pdftoppm", Some(&path), &[]),
             Ok(fixture.system.join("pdftoppm"))
         );
         let missing_path = std::env::join_paths([temp.path().as_os_str()]).unwrap();
         assert_eq!(
-            resolve_renderer("absent-renderer", Some(&missing_path), None),
+            resolve_renderer("absent-renderer", Some(&missing_path), &[]),
             Err(RendererLookup::Missing)
         );
     }
@@ -691,7 +989,7 @@ mod tests {
             Some(true) | None => non_executable,
         };
         assert_eq!(
-            resolve_renderer("pdftoppm", Some(&path), None),
+            resolve_renderer("pdftoppm", Some(&path), &[]),
             Ok(expected),
             "Unix PATH lookup skips a regular file without any execute bit"
         );
