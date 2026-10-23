@@ -28,6 +28,31 @@ fn close_selection(
     }
 }
 
+/// Deliver warnings from off-loop teardown work to stderr or the active TUI.
+fn warn_visible_with(text: &str, tui_active: bool, show: impl FnOnce(&str)) {
+    thegn_core::msg::warn(text);
+    if tui_active {
+        show(text);
+    }
+}
+
+/// Report off-loop teardown warnings on stderr outside the TUI, or in its
+/// status line and toast once the TUI is active.
+pub(crate) fn warn_visible(text: &str) {
+    warn_visible_with(text, thegn_core::msg::tui_active(), |text| {
+        if let Some(notify) = crate::notify::global() {
+            notify.emit_status(text);
+            notify.emit_toast(text, thegn_core::notification::Priority::Notice);
+        }
+    });
+}
+
+fn placed_teardown_warning(path: &str, name: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Sandbox teardown incomplete while closing {path}: container {name} may still be running on its SSH host ({error})"
+    )
+}
+
 pub(crate) fn sandbox_teardown(
     cfg: &thegn_core::config::Config,
     env: &thegn_core::env::Environment,
@@ -44,6 +69,7 @@ pub(crate) fn sandbox_teardown(
                 &name,
             ) {
                 tracing::warn!(target: "thegn::lifecycle", worktree = path, %error, "sandbox teardown incomplete during close");
+                warn_visible(&placed_teardown_warning(path, &name, &error));
             }
         }
         Route::LocalByPath => thegn_core::sandbox::teardown_by_path(path),
@@ -88,7 +114,7 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, close_selection, route};
+    use super::{Route, close_selection, placed_teardown_warning, route, warn_visible_with};
     use thegn_core::placement::{Placement, ProviderPlacement, SshPlacement, TransportKind};
 
     #[test]
@@ -132,5 +158,25 @@ mod tests {
             Ok(Some("box".into()))
         );
         assert_eq!(close_selection("/wt", Ok(None)), Ok(None));
+    }
+
+    #[test]
+    fn warn_visible_toasts_only_while_the_tui_runs() {
+        let mut shown: Option<String> = None;
+        warn_visible_with("x", true, |text| shown = Some(text.to_string()));
+        assert_eq!(shown.as_deref(), Some("x"));
+
+        let mut shown: Option<String> = None;
+        warn_visible_with("x", false, |text| shown = Some(text.to_string()));
+        assert_eq!(shown, None);
+    }
+
+    #[test]
+    fn placed_teardown_warning_names_the_container_and_cause() {
+        let warning = placed_teardown_warning("/wt", "tg-c", &"ssh: connection refused");
+        assert!(warning.contains("/wt"));
+        assert!(warning.contains("tg-c"));
+        assert!(warning.contains("may still be running"));
+        assert!(warning.contains("connection refused"));
     }
 }
