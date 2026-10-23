@@ -615,35 +615,75 @@ fn same_size_repaint_reuses_rows_and_emits_exact_width_runs() {
 #[test]
 fn graph_backgrounds_use_the_panel_slot_not_the_dim_text_slot() {
     use crate::compositor::Rect;
-    test_override::with_color(ColorDepth::Truecolor, || {
-        let panel = chrome::col(chrome::S::Panel);
-        let dim = chrome::col(chrome::S::Dim);
-        assert_ne!(panel, dim, "fixture palette must distinguish panel and dim");
-        let values = [0.0, 0.1, f32::NAN, 0.5, 0.9, 0.2];
-        let mut surface = termwiz::surface::Surface::new(20, 6);
-        let spark = Rect {
-            x: 0,
-            y: 0,
-            cols: 20,
-            rows: 1,
-        };
-        super::paint_sparkline(&values, 20, RampId::Util, spark, &mut surface);
-        let history = Rect {
-            x: 0,
-            y: 1,
-            cols: 20,
-            rows: 5,
-        };
-        super::paint_history_graph(&values, RampId::Util, history, &mut surface);
-        for (y, line) in surface.screen_cells().iter().enumerate() {
-            for (x, cell) in line.iter().enumerate() {
-                assert_eq!(
-                    cell.attrs().background(),
-                    panel,
-                    "cell ({x}, {y}) {:?} is not on the panel background",
-                    cell.str()
-                );
+    for depth in [ColorDepth::Truecolor, ColorDepth::Ansi256] {
+        test_override::with_color(depth, || {
+            let (panel, dim) = chrome::with_palette(|palette| {
+                (
+                    crate::wire::color_spec(chrome::theme_color(&palette.panel), depth),
+                    crate::wire::color_spec(chrome::theme_color(&palette.dim), depth),
+                )
+            });
+            assert_ne!(panel, dim, "fixture palette must distinguish panel and dim");
+            let values = [0.0, 0.1, f32::NAN, 0.5, 0.9, 0.2];
+            let mut surface = termwiz::surface::Surface::new(20, 6);
+            let spark = Rect {
+                x: 0,
+                y: 0,
+                cols: 20,
+                rows: 1,
+            };
+            super::paint_sparkline(&values, 20, RampId::Util, spark, &mut surface);
+            let history = Rect {
+                x: 0,
+                y: 1,
+                cols: 20,
+                rows: 5,
+            };
+            super::paint_history_graph(&values, RampId::Util, history, &mut surface);
+            let mut heatmap = super::GraphOut::new();
+            super::paint_heatmap(
+                &mut heatmap,
+                &[&[0.4]],
+                RampId::Heat,
+                &chrome::palette_snapshot(),
+            );
+            if let Some(line) = heatmap.lines.first() {
+                crate::seg::draw_line(&mut surface, 0, 5, 20, line, Tok::Slot(chrome::S::Panel));
             }
-        }
+            for (y, line) in surface.screen_cells().iter().enumerate() {
+                for (x, cell) in line.iter().enumerate() {
+                    let actual = crate::wire::color_spec(cell.attrs().background(), depth);
+                    assert_eq!(
+                        actual,
+                        panel,
+                        "cell ({x}, {y}) {:?} is not on the panel",
+                        cell.str()
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn unresolved_stacked_background_inherits_instead_of_using_dim() {
+    let palette = default_palette();
+    let resolved = Resolved::new(
+        &palette,
+        Paint::Bands(&[SeriesRole::MemAnon]),
+        ColorDepth::Truecolor,
+    );
+    let style = resolved.cell(viz_raster::RCell {
+        ch: '█',
+        fg: 0,
+        bg: Some(7),
     });
+    assert_eq!(
+        style.bg, None,
+        "a missing stacked role must inherit the panel surface"
+    );
+    assert_eq!(
+        style.fg,
+        chrome::theme_color(&palette.series(SeriesRole::MemAnon))
+    );
 }

@@ -157,6 +157,65 @@ fn fixture() -> MonitorFrame {
     frame
 }
 
+#[test]
+fn thermal_heatmap_raster_keeps_ramp_foreground_and_stacked_background() {
+    use crate::monitor::{
+        graphs,
+        kit::{emit::Emitter, grid::CellGrid},
+    };
+    use thegn_core::theme::RampId;
+    use thegn_core::viz_raster;
+
+    for depth in [ColorDepth::Truecolor, ColorDepth::Ansi256] {
+        test_override::with_color(depth, || {
+            let table = graphs::table();
+            let mut cells = viz_raster::CellBuf::new();
+            viz_raster::heatmap(&[&[0.25], &[0.85]], table, &mut cells);
+            let mut grid = CellGrid::new(1, 1);
+            super::paint::draw_graph(&mut grid, Rect::full(1, 1), 0, 0, &cells, table, 1);
+            let mut surface = Surface::new(1, 1);
+            Emitter::default().emit(&grid, Rect::full(1, 1), &mut surface, 0, 0);
+            let emitted = surface.screen_cells();
+            let actual = emitted[0][0].attrs();
+            let upper_level = (0.25_f32 * 7.0).round() as u8;
+            let lower_level = (0.85_f32 * 7.0).round() as u8;
+            crate::chrome::with_palette(|palette| {
+                let expected_fg = crate::chrome::theme_color(
+                    &palette.ramp(RampId::Temp)[usize::from(upper_level)],
+                );
+                let expected_bg = crate::chrome::theme_color(
+                    &palette.ramp(RampId::Temp)[usize::from(lower_level)],
+                );
+                assert_eq!(
+                    crate::wire::color_spec(actual.foreground(), depth),
+                    crate::wire::color_spec(expected_fg, depth),
+                    "thermal heatmap foreground retains its temperature ramp"
+                );
+                assert_eq!(
+                    crate::wire::color_spec(actual.background(), depth),
+                    crate::wire::color_spec(expected_bg, depth),
+                    "packed lower instance retains its temperature ramp as background"
+                );
+            });
+
+            let mut single = viz_raster::CellBuf::new();
+            viz_raster::heatmap(&[&[0.5]], table, &mut single);
+            let mut grid = CellGrid::new(1, 1);
+            super::paint::draw_graph(&mut grid, Rect::full(1, 1), 0, 0, &single, table, 1);
+            let mut surface = Surface::new(1, 1);
+            Emitter::default().emit(&grid, Rect::full(1, 1), &mut surface, 0, 0);
+            let expected_panel =
+                crate::chrome::with_palette(|palette| crate::chrome::theme_color(&palette.panel));
+            let emitted = surface.screen_cells();
+            assert_eq!(
+                crate::wire::color_spec(emitted[0][0].attrs().background(), depth),
+                crate::wire::color_spec(expected_panel, depth),
+                "single-instance heatmap cells inherit the panel surface"
+            );
+        });
+    }
+}
+
 fn fixture_with_fan() -> MonitorFrame {
     let mut frame = fixture();
     let mut layout = (**frame.parts.hwmon.layout.as_ref().expect("hwmon layout")).clone();

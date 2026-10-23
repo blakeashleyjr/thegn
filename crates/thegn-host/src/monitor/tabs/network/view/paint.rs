@@ -344,7 +344,7 @@ fn paint_throughput(grid: &mut CellGrid, body: Rect, model: &NetworkModel) {
     );
 }
 
-fn paint_mirrored_finite_runs(
+pub(super) fn paint_mirrored_finite_runs(
     values: &[f32],
     upper: bool,
     area: Rect,
@@ -395,6 +395,11 @@ fn paint_mirrored_finite_runs(
                                 y + 1,
                                 CellStyle {
                                     ch: cell.ch,
+                                    fg: crate::seg::StyleTok::from_tok(crate::seg::Tok::Ramp(
+                                        if upper { RampId::Rx } else { RampId::Tx },
+                                        cell.fg,
+                                    ))
+                                    .unwrap_or(crate::seg::StyleTok::INHERIT),
                                     ..CellStyle::default()
                                 },
                             );

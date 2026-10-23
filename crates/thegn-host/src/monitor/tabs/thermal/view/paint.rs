@@ -126,7 +126,8 @@ pub(super) fn package(
             rect,
             rect.cols.saturating_sub(graph_width),
             3,
-            &graph.lines,
+            &graph.cells,
+            crate::monitor::graphs::table(),
             1,
         );
     }
@@ -167,31 +168,19 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
         let row = [normalized];
         let mut heatmap = crate::monitor::graphs::GraphOut::new();
         crate::monitor::graphs::paint_heatmap(&mut heatmap, &[&row], RampId::Temp, &palette);
-        if let Some(crate::seg::Line::Segs(segs)) = heatmap.lines.first() {
-            let mut offset = 0;
-            for seg in segs {
-                for ch in seg.text.chars() {
-                    grid.view(rect).put(
-                        x + offset,
-                        y,
-                        CellStyle {
-                            ch,
-                            fg: StyleTok::from_tok(Tok::Ramp(
-                                RampId::Temp,
-                                (normalized * 7.0).round() as u8,
-                            ))
-                            .unwrap_or(StyleTok::INHERIT),
-                            bg: seg
-                                .bg
-                                .and_then(StyleTok::from_tok)
-                                .unwrap_or(StyleTok::INHERIT),
-                            ..CellStyle::default()
-                        },
-                    );
-                    offset += 1;
-                }
-            }
-        }
+        crate::monitor::kit::raster::draw_raster(
+            grid,
+            Rect {
+                x,
+                y,
+                cols: 1,
+                rows: 1,
+            },
+            &heatmap.cells,
+            crate::monitor::kit::raster::RasterStyle::Ramp(RampId::Temp),
+            crate::monitor::graphs::table(),
+            false,
+        );
         put(
             grid,
             rect,
@@ -203,37 +192,28 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
     }
 }
 
-fn draw_graph(
+pub(super) fn draw_graph(
     grid: &mut CellGrid,
     rect: Rect,
     x: usize,
     y: usize,
-    lines: &[crate::seg::Line],
+    raster: &thegn_core::viz_raster::CellBuf,
+    table: &thegn_core::viz_raster::RasterTable,
     max_rows: usize,
 ) {
-    for (row, line) in lines.iter().enumerate().take(max_rows) {
-        if let crate::seg::Line::Segs(segs) = line {
-            let mut col = x;
-            for seg in segs {
-                for ch in seg.text.chars() {
-                    grid.view(rect).put(
-                        col,
-                        y + row,
-                        CellStyle {
-                            ch,
-                            fg: StyleTok::from_tok(seg.fg).unwrap_or(StyleTok::INHERIT),
-                            bg: seg
-                                .bg
-                                .and_then(StyleTok::from_tok)
-                                .unwrap_or(StyleTok::INHERIT),
-                            ..CellStyle::default()
-                        },
-                    );
-                    col += 1;
-                }
-            }
-        }
-    }
+    crate::monitor::kit::raster::draw_raster(
+        grid,
+        Rect {
+            x: rect.x + x,
+            y: rect.y + y,
+            cols: raster.width(),
+            rows: max_rows,
+        },
+        raster,
+        crate::monitor::kit::raster::RasterStyle::Ramp(RampId::Temp),
+        table,
+        false,
+    );
 }
 
 pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
@@ -600,7 +580,8 @@ pub(super) fn heatmap(
         rect,
         label_width + graph_width.saturating_sub(display_width),
         0,
-        &graph.lines,
+        &graph.cells,
+        crate::monitor::graphs::table(),
         rows_emitted,
     );
 }

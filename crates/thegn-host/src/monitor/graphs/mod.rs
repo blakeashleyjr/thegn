@@ -59,6 +59,7 @@ struct Style {
 /// Pre-resolved colors for a single paint operation.
 struct Resolved {
     levels: [Style; 8],
+    has_level: [bool; 8],
     dim: Style,
 }
 
@@ -76,24 +77,27 @@ impl Resolved {
             bg: None,
             bold: false,
         };
-        let levels = match paint {
+        let (levels, has_level) = match paint {
             Paint::Ramp { id, warn, crit } => {
                 let ramp = palette.ramp(id);
-                std::array::from_fn(|level| {
-                    let threshold = band_of(level as f32 / 7.0, warn, crit);
-                    let fg = match depth {
-                        ColorDepth::None => ColorAttribute::Default,
-                        ColorDepth::Ansi16 => chrome::theme_color(palette.band(id, threshold)),
-                        ColorDepth::Truecolor | ColorDepth::Ansi256 => {
-                            chrome::theme_color(&ramp[level])
+                (
+                    std::array::from_fn(|level| {
+                        let threshold = band_of(level as f32 / 7.0, warn, crit);
+                        let fg = match depth {
+                            ColorDepth::None => ColorAttribute::Default,
+                            ColorDepth::Ansi16 => chrome::theme_color(palette.band(id, threshold)),
+                            ColorDepth::Truecolor | ColorDepth::Ansi256 => {
+                                chrome::theme_color(&ramp[level])
+                            }
+                        };
+                        Style {
+                            fg,
+                            bg: None,
+                            bold: depth == ColorDepth::None && threshold == Band::Crit,
                         }
-                    };
-                    Style {
-                        fg,
-                        bg: None,
-                        bold: depth == ColorDepth::None && threshold == Band::Crit,
-                    }
-                })
+                    }),
+                    [true; 8],
+                )
             }
             Paint::Flat(role) => {
                 let fg = if depth == ColorDepth::None {
@@ -101,28 +105,38 @@ impl Resolved {
                 } else {
                     chrome::theme_color(palette.series(role))
                 };
-                [Style {
-                    fg,
-                    bg: None,
-                    bold: false,
-                }; 8]
+                (
+                    [Style {
+                        fg,
+                        bg: None,
+                        bold: false,
+                    }; 8],
+                    [true; 8],
+                )
             }
-            Paint::Bands(roles) => std::array::from_fn(|level| {
-                let fg = match roles.get(level) {
-                    Some(role) if depth != ColorDepth::None => {
-                        chrome::theme_color(palette.series(*role))
+            Paint::Bands(roles) => (
+                std::array::from_fn(|level| {
+                    let fg = match roles.get(level) {
+                        Some(role) if depth != ColorDepth::None => {
+                            chrome::theme_color(palette.series(*role))
+                        }
+                        Some(_) => ColorAttribute::Default,
+                        None => dim.fg,
+                    };
+                    Style {
+                        fg,
+                        bg: None,
+                        bold: false,
                     }
-                    Some(_) => ColorAttribute::Default,
-                    None => dim.fg,
-                };
-                Style {
-                    fg,
-                    bg: None,
-                    bold: false,
-                }
-            }),
+                }),
+                std::array::from_fn(|level| level < roles.len()),
+            ),
         };
-        Self { levels, dim }
+        Self {
+            levels,
+            has_level,
+            dim,
+        }
     }
 
     fn cell(&self, cell: RCell) -> Style {
@@ -131,10 +145,13 @@ impl Resolved {
             .get(usize::from(cell.fg))
             .copied()
             .unwrap_or(self.dim);
-        style.bg = cell.bg.map(|index| {
-            self.levels
-                .get(usize::from(index))
-                .map_or(self.dim.fg, |style| style.fg)
+        style.bg = cell.bg.and_then(|index| {
+            let index = usize::from(index);
+            self.has_level
+                .get(index)
+                .copied()
+                .filter(|exists| *exists)
+                .and_then(|_| self.levels.get(index).map(|style| style.fg))
         });
         style
     }
