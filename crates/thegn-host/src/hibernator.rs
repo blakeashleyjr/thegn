@@ -207,6 +207,10 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
             .ok()
             .and_then(|f| f.get(&g.path).map(|t| t.elapsed() < FAILURE_BACKOFF))
             .unwrap_or(false);
+        let Some(already_hibernated) = hibernated_state(&g.path, db.hibernation_for(&g.path))
+        else {
+            continue;
+        };
         envs.insert(g.path.clone(), env_name);
         cands.push(HibernateCandidate {
             worktree: g.path.clone(),
@@ -219,7 +223,7 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
             idle_secs: crate::lifecycle::idle_secs(&g.path).unwrap_or(0),
             hibernate_enabled: enabled && !in_backoff,
             after_secs: after,
-            already_hibernated: db.hibernation_for(&g.path).ok().flatten().is_some(),
+            already_hibernated,
         });
     }
     if let Some(wt) = decide_hibernate(&cands).into_iter().next() {
@@ -231,6 +235,16 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
                 env_name,
             },
         );
+    }
+}
+
+fn hibernated_state(worktree: &str, read: anyhow::Result<Option<HibernationRow>>) -> Option<bool> {
+    match read {
+        Ok(row) => Some(row.is_some()),
+        Err(error) => {
+            tracing::warn!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "hibernation skipped: hibernation record could not be read");
+            None
+        }
     }
 }
 
@@ -417,17 +431,52 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
     Ok(())
 }
 
+/// The snapshot a re-provision must overlay, from an already-performed record
+/// read. An unreadable record is an error when hibernation is on for the env
+/// (provisioning a fresh clone would hide the user's snapshot), and "nothing
+/// to restore" (with a warning) when it is off.
+fn restore_snapshot_id(
+    worktree: &str,
+    hibernation_enabled: bool,
+    read: anyhow::Result<Option<HibernationRow>>,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context as _;
+
+    match read {
+        Ok(Some(row)) if row.state != "capturing" && !row.snapshot_id.is_empty() => {
+            Ok(Some(row.snapshot_id))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if hibernation_enabled => Err(error.context(format!(
+            "cannot read the hibernation record for {worktree}; refusing to provision a fresh sandbox that would hide its snapshot (retry once the state DB is readable)"
+        ))),
+        Err(error) => {
+            tracing::warn!(target: "thegn::hibernate", worktree = %worktree, error = %format!("{error:#}"), "hibernation record unreadable; hibernation is off for this env, provisioning without a restore");
+            Ok(None)
+        }
+    }
+}
+
 /// If `worktree` has a restorable hibernation row, flip it to `restoring` and
 /// return the snapshot id the provision plan should overlay. `capturing`
-/// rows are not restorable (their snapshot never verified).
-pub(crate) fn begin_restore(worktree: &str) -> Option<String> {
-    let db = thegn_core::db::Db::open().ok()?;
-    let row = db.hibernation_for(worktree).ok().flatten()?;
-    if row.state == "capturing" || row.snapshot_id.is_empty() {
-        return None;
+/// rows are not restorable (their snapshot never verified). An unreadable
+/// record is an error while hibernation is enabled for this environment.
+pub(crate) fn begin_restore(
+    worktree: &str,
+    hibernation_enabled: bool,
+) -> anyhow::Result<Option<String>> {
+    let db = thegn_core::db::Db::open();
+    let read = match &db {
+        Ok(db) => db.hibernation_for(worktree),
+        Err(error) => Err(anyhow::anyhow!("open the state DB: {error:#}")),
+    };
+    let snapshot = restore_snapshot_id(worktree, hibernation_enabled, read)?;
+    if snapshot.is_some()
+        && let Ok(db) = &db
+    {
+        let _ = db.set_hibernation_state(worktree, "restoring", None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
-    let _ = db.set_hibernation_state(worktree, "restoring", None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    Some(row.snapshot_id)
+    Ok(snapshot)
 }
 
 /// Apply the `snapshot_restore` plan step: fetch the snapshot's artifacts from
@@ -1108,6 +1157,87 @@ mod tests {
                 Ok((std::path::PathBuf::new(), "repo".into(), "picked".into()))
             ),
             Some("picked".into())
+        );
+    }
+
+    fn row(state: &str, snapshot_id: &str) -> HibernationRow {
+        HibernationRow {
+            worktree_path: "/wt".into(),
+            repo_path: "/repo".into(),
+            env_name: "e".into(),
+            sandbox_name: "s".into(),
+            snapshot_id: snapshot_id.into(),
+            head: String::new(),
+            state: state.into(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn restore_snapshot_id_refuses_an_unreadable_record_when_hibernation_is_on() {
+        let result = restore_snapshot_id("/wt", true, Err(anyhow::anyhow!("database is locked")));
+        let Err(error) = result else {
+            panic!("unreadable hibernation record must refuse restore");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("cannot read the hibernation record for /wt"));
+        assert!(message.contains("database is locked"));
+    }
+
+    #[test]
+    fn restore_snapshot_id_skips_an_unreadable_record_when_hibernation_is_off() {
+        assert_eq!(
+            restore_snapshot_id("/wt", false, Err(anyhow::anyhow!("database is locked"))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_id_returns_the_hibernated_snapshot() {
+        for state in ["hibernated", "restoring"] {
+            for enabled in [true, false] {
+                assert_eq!(
+                    restore_snapshot_id("/wt", enabled, Ok(Some(row(state, "0009-abcd")))).unwrap(),
+                    Some("0009-abcd".into())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restore_snapshot_id_ignores_capturing_and_empty_rows() {
+        assert_eq!(
+            restore_snapshot_id("/wt", true, Ok(Some(row("capturing", "0009-abcd")))).unwrap(),
+            None
+        );
+        assert_eq!(
+            restore_snapshot_id("/wt", true, Ok(Some(row("hibernated", "")))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_id_is_none_without_a_record() {
+        for enabled in [true, false] {
+            assert_eq!(restore_snapshot_id("/wt", enabled, Ok(None)).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn hibernated_state_skips_an_unreadable_record() {
+        assert_eq!(
+            hibernated_state("/wt", Err(anyhow::anyhow!("locked"))),
+            None
+        );
+    }
+
+    #[test]
+    fn hibernated_state_reports_whether_a_row_exists() {
+        assert_eq!(hibernated_state("/wt", Ok(None)), Some(false));
+        assert_eq!(
+            hibernated_state("/wt", Ok(Some(row("hibernated", "x")))),
+            Some(true)
         );
     }
 }

@@ -2469,6 +2469,15 @@ pub fn provision_provider_env_named(
     // guards SEQUENTIAL re-runs — it is written at the END of the pipeline.
     let _gate = crate::provision_gate::sandbox_lock(&id);
 
+    // A hibernated worktree resumes by overlaying its snapshot on the fresh
+    // clone. Read it before any sandbox create: an unreadable record must
+    // refuse here rather than provision an empty clone over the snapshot.
+    let snapshot_restore = if name_override.is_none() {
+        crate::hibernator::begin_restore(worktree, pc.hibernate_enabled())?
+    } else {
+        None
+    };
+
     // Recreate-if-missing: the sandbox may have been cleaned up out-of-band (TTL,
     // manual delete, provider GC). `ensure_exists` recreates it before we read the
     // marker / run any exec, so provisioning can't fail against a dead sandbox.
@@ -2741,9 +2750,7 @@ pub fn provision_provider_env_named(
             .then(|| worktree.to_string()),
         // A hibernated worktree resumes by overlaying its snapshot on the
         // fresh clone; the row flips to `restoring` here (deleted on success).
-        snapshot_restore: (name_override.is_none())
-            .then(|| crate::hibernator::begin_restore(worktree))
-            .flatten(),
+        snapshot_restore,
         // Host-cache loopback substituter for nix.conf — but only when the resident
         // musl bridge that carries the `:8484` tunnel is pushable; otherwise the port
         // is dead and nix wastes minutes timing out before falling back to source.
