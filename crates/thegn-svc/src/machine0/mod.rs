@@ -345,7 +345,7 @@ impl Machine0Provider {
             .call(tool::VM_GET_BY_NAME, json!({ "name": name }))
             .await
         {
-            Ok(v) => vm_for_destroy(&v, name).map(Some),
+            Ok(v) => vm_for_destroy_response(&v, name),
             Err(e) if is_not_found(&e.to_string()) => Ok(None),
             Err(e) => Err(e),
         }
@@ -1333,6 +1333,17 @@ fn vm_for_destroy(v: &Value, name: &str) -> Result<Machine0Vm> {
         ));
     }
     Ok(vm)
+}
+
+/// Treat a plain-text not-found answer as absence, while keeping every other
+/// unrecognized response fail-closed for destroy.
+fn vm_for_destroy_response(v: &Value, name: &str) -> Result<Option<Machine0Vm>> {
+    if let Value::String(message) = v
+        && is_not_found(message)
+    {
+        return Ok(None);
+    }
+    vm_for_destroy(v, name).map(Some)
 }
 
 /// Parse a `vm_list` response (array, or `{machines|vms|items: [...]}`) into
@@ -2637,8 +2648,17 @@ mod tests {
         for response in [json!({}), json!({ "error": "x" })] {
             let error = vm_for_destroy(&response, "dev").unwrap_err();
             assert!(error.to_string().contains("unrecognized response"));
-            assert!(!error.to_string().contains("\"error\""));
+            assert!(!error.to_string().contains("x"));
         }
+    }
+
+    #[test]
+    fn vm_for_destroy_treats_plain_text_not_found_as_absent() {
+        assert!(
+            vm_for_destroy_response(&Value::String("VM not found".into()), "dev")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
