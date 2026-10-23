@@ -1,0 +1,2 @@
+# Rule: production thread name literals start with `thegn-` and fit Linux's 15-byte comm limit.
+# RATCHET-EMPTY
