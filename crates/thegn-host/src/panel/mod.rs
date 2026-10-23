@@ -683,6 +683,12 @@ pub struct ReviewTaskRow {
     pub worktree_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingRead {
+    Ids(std::collections::HashSet<i64>),
+    Deleted(i64),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelData {
     pub branch: String,
@@ -825,6 +831,10 @@ pub struct PanelData {
     pub alert_notifications: usize,
     /// Full notification list: every unread row plus the newest 50 read rows.
     pub notifications: Vec<thegn_core::notification::Notification>,
+    /// Last committed notification-write epoch observed before inbox hydration.
+    pub notifications_epoch: u64,
+    /// Loop-owned optimistic changes not yet covered by a hydrated DB snapshot.
+    pub(crate) pending_reads: Vec<(u64, PendingRead)>,
     /// Read rows beyond the 50-row inbox read window.
     pub notifications_hidden_read: usize,
     /// Per-kind *effective* priority (`[notifications.priority]` overrides
@@ -920,6 +930,48 @@ impl PanelData {
             }
         }
         self.recount_unread();
+    }
+
+    /// Record an optimistic read against the exact ids in hand. Rows created
+    /// after the action are deliberately absent from this overlay.
+    pub fn mark_read_ids_at(&mut self, epoch: u64, ids: impl IntoIterator<Item = i64>) {
+        let ids: std::collections::HashSet<i64> = ids.into_iter().collect();
+        self.mark_read_where(|row| ids.contains(&row.id));
+        self.pending_reads.push((epoch, PendingRead::Ids(ids)));
+    }
+
+    /// Record an optimistic deletion so an older hydration cannot restore it.
+    pub fn delete_notification_at(&mut self, epoch: u64, id: i64) {
+        self.notifications.retain(|row| row.id != id);
+        self.recount_unread();
+        self.pending_reads.push((epoch, PendingRead::Deleted(id)));
+    }
+
+    /// Overlay writes issued after this hydration captured its committed epoch.
+    /// Once the DB snapshot covers an epoch, its optimistic entry can be dropped.
+    pub fn reconcile_pending_reads(&mut self, prev: &PanelData) -> bool {
+        let mut has_uncovered = false;
+        for (epoch, pending) in &prev.pending_reads {
+            if *epoch <= self.notifications_epoch {
+                continue;
+            }
+            has_uncovered = true;
+            match pending {
+                PendingRead::Ids(ids) => {
+                    for row in &mut self.notifications {
+                        if ids.contains(&row.id) {
+                            row.read = true;
+                        }
+                    }
+                }
+                PendingRead::Deleted(id) => self.notifications.retain(|row| row.id != *id),
+            }
+            self.pending_reads.push((*epoch, pending.clone()));
+        }
+        if !self.pending_reads.is_empty() {
+            self.recount_unread();
+        }
+        has_uncovered
     }
 
     /// Recompute `alert_notifications` / `unread_notifications` from the rows

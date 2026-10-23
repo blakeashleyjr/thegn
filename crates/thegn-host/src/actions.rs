@@ -2176,16 +2176,18 @@ impl CiActionCtx<'_> {
     fn mutate_notifications(&mut self, id: i64) {
         let tx = self.refresh_tx.clone();
         let waker = self.waker.clone();
+        let epoch = crate::hydrate_feed::issue_notification_write();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
                 let _ = db.mark_notification_read(id); // best-effort: DB is a cache
             }
+            crate::hydrate_feed::commit_notification_write(epoch);
             if tx.send(RefreshKind::Model).is_ok() {
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
         // Optimistic: the chip drops on the next frame, not after the rehydrate.
-        self.model.panel.mark_read_where(|n| n.id == id);
+        self.model.panel.mark_read_ids_at(epoch, [id]);
         self.model.status = "Dismissed notification".into();
     }
 

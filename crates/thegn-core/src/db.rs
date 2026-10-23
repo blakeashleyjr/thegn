@@ -2568,6 +2568,10 @@ impl Db {
         // (see `attention.rs`), and `put_notification` stamps it with
         // `util::now()` (seconds) — so the cutoff is a plain seconds subtraction.
         let cutoff = crate::util::now() - older_than_secs;
+        crate::store::NotificationStore::expire_failures(
+            self,
+            crate::util::now() - crate::attention::FAILURE_ATTENTION_TTL_SECS,
+        )?;
         let n = self.conn.execute(
             "DELETE FROM notifications WHERE read=1 AND created_at_ms < ?1",
             rusqlite::params![cutoff],
