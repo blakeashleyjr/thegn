@@ -131,7 +131,10 @@ fn resolve_ref_for_outcome_with(
         },
         SecretRef::File { path } => {
             let p = thegn_core::util::expand_tilde(path);
-            match thegn_core::fsperm::read_owner_only_secret_file(&p, MAX_SECRET_BYTES) {
+            match thegn_core::fsperm::read_owner_only_secret_file(
+                std::path::Path::new(&p),
+                MAX_SECRET_BYTES,
+            ) {
                 Ok(value) if !value.is_empty() => (Some(value), SecretOutcome::Resolved),
                 Ok(_) | Err(thegn_core::fsperm::SecretFileError::NotFound) => {
                     (None, SecretOutcome::Missing)
@@ -716,7 +719,7 @@ fn keyring_get(account: &str) -> Result<Option<String>, KeyringReadError> {
             keyring::Entry::new(KEYRING_SERVICE, &account).and_then(|entry| entry.get_password()),
         )
     }) {
-        KeyringOutcome::Completed(value) => Ok(value),
+        KeyringOutcome::Completed(value) => value,
         KeyringOutcome::TimedOut => Err(KeyringReadError::Unavailable(format!(
             "keyring get timed out after {}ms",
             KEYRING_PROBE_TIMEOUT.as_millis()
