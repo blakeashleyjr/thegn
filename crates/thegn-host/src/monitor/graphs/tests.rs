@@ -549,7 +549,7 @@ fn heatmap_half_block_uses_upper_foreground_and_lower_background() {
 }
 
 #[test]
-fn stacked_out_of_range_band_index_falls_back_to_dim() {
+fn stacked_missing_band_background_inherits_panel_surface() {
     let palette = default_palette();
     static ROLES: &[SeriesRole] = &[
         SeriesRole::CpuUser,
@@ -572,7 +572,10 @@ fn stacked_out_of_range_band_index_falls_back_to_dim() {
         bg: Some(9),
     });
     assert_eq!(style.fg, chrome::theme_color(&palette.dim));
-    assert_eq!(style.bg, Some(chrome::theme_color(&palette.dim)));
+    assert_eq!(
+        style.bg, None,
+        "a missing stacked background role must inherit the panel surface"
+    );
 }
 
 #[test]
