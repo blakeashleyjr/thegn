@@ -1537,4 +1537,161 @@ mod tests {
         };
         assert!(sandbox_hint(&ctx, false).is_none());
     }
+
+    fn render_share(width: PanelWidth, view: crate::share::ShareView) -> String {
+        let model = FrameModel {
+            shares: vec![view],
+            ..FrameModel::default()
+        };
+        let ui = PanelUi {
+            open: Section::Share,
+            width,
+            ..PanelUi::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 100,
+            rows: 30,
+        };
+        text(&share(&ctx))
+    }
+
+    fn share_view(endpoint: thegn_svc::share::PublicEndpoint) -> crate::share::ShareView {
+        crate::share::ShareView {
+            worktree: "/wt".into(),
+            port: 3000,
+            url: Some(endpoint.canonical()),
+            endpoint: Some(endpoint),
+            failed: false,
+            stopping: false,
+            error: None,
+            provider: "bore",
+            public: true,
+        }
+    }
+
+    // Positive control: URL rows are rendered in the normal panel and sanitized at the segment boundary.
+    #[test]
+    fn share_normal_row_shows_sanitized_url_endpoint() {
+        let view = crate::share::ShareView {
+            url: Some("https://safe.example\u{1b}[31m".into()),
+            ..share_view(
+                thegn_svc::share::PublicEndpoint::parse_url("https://safe.example")
+                    .expect("valid URL endpoint"),
+            )
+        };
+        let rendered = render_share(PanelWidth::Normal, view);
+        assert!(rendered.contains("https://safe.example"));
+        assert!(!rendered.chars().any(char::is_control));
+    }
+
+    // Positive control: opaque ticket rows remain display data in the normal panel.
+    #[test]
+    fn share_ticket_row_is_data_not_a_shell_command() {
+        let rendered = render_share(
+            PanelWidth::Normal,
+            share_view(
+                thegn_svc::share::PublicEndpoint::parse_ticket("opaque-ticket_7")
+                    .expect("valid opaque ticket"),
+            ),
+        );
+        assert!(rendered.contains("opaque-ticket_7"));
+        assert!(!rendered.contains("dumbpipe"));
+        assert!(!rendered.contains("connect-tcp"));
+    }
+
+    // Positive control: socket endpoints stay host:port authorities in the normal panel.
+    #[test]
+    fn share_socket_row_renders_host_port() {
+        let rendered = render_share(
+            PanelWidth::Normal,
+            share_view(
+                thegn_svc::share::UrlRule::Fixed("bore.pub:4123".into())
+                    .fixed()
+                    .expect("valid socket endpoint"),
+            ),
+        );
+        assert!(rendered.contains("bore.pub:4123"));
+        assert!(!rendered.contains("https://bore.pub:4123"));
+        assert!(!rendered.contains("http://bore.pub:4123"));
+    }
+
+    // Positive control: failed share errors are sanitized before they reach normal rows.
+    #[test]
+    fn share_failed_row_has_no_control_characters() {
+        let rendered = render_share(
+            PanelWidth::Normal,
+            crate::share::ShareView {
+                port: 3000,
+                failed: true,
+                error: Some("boom\u{1b}[31m".into()),
+                ..Default::default()
+            },
+        );
+        assert!(rendered.contains("boom"));
+        assert!(!rendered.chars().any(char::is_control));
+    }
+
+    // Positive control: URL rows are rendered in the full panel and sanitized at the segment boundary.
+    #[test]
+    fn share_full_row_shows_sanitized_url_endpoint() {
+        let view = crate::share::ShareView {
+            url: Some("https://safe.example\u{1b}[31m".into()),
+            ..share_view(
+                thegn_svc::share::PublicEndpoint::parse_url("https://safe.example")
+                    .expect("valid URL endpoint"),
+            )
+        };
+        let rendered = render_share(PanelWidth::Full, view);
+        assert!(rendered.contains("https://safe.example"));
+        assert!(!rendered.chars().any(char::is_control));
+    }
+
+    // Positive control: opaque ticket rows remain display data in the full panel.
+    #[test]
+    fn share_full_ticket_row_is_data_not_a_shell_command() {
+        let rendered = render_share(
+            PanelWidth::Full,
+            share_view(
+                thegn_svc::share::PublicEndpoint::parse_ticket("opaque-ticket_7")
+                    .expect("valid opaque ticket"),
+            ),
+        );
+        assert!(rendered.contains("opaque-ticket_7"));
+        assert!(!rendered.contains("dumbpipe"));
+        assert!(!rendered.contains("connect-tcp"));
+    }
+
+    // Positive control: socket endpoints stay host:port authorities in the full panel.
+    #[test]
+    fn share_full_socket_row_renders_host_port() {
+        let rendered = render_share(
+            PanelWidth::Full,
+            share_view(
+                thegn_svc::share::UrlRule::Fixed("bore.pub:4123".into())
+                    .fixed()
+                    .expect("valid socket endpoint"),
+            ),
+        );
+        assert!(rendered.contains("bore.pub:4123"));
+        assert!(!rendered.contains("https://bore.pub:4123"));
+        assert!(!rendered.contains("http://bore.pub:4123"));
+    }
+
+    // Positive control: failed share errors are sanitized before they reach full rows.
+    #[test]
+    fn share_full_failed_row_has_no_control_characters() {
+        let rendered = render_share(
+            PanelWidth::Full,
+            crate::share::ShareView {
+                port: 3000,
+                failed: true,
+                error: Some("boom\u{1b}[31m".into()),
+                ..Default::default()
+            },
+        );
+        assert!(rendered.contains("boom"));
+        assert!(!rendered.chars().any(char::is_control));
+    }
 }
