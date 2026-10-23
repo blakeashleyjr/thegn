@@ -122,9 +122,8 @@ impl BridgeSupervisor {
         bridge::register(&key, client.clone());
         if let Ok(rx) = client.watch(workdir) {
             let on_event = self.inner.on_event.clone();
-            std::thread::Builder::new()
-                .name("thegn-brfswatch".into())
-                .spawn(move || {
+            thegn_core::thread_name::try_spawn_named("thegn-brfswatch",
+                move || {
                     // Housekeeping: an fs-watch event pump that lives as long as
                     // the client; nobody blocks on the notification it relays.
                     crate::platform::qos::set_self(crate::platform::qos::Qos::Background);

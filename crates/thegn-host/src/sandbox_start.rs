@@ -96,19 +96,27 @@ fn run_with(
                     // own is fine, and killing it would be worse than waiting.
                     tracing::warn!(target: "thegn::sandbox", cmd = %argv.join(" "), "runtime start timed out; leaving it to finish");
                     pending.fetch_add(1, Ordering::SeqCst);
-                    let reaper = std::thread::Builder::new()
-                        .name("thegn-sbx-reap".to_owned())
-                        .spawn(move || {
+                    let reaper = thegn_core::thread_name::try_spawn_named(
+                        "thegn-sbx-reap",
+                        move || {
                             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                            #[expect(clippy::disallowed_methods, reason = "the timed-out child must be reaped without killing it")]
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "the timed-out child must be reaped without killing it"
+                            )]
                             let result = child.wait();
                             match &result {
-                                Ok(status) => tracing::info!(target: "thegn::sandbox", %status, "timed-out runtime start finished"),
-                                Err(error) => tracing::warn!(target: "thegn::sandbox", %error, "timed-out runtime start could not be reaped"),
+                                Ok(status) => {
+                                    tracing::info!(target: "thegn::sandbox", %status, "timed-out runtime start finished")
+                                }
+                                Err(error) => {
+                                    tracing::warn!(target: "thegn::sandbox", %error, "timed-out runtime start could not be reaped")
+                                }
                             }
                             pending.fetch_sub(1, Ordering::SeqCst);
                             result
-                        });
+                        },
+                    );
                     return match reaper {
                         Ok(handle) => Start::TimedOut(Some(handle)),
                         Err(error) => {

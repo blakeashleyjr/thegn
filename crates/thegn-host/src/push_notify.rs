@@ -58,70 +58,66 @@ pub fn spawn(
     providers: BTreeMap<String, Box<dyn PushProvider>>,
     snapshot: DeliverySnapshot,
 ) {
-    std::thread::Builder::new()
-        .name("thegn-push".into())
-        .spawn(move || {
-            // Housekeeping, not interactive: keep it off the perf cores (no-op
-            // off Apple silicon).
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(_) => {
-                    // Drain so the bounded sender never wedges the emit site.
-                    while rx.recv().is_ok() {}
-                    return;
-                }
-            };
-            let mut limiters: BTreeMap<String, TokenBucket> = providers
-                .iter()
-                .map(|(name, provider)| (name.clone(), TokenBucket::for_kind(provider.kind())))
-                .collect();
-            while let Ok(job) = rx.recv() {
-                let sink = job.sink.clone();
-                let rendered = job.rendered.clone();
-                let msg = to_message(job);
-                let Some(provider) = providers.get(&sink) else {
-                    snapshot.event(&sink, DeliveryEvent::DeadLetter);
-                    continue;
-                };
-                let Some(limiter) = limiters.get_mut(&sink) else {
-                    snapshot.event(&sink, DeliveryEvent::DeadLetter);
-                    continue;
-                };
-                if !acquire_rate_limit(limiter, &rt, &snapshot, &sink) {
-                    continue;
-                }
-                // The provider owns its bounded retry; block this worker thread
-                // (never the event loop) on the result.
-                let result = if provider.kind() == PushKind::Ntfy {
-                    rt.block_on(provider.publish(&msg))
-                } else if let Some(notification) = rendered.as_ref() {
-                    rt.block_on(provider.publish_rendered(notification))
-                } else {
-                    Err(thegn_svc::push::PushError::Other(
-                        "rendered notification missing".into(),
-                    ))
-                };
-                if let Err(e) = result {
-                    match e.class() {
-                        ErrorClass::RateLimited => {
-                            snapshot.event(&sink, DeliveryEvent::RateLimitDrop)
-                        }
-                        ErrorClass::Transient => snapshot.event(&sink, DeliveryEvent::Retry),
-                        _ => {}
-                    }
-                    snapshot.event(&sink, DeliveryEvent::DeadLetter);
-                    tracing::debug!(target: "thegn::push", error = %e, "push delivery failed");
-                } else {
-                    snapshot.event(&sink, DeliveryEvent::Sent);
-                }
+    thegn_core::thread_name::try_spawn_named("thegn-push", move || {
+        // Housekeeping, not interactive: keep it off the perf cores (no-op
+        // off Apple silicon).
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => {
+                // Drain so the bounded sender never wedges the emit site.
+                while rx.recv().is_ok() {}
+                return;
             }
-            // best-effort: push worker: a failed spawn just disables push this session; delivery failures are already logged below
-        })
-        .ok();
+        };
+        let mut limiters: BTreeMap<String, TokenBucket> = providers
+            .iter()
+            .map(|(name, provider)| (name.clone(), TokenBucket::for_kind(provider.kind())))
+            .collect();
+        while let Ok(job) = rx.recv() {
+            let sink = job.sink.clone();
+            let rendered = job.rendered.clone();
+            let msg = to_message(job);
+            let Some(provider) = providers.get(&sink) else {
+                snapshot.event(&sink, DeliveryEvent::DeadLetter);
+                continue;
+            };
+            let Some(limiter) = limiters.get_mut(&sink) else {
+                snapshot.event(&sink, DeliveryEvent::DeadLetter);
+                continue;
+            };
+            if !acquire_rate_limit(limiter, &rt, &snapshot, &sink) {
+                continue;
+            }
+            // The provider owns its bounded retry; block this worker thread
+            // (never the event loop) on the result.
+            let result = if provider.kind() == PushKind::Ntfy {
+                rt.block_on(provider.publish(&msg))
+            } else if let Some(notification) = rendered.as_ref() {
+                rt.block_on(provider.publish_rendered(notification))
+            } else {
+                Err(thegn_svc::push::PushError::Other(
+                    "rendered notification missing".into(),
+                ))
+            };
+            if let Err(e) = result {
+                match e.class() {
+                    ErrorClass::RateLimited => snapshot.event(&sink, DeliveryEvent::RateLimitDrop),
+                    ErrorClass::Transient => snapshot.event(&sink, DeliveryEvent::Retry),
+                    _ => {}
+                }
+                snapshot.event(&sink, DeliveryEvent::DeadLetter);
+                tracing::debug!(target: "thegn::push", error = %e, "push delivery failed");
+            } else {
+                snapshot.event(&sink, DeliveryEvent::Sent);
+            }
+        }
+        // best-effort: push worker: a failed spawn just disables push this session; delivery failures are already logged below
+    })
+    .ok();
 }
 
 /// Consume one token for a queued sink job, waiting only on the worker's
