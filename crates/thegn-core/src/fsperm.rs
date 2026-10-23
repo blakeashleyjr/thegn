@@ -228,6 +228,69 @@ pub fn open_regular_file_nofollow(path: &Path) -> std::io::Result<std::fs::File>
     }
 }
 
+/// Why a user-named secret file was not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretFileError {
+    /// The path (final component) does not exist.
+    NotFound,
+    /// The file exists but must not be used; the text names the path and remedy, never its contents.
+    Refused(String),
+}
+
+/// Read a `file:` SecretRef with the managed store's owner, mode, link, no-follow, size and UTF-8 checks.
+///
+/// Only the final path component is opened without following symlinks, so a symlinked parent directory remains usable.
+/// The returned string is trimmed; callers treat an empty value as missing.
+pub fn read_owner_only_secret_file(path: &Path, max_bytes: u64) -> Result<String, SecretFileError> {
+    use std::io::Read;
+
+    let refuse = |reason: String| SecretFileError::Refused(reason);
+    let file = open_regular_file_nofollow(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SecretFileError::NotFound
+        } else {
+            refuse(format!("secret file {}: {error}", path.display()))
+        }
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| refuse(format!("secret file {}: {error}", path.display())))?;
+    if !owned_by_current_user(&metadata) {
+        return Err(refuse(format!(
+            "secret file {} is owned by another user; refusing to read it",
+            path.display()
+        )));
+    }
+    if ensure_single_link_regular_file(&metadata).is_err() {
+        return Err(refuse(format!(
+            "secret file {} has other hard links; refusing to read it (remove the extra link, then store the secret again)",
+            path.display()
+        )));
+    }
+    if let Some(mode) = mode_bits_from_metadata(&metadata)
+        && mode & 0o077 != 0
+    {
+        return Err(refuse(format!(
+            "secret file {} is accessible to other users (mode {mode:o}); refusing to read it (run `chmod 600` on it, or store the secret again)",
+            path.display()
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| refuse(format!("secret file {}: {error}", path.display())))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(refuse(format!(
+            "secret file {} exceeds size limit ({max_bytes} bytes); refusing to read it",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map(|value| value.trim().to_string())
+        .map_err(|_| refuse(format!("secret file {} is not valid UTF-8", path.display())))
+}
+
 /// Restrict a file at `path` to the owning user: `chmod 0600` on unix; on
 /// Windows strip inherited ACEs and grant only the current user full control
 /// (a protected DACL containing only the current user with full control).
@@ -2442,5 +2505,77 @@ mod tests {
             Err(error) => panic!("could not set fixture mode: {error}"),
         }
         assert_eq!(mode_bits(&path).unwrap(), Some(0o640));
+    }
+
+    #[test]
+    fn secret_file_read_refuses_group_readable_symlinked_and_linked_files() {
+        let temp = tempfile::tempdir().unwrap();
+        restrict_dir_to_owner(temp.path()).unwrap();
+        let path = temp.path().join("secret");
+        std::fs::write(&path, b"tok").unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert_eq!(read_owner_only_secret_file(&path, 16), Ok("tok".into()));
+
+        match set_mode_for_test(&path, 0o640) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("could not set fixture mode: {error}"),
+        }
+        if mode_bits(&path).unwrap().is_some() {
+            assert!(matches!(
+                read_owner_only_secret_file(&path, 16),
+                Err(SecretFileError::Refused(reason)) if reason.contains("accessible to other users")
+            ));
+        }
+        restrict_to_owner(&path).unwrap();
+
+        let linked = temp.path().join("secret-link-name");
+        std::fs::hard_link(&path, &linked).unwrap();
+        assert!(matches!(
+            read_owner_only_secret_file(&path, 16),
+            Err(SecretFileError::Refused(reason)) if reason.contains("hard links")
+        ));
+        std::fs::remove_file(linked).unwrap();
+
+        let symlink = temp.path().join("secret-symlink");
+        if create_symlink(&path, &symlink, false).is_ok() {
+            assert!(matches!(
+                read_owner_only_secret_file(&symlink, 16),
+                Err(SecretFileError::Refused(_))
+            ));
+        }
+        assert_eq!(
+            read_owner_only_secret_file(&temp.path().join("missing"), 16),
+            Err(SecretFileError::NotFound)
+        );
+        assert!(matches!(
+            read_owner_only_secret_file(temp.path(), 16),
+            Err(SecretFileError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn secret_file_read_bounds_size_and_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        restrict_dir_to_owner(temp.path()).unwrap();
+        let path = temp.path().join("secret");
+
+        std::fs::write(&path, b"12345").unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert!(matches!(
+            read_owner_only_secret_file(&path, 4),
+            Err(SecretFileError::Refused(reason)) if reason.contains("size limit")
+        ));
+
+        std::fs::write(&path, [0xff_u8]).unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert!(matches!(
+            read_owner_only_secret_file(&path, 4),
+            Err(SecretFileError::Refused(reason)) if reason.contains("not valid UTF-8")
+        ));
+
+        std::fs::write(&path, b"1234").unwrap();
+        restrict_to_owner(&path).unwrap();
+        assert_eq!(read_owner_only_secret_file(&path, 4), Ok("1234".into()));
     }
 }

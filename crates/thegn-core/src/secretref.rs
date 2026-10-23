@@ -87,8 +87,9 @@ pub enum SecretRef {
     Keyring { account: String },
     /// `env:VAR` (and bare-as-env-name fields) — an environment variable.
     Env { var: String },
-    /// `file:PATH` — a `0600` file (agenix/sops tmpfs targets land here). `~`
-    /// is expanded by the broker at read time.
+    /// `file:PATH` — a file owned by you with no group/other permission bits (mode 0600 or 0400) and a single link;
+    /// the final path component must not be a symlink (a symlinked parent directory such as agenix's /run/agenix is
+    /// fine). `~` is expanded by the broker at read time; a file that fails these checks is refused, not read.
     File { path: String },
     /// A legacy literal value pasted into config plaintext (deprecated).
     Literal(LiteralSecret),
