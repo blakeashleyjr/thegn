@@ -14,9 +14,9 @@ use crate::config::ForwardConfig;
 use std::collections::BTreeSet;
 
 impl ForwardConfig {
-    /// Refuse empty binds and non-loopback binds unless explicitly opted in.
+    /// Validate the bind and return its trimmed, unbracketed host spelling.
     /// The eventual socket bind remains responsible for resolving hostnames.
-    pub fn bind_check(&self) -> Result<(), ForwardBindRefusal> {
+    pub fn bind_host(&self) -> Result<&str, ForwardBindRefusal> {
         let bind = self.bind.trim();
         if bind.is_empty() {
             return Err(ForwardBindRefusal::Unparsable(self.bind.clone()));
@@ -31,20 +31,25 @@ impl ForwardConfig {
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|address| address.is_loopback())
         {
-            return Ok(());
+            return Ok(unbracketed);
         }
 
         let is_ip = unbracketed.parse::<std::net::IpAddr>().is_ok();
         let is_hostname = valid_bind_hostname(unbracketed);
         if is_ip || is_hostname {
             return if self.allow_external_bind {
-                Ok(())
+                Ok(unbracketed)
             } else {
                 Err(ForwardBindRefusal::NonLoopback(self.bind.clone()))
             };
         }
 
         Err(ForwardBindRefusal::Unparsable(self.bind.clone()))
+    }
+
+    /// Refuse empty binds and non-loopback binds unless explicitly opted in.
+    pub fn bind_check(&self) -> Result<(), ForwardBindRefusal> {
+        self.bind_host().map(|_| ())
     }
 
     /// Whether a newly-detected `container_port` should be auto-forwarded:
@@ -219,6 +224,17 @@ mod tests {
                 ..ForwardConfig::default()
             };
             assert_eq!(config.bind_check(), Ok(()), "{bind} should be accepted");
+        }
+    }
+
+    #[test]
+    fn bind_host_returns_trimmed_unbracketed_host() {
+        for (bind, host) in [(" 127.0.0.1 ", "127.0.0.1"), (" [::1] ", "::1")] {
+            let config = ForwardConfig {
+                bind: bind.to_string(),
+                ..ForwardConfig::default()
+            };
+            assert_eq!(config.bind_host(), Ok(host));
         }
     }
 

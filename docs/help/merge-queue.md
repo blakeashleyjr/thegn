@@ -156,9 +156,9 @@ command `<command>` (timeout Ns) -> tree <oid>”.
 `on_landed` decides what happens to a worktree whose branch just landed.
 The default is **`expire`**: the worktree is filed into the _Merged_
 folder and kept there for `merged_ttl_secs` (7 days out of the box),
-then the worktree is swept away. Automatic cleanup keeps the branch ref; it
-does not delete branches yet. A branch that cannot be safely deleted appears
-as a THE-596 branch hold in `thegn merge sweep`.
+then the worktree is swept away. Automatic cleanup keeps the branch ref (it
+does not delete branches yet); `thegn merge sweep` reports each retained branch
+as a THE-596 branch hold.
 
 The grace period exists because the two halves of a land are not equally
 recoverable. The branch ref is the merge commit's second parent, so it
