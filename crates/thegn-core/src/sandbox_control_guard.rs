@@ -656,7 +656,7 @@ mod tests {
         );
         assert!(matches!(
             refusal,
-            MaskPlan::Refuse(ControlExposure { control_dir, .. }) if control_dir == PathBuf::from(run)
+            MaskPlan::Refuse(ControlExposure { control_dir, .. }) if control_dir == *run
         ));
     }
 
@@ -672,7 +672,7 @@ mod tests {
         );
         assert!(matches!(
             refusal,
-            MaskPlan::Refuse(ControlExposure { control_dir, .. }) if control_dir == PathBuf::from(run)
+            MaskPlan::Refuse(ControlExposure { control_dir, .. }) if control_dir == *run
         ));
     }
 
