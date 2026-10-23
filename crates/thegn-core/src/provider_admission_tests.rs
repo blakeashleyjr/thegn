@@ -713,6 +713,62 @@ fn config_validation_uses_the_same_grammar() {
 }
 
 #[test]
+fn configured_provider_ids_must_be_lowercase_for_managed_kinds() {
+    for provider in ["sprites", "hetzner", "digitalocean", "fly", "machine0"] {
+        let mut cfg = crate::config::Config::default();
+        let mut env = crate::config::EnvConfig::default();
+        env.provider.provider = provider.into();
+        env.provider.id = "Work-{worktree}".into();
+        cfg.env.insert("e".into(), env);
+
+        let errors = validate_config(&cfg);
+        let id_errors: Vec<_> = errors
+            .iter()
+            .filter(|error| error.starts_with("env.e.provider.id:"))
+            .collect();
+        assert_eq!(id_errors.len(), 1, "{provider}: {errors:?}");
+        assert!(
+            !id_errors[0].contains("Work-{worktree}"),
+            "provider id was echoed: {id_errors:?}"
+        );
+    }
+}
+
+#[test]
+fn configured_provider_ids_keep_case_for_custom_and_daytona() {
+    // The first two controls pass at the base: these ids remain vendor-opaque.
+    for provider in ["", "daytona"] {
+        let mut cfg = crate::config::Config::default();
+        let mut env = crate::config::EnvConfig::default();
+        env.provider.provider = provider.into();
+        env.provider.id = "Work-{worktree}".into();
+        cfg.env.insert("e".into(), env);
+
+        let errors = validate_config(&cfg);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.starts_with("env.e.provider.id:")),
+            "{provider:?}: {errors:?}"
+        );
+    }
+
+    // Lowercase managed ids also pass at the base (positive control).
+    let mut cfg = crate::config::Config::default();
+    let mut env = crate::config::EnvConfig::default();
+    env.provider.provider = "fly".into();
+    env.provider.id = "work-{worktree}".into();
+    cfg.env.insert("e".into(), env);
+    let errors = validate_config(&cfg);
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.starts_with("env.e.provider.id:")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn base64_decoding_is_strict_and_canonical() {
     assert_eq!(decode_base64("AA=="), Some(vec![0]));
     assert_eq!(decode_base64("AAA="), Some(vec![0, 0]));

@@ -469,10 +469,33 @@ pub fn validate_vps_config(
 /// Validate every configured Fly/VPS table using the same local grammar that
 /// the service constructors use. Provider names outside these implemented
 /// adapters are handled by the schema/enum validator and are not probed here.
+/// Managed provider ids must also be lowercase; custom and Daytona ids remain
+/// vendor-opaque and are exempt.
 pub fn validate_config(cfg: &crate::config::Config) -> Vec<String> {
     let mut errors = Vec::new();
     for (env_name, env) in &cfg.env {
         let provider = env.provider.provider.trim().to_ascii_lowercase();
+        // Custom and Daytona ids are vendor-opaque. Only thegn-managed kinds
+        // use configured ids as local registry and SSH custody identities.
+        let managed = matches!(
+            crate::config::EnvProviderKind::of(env.provider.provider.trim()),
+            crate::config::EnvProviderKind::Sprites
+                | crate::config::EnvProviderKind::Hetzner
+                | crate::config::EnvProviderKind::DigitalOcean
+                | crate::config::EnvProviderKind::Fly
+                | crate::config::EnvProviderKind::Machine0
+        );
+        if managed
+            && env
+                .provider
+                .id
+                .bytes()
+                .any(|byte| byte.is_ascii_uppercase())
+        {
+            errors.push(format!(
+                "env.{env_name}.provider.id: provider ids must be lowercase (provider names are case-insensitive DNS names, so an uppercase id would give one instance two local identities)"
+            ));
+        }
         let result = match provider.as_str() {
             "fly" => validate_fly_config(
                 &env.provider.api_base,
