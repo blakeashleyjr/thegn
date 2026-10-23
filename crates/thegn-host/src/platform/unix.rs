@@ -71,11 +71,11 @@ impl StderrGuard {
     }
 }
 
-/// A panic-safe terminal restorer: an owned fd to the controlling terminal plus
-/// the saved *cooked* termios captured before raw mode. [`TerminalRestore::restore`]
-/// uses only non-panicking writes / a raw `libc::tcsetattr` — never a termwiz
-/// method that can `unwrap` during unwind — so the panic hook can call it while
-/// the original panic is unwinding without risking a double panic.
+/// A panic-safe terminal restorer: an owned nonblocking fd to the controlling
+/// terminal plus the saved *cooked* termios captured before raw mode.
+/// [`TerminalRestore::restore`] makes one best-effort nonblocking teardown
+/// write, then restores termios with `tcsetattr`, so the panic hook cannot wait
+/// for terminal output while the original panic is unwinding.
 ///
 /// The termios is stored as the raw `libc::termios` (a plain `Copy` C struct)
 /// rather than nix's `Termios`, whose internal `RefCell` is not `Sync` and so
@@ -106,7 +106,9 @@ impl TerminalRestore {
         // it is defensive against an inner app that pushed flags and died
         // without popping them. Leave the bytes.
         const SEQ: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l";
-        let _ = nix::unistd::write(&self.tty, SEQ); // best-effort: terminal teardown: leave the bytes; the tty drops anyway
+        if let Err(error) = nix::unistd::write(&self.tty, SEQ) {
+            tracing::debug!(target: "thegn::shutdown", %error, "best-effort panic terminal teardown write failed");
+        }
         // SAFETY: `tcsetattr` on our own controlling-terminal fd with a termios
         // we captured from it. Result ignored — this runs during a panic unwind
         // and must not itself panic.
@@ -118,16 +120,28 @@ impl TerminalRestore {
 
 /// Capture the controlling terminal's current (cooked) state so the panic hook
 /// can restore it. Call BEFORE entering raw mode + the alternate screen. `None`
-/// if `/dev/tty` cannot be opened or queried (the caller then relies on the
-/// normal teardown path).
+/// if `/dev/tty` cannot be opened, made nonblocking, or queried (the caller then
+/// relies on the normal teardown path).
 pub fn capture_terminal_restore() -> Option<TerminalRestore> {
-    use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
         .ok()?;
-    let tty: std::os::fd::OwnedFd = file.into();
+    terminal_restore_from(file.into())
+}
+
+/// Build a restore handle from an owned controlling-terminal descriptor.
+/// Setting `O_NONBLOCK` is safe here because callers supply an independently
+/// opened descriptor, not a dup that shares another writer's file description.
+pub(crate) fn terminal_restore_from(tty: std::os::fd::OwnedFd) -> Option<TerminalRestore> {
+    use std::os::fd::AsRawFd;
+    let flags = unsafe { libc::fcntl(tty.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(tty.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return None;
+    }
     // SAFETY: `tcgetattr` into a zeroed termios on a valid open fd.
     let mut cooked: libc::termios = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut cooked) };
@@ -135,6 +149,165 @@ pub fn capture_terminal_restore() -> Option<TerminalRestore> {
         return None;
     }
     Some(TerminalRestore { tty, cooked })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod terminal_teardown_tests {
+    use super::terminal_restore_from;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use termwiz::caps::{Capabilities, ProbeHints};
+    use termwiz::terminal::{Terminal, UnixTerminal};
+
+    fn pty() -> (std::fs::File, std::fs::File) {
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned two fresh descriptors owned by this fixture.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        }
+    }
+
+    fn slave_path(slave: &std::fs::File) -> std::path::PathBuf {
+        std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap()
+    }
+
+    fn fill_output(slave: &std::fs::File) {
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(slave_path(slave))
+            .unwrap();
+        let chunk = [b'x'; 4096];
+        loop {
+            match writer.write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("filling pty output: {error}"),
+            }
+        }
+    }
+
+    fn bounded_call(call: impl FnOnce() + Send + 'static) {
+        let (send, receive) = mpsc::channel();
+        let worker = call;
+        let _handle = thegn_core::thread_name::try_spawn_named("thegn-test-tty", move || {
+            worker();
+            send.send(()).unwrap();
+        })
+        .unwrap();
+        assert!(
+            receive.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "terminal teardown blocked on a full pty"
+        );
+    }
+
+    #[test]
+    fn restore_returns_promptly_on_a_full_tty_and_restores_cooked_termios() {
+        let (_master, slave) = pty();
+        let restore_fd: std::os::fd::OwnedFd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(slave_path(&slave))
+            .unwrap()
+            .into();
+        let restore = terminal_restore_from(restore_fd).unwrap();
+        let mut raw = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut raw) }, 0);
+        let cooked = raw;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &raw) },
+            0
+        );
+        fill_output(&slave);
+        bounded_call(move || restore.restore());
+        let mut restored = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut restored) },
+            0
+        );
+        assert_eq!(cooked.c_lflag, restored.c_lflag);
+        assert_eq!(cooked.c_iflag, restored.c_iflag);
+    }
+
+    #[test]
+    fn release_terminal_with_raw_restore_skips_the_blocking_termwiz_cleanup() {
+        let (_master, slave) = pty();
+        let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
+        let mut terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
+        terminal.set_raw_mode().unwrap();
+        let buf = termwiz::terminal::buffered::BufferedTerminal::new(terminal).unwrap();
+        fill_output(&slave);
+        bounded_call(move || crate::frame_write::release_terminal(buf, true));
+    }
+
+    #[test]
+    fn release_terminal_without_raw_restore_runs_termwiz_cleanup() {
+        let (master, slave) = pty();
+        let before = unsafe {
+            let mut value = std::mem::zeroed::<libc::termios>();
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut value), 0);
+            value
+        };
+        let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
+        let mut terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
+        terminal.set_raw_mode().unwrap();
+        let buf = termwiz::terminal::buffered::BufferedTerminal::new(terminal).unwrap();
+        let master_fd = master.as_raw_fd();
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let (stop_send, stop_receive) = mpsc::channel();
+        let _reader = thegn_core::thread_name::try_spawn_named("thegn-test-tty", move || {
+            let mut bytes = [0_u8; 4096];
+            loop {
+                if stop_receive.try_recv().is_ok() {
+                    break;
+                }
+                match master.read(&mut bytes) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now()
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .unwrap();
+        let (done_send, done_receive) = mpsc::channel();
+        let _worker = thegn_core::thread_name::try_spawn_named("thegn-test-tty", move || {
+            crate::frame_write::release_terminal(buf, false);
+            done_send.send(()).unwrap();
+        })
+        .unwrap();
+        assert!(done_receive.recv_timeout(Duration::from_secs(5)).is_ok());
+        stop_send.send(()).unwrap();
+        let mut after = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut after) }, 0);
+        assert_eq!(before.c_lflag, after.c_lflag);
+        assert_eq!(before.c_iflag, after.c_iflag);
+    }
 }
 
 /// Point fd 2 at `file`, saving the original for the guard's `Drop`.
