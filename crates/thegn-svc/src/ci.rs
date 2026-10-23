@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, atomic::AtomicBool};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Provider-side bounds are deliberately finite even before the host applies
 /// the user's cache policy.  This protects the blocking provider lane from a
@@ -39,6 +39,9 @@ const GITLAB_JOBS_MAX_ROWS: usize = GITLAB_JOBS_PAGE_SIZE * GITLAB_JOBS_MAX_PAGE
 const GITLAB_JOBS_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CI_CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const CI_LOG_TIMEOUT: Duration = Duration::from_secs(60);
+/// One end-to-end deadline for a whole GitLab run detail (pipeline header plus
+/// every job page).
+const GITLAB_DETAIL_DEADLINE: Duration = CI_LOG_TIMEOUT;
 const CI_CLI_MAX_STDOUT: usize = 8 * 1024 * 1024;
 const CI_CLI_MAX_STDERR: usize = 64 * 1024;
 const PROVIDER_JSON_MAX_DEPTH: usize = 32;
@@ -113,6 +116,7 @@ pub enum CiDetailIncomplete {
     PageBudget { pages: usize },
     RowBudget { rows: usize },
     ByteBudget { bytes: usize },
+    Deadline { secs: u64 },
 }
 
 impl CiDetailIncomplete {
@@ -126,6 +130,9 @@ impl CiDetailIncomplete {
             }
             Self::ByteBudget { bytes } => {
                 format!("job list stopped after {bytes} bytes (byte budget)")
+            }
+            Self::Deadline { secs } => {
+                format!("job list stopped after {secs} seconds (time budget)")
             }
         }
     }
@@ -1811,6 +1818,7 @@ impl CiProvider for GitlabCi {
         // Pipeline header + its jobs (two calls; the jobs carry the states).
         let run_endpoint = gitlab_run_endpoint(&proj, run_id, "")?;
         let jobs_endpoint = gitlab_run_endpoint(&proj, run_id, "jobs")?;
+        let deadline = Instant::now() + GITLAB_DETAIL_DEADLINE;
         let pipe_json = run_cli(
             self.command(loc, &remote, &["api", &run_endpoint])?,
             &self.cancel,
@@ -1832,21 +1840,23 @@ impl CiProvider for GitlabCi {
         }
         let (jobs, discarded_jobs, incomplete) =
             collect_gitlab_jobs(GITLAB_JOBS_MAX_BYTES, |page, remaining| {
+                let Some((timeout, clipped)) =
+                    gitlab_page_timeout(deadline.saturating_duration_since(Instant::now()))
+                else {
+                    return Ok(GitlabJobPage::OverDeadline);
+                };
                 let endpoint =
                     format!("{jobs_endpoint}?per_page={GITLAB_JOBS_PAGE_SIZE}&page={page}");
-                match crate::issue::gh_run::run_blocking(
+                let result = crate::issue::gh_run::run_blocking(
                     self.command(loc, &remote, &["api", &endpoint])?,
                     crate::issue::gh_run::Limits {
-                        timeout: CI_CLI_TIMEOUT,
+                        timeout,
                         max_stdout: remaining,
                         max_stderr: CI_CLI_MAX_STDERR,
                     },
                     &self.cancel,
-                ) {
-                    Ok(body) => Ok(GitlabJobPage::Body(body)),
-                    Err(crate::issue::gh_run::RunError::Truncated) => Ok(GitlabJobPage::OverBudget),
-                    Err(error) => Err(ci_run_error(error)),
-                }
+                );
+                gitlab_page_result(result, clipped)
             })?;
         if discarded_jobs > 0 {
             tracing::warn!(target: "thegn::ci", discarded_rows = discarded_jobs, "discarded malformed GitLab job rows");
@@ -1951,6 +1961,28 @@ impl CiProvider for GitlabCi {
 enum GitlabJobPage {
     Body(String),
     OverBudget,
+    OverDeadline,
+}
+
+fn gitlab_page_timeout(left: Duration) -> Option<(Duration, bool)> {
+    if left.is_zero() {
+        None
+    } else {
+        Some((left.min(CI_CLI_TIMEOUT), left < CI_CLI_TIMEOUT))
+    }
+}
+
+fn gitlab_page_result(
+    result: Result<String, crate::issue::gh_run::RunError>,
+    clipped: bool,
+) -> Result<GitlabJobPage, CiError> {
+    use crate::issue::gh_run::RunError;
+    match result {
+        Ok(body) => Ok(GitlabJobPage::Body(body)),
+        Err(RunError::Truncated) => Ok(GitlabJobPage::OverBudget),
+        Err(RunError::Timeout) if clipped => Ok(GitlabJobPage::OverDeadline),
+        Err(error) => Err(ci_run_error(error)),
+    }
 }
 
 fn collect_gitlab_jobs(
@@ -1978,6 +2010,15 @@ fn collect_gitlab_jobs(
             }
             GitlabJobPage::OverBudget => {
                 incomplete = Some(CiDetailIncomplete::ByteBudget { bytes: max_bytes });
+                break;
+            }
+            GitlabJobPage::OverDeadline if page == 1 => {
+                return Err(CiError::Other("CI provider command timed out".into()));
+            }
+            GitlabJobPage::OverDeadline => {
+                incomplete = Some(CiDetailIncomplete::Deadline {
+                    secs: GITLAB_DETAIL_DEADLINE.as_secs(),
+                });
                 break;
             }
         };
@@ -3097,6 +3138,11 @@ esac
                 .reason()
                 .contains("(byte budget)")
         );
+        assert!(
+            CiDetailIncomplete::Deadline { secs: 60 }
+                .reason()
+                .contains("60 seconds (time budget)")
+        );
     }
 
     fn gitlab_jobs_json(ids: std::ops::RangeInclusive<u64>) -> String {
@@ -3104,6 +3150,76 @@ esac
             .map(|id| serde_json::json!({"id": id, "name": format!("job-{id}"), "status": "success"}))
             .collect();
         serde_json::to_string(&rows).unwrap()
+    }
+
+    #[test]
+    fn gitlab_detail_deadline_cut_after_page_one_returns_typed_partial() {
+        let (jobs, _, incomplete) = collect_gitlab_jobs(usize::MAX, |page, _| match page {
+            1 => Ok(GitlabJobPage::Body(gitlab_jobs_json(1..=100))),
+            2 => Ok(GitlabJobPage::OverDeadline),
+            _ => panic!("unexpected page {page}"),
+        })
+        .unwrap();
+
+        assert_eq!(jobs.len(), 100);
+        assert_eq!(incomplete, Some(CiDetailIncomplete::Deadline { secs: 60 }));
+        assert!(
+            !CiRunDetail {
+                run: CiRun::default(),
+                discarded_jobs: 0,
+                incomplete,
+            }
+            .is_complete()
+        );
+    }
+
+    #[test]
+    fn gitlab_detail_deadline_on_first_page_is_an_error() {
+        let result = collect_gitlab_jobs(usize::MAX, |_page, _| Ok(GitlabJobPage::OverDeadline));
+
+        assert!(matches!(
+            result,
+            Err(CiError::Other(message)) if message == "CI provider command timed out"
+        ));
+    }
+
+    #[test]
+    fn gitlab_page_timeout_clips_to_the_deadline() {
+        assert_eq!(gitlab_page_timeout(Duration::ZERO), None);
+        assert_eq!(
+            gitlab_page_timeout(Duration::from_secs(10)),
+            Some((Duration::from_secs(10), true))
+        );
+        assert_eq!(
+            gitlab_page_timeout(Duration::from_secs(120)),
+            Some((CI_CLI_TIMEOUT, false))
+        );
+        assert_eq!(
+            gitlab_page_timeout(CI_CLI_TIMEOUT),
+            Some((CI_CLI_TIMEOUT, false))
+        );
+    }
+
+    #[test]
+    fn gitlab_page_timeout_clipped_timeout_is_a_deadline_partial() {
+        use crate::issue::gh_run::RunError;
+
+        assert!(matches!(
+            gitlab_page_result(Err(RunError::Timeout), true),
+            Ok(GitlabJobPage::OverDeadline)
+        ));
+        assert!(matches!(
+            gitlab_page_result(Err(RunError::Timeout), false),
+            Err(CiError::Other(message)) if message == "CI provider command timed out"
+        ));
+        assert!(matches!(
+            gitlab_page_result(Err(RunError::Truncated), false),
+            Ok(GitlabJobPage::OverBudget)
+        ));
+        assert!(matches!(
+            gitlab_page_result(Ok("[]".to_owned()), false),
+            Ok(GitlabJobPage::Body(body)) if body == "[]"
+        ));
     }
 
     #[test]
