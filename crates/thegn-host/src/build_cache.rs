@@ -492,6 +492,26 @@ pub(crate) fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, Str
     out
 }
 
+/// Explain target-directory settings that can make Cargo reuse artifacts from
+/// another worktree. This is deliberately a pure config report: it performs no
+/// filesystem access.
+pub(crate) fn shared_target_hazards(cfg: &Config, gate_target_dir: &str) -> Vec<String> {
+    let mut hazards = Vec::new();
+    if !cfg.disk.shared_target_dir.is_empty() {
+        hazards.push(format!(
+            "[disk] shared_target_dir is set to {:?}: every worktree of a repository builds into one CARGO_TARGET_DIR, and Cargo can reuse a crate compiled from another worktree's source (same relative paths); build one worktree at a time or leave it empty",
+            cfg.disk.shared_target_dir
+        ));
+    }
+    if !gate_target_dir.is_empty() {
+        hazards.push(format!(
+            "[merge_queue] gate_target_dir is set to {:?}: the reused gate builds in <dir>/repo-<id> per repository; isolated gates ignore it and build in a private target",
+            gate_target_dir
+        ));
+    }
+    hazards
+}
+
 // Convenience for existing path-planning tests; shipping overmount code
 // supplies its already-resolved inherited home directly.
 #[cfg(test)]
@@ -660,6 +680,26 @@ mod tests {
         cfg.disk.shared_target_dir = "/abs/target".into();
         let env = build_env_vars(&cfg, Path::new("/repo"));
         assert!(env.contains(&("CARGO_TARGET_DIR".to_string(), "/abs/target".to_string())));
+    }
+
+    #[test]
+    fn shared_target_hazards_empty_by_default() {
+        assert!(shared_target_hazards(&Config::default(), "").is_empty());
+    }
+
+    #[test]
+    fn shared_target_hazards_name_each_setting() {
+        let cfg = Config {
+            disk: thegn_core::config::DiskConfig {
+                shared_target_dir: "/tmp/shared".into(),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let hazards = shared_target_hazards(&cfg, "/tmp/gate");
+        assert_eq!(hazards.len(), 2);
+        assert!(hazards[0].contains("[disk] shared_target_dir"));
+        assert!(hazards[1].contains("[merge_queue] gate_target_dir"));
     }
 
     #[test]
