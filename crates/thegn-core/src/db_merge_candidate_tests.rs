@@ -186,6 +186,27 @@ fn enqueue_identity_claimed_row_is_refused() {
         })
         .unwrap()
         .unwrap();
+    let claim_state_before = db
+        .conn()
+        .query_row(
+            "SELECT claim_owner,claim_generation,claim_phase,claim_lease_until_ms,\
+                    claim_owner_hint,claim_launch_nonce,claim_diagnostic,status \
+             FROM merge_queue WHERE worktree=?1",
+            [WORKTREE],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .unwrap();
 
     let error = db
         .enqueue_merge_candidate_with_identity(
@@ -205,7 +226,30 @@ fn enqueue_identity_claimed_row_is_refused() {
         db.merge_candidate(WORKTREE).unwrap(),
         Some(candidate(OID_A))
     );
-    db.release_merge_claim(&claim).unwrap();
+    let claim_state_after = db
+        .conn()
+        .query_row(
+            "SELECT claim_owner,claim_generation,claim_phase,claim_lease_until_ms,\
+                    claim_owner_hint,claim_launch_nonce,claim_diagnostic,status \
+             FROM merge_queue WHERE worktree=?1",
+            [WORKTREE],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(claim_state_after, claim_state_before);
+    let settled = db.settle_merge_claim_no_child(&claim).unwrap();
+    db.release_merge_claim(&settled).unwrap();
 }
 
 #[test]
