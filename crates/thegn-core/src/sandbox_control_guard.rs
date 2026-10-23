@@ -1,36 +1,78 @@
-//! Plans masks for the daemon control socket when a sandbox bind exposes it.
+//! Plans sandbox protection for daemon control sockets and the state locator.
 //!
 //! The daemon socket confers host control authority. Bwrap can hide a visible
 //! socket directory after its binds; fixed-mount container backends must refuse.
+//! The state locator is write-protected separately because a read-only view is safe.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+struct Published {
+    sockets: Vec<PathBuf>,
+    protected: Vec<PathBuf>,
+}
 
-static PUBLISHED: OnceLock<PathBuf> = OnceLock::new();
+static PUBLISHED: std::sync::Mutex<Published> = std::sync::Mutex::new(Published {
+    sockets: Vec::new(),
+    protected: Vec::new(),
+});
 
-/// Publish the resolved host control-socket directory once during startup.
+fn publish_into(list: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !list.contains(&dir) {
+        list.push(dir);
+    }
+}
+
+/// Publish each resolved host control-socket directory at startup, after a
+/// daemon is reached, and after daemon socket relocation.
 pub fn publish_control_socket_dir(dir: PathBuf) {
-    PUBLISHED.get_or_init(|| dir);
+    publish_into(
+        &mut PUBLISHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sockets,
+        dir,
+    );
+}
+
+/// Publish a host-state directory that sandboxes must not be able to write.
+/// Bwrap masks it when present, systemd makes it inaccessible, and OCI refuses
+/// writable mounts that cover it.
+pub fn publish_protected_state_dir(dir: PathBuf) {
+    publish_into(
+        &mut PUBLISHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .protected,
+        dir,
+    );
 }
 
 pub(crate) fn control_dirs() -> Vec<PathBuf> {
-    control_dirs_from(
-        std::env::var_os("XDG_RUNTIME_DIR"),
-        PUBLISHED.get().map(PathBuf::as_path),
-    )
+    let published = PUBLISHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .sockets
+        .clone();
+    control_dirs_from(std::env::var_os("XDG_RUNTIME_DIR"), &published)
+}
+
+pub(crate) fn protected_dirs() -> Vec<PathBuf> {
+    let published = PUBLISHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .protected
+        .clone();
+    normalize(published)
 }
 
 pub(crate) fn control_dirs_from(
     runtime_dir: Option<std::ffi::OsString>,
-    published: Option<&Path>,
+    published: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(runtime_dir) = runtime_dir.filter(|value| !value.is_empty()) {
         dirs.push(PathBuf::from(runtime_dir).join("thegn"));
     }
-    if let Some(dir) = published {
-        dirs.push(dir.to_path_buf());
-    }
+    dirs.extend_from_slice(published);
     normalize(dirs)
 }
 
@@ -45,6 +87,52 @@ pub(crate) enum MaskPlan {
     Clear,
     Mask(Vec<PathBuf>),
     Refuse(ControlExposure),
+}
+
+pub(crate) fn plan_protected(
+    protected: &[PathBuf],
+    visible_roots: &[&Path],
+    writable_roots: &[&Path],
+    bind_dests: &[&Path],
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> MaskPlan {
+    let mut masks = Vec::new();
+    for protected_dir in protected {
+        if !visible_roots
+            .iter()
+            .any(|root| protected_dir.starts_with(*root))
+        {
+            continue;
+        }
+        let exists = is_dir(protected_dir);
+        if exists
+            && let Some(dest) = bind_dests
+                .iter()
+                .find(|dest| dest.starts_with(protected_dir))
+        {
+            return MaskPlan::Refuse(ControlExposure {
+                control_dir: protected_dir.clone(),
+                visible_through: dest.to_path_buf(),
+            });
+        }
+        if exists && !masks.contains(protected_dir) {
+            masks.push(protected_dir.clone());
+        } else if !exists
+            && let Some(root) = writable_roots
+                .iter()
+                .find(|root| protected_dir.starts_with(**root))
+        {
+            return MaskPlan::Refuse(ControlExposure {
+                control_dir: protected_dir.clone(),
+                visible_through: root.to_path_buf(),
+            });
+        }
+    }
+    if masks.is_empty() {
+        MaskPlan::Clear
+    } else {
+        MaskPlan::Mask(masks)
+    }
 }
 
 pub(crate) fn plan(
@@ -215,7 +303,7 @@ fn normalize(mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
 mod tests {
     use super::{
         ControlExposure, MaskPlan, control_dirs_from, exposure, in_sandbox_paths,
-        mount_inside_control_dir, normalize, plan,
+        mount_inside_control_dir, normalize, plan, plan_protected, publish_into,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -444,8 +532,7 @@ mod tests {
 
     #[test]
     fn control_dirs_from_joins_thegn_to_the_runtime_dir_and_adds_the_published_dir() {
-        let mut actual =
-            control_dirs_from(Some("/run/user/42".into()), Some(Path::new("/srv/ctl")));
+        let mut actual = control_dirs_from(Some("/run/user/42".into()), &paths(&["/srv/ctl"]));
         let mut expected = paths(&["/run/user/42/thegn", "/srv/ctl"]);
         actual.sort();
         expected.sort();
@@ -457,9 +544,9 @@ mod tests {
 
     #[test]
     fn control_dirs_from_ignores_an_empty_runtime_dir() {
-        assert!(control_dirs_from(Some("".into()), None).is_empty());
+        assert!(control_dirs_from(Some("".into()), &[]).is_empty());
         assert_eq!(
-            control_dirs_from(None, Some(Path::new("/srv/ctl"))),
+            control_dirs_from(None, &paths(&["/srv/ctl"])),
             paths(&["/srv/ctl"])
         );
     }
@@ -469,10 +556,124 @@ mod tests {
         assert_eq!(
             control_dirs_from(
                 Some("/run/user/42".into()),
-                Some(Path::new("/run/user/42/thegn/key")),
+                &paths(&["/run/user/42/thegn/key"]),
             ),
             paths(&["/run/user/42/thegn"])
         );
+    }
+
+    #[test]
+    fn publish_into_keeps_every_distinct_dir_once() {
+        let mut published = Vec::new();
+        publish_into(&mut published, PathBuf::from("/tmp/thegn-42-k"));
+        publish_into(
+            &mut published,
+            PathBuf::from("/tmp/thegn-42-k-0123456789abcdef0123456789abcdef"),
+        );
+        publish_into(&mut published, PathBuf::from("/tmp/thegn-42-k"));
+        publish_into(&mut published, PathBuf::from("/state/thegn/run"));
+        let mut expected = paths(&[
+            "/tmp/thegn-42-k",
+            "/tmp/thegn-42-k-0123456789abcdef0123456789abcdef",
+            "/state/thegn/run",
+        ]);
+        published.sort();
+        expected.sort();
+        assert_eq!(published, expected);
+    }
+
+    #[test]
+    fn control_dirs_from_keeps_every_published_dir() {
+        let mut actual = control_dirs_from(
+            Some("/run/user/42".into()),
+            &paths(&[
+                "/tmp/thegn-42-k",
+                "/tmp/thegn-42-k-0123456789abcdef0123456789abcdef",
+                "/state/thegn/run",
+            ]),
+        );
+        let mut expected = paths(&[
+            "/run/user/42/thegn",
+            "/tmp/thegn-42-k",
+            "/tmp/thegn-42-k-0123456789abcdef0123456789abcdef",
+            "/state/thegn/run",
+        ]);
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn plan_protected_masks_exactly_an_existing_run_dir() {
+        let run = "/home/u/.local/state/thegn/run";
+        let protected = paths(&[run]);
+        let visible = [Path::new("/home/u")];
+        let writable = [
+            Path::new("/home/u/wt"),
+            Path::new("/home/u/.local/state/thegn/accounts/claude/a"),
+        ];
+        let binds = [
+            Path::new("/home/u"),
+            Path::new("/home/u/wt"),
+            Path::new("/home/u/.local/state/thegn/accounts/claude/a"),
+        ];
+        let dirs = dir_set(&["/home/u", "/home/u/.local/state/thegn", run]);
+        assert_eq!(
+            plan_protected(&protected, &visible, &writable, &binds, &is_dir(&dirs)),
+            MaskPlan::Mask(paths(&[run]))
+        );
+    }
+
+    #[test]
+    fn plan_protected_never_climbs_when_the_run_dir_is_absent() {
+        let run = "/home/u/.local/state/thegn/run";
+        let protected = paths(&[run]);
+        let visible = [Path::new("/home/u")];
+        let writable = [
+            Path::new("/home/u/wt"),
+            Path::new("/home/u/.local/state/thegn/accounts/claude/a"),
+        ];
+        let binds = [
+            Path::new("/home/u"),
+            Path::new("/home/u/wt"),
+            Path::new("/home/u/.local/state/thegn/accounts/claude/a"),
+        ];
+        let dirs = dir_set(&["/home/u", "/home/u/.local/state/thegn"]);
+        let plan = plan_protected(&protected, &visible, &writable, &binds, &is_dir(&dirs));
+        assert_eq!(plan, MaskPlan::Clear);
+        assert_ne!(plan, MaskPlan::Mask(paths(&["/home/u/.local/state/thegn"])));
+    }
+
+    #[test]
+    fn plan_protected_refuses_an_absent_run_dir_under_a_writable_root() {
+        let run = "/home/u/.local/state/thegn/run";
+        let refusal = plan_protected(
+            &paths(&[run]),
+            &[Path::new("/home/u")],
+            &[Path::new("/home/u")],
+            &[Path::new("/home/u")],
+            &|_| false,
+        );
+        assert!(matches!(
+            refusal,
+            MaskPlan::Refuse(ControlExposure { control_dir, .. }) if control_dir == PathBuf::from(run)
+        ));
+    }
+
+    #[test]
+    fn plan_protected_refuses_when_a_bind_lies_inside_the_run_dir() {
+        let run = "/home/u/.local/state/thegn/run";
+        let refusal = plan_protected(
+            &paths(&[run]),
+            &[Path::new("/home/u")],
+            &[],
+            &[Path::new("/home/u/.local/state/thegn/run/x")],
+            &|path| path == Path::new(run),
+        );
+        assert!(matches!(
+            refusal,
+            MaskPlan::Refuse(ControlExposure { control_dir, .. }) if control_dir == PathBuf::from(run)
+        ));
     }
 
     #[test]

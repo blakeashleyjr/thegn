@@ -342,6 +342,14 @@ impl Fixture {
     }
 
     fn build(with_runtime_dir: bool) -> Self {
+        Self::build_configured(with_runtime_dir, false)
+    }
+
+    fn build_with_state_run_probe() -> Self {
+        Self::build_configured(true, true)
+    }
+
+    fn build_configured(with_runtime_dir: bool, state_run_probe: bool) -> Self {
         let state = IsolatedState::new();
         let runtime = with_runtime_dir.then(|| {
             tempfile::Builder::new()
@@ -353,6 +361,46 @@ impl Fixture {
         let captures = tempfile::tempdir_in(state.root()).expect("private capture directory");
         let marker_dir = tempfile::tempdir().expect("private host-only marker directory");
         let marker = marker_dir.path().join("marker");
+
+        if state_run_probe {
+            let state_home = state.root().join("state");
+            let _run_dir =
+                thegn_core::fsperm::ensure_private_dir_beneath(&state_home, Path::new("thegn/run"))
+                    .expect("create private state run directory before daemon startup");
+            let run_dir = state_home.join("thegn/run");
+            thegn_core::fsperm::write_owner_only_new(
+                &run_dir.join("tg-sentinel"),
+                b"host sentinel",
+            )
+            .expect("write owner-only run sentinel");
+            let result = worktree.path().join("state-run-result");
+            let command = format!(
+                "if test -e {}; then printf visible > {}; else printf hidden > {}; fi; touch {}",
+                shell_quote(
+                    run_dir
+                        .join("tg-sentinel")
+                        .to_str()
+                        .expect("sentinel path is UTF-8")
+                ),
+                shell_quote(result.to_str().expect("result path is UTF-8")),
+                shell_quote(result.to_str().expect("result path is UTF-8")),
+                shell_quote(
+                    run_dir
+                        .join("tg-pane-write")
+                        .to_str()
+                        .expect("write path is UTF-8")
+                ),
+            );
+            let config_dir = state.root().join(".config/thegn");
+            fs::create_dir_all(&config_dir).expect("create daemon config directory");
+            fs::write(
+                config_dir.join("config.toml"),
+                format!(
+                    "[sandbox]\nenabled = true\nbackend = \"bwrap\"\nbackend_chain = [\"bwrap\"]\nprofile = \"standard\"\n\n[sandbox.limits]\ncpu_total = \"off\"\n\n[[agents]]\nname = \"probe\"\ncommand = {command:?}\n"
+                ),
+            )
+            .expect("write sandboxed agent config before daemon startup");
+        }
 
         let init = run_bounded(
             thegn_core::util::git_cmd(worktree.path())
@@ -543,6 +591,30 @@ impl Fixture {
         );
         result
     }
+
+    fn open_probe_agent(&self) -> Captured {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
+        command.args([
+            "session",
+            "open",
+            "--agent",
+            "probe",
+            "--worktree",
+            self.worktree
+                .path()
+                .to_str()
+                .expect("worktree path is UTF-8"),
+            "--prompt",
+            "x",
+        ]);
+        self.child_env(&mut command);
+        run_bounded(
+            &mut command,
+            self.captures.path(),
+            "state-run-open",
+            PROCESS_TIMEOUT,
+        )
+    }
 }
 
 fn wait_for_endpoint(candidates: &[PathBuf], daemon: &mut RunningDaemon) -> PathBuf {
@@ -706,6 +778,41 @@ fn assert_fail_closed_daemon_probe(probe: &Captured, layout: &str, route: &str) 
             || probe_output.contains("listener registry could not be read"),
         "expected the hardened pane's fail-closed daemon refusal through {route} at {layout}: {probe_output}"
     );
+}
+
+#[test]
+fn security_e2e_daemon_pane_cannot_see_or_write_the_state_run_dir() {
+    if !required_prerequisites() {
+        return;
+    }
+    let mut fixture = Fixture::build_with_state_run_probe();
+    let run_dir = fixture.state.root().join("state/thegn/run");
+    let sentinel = run_dir.join("tg-sentinel");
+    let pane_write = run_dir.join("tg-pane-write");
+    let result_path = fixture.worktree.path().join("state-run-result");
+
+    let opened = fixture.open_probe_agent();
+    assert!(
+        opened.status.success(),
+        "host session open failed: stdout: {} stderr: {}",
+        String::from_utf8_lossy(&opened.stdout),
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while !result_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        result_path.exists(),
+        "daemon agent did not write its result before timeout"
+    );
+    assert_eq!(fs::read_to_string(&result_path).unwrap(), "hidden");
+    assert!(
+        !pane_write.exists(),
+        "daemon agent wrote through the protected state run directory"
+    );
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "host sentinel");
+    fixture.assert_daemon_alive("after the state run directory probe");
 }
 
 #[test]

@@ -190,13 +190,13 @@ an owner-only locator under the state directory. A locator that does not name a
 valid owner-only directory is ignored, and the daemon replaces it on its next
 start.
 If a control socket directory is visible through a sandbox bind (for example,
-an explicit `[daemon] socket` or an `XDG_RUNTIME_DIR` under `$HOME` or the
-worktree), bwrap hides it with a tmpfs and systemd makes it inaccessible unless
-that would hide the worktree or a carved-back mount, in which case it refuses.
-Container backends refuse the launch (`control-socket-reachable`) because
-their mounts are fixed when the container is created. On bwrap,
-`file_access = "all"` or `"host"` exposes the host filesystem by design,
-including runtime paths; those modes do not hide the control socket.
+explicit `[daemon] socket` or `XDG_RUNTIME_DIR` under `$HOME` or the worktree),
+bwrap hides it with a tmpfs. systemd makes it inaccessible unless that would hide
+the worktree or a carved-back mount, in which case it refuses. OCI refuses any
+mount exposing it. The relocated private `/tmp` directory is guarded with the
+predictable fallback. State `run/` (locator and lock) is write-protected: bwrap
+hides it when present, systemd makes it inaccessible, and OCI refuses writable
+mounts covering it while admitting read-only `$HOME`. `file_access = "all"` or `"host"` exposes the host by design.
 
 Standard, hardened, and sealed panes do not inherit `DBUS_SESSION_BUS_ADDRESS`.
 Bwrap unsets it, and systemd panes also cannot reach `$XDG_RUNTIME_DIR/bus` or

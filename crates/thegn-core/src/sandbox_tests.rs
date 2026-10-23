@@ -1441,6 +1441,7 @@ fn compose_refusal_tracks_only_unenforced_restrictions() {
             resolver_dir: None,
             runtime_dir: Some("/run/user/42".into()),
             control_dirs: Vec::new(),
+            protected_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -3993,6 +3994,7 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
             resolver_dir: None,
             runtime_dir: Some("/run/user/9".into()),
             control_dirs: Vec::new(),
+            protected_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -4013,6 +4015,7 @@ fn systemd_launch_refuses_mount_paths_systemd_would_misparse() {
             resolver_dir: None,
             runtime_dir: Some("/run/user/9".into()),
             control_dirs: Vec::new(),
+            protected_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -4878,6 +4881,7 @@ fn control_socket_bwrap_masks_a_visible_control_dir_after_the_binds() {
             resolver_dir: None,
             runtime_dir: None,
             control_dirs: vec![control_dir.clone()],
+            protected_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -4927,6 +4931,7 @@ fn control_socket_bwrap_refuses_a_mask_that_would_hide_a_bind() {
                 resolver_dir: None,
                 runtime_dir: None,
                 control_dirs: vec![control_dir],
+                protected_dirs: Vec::new(),
             },
         ),
         Err(EnterError::Refused(refusal))
@@ -4953,6 +4958,7 @@ fn control_socket_bwrap_translates_a_host_dir_to_a_renamed_mount() {
             resolver_dir: None,
             runtime_dir: None,
             control_dirs: vec![control_dir],
+            protected_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -4973,6 +4979,7 @@ fn control_socket_systemd_adds_inaccessible_paths_for_published_dirs() {
             resolver_dir: None,
             runtime_dir: Some("/run/user/42".into()),
             control_dirs: vec!["/srv/ctl".into()],
+            protected_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -4996,6 +5003,7 @@ fn control_socket_systemd_refuses_a_dir_that_hides_the_worktree() {
                 resolver_dir: None,
                 runtime_dir: None,
                 control_dirs: vec!["/wt".into()],
+                protected_dirs: Vec::new(),
             },
         ),
         Err(EnterError::Refused(refusal))
@@ -5014,6 +5022,7 @@ fn control_socket_systemd_leaves_private_tmp_unmasked() {
             resolver_dir: None,
             runtime_dir: None,
             control_dirs: vec!["/tmp".into()],
+            protected_dirs: Vec::new(),
         },
     )
     .unwrap();
@@ -5132,6 +5141,7 @@ fn control_socket_bwrap_refuses_a_bind_sourced_inside_a_control_dir() {
                 resolver_dir: None,
                 runtime_dir: None,
                 control_dirs: vec![control_dir],
+                protected_dirs: Vec::new(),
             },
         ),
         Err(EnterError::Refused(refusal))
@@ -5194,6 +5204,169 @@ fn control_socket_host_compose_guard_wiring_compile_check() {
                 .protected
                 .iter()
                 .any(|protected| { control_dir.starts_with(protected) }))
+    );
+}
+
+#[test]
+fn control_socket_oci_read_only_mount_covering_the_run_dir_is_admitted() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let run = temp.path().join("state/thegn/run");
+    std::fs::create_dir_all(run.parent().unwrap()).unwrap();
+    std::fs::create_dir(&run).unwrap();
+    for backend in [Backend::Podman, Backend::Docker] {
+        let mut sandbox = spec(backend);
+        sandbox.mounts.push(Mount {
+            host: temp.path().display().to_string(),
+            dest: temp.path().display().to_string(),
+            ro: true,
+            cache: false,
+        });
+        assert!(!matches!(
+            launchable_guarded(&sandbox, &[], std::slice::from_ref(&run)),
+            Err(EnterError::Refused(refusal))
+                if refusal.class == RefusalClass::ControlSocketReachable
+        ));
+    }
+}
+
+#[test]
+fn control_socket_oci_writable_mount_covering_the_run_dir_is_refused() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let run = temp.path().join("state/thegn/run");
+    std::fs::create_dir_all(run.parent().unwrap()).unwrap();
+    std::fs::create_dir(&run).unwrap();
+    let mut sandbox = spec(Backend::Podman);
+    sandbox.mounts.push(Mount {
+        host: temp.path().display().to_string(),
+        dest: temp.path().display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    let result = launchable_guarded(&sandbox, &[], std::slice::from_ref(&run));
+    let expected = run.display().to_string();
+    assert!(matches!(
+        result,
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+                && refusal.path.as_deref() == Some(expected.as_str())
+    ));
+}
+
+#[test]
+fn control_socket_bwrap_masks_exactly_the_protected_run_dir() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let run = temp.path().join("state/thegn/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: temp.path().display().to_string(),
+        dest: temp.path().display().to_string(),
+        ro: true,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            protected_dirs: vec![run.clone()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mask = argv
+        .windows(2)
+        .position(|pair| pair[0] == "--tmpfs" && pair[1] == run.display().to_string())
+        .unwrap();
+    let last_bind = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_str() == "--bind" || arg.as_str() == "--ro-bind")
+        .map(|(index, _)| index)
+        .max()
+        .unwrap();
+    let command = argv.iter().position(|arg| arg == "--").unwrap();
+    assert!(mask > last_bind, "protected tmpfs follows every bind");
+    assert!(
+        mask < command,
+        "protected tmpfs precedes the command separator"
+    );
+    for ancestor in [temp.path().join("state/thegn"), temp.path().join("state")] {
+        assert!(
+            !argv
+                .windows(2)
+                .any(|pair| { pair[0] == "--tmpfs" && pair[1] == ancestor.display().to_string() })
+        );
+    }
+}
+
+#[test]
+fn control_socket_bwrap_leaves_an_absent_protected_dir_under_a_read_only_bind_unmasked() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let run = temp.path().join("state/thegn/run");
+    std::fs::create_dir_all(run.parent().unwrap()).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: temp.path().display().to_string(),
+        dest: temp.path().display().to_string(),
+        ro: true,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            protected_dirs: vec![run],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!argv.windows(2).any(|pair| {
+        pair[0] == "--tmpfs" && std::path::Path::new(&pair[1]).starts_with(temp.path())
+    }));
+}
+
+#[test]
+fn control_socket_bwrap_refuses_an_absent_protected_dir_under_a_writable_bind() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let run = temp.path().join("state/thegn/run");
+    std::fs::create_dir_all(run.parent().unwrap()).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: temp.path().display().to_string(),
+        dest: temp.path().display().to_string(),
+        ro: false,
+        cache: false,
+    });
+    assert!(matches!(
+        backend_enter_argv_with_env(
+            &sandbox,
+            "true",
+            SandboxArgvEnv {
+                protected_dirs: vec![run],
+                ..Default::default()
+            },
+        ),
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+    ));
+}
+
+#[test]
+fn control_socket_systemd_makes_the_protected_dir_inaccessible() {
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.read_only_root = true;
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            protected_dirs: vec!["/srv/state/thegn/run".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "InaccessiblePaths=-/srv/state/thegn/run")
     );
 }
 
