@@ -190,7 +190,9 @@ pub fn repo_slug_with(db: &crate::db::Db, root: &Path) -> String {
         let s = util::slugify(&repo_name_from_path(root));
         if s.is_empty() { "repo".to_string() } else { s }
     };
-    db.slug_for_repo(&root.to_string_lossy(), &base)
+    // Callers run on the UI loop and the startup path: never wait on another
+    // process's held write lock, fall back to the base and claim later.
+    db.slug_for_repo_nowait(&root.to_string_lossy(), &base)
         .unwrap_or(base)
 }
 
