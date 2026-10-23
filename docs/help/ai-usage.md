@@ -113,10 +113,12 @@ that returns unchanged numbers repaints nothing.
 `[usage.alerts]` raises a toast — and, by default, a notification-inbox entry —
 as a window crosses `warn_percent` and again at `crit_percent`. The inbox keeps
 one entry per account, window, alert level and reset period; repeats update its
-message in place without changing its read state. Clearing or deleting that row
-stays in effect until the window resets or usage retreats below the clear line.
-`repeat_secs` controls in-app toast reminders only. The other knobs are the same
-ones `[stats.alerts]` uses and mean the same things:
+message in place without changing its read state. Dismissing or deleting a row
+stays in effect until the window resets or usage retreats below the clear line,
+which re-arms the alert even when clear notifications are disabled. A one-poll
+gap in reset metadata preserves the last known period. `repeat_secs` controls
+in-app toast reminders; inbox repeats still update the existing row. The other
+knobs are the same ones `[stats.alerts]` uses and mean the same things:
 
 - `sustain_secs` — how long a crossing must persist before it fires.
 - `repeat_secs` — how often a standing alert reminds you. `0` never repeats.

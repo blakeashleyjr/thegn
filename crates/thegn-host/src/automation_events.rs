@@ -146,7 +146,6 @@ pub(crate) fn insert_usage_alert(
     account_window: &str,
     message: &str,
 ) -> anyhow::Result<thegn_core::store::UsageAlertWrite> {
-    use thegn_core::store::NotificationStore;
     let kind = NotificationKind::UsageLimit.as_str();
     let decision = state.decide(kind, claim_key, message, "");
     if !decision.record {
@@ -164,6 +163,9 @@ pub(crate) fn insert_usage_alert(
             EventFacts::default(),
         );
         state.emit_sound(&decision);
+        if decision.toast {
+            state.emit_toast(message, decision.effective_priority);
+        }
         state.emit_push(&decision, kind, claim_key, message, "", "");
     }
     Ok(result)
