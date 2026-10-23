@@ -903,6 +903,64 @@ fn write_and_flush(bytes: &[u8]) -> std::io::Result<()> {
     out.flush()
 }
 
+/// Outcome of the bounded terminal-teardown write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownWrite {
+    Written,
+    Failed(std::io::ErrorKind),
+    TimedOut,
+    NotStarted,
+}
+
+pub(crate) fn write_terminal_teardown(bytes: &'static [u8]) -> TeardownWrite {
+    write_teardown_with(bytes, WRITER_SHUTDOWN_BOUND, write_and_flush)
+}
+
+fn write_teardown_with(
+    bytes: &'static [u8],
+    bound: std::time::Duration,
+    sink: impl FnOnce(&[u8]) -> std::io::Result<()> + Send + 'static,
+) -> TeardownWrite {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let handle = match thegn_core::thread_name::try_spawn_named("thegn-tty-rst", move || {
+        let result = sink(bytes);
+        if let Err(error) = tx.send(result) {
+            tracing::debug!(target: "thegn::shutdown", ?error, "terminal teardown result receiver is gone");
+        }
+    }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::warn!(target: "thegn::shutdown", %error, "could not start terminal teardown writer");
+            return TeardownWrite::NotStarted;
+        }
+    };
+
+    match rx.recv_timeout(bound) {
+        Ok(Ok(())) => {
+            if let Err(panic) = handle.join() {
+                tracing::warn!(target: "thegn::shutdown", ?panic, "terminal teardown writer panicked after writing");
+            }
+            TeardownWrite::Written
+        }
+        Ok(Err(error)) => {
+            if let Err(panic) = handle.join() {
+                tracing::warn!(target: "thegn::shutdown", ?panic, "terminal teardown writer panicked after failing");
+            }
+            TeardownWrite::Failed(error.kind())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            drop(handle);
+            TeardownWrite::TimedOut
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = handle.join() {
+                tracing::warn!(target: "thegn::shutdown", ?panic, "terminal teardown writer panicked");
+            }
+            TeardownWrite::Failed(std::io::ErrorKind::Other)
+        }
+    }
+}
+
 /// Fold one write's outcome into the shared status: success resets the
 /// consecutive-failure counter; a transient error becomes `Transient` until
 /// [`crate::frame_write::RETRY_MAX`] in a row escalate to `Fatal`; a
@@ -2223,6 +2281,64 @@ mod tests {
             writer
                 .try_submit_host_clipboard(vec![b'x'; OOB_QUEUE_BYTES + 1])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn teardown_write_returns_within_bound_while_stdout_is_locked() {
+        let guard = std::io::stdout().lock();
+        let started = std::time::Instant::now();
+        let outcome = write_teardown_with(b"", WRITER_SHUTDOWN_BOUND, write_and_flush);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, TeardownWrite::TimedOut);
+        assert!(
+            elapsed < WRITER_SHUTDOWN_BOUND * 20,
+            "stdout-lock teardown returned in {elapsed:?} with a bound of {WRITER_SHUTDOWN_BOUND:?}"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn teardown_write_returns_within_bound_on_a_never_returning_sink() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let outcome = write_teardown_with(b"", WRITER_SHUTDOWN_BOUND, move |_| {
+            release_rx.recv().expect("test releases teardown sink");
+            Ok(())
+        });
+        let elapsed = started.elapsed();
+        release_tx
+            .send(())
+            .expect("teardown helper is still waiting");
+        assert_eq!(outcome, TeardownWrite::TimedOut);
+        assert!(
+            elapsed < WRITER_SHUTDOWN_BOUND * 20,
+            "blocked-sink teardown returned in {elapsed:?} with a bound of {WRITER_SHUTDOWN_BOUND:?}"
+        );
+    }
+
+    #[test]
+    fn teardown_write_reports_written_and_the_exact_bytes() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink_bytes = Arc::clone(&written);
+        let outcome = write_teardown_with(b"restore", WRITER_SHUTDOWN_BOUND, move |bytes| {
+            sink_bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        });
+
+        assert_eq!(outcome, TeardownWrite::Written);
+        assert_eq!(written.lock().unwrap().as_slice(), b"restore");
+    }
+
+    #[test]
+    fn teardown_write_reports_a_failed_sink_kind() {
+        let outcome = write_teardown_with(b"", WRITER_SHUTDOWN_BOUND, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        });
+
+        assert_eq!(
+            outcome,
+            TeardownWrite::Failed(std::io::ErrorKind::BrokenPipe)
         );
     }
 }
