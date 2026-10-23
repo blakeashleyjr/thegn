@@ -1329,7 +1329,7 @@ pub async fn main(
         // no-op in the kitty spec, and it is defensive against an inner app
         // that pushed flags and died without popping them. Leave the bytes.
         let outcome = crate::frame_writer::write_terminal_teardown(
-            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h",
+            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l\x1b[?2004l",
         );
         if outcome != crate::frame_writer::TeardownWrite::Written {
             tracing::warn!(
