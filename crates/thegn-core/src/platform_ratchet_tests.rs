@@ -68,6 +68,22 @@ fn threads_are_named_ratchet() {
 }
 
 #[test]
+fn thread_builders_go_through_spawn_named_ratchet() {
+    file_ratchet(
+        env!("CARGO_MANIFEST_DIR"),
+        "thread-builder-core-ratchet.txt",
+        &["thread_name.rs"],
+        |key, body| {
+            !crate::test_support::thread_spawn::is_test_module_file(key)
+                && crate::test_support::thread_spawn::builds_thread_directly(body)
+        },
+        "Spawn production threads with `thegn_core::thread_name::spawn_named` / \
+         `try_spawn_named` (named, `thegn-` prefix, <= 15 bytes, QoS declared first); \
+         the allowlist is seeded debt (THE-931) and shrink-only.",
+    );
+}
+
+#[test]
 fn thread_names_fit_the_comm_limit_ratchet() {
     file_ratchet(
         env!("CARGO_MANIFEST_DIR"),
