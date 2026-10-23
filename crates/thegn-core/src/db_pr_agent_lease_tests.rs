@@ -379,3 +379,96 @@ fn rebind_refuses_while_lease_live() {
             .contains("a PR agent is running")
     );
 }
+
+#[test]
+fn refund_gives_back_the_attempt_and_holds_needs_human() {
+    let db = Db::open_memory().unwrap();
+    let key = enqueue(&db, 18);
+    let lease = admitted(&db, &key, 0);
+
+    assert!(
+        db.refund_pr_agent_attempt(
+            &lease,
+            PrqStatus::NeedsHuman.as_str(),
+            "agent did not start: sandbox entry refused; held, no attempt spent",
+        )
+        .unwrap()
+    );
+
+    let row = db.list_pr_queue().unwrap().remove(0);
+    assert_eq!(row.agent_attempts, 0);
+    assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+    assert_eq!(
+        row.detail.as_deref(),
+        Some("agent did not start: sandbox entry refused; held, no attempt spent")
+    );
+    assert!(db.pr_agent_lease_view(&key).unwrap().is_none());
+}
+
+#[test]
+fn refund_refuses_a_stale_or_released_lease_and_changes_nothing() {
+    let db = Db::open_memory().unwrap();
+    let key = enqueue(&db, 19);
+    let lease = admitted(&db, &key, 0);
+    assert!(db.release_pr_agent(&lease, None).unwrap());
+    let before = db.list_pr_queue().unwrap().remove(0);
+
+    assert!(
+        !db.refund_pr_agent_attempt(
+            &lease,
+            PrqStatus::NeedsHuman.as_str(),
+            "agent did not start",
+        )
+        .unwrap()
+    );
+    assert_eq!(db.list_pr_queue().unwrap().remove(0), before);
+
+    let active_key = enqueue(&db, 20);
+    let active_lease = admitted(&db, &active_key, 0);
+    assert!(
+        db.refund_pr_agent_attempt(
+            &active_lease,
+            PrqStatus::NeedsHuman.as_str(),
+            "agent did not start",
+        )
+        .unwrap()
+    );
+    assert!(
+        !db.refund_pr_agent_attempt(
+            &active_lease,
+            PrqStatus::NeedsHuman.as_str(),
+            "agent did not start",
+        )
+        .unwrap()
+    );
+    let row = db
+        .list_pr_queue()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == active_key)
+        .unwrap();
+    assert_eq!(row.agent_attempts, 0);
+}
+
+#[test]
+fn refund_refuses_an_expired_lease() {
+    let db = Db::open_memory().unwrap();
+    let key = enqueue(&db, 21);
+    let lease = admitted(&db, &key, 0);
+    db.conn()
+        .execute(
+            "UPDATE pr_queue SET agent_claim_lease_until_ms=?2 WHERE key=?1",
+            rusqlite::params![key, crate::util::now_ms() - 1],
+        )
+        .unwrap();
+
+    assert!(
+        !db.refund_pr_agent_attempt(
+            &lease,
+            PrqStatus::NeedsHuman.as_str(),
+            "agent did not start",
+        )
+        .unwrap()
+    );
+    assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 1);
+}

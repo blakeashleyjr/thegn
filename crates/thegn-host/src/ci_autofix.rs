@@ -489,11 +489,30 @@ fn consider_candidate_with_forge(
         guard.cancel_flag(),
     );
     if let Some(reason) = verdict.not_started() {
-        tracing::warn!(target: "thegn::ci_autofix", pr = item.number, %reason, "CI autofix agent did not start");
-        notify(format!(
-            "CI autofix for PR #{} did not start: {reason}; the attempt was still counted",
-            item.number
-        ));
+        match guard.finish_not_started(db, reason) {
+            crate::pr_agent_lease::NotStartedRelease::Refunded => {
+                notify(format!(
+                    "CI autofix for PR #{} held: {}",
+                    item.number,
+                    crate::pr_agent_lease::not_started_detail(reason, false)
+                ));
+            }
+            crate::pr_agent_lease::NotStartedRelease::RefundFailed(error) => {
+                let detail = crate::pr_agent_lease::not_started_detail(reason, true);
+                tracing::warn!(target: "thegn::ci_autofix", pr = item.number, %error, "{detail}");
+                notify(format!(
+                    "CI autofix for PR #{} held: {detail} ({error})",
+                    item.number
+                ));
+            }
+            crate::pr_agent_lease::NotStartedRelease::LeaseLost => {
+                notify(format!(
+                    "CI autofix for PR #{} stopped: its PR-agent lease could not be confirmed; the next refresh re-evaluates the row",
+                    item.number
+                ));
+            }
+        }
+        return;
     }
     if guard.lease_lost() {
         notify(format!(
@@ -612,10 +631,10 @@ fn head_is_current(
 /// The PR-queue detail recorded when a CI autofix run ends. An agent that never started is an
 /// infrastructure failure, not a failed exit, and says why.
 fn autofix_finish_detail(verdict: &crate::agent_run::AgentRunVerdict) -> String {
-    let outcome = match verdict.not_started() {
-        Some(reason) => format!("agent did not start: {reason}; the attempt was still counted"),
-        None if verdict.exited_zero() => "exit ok".to_string(),
-        None => "exit failed".to_string(),
+    let outcome = if verdict.exited_zero() {
+        "exit ok".to_string()
+    } else {
+        "exit failed".to_string()
     };
     format!("CI autofix finished ({outcome}); awaiting the next PR refresh")
 }
@@ -1778,14 +1797,14 @@ mod tests {
     }
 
     #[test]
-    fn not_started_finish_detail_names_the_reason() {
-        let finished = autofix_finish_detail(&crate::agent_run::AgentRunVerdict::NotStarted(
-            "sandbox entry refused".into(),
-        ));
-
-        assert!(
-            finished.starts_with("CI autofix finished (agent did not start: sandbox entry refused")
-        );
+    fn finish_detail_has_no_not_started_wording() {
+        for verdict in [
+            crate::agent_run::AgentRunVerdict::Exited(Some(1)),
+            crate::agent_run::AgentRunVerdict::Exited(None),
+            crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
+        ] {
+            assert!(!autofix_finish_detail(&verdict).contains("did not start"));
+        }
     }
 
     #[test]
@@ -1820,13 +1839,11 @@ mod tests {
 
         assert!(!handoff.sentinel.exists());
         let row = handoff.db.list_pr_queue().unwrap().remove(0);
-        assert_eq!(row.agent_attempts, 1);
-        assert_eq!(row.status, PrqStatus::BlockedCi.as_str());
-        assert!(
-            row.detail
-                .as_deref()
-                .is_some_and(|detail| { detail.contains("agent did not start:") })
-        );
+        assert_eq!(row.agent_attempts, 0);
+        assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+        assert!(row.detail.as_deref().is_some_and(|detail| {
+            detail.contains("agent did not start:") && detail.contains("no attempt spent")
+        }));
         assert!(
             handoff
                 .db
@@ -1834,6 +1851,12 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|notification| notification.message.contains("did not start:"))
+        );
+        assert!(
+            !handoff
+                .db
+                .claim_ci_autofix(&handoff.entry.candidate())
+                .unwrap()
         );
     }
 }
