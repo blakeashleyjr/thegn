@@ -444,9 +444,14 @@ mod tests {
 
     #[test]
     fn control_dirs_from_joins_thegn_to_the_runtime_dir_and_adds_the_published_dir() {
+        let mut actual =
+            control_dirs_from(Some("/run/user/42".into()), Some(Path::new("/srv/ctl")));
+        let mut expected = paths(&["/run/user/42/thegn", "/srv/ctl"]);
+        actual.sort();
+        expected.sort();
         assert_eq!(
-            control_dirs_from(Some("/run/user/42".into()), Some(Path::new("/srv/ctl"))),
-            paths(&["/run/user/42/thegn", "/srv/ctl"])
+            actual, expected,
+            "control directory membership is independent of path ordering"
         );
     }
 
