@@ -193,9 +193,14 @@ fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str, loc: &Git
         .map(PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected = thegn_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let selected = park_selection(
+        worktree,
+        thegn_core::db::Db::open()
+            .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
+    );
+    let Some(selected) = selected else {
+        return;
+    };
     let env = app_cfg.resolve_env(&repo_root, loc, Path::new(worktree), selected.as_deref());
     let Some(envc) = app_cfg.env.get(&env.name) else {
         return;
@@ -240,6 +245,16 @@ fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str, loc: &Git
     }
 }
 
+fn park_selection(worktree: &str, read: anyhow::Result<Option<String>>) -> Option<Option<String>> {
+    match read {
+        Ok(selected) => Some(selected),
+        Err(error) => {
+            tracing::warn!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "explicit park skipped: the environment selection could not be read");
+            None
+        }
+    }
+}
+
 /// Seconds since `worktree` was last seen active/busy by the warm reconcile's
 /// clock, or `None` if it hasn't been observed this session. The clock starts
 /// at process start (first observation), so a fresh thegn never hibernates
@@ -252,12 +267,6 @@ pub(crate) fn idle_secs(worktree: &str) -> Option<u64> {
         .map(|t| t.elapsed().as_secs())
 }
 
-/// Resolve the `(repo_root, repo, env_name)` triple the warm pool operates on
-/// for the active worktree — using the worktree's EFFECTIVE env (its DB
-/// selection, falling back through the normal repo/global layering via
-/// `resolve_env`), never the bare ambient default: reconciling under the default
-/// while the worktree runs a picked env warms — and claims! — spares for the
-/// wrong env (the phantom-spare / bare-sprite-shell incident).
 /// The sidebar warm-pool chip's latest value, computed OFF-loop and mirrored
 /// into the model by the event loop: `(worktree it was computed for,
 /// Some((ready, target)) when a pool applies)`. The worktree key lets the
@@ -270,12 +279,19 @@ pub(crate) fn pool_chip() -> &'static Mutex<Option<(String, Option<(usize, usize
     CHIP.get_or_init(|| Mutex::new(None))
 }
 
+/// Resolve the `(repo_root, repo, env_name)` triple the warm pool operates on
+/// for the active worktree — using the worktree's EFFECTIVE env (its DB
+/// selection, falling back through the normal repo/global layering via
+/// `resolve_env`), never the bare ambient default: reconciling under the default
+/// while the worktree runs a picked env warms — and claims! — spares for the
+/// wrong env (the phantom-spare / bare-sprite-shell incident). A failed selection
+/// read is an error; no caller may fall back to the default env.
 pub fn pool_context(
     db: &thegn_core::db::Db,
     cfg: &Config,
     wt: &str,
     loc: &GitLoc,
-) -> (std::path::PathBuf, String, String) {
+) -> anyhow::Result<(std::path::PathBuf, String, String)> {
     let repo_root = db
         .repo_root_for(wt)
         .ok()
@@ -285,11 +301,30 @@ pub fn pool_context(
         .or_else(|| thegn_core::repo::main_worktree(Path::new(wt)))
         .unwrap_or_else(|| std::path::PathBuf::from(wt));
     let repo = repo_root.to_string_lossy().into_owned();
-    let selected = db.effective_env(wt, &repo);
-    let env_name = cfg
-        .resolve_env(&repo_root, loc, Path::new(wt), selected.as_deref())
-        .name;
-    (repo_root, repo, env_name)
+    let env_name = pool_env(
+        cfg,
+        &repo_root,
+        loc,
+        wt,
+        db.effective_env_checked(wt, &repo),
+    )?;
+    Ok((repo_root, repo, env_name))
+}
+
+fn pool_env(
+    cfg: &Config,
+    repo_root: &Path,
+    loc: &GitLoc,
+    wt: &str,
+    read: anyhow::Result<Option<String>>,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let selected = read.with_context(|| {
+        format!("warm pool: cannot read the environment selection for {wt}; no pool changes made")
+    })?;
+    Ok(cfg
+        .resolve_env(repo_root, loc, Path::new(wt), selected.as_deref())
+        .name)
 }
 
 /// Hard ceiling on the resolved pool target — a runaway guard so no config typo or
@@ -349,7 +384,13 @@ pub fn refill_pool_after_claim(cfg: &Config, worktree: &str) {
         let Ok(db) = thegn_core::db::Db::open() else {
             return;
         };
-        let (repo_root, _repo, env_name) = pool_context(&db, &cfg, &worktree, &loc);
+        let (repo_root, _repo, env_name) = match pool_context(&db, &cfg, &worktree, &loc) {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "warm pool refill skipped");
+                return;
+            }
+        };
         if let PoolReconcile::Halted(halt) = reconcile_pool(&cfg, &repo_root, &env_name, || {}) {
             tracing::debug!(
                 target: "thegn::lifecycle",
@@ -442,9 +483,18 @@ pub(crate) fn pool_ledger_open_failed(worktree: &str) -> Option<String> {
     )
 }
 
-/// Clear the fallback DB-failure latch once the maintainer can resolve the
-/// worktree's normal repo/env key again.
-pub(crate) fn clear_pool_ledger_open_failure(worktree: &str) {
+/// Report a selection lookup failure from the maintainer tick before it has a
+/// repo/env pair to reconcile. The worktree is the stable fallback key.
+pub(crate) fn pool_selection_read_failed(worktree: &str, error: &anyhow::Error) -> Option<String> {
+    let message = format!(
+        "warm pool: cannot read environment selection for {worktree}; no pool changes made ({error:#})"
+    );
+    halt_toast(worktree, "", &PoolReconcile::Halted(PoolHalt { message }))
+}
+
+/// Clear the fallback pre-reconcile failure latch once the maintainer can
+/// resolve the worktree's normal repo/env key again.
+pub(crate) fn clear_pool_pre_reconcile_failure(worktree: &str) {
     halt_toast(worktree, "", &PoolReconcile::Ran);
 }
 
@@ -1434,11 +1484,72 @@ mod tests {
         );
         assert_eq!(pool_ledger_open_failed(worktree), None);
 
-        clear_pool_ledger_open_failure(worktree);
+        clear_pool_pre_reconcile_failure(worktree);
 
         assert_eq!(
             pool_ledger_open_failed(worktree),
             Some("warm pool: cannot open ledger for reconciliation; no pool changes made".into())
+        );
+    }
+
+    #[test]
+    fn pool_env_refuses_an_unreadable_selection() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let error = pool_env(
+            &Config::default(),
+            dir.path(),
+            &GitLoc::Local(dir.path().into()),
+            "/wt",
+            Err(anyhow::anyhow!("database is locked")),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("cannot read the environment selection"));
+        assert!(message.contains("database is locked"));
+    }
+
+    #[test]
+    fn pool_env_uses_the_default_only_when_nothing_is_selected() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let loc = GitLoc::Local(dir.path().into());
+        let expected = cfg
+            .resolve_env(dir.path(), &loc, Path::new("/wt"), None)
+            .name;
+        assert_eq!(
+            pool_env(&cfg, dir.path(), &loc, "/wt", Ok(None)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn pool_selection_read_failure_toasts_once_until_recovery() {
+        let worktree = "/selection-read-failure-test";
+        let error = anyhow::anyhow!("database is locked");
+        let first = pool_selection_read_failed(worktree, &error);
+        assert!(
+            first
+                .as_deref()
+                .is_some_and(|message| message.contains("database is locked"))
+        );
+        assert_eq!(pool_selection_read_failed(worktree, &error), None);
+        clear_pool_pre_reconcile_failure(worktree);
+        assert!(pool_selection_read_failed(worktree, &error).is_some());
+        clear_pool_pre_reconcile_failure(worktree);
+    }
+
+    #[test]
+    fn park_selection_skips_an_unreadable_selection() {
+        assert!(park_selection("/wt", Err(anyhow::anyhow!("locked"))).is_none());
+    }
+
+    #[test]
+    fn park_selection_passes_a_read_through() {
+        assert_eq!(
+            park_selection("/wt", Ok(Some("picked".into()))),
+            Some(Some("picked".into()))
         );
     }
 }
