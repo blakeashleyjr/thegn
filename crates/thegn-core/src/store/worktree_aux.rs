@@ -33,11 +33,13 @@ pub enum MergeRetryOutcome {
 /// Rows kept per worktree in `merge_queue_events`; older rows are pruned in the writing transaction.
 pub const MERGE_QUEUE_EVENTS_PER_WORKTREE: usize = 200;
 
-/// One operator transition on a merge-queue row. `operation` is "retry" or "remove"
-/// (`thegn merge clear` removes row by row and is recorded as "remove"); `outcome` is
-/// "rearmed", "not_retryable", "claimed" or "deleted"; `new_status` is "queued" for a
+/// One operator or lifecycle transition on a merge-queue row. `operation` is "retry" or
+/// "remove" (`thegn merge clear` removes row by row and is recorded as "remove"); `outcome`
+/// is "rearmed", "not_retryable", "claimed" or "deleted"; `new_status` is "queued" for a
 /// re-arm and None otherwise; `row_updated_at` is the row's `updated_at` before the
-/// transition (its version).
+/// transition (its version). Operator removals use the process actor (`thegn pid N`);
+/// automatic cleanup uses a distinct actor such as `thegn close` (or `thegn sweep`), so
+/// lifecycle work is distinguishable from `merge rm` / `clear`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeQueueEvent {
     pub worktree: String,
@@ -424,8 +426,13 @@ pub trait WorktreeAuxStore {
     fn retry_held_merge_entry(&self, worktree: &str) -> Result<MergeRetryOutcome>;
 
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
-    /// elsewhere, or the worktree is removed).
+    /// elsewhere, or the worktree is removed). Joins a caller's transaction when
+    /// one is already open, so the deletion and event commit or roll back together.
     fn remove_merge_entry(&self, worktree: &str) -> Result<()>;
+
+    /// Drop a worktree's merge-queue row while recording the supplied lifecycle actor.
+    /// Joins a caller's transaction when one is already open.
+    fn remove_merge_entry_as(&self, worktree: &str, actor: &str) -> Result<()>;
 
     /// Read an operator-event history newest first, limited to at most `limit` rows.
     fn merge_queue_events(&self, worktree: &str, limit: usize) -> Result<Vec<MergeQueueEvent>>;

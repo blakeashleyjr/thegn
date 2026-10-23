@@ -420,7 +420,7 @@ pub(crate) fn clear_selected_landed(db: &Db, selected: &[MergeQueueRow]) -> anyh
         let mut removed = 0;
         for row in selected {
             if row.status == "landed" && current.iter().any(|now| now == row) {
-                db.remove_merge_entry(&row.worktree)?;
+                db.remove_merge_entry_as(&row.worktree, "thegn sweep")?;
                 current.retain(|now| now.worktree != row.worktree);
                 removed += 1;
             }

@@ -587,7 +587,7 @@ fn operator_table_matches_the_database_cell_by_cell() {
 #[test]
 fn merge_queue_events_are_bounded_per_worktree() {
     let db = seeded();
-    for _ in 0..205 {
+    for _ in 0..204 {
         assert_eq!(
             db.retry_held_merge_entry(WORKTREE).unwrap(),
             MergeRetryOutcome::Rearmed
@@ -595,13 +595,43 @@ fn merge_queue_events_are_bounded_per_worktree() {
         db.replace_merge_status(WORKTREE, "deferred", &MergeStatusFields::default())
             .unwrap();
     }
+    db.replace_merge_status(WORKTREE, "queued", &MergeStatusFields::default())
+        .unwrap();
+    assert_eq!(
+        db.retry_held_merge_entry(WORKTREE).unwrap(),
+        MergeRetryOutcome::NotRetryable {
+            status: "queued".into()
+        }
+    );
     let events = db
         .merge_queue_events(WORKTREE, crate::store::MERGE_QUEUE_EVENTS_PER_WORKTREE + 1)
         .unwrap();
     assert_eq!(events.len(), crate::store::MERGE_QUEUE_EVENTS_PER_WORKTREE);
-    assert_eq!(events[0].outcome, "rearmed");
-    assert_eq!(events[0].new_status.as_deref(), Some("queued"));
+    assert_eq!(events[0].outcome, "not_retryable");
+    assert_eq!(events[1].outcome, "rearmed");
+    assert_eq!(events[1].new_status.as_deref(), Some("queued"));
     assert!(events.iter().all(|event| event.worktree == WORKTREE));
+}
+
+#[test]
+fn remove_inside_a_caller_transaction_records_one_event() {
+    let db = seeded();
+
+    let removed = db.transaction(|db| db.remove_merge_entry(WORKTREE));
+
+    assert!(removed.is_ok());
+    assert!(db.list_merge_queue().unwrap().is_empty());
+    let events = db.merge_queue_events(WORKTREE, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].outcome, "deleted");
+
+    let retry_db = seeded();
+    let retried = retry_db.transaction(|db| db.retry_held_merge_entry(WORKTREE));
+    assert_eq!(retried.unwrap(), MergeRetryOutcome::Rearmed);
+    assert_eq!(row(&retry_db).status, "queued");
+    let retry_events = retry_db.merge_queue_events(WORKTREE, 10).unwrap();
+    assert_eq!(retry_events.len(), 1);
+    assert_eq!(retry_events[0].outcome, "rearmed");
 }
 
 #[test]
