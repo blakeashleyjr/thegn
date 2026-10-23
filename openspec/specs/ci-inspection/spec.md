@@ -186,5 +186,3 @@ ordinary pane sandboxing, with a recipe in the example config and help.
   it from the picker
 - **THEN** it runs as a plain pane command in the active worktree, and no
   thegn code path interprets or executes workflow definitions itself
-
-## MODIFIED Requirements
