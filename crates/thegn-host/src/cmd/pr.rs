@@ -169,16 +169,65 @@ fn forges() -> std::sync::Arc<thegn_svc::forge::ForgeSet> {
     crate::forge_handle::get()
 }
 
+fn registered_spelling(
+    resolved: &std::path::Path,
+    registered: &[String],
+    canonical: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if registered
+        .iter()
+        .any(|path| path == resolved.to_string_lossy().as_ref())
+    {
+        return None;
+    }
+
+    let target = canonical(resolved)?;
+    let mut matches = registered.iter().filter(|path| {
+        // Canonicalization is a best-effort identity probe; an unresolvable entry cannot match.
+        canonical(std::path::Path::new(path)) == Some(target.clone())
+    });
+    let matched = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(matched))
+}
+
+fn registered_worktree_spelling(resolved: &std::path::Path) -> Option<std::path::PathBuf> {
+    use thegn_core::store::WorkspaceStore as _;
+
+    let rows = match Db::open().and_then(|db| db.worktrees()) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::debug!(target: "thegn::pr", %error, "registered worktree spelling unavailable");
+            return None;
+        }
+    };
+    let paths = rows
+        .into_iter()
+        .map(|row| row.worktree)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    // Canonicalization only probes identity; a missing or inaccessible entry cannot be mapped.
+    registered_spelling(resolved, &paths, |path| std::fs::canonicalize(path).ok())
+}
+
 /// The worktree a `thegn pr` verb acts on. Without `--worktree` this is the usual default; an explicit
 /// `--worktree` must be a directory inside a git worktree and resolves to that worktree's root, so a
 /// typo or a deleted path is refused before anything reaches the forge.
 fn target_worktree(arg: Option<String>) -> Result<std::path::PathBuf> {
-    target_worktree_with(
+    let explicit = arg.is_some();
+    let resolved = target_worktree_with(
         arg,
         resolve_worktree,
         thegn_core::repo::worktree_root_for_cwd,
         |path| !matches!(GitLoc::for_worktree(path), GitLoc::Local(_)),
-    )
+    )?;
+    Ok(if explicit {
+        registered_worktree_spelling(&resolved).unwrap_or(resolved)
+    } else {
+        resolved
+    })
 }
 
 fn target_worktree_with(
@@ -1003,6 +1052,64 @@ mod tests {
         let explicit_root = repo.display().to_string();
         let resolved_root = resolve_local_target(Some(explicit_root.clone())).unwrap();
         assert_eq!(resolved_root, PathBuf::from(explicit_root));
+    }
+
+    #[test]
+    fn registered_spelling_maps_a_symlink_to_the_registered_path() {
+        let registered = vec!["/data/wt".to_owned()];
+        let resolved =
+            super::registered_spelling(std::path::Path::new("/home/u/link"), &registered, |path| {
+                match path.to_str() {
+                    Some("/home/u/link") | Some("/data/wt") => Some(PathBuf::from("/data/wt")),
+                    _ => None,
+                }
+            });
+        assert_eq!(resolved, Some(PathBuf::from("/data/wt")));
+
+        let registered = vec!["/home/u/link".to_owned()];
+        let nested =
+            super::registered_spelling(std::path::Path::new("/data/wt"), &registered, |path| {
+                match path.to_str() {
+                    Some("/data/wt") | Some("/home/u/link") => Some(PathBuf::from("/data/wt")),
+                    _ => None,
+                }
+            });
+        assert_eq!(nested, Some(PathBuf::from("/home/u/link")));
+    }
+
+    #[test]
+    fn registered_spelling_keeps_an_already_registered_path() {
+        let registered = vec!["/data/wt".to_owned()];
+        let resolved =
+            super::registered_spelling(std::path::Path::new("/data/wt"), &registered, |_| {
+                panic!("canonicalization is unnecessary for an already-registered path")
+            });
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn registered_spelling_is_none_for_an_unregistered_or_ambiguous_root() {
+        let registered = vec!["/data/other".to_owned()];
+        let unregistered =
+            super::registered_spelling(std::path::Path::new("/data/wt"), &registered, |path| {
+                match path.to_str() {
+                    Some("/data/wt") => Some(PathBuf::from("/data/wt")),
+                    _ => None,
+                }
+            });
+        assert_eq!(unregistered, None);
+
+        let registered = vec!["/data/wt".to_owned(), "/home/u/link".to_owned()];
+        let ambiguous =
+            super::registered_spelling(std::path::Path::new("/resolved/wt"), &registered, |path| {
+                match path.to_str() {
+                    Some("/resolved/wt") | Some("/data/wt") | Some("/home/u/link") => {
+                        Some(PathBuf::from("/data/wt"))
+                    }
+                    _ => None,
+                }
+            });
+        assert_eq!(ambiguous, None);
     }
 
     #[test]
