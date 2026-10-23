@@ -2,7 +2,13 @@
 
 Linear: THE-93
 
-## Delivered behavior
+## Why
+
+Bare `g` changes and persists flat/grouped mode, but the sidebar header exposed
+sort state only. After the transient message disappeared, an intentionally flat
+tree was indistinguishable from missing grouping data.
+
+## What Changes
 
 The full sidebar header names the current layout with a lowercase `flat` or
 `grouped` chip. Flat uses the accent colour; grouped uses a quiet colour. The
