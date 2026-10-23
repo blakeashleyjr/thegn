@@ -5032,5 +5032,170 @@ fn control_socket_label_and_remediation_are_stable() {
     );
 }
 
+#[test]
+fn control_socket_oci_mount_covering_a_control_dir_is_refused() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let control_dir = temp.path().join("run/thegn");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    for backend in [Backend::Podman, Backend::Docker] {
+        let mut sandbox = spec(backend);
+        sandbox.mounts.push(Mount {
+            host: temp.path().display().to_string(),
+            dest: temp.path().display().to_string(),
+            ro: true,
+            cache: false,
+        });
+        let result = launchable_with(&sandbox, std::slice::from_ref(&control_dir));
+        let expected_path = control_dir.display().to_string();
+        assert!(matches!(
+            result,
+            Err(EnterError::Refused(refusal))
+                if refusal.class == RefusalClass::ControlSocketReachable
+                    && refusal.backend == sandbox.backend.label()
+                    && refusal.path.as_deref() == Some(expected_path.as_str())
+        ));
+    }
+}
+
+#[test]
+fn control_socket_compose_spec_mount_covering_a_control_dir_is_refused() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let control_dir = temp.path().join("run/thegn");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    let mut sandbox = spec(Backend::Docker);
+    sandbox.mounts.push(Mount {
+        host: temp.path().display().to_string(),
+        dest: temp.path().display().to_string(),
+        ro: true,
+        cache: false,
+    });
+    sandbox.compose = Some(
+        crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("app".into()),
+            run_services: Vec::new(),
+        }
+        .encode(),
+    );
+    let result = launchable_with(&sandbox, std::slice::from_ref(&control_dir));
+    let expected_path = control_dir.display().to_string();
+    assert!(matches!(
+        result,
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+                && refusal.backend == sandbox.backend.label()
+                && refusal.path.as_deref() == Some(expected_path.as_str())
+    ));
+}
+
+#[test]
+fn control_socket_oci_mount_inside_a_control_dir_is_refused() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let control_dir = temp.path().join("run/thegn");
+    let source = control_dir.join("key");
+    std::fs::create_dir_all(&source).unwrap();
+    let mut sandbox = spec(Backend::Podman);
+    sandbox.mounts.push(Mount {
+        host: source.display().to_string(),
+        dest: "/data".into(),
+        ro: true,
+        cache: false,
+    });
+    let result = launchable_with(&sandbox, std::slice::from_ref(&control_dir));
+    let expected_path = control_dir.display().to_string();
+    assert!(matches!(
+        result,
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+                && refusal.path.as_deref() == Some(expected_path.as_str())
+    ));
+}
+
+#[test]
+fn control_socket_bwrap_refuses_a_bind_sourced_inside_a_control_dir() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let control_dir = temp.path().join("run/thegn");
+    let source = control_dir.join("key");
+    std::fs::create_dir_all(&source).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: source.display().to_string(),
+        dest: "/data".into(),
+        ro: true,
+        cache: false,
+    });
+    assert!(matches!(
+        backend_enter_argv_with_env(
+            &sandbox,
+            "true",
+            SandboxArgvEnv {
+                resolver_dir: None,
+                runtime_dir: None,
+                control_dirs: vec![control_dir],
+            },
+        ),
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+    ));
+}
+
+#[test]
+fn control_socket_oci_file_access_all_and_host_are_exempt() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let control_dir = temp.path().join("run/thegn");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    for file_access in [FileAccess::All, FileAccess::Host] {
+        let mut sandbox = spec(Backend::Podman);
+        sandbox.file_access = file_access;
+        sandbox.mounts.push(Mount {
+            host: temp.path().display().to_string(),
+            dest: temp.path().display().to_string(),
+            ro: true,
+            cache: false,
+        });
+        assert!(!matches!(
+            launchable_with(&sandbox, std::slice::from_ref(&control_dir)),
+            Err(EnterError::Refused(refusal))
+                if refusal.class == RefusalClass::ControlSocketReachable
+        ));
+    }
+}
+
+// Positive control: unrelated control directories do not block OCI launches.
+#[test]
+fn control_socket_oci_control_dir_outside_every_mount_is_clear() {
+    let mount = tempfile::tempdir_in("/tmp").unwrap();
+    let control = tempfile::tempdir_in("/tmp").unwrap();
+    let control_dir = control.path().join("run/thegn");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    let mut sandbox = spec(Backend::Docker);
+    sandbox.mounts.push(Mount {
+        host: mount.path().display().to_string(),
+        dest: "/data".into(),
+        ro: true,
+        cache: false,
+    });
+    assert!(!matches!(
+        launchable_with(&sandbox, std::slice::from_ref(&control_dir)),
+        Err(EnterError::Refused(refusal))
+            if refusal.class == RefusalClass::ControlSocketReachable
+    ));
+}
+
+// Compile/wiring check only: in this test process the resolved list may be empty,
+// so this does not prove that each configured control dir is added to the guard.
+#[test]
+fn control_socket_host_compose_guard_wiring_compile_check() {
+    let guard = host_compose_guard();
+    assert!(
+        crate::sandbox_control_guard::control_dirs()
+            .iter()
+            .all(|control_dir| guard
+                .protected
+                .iter()
+                .any(|protected| { control_dir.starts_with(protected) }))
+    );
+}
+
 #[path = "sandbox_evidence_tests.rs"]
 mod evidence;

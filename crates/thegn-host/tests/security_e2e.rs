@@ -232,13 +232,53 @@ struct Fixture {
     /// Keep the daemon runtime outside isolated HOME: hardened panes bind HOME
     /// read-only, and Unix socket connects still work through that bind. In
     /// production the runtime is under `/run/user/<uid>`, which bwrap does not mount.
-    runtime: tempfile::TempDir,
+    runtime: Option<tempfile::TempDir>,
     worktree: tempfile::TempDir,
     captures: tempfile::TempDir,
     _marker_dir: tempfile::TempDir,
     marker: PathBuf,
     socket: PathBuf,
     daemon: RunningDaemon,
+    _endpoint_cleanup: Option<EndpointCleanup>,
+    endpoint_layout: &'static str,
+}
+
+struct EndpointCleanup(PathBuf);
+
+impl Drop for EndpointCleanup {
+    fn drop(&mut self) {
+        let lock = self.0.with_extension("sock.lock");
+        for path in [self.0.as_path(), lock.as_path()] {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                let _write_result = writeln!(
+                    std::io::stderr().lock(),
+                    "security_e2e: could not remove fallback endpoint {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        let Some(euid) = thegn_svc::ipc::effective_uid() else {
+            return;
+        };
+        let Some(parent) = self.0.parent() else {
+            return;
+        };
+        let expected_prefix = format!("thegn-{euid}-");
+        if parent.parent() == Some(Path::new("/tmp"))
+            && parent
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix))
+            && let Err(error) = fs::remove_dir(parent)
+        {
+            let _write_result = writeln!(
+                std::io::stderr().lock(),
+                "security_e2e: could not remove fallback endpoint directory {}: {error}",
+                parent.display()
+            );
+        }
+    }
 }
 
 /// The test launches panes with a private XDG_RUNTIME_DIR that has no user
@@ -294,11 +334,21 @@ fn security_e2e_pane_argv_strips_only_the_cpu_cap() {
 
 impl Fixture {
     fn new() -> Self {
+        Self::build(true)
+    }
+
+    fn new_without_runtime_dir() -> Self {
+        Self::build(false)
+    }
+
+    fn build(with_runtime_dir: bool) -> Self {
         let state = IsolatedState::new();
-        let runtime = tempfile::Builder::new()
-            .prefix("tg-sec-")
-            .tempdir_in("/tmp")
-            .expect("private runtime directory outside isolated HOME");
+        let runtime = with_runtime_dir.then(|| {
+            tempfile::Builder::new()
+                .prefix("tg-sec-")
+                .tempdir_in("/tmp")
+                .expect("private runtime directory outside isolated HOME")
+        });
         let worktree = tempfile::tempdir_in(state.root()).expect("private worktree directory");
         let captures = tempfile::tempdir_in(state.root()).expect("private capture directory");
         let marker_dir = tempfile::tempdir().expect("private host-only marker directory");
@@ -323,18 +373,41 @@ impl Fixture {
         daemon_cmd
             .arg("daemon")
             .envs(state_env_all(state.root()))
-            .env("XDG_RUNTIME_DIR", runtime.path())
             .env_remove("THEGN_LOG")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
+        if let Some(runtime) = runtime.as_ref() {
+            daemon_cmd.env("XDG_RUNTIME_DIR", runtime.path());
+        } else {
+            daemon_cmd.env_remove("XDG_RUNTIME_DIR");
+        }
         let child = spawn_quiet(&mut daemon_cmd);
         let mut daemon = RunningDaemon { child };
-        let socket = wait_for_socket(runtime.path(), &mut daemon);
+        let socket = if let Some(runtime) = runtime.as_ref() {
+            wait_for_socket(runtime.path(), &mut daemon)
+        } else {
+            let euid = thegn_svc::ipc::effective_uid().expect("effective uid on Linux");
+            let state_dir = state.root().join("state").join("thegn");
+            let key = thegn_core::config_daemon::state_endpoint_key(&state_dir);
+            let candidates = [
+                PathBuf::from(format!("/run/user/{euid}/thegn-{key}.sock")),
+                PathBuf::from(format!("/tmp/thegn-{euid}-{key}/daemon.sock")),
+            ];
+            wait_for_endpoint(&candidates, &mut daemon)
+        };
         assert!(
             !socket.starts_with(state.root()),
-            "daemon socket {} must stay outside isolated HOME because hardened panes bind HOME read-only and Unix socket connects still work through that bind",
+            "daemon socket {} must stay outside isolated HOME/state because hardened panes bind HOME read-only and Unix socket connects still work through that bind",
             socket.display()
         );
+        let endpoint_cleanup = (!with_runtime_dir).then(|| EndpointCleanup(socket.clone()));
+        let endpoint_layout = if with_runtime_dir {
+            "isolated XDG_RUNTIME_DIR"
+        } else if socket.starts_with("/run/user") {
+            "/run/user short-runtime fallback"
+        } else {
+            "private /tmp fallback"
+        };
 
         Self {
             state,
@@ -345,6 +418,8 @@ impl Fixture {
             marker,
             socket,
             daemon,
+            _endpoint_cleanup: endpoint_cleanup,
+            endpoint_layout,
         }
     }
 
@@ -365,9 +440,13 @@ impl Fixture {
     }
 
     fn child_env(&self, command: &mut Command) {
+        command.envs(state_env_all(self.state.root()));
+        if let Some(runtime) = self.runtime.as_ref() {
+            command.env("XDG_RUNTIME_DIR", runtime.path());
+        } else {
+            command.env_remove("XDG_RUNTIME_DIR");
+        }
         command
-            .envs(state_env_all(self.state.root()))
-            .env("XDG_RUNTIME_DIR", self.runtime.path())
             // Never pass the developer's real bus to a security probe. The
             // sentinel also reaches fixture daemon and CLI children; a daemon
             // session-spawn test must account for it because it is unreachable.
@@ -466,6 +545,23 @@ impl Fixture {
     }
 }
 
+fn wait_for_endpoint(candidates: &[PathBuf], daemon: &mut RunningDaemon) -> PathBuf {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        if let Some(endpoint) = candidates.iter().find(|candidate| candidate.exists()) {
+            return endpoint.clone();
+        }
+        if let Some(status) = daemon.child.try_wait().expect("poll isolated daemon") {
+            panic!("isolated daemon exited before creating its socket ({status})");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not create its fallback socket within 10 seconds"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_for_socket(runtime: &Path, daemon: &mut RunningDaemon) -> PathBuf {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     loop {
@@ -543,6 +639,73 @@ fn security_e2e_hardened_pane_cannot_stop_daemon() {
     fixture.assert_daemon_alive("after the stop probe");
     let host = fixture.host_sessions_with_config("sessions-after-stop", &config_home);
     fixture.assert_no_sessions(&host);
+}
+
+#[test]
+fn security_e2e_hardened_pane_cannot_reach_a_daemon_started_without_xdg_runtime_dir() {
+    // The fixture owns one foreground daemon child; each host/pane probe is a
+    // separate bounded CLI child, and the fallback poll uses the shared 20 ms
+    // interval plus PROCESS_TIMEOUT. The isolated state key makes its candidate
+    // endpoints distinct from other fixtures; bwrap exposes neither candidate.
+    if !required_prerequisites() {
+        return;
+    }
+    let mut fixture = Fixture::new_without_runtime_dir();
+    let (config_home, _) = fixture.probe_config();
+    let layout = fixture.endpoint_layout;
+    assert!(
+        !fixture.socket.starts_with(fixture.state.root()),
+        "{layout} endpoint {} must be outside isolated HOME/state",
+        fixture.socket.display()
+    );
+    let host = fixture.host_sessions_with_config("no-runtime-host-control", &config_home);
+    fixture.assert_no_sessions(&host);
+
+    let version = fixture.run_pane("no-runtime-version-control", "./thegn --version");
+    assert!(
+        version.status.success(),
+        "in-pane thegn --version failed for {layout} (program {}): stdout: {} stderr: {}",
+        version.program,
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr)
+    );
+
+    let default_probe = fixture.run_pane("no-runtime-default-stop-probe", "./thegn daemon stop");
+    assert_fail_closed_daemon_probe(&default_probe, layout, "default endpoint resolution");
+
+    let config_home_env = shell_quote(config_home.to_str().expect("config home path is UTF-8"));
+    let explicit_inner = format!("env XDG_CONFIG_HOME={config_home_env} ./thegn daemon stop");
+    let explicit_probe = fixture.run_pane("no-runtime-explicit-stop-probe", &explicit_inner);
+    assert_fail_closed_daemon_probe(&explicit_probe, layout, "explicit socket configuration");
+
+    fixture.assert_daemon_alive(&format!("after {layout} pane probes"));
+    let host = fixture.host_sessions_with_config("no-runtime-sessions-after-stop", &config_home);
+    fixture.assert_no_sessions(&host);
+}
+
+fn assert_fail_closed_daemon_probe(probe: &Captured, layout: &str, route: &str) {
+    assert!(
+        !probe.status.success(),
+        "hardened pane reached the daemon through {route} at {layout}; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let probe_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    assert!(
+        !probe_output.contains("stopped ")
+            && !probe_output.contains("shutdown refused for ")
+            && !probe_output.contains("still running after "),
+        "hardened pane reached a listener through {route} at {layout}: {probe_output}"
+    );
+    assert!(
+        probe_output.contains("no thegn pane daemon is running")
+            || probe_output.contains("listener registry could not be read"),
+        "expected the hardened pane's fail-closed daemon refusal through {route} at {layout}: {probe_output}"
+    );
 }
 
 #[test]
