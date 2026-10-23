@@ -114,6 +114,13 @@ per kind under `[pr_queue.prompts]`; keep those rules if you do.
 Before waking an agent on a red build thegn re-runs the failed checks
 once, since plenty of red CI is a flake.
 
+When the CI cache has failed-job logs captured for the PR's current head
+commit, the CI-failure prompt includes a redacted excerpt for each job,
+windowed from 20 lines before its first recognised failure (or its last lines
+when no failure is recognised), newest run first, with 16 KiB total. If no
+cached log matches that head, the prompt lists the failing-check links as
+before.
+
 Each PR-agent run holds a durable per-PR lease, so the PR queue and CI autofix cannot run two agents on the same PR at once; each admitted run spends exactly one attempt. A second dispatcher is refused while the lease is live. If thegn exits mid-run, the lease lapses within five minutes; the next PR-queue or CI-autofix pass clears the stale claim, notes that the previous agent's outcome is unknown, and may dispatch again. The attempt that run consumed stays spent.
 
 While a PR agent's lease is live, other refresh passes skip that PR entirely: no merge, re-run or status change happens under a running agent.
@@ -121,6 +128,11 @@ While a PR agent's lease is live, other refresh passes skip that PR entirely: no
 If thegn cannot confirm a running PR agent's lease before it expires, it stops
 the agent and reports that the next refresh re-evaluates the row.
 CI autofix reports the same lost-lease condition when it stops its PR agent.
+After an own-PR agent in the PR queue or CI autofix returns, thegn re-reads the
+PR and checks its author, forge account, repository and head before recording a
+push or updating the row. If the author, account or repository changed, the
+head moved to anything other than the agent's own push, or any of them cannot
+be verified, the row is held as `needs_human`.
 
 ## Review comment tasks
 

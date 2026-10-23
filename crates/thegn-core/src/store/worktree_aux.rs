@@ -155,6 +155,13 @@ pub struct MergeCandidate {
     pub candidate_oid: String,
 }
 
+/// Repository and linked-worktree identity captured by a deliberate local enqueue (THE-230). Canonical absolute paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeEnqueueIdentity {
+    pub common_dir: String,
+    pub admin_dir: String,
+}
+
 /// Registry facts relevant to outcome routing. NULL is retained, not fabricated
 /// into a repository/branch identity. These strings are cache metadata, not Git
 /// or filesystem identity proof.
@@ -273,6 +280,19 @@ pub trait WorktreeAuxStore {
     /// remote, or enqueued through `enqueue_merge`); incomplete pairs are also
     /// treated as unbound.
     fn merge_candidate(&self, worktree: &str) -> Result<Option<MergeCandidate>>;
+
+    /// Enqueue a local candidate and record its canonical repository and worktree registration identity in the same upsert.
+    fn enqueue_merge_candidate_with_identity(
+        &self,
+        worktree: &str,
+        branch: &str,
+        target_branch: &str,
+        candidate: &MergeCandidate,
+        identity: &MergeEnqueueIdentity,
+    ) -> Result<()>;
+
+    /// Read the recorded identity. `None` means either identity column is NULL.
+    fn merge_enqueue_identity(&self, worktree: &str) -> Result<Option<MergeEnqueueIdentity>>;
 
     /// Adopt a verified fast-forward repair for an already held merge candidate.
     /// The expected pair makes this a compare-and-swap against concurrent edits.

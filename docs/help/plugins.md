@@ -81,11 +81,16 @@ admitted with.
   lines, 1 MiB per line, 8 MiB of retained stdout, and keeps up to 8 KiB of
   stderr.
   At most four one-shot runs, scheduled or started from the palette,
-  run at once across all plugins. A scheduled run waits for its next interval
-  if that limit is reached or its previous run is still going; a palette
-  action reports `... is already running` or
+  run at once across all plugins. Each plugin's first one-shot run uses the
+  same limit: if the cap is full, it stays pending until a later scheduler
+  tick, and is dropped if the plugin is disabled meanwhile. When more plugins
+  are due than the limit allows, the least recently started go first so every
+  plugin gets a turn. A scheduled run waits for its next interval if that
+  limit is reached or its previous run is still going; missed ticks are
+  skipped and never replayed. A palette action reports `... is already running` or
   `... not started: too many plugin runs in flight (4 max)` in the status
-  line.
+  line. A run still in progress when its plugin is disabled, plugins are
+  reloaded, or thegn quits finishes, but its output is discarded.
 - `mode = "resident"`: one long-lived process for the session; thegn sends
   `activate`, then `render` per cadence, and `deactivate` on shutdown.
 

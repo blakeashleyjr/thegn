@@ -73,7 +73,7 @@
           "project": "Agent & Workflow Platform"
         }
       ],
-      "summary": "Redacted CI-log caching, failure windows, guarded autofix and the cache-first CLI smoke are delivered; the pre-PR gate remains."
+      "summary": "Redacted CI-log caching, failure windows, guarded autofix, PR-queue log excerpts, retention docs and the cache-first CLI smoke are delivered; the pre-PR gate remains."
     },
     {
       "change": "add-crash-reporting-and-traceability",
@@ -826,7 +826,8 @@
     },
     {
       "change": "make-sidebar-mode-visible",
-      "lifecycle": "active",
+      "lifecycle": "archived",
+      "archive_path": "openspec/changes/archive/2026-10-22-make-sidebar-mode-visible/",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -834,7 +835,7 @@
           "project": "Alpha Reliability & State Compatibility"
         }
       ],
-      "summary": "Render the persisted flat or grouped sidebar mode continuously and at narrow widths."
+      "summary": "The sidebar header names the flat or grouped layout in a clickable chip that degrades whole at narrow widths."
     },
     {
       "change": "make-usage-overlay-scannable",

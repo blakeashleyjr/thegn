@@ -526,6 +526,28 @@ fn note_cleared(prev_active: bool, now_active: bool) {
 }
 
 async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: TerminalWaker) {
+    let resolver_cfg = cfg.clone();
+    run_with(cfg, generation, tx, waker, move || {
+        let cfg = resolver_cfg.clone();
+        async move {
+            crate::media_secret::client_for(&cfg)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+}
+
+async fn run_with<R, F>(
+    cfg: MediaConfig,
+    generation: u64,
+    tx: SnapshotSender,
+    waker: TerminalWaker,
+    mut resolve: R,
+) where
+    R: FnMut() -> F + Send,
+    F: std::future::Future<Output = Result<thegn_media::MediaClient, String>> + Send,
+{
     let period = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
     let max_backoff = std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_secs(1);
@@ -542,7 +564,7 @@ async fn run(cfg: MediaConfig, generation: u64, tx: SnapshotSender, waker: Termi
     let mut active = false;
 
     loop {
-        let client = match crate::media_secret::client_for(&cfg).await {
+        let client = match resolve().await {
             Ok(client) => client,
             Err(error) => {
                 // No backend yet (bus down, playerctl absent). Retry with backoff so
@@ -751,12 +773,13 @@ mod tests {
     use tokio::time::MissedTickBehavior;
 
     use super::{
-        FlapAction, Freshness, MediaHealth, MediaSnapshotDelivery, STREAM_STABILITY, WatchState,
-        WatcherRegistry, WatcherStop, abort_and_join, backoff_after_stream, drain_snapshots,
-        failure_delivery, flap_action, interval, jittered, join_stops, join_within, next_push_wake,
-        offer, reset_probe_on_activation, should_confirm_flap, should_deliver, stale_grace,
+        FlapAction, Freshness, MediaConfig, MediaHealth, MediaSnapshotDelivery, STREAM_STABILITY,
+        WatchState, WatcherRegistry, WatcherStop, abort_and_join, backoff_after_stream,
+        drain_snapshots, failure_delivery, flap_action, interval, jittered, join_stops,
+        join_within, next_push_wake, offer, reset_probe_on_activation, run_with,
+        should_confirm_flap, should_deliver, stale_grace,
     };
-    use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
+    use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState, Playlist};
 
     #[tokio::test]
     async fn shutdown_aborts_and_joins_a_silent_watcher() {
@@ -1534,5 +1557,298 @@ mod tests {
             .await
         );
         assert!(join_within(std::future::ready(()), crate::media_ctl::MEDIA_OP_BUDGET).await);
+    }
+
+    struct LoopFake {
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        watch: fn() -> Box<dyn thegn_media::MediaWatch + Send>,
+    }
+
+    impl thegn_media::MediaBackend for LoopFake {
+        fn snapshot(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<Option<MediaState>, thegn_media::MediaError>>
+        {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async {
+                Ok(Some(MediaState {
+                    player: "fake".into(),
+                    title: "t".into(),
+                    state: thegn_core::media::PlaybackState::Playing,
+                    ..Default::default()
+                }))
+            })
+        }
+
+        fn play_pause(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<(), thegn_media::MediaError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn next(&self) -> futures::future::BoxFuture<'_, Result<(), thegn_media::MediaError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn previous(&self) -> futures::future::BoxFuture<'_, Result<(), thegn_media::MediaError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_shuffle(
+            &self,
+            _on: bool,
+        ) -> futures::future::BoxFuture<'_, Result<(), thegn_media::MediaError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_loop(
+            &self,
+            _mode: LoopMode,
+        ) -> futures::future::BoxFuture<'_, Result<(), thegn_media::MediaError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn volume_step(
+            &self,
+            _delta: f64,
+        ) -> futures::future::BoxFuture<'_, Result<(), thegn_media::MediaError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn playlists(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<Playlist>, thegn_media::MediaError>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn activate_playlist<'a>(
+            &'a self,
+            _id: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<(), thegn_media::MediaError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn caps(&self) -> MediaCaps {
+            MediaCaps::default()
+        }
+
+        fn watch(
+            &self,
+        ) -> futures::future::BoxFuture<
+            '_,
+            Result<Option<Box<dyn thegn_media::MediaWatch + Send>>, thegn_media::MediaError>,
+        > {
+            Box::pin(async move { Ok(Some((self.watch)())) })
+        }
+
+        fn players(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<Vec<String>, thegn_media::MediaError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn loop_client(
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        watch: fn() -> Box<dyn thegn_media::MediaWatch + Send>,
+    ) -> thegn_media::MediaClient {
+        Box::new(LoopFake { reads, watch })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loop_immediate_eof_backs_off_exponentially() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, _rx) = watch::channel(None);
+        let resolves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver_times = resolves.clone();
+        let timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(100),
+            run_with(MediaConfig::default(), 1, tx, waker, move || {
+                resolver_times
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tokio::time::Instant::now());
+                async {
+                    Ok(loop_client(
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        || Box::new(EndedWatch),
+                    ))
+                }
+            }),
+        )
+        .await;
+        assert!(timeout.is_err(), "the watcher should still be reconnecting");
+
+        let resolves = resolves
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let gaps: Vec<_> = resolves
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .collect();
+        let slack = std::time::Duration::from_millis(1);
+        let backoffs = [1, 2, 4, 8, 16, 30].map(std::time::Duration::from_secs);
+        let gaps_in_range = gaps.len() >= backoffs.len()
+            && gaps
+                .iter()
+                .zip(backoffs)
+                .all(|(gap, backoff)| *gap + slack >= backoff / 2 && *gap <= backoff + slack);
+        assert!(
+            gaps_in_range,
+            "immediate EOF gaps must follow jittered exponential backoff; gaps={gaps:?}"
+        );
+        assert!(
+            (8..=11).contains(&resolves.len()),
+            "unexpected reconnect count {}; gaps={gaps:?}",
+            resolves.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loop_silent_stream_rereads_on_the_liveness_probe() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, _rx) = watch::channel(None);
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_reads = reads.clone();
+        let resolves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver_times = resolves.clone();
+        let result = tokio::time::timeout(
+            STREAM_STABILITY * 2 + std::time::Duration::from_secs(1),
+            run_with(MediaConfig::default(), 1, tx, waker, move || {
+                resolver_times
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tokio::time::Instant::now());
+                let reads = client_reads.clone();
+                async move { Ok(loop_client(reads, || Box::new(SilentWatch))) }
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the silent watcher should remain connected"
+        );
+        let resolves = resolves
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(resolves.len(), 1, "resolver timeline: {resolves:?}");
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "one initial read and reads at the 30 s and 60 s liveness probes; resolver timeline: {resolves:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loop_resolution_outage_keeps_last_good_then_unavailable() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, mut rx) = watch::channel(None);
+        let started = tokio::time::Instant::now();
+        let deliveries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = deliveries.clone();
+        let collector = tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let at = tokio::time::Instant::now().duration_since(started);
+                let delivery: Option<MediaSnapshotDelivery> = rx.borrow_and_update().clone();
+                if let Some(delivery) = delivery {
+                    recorded
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((
+                            at,
+                            delivery.health,
+                            delivery.snapshot.map(|snapshot| snapshot.state),
+                        ));
+                }
+            }
+        });
+        let resolves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver_times = resolves.clone();
+        let mut calls = 0_usize;
+        let timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_with(MediaConfig::default(), 1, tx, waker, move || {
+                resolver_times
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tokio::time::Instant::now());
+                let first = calls == 0;
+                calls += 1;
+                async move {
+                    if first {
+                        Ok(loop_client(
+                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                            || Box::new(EndedWatch),
+                        ))
+                    } else {
+                        Err("bus down".to_owned())
+                    }
+                }
+            }),
+        )
+        .await;
+        assert!(timeout.is_err(), "the outage should keep retrying");
+        collector.await.unwrap();
+
+        let deliveries = deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = format!("{deliveries:?}");
+        assert_eq!(deliveries.len(), 3, "delivery sequence: {log}");
+        let (fresh_at, fresh_health, fresh_snapshot) = &deliveries[0];
+        let (degraded_at, degraded_health, degraded_snapshot) = &deliveries[1];
+        let (unavailable_at, unavailable_health, unavailable_snapshot) = &deliveries[2];
+        let resolves = resolves
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            resolves.len() >= 2,
+            "resolver timeline: {resolves:?}; {log}"
+        );
+        assert_eq!(*fresh_health, Some(MediaHealth::Fresh), "{log}");
+        assert_eq!(
+            fresh_snapshot.as_ref().map(|state| state.state),
+            Some(thegn_core::media::PlaybackState::Playing),
+            "first delivery must be playing: {log}"
+        );
+        assert_eq!(
+            fresh_snapshot
+                .as_ref()
+                .map(|state| (state.player.as_str(), state.title.as_str())),
+            Some(("fake", "t")),
+            "first delivery must contain the playing snapshot: {log}"
+        );
+        assert_eq!(*degraded_health, Some(MediaHealth::Degraded), "{log}");
+        assert_eq!(
+            degraded_snapshot, fresh_snapshot,
+            "degraded delivery must retain the same track: {log}"
+        );
+        assert_eq!(*unavailable_health, Some(MediaHealth::Unavailable), "{log}");
+        assert!(unavailable_snapshot.is_none(), "{log}");
+        let grace = stale_grace(std::time::Duration::from_secs(3));
+        let failure_started = resolves[1].duration_since(started);
+        let outage_age = unavailable_at.saturating_sub(failure_started);
+        assert!(
+            *degraded_at >= failure_started
+                && outage_age >= grace
+                && outage_age <= grace + std::time::Duration::from_millis(1),
+            "unavailable must arrive at the 10 s grace expiry after failed resolution at {failure_started:?}; age={outage_age:?}; log={log}"
+        );
+        assert!(*fresh_at <= *degraded_at, "{log}");
     }
 }

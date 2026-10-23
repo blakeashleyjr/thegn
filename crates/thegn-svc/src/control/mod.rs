@@ -512,7 +512,8 @@ pub struct PrStatusRow {
 /// Cached CI run history projected through the control plane. `runs` is kept
 /// as JSON because the provider-neutral CI model intentionally belongs to
 /// `thegn-core` without a control-wire schema dependency; the response still
-/// carries the cache source and timestamp explicitly.
+/// carries its source (`cache`, `provider`, or `stale-cache`) and timestamp
+/// explicitly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CiRunsReply {
     pub worktree: String,
@@ -522,6 +523,9 @@ pub struct CiRunsReply {
     pub discarded_rows: usize,
     pub source: String,
     pub fetched_at: i64,
+    /// Why a cached list was served after a failed or incomplete provider read (`source == "stale-cache"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
 }
 
 /// One cache-first CI log projection. Entries contain only the bounded,

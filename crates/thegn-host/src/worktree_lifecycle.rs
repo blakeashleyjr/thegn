@@ -540,6 +540,17 @@ pub fn spawn_event(
     )
 }
 
+const fn hook_thread_name(event: HookEvent) -> &'static str {
+    match event {
+        HookEvent::PreCreate => "thegn-hk-precr",
+        HookEvent::PostCreate => "thegn-hk-postcr",
+        HookEvent::PreDestroy => "thegn-hk-predst",
+        HookEvent::PostDestroy => "thegn-hk-pstdst",
+        HookEvent::SessionStart => "thegn-hk-sstart",
+        HookEvent::SessionEnd => "thegn-hk-send",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_event_with_completion(
     cfg: Config,
@@ -553,7 +564,7 @@ fn spawn_event_with_completion(
     completion: Option<SessionEndGuard>,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
-        .name(format!("thegn-resolve-hook-{}", event.as_str()))
+        .name(hook_thread_name(event).to_owned())
         .spawn(move || {
             // Holding this guard for the entire worker makes destructive
             // teardown wait for all hook/report/waker work. It also releases
@@ -636,7 +647,7 @@ pub fn spawn_worktree_destroy(
 ) -> std::io::Result<()> {
     let claimed_path = worktree.clone();
     let spawned = std::thread::Builder::new()
-        .name("thegn-worktree-destroy".into())
+        .name("thegn-wt-dstroy".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let cfg = crate::config_startup::cleanup_config();
@@ -699,7 +710,7 @@ pub fn spawn_workspace_destroy(
 ) -> std::io::Result<()> {
     let runtime_handle = tokio::runtime::Handle::try_current().ok();
     std::thread::Builder::new()
-        .name("thegn-workspace-destroy".into())
+        .name("thegn-ws-dstroy".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let db = Db::open();
@@ -2592,6 +2603,17 @@ mod tests {
 
         assert!(result.ends_with("nothing was created, so nothing was rolled back"));
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn hook_thread_names_fit_the_comm_limit_and_are_distinct() {
+        let names = HookEvent::ALL.map(hook_thread_name);
+        for name in names {
+            assert!(name.starts_with("thegn-"));
+            assert!(name.len() <= 15);
+        }
+        let distinct: std::collections::BTreeSet<_> = names.into_iter().collect();
+        assert_eq!(distinct.len(), 6);
     }
 }
 

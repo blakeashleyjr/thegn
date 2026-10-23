@@ -128,7 +128,7 @@ impl AdmissionLimiter {
         self.active.fetch_add(1, Ordering::AcqRel);
         let limiter = self.clone();
         match std::thread::Builder::new()
-            .name("bridge-exec".into())
+            .name("thegn-br-exec".into())
             .spawn(move || Self::run_worker(limiter, job))
         {
             Ok(_) => Ok(()),
@@ -913,7 +913,7 @@ fn spawn_reader_thread(
     f: Box<dyn FnOnce() + Send>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
-        .name("bridge-reader".into())
+        .name("thegn-br-read".into())
         .spawn(f)
 }
 
@@ -932,7 +932,7 @@ fn reap_child(mut child: Child, deadline: Duration) -> bool {
         }
     }
     let spawned = std::thread::Builder::new()
-        .name("bridge-reaper".into())
+        .name("thegn-br-reap".into())
         .spawn(move || {
             let _ = child.wait(); // best-effort: reap only
         });
@@ -1322,7 +1322,7 @@ pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
                     let (w, procs) = (writer.clone(), procs.clone());
                     let req_id = req.id;
                     if let Err(e) = std::thread::Builder::new()
-                        .name("bridge-proc-kill".into())
+                        .name("thegn-br-pkill".into())
                         .spawn(move || write_frame(&w, &proc_kill_response(&req, &procs)))
                     {
                         write_frame(
@@ -1479,7 +1479,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     // errors — either way stdin drops → EOF.
     let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_DEPTH);
     let writer_thread = std::thread::Builder::new()
-        .name("bridge-proc-stdin".into())
+        .name("thegn-br-pstdin".into())
         .spawn(move || {
             let mut stdin = stdin;
             while let Ok(chunk) = stdin_rx.recv() {
@@ -1495,7 +1495,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
         });
     if let Err(e) = writer_thread {
         kill_and_reap(&mut child);
-        return Err(e).context("spawn bridge-proc-stdin thread");
+        return Err(e).context("spawn thegn-br-pstdin thread");
     }
     let ctl = ProcCtl::new(pid);
     procs.lock().unwrap().insert(
@@ -1512,7 +1512,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     let slot = Arc::new(Mutex::new(Some(child)));
     let (slot2, ctl2, procs2) = (slot.clone(), ctl.clone(), procs.clone());
     let waiter = std::thread::Builder::new()
-        .name("bridge-proc-wait".into())
+        .name("thegn-br-pwait".into())
         .spawn(move || {
             let relays = [out_relay, err_relay];
             // Err = no WNOWAIT support: fall through to a plain reap.
@@ -1585,7 +1585,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
             kill_and_reap(&mut c);
             *phase = ProcPhase::Reaped(-1);
         }
-        return Err(e).context("spawn bridge-proc-wait thread");
+        return Err(e).context("spawn thegn-br-pwait thread");
     }
     Ok(())
 }
@@ -1596,6 +1596,15 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait(); // best-effort: reap-or-not is terminal here
 }
 
+/// Map the two `stdout`/`stderr` callers to fixed Linux comm-safe thread names.
+fn relay_thread_name(stream: &str) -> &'static str {
+    if stream == "stdout" {
+        "thegn-br-pout"
+    } else {
+        "thegn-br-perr"
+    }
+}
+
 /// Relay a child stream to the client as `proc.out` notifications until EOF.
 fn spawn_stream_relay(
     mut r: impl Read + Send + 'static,
@@ -1604,7 +1613,7 @@ fn spawn_stream_relay(
     writer: SharedWriter,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
-        .name(format!("bridge-proc-{stream}"))
+        .name(relay_thread_name(stream).to_owned())
         .spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -1836,7 +1845,7 @@ fn start_watch(
     let flush_coalescer = coalescer.clone();
     let flush_writer = writer.clone();
     std::thread::Builder::new()
-        .name("bridge-fs-flush".into())
+        .name("thegn-br-fsflsh".into())
         .spawn(move || flush_watch_events(flush_coalescer, flush_writer, nudge_rx, watch_id))
         .map_err(notify::Error::io)?;
 
@@ -2036,7 +2045,7 @@ fn output_bounded(
     let out_state = stdout_capture.clone();
     let out_done = done_tx.clone();
     let out_h = match std::thread::Builder::new()
-        .name("bridge-stdout".into())
+        .name("thegn-br-stdout".into())
         .spawn(move || {
             drain_capture(stdout, out_state);
             if let Err(error) = out_done.send(()) {
@@ -2057,7 +2066,7 @@ fn output_bounded(
     let err_state = stderr_capture.clone();
     let err_done = done_tx;
     let err_h = match std::thread::Builder::new()
-        .name("bridge-stderr".into())
+        .name("thegn-br-stderr".into())
         .spawn(move || {
             drain_capture(stderr, err_state);
             if let Err(error) = err_done.send(()) {
@@ -3830,5 +3839,16 @@ mod tests {
         drop(c);
         assert!(t.elapsed() < Duration::from_millis(500));
         drop(tx);
+    }
+
+    #[test]
+    fn relay_thread_names_fit_the_comm_limit() {
+        let stdout = relay_thread_name("stdout");
+        let stderr = relay_thread_name("stderr");
+        assert_eq!(stdout, "thegn-br-pout");
+        assert_eq!(stderr, "thegn-br-perr");
+        assert!(stdout.len() <= 15);
+        assert!(stderr.len() <= 15);
+        assert_ne!(stdout, stderr);
     }
 }
