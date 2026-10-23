@@ -262,8 +262,9 @@ API's `ci.logs` reply carries the same field.
 The daemon/API `ci.logs` `tail_lines` argument can narrow `[ci] log_tail_lines`,
 but a larger value is clamped to that setting. A value of `0` is refused.
 
-When a GitLab job list reaches its page, row or byte budget, `thegn ci view` and
-`ci logs` warn that the list is incomplete and show the first jobs. Incomplete
+When a GitLab job list reaches its page, row, byte or time budget (one minute
+for the whole run detail), `thegn ci view` and `ci logs` warn that the list is
+incomplete and show the first jobs. Incomplete
 details are not used to ingest job logs, so their logs are not cached and CI
 autofix does not start from them. `thegn ci trigger -i KEY=VALUE` inputs are
 validated before any provider request; malformed or duplicate keys, control
