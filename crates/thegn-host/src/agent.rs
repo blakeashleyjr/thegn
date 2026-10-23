@@ -2467,7 +2467,7 @@ pub fn provision_provider_env_named(
         })
         .transpose()?;
     if let Some((_, _, pubkey)) = &managed_ssh {
-        setup.push(sprite_sshd_setup_script(pubkey));
+        setup.push(sprite_sshd_setup_script(pubkey)?);
     }
     // mosh transport: install mosh-server (else the pane falls back to plain ssh).
     if pc.transport == thegn_core::config::RemoteTransport::Mosh
@@ -2824,10 +2824,8 @@ pub fn provision_provider_env_named(
         // Verify that the exact key made it into the remote authorization file
         // before publishing custody. A failed SSH setup must not become an
         // apparently-authorized ledger row.
-        let script = format!(
-            "grep -qF -- {} \"$HOME/.ssh/authorized_keys\"",
-            thegn_core::util::sh_quote(public)
-        );
+        let key_id = crate::managed_ssh_rotation::key_id(public)?;
+        let script = crate::managed_ssh_rotation::authorized_probe_script(&key_id);
         let argv = vec!["sh".to_string(), "-lc".to_string(), script];
         let (code, _) =
             block_on_provider(|| async { provider.run_exec(&id, &argv, None, &[]).await })?;
