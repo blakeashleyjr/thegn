@@ -356,6 +356,7 @@ pub(crate) struct ReadyLandAdmission {
     pub(crate) observed: MergeOutcomeObservation,
 }
 
+/// The verified outcome details to persist after a queue-aware land.
 pub(crate) struct ReadyLandRecord<'a> {
     pub(crate) branch: &'a str,
     pub(crate) repo_root: &'a Path,
@@ -1207,6 +1208,9 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let repo_canonical = repo.canonicalize().unwrap();
+        let repo_canonical_s = repo_canonical.to_string_lossy().into_owned();
+        db.put_worktree("feat", &repo_canonical_s, &worktree_s, "feat", None, None)
+            .unwrap();
         enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
         db.update_merge_status(&worktree_s, "ready", Some("fold-oid"), None, None)
             .unwrap();
@@ -1215,7 +1219,7 @@ mod tests {
             db.admit_merge_claim(&MergeClaimRequest {
                 worktree: worktree_s.clone(),
                 branch: "feat".into(),
-                repo_root: repo_canonical.to_string_lossy().into_owned(),
+                repo_root: repo_canonical_s,
                 target_branch: "main".into(),
                 location: String::new(),
                 expected_status: "ready".into(),
