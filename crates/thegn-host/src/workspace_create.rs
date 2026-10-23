@@ -513,6 +513,16 @@ fn clone_workspace_repo_with_deadline(
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("workspace"))
             .to_string_lossy();
+        let reclaimed = reclaim_stale_clone_staging(
+            parent,
+            &name,
+            std::process::id(),
+            crate::platform::pid_alive,
+        );
+        if reclaimed > 0 {
+            tracing::debug!(reclaimed, path = %parent.display(), "reclaimed stale workspace clone staging");
+        }
+        // Leftovers from a crashed run are reclaimed here before staging is checked.
         let staging_path =
             parent.join(format!(".{name}.clone-{generation}-{}", std::process::id()));
         match std::fs::symlink_metadata(&staging_path) {
@@ -752,6 +762,83 @@ fn promote_staged_clone(staging: &std::path::Path, dest: &std::path::Path) -> Re
         remove_partial_clone_dest(staging, false);
     }
     result
+}
+
+/// Reclaim exact-name staging directories from dead clone processes, but only
+/// when they are real directories owned by the current user. A live or reused
+/// pid is kept because deleting another active clone is unsafe.
+fn reclaim_stale_clone_staging(
+    parent: &std::path::Path,
+    name: &str,
+    own_pid: u32,
+    pid_alive: impl Fn(i64) -> bool,
+) -> usize {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(%error, path = %parent.display(), "reclaim stale workspace clone staging");
+            return 0;
+        }
+    };
+    let prefix = format!(".{name}.clone-");
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(%error, path = %parent.display(), "reclaim stale workspace clone staging");
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(remainder) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((generation, pid)) = remainder.rsplit_once('-') else {
+            continue;
+        };
+        if generation.is_empty()
+            || pid.is_empty()
+            || !generation.bytes().all(|byte| byte.is_ascii_digit())
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let Ok(_generation) = generation.parse::<u64>() else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid == own_pid || pid_alive(i64::from(pid)) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "reclaim stale workspace clone staging");
+                continue;
+            }
+        };
+        let file_type = metadata.file_type();
+        if !file_type.is_dir()
+            || file_type.is_symlink()
+            || !thegn_core::fsperm::owned_by_current_user(&metadata)
+        {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "reclaim stale workspace clone staging");
+            }
+        }
+    }
+    removed
 }
 
 fn remove_partial_clone_dest(dest: &std::path::Path, dest_existed: bool) {
@@ -1985,6 +2072,124 @@ Receiving objects: 100% (10/10)\rdone.\n";
                 name.to_string_lossy()
             );
         }
+    }
+
+    #[test]
+    fn stale_staging_from_a_dead_pid_is_reclaimed() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp.path().join(".ws.clone-7-4242");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("partial"), b"clone in progress").unwrap();
+
+        assert_eq!(
+            reclaim_stale_clone_staging(temp.path(), "ws", 1, |_| false),
+            1
+        );
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn stale_staging_of_a_live_or_own_pid_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join(".ws.clone-7-4242");
+        let own = temp.path().join(".ws.clone-8-1");
+        for path in [&live, &own] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("partial"), b"clone in progress").unwrap();
+        }
+
+        assert_eq!(
+            reclaim_stale_clone_staging(temp.path(), "ws", 1, |pid| pid == 4242),
+            0
+        );
+        assert!(live.join("partial").is_file());
+        assert!(own.join("partial").is_file());
+    }
+
+    #[test]
+    fn stale_staging_reclaim_ignores_other_names() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            ".other.clone-7-4242",
+            ".ws.clone-x-4242",
+            ".ws.clone-7-",
+            ".ws.clone--4242",
+            ".ws.clone-7-4242-extra",
+            "ws",
+        ] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let regular_file = temp.path().join(".ws.clone-9-4242");
+        std::fs::write(&regular_file, b"not a directory").unwrap();
+
+        assert_eq!(
+            reclaim_stale_clone_staging(temp.path(), "ws", 1, |_| false),
+            0
+        );
+        for name in [
+            ".other.clone-7-4242",
+            ".ws.clone-x-4242",
+            ".ws.clone-7-",
+            ".ws.clone--4242",
+            ".ws.clone-7-4242-extra",
+            "ws",
+        ] {
+            assert!(temp.path().join(name).is_dir(), "{name} should remain");
+        }
+        assert!(regular_file.is_file());
+    }
+
+    #[test]
+    fn stale_staging_reclaim_never_follows_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("important"), b"keep").unwrap();
+        let link = temp.path().join(".ws.clone-7-4242");
+        if crate::platform::symlink_file_for_test(&victim, &link).is_err() {
+            return;
+        }
+
+        assert_eq!(
+            reclaim_stale_clone_staging(temp.path(), "ws", 1, |_| false),
+            0
+        );
+        assert!(victim.join("important").is_file());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn stale_staging_is_reclaimed_before_a_new_clone() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = committed_fixture_repo(temp.path());
+        let source_url = source.to_string_lossy().into_owned();
+        let stale = temp.path().join(".workspace.clone-3-2147483647");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("partial"), b"interrupted clone").unwrap();
+        let dest = temp.path().join("workspace");
+
+        clone_workspace_repo_with_deadline(
+            &source_url,
+            &dest,
+            44,
+            None,
+            CloneLimits {
+                total: Duration::from_secs(30),
+                connect: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+            || false,
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(dest.join("tracked.txt").is_file());
+        assert_no_clone_staging(temp.path());
     }
 
     #[test]
