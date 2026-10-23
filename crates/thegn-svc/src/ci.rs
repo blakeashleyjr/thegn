@@ -3162,6 +3162,34 @@ esac
         ));
     }
 
+    // Positive control: page failures already fail closed; pin that no partial
+    // detail is returned when a later page cannot be fetched.
+    #[test]
+    fn gitlab_detail_page_two_fetch_error_fails_the_whole_detail() {
+        let page_one = gitlab_jobs_json(1..=100);
+        let result = collect_gitlab_jobs(usize::MAX, |page, _remaining| match page {
+            1 => Ok(GitlabJobPage::Body(page_one.clone())),
+            2 => Err(CiError::Other("boom".into())),
+            _ => panic!("unexpected page {page}"),
+        });
+
+        assert!(matches!(result, Err(CiError::Other(message)) if message == "boom"));
+    }
+
+    // Positive control: later-page decode failures already fail closed; pin
+    // that no partial detail claims completeness after page one succeeded.
+    #[test]
+    fn gitlab_detail_page_two_decode_error_fails_the_whole_detail() {
+        let page_one = gitlab_jobs_json(1..=100);
+        let result = collect_gitlab_jobs(usize::MAX, |page, _remaining| match page {
+            1 => Ok(GitlabJobPage::Body(page_one.clone())),
+            2 => Ok(GitlabJobPage::Body("{not json".into())),
+            _ => panic!("unexpected page {page}"),
+        });
+
+        assert!(matches!(result, Err(CiError::Other(_))));
+    }
+
     #[test]
     fn gitlab_detail_collector_keeps_page_and_row_rules() {
         let (jobs, _, page_incomplete) = collect_gitlab_jobs(usize::MAX, |page, _remaining| {
