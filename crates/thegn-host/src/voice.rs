@@ -313,7 +313,7 @@ impl VoiceController {
         self.transcription_cancel = Some((request_id, cancel.clone()));
         self.transcription_terminal = false;
         match thread::Builder::new()
-            .name("voice-transcribe".into())
+            .name("thegn-voice-stt".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let reaped_tx = tx.clone();
@@ -421,7 +421,7 @@ fn spawn_capture(
     waker: TerminalWaker,
 ) -> Option<thread::JoinHandle<()>> {
     thread::Builder::new()
-        .name("voice-capture".into())
+        .name("thegn-voice-cap".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let reaped_tx = tx.clone();
@@ -747,7 +747,7 @@ fn terminate_capture_child(
     }
     let reaped = Arc::clone(on_reaped);
     match thread::Builder::new()
-        .name("voice-capture-reaper".into())
+        .name("thegn-voice-rp".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             if let Err(error) = child.wait() {

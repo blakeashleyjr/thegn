@@ -231,7 +231,7 @@ fn teardown_off_loop(clients: Vec<Arc<LspClient>>) {
         return;
     }
     let spawned = std::thread::Builder::new()
-        .name("thegn-lsp-teardown".into())
+        .name("thegn-lsp-down".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             for client in &clients {

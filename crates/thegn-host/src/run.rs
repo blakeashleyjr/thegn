@@ -7450,7 +7450,7 @@ async fn event_loop<T: Terminal>(
         let wake_rx = lsp_diag_rx.clone();
         let bridge_waker = waker.clone();
         let spawned = std::thread::Builder::new()
-            .name("thegn-lsp-bridge".into())
+            .name("thegn-lsp-brdg".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 while wake_rx.wait() {
@@ -7992,7 +7992,7 @@ async fn event_loop<T: Terminal>(
         let ns = std::sync::Arc::clone(&notify_state);
         let wk = waker.clone();
         std::thread::Builder::new()
-            .name("crash-scan".into())
+            .name("thegn-crashscan".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 let reports = thegn_core::diagnostics::unacknowledged_reports();
