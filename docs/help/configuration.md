@@ -430,7 +430,7 @@ If the database cannot be opened at all when a pane launches, configured
 agents and tools are refused because the worktree's saved sandbox override and
 credential-overlay gate cannot be checked. A plain shell, including the
 `clean-shell` fallback, still starts without the worktree's saved sandbox
-override, and the reason is logged as a warning.
+override, and the reason is logged as a warning. While the UI is running, the warning also appears on the status line and is recorded in the notification inbox; the CLI still prints it.
 
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,

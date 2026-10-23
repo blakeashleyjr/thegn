@@ -123,6 +123,7 @@ mod keymap;
 mod keymap_merge;
 mod keymap_specs;
 mod kitty_relay;
+mod launch_notice;
 mod layer;
 mod layout;
 mod layout_spec;

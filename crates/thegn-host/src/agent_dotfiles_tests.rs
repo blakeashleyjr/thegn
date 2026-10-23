@@ -27,6 +27,7 @@ fn dotfiles_failure_refuses_a_configured_agent() {
 
     let error = dotfiles_launch_gate(
         &cfg,
+        "/wt/a",
         "claude",
         anyhow::anyhow!("cannot create HOME").context("bundle dotfiles into /tmp/bundle-home"),
     )
@@ -40,5 +41,5 @@ fn dotfiles_failure_refuses_a_configured_agent() {
 fn dotfiles_failure_lets_a_plain_shell_launch() {
     let cfg = configured_agent();
 
-    assert!(dotfiles_launch_gate(&cfg, "shell", anyhow::anyhow!("x")).is_ok());
+    assert!(dotfiles_launch_gate(&cfg, "/wt/a", "shell", anyhow::anyhow!("x")).is_ok());
 }
