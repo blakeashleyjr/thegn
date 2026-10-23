@@ -234,6 +234,10 @@ An event marked free (`TRANSP:TRANSPARENT` in iCalendar, `"busy": "free"` from
 a command plugin) is shown dimmed in the agenda. It is still listed and its
 reminders still fire; only its busy status differs.
 
+Across local calendar files, subscribed links, and CalDAV, `TRANSPARENT` means free, while `OPAQUE`
+or an absent `TRANSP` means busy; an unrecognised value is reported as an event problem and stays
+busy, and a command plugin's `busy` value is used exactly as sent.
+
 Each reminder firing is claimed in the state database before delivery, so it
 fires at most once, even with several thegn instances on one state directory,
 and does not fire again after its inbox entry is dismissed. Claims last 30
