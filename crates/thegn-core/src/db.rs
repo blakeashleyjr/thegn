@@ -1151,7 +1151,7 @@ pub struct PoolSpare {
     pub updated_at: i64,
 }
 
-fn db_path() -> PathBuf {
+pub(crate) fn db_path() -> PathBuf {
     util::xdg_state_home().join("thegn/thegn.db")
 }
 

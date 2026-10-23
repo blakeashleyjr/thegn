@@ -209,6 +209,28 @@ fn target_worktree_with(
     }
 }
 
+/// The location a mutating verb acts on; an unreadable location refuses before any forge call.
+fn mutation_loc(worktree: Option<String>, verb: &str) -> Result<GitLoc> {
+    let wt = match worktree {
+        None => resolve_worktree(None),
+        Some(raw) => {
+            let path = std::path::Path::new(&raw);
+            let registered = GitLoc::for_worktree_op(path, verb).map_err(anyhow::Error::msg)?;
+            if !matches!(registered, GitLoc::Local(_)) {
+                std::path::PathBuf::from(raw)
+            } else {
+                target_worktree_with(
+                    Some(raw),
+                    resolve_worktree,
+                    thegn_core::repo::worktree_root_for_cwd,
+                    |_| false,
+                )?
+            }
+        }
+    };
+    GitLoc::for_worktree_op(&wt, verb).map_err(anyhow::Error::msg)
+}
+
 fn status(worktree: Option<String>) -> Result<()> {
     let wt = target_worktree(worktree)?;
     let loc = GitLoc::for_worktree(&wt);
@@ -260,7 +282,7 @@ fn create(
     web: bool,
     fill: bool,
 ) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr create")?;
     let fill = fill || (title.is_none() && body.is_none() && !web);
     let opts = CreateOpts {
         title,
@@ -291,7 +313,7 @@ fn open(worktree: Option<String>) -> Result<()> {
 }
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr approve")?;
     let registry = forges();
     let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -328,7 +350,7 @@ fn merge(
     auto: bool,
     yes: bool,
 ) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr merge")?;
     let forges = forges();
     let forge = forges.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -461,7 +483,7 @@ pub(crate) fn merge_outcome_text(
 }
 
 fn rerun(worktree: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr rerun-checks")?;
     match forges().for_loc(&loc).rerun_failed(&loc, PrRef::Current) {
         Ok(0) => msg::info("no failed checks to re-run"),
         Ok(n) => msg::info(&format!("re-ran {n} failed workflow run(s)")),
@@ -480,7 +502,7 @@ fn reviews(worktree: Option<String>) -> Result<()> {
 }
 
 fn comment(worktree: Option<String>, body: String) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr comment")?;
     match forges().for_loc(&loc).comment(&loc, PrRef::Current, &body) {
         Ok(()) => msg::info("comment posted"),
         Err(e) => msg::die(&format!("pr comment failed: {}", e.describe())),
@@ -489,7 +511,7 @@ fn comment(worktree: Option<String>, body: String) -> Result<()> {
 }
 
 fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr review")?;
     let registry = forges();
     let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -537,7 +559,7 @@ fn diff(worktree: Option<String>, json: bool) -> Result<()> {
 }
 
 fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr ready")?;
     // `undo` converts the PR back to a draft; otherwise mark it ready.
     match forges().for_loc(&loc).set_draft(&loc, PrRef::Current, undo) {
         Ok(()) if undo => msg::info("PR converted to draft"),
@@ -548,7 +570,7 @@ fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
 }
 
 fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
-    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
+    let loc = mutation_loc(worktree, "pr auto-merge")?;
     match forges()
         .for_loc(&loc)
         .set_auto_merge(&loc, PrRef::Current, !disable, MergeMethod::Squash)
@@ -563,7 +585,7 @@ fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReviewedPr, merge_outcome_text, merge_reviewed_head, review_reviewed_head,
+        ReviewedPr, merge_outcome_text, merge_reviewed_head, mutation_loc, review_reviewed_head,
         target_worktree_with,
     };
     use std::path::PathBuf;
@@ -1015,5 +1037,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/default"));
+    }
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "creates an isolated git worktree fixture"
+    )]
+    fn mutation_loc_refuses_when_the_location_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let output = thegn_core::util::git_cmd(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "commit.gpgsign=false", "init", "-q"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let state = crate::testenv::IsolatedState::new();
+        std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+        let result = super::mutation_loc(Some(repo.display().to_string()), "pr merge");
+        assert!(matches!(result, Err(error) if format!("{error:#}").contains("pr merge refused")));
     }
 }

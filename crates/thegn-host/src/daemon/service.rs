@@ -1769,11 +1769,7 @@ impl ControlApi for DaemonService {
             let wt = worktree.to_string();
             let paths = paths.to_vec();
             tokio::task::spawn_blocking(move || {
-                let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
-                for p in &paths {
-                    CliGit.stage(&loc, p)?;
-                }
-                Ok::<_, anyhow::Error>(())
+                crate::gitmut::control_stage(std::path::Path::new(&wt), &paths)
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("git task join: {e}")))?
@@ -1791,19 +1787,7 @@ impl ControlApi for DaemonService {
             let wt = worktree.to_string();
             let message = message.to_string();
             tokio::task::spawn_blocking(move || {
-                let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
-                CliGit.commit(&loc, &message, false, None)?;
-                // The new HEAD is the commit we just made (git_cmd scrubs
-                // GIT_* env; inside spawn_blocking, so the wait is off-loop).
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "inside spawn_blocking — off-loop child wait is the sanctioned pattern"
-                )]
-                let out = thegn_core::util::git_cmd(std::path::Path::new(&wt))
-                    .args(["rev-parse", "HEAD"])
-                    .output()?;
-                anyhow::ensure!(out.status.success(), "rev-parse HEAD failed");
-                Ok::<_, anyhow::Error>(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                crate::gitmut::control_commit(std::path::Path::new(&wt), &message)
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("git task join: {e}")))?
