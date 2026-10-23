@@ -16,8 +16,9 @@ Two ways a worktree's dev server reaches a browser.
 worktree at a public URL. The [[panel]]'s **system → share** section
 lists every active share: `↵` copies the URL, `o` opens it in the
 browser, `n` starts a share, and `x` stops the highlighted share (the
-stop-share action stops them all). Stopping a share also removes its saved
-entry, so it will not return on the next launch. A failed share shows its
+stop-share action stops them all). The row stays `stopping…` until the tunnel
+client exits; then its saved entry is removed, so it will not return on the
+next launch. A failed share shows its
 reason and can simply be retried. If a tailscale share's teardown cannot be
 confirmed, it stays in the list as failed with the reason and keeps its saved
 entry; stopping it again retries the teardown. If thegn cannot stop a bore,
@@ -44,7 +45,8 @@ verify teardown; restarting the worktree sandbox lets thegn record the runtime.
 Stopping a share in thegn while it is still starting cancels the start, so
 the tunnel does not come up after the stop request.
 A share client started by thegn runs in its own process group. Stopping it sends
-TERM to the group, then KILL after a short grace period if processes remain.
+TERM to the group, then KILL after a short grace period if processes remain; the
+row stays `stopping…` until the group has exited.
 A Tailscale share cannot restart on a port whose previous share is still
 stopping; wait for teardown to finish first.
 
