@@ -2662,19 +2662,86 @@ impl Db {
         Ok(counts)
     }
 
-    /// Run `f` inside a single SQLite transaction: commit on `Ok`, roll back
+    /// Run `f` inside a single DEFERRED SQLite transaction: commit on `Ok`, roll back
     /// on `Err` (the dropped transaction rolls back). Multi-statement writes
     /// (e.g. persisting a whole session's tab list) must use this so a crash
     /// mid-sequence can't leave a torn half-write — and batched writes pay one
     /// fsync instead of one per statement. Uses `unchecked_transaction`
     /// because `Db` methods take `&self`; do NOT nest `transaction` calls
-    /// (SQLite has no nested BEGIN).
+    /// (SQLite has no nested BEGIN). A closure that reads then writes under
+    /// contention must use [`Db::transaction_immediate`]: upgrading a deferred
+    /// read transaction can return SQLITE_BUSY without waiting for the busy
+    /// handler.
     pub fn transaction<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
         let tx = self.conn.unchecked_transaction()?;
         let out = f(self)?;
         tx.commit()?;
         Ok(out)
     }
+
+    /// Run `f` with a write lock acquired before its first statement. Joins an
+    /// existing transaction so store methods remain composable.
+    pub fn transaction_immediate<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return f(self);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+}
+
+/// Whether an error chain contains a transient SQLite busy/locked error.
+pub fn is_transient_lock(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    })
+}
+
+const RETRY_TRANSIENT_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 400];
+
+/// Retry a DB read when SQLite reports a transient busy/locked condition.
+pub fn retry_transient<T>(f: impl FnMut() -> Result<T>) -> Result<T> {
+    retry_transient_with(&RETRY_TRANSIENT_DELAYS_MS, std::thread::sleep, f)
+}
+
+fn retry_transient_with<T>(
+    delays_ms: &[u64],
+    mut sleep: impl FnMut(std::time::Duration),
+    mut f: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    use anyhow::Context;
+
+    let mut last_error = match f() {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    for delay_ms in delays_ms {
+        if !is_transient_lock(&last_error) {
+            return Err(last_error);
+        }
+        sleep(std::time::Duration::from_millis(*delay_ms));
+        match f() {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = error,
+        }
+    }
+    if !is_transient_lock(&last_error) {
+        return Err(last_error);
+    }
+    Err(last_error).context(format!("still locked after {} retries", delays_ms.len()))
 }
 
 /// A current-state read could not safely use the immutable view or join the WAL.

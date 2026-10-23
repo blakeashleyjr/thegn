@@ -4219,7 +4219,7 @@ pub fn launch_spec_full(
             {
                 let _ = db.set_worktree_agent(worktree, choice); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
-            match db.worktree_sandbox(worktree) {
+            match thegn_core::db::retry_transient(|| db.worktree_sandbox(worktree)) {
                 Ok(saved) => saved,
                 Err(error) => {
                     launch_state_gate(
@@ -4238,7 +4238,10 @@ pub fn launch_spec_full(
 
     // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
     // DB (carries remote worktrees with no local cwd), else climb from the path.
-    let recorded_root = match db.as_ref().map(|db| db.repo_root_for(worktree)) {
+    let recorded_root = match db
+        .as_ref()
+        .map(|db| thegn_core::db::retry_transient(|| db.repo_root_for(worktree)))
+    {
         Some(Ok(root)) => root,
         Some(Err(error)) => {
             launch_state_gate(
@@ -4261,7 +4264,9 @@ pub fn launch_spec_full(
     // The selected execution environment: the worktree's own `env_name`, else
     // its workspace's. `resolve_env` falls through to the repo/global default.
     let selected_env = match db.as_ref() {
-        Some(db) => match db.effective_env_checked(worktree, &repo_root.to_string_lossy()) {
+        Some(db) => match thegn_core::db::retry_transient(|| {
+            db.effective_env_checked(worktree, &repo_root.to_string_lossy())
+        }) {
             Ok(selected) => selected,
             Err(error) => {
                 launch_state_gate(
@@ -4354,7 +4359,7 @@ pub fn launch_spec_full(
     if !loc.is_remote()
         && let Some(db) = db.as_ref()
     {
-        match repo_slug_checked(db, &repo_root) {
+        match thegn_core::db::retry_transient(|| repo_slug_checked(db, &repo_root)) {
             Ok(Some(slug)) => credential_overlay_gate(cfg, db, &slug, choice)?,
             Ok(None) => {}
             Err(error) => launch_state_gate(
@@ -4818,8 +4823,11 @@ pub(crate) fn repo_slug_checked(db: &Db, repo_root: &Path) -> anyhow::Result<Opt
         return Ok(None);
     };
     let base = file_name.to_string_lossy().into_owned();
-    db.slug_for_repo(&repo_root.to_string_lossy(), &base)
-        .map(Some)
+    let repo_path = repo_root.to_string_lossy();
+    if let Some(slug) = db.repo_slug_lookup(&repo_path)? {
+        return Ok(Some(slug));
+    }
+    db.slug_for_repo(&repo_path, &base).map(Some)
 }
 
 fn sandbox_candidates(

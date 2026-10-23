@@ -299,16 +299,33 @@ impl WorkspaceStore for Db {
     /// `-2`, `-3`, … on collision with a *different* repo, then persists it.
     /// Two repos with the same basename therefore get distinct tab namespaces.
     fn slug_for_repo(&self, repo_path: &str, base: &str) -> Result<String> {
-        // One transaction around the read-check-insert so two processes can't
-        // both pass the uniqueness scan and claim the same slug.
-        self.transaction(|db| {
-            if let Ok(s) = db.conn().query_row(
+        if let Some(slug) = self
+            .conn()
+            .query_row(
                 "SELECT slug FROM repo_slugs WHERE repo_path=?1",
                 params![repo_path],
                 |r| r.get::<_, String>(0),
-            ) && !s.is_empty()
+            )
+            .optional()?
+            .filter(|slug| !slug.is_empty())
+        {
+            return Ok(slug);
+        }
+
+        // Take the write lock before the recheck and uniqueness scan so two
+        // processes cannot both pass the scan and claim the same slug.
+        self.transaction_immediate(|db| {
+            if let Some(slug) = db
+                .conn()
+                .query_row(
+                    "SELECT slug FROM repo_slugs WHERE repo_path=?1",
+                    params![repo_path],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .filter(|slug| !slug.is_empty())
             {
-                return Ok(s);
+                return Ok(slug);
             }
             let taken: std::collections::HashSet<String> = {
                 let mut stmt = db
@@ -329,6 +346,18 @@ impl WorkspaceStore for Db {
             )?;
             Ok(cand)
         })
+    }
+
+    fn repo_slug_lookup(&self, repo_path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT slug FROM repo_slugs WHERE repo_path=?1",
+                params![repo_path],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|slug| !slug.is_empty()))
     }
 
     fn repo_slug_rows(&self) -> Result<Vec<(String, String)>> {
@@ -3094,5 +3123,59 @@ mod tests {
         let db = Db::open_memory().unwrap();
 
         assert_eq!(db.effective_env_checked("/wt/a", "/repo").unwrap(), None);
+    }
+
+    #[test]
+    fn slug_for_repo_waits_for_a_held_writer_instead_of_busy() {
+        use crate::store::WorkspaceStore;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer = Db::open_at(&path).unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO repo_slugs(repo_path, slug) VALUES('/other','o');",
+            )
+            .unwrap();
+
+        let thread_path = path.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let started = Instant::now();
+        let join = std::thread::spawn(move || {
+            let db = Db::open_at(&thread_path).unwrap();
+            started_tx.send(()).unwrap();
+            result_tx.send(db.slug_for_repo("/fresh", "fresh")).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        writer.conn().execute_batch("COMMIT;").unwrap();
+
+        assert_eq!(result_rx.recv().unwrap().unwrap(), "fresh");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn slug_for_repo_joins_an_open_transaction() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        let slug = db.transaction(|db| db.slug_for_repo("/r", "r")).unwrap();
+
+        assert_eq!(slug, "r");
+        assert_eq!(db.repo_slug_lookup("/r").unwrap().as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn repo_slug_lookup_never_writes() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.repo_slug_lookup("/unknown").unwrap(), None);
+        assert!(db.repo_slug_rows().unwrap().is_empty());
     }
 }
