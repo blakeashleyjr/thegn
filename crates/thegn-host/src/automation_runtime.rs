@@ -75,7 +75,7 @@ pub fn install(cfg: &Config) {
         return;
     };
     let spawn = std::thread::Builder::new()
-        .name("automation-runtime".into())
+        .name("thegn-automate".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             rt.block_on(run(rx, cfg, rules, thread_cfg));
@@ -147,7 +147,7 @@ fn pending_done() {
 
 fn audit_dropped(event: AutomationEvent) -> Option<std::thread::JoinHandle<anyhow::Result<()>>> {
     std::thread::Builder::new()
-        .name("automation-drop-audit".into())
+        .name("thegn-auto-drop".into())
         .spawn(move || -> anyhow::Result<()> {
             let result = (|| -> anyhow::Result<()> {
                 let db = thegn_core::db::Db::open()?;

@@ -319,7 +319,7 @@ impl DiscoveryOwner {
         let generation = self.generation;
         let cancel = Arc::clone(&self.cancel);
         let spawned = std::thread::Builder::new()
-            .name("thegn-font-discovery".into())
+            .name("thegn-font-disc".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 // A panic must still deliver a result, or `in_flight` would stay
