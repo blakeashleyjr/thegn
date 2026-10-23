@@ -4,9 +4,30 @@
 
 use anyhow::Result;
 
+/// Outcome of recording a durable usage-alert claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageAlertWrite {
+    Inserted(i64),
+    Updated,
+    Suppressed,
+}
+
 /// Object-safe (`&self` + concrete args), so `&dyn NotificationStore` works for
 /// backend-agnostic consumers. [`crate::db::Db`] is the embedded-SQLite impl.
 pub trait NotificationStore {
+    /// Record or refresh one usage alert. Claims survive restarts and are
+    /// shared by every process using this notification store.
+    fn record_usage_alert(
+        &self,
+        claim_key: &str,
+        account_window: &str,
+        message: &str,
+    ) -> Result<UsageAlertWrite>;
+
+    /// Remove claims for an account window, optionally retaining its current
+    /// claim. Used to re-arm on recovery and to discard prior reset periods.
+    fn rearm_usage_alerts(&self, account_window: &str, keep_claim_key: Option<&str>) -> Result<()>;
+
     /// Append a notification.  Returns the new row id.
     fn put_notification(
         &self,

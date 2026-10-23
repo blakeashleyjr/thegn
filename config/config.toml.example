@@ -4847,12 +4847,14 @@ history_days = 14
 enabled = true
 # Also record to the notification inbox, not just an in-app toast. On by default
 # here (unlike [stats.alerts]): a quota you are about to exhaust is worth finding
-# later, and it fires at most a handful of times a week.
+# later. Each reset period and alert level keeps one inbox row, updated in place.
 notify = true
 # Seconds past a threshold before firing. Usage moves in poll-sized steps, so
 # this is mostly a guard against one bad API response.
 sustain_secs = 0
-# Minimum seconds between repeats of a standing alert. 0 disables repeats.
+# Minimum seconds between in-app toast reminders for a standing alert. Inbox
+# repeats update the existing row in place without changing its read state.
+# 0 disables reminders.
 repeat_secs = 3600
 # Fractional retreat below the threshold required before an alert clears, so a
 # window hovering on the line cannot flap.

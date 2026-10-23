@@ -137,6 +137,38 @@ pub(crate) fn insert_routed(
     Ok(id)
 }
 
+/// Persist a usage alert through its durable claim ledger. Only a fresh claim
+/// creates an automation event or emits routed transient channels.
+pub(crate) fn insert_usage_alert(
+    db: &thegn_core::db::Db,
+    state: &crate::notify::NotifyState,
+    claim_key: &str,
+    account_window: &str,
+    message: &str,
+) -> anyhow::Result<thegn_core::store::UsageAlertWrite> {
+    use thegn_core::store::NotificationStore;
+    let kind = NotificationKind::UsageLimit.as_str();
+    let decision = state.decide(kind, claim_key, message, "");
+    if !decision.record {
+        return Ok(thegn_core::store::UsageAlertWrite::Suppressed);
+    }
+    let result = db.record_usage_alert(claim_key, account_window, message)?;
+    if let thegn_core::store::UsageAlertWrite::Inserted(id) = result {
+        submit_notification(
+            id,
+            kind,
+            claim_key,
+            message,
+            "",
+            decision.effective_priority,
+            EventFacts::default(),
+        );
+        state.emit_sound(&decision);
+        state.emit_push(&decision, kind, claim_key, message, "", "");
+    }
+    Ok(result)
+}
+
 /// Submit a normalized non-notification fact (session, PR, queue, or disk).
 pub fn submit_fact(
     kind: AutomationEventKind,
