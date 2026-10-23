@@ -346,6 +346,10 @@ fn claim_selection(worktree: &str, read: anyhow::Result<Option<String>>) -> Opti
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "SandboxHalt is returned unboxed by every attach/launch gate; boxing here alone would split the convention"
+)]
 fn attach_selection(
     read: anyhow::Result<Option<String>>,
 ) -> Result<Option<String>, crate::agent::SandboxHalt> {
