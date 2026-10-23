@@ -567,8 +567,10 @@ mod tests {
 
     #[test]
     fn stale_notification_hydration_keeps_optimistic_read_until_epoch_commits() {
-        let mut loop_panel = crate::panel::PanelData::default();
-        loop_panel.notifications = vec![notification(1, "cleared", false)];
+        let mut loop_panel = crate::panel::PanelData {
+            notifications: vec![notification(1, "cleared", false)],
+            ..Default::default()
+        };
         loop_panel.mark_read_ids_at(7, [1]);
         assert_eq!(loop_panel.unread_notifications, 0);
 
