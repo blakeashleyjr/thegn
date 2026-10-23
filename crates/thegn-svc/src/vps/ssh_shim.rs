@@ -153,13 +153,13 @@ impl SshShim {
 
     /// The shared ssh option set (control plane): batch, safe multiplexing,
     /// pinned per-instance host key, quiet. Pure over `self` (unit-tested).
-    pub fn base_argv(&self) -> Vec<String> {
+    pub fn base_argv(&self) -> Result<Vec<String>> {
         let control = control_socket_path_for(&self.key_path);
         self.base_argv_with(control.as_deref())
     }
 
-    fn base_argv_with(&self, control: Option<&std::path::Path>) -> Vec<String> {
-        let kh = registry::known_hosts_path(&self.name);
+    fn base_argv_with(&self, control: Option<&std::path::Path>) -> Result<Vec<String>> {
+        let kh = registry::known_hosts_path(&self.name)?;
         // The identity is part of the multiplexing namespace. This is
         // load-bearing for managed-key rotation: a connection made with the
         // old key must never satisfy the replacement-key connectivity proof by
@@ -214,7 +214,7 @@ impl SshShim {
             self.key_path.to_string_lossy().into_owned(),
             format!("{}@{}", self.user, self.ip),
         ]);
-        v
+        Ok(v)
     }
 
     /// Run `full_script` remotely by streaming it to `/bin/sh -s` on **stdin**
@@ -226,7 +226,7 @@ impl SshShim {
     /// channel to multiplex.
     async fn run_raw(&self, full_script: &str) -> Result<(i32, Vec<u8>)> {
         self.prepare_known_hosts()?;
-        let mut argv = self.base_argv();
+        let mut argv = self.base_argv()?;
         argv.push("--".into());
         argv.push("/bin/sh".into());
         argv.push("-s".into());
@@ -285,7 +285,7 @@ impl SshShim {
     ) -> Result<CappedExec> {
         let script = stdin_script(&script_from_argv(argv), cwd, env)?;
         self.prepare_known_hosts()?;
-        let mut ssh_argv = self.base_argv();
+        let mut ssh_argv = self.base_argv()?;
         ssh_argv.push("--".into());
         ssh_argv.push("/bin/sh".into());
         ssh_argv.push("-s".into());
@@ -719,7 +719,7 @@ mod tests {
             key_path: "/state/ssh/sprite_ed25519".into(),
         };
         let control = control_template(std::path::Path::new("/r/tg-ssh"), &shim.key_path).unwrap();
-        let argv = shim.base_argv_with(Some(&control));
+        let argv = shim.base_argv_with(Some(&control)).unwrap();
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         assert!(argv.contains(&"ControlMaster=auto".to_string()));
@@ -728,7 +728,7 @@ mod tests {
         // instance's per-instance known_hosts. Assert against ITS output rather
         // than a literal here (keeps host-key literals out of every file but
         // `hostkey.rs` — the ratchet).
-        let kh = registry::known_hosts_path("tg-dev-x1");
+        let kh = registry::known_hosts_path("tg-dev-x1").unwrap();
         let expected = thegn_core::hostkey::host_key_args(
             thegn_core::hostkey::HostKeyClass::ManagedFresh,
             &thegn_core::hostkey::HostKeyContext {
@@ -790,12 +790,25 @@ mod tests {
             control_socket_path_in(&link, &shim.key_path).is_none(),
             "a symlinked control directory must be refused"
         );
-        let argv = shim.base_argv_with(None);
+        let argv = shim.base_argv_with(None).unwrap();
         assert!(argv.contains(&"ControlMaster=no".to_string()));
         assert!(argv.contains(&"ControlPath=none".to_string()));
         assert!(!argv.contains(&"ControlMaster=auto".to_string()));
         assert!(!argv.contains(&"ControlPersist=90".to_string()));
         assert_eq!(argv.last().unwrap(), "root@203.0.113.7");
+    }
+
+    #[test]
+    fn base_argv_refuses_an_invalid_name() {
+        let shim = SshShim {
+            name: "../x".into(),
+            ip: "203.0.113.7".into(),
+            user: "root".into(),
+            key_path: "/state/ssh/key".into(),
+        };
+
+        assert!(shim.base_argv_with(None).is_err());
+        assert!(shim.base_argv().is_err());
     }
 
     #[test]
