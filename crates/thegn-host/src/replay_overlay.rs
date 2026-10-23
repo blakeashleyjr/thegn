@@ -602,40 +602,38 @@ impl SearchWorker {
         let state = Arc::new((Mutex::new(SearchWorkerState::default()), Condvar::new()));
         let thread_state = state.clone();
         let (result_tx, results) = mpsc::sync_channel(1);
-        match std::thread::Builder::new()
-            .name("thegn-replay-sr".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                loop {
-                    let job = {
-                        let (lock, cv) = &*thread_state;
-                        let mut guard = lock
-                            .lock()
+        match thegn_core::thread_name::try_spawn_named("thegn-replay-sr", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            loop {
+                let job = {
+                    let (lock, cv) = &*thread_state;
+                    let mut guard = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while guard.pending.is_none() && !guard.stopped {
+                        guard = cv
+                            .wait(guard)
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        while guard.pending.is_none() && !guard.stopped {
-                            guard = cv
-                                .wait(guard)
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        }
-                        if guard.stopped {
-                            return;
-                        }
-                        guard.pending.take().expect("pending job checked")
-                    };
-                    let result =
-                        job.snapshot
-                            .search(&job.query, job.from_ms, job.reverse, &job.cancelled);
-                    if result != SearchResult::Cancelled
-                        && !job.cancelled.load(Ordering::Relaxed)
-                        && result_tx
-                            .send((job.generation, job.recording_version, job.query, result))
-                            .is_ok()
-                        && let Err(error) = waker.wake()
-                    {
-                        tracing::debug!(%error, "could not wake loop for replay search result");
                     }
+                    if guard.stopped {
+                        return;
+                    }
+                    guard.pending.take().expect("pending job checked")
+                };
+                let result =
+                    job.snapshot
+                        .search(&job.query, job.from_ms, job.reverse, &job.cancelled);
+                if result != SearchResult::Cancelled
+                    && !job.cancelled.load(Ordering::Relaxed)
+                    && result_tx
+                        .send((job.generation, job.recording_version, job.query, result))
+                        .is_ok()
+                    && let Err(error) = waker.wake()
+                {
+                    tracing::debug!(%error, "could not wake loop for replay search result");
                 }
-            }) {
+            }
+        }) {
             Ok(_) => {}
             Err(error) => {
                 tracing::debug!(%error, "could not spawn replay search worker");

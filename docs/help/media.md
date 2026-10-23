@@ -62,6 +62,10 @@ local player, without leaving the compositor. Hidden unless
   state”. A read that does not answer within two seconds reports “Media
   operation timed out”. A control that was sent is not reported as timed out
   because a read after it was slow.
+- With MPD, a control whose command the server does not permit for this
+  connection (for example, under a restricted password) is not sent. Shuffle,
+  loop, volume and seek report “This player does not support that control”;
+  play/pause, next and previous report “Media operation failed”.
 - When reading the player fails, the last track stays visible with a dim
   `stale` marker for up to three poll periods or ten seconds, whichever is
   longer; the status-bar badge turns amber and says `stale` for the same period.

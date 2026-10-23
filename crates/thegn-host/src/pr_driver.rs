@@ -315,14 +315,10 @@ pub(crate) fn drive_queue(
                     describe(&e)
                 );
                 tracing::warn!(target: "thegn::prq", "{msg}");
-                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                let _ = db.update_pr_status(
-                    &item.key,
-                    &current_status(db, &item.key),
-                    None,
-                    Some(&msg),
-                    None,
-                );
+                // best-effort: cache write: the note is a cache; the status column is never written on a failed fetch
+                if let Err(error) = db.update_pr_detail(&item.key, &msg) {
+                    tracing::debug!(target: "thegn::prq", %error, "could not persist forge fetch retry note");
+                }
                 out.warnings.push(msg);
                 continue;
             }
@@ -920,7 +916,7 @@ pub(crate) fn drive_queue(
                 };
                 step(PrqStatus::AgentRunning.as_str(), &note, &mut progress);
 
-                crate::agent_run::run_outcome_cancellable(
+                let verdict = crate::agent_run::run_outcome_cancellable(
                     &crate::agent_run::AgentTaskRun {
                         kind,
                         worktree: wt,
@@ -933,6 +929,10 @@ pub(crate) fn drive_queue(
                     },
                     guard.cancel_flag(),
                 );
+                if let Some(warning) = agent_not_started_warning(item.number, &verdict) {
+                    tracing::warn!(target: "thegn::prq", pr = item.number, "{warning}");
+                    out.warnings.push(warning);
+                }
 
                 let fresh = authorship.as_ref().and_then(|_| {
                     forge
@@ -1480,6 +1480,16 @@ fn format_threads(threads: &[ReviewThreadRow]) -> String {
         out.push_str("  (no unresolved threads found)\n");
     }
     out
+}
+
+/// The warning for a PR-queue agent that never started (an infrastructure failure, not a code result).
+fn agent_not_started_warning(
+    number: u64,
+    verdict: &crate::agent_run::AgentRunVerdict,
+) -> Option<String> {
+    verdict.not_started().map(|reason| {
+        format!("PR #{number}: agent did not start: {reason}; the attempt was still counted")
+    })
 }
 
 #[cfg(test)]
@@ -2854,6 +2864,65 @@ mod tests {
     }
 
     #[test]
+    fn fetch_failure_never_writes_status() {
+        let (dir, db) = temp_db("prq-hold");
+        let saved = saved_bound_item(
+            &dir,
+            &db,
+            PrItem {
+                key: String::new(),
+                number: 8754,
+                pr_url: Some("https://github.com/me/repo/pull/8754".into()),
+                ..item()
+            },
+        );
+        db.update_pr_status(
+            &saved.key,
+            PrqStatus::NeedsHuman.as_str(),
+            Some("ci"),
+            Some("held by a human"),
+            None,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(dir.path().join("prq-hold.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE status_writes(n INTEGER);
+             CREATE TRIGGER count_status_writes AFTER UPDATE OF status ON pr_queue
+             BEGIN INSERT INTO status_writes VALUES (1); END;",
+        )
+        .unwrap();
+
+        drive_queue(
+            &cfg(),
+            &Config::default(),
+            &FakeForge::new(None),
+            Path::new("/repo"),
+            &db,
+            vec![saved.clone()],
+            |_| {},
+        );
+
+        let status_writes = conn
+            .query_row("SELECT COUNT(*) FROM status_writes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(
+            status_writes, 0,
+            "fetch failure must not issue UPDATE OF status"
+        );
+        let row = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == saved.key)
+            .unwrap();
+        assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+        assert!(row.detail.as_deref().unwrap().starts_with("PR #8754: "));
+    }
+
+    #[test]
     fn explicit_review_watch_is_required_for_deep_fetch() {
         let (dir, db) = temp_db("prq-review-filter");
         let forge = FakeForge::new(Some(requested_pr()))
@@ -4081,5 +4150,46 @@ mod tests {
         assert_eq!(row.agent_attempts, 1);
         assert_eq!(out.warnings.len(), 1, "{out:?}");
         assert!(out.warnings[0].contains("lost its lease"), "{out:?}");
+    }
+
+    #[test]
+    fn agent_not_started_warning_names_the_reason() {
+        let warning = agent_not_started_warning(
+            7,
+            &crate::agent_run::AgentRunVerdict::NotStarted("sandbox entry refused".into()),
+        );
+
+        assert!(warning.is_some_and(|warning| {
+            warning.contains("PR #7: agent did not start: sandbox entry refused")
+        }));
+    }
+
+    #[test]
+    fn agent_not_started_warning_is_silent_for_runs_that_started() {
+        for verdict in [
+            crate::agent_run::AgentRunVerdict::Exited(Some(0)),
+            crate::agent_run::AgentRunVerdict::Exited(Some(1)),
+            crate::agent_run::AgentRunVerdict::Exited(None),
+            crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
+        ] {
+            assert_eq!(agent_not_started_warning(7, &verdict), None);
+        }
+    }
+
+    #[test]
+    fn agent_not_started_verdict_is_consumed_by_the_pr_queue() {
+        let source = include_str!("pr_driver.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test module boundary exists")
+            .0;
+        let run_call = production
+            .find("let verdict = crate::agent_run::run_outcome_cancellable(")
+            .expect("PR queue binds the agent run verdict");
+        let warning_call = production
+            .find("agent_not_started_warning(item.number, &verdict)")
+            .expect("PR queue turns NotStarted into a warning");
+
+        assert!(warning_call > run_call);
     }
 }

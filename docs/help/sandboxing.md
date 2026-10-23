@@ -576,6 +576,9 @@ appear as a status-line toast; the same halt is shown once until it clears or
 its message changes. When deleting a worktree cannot recycle a claimed spare,
 its ledger row remains until the provider confirms destruction, so a failed
 destroy leaves it listed for a later retry.
+A stale or released spare is recycled from its base checkpoint only when the
+provider's checkpoint list confirms that checkpoint exists; if the list cannot
+be read, the spare is destroyed instead.
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and
 quarantined spares under `Warm pool (provider spares needing review)`; it will

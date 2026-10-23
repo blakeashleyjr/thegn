@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression coverage for the justfile's repository backend overlay writer."""
 
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -59,6 +60,14 @@ def make_repo(root: Path) -> tuple[Path, Path]:
     return worktree, home
 
 
+def staged_leftovers(directory: Path) -> list[Path]:
+    return [
+        path
+        for path in directory.glob(".config.toml.*")
+        if path.name != ".config.toml.lock"
+    ]
+
+
 def main() -> None:
     if shutil.which("just") is None:
         raise SystemExit("test-apply-backend requires just on PATH")
@@ -90,6 +99,35 @@ def main() -> None:
             assert overlay.is_symlink()
             assert target.read_bytes() == b'theme = "target"\n'
             print("apply-backend podman symlink refusal passed")
+
+            # The recipe checks an overlay symlink before config problems, then
+            # checks config before refusing hand-written overlay contents.
+            overlay.unlink()
+            overlay.write_bytes(original)
+            precedence_cfg = home / ".config" / "thegn" / "config.toml"
+            precedence_cfg.parent.mkdir(parents=True)
+            precedence_target = root / "precedence-config-target.toml"
+            precedence_target.write_bytes(b'theme = "target"\n')
+            precedence_cfg.symlink_to(precedence_target)
+            result = run_backend(worktree, home)
+            assert result.returncode != 0, result.stdout + result.stderr
+            assert "config.toml is a symlink" in result.stderr
+            assert "user-managed content" not in result.stderr
+            assert overlay.read_bytes() == original
+            assert precedence_target.read_bytes() == b'theme = "target"\n'
+            precedence_cfg.unlink()
+            precedence_target.unlink()
+
+            overlay.unlink()
+            precedence_target.write_bytes(b'theme = "target"\n')
+            overlay.symlink_to(target)
+            precedence_cfg.symlink_to(precedence_target)
+            result = run_backend(worktree, home)
+            assert result.returncode != 0, result.stdout + result.stderr
+            assert ".thegn.toml" in result.stderr and "symlink" in result.stderr
+            precedence_cfg.unlink()
+            overlay.unlink()
+            overlay.write_bytes(original)
 
             # A two-line overlay from the prior recipe is generated content.
             overlay.unlink()
@@ -130,7 +168,7 @@ def main() -> None:
         assert "Traceback" not in result.stderr
         assert invalid_cfg.read_bytes() == b"[broken\n"
         assert not (invalid_repo / ".thegn.toml").exists()
-        assert not list(invalid_cfg.parent.glob(".config.toml.*"))
+        assert not staged_leftovers(invalid_cfg.parent)
         print("apply-backend sprites invalid-config refusal passed")
 
         duplicate_root = root / "sprites-duplicate-table"
@@ -144,7 +182,7 @@ def main() -> None:
         assert result.returncode != 0, result.stdout + result.stderr
         assert duplicate_cfg.read_bytes() == duplicate_bytes
         assert not (duplicate_repo / ".thegn.toml").exists()
-        assert not list(duplicate_cfg.parent.glob(".config.toml.*"))
+        assert not staged_leftovers(duplicate_cfg.parent)
         print("apply-backend sprites duplicate-table refusal passed")
 
         if os.geteuid() == 0:
@@ -159,7 +197,7 @@ def main() -> None:
                 assert result.returncode != 0, result.stdout + result.stderr
                 readonly_cfg = readonly_home / ".config" / "thegn" / "config.toml"
                 assert not readonly_cfg.exists()
-                assert not list(readonly_cfg.parent.glob(".config.toml.*"))
+                assert not staged_leftovers(readonly_cfg.parent)
                 print("apply-backend sprites overlay-stage failure leaves config absent")
             finally:
                 os.chmod(readonly_repo, 0o755)
@@ -188,8 +226,35 @@ def main() -> None:
         assert valid_overlay.read_bytes() == overlay_bytes
         assert valid_cfg.stat().st_mtime_ns == cfg_mtime
         assert valid_overlay.stat().st_mtime_ns == overlay_mtime
-        assert not list(valid_cfg.parent.glob(".config.toml.*"))
+        assert not staged_leftovers(valid_cfg.parent)
         print("apply-backend sprites valid-config and identical-rerun passed")
+
+        already_scaffolded_root = root / "sprites-config-already-scaffolded"
+        already_scaffolded_root.mkdir()
+        already_repo, already_home = make_repo(already_scaffolded_root)
+        already_cfg = already_home / ".config" / "thegn" / "config.toml"
+        already_cfg.parent.mkdir(parents=True)
+        already_cfg.write_bytes(b"[env.sprites]\n")
+        result = run_backend(already_repo, already_home, "sprites", sprites_env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (already_repo / ".thegn.toml").read_bytes() == b'env = "sprites"\n'
+        assert not (already_cfg.parent / ".config.toml.lock").exists()
+        print("apply-backend sprites existing-config path skips writer lock passed")
+
+        dangling_root = root / "sprites-dangling-config-link"
+        dangling_root.mkdir()
+        dangling_repo, dangling_home = make_repo(dangling_root)
+        dangling_cfg = dangling_home / ".config" / "thegn" / "config.toml"
+        dangling_cfg.parent.mkdir(parents=True)
+        dangling_cfg.symlink_to(dangling_root / "missing-target.toml")
+        result = run_backend(dangling_repo, dangling_home, "sprites", sprites_env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not dangling_cfg.is_symlink()
+        assert (
+            tomllib.loads(dangling_cfg.read_text())["env"]["sprites"]["provider"]["provider"]
+            == "sprites"
+        )
+        print("apply-backend sprites dangling config symlink follows recipe existence check passed")
 
         absent_root = root / "sprites-absent-config"
         absent_root.mkdir()
@@ -199,7 +264,7 @@ def main() -> None:
         absent_cfg = absent_home / ".config" / "thegn" / "config.toml"
         assert tomllib.loads(absent_cfg.read_text())["env"]["sprites"]["provider"]["provider"] == "sprites"
         assert stat.S_IMODE(absent_cfg.stat().st_mode) == 0o600
-        assert not list(absent_cfg.parent.glob(".config.toml.*"))
+        assert not staged_leftovers(absent_cfg.parent)
         print("apply-backend sprites absent-config scaffold passed")
 
         symlink_root = root / "sprites-symlink-config"
@@ -216,8 +281,168 @@ def main() -> None:
         assert symlink_cfg.is_symlink()
         assert config_target.read_bytes() == config_bytes
         assert not (symlink_repo / ".thegn.toml").exists()
-        assert not list(symlink_cfg.parent.glob(".config.toml.*"))
+        assert not staged_leftovers(symlink_cfg.parent)
         print("apply-backend sprites symlink-config refusal passed")
+
+        lock_root = root / "sprites-held-writer-lock"
+        lock_root.mkdir()
+        lock_repo, lock_home = make_repo(lock_root)
+        lock_cfg = lock_home / ".config" / "thegn" / "config.toml"
+        lock_cfg.parent.mkdir(parents=True)
+        lock_original = b'theme = "keep"\n'
+        lock_cfg.write_bytes(lock_original)
+        lock_path = lock_cfg.parent / ".config.toml.lock"
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            result = run_backend(lock_repo, lock_home, "sprites", sprites_env)
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "another thegn writer" in result.stderr
+        assert lock_cfg.read_bytes() == lock_original
+        assert not (lock_repo / ".thegn.toml").exists()
+        print("apply-backend sprites held writer lock refusal passed")
+
+        changed_root = root / "sprites-overlay-generation-change"
+        changed_root.mkdir()
+        changed_repo, changed_home = make_repo(changed_root)
+        changed_cfg = changed_home / ".config" / "thegn" / "config.toml"
+        changed_cfg.parent.mkdir(parents=True)
+        changed_original = b'theme = "preserve"\n'
+        changed_cfg.write_bytes(changed_original)
+        result = run_backend(
+            changed_repo,
+            changed_home,
+            "sprites",
+            {**sprites_env, "THEGN_APPLY_BACKEND_TOUCH_OVERLAY": "1"},
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "changed while staging" in result.stderr
+        assert changed_cfg.read_bytes() == changed_original
+        assert (changed_repo / ".thegn.toml").read_bytes() == b"# concurrent edit\n"
+        assert not staged_leftovers(changed_cfg.parent)
+        print("apply-backend sprites overlay generation check and config rollback passed")
+
+        failure_root = root / "sprites-overlay-install-failure"
+        failure_root.mkdir()
+        failure_repo, failure_home = make_repo(failure_root)
+        failure_cfg = failure_home / ".config" / "thegn" / "config.toml"
+        failure_cfg.parent.mkdir(parents=True)
+        failure_original = b'theme = "preserve"\n'
+        failure_cfg.write_bytes(failure_original)
+        os.utime(failure_cfg, ns=(1_600_000_000_123_456_789, 1_600_000_000_123_456_789))
+        failure_mode = stat.S_IMODE(failure_cfg.stat().st_mode)
+        failure_mtime = failure_cfg.stat().st_mtime_ns
+        result = run_backend(
+            failure_repo,
+            failure_home,
+            "sprites",
+            {**sprites_env, "THEGN_APPLY_BACKEND_FAIL": "overlay-install"},
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "restored the prior config state" in result.stderr
+        assert failure_cfg.read_bytes() == failure_original
+        assert stat.S_IMODE(failure_cfg.stat().st_mode) == failure_mode
+        assert failure_cfg.stat().st_mtime_ns == failure_mtime
+        assert not (failure_repo / ".thegn.toml").exists()
+        assert not staged_leftovers(failure_cfg.parent)
+        print("apply-backend sprites overlay-install rollback preserves bytes and mode passed")
+
+        absent_failure_root = root / "sprites-overlay-install-failure-absent-config"
+        absent_failure_root.mkdir()
+        absent_failure_repo, absent_failure_home = make_repo(absent_failure_root)
+        result = run_backend(
+            absent_failure_repo,
+            absent_failure_home,
+            "sprites",
+            {**sprites_env, "THEGN_APPLY_BACKEND_FAIL": "overlay-install"},
+        )
+        absent_failure_cfg = absent_failure_home / ".config" / "thegn" / "config.toml"
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "restored the prior config state" in result.stderr
+        assert not absent_failure_cfg.exists()
+        assert not (absent_failure_repo / ".thegn.toml").exists()
+        assert not staged_leftovers(absent_failure_cfg.parent)
+        print("apply-backend sprites overlay-install rollback removes new config passed")
+
+        no_scaffold_failure_root = root / "sprites-overlay-install-failure-existing-scaffold"
+        no_scaffold_failure_root.mkdir()
+        no_scaffold_failure_repo, no_scaffold_failure_home = make_repo(
+            no_scaffold_failure_root
+        )
+        no_scaffold_failure_cfg = (
+            no_scaffold_failure_home / ".config" / "thegn" / "config.toml"
+        )
+        no_scaffold_failure_cfg.parent.mkdir(parents=True)
+        no_scaffold_original = b"[env.sprites]\n"
+        no_scaffold_failure_cfg.write_bytes(no_scaffold_original)
+        result = run_backend(
+            no_scaffold_failure_repo,
+            no_scaffold_failure_home,
+            "sprites",
+            {**sprites_env, "THEGN_APPLY_BACKEND_FAIL": "overlay-install"},
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "could not install staged overlay" in result.stderr
+        assert "restored the prior config state" in result.stderr
+        assert no_scaffold_failure_cfg.read_bytes() == no_scaffold_original
+        assert not (no_scaffold_failure_repo / ".thegn.toml").exists()
+        print("apply-backend no-scaffold overlay failure keeps recipe refusal text passed")
+
+        fsync_root = root / "sprites-overlay-dir-fsync-failure"
+        fsync_root.mkdir()
+        fsync_repo, fsync_home = make_repo(fsync_root)
+        fsync_cfg = fsync_home / ".config" / "thegn" / "config.toml"
+        fsync_cfg.parent.mkdir(parents=True)
+        fsync_original = b'theme = "keep"\n'
+        fsync_cfg.write_bytes(fsync_original)
+        result = run_backend(
+            fsync_repo,
+            fsync_home,
+            "sprites",
+            {**sprites_env, "THEGN_APPLY_BACKEND_FAIL": "overlay-dir-fsync"},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (
+            "overlay was installed but its directory could not be synced" in result.stderr
+        )
+        assert (fsync_repo / ".thegn.toml").read_bytes() == b'env = "sprites"\n'
+        assert fsync_cfg.read_bytes().startswith(fsync_original)
+        print("apply-backend overlay rename remains committed after directory fsync failure passed")
+
+        git_error_root = root / "not-a-git-repository"
+        git_error_root.mkdir()
+        git_error = subprocess.run(
+            ["python3", "-B", str(REPO / "scripts" / "apply_backend.py"), "podman"],
+            cwd=git_error_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert git_error.returncode != 0
+        assert "not a git repository" in git_error.stderr
+        print("apply-backend git failure preserves git stderr passed")
+
+        for backend in ("podman", "docker", "apple", "bwrap", "systemd", "none"):
+            backend_root = root / f"backend-{backend}"
+            backend_root.mkdir()
+            backend_repo, backend_home = make_repo(backend_root)
+            result = run_backend(backend_repo, backend_home, backend)
+            expected_backend = f'[sandbox]\nbackend = "{backend}"\n'.encode()
+            backend_overlay = backend_repo / ".thegn.toml"
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert backend_overlay.read_bytes() == expected_backend
+            assert tomllib.loads(backend_overlay.read_text()) == {"sandbox": {"backend": backend}}
+        print("apply-backend every sandbox backend overlay passed")
+
+        empty_root = root / "empty-backend-no-op"
+        empty_root.mkdir()
+        empty_repo, empty_home = make_repo(empty_root)
+        empty_overlay = empty_repo / ".thegn.toml"
+        empty_original = b'theme = "hand-written"\n'
+        empty_overlay.write_bytes(empty_original)
+        result = run_backend(empty_repo, empty_home, "")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert empty_overlay.read_bytes() == empty_original
+        print("apply-backend empty backend no-op passed")
 
         assert os.path.lexists(REAL_REPO_OVERLAY) == real_overlay_was_present
 

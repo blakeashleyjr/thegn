@@ -945,8 +945,16 @@ pub(crate) fn load_or_seed_session(
     // the cwd fallback. Honour the removal — run it only as a transient live
     // fallback, never re-registering it in `workspaces` or re-pinning it active
     // — so "remove workspace" sticks instead of resurrecting on the next launch.
-    let tombstoned = db.workspace_tombstoned(&session.id).unwrap_or(false);
-    if !tombstoned && Path::new(&session.id).is_dir() {
+    // An unreadable removal record is treated like a removal.
+    let registration = startup_registration(
+        db.workspace_tombstoned(&session.id),
+        Path::new(&session.id).is_dir(),
+    );
+    if let StartupRegistration::Unknown(reason) = &registration {
+        tracing::warn!(target: "thegn::session", workspace = %session.id,
+            "could not read the workspace removal record ({reason}); running it as a transient workspace without re-registering it");
+    }
+    if registration == StartupRegistration::Register {
         let (name, kind) = crate::workspace_identity::workspace_identity(&session.id, None);
         let repo_path = session.id.clone();
         // These are cache writes; the session returned to startup does not
@@ -965,6 +973,28 @@ pub(crate) fn load_or_seed_session(
         });
     }
     (session, seeded)
+}
+
+/// What the startup path may do with the resolved workspace directory.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupRegistration {
+    /// Not removed and a real directory: register it and pin it active.
+    Register,
+    /// The user removed it: run it as a transient live fallback only.
+    Removed,
+    /// Not a directory: nothing to register.
+    NotADir,
+    /// The removal record could not be read: treat it like `Removed` (fail closed).
+    Unknown(String),
+}
+
+fn startup_registration(tombstoned: anyhow::Result<bool>, is_dir: bool) -> StartupRegistration {
+    match (tombstoned, is_dir) {
+        (_, false) => StartupRegistration::NotADir,
+        (Ok(true), true) => StartupRegistration::Removed,
+        (Ok(false), true) => StartupRegistration::Register,
+        (Err(error), true) => StartupRegistration::Unknown(format!("{error:#}")),
+    }
 }
 
 /// The identity the loop's switch detection and the switch cache key on.
