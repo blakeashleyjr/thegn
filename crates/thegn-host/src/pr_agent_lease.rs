@@ -5,13 +5,30 @@ use std::time::Duration;
 
 use thegn_core::db::Db;
 use thegn_core::pr_queue::{
-    PR_AGENT_MAX_LEASE_MS, PrAgentAdmit, PrAgentLease, PrAgentLeaseView, PrAgentRefusal,
+    PR_AGENT_MAX_LEASE_MS, PrAgentAdmit, PrAgentLease, PrAgentLeaseView, PrAgentRefusal, PrqStatus,
     expired_pr_agent_detail, pr_agent_lease_live,
 };
 use thegn_core::store::WorktreeAuxStore;
 
 const LEASE_MS: i64 = PR_AGENT_MAX_LEASE_MS - 10_000;
 const RENEW_EVERY: Duration = Duration::from_secs(60);
+
+/// What a not-started PR agent's release did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NotStartedRelease {
+    Refunded,
+    RefundFailed(String),
+    LeaseLost,
+}
+
+/// The row detail for an agent that never started (same wording as the merge queue).
+pub(crate) fn not_started_detail(reason: &str, refund_failed: bool) -> String {
+    if refund_failed {
+        format!("agent did not start: {reason}; held (attempt refund failed)")
+    } else {
+        format!("agent did not start: {reason}; held, no attempt spent")
+    }
+}
 
 fn heartbeat_failure_is_terminal(error: &anyhow::Error, lease_until_ms: i64, now_ms: i64) -> bool {
     error
@@ -140,6 +157,32 @@ impl PrAgentGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         db.release_pr_agent(&lease, finished)
+    }
+
+    pub(crate) fn finish_not_started(mut self, db: &Db, reason: &str) -> NotStartedRelease {
+        self.stop_heartbeat();
+        if self.lost.load(Ordering::Acquire) {
+            return NotStartedRelease::LeaseLost;
+        }
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = PrqStatus::NeedsHuman.as_str();
+        let detail = not_started_detail(reason, false);
+        let refund_error = match db.refund_pr_agent_attempt(&lease, status, &detail) {
+            Ok(true) => return NotStartedRelease::Refunded,
+            Ok(false) => "the lease no longer matched".to_string(),
+            Err(error) => error.to_string(),
+        };
+        let failed_detail = not_started_detail(reason, true);
+        match db.release_pr_agent(&lease, Some((status, &failed_detail))) {
+            Ok(true) => NotStartedRelease::RefundFailed(refund_error),
+            Ok(false) => NotStartedRelease::LeaseLost,
+            Err(error) => NotStartedRelease::RefundFailed(format!(
+                "{refund_error}; release also failed: {error}"
+            )),
+        }
     }
 
     fn stop_heartbeat(&mut self) {
@@ -533,5 +576,106 @@ mod tests {
             own_head_record_warning(7, Err(anyhow::anyhow!("injected database failure"))).unwrap();
         assert!(warning.contains("could not be recorded under its lease"));
         assert!(warning.contains("injected database failure"));
+    }
+
+    #[test]
+    fn not_started_detail_matches_the_merge_queue_wording() {
+        assert_eq!(
+            not_started_detail("sandbox entry refused", false),
+            "agent did not start: sandbox entry refused; held, no attempt spent"
+        );
+        assert_eq!(
+            not_started_detail("sandbox entry refused", true),
+            "agent did not start: sandbox entry refused; held (attempt refund failed)"
+        );
+    }
+
+    #[test]
+    fn finish_not_started_refunds_under_a_live_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("pr-agent.db")).unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            1,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/1",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let request = PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-a",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = PrAgentGuard::admit(&db, &request).unwrap().unwrap();
+
+        assert_eq!(
+            guard.finish_not_started(&db, "sandbox entry refused"),
+            NotStartedRelease::Refunded
+        );
+        let held = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(held.agent_attempts, 0);
+        assert_eq!(held.status, PrqStatus::NeedsHuman.as_str());
+    }
+
+    #[test]
+    fn finish_not_started_holds_the_row_when_refund_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pr-agent.db");
+        let db = Db::open_at(&path).unwrap();
+        db.enqueue_bound_pr(
+            "/repo",
+            1,
+            Some("/repo/wt"),
+            "feature",
+            "main",
+            "github",
+            "https://github.com/me/repo/pull/1",
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let request = PrAgentAdmit {
+            key: &row.key,
+            expected_attempts: 0,
+            expected_checkout_gen: row.checkout_gen,
+            max_attempts: 3,
+            head: "head-a",
+            blocker: "ci",
+            detail: "dispatch",
+            lease_until_ms: lease_until_ms(),
+            owner_hint: Some("test"),
+            ci_candidate: None,
+        };
+        let guard = PrAgentGuard::admit(&db, &request).unwrap().unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER deny_attempt_refund BEFORE UPDATE OF agent_attempts ON pr_queue
+                 BEGIN SELECT RAISE(ABORT, 'refund denied'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            guard.finish_not_started(&db, "sandbox entry refused"),
+            NotStartedRelease::RefundFailed(error) if error.contains("refund denied")
+        ));
+        let held = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(held.agent_attempts, 1);
+        assert_eq!(held.status, PrqStatus::NeedsHuman.as_str());
+        assert!(
+            held.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("attempt refund failed"))
+        );
     }
 }
