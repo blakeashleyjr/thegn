@@ -44,6 +44,7 @@ pub const CONTROLLER_KEY: &str = "tg-ctl";
 const MAX_INVENTORY_PAGES: u32 = 50;
 const MAX_INVENTORY_ROWS: usize = 10_000;
 const INVENTORY_BUDGET: Duration = Duration::from_secs(120);
+const DESTROY_ATTEMPTS: u32 = 3;
 
 /// One validated provider inventory page.
 pub struct InventoryPage<T> {
@@ -680,6 +681,48 @@ impl VpsProvider {
             .find(|s| s.name == name))
     }
 
+    /// Confirm that a deleted instance is absent from the complete managed inventory.
+    async fn confirm_absent(&self, name: &str, instance_id: &str) -> Result<()> {
+        for check_attempt in 0..DESTROY_ATTEMPTS {
+            let inventory = self.list_detailed().await.map_err(|error| {
+                tracing::debug!(
+                    target: "thegn::vps",
+                    %error,
+                    name,
+                    "could not confirm VPS absence from provider inventory"
+                );
+                anyhow!("vps destroy {name}: cannot confirm the instance is gone (provider inventory lookup failed); keeping the ledger record and SSH custody")
+            })?;
+
+            let still_has_instance_id = inventory.iter().any(|instance| instance.id == instance_id);
+            if !still_has_instance_id && !inventory.iter().any(|instance| instance.name == name) {
+                return Ok(());
+            }
+
+            if !still_has_instance_id
+                && let Some(instance) = inventory.iter().find(|instance| instance.name == name)
+            {
+                let listed_id = instance.id.clone();
+                if let Some(mut record) = registry::read(name) {
+                    record.instance_id.clone_from(&listed_id);
+                    registry::write(&record)
+                        .context("vps: retarget registry record to listed instance")?;
+                }
+                return Err(anyhow!(
+                    "vps destroy {name}: provider still lists an instance of this name under vendor id {listed_id}; retargeting the next destroy while keeping the ledger record and SSH custody"
+                ));
+            }
+
+            if check_attempt + 1 < DESTROY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+
+        Err(anyhow!(
+            "vps destroy {name}: the provider accepted the delete but still lists the instance; keeping the ledger record and SSH custody until a later destroy or reaper pass confirms it is gone"
+        ))
+    }
+
     /// Ensure the managed public key is registered, returning its vendor id;
     /// the existing-key lookup sees a complete inventory or returns Err.
     async fn ensure_ssh_key(&self) -> Result<i64> {
@@ -1241,7 +1284,6 @@ impl RemoteProvider for VpsProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            const DESTROY_ATTEMPTS: u32 = 3;
             registry::checked_name(id)?;
             let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
             thegn_core::managed_ssh::read(self.spec.kind.as_str(), &custody_account, id)
@@ -1289,27 +1331,7 @@ impl RemoteProvider for VpsProvider {
                         .status()
                 };
                 if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                    let mut confirmed_absent = false;
-                    for check_attempt in 0..DESTROY_ATTEMPTS {
-                        let inventory = self.list_detailed().await.map_err(|_| {
-                            anyhow!("vps destroy {id}: cannot confirm the instance is gone (provider inventory lookup failed); keeping the ledger record and SSH custody")
-                        })?;
-                        if !inventory
-                            .iter()
-                            .any(|instance| instance.id == iid || instance.name == id)
-                        {
-                            confirmed_absent = true;
-                            break;
-                        }
-                        if check_attempt + 1 < DESTROY_ATTEMPTS {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                    }
-                    if !confirmed_absent {
-                        return Err(anyhow!(
-                            "vps destroy {id}: the provider accepted the delete but still lists the instance; keeping the ledger record and SSH custody until a later destroy or reaper pass confirms it is gone"
-                        ));
-                    }
+                    self.confirm_absent(id, &iid).await?;
                     registry::remove(id);
                     thegn_core::managed_ssh::record_revoked(
                         self.spec.kind.as_str(),
@@ -1938,6 +1960,7 @@ mod tests {
     async fn fake_hetzner_server(
         delete_status: u16,
         still_listed: bool,
+        listed_id: u64,
         list_status: u16,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1963,11 +1986,13 @@ mod tests {
                         let (code, servers, total) = if list_status == 200 && still_listed {
                             (
                                 list_status,
-                                r#"[{"id":42,"name":"tg-vps-destroy-proof","status":"running","labels":{}}]"#,
+                                format!(
+                                    r#"[{{"id":{listed_id},"name":"tg-vps-destroy-proof","status":"running","labels":{{}}}}]"#
+                                ),
                                 1,
                             )
                         } else {
-                            (list_status, "[]", 0)
+                            (list_status, "[]".to_string(), 0)
                         };
                         let body = if code == 200 {
                             format!(
@@ -2032,7 +2057,7 @@ mod tests {
         let _state = thegn_core::testenv::IsolatedState::new();
         let name = "tg-vps-destroy-proof";
         write_destroy_test_record(name);
-        let (base, _server) = fake_hetzner_server(200, true, 200).await;
+        let (base, _server) = fake_hetzner_server(200, true, 42, 200).await;
         let provider = destroy_test_provider(name, base);
 
         let error = match provider.destroy(name).await {
@@ -2051,7 +2076,7 @@ mod tests {
         let _state = thegn_core::testenv::IsolatedState::new();
         let name = "tg-vps-destroy-proof";
         write_destroy_test_record(name);
-        let (base, _server) = fake_hetzner_server(404, false, 500).await;
+        let (base, _server) = fake_hetzner_server(404, false, 42, 500).await;
         let provider = destroy_test_provider(name, base);
 
         let error = match provider.destroy(name).await {
@@ -2074,11 +2099,33 @@ mod tests {
         let _state = thegn_core::testenv::IsolatedState::new();
         let name = "tg-vps-destroy-proof";
         write_destroy_test_record(name);
-        let (base, _server) = fake_hetzner_server(200, false, 200).await;
+        let (base, _server) = fake_hetzner_server(200, false, 42, 200).await;
         let provider = destroy_test_provider(name, base);
 
         // Positive control: this also passes before the absence-proof change.
         assert!(provider.destroy(name).await.is_ok());
         assert!(registry::read(name).is_none());
+    }
+
+    #[tokio::test]
+    async fn destroy_retargets_stale_registry_id_to_same_named_instance() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-vps-destroy-proof";
+        write_destroy_test_record(name);
+        let (base, _server) = fake_hetzner_server(404, true, 84, 200).await;
+        let provider = destroy_test_provider(name, base);
+
+        let error = match provider.destroy(name).await {
+            Ok(()) => {
+                panic!("destroy must retain the ledger while the same-named instance remains")
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("retargeting the next destroy"));
+        assert_eq!(
+            registry::read(name).map(|record| record.instance_id),
+            Some("84".into()),
+            "a name match under a different vendor id retargets the next destroy"
+        );
     }
 }
