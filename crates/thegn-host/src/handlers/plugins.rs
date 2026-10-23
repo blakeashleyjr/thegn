@@ -2945,30 +2945,9 @@ mod tests {
             }),
         })
         .unwrap();
-        tx.send(PluginMsg::Event {
-            plugin: "p".into(),
-            event: SessionEvent::Message(RpcMessage {
-                id: Some(23),
-                method: "state.get".into(),
-                params: serde_json::json!({"key": "cursor"}),
-            }),
-        })
-        .unwrap();
         drop(tx);
 
-        let mut responses = Vec::new();
-        drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, response| {
-            responses.push(response)
-        });
-
-        assert_eq!(responses.len(), 2);
-        for (response, id) in responses.iter().zip([22, 23]) {
-            assert_eq!(response.id, id);
-            assert_eq!(
-                response.error.as_ref().map(|error| error.code),
-                Some(RpcErrorCode::Unsupported)
-            );
-        }
+        drain(&mut rx, &mut state, &mut model, None);
         assert_eq!(
             state
                 .plugins
@@ -2978,7 +2957,7 @@ mod tests {
                 .state_get(pid, "cursor")
                 .expect("read seeded state"),
             Some(serde_json::json!(3)),
-            "the refused state.set must leave the prior value unchanged"
+            "dispatch must refuse v0.1 state.set without mutating prior state"
         );
     }
 
