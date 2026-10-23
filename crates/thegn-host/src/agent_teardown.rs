@@ -28,16 +28,27 @@ fn after_destroy(
 /// resolves the env itself. Best-effort + off-loop; checkpoints-capable only.
 pub fn checkpoint_on_close(worktree: &str) {
     let cfg = crate::config_startup::cleanup_config();
-    let Ok(db) = Db::open() else {
-        return;
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "auto-checkpoint on close skipped: the environment selection could not be read: {error:#}"
+            ));
+            return;
+        }
     };
     let repo_root = db
         .repo_root_for(worktree)
         .ok()
         .flatten()
         .unwrap_or_default();
-    let Some(env_name) = db.effective_env(worktree, &repo_root) else {
-        return;
+    let env_name = match checkpoint_selection(db.effective_env_checked(worktree, &repo_root)) {
+        Ok(Some(name)) => name,
+        Ok(None) => return,
+        Err(message) => {
+            thegn_core::msg::warn(&message);
+            return;
+        }
     };
     let Some(env) = cfg.env.get(&env_name) else {
         return;
@@ -61,6 +72,13 @@ pub fn checkpoint_on_close(worktree: &str) {
         Ok(id) => thegn_core::msg::info(&format!("checkpointed {name} on close: {id}")),
         Err(e) => thegn_core::msg::warn(&format!("auto-checkpoint on close failed: {e}")),
     }
+}
+
+/// The env to checkpoint on close: `Ok(None)` = nothing selected, `Err` = unreadable (skip with a warning).
+fn checkpoint_selection(read: anyhow::Result<Option<String>>) -> Result<Option<String>, String> {
+    read.map_err(|error| format!(
+        "auto-checkpoint on close skipped: the environment selection could not be read: {error:#}"
+    ))
 }
 
 /// Destroy a provider sandbox using an already-resolved configuration. The
@@ -155,5 +173,23 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert!(!called);
+    }
+
+    #[test]
+    fn checkpoint_selection_skips_an_unreadable_selection() {
+        let Err(message) = checkpoint_selection(Err(anyhow::anyhow!("unavailable"))) else {
+            panic!("unreadable selection must skip checkpoint");
+        };
+
+        assert!(message.starts_with("auto-checkpoint on close skipped"));
+    }
+
+    #[test]
+    fn checkpoint_selection_passes_a_read_through() {
+        assert_eq!(
+            checkpoint_selection(Ok(Some("box".into()))),
+            Ok(Some("box".into()))
+        );
+        assert_eq!(checkpoint_selection(Ok(None)), Ok(None));
     }
 }
