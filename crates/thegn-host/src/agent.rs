@@ -4575,6 +4575,16 @@ pub(crate) fn dotfiles_launch_gate(
     choice: &str,
     failure: anyhow::Error,
 ) -> anyhow::Result<()> {
+    dotfiles_launch_gate_with_notice(cfg, worktree, choice, failure, crate::launch_notice::post)
+}
+
+pub(crate) fn dotfiles_launch_gate_with_notice(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    failure: anyhow::Error,
+    notify: impl FnOnce(&str, &str),
+) -> anyhow::Result<()> {
     if is_configured_entry(cfg, choice) {
         let detail = format!("{failure:#}");
         return Err(failure.context(format!(
@@ -4583,7 +4593,7 @@ pub(crate) fn dotfiles_launch_gate(
     }
     let text = format!("{failure:#}; the shell launches without it");
     thegn_core::msg::warn(&text);
-    crate::launch_notice::post(worktree, &text);
+    notify(worktree, &text);
     Ok(())
 }
 
@@ -4601,12 +4611,30 @@ pub(crate) fn launch_state_gate(
     what: &str,
     error: &anyhow::Error,
 ) -> anyhow::Result<()> {
+    launch_state_gate_with_notice(
+        cfg,
+        worktree,
+        choice,
+        what,
+        error,
+        crate::launch_notice::post,
+    )
+}
+
+pub(crate) fn launch_state_gate_with_notice(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    what: &str,
+    error: &anyhow::Error,
+    notify: impl FnOnce(&str, &str),
+) -> anyhow::Result<()> {
     if is_configured_entry(cfg, choice) {
         anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");
     }
     let text = format!("{what}: {error:#}; the shell launches without it");
     thegn_core::msg::warn(&text);
-    crate::launch_notice::post(worktree, &text);
+    notify(worktree, &text);
     Ok(())
 }
 

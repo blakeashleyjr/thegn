@@ -15,6 +15,21 @@ pub(crate) fn deliver(
 }
 
 pub(crate) fn post(worktree: &str, text: &str) {
+    post_with(worktree, text, |job| {
+        let spawn = thegn_core::thread_name::try_spawn_named("thegn-launchnt", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            job();
+        });
+        if let Err(error) = spawn {
+            tracing::debug!(target: "thegn::launch_notice", %error, "best-effort launch warning inbox worker could not start");
+        }
+    });
+}
+
+/// Route a warning and hand persistence to the supplied worker seam. Tests
+/// execute the job inline so isolated state remains active until its DB write
+/// has completed.
+pub(crate) fn post_with(worktree: &str, text: &str, spawn: impl FnOnce(Box<dyn FnOnce() + Send>)) {
     if !thegn_core::msg::tui_active() {
         return;
     }
@@ -25,31 +40,25 @@ pub(crate) fn post(worktree: &str, text: &str) {
     if decision.record {
         let worktree = worktree.to_string();
         let text = text.to_string();
-        let spawn = thegn_core::thread_name::try_spawn_named("thegn-launchnt", move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            match thegn_core::db::Db::open() {
-                Ok(db) => {
-                    if let Err(error) = crate::automation_events::insert_routed(
-                        &db,
-                        KIND,
-                        &worktree,
-                        &text,
-                        &worktree,
-                        Default::default(),
-                        &decision,
-                        false,
-                    ) {
-                        tracing::debug!(target: "thegn::launch_notice", %error, "best-effort launch warning inbox write failed");
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(target: "thegn::launch_notice", %error, "best-effort launch warning inbox database open failed");
+        spawn(Box::new(move || match thegn_core::db::Db::open() {
+            Ok(db) => {
+                if let Err(error) = crate::automation_events::insert_routed(
+                    &db,
+                    KIND,
+                    &worktree,
+                    &text,
+                    &worktree,
+                    Default::default(),
+                    &decision,
+                    true,
+                ) {
+                    tracing::debug!(target: "thegn::launch_notice", %error, "best-effort launch warning inbox write failed");
                 }
             }
-        });
-        if let Err(error) = spawn {
-            tracing::debug!(target: "thegn::launch_notice", %error, "best-effort launch warning inbox worker could not start");
-        }
+            Err(error) => {
+                tracing::debug!(target: "thegn::launch_notice", %error, "best-effort launch warning inbox database open failed");
+            }
+        }));
     }
 }
 
@@ -60,6 +69,7 @@ mod tests {
     use super::*;
     use crate::hydrate::RefreshKind;
     use thegn_core::config::{Config, NamedCommand};
+    use thegn_core::store::NotificationStore;
 
     fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<RefreshKind>) -> Vec<RefreshKind> {
         let mut messages = Vec::new();
@@ -70,6 +80,10 @@ mod tests {
             }
         }
         messages
+    }
+
+    fn post_inline(worktree: &str, text: &str) {
+        post_with(worktree, text, |job| job());
     }
 
     fn setup() -> (
@@ -135,12 +149,13 @@ mod tests {
         }
         let (_isolated, _state, mut rx, _waker, _keepalive) = setup();
         thegn_core::msg::set_tui_active(true);
-        let result = crate::agent::launch_state_gate(
+        let result = crate::agent::launch_state_gate_with_notice(
             &Config::default(),
             "/wt/a",
             "shell",
             "this worktree's repository root could not be read",
             &anyhow::anyhow!("disk I/O error"),
+            post_inline,
         );
         thegn_core::msg::set_tui_active(false);
         assert!(result.is_ok());
@@ -160,11 +175,12 @@ mod tests {
         }
         let (_isolated, _state, mut rx, _waker, _keepalive) = setup();
         thegn_core::msg::set_tui_active(true);
-        let result = crate::agent::dotfiles_launch_gate(
+        let result = crate::agent::dotfiles_launch_gate_with_notice(
             &Config::default(),
             "/wt/a",
             "shell",
             anyhow::anyhow!("cannot create HOME"),
+            post_inline,
         );
         thegn_core::msg::set_tui_active(false);
         assert!(result.is_ok());
@@ -211,5 +227,31 @@ mod tests {
         };
         assert!(format!("{error:#}").contains("refusing to launch `codex`"));
         assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn post_persists_only_one_inbox_row_for_a_worktree_and_reason() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (_isolated, _state, _rx, _waker, _keepalive) = setup();
+        thegn_core::msg::set_tui_active(true);
+        let reason = "saved override could not be read: disk I/O error";
+        post_inline("/wt/a", reason);
+        post_inline("/wt/a", reason);
+        thegn_core::msg::set_tui_active(false);
+
+        let db = thegn_core::db::Db::open().unwrap();
+        let matching = db
+            .get_all_notifications(64)
+            .unwrap()
+            .into_iter()
+            .filter(|notification| {
+                notification.source_ref == "/wt/a"
+                    && notification.worktree_path == "/wt/a"
+                    && notification.message == reason
+            })
+            .count();
+        assert_eq!(matching, 1, "duplicate pane launches share one inbox row");
     }
 }
