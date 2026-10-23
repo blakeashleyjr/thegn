@@ -2643,9 +2643,21 @@ fn model_proxy_report(cfg: &Config) {
     let mp = &cfg.model_proxy;
     if !mp.enabled {
         outln!("Model proxy ([model_proxy])  disabled");
+        outln!(
+            "  tgproxy       {}",
+            crate::model_proxy_daemon::tgproxy_status_line(
+                crate::model_proxy_daemon::find_tgproxy().as_deref()
+            )
+        );
         return;
     }
     outln!("Model proxy ([model_proxy])");
+    outln!(
+        "  tgproxy       {}",
+        crate::model_proxy_daemon::tgproxy_status_line(
+            crate::model_proxy_daemon::find_tgproxy().as_deref()
+        )
+    );
     let loopback = mp.listen_is_loopback();
     outln!(
         "  listen        {}{}",
@@ -2741,10 +2753,16 @@ fn model_proxy_json(cfg: &Config) -> serde_json::Value {
     use thegn_core::seam::Kind;
     let mp = &cfg.model_proxy;
     if !mp.enabled {
-        return serde_json::json!({"enabled": false});
+        return serde_json::json!({
+            "enabled": false,
+            "tgproxy": crate::model_proxy_daemon::find_tgproxy()
+                .map(|path| path.display().to_string()),
+        });
     }
     serde_json::json!({
         "enabled": true,
+        "tgproxy": crate::model_proxy_daemon::find_tgproxy()
+            .map(|path| path.display().to_string()),
         "listen": mp.listen,
         "loopback": mp.listen_is_loopback(),
         "reachable": crate::model_proxy_daemon::probe_up(mp),

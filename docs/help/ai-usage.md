@@ -145,6 +145,10 @@ coarser number and are labelled as such.
 
 ## Model-proxy spend
 
+The model proxy is a separate binary, `tgproxy`. The alpha release tarball and nix flake ship only `thegn`: build the proxy
+from a source checkout with `cargo install --path crates/thegn-proxy` and put it beside `thegn` or on `PATH`. `thegn doctor`
+reports where it found `tgproxy`, or `not installed`.
+
 When the opt-in model proxy is enabled (`[model_proxy] enabled = true`), the
 **System ▸ Usage** section and the `Alt-u` overlay grow a **model-proxy spend**
 block beside the per-account quota windows: cost and token totals for the
