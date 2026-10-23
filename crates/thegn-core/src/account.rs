@@ -221,14 +221,14 @@ fn ensure_managed_home_claiming(
         }
         None => {
             if !legacy_aliases.is_empty() {
-                let has_entries =
+                let entries =
                     private
                         .file_names()
                         .map_err(|error| AccountHomeError::UnsafePath {
                             path: path.clone(),
                             error: error.to_string(),
                         })?;
-                if !has_entries.is_empty() {
+                if !entries.is_empty() {
                     return Err(AccountHomeError::AmbiguousLegacyHome {
                         path,
                         aliases: legacy_aliases.to_vec(),
