@@ -866,6 +866,13 @@ pub fn sealed_view(spec: &SandboxSpec) -> std::borrow::Cow<'_, SandboxSpec> {
 /// Every launch gate in one place: volume admission, the sealed deny filter and
 /// `$HOME` gate, and the OCI `-v` path syntax check.
 fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, EnterError> {
+    launchable_with(spec, &crate::sandbox_control_guard::control_dirs())
+}
+
+fn launchable_with<'a>(
+    spec: &'a SandboxSpec,
+    control_dirs: &[std::path::PathBuf],
+) -> Result<std::borrow::Cow<'a, SandboxSpec>, EnterError> {
     admit_volumes(spec)?;
     if let Some(message) = compose_policy_refusal(spec) {
         return Err(refusal(spec, RefusalClass::ComposePolicy, None, message));
@@ -882,45 +889,7 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
         ));
     }
     tunnel_admission(spec)?;
-    if spec.placement.is_local()
-        && spec.backend.is_oci()
-        && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
-    {
-        let host_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = spec
-            .mounts
-            .iter()
-            .map(|mount| {
-                (
-                    std::path::PathBuf::from(&mount.host),
-                    std::path::PathBuf::from(&mount.dest),
-                )
-            })
-            .collect();
-        let mount_refs: Vec<(&std::path::Path, &std::path::Path)> = host_mounts
-            .iter()
-            .map(|(host, dest)| (host.as_path(), dest.as_path()))
-            .collect();
-        let (control_dirs, unresolved_exposure) = crate::sandbox_control_guard::in_sandbox_paths(
-            &crate::sandbox_control_guard::control_dirs(),
-            &mount_refs,
-        );
-        let visible_roots: Vec<&std::path::Path> =
-            host_mounts.iter().map(|(_, dest)| dest.as_path()).collect();
-        if let Some(exposure) = unresolved_exposure
-            .or_else(|| crate::sandbox_control_guard::exposure(&control_dirs, &visible_roots))
-        {
-            return Err(refusal(
-                spec,
-                RefusalClass::ControlSocketReachable,
-                Some(exposure.control_dir.display().to_string()),
-                format!(
-                    "daemon control directory {} is visible through sandbox mount {}; OCI mounts are fixed when the container is created",
-                    exposure.control_dir.display(),
-                    exposure.visible_through.display()
-                ),
-            ));
-        }
-    }
+    oci_control_socket_refusal(spec, control_dirs)?;
     let mut view = if !spec.backend.is_oci() && spec.compose.is_some() {
         let mut owned = spec.clone();
         owned.compose = None;
@@ -1005,6 +974,55 @@ fn launchable(spec: &SandboxSpec) -> Result<std::borrow::Cow<'_, SandboxSpec>, E
         })?;
     }
     Ok(view)
+}
+
+fn oci_control_socket_refusal(
+    spec: &SandboxSpec,
+    control_dirs: &[std::path::PathBuf],
+) -> Result<(), EnterError> {
+    if spec.placement.is_local()
+        && spec.backend.is_oci()
+        && !matches!(spec.file_access, FileAccess::All | FileAccess::Host)
+    {
+        let host_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> = spec
+            .mounts
+            .iter()
+            .map(|mount| {
+                (
+                    std::path::PathBuf::from(&mount.host),
+                    std::path::PathBuf::from(&mount.dest),
+                )
+            })
+            .collect();
+        let mount_refs: Vec<(&std::path::Path, &std::path::Path)> = host_mounts
+            .iter()
+            .map(|(host, dest)| (host.as_path(), dest.as_path()))
+            .collect();
+        let (mapped_control_dirs, unresolved_exposure) =
+            crate::sandbox_control_guard::in_sandbox_paths(control_dirs, &mount_refs);
+        let visible_roots: Vec<&std::path::Path> =
+            host_mounts.iter().map(|(_, dest)| dest.as_path()).collect();
+        if let Some(exposure) = unresolved_exposure
+            .or_else(|| {
+                crate::sandbox_control_guard::mount_inside_control_dir(control_dirs, &mount_refs)
+            })
+            .or_else(|| {
+                crate::sandbox_control_guard::exposure(&mapped_control_dirs, &visible_roots)
+            })
+        {
+            return Err(refusal(
+                spec,
+                RefusalClass::ControlSocketReachable,
+                Some(exposure.control_dir.display().to_string()),
+                format!(
+                    "daemon control directory {} is visible through sandbox mount {}; OCI mounts are fixed when the container is created",
+                    exposure.control_dir.display(),
+                    exposure.visible_through.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Refusal for a Compose-backed OCI launch whose requested restrictions Compose
@@ -2614,13 +2632,17 @@ fn split_image_line(stdout: &str) -> (String, Option<String>) {
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
-    let report = ensure_attested(spec, &crate::sandbox_compose::ComposeGuard::for_host(&[]))?;
+    let report = ensure_attested(spec, &host_compose_guard())?;
     if let Some(reason) = report.compose_unverified {
         msg::warn(&format!(
             "Compose config could not be inspected ({reason}); protected host binds were not checked; isolation reported as host-process"
         ));
     }
     Ok(())
+}
+
+fn host_compose_guard() -> crate::sandbox_compose::ComposeGuard {
+    crate::sandbox_compose::ComposeGuard::for_host(&crate::sandbox_control_guard::control_dirs())
 }
 
 /// Ensure sandbox state and report whether Compose's effective config was checked.
@@ -3529,6 +3551,21 @@ fn backend_enter_argv_guarded_with_env(
                         Some(exposure.control_dir.display().to_string()),
                         format!(
                             "daemon control directory {} may be visible through sandbox bind {}; its host path could not be canonicalized, so move the socket directory or change the bind layout",
+                            exposure.control_dir.display(),
+                            exposure.visible_through.display()
+                        ),
+                    ));
+                }
+                if let Some(exposure) = crate::sandbox_control_guard::mount_inside_control_dir(
+                    &env.control_dirs,
+                    &mount_refs,
+                ) {
+                    return Err(refusal(
+                        spec,
+                        RefusalClass::ControlSocketReachable,
+                        Some(exposure.control_dir.display().to_string()),
+                        format!(
+                            "daemon control directory {} is visible through sandbox bind {} whose source lies inside it; bwrap cannot mask it without hiding the bind, so move the socket directory or change the bind layout",
                             exposure.control_dir.display(),
                             exposure.visible_through.display()
                         ),
