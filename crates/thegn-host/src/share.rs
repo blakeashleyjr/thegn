@@ -1383,7 +1383,9 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 31)]);
+        let stopped = sup.stop("/wt", Some(3000));
+        assert!(stopped.removed.is_empty());
+        assert_eq!(stopped.pending, vec![(3000, 31)]);
         assert_eq!(sup.generation_of("/wt", 3000), None);
         assert_eq!(sup.instances.len(), 1);
         assert!(matches!(sup.instances[0].state, ShareState::Stopping));
@@ -1410,7 +1412,9 @@ mod tests {
             event_tx: None,
             event_waker: None,
         });
-        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 51)]);
+        let stopped = sup.stop("/wt", Some(3000));
+        assert!(stopped.removed.is_empty());
+        assert_eq!(stopped.pending, vec![(3000, 51)]);
         assert!(sup.on_event(ShareEvent::Failed {
             worktree: "/wt".into(),
             port: 3000,
@@ -1530,10 +1534,14 @@ mod tests {
             event_waker: None,
         };
         sup.instances.push(instance(61));
-        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 61)]);
+        let stopped = sup.stop("/wt", Some(3000));
+        assert!(stopped.removed.is_empty());
+        assert_eq!(stopped.pending, vec![(3000, 61)]);
         sup.instances.push(instance(62));
         assert_eq!(sup.generation_of("/wt", 3000), Some(62));
-        assert_eq!(sup.stop("/wt", Some(3000)).removed, vec![(3000, 62)]);
+        let stopped = sup.stop("/wt", Some(3000));
+        assert!(stopped.removed.is_empty());
+        assert_eq!(stopped.pending, vec![(3000, 62)]);
         assert_eq!(sup.generation_of("/wt", 3000), None);
         assert_eq!(
             sup.instances.len(),
