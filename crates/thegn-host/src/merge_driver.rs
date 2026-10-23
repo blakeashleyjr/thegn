@@ -344,6 +344,7 @@ pub(crate) fn drive_queue(
             attempt: |branch: &str, location: &thegn_core::remote::GitLoc, held: bool| {
                 if let thegn_core::remote::GitLoc::Local(worktree) = location {
                     let key = worktree.to_string_lossy().into_owned();
+                    let candidate = db.merge_candidate(&key)?;
                     if let Some(recorded) = db.merge_enqueue_identity(&key)? {
                         let live = crate::merge_ops::local_enqueue_identity(worktree);
                         let drain_common = repo_root
@@ -366,8 +367,12 @@ pub(crate) fn drive_queue(
                         ) {
                             return Err(anyhow::Error::new(CandidateDrift { reason }));
                         }
+                    } else if candidate.is_some() {
+                        return Err(anyhow::Error::new(CandidateDrift {
+                            reason: "queued before its worktree identity was recorded (enqueued by an older thegn)"
+                                .into(),
+                        }));
                     }
-                    let candidate = db.merge_candidate(&key)?;
                     if let Some(candidate) = candidate.as_ref() {
                         let expected_ref = format!("refs/heads/{branch}");
                         if candidate.branch_ref != expected_ref {
@@ -2436,7 +2441,7 @@ mod tests {
 
         fn bound_item(db: &Db, feat_wt: &Path) -> QueueItem {
             let worktree = feat_wt.to_string_lossy().into_owned();
-            db.enqueue_merge_candidate(
+            db.enqueue_merge_candidate_with_identity(
                 &worktree,
                 "feat",
                 "main",
@@ -2444,6 +2449,7 @@ mod tests {
                     branch_ref: "refs/heads/feat".into(),
                     candidate_oid: out(feat_wt, &["rev-parse", "HEAD"]),
                 },
+                &crate::merge_ops::local_enqueue_identity(feat_wt).unwrap(),
             )
             .unwrap();
             QueueItem {
@@ -2597,6 +2603,116 @@ mod tests {
                 &root,
                 &db,
                 vec![queued],
+                |_| {},
+            );
+            assert_eq!(outcome.landed, ["feat"]);
+        }
+
+        #[test]
+        fn enqueue_identity_legacy_bound_row_holds_without_fold_or_agent() {
+            let (_fixture, root, feat_wt) = clean_repo("legacy-identity");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let worktree = feat_wt.to_string_lossy().into_owned();
+            db.enqueue_merge_candidate(
+                &worktree,
+                "feat",
+                "main",
+                &MergeCandidate {
+                    branch_ref: "refs/heads/feat".into(),
+                    candidate_oid: out(&feat_wt, &["rev-parse", "HEAD"]),
+                },
+            )
+            .unwrap();
+            let queued = QueueItem {
+                worktree: worktree.clone(),
+                branch: "feat".into(),
+                location: String::new(),
+            };
+            let sentinel = root.join("legacy-fixer-ran");
+            let outcome = drive_queue(
+                &cfg(&format!("touch {}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert!(outcome.landed.is_empty());
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert!(!sentinel.exists());
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 0);
+            let detail = row.error_detail.unwrap();
+            assert!(detail.contains("identity drift"), "{detail}");
+            assert!(detail.contains("older thegn"), "{detail}");
+            assert!(detail.contains("re-enqueue"), "{detail}");
+        }
+
+        #[test]
+        fn enqueue_identity_legacy_row_reenqueue_adopts_and_lands() {
+            let (_fixture, root, feat_wt) = clean_repo("legacy-identity-reenqueue");
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let worktree = feat_wt.to_string_lossy().into_owned();
+            db.enqueue_merge_candidate(
+                &worktree,
+                "feat",
+                "main",
+                &MergeCandidate {
+                    branch_ref: "refs/heads/feat".into(),
+                    candidate_oid: out(&feat_wt, &["rev-parse", "HEAD"]),
+                },
+            )
+            .unwrap();
+            let queued = QueueItem {
+                worktree: worktree.clone(),
+                branch: "feat".into(),
+                location: String::new(),
+            };
+            let first = drive_queue(
+                &cfg("true", 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(first.agent_blocked, ["feat"]);
+            assert!(first.landed.is_empty());
+
+            crate::merge_ops::enqueue_bound_local(&db, &worktree, "feat", "main").unwrap();
+            assert!(db.merge_enqueue_identity(&worktree).unwrap().is_some());
+            let outcome = drive_queue(
+                &cfg("", 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![QueueItem {
+                    worktree,
+                    branch: "feat".into(),
+                    location: String::new(),
+                }],
                 |_| {},
             );
             assert_eq!(outcome.landed, ["feat"]);
