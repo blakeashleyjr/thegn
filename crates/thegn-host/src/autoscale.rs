@@ -302,7 +302,15 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
     };
     let pc = lane_provider_config(cfg, &template);
     let Some(provider) = crate::provider_factory::vps_provider_for(&pc, name) else {
-        return; // token gone: leave it; the reaper's lifetime ceiling backstops
+        report_scale_down_blocked(
+            name,
+            &scale_down_blocked_message(
+                name,
+                &row.provider,
+                "its provider could not be built: the API token is unresolved or the VPS ledger record is unreadable",
+            ),
+        );
+        return;
     };
     match crate::agent::block_on_provider(|| async {
         use thegn_svc::provider::RemoteProvider;
@@ -312,10 +320,56 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
             let _ = db.stop_compute_meter(name, unix_now() * 1000); // best-effort: ledger bookkeeping after a successful destroy
             let _ = db.capacity_delete(host); // best-effort: cache bookkeeping after a successful destroy
             let _ = db.host_delete(host); // best-effort: cache bookkeeping after a successful destroy
+            rearm_scale_down_report(name);
             thegn_core::msg::info(&format!("placement: scaled down idle host {name}"));
         }
-        Err(e) => thegn_core::msg::warn(&format!("placement: scale-down of {name}: {e}")),
+        Err(e) => report_scale_down_blocked(
+            name,
+            &scale_down_blocked_message(name, &row.provider, &format!("the destroy failed ({e})")),
+        ),
     }
+}
+
+fn scale_down_blocked_message(name: &str, provider: &str, why: &str) -> String {
+    format!(
+        "placement: idle engine host {name} ({provider}) was not scaled down: {why}; it keeps running and billing until this is fixed"
+    )
+}
+
+static SCALE_DOWN_REPORTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn report_scale_down_blocked_with(
+    name: &str,
+    text: &str,
+    tui_active: bool,
+    toast: impl FnOnce(&str),
+) {
+    thegn_core::msg::warn(text);
+    let newly_reported = tui_active
+        && SCALE_DOWN_REPORTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned());
+    if newly_reported {
+        toast(text);
+    }
+}
+
+fn report_scale_down_blocked(name: &str, text: &str) {
+    report_scale_down_blocked_with(name, text, thegn_core::msg::tui_active(), |text| {
+        if let Some(notify) = crate::notify::global() {
+            notify.emit_status(text);
+            notify.emit_toast(text, thegn_core::notification::Priority::Notice);
+        }
+    });
+}
+
+fn rearm_scale_down_report(name: &str) {
+    SCALE_DOWN_REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name);
 }
 
 fn auto_host_name(size: &str, nonce: [u8; 8]) -> String {
@@ -712,6 +766,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn scale_down_blocked_message_names_the_host_and_the_cost() {
+        let cause = "its provider could not be built: the API token is unresolved or the VPS ledger record is unreadable";
+        let text = scale_down_blocked_message("tg-auto-test-message", "hetzner", cause);
+        assert!(text.contains("tg-auto-test-message"));
+        assert!(text.contains("(hetzner)"));
+        assert!(text.contains("was not scaled down"));
+        assert!(text.contains(cause));
+        assert!(!text.contains("see the warning above"));
+        assert!(text.contains("keeps running and billing"));
+    }
+
+    #[test]
+    fn scale_down_report_toasts_once_per_host_while_the_tui_runs() {
+        let name = "tg-auto-test-once";
+        let mut toasts: u32 = 0;
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        assert_eq!(toasts, 1);
+        rearm_scale_down_report(name);
+    }
+
+    #[test]
+    fn scale_down_report_never_toasts_without_the_tui() {
+        let mut toasts: u32 = 0;
+        report_scale_down_blocked_with("tg-auto-test-no-tui", "t", false, |_| toasts += 1);
+        assert_eq!(toasts, 0);
+    }
+
+    #[test]
+    fn scale_down_success_rearms_the_report() {
+        let name = "tg-auto-test-rearm";
+        let mut toasts: u32 = 0;
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        rearm_scale_down_report(name);
+        report_scale_down_blocked_with(name, "t", true, |_| toasts += 1);
+        assert_eq!(toasts, 2);
+        rearm_scale_down_report(name);
     }
 
     #[test]
