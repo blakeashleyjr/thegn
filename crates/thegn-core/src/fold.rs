@@ -326,11 +326,93 @@ fn fold_one(git: &impl FoldGit, tip: &str, b: &Branch, opts: &LandOpts) -> Resul
     }
 }
 
+/// The rebase commit walk was not exactly the linear chain `base..tip`; nothing was replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncoherentCommitWalk {
+    pub branch: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for IncoherentCommitWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "commit walk for {} is not the linear chain from the merge base to its tip ({}); nothing was replayed",
+            self.branch, self.reason
+        )
+    }
+}
+
+impl std::error::Error for IncoherentCommitWalk {}
+
+/// Verify `commits` is exactly the ancestor-first chain from `base` (exclusive)
+/// to `tip` (inclusive), with each commit having one parent.
+fn verify_linear_walk(
+    base: &str,
+    tip: &str,
+    commits: &[CommitMeta],
+) -> std::result::Result<(), String> {
+    if commits.is_empty() {
+        return if base.eq_ignore_ascii_case(tip) {
+            Ok(())
+        } else {
+            Err("empty walk but the merge base is not the tip".to_string())
+        };
+    }
+
+    let first = &commits[0];
+    if !matches!(first.parents.as_slice(), [parent] if parent.eq_ignore_ascii_case(base)) {
+        return Err(format!(
+            "commit at index 0 expected sole parent {base}, found [{}]",
+            first.parents.join(", ")
+        ));
+    }
+    if !first.parent.eq_ignore_ascii_case(base) {
+        return Err(format!(
+            "commit at index 0 expected replay parent {base}, found {}",
+            first.parent
+        ));
+    }
+
+    for (index, pair) in commits.windows(2).enumerate() {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if !matches!(current.parents.as_slice(), [parent] if parent.eq_ignore_ascii_case(&previous.oid))
+        {
+            return Err(format!(
+                "commit at index {} expected sole parent {}, found [{}]",
+                index + 1,
+                previous.oid,
+                current.parents.join(", ")
+            ));
+        }
+        if !current.parent.eq_ignore_ascii_case(&previous.oid) {
+            return Err(format!(
+                "commit at index {} expected replay parent {}, found {}",
+                index + 1,
+                previous.oid,
+                current.parent
+            ));
+        }
+    }
+
+    let last_index = commits.len() - 1;
+    let last = &commits[last_index];
+    if !last.oid.eq_ignore_ascii_case(tip) {
+        return Err(format!(
+            "commit at index {last_index} expected tip {tip}, found {}",
+            last.oid
+        ));
+    }
+    Ok(())
+}
+
 /// Replay a linear branch's commits one at a time onto `tip` (a plumbing
 /// cherry-pick per commit). Unrelated history and histories containing root
-/// or merge commits are held before replay; any conflicting step also defers
-/// the WHOLE branch — no commit lands until every one replays clean, exactly
-/// like a conflicting merge fold.
+/// or merge commits are held before replay; the walk must then be the complete
+/// ancestor-first chain from the merge base through the branch tip. Any
+/// conflicting step also defers the WHOLE branch — no commit lands until every
+/// one replays clean, exactly like a conflicting merge fold.
 fn rebase_replay(git: &impl FoldGit, tip: &str, b: &Branch) -> Result<One> {
     let Some(base) = git.merge_base(tip, &b.tip)? else {
         return Ok(One::UnsupportedMergeHistory);
@@ -341,6 +423,12 @@ fn rebase_replay(git: &impl FoldGit, tip: &str, b: &Branch) -> Result<One> {
         .any(|commit| commit.parents.is_empty() || commit.parents.len() > 1)
     {
         return Ok(One::UnsupportedMergeHistory);
+    }
+    if let Err(reason) = verify_linear_walk(&base, &b.tip, &commits) {
+        return Err(anyhow::Error::new(IncoherentCommitWalk {
+            branch: b.name.clone(),
+            reason,
+        }));
     }
     let mut running = tip.to_string();
     for c in commits {
@@ -977,11 +1065,148 @@ mod tests {
 
     // ---- rebase strategy ---------------------------------------------------
 
+    fn assert_incoherent_walk(error: &anyhow::Error, branch: &str) {
+        let walk_error = error
+            .downcast_ref::<IncoherentCommitWalk>()
+            .expect("incoherent walk error is typed");
+        assert_eq!(walk_error.branch, branch);
+        assert!(!walk_error.reason.is_empty());
+    }
+
+    #[test]
+    fn rebase_walk_out_of_order_fails_before_any_replay() {
+        let mut git = Fake::new()
+            .branch("feat", None)
+            .with_commits("feat", &[("c1", "one"), ("tfeat", "two")]);
+        git.commits.get_mut("tfeat").unwrap().swap(0, 1);
+
+        let result = fold(
+            &git,
+            "base",
+            vec![br("feat")],
+            &[],
+            &opts(LandStrategy::Rebase, ""),
+        );
+        let error = match result {
+            Ok(_) => panic!("out-of-order walk must fail"),
+            Err(error) => error,
+        };
+        assert_incoherent_walk(&error, "feat");
+        assert!(git.merge_calls.borrow().is_empty());
+        assert!(git.commit_parents.borrow().is_empty());
+    }
+
+    #[test]
+    fn rebase_walk_with_a_gap_fails_before_any_replay() {
+        let mut git = Fake::new()
+            .branch("feat", None)
+            .with_commits("feat", &[("c1", "one"), ("c2", "two"), ("tfeat", "three")]);
+        git.commits.get_mut("tfeat").unwrap().remove(1);
+
+        let result = fold(
+            &git,
+            "base",
+            vec![br("feat")],
+            &[],
+            &opts(LandStrategy::Rebase, ""),
+        );
+        let error = match result {
+            Ok(_) => panic!("gapped walk must fail"),
+            Err(error) => error,
+        };
+        assert_incoherent_walk(&error, "feat");
+        assert!(git.merge_calls.borrow().is_empty());
+        assert!(git.commit_parents.borrow().is_empty());
+    }
+
+    #[test]
+    fn rebase_walk_not_ending_at_the_tip_fails() {
+        let git = Fake::new()
+            .branch("feat", None)
+            .with_commits("feat", &[("c1", "one"), ("c2", "two")]);
+
+        let result = fold(
+            &git,
+            "base",
+            vec![br("feat")],
+            &[],
+            &opts(LandStrategy::Rebase, ""),
+        );
+        let error = match result {
+            Ok(_) => panic!("walk not ending at the tip must fail"),
+            Err(error) => error,
+        };
+        assert_incoherent_walk(&error, "feat");
+        assert!(git.merge_calls.borrow().is_empty());
+        assert!(git.commit_parents.borrow().is_empty());
+    }
+
+    #[test]
+    fn rebase_walk_not_starting_at_the_merge_base_fails() {
+        let mut git = Fake::new()
+            .branch("feat", None)
+            .with_commits("feat", &[("c1", "one"), ("tfeat", "two")]);
+        let first = &mut git.commits.get_mut("tfeat").unwrap()[0];
+        first.parent = "elsewhere".to_string();
+        first.parents = vec!["elsewhere".to_string()];
+
+        let result = fold(
+            &git,
+            "base",
+            vec![br("feat")],
+            &[],
+            &opts(LandStrategy::Rebase, ""),
+        );
+        let error = match result {
+            Ok(_) => panic!("walk not starting at the merge base must fail"),
+            Err(error) => error,
+        };
+        assert_incoherent_walk(&error, "feat");
+        assert!(git.merge_calls.borrow().is_empty());
+        assert!(git.commit_parents.borrow().is_empty());
+    }
+
+    #[test]
+    fn rebase_walk_empty_but_tip_differs_fails() {
+        let git = Fake::new().branch("feat", None);
+        let result = fold(
+            &git,
+            "base",
+            vec![br("feat")],
+            &[],
+            &opts(LandStrategy::Rebase, ""),
+        );
+        let error = match result {
+            Ok(_) => panic!("empty walk away from the merge base must fail"),
+            Err(error) => error,
+        };
+        assert_incoherent_walk(&error, "feat");
+        assert!(git.merge_calls.borrow().is_empty());
+        assert!(git.commit_parents.borrow().is_empty());
+    }
+
+    #[test]
+    fn verify_linear_walk_accepts_an_empty_walk_at_the_tip() {
+        assert_eq!(verify_linear_walk("AbCd", "aBcD", &[]), Ok(()));
+    }
+
+    #[test]
+    fn incoherent_commit_walk_display_names_branch_and_reason() {
+        let error = IncoherentCommitWalk {
+            branch: "feat".to_string(),
+            reason: "walk ends at c2, expected tip tfeat".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "commit walk for feat is not the linear chain from the merge base to its tip (walk ends at c2, expected tip tfeat); nothing was replayed"
+        );
+    }
+
     #[test]
     fn rebase_replays_each_commit_single_parent_preserving_message() {
         let git = Fake::new()
             .branch("feat", None)
-            .with_commits("feat", &[("c1", "one"), ("c2", "two")]);
+            .with_commits("feat", &[("c1", "one"), ("tfeat", "two")]);
         let plan = fold(
             &git,
             "base",
@@ -1005,8 +1230,8 @@ mod tests {
     fn rebase_merge_history_is_held_before_any_replay_object() {
         let git = Fake::new()
             .branch("feat", None)
-            .with_commits("feat", &[("c1", "one"), ("c2", "merge")])
-            .with_merge_commit("feat", "c2", "side-parent");
+            .with_commits("feat", &[("c1", "one"), ("tfeat", "merge")])
+            .with_merge_commit("feat", "tfeat", "side-parent");
         let plan = fold(
             &git,
             "base",
@@ -1035,7 +1260,7 @@ mod tests {
     fn rebase_unrelated_history_is_held_before_any_replay_object() {
         let git = Fake::new()
             .branch("feat", None)
-            .with_commits("feat", &[("c1", "one"), ("c2", "two")])
+            .with_commits("feat", &[("c1", "one"), ("tfeat", "two")])
             .unrelated();
         let plan = fold(
             &git,
@@ -1058,7 +1283,7 @@ mod tests {
     fn rebase_root_commit_in_range_is_held() {
         let mut git = Fake::new()
             .branch("feat", None)
-            .with_commits("feat", &[("root", "root"), ("child", "child")]);
+            .with_commits("feat", &[("root", "root"), ("tfeat", "child")]);
         let commits = git.commits.get_mut("tfeat").expect("fixture commits exist");
         commits[0].parent.clear();
         commits[0].parents.clear();
@@ -1086,8 +1311,8 @@ mod tests {
         for strategy in [LandStrategy::Merge, LandStrategy::Squash] {
             let git = Fake::new()
                 .branch("feat", None)
-                .with_commits("feat", &[("c1", "one"), ("c2", "merge")])
-                .with_merge_commit("feat", "c2", "side-parent");
+                .with_commits("feat", &[("c1", "one"), ("tfeat", "merge")])
+                .with_merge_commit("feat", "tfeat", "side-parent");
             let plan = fold(&git, "base", vec![br("feat")], &[], &opts(strategy, "")).unwrap();
 
             assert_eq!(plan.landed.len(), 1, "{strategy:?}");
@@ -1101,7 +1326,10 @@ mod tests {
         // lands (the running tip never moved off base).
         let git = Fake::new()
             .branch("feat", None)
-            .with_commits("feat", &[("c1", "ok"), ("c2", "boom"), ("c3", "unreached")])
+            .with_commits(
+                "feat",
+                &[("c1", "ok"), ("c2", "boom"), ("tfeat", "unreached")],
+            )
             .replay_conflicts("c2", &["src/x.rs"]);
         let plan = fold(
             &git,
@@ -1115,19 +1343,20 @@ mod tests {
         assert_eq!(plan.deferred.len(), 1);
         assert_eq!(plan.deferred[0].paths, ["src/x.rs"]);
         assert!(!plan.advanced());
-        // c3 was never attempted.
+        // The branch tip was never attempted after the conflict at c2.
         let calls = git.merge_calls.borrow();
-        assert!(!calls.iter().any(|(_, t)| t == "c3"));
+        assert!(!calls.iter().any(|(_, t)| t == "tfeat"));
+        assert_eq!(plan.final_tip, "base");
     }
 
     #[test]
     fn rebase_defers_but_a_later_clean_branch_still_lands() {
         let git = Fake::new()
             .branch("bad", None)
-            .with_commits("bad", &[("c1", "boom")])
-            .replay_conflicts("c1", &["x.rs"])
+            .with_commits("bad", &[("tbad", "boom")])
+            .replay_conflicts("tbad", &["x.rs"])
             .branch("good", None)
-            .with_commits("good", &[("g1", "fine")]);
+            .with_commits("good", &[("tgood", "fine")]);
         let plan = fold(
             &git,
             "base",
