@@ -284,9 +284,10 @@ serves the last good list recorded for the same branch and provider as
 returned. If a run's job detail cannot be fetched, the drill says "job detail
 unavailable", keeps the cached run, and refuses **f**. Cached job logs written
 under an older redaction policy are redacted and bounded into a window again
-when read. When no CI provider resolves for the worktree, `ci.runs` and
-`ci.logs` refuse with `failed_precondition` (HTTP 412) and a message starting
-`no-provider:`, and never serve a cached list.
+when read. When no CI provider resolves for the worktree, `ci.runs` and a
+cache-missing `ci.logs` request refuse with `failed_precondition` (HTTP 412)
+and a message starting `no-provider:`. `ci.runs` never serves a cached list
+for a worktree with no provider.
 
 Cached run lists are shown when their recorded provider context matches the
 worktree's current context. A different or unknown cached context shows
