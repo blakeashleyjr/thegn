@@ -1025,7 +1025,7 @@ fn sweep_one_background(
     cfg: &thegn_core::config::CiConfig,
     full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
-    mut context: RefreshContext<'_>,
+    context: RefreshContext<'_>,
 ) {
     let others: Vec<&str> = session
         .worktrees
