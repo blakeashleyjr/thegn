@@ -488,8 +488,23 @@ impl Machine0Provider {
             .await_created_vm(name)
             .await
             .with_context(|| pending_outcome_unknown(name))?;
-        self.remove_pending_record(name).await;
         Ok(vm)
+    }
+
+    async fn pending_names() -> Result<Result<Vec<String>>> {
+        Ok(
+            tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
+                .await
+                .context("machine0: pending create listing worker failed")?,
+        )
+    }
+
+    fn warn_pending_names_unknown(name: &str) {
+        tracing::warn!(
+            target: "thegn::provider",
+            sandbox = name,
+            "machine0: pending create records unreadable; a pending reservation for this VM, if any, is kept"
+        );
     }
 
     async fn remove_pending_record(&self, name: &str) {
@@ -525,35 +540,23 @@ impl Machine0Provider {
     }
 
     pub(crate) async fn adopt_listed_pending(&self, name: &str) -> Result<()> {
-        let names = tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
-            .await
-            .context("machine0: pending create listing worker failed")?;
+        let names = Self::pending_names().await?;
         match listed_pending_action(&names, name) {
             ListedPending::Settled => return Ok(()),
             ListedPending::Unknown => {
-                tracing::warn!(
-                    target: "thegn::provider",
-                    sandbox = name,
-                    "machine0: pending create records unreadable; a pending reservation for this VM, if any, is kept"
-                );
+                Self::warn_pending_names_unknown(name);
                 return Ok(());
             }
             ListedPending::Adopt => {}
         }
 
         let guard = create_lock().await?;
-        let names = tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
-            .await
-            .context("machine0: pending create listing worker failed")?;
+        let names = Self::pending_names().await?;
         let action = listed_pending_action(&names, name);
         if action != ListedPending::Adopt {
             drop(guard);
             if action == ListedPending::Unknown {
-                tracing::warn!(
-                    target: "thegn::provider",
-                    sandbox = name,
-                    "machine0: pending create records unreadable; a pending reservation for this VM, if any, is kept"
-                );
+                Self::warn_pending_names_unknown(name);
             }
             return Ok(());
         }
@@ -561,7 +564,9 @@ impl Machine0Provider {
         let vm = self.adopt(name).await;
         drop(guard);
         let vm = vm?;
-        self.finish_ready(name, vm).await.map(|_| ())
+        self.finish_ready(name, vm).await?;
+        self.remove_pending_record(name).await;
+        Ok(())
     }
 
     /// The ssh user for a VM: the configured `ssh_user`, else the VM's own
@@ -1173,16 +1178,14 @@ impl RemoteProvider for Machine0Provider {
                 return Err(anyhow!("machine0: the sandbox name is empty"));
             }
             let create_guard = create_lock().await?;
-            let pending_names =
-                tokio::task::spawn_blocking(|| pending::names_at(&crate::vps::registry::dir()))
-                    .await
-                    .context("machine0: pending create listing worker failed")?;
+            let pending_names = Self::pending_names().await?;
             let admission = admit_create(
                 self.list().await,
                 pending_names,
                 &name,
                 self.spec.max_instances(),
             )?;
+            let adopted = admission != pending::Admission::Create;
             let spawned = match admission {
                 pending::Admission::Create => self.spawn(&name, &self.spec.image).await,
                 pending::Admission::Adopt => self.adopt(&name).await,
@@ -1196,7 +1199,11 @@ impl RemoteProvider for Machine0Provider {
             // NixOS flake apply (no-op unless `provision_flake` is set). Attestation-gated
             // so a failed apply here is re-attempted on the next wake rather than
             // leaving a permanently half-provisioned VM.
-            self.finish_ready(&name, vm).await
+            let handle = self.finish_ready(&name, vm).await?;
+            if adopted {
+                self.remove_pending_record(&name).await;
+            }
+            Ok(handle)
         })
     }
 
