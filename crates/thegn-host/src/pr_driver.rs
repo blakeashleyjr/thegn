@@ -929,9 +929,29 @@ pub(crate) fn drive_queue(
                     },
                     guard.cancel_flag(),
                 );
-                if let Some(warning) = agent_not_started_warning(item.number, &verdict) {
-                    tracing::warn!(target: "thegn::prq", pr = item.number, "{warning}");
-                    out.warnings.push(warning);
+                if let Some(reason) = verdict.not_started() {
+                    match guard.finish_not_started(db, reason) {
+                        crate::pr_agent_lease::NotStartedRelease::Refunded => {
+                            let detail = crate::pr_agent_lease::not_started_detail(reason, false);
+                            let warning = format!("PR #{}: {detail}", item.number);
+                            tracing::warn!(target: "thegn::prq", pr = item.number, "{warning}");
+                            out.warnings.push(warning);
+                            step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
+                            out.needs_human.push(item.number);
+                        }
+                        crate::pr_agent_lease::NotStartedRelease::RefundFailed(error) => {
+                            let detail = crate::pr_agent_lease::not_started_detail(reason, true);
+                            let warning = format!("PR #{}: {detail} ({error})", item.number);
+                            tracing::warn!(target: "thegn::prq", pr = item.number, %error, "{warning}");
+                            out.warnings.push(warning);
+                            step(PrqStatus::NeedsHuman.as_str(), &detail, &mut progress);
+                            out.needs_human.push(item.number);
+                        }
+                        crate::pr_agent_lease::NotStartedRelease::LeaseLost => {
+                            out.warnings.push(format!("PR #{}: agent lease could not be confirmed while the agent ran; the next refresh re-evaluates the row", item.number));
+                        }
+                    }
+                    continue;
                 }
 
                 let fresh = authorship.as_ref().and_then(|_| {
@@ -1480,16 +1500,6 @@ fn format_threads(threads: &[ReviewThreadRow]) -> String {
         out.push_str("  (no unresolved threads found)\n");
     }
     out
-}
-
-/// The warning for a PR-queue agent that never started (an infrastructure failure, not a code result).
-fn agent_not_started_warning(
-    number: u64,
-    verdict: &crate::agent_run::AgentRunVerdict,
-) -> Option<String> {
-    verdict.not_started().map(|reason| {
-        format!("PR #{number}: agent did not start: {reason}; the attempt was still counted")
-    })
 }
 
 #[cfg(test)]
@@ -4153,31 +4163,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_not_started_warning_names_the_reason() {
-        let warning = agent_not_started_warning(
-            7,
-            &crate::agent_run::AgentRunVerdict::NotStarted("sandbox entry refused".into()),
-        );
-
-        assert!(warning.is_some_and(|warning| {
-            warning.contains("PR #7: agent did not start: sandbox entry refused")
-        }));
-    }
-
-    #[test]
-    fn agent_not_started_warning_is_silent_for_runs_that_started() {
-        for verdict in [
-            crate::agent_run::AgentRunVerdict::Exited(Some(0)),
-            crate::agent_run::AgentRunVerdict::Exited(Some(1)),
-            crate::agent_run::AgentRunVerdict::Exited(None),
-            crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
-        ] {
-            assert_eq!(agent_not_started_warning(7, &verdict), None);
-        }
-    }
-
-    #[test]
-    fn agent_not_started_verdict_is_consumed_by_the_pr_queue() {
+    fn not_started_verdict_is_routed_to_the_refund_before_post_agent_checks() {
         let source = include_str!("pr_driver.rs");
         let production = source
             .split_once("\n#[cfg(test)]\nmod tests {")
@@ -4186,10 +4172,75 @@ mod tests {
         let run_call = production
             .find("let verdict = crate::agent_run::run_outcome_cancellable(")
             .expect("PR queue binds the agent run verdict");
-        let warning_call = production
-            .find("agent_not_started_warning(item.number, &verdict)")
-            .expect("PR queue turns NotStarted into a warning");
+        let refund_call = production
+            .find("guard.finish_not_started(db, reason)")
+            .expect("PR queue refunds and holds a NotStarted lease");
+        let post_agent_check = production
+            .find("crate::pr_authorship::revalidate_after_agent(")
+            .expect("PR queue still has its post-agent authorship check");
 
-        assert!(warning_call > run_call);
+        assert!(run_call < refund_call && refund_call < post_agent_check);
+    }
+
+    #[test]
+    fn not_started_agent_refunds_and_holds_the_pr_needs_human() {
+        use crate::pr_authorship::tests::Fixture;
+
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = &fixture.db;
+        db.enqueue_bound_pr(
+            path,
+            7,
+            Some(path),
+            "fixture",
+            "main",
+            "github",
+            &fixture.pr.url,
+        )
+        .unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        db.update_pr_status(
+            &row.key,
+            PrqStatus::BlockedCi.as_str(),
+            None,
+            None,
+            Some(&fixture.pr.head_ref_oid),
+        )
+        .unwrap();
+        db.set_pr_agent_attempts(&row.key, 1).unwrap();
+        let row = db.list_pr_queue().unwrap().remove(0);
+        let sentinel = fixture.dir.path().join("agent-must-not-run");
+        let mut config = cfg();
+        config.watch = vec![PrWatchKind::Ci];
+        config.agent_command = format!(
+            "touch {} {{prompt}} {}",
+            sentinel.display(),
+            "x".repeat(101 * 1024)
+        );
+        let mut forge = fixture.forge(vec![fixture.proof.clone(), fixture.proof.clone()]);
+        forge.pr.status_check_rollup = vec![
+            serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                .unwrap(),
+        ];
+
+        let out = drive_queue(
+            &config,
+            &uncontained_config(),
+            &forge,
+            fixture.dir.path(),
+            db,
+            vec![PrItem::from(&row)],
+            |_| {},
+        );
+
+        let held = db.list_pr_queue().unwrap().remove(0);
+        assert!(!sentinel.exists());
+        assert_eq!(held.agent_attempts, 1);
+        assert_eq!(held.status, PrqStatus::NeedsHuman.as_str());
+        assert_eq!(out.needs_human, vec![7]);
+        assert!(out.warnings.iter().any(|warning| {
+            warning.contains("agent did not start:") && warning.contains("no attempt spent")
+        }));
     }
 }

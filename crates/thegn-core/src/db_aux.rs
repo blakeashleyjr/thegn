@@ -1678,6 +1678,39 @@ impl WorktreeAuxStore for Db {
         Ok(changed == 1)
     }
 
+    fn refund_pr_agent_attempt(
+        &self,
+        lease: &crate::pr_queue::PrAgentLease,
+        status: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            crate::pr_queue::PrqStatus::parse(status).is_some(),
+            "unknown PR-queue status {status:?}"
+        );
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE pr_queue SET agent_attempts=agent_attempts-1,
+               agent_claim_owner=NULL,agent_claim_lease_until_ms=NULL,agent_claim_owner_hint=NULL,
+               status=CASE WHEN status='agent_running' THEN ?3 ELSE status END,
+               detail=CASE WHEN status='agent_running' THEN ?4 ELSE detail END, updated_at=?5
+             WHERE key=?1 AND agent_claim_owner=?2 AND agent_claim_generation=?6
+               AND agent_claim_lease_until_ms>=?7 AND agent_attempts=?8 AND agent_attempts>0",
+            params![
+                lease.key,
+                lease.owner_token,
+                status,
+                detail,
+                util::now(),
+                lease.generation,
+                util::now_ms(),
+                lease.attempt,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     fn record_pr_agent_head(
         &self,
         lease: &crate::pr_queue::PrAgentLease,
