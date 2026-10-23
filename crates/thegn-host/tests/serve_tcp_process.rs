@@ -225,7 +225,7 @@ async fn cli_serve_tcp_pairs_and_requires_a_token() {
 
     let empty = thegn_svc::control::client::ControlClient::new(
         thegn_svc::control::client::ControlAddr::Tcp {
-            addr,
+            addr: addr.to_string(),
             token: String::new(),
         },
     );
@@ -269,7 +269,10 @@ async fn cli_serve_tcp_pairs_and_requires_a_token() {
     );
 
     let reader_client = thegn_svc::control::client::ControlClient::new(
-        thegn_svc::control::client::ControlAddr::Tcp { addr, token },
+        thegn_svc::control::client::ControlAddr::Tcp {
+            addr: addr.to_string(),
+            token,
+        },
     );
     reader_client
         .me()
@@ -281,7 +284,7 @@ async fn cli_serve_tcp_pairs_and_requires_a_token() {
         .expect("redeemed token can read sessions");
     let unknown = thegn_svc::control::client::ControlClient::new(
         thegn_svc::control::client::ControlAddr::Tcp {
-            addr,
+            addr: addr.to_string(),
             token: "tgp1_invalid".into(),
         },
     );
