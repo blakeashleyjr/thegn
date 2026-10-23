@@ -87,9 +87,11 @@ the reason; use `thegn land` to land that branch outside the queue.
 - If Git cannot read the queued branch or fixer's checkout during a drain, the
   row is held `agent_blocked` with a `candidate unreadable:` reason and Git's
   error, without spending an attempt. Retry it once Git is readable.
-- `thegn merge clear` removes unclaimed rows. Rows held by an active drain
-  stay queued, are named in the error, and require another clear after the
-  drain finishes.
+- When a drain holds a row, `thegn merge add` (re-enqueue) and `thegn merge rm`
+  refuse and name the drain; `thegn merge retry` and `thegn merge land` refuse;
+  `thegn merge clear` removes unclaimed rows, names kept claimed rows, and exits
+  non-zero; deleting the worktree keeps its row. The control API answers
+  `conflict` for a claimed-row refusal.
 - An unrecognised stored queue status is shown as such and has no land or
   retry key.
 - `thegn land` and `thegn integrate` can finish a land while an active drain

@@ -11,6 +11,17 @@ pub const MERGE_CLAIM_OWNER_HINT_MAX: usize = 64;
 pub const MERGE_CLAIM_LOST: &str = "merge claim lost";
 pub const MERGE_CLAIM_ACTIVE: &str = "merge row is claimed by an active drain";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeClaimActive;
+
+impl std::fmt::Display for MergeClaimActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MERGE_CLAIM_ACTIVE)
+    }
+}
+
+impl std::error::Error for MergeClaimActive {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeRetryOutcome {
     Rearmed,
