@@ -9,6 +9,48 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.37] — 2026-10-23 (maintenance batch 74)
 
+### Changed
+
+- `thegn pr queue rm` refuses to remove a row while its PR agent is running;
+  `clear` removes other rows, names the kept PRs and exits with an error. The
+  section’s `x` and `c` actions report the same result. `thegn session move`
+  drops pane working directories outside the moved worktree, so those panes
+  start in the worktree root. The daemon’s `ci.runs` and `ci.logs` refuse a
+  worktree with no CI provider with a `no-provider:` failed-precondition error
+  instead of serving a cached list. CI autofix acts on the one active PR-queue
+  row for the failing worktree and holds with a notification when several
+  active rows share it.
+- `thegn merge land` and the panel’s `l` fold exactly the commit the queue
+  verified; a branch that moved since is refused before anything is folded.
+  A workspace clone does not replace a destination directory that appears
+  during cloning, and staging left by crashed clones is reclaimed at startup.
+  MPD controls the server does not permit are reported as unsupported instead
+  of being sent, and a burst of player-change notifications is read once. A
+  keyring write or delete that does not answer in time is reported as having
+  an unknown outcome instead of a refusal. The pane daemon exits and removes
+  its socket when SIGTERM arrives right after it starts.
+
+### Fixed
+
+- VPS destroys retire their record only after the instance is absent from the
+  provider inventory, and machine0 destroys refuse when the VM lookup is
+  unclear instead of treating the VM as already gone (dev channel).
+
+### Security
+
+- Configured agents and tools are refused when the state database cannot be
+  opened at launch; a plain shell starts with a warning. PDF and Mermaid
+  previews do not run a renderer found inside the previewed repository.
+  `file:` secret references in the push inbox, share and issue tokens, the
+  embedded git UI and the proxy use the owner-only checked reader. A managed
+  account home that another account’s legacy name also matches (`work` vs
+  `Work`) is refused instead of being reused. The macOS launcher passes
+  `--env` values as data, never as shell code (macOS).
+- Provider close-time downloads stay within held directory handles; unreadable
+  warm-pool bindings refuse instead of targeting a derived sandbox; Sprites
+  sshd setup refuses symlinked or unparsable `authorized_keys` before custody
+  (dev channel).
+
 ## [0.1.0-alpha.36] — 2026-10-23 (maintenance batch 73)
 
 ### Changed
