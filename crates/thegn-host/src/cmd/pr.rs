@@ -169,8 +169,32 @@ fn forges() -> std::sync::Arc<thegn_svc::forge::ForgeSet> {
     crate::forge_handle::get()
 }
 
+/// The worktree a `thegn pr` verb acts on. Without `--worktree` this is the usual default; an explicit
+/// `--worktree` must be a directory inside a git worktree and resolves to that worktree's root, so a
+/// typo or a deleted path is refused before anything reaches the forge.
+fn target_worktree(arg: Option<String>) -> Result<std::path::PathBuf> {
+    target_worktree_with(
+        arg,
+        resolve_worktree,
+        thegn_core::repo::worktree_root_for_cwd,
+    )
+}
+
+fn target_worktree_with(
+    arg: Option<String>,
+    default: impl FnOnce(Option<String>) -> std::path::PathBuf,
+    root_of: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    match arg {
+        None => Ok(default(None)),
+        Some(raw) => root_of(std::path::Path::new(&raw)).ok_or_else(|| {
+            anyhow::anyhow!("--worktree {raw} is not a git worktree; nothing was sent to the forge")
+        }),
+    }
+}
+
 fn status(worktree: Option<String>) -> Result<()> {
-    let wt = resolve_worktree(worktree);
+    let wt = target_worktree(worktree)?;
     let loc = GitLoc::for_worktree(&wt);
     let panel = forges()
         .for_loc(&loc)
@@ -220,7 +244,7 @@ fn create(
     web: bool,
     fill: bool,
 ) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     let fill = fill || (title.is_none() && body.is_none() && !web);
     let opts = CreateOpts {
         title,
@@ -243,7 +267,7 @@ fn create(
 }
 
 fn open(worktree: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     if let Err(e) = forges().for_loc(&loc).open_in_browser(&loc, None) {
         msg::die(&format!("pr open failed: {}", e.describe()));
     }
@@ -251,7 +275,7 @@ fn open(worktree: Option<String>) -> Result<()> {
 }
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     let registry = forges();
     let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -288,7 +312,7 @@ fn merge(
     auto: bool,
     yes: bool,
 ) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     let forges = forges();
     let forge = forges.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -421,7 +445,7 @@ pub(crate) fn merge_outcome_text(
 }
 
 fn rerun(worktree: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     match forges().for_loc(&loc).rerun_failed(&loc, PrRef::Current) {
         Ok(0) => msg::info("no failed checks to re-run"),
         Ok(n) => msg::info(&format!("re-ran {n} failed workflow run(s)")),
@@ -431,7 +455,7 @@ fn rerun(worktree: Option<String>) -> Result<()> {
 }
 
 fn reviews(worktree: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     match forges().for_loc(&loc).reviews_json(&loc) {
         Ok(json) => outln!("{json}"),
         Err(e) => msg::die(&format!("pr reviews failed: {}", e.describe())),
@@ -440,7 +464,7 @@ fn reviews(worktree: Option<String>) -> Result<()> {
 }
 
 fn comment(worktree: Option<String>, body: String) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     match forges().for_loc(&loc).comment(&loc, PrRef::Current, &body) {
         Ok(()) => msg::info("comment posted"),
         Err(e) => msg::die(&format!("pr comment failed: {}", e.describe())),
@@ -449,7 +473,7 @@ fn comment(worktree: Option<String>, body: String) -> Result<()> {
 }
 
 fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     let registry = forges();
     let forge = registry.for_loc(&loc);
     let pr = match forge.pr_status(&loc, PrRef::Current) {
@@ -480,7 +504,7 @@ fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) ->
 }
 
 fn diff(worktree: Option<String>, json: bool) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     if json {
         match forges().for_loc(&loc).pr_diff(&loc, PrRef::Current) {
             Ok(d) => outln!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()),
@@ -497,7 +521,7 @@ fn diff(worktree: Option<String>, json: bool) -> Result<()> {
 }
 
 fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     // `undo` converts the PR back to a draft; otherwise mark it ready.
     match forges().for_loc(&loc).set_draft(&loc, PrRef::Current, undo) {
         Ok(()) if undo => msg::info("PR converted to draft"),
@@ -508,7 +532,7 @@ fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
 }
 
 fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree(&target_worktree(worktree)?);
     match forges()
         .for_loc(&loc)
         .set_auto_merge(&loc, PrRef::Current, !disable, MergeMethod::Squash)
@@ -522,7 +546,11 @@ fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewedPr, merge_outcome_text, merge_reviewed_head, review_reviewed_head};
+    use super::{
+        ReviewedPr, merge_outcome_text, merge_reviewed_head, review_reviewed_head, target_worktree,
+        target_worktree_with,
+    };
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use thegn_core::forge::model::{MergeMethod, PrHeader, PrStatus, ReviewState};
     use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef};
@@ -880,5 +908,58 @@ mod tests {
             forge.calls().last().map(String::as_str),
             Some("status Number(7)")
         );
+    }
+
+    #[test]
+    fn explicit_worktree_outside_any_repository_is_refused_before_the_forge() {
+        let result = target_worktree_with(
+            Some("/definitely/not/here".into()),
+            |_| panic!("default must not run"),
+            |_| None,
+        );
+        let error = result.expect_err("an explicit non-repository path must be refused");
+        assert!(error.to_string().contains("is not a git worktree"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(target_worktree(Some(missing.display().to_string())).is_err());
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "creates a real Git repository for the worktree resolver regression"
+    )]
+    fn explicit_nested_directory_targets_its_worktree_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let output = thegn_core::util::git_cmd(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "commit.gpgsign=false", "init", "-q"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let nested = repo.join("sub/dir");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let resolved = target_worktree(Some(nested.display().to_string())).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(repo).unwrap());
+    }
+
+    #[test]
+    fn no_worktree_flag_keeps_the_default_resolution() {
+        let resolved = target_worktree_with(
+            None,
+            |_| PathBuf::from("/default"),
+            |_| panic!("root_of must not run"),
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/default"));
     }
 }
