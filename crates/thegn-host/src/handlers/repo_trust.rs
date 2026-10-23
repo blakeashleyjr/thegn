@@ -59,8 +59,8 @@ pub(crate) fn approvals_for(db: &Db, repo_root: &str) -> Approvals {
 /// worktree. Read-only status/provisioning callers must not stop at the base
 /// repo sandbox: doing so drops the workspace/worktree env selection and its
 /// `[env.<name>.sandbox]` overlay. A failed location or selection read is an
-/// error, never a local location or the default environment. `db: None`
-/// performs no reads.
+/// error, except that a failed selection read can use the implicit default
+/// when no named environments are configured. `db: None` performs no reads.
 pub(crate) fn effective_environment_for_worktree(
     cfg: &Config,
     db: Option<&Db>,
@@ -101,7 +101,13 @@ fn environment_from_reads(
 ) -> anyhow::Result<Environment> {
     use anyhow::Context;
     let location = location.context("the worktree's recorded location could not be read")?;
-    let selected = selected.context("the worktree's environment selection could not be read")?;
+    let selected = match selected {
+        Ok(selected) => selected,
+        Err(_) if cfg.env.is_empty() => None,
+        Err(error) => {
+            return Err(error).context("the worktree's environment selection could not be read");
+        }
+    };
     let loc = GitLoc::from_db(&worktree.to_string_lossy(), location.as_deref());
     Ok(cfg
         .resolve_env_with(repo_root, &loc, worktree, selected.as_deref(), approvals)
@@ -309,6 +315,10 @@ pub(crate) fn devcontainer_lifecycle_steps(
     ) {
         Ok(env) => env,
         Err(error) => {
+            crate::launch_notice::post(
+                worktree,
+                &format!("devcontainer lifecycle steps skipped: {error:#}"),
+            );
             thegn_core::msg::warn(&format!(
                 "devcontainer lifecycle steps skipped for {worktree}: {error:#}"
             ));
@@ -357,6 +367,10 @@ pub(crate) fn devcontainer_feature_steps(
     ) {
         Ok(env) => env,
         Err(error) => {
+            crate::launch_notice::post(
+                worktree,
+                &format!("devcontainer feature steps skipped: {error:#}"),
+            );
             thegn_core::msg::warn(&format!(
                 "devcontainer feature steps skipped for {worktree}: {error:#}"
             ));
@@ -473,8 +487,18 @@ mod tests {
     #[test]
     fn environment_from_reads_refuses_an_unreadable_selection() {
         let root = tempfile::tempdir().unwrap();
+        let cfg = thegn_core::config::Config {
+            env: std::collections::BTreeMap::from([(
+                "box".into(),
+                thegn_core::config::EnvConfig {
+                    placement: thegn_core::config::PlacementMode::Local,
+                    ..thegn_core::config::EnvConfig::default()
+                },
+            )]),
+            ..thegn_core::config::Config::default()
+        };
         let error = environment_from_reads(
-            &thegn_core::config::Config::default(),
+            &cfg,
             root.path(),
             root.path(),
             Ok(None),
@@ -486,6 +510,22 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("environment selection could not be read"));
         assert!(message.contains("database is locked"));
+    }
+
+    #[test]
+    fn environment_from_reads_uses_default_when_unconfigured_selection_is_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = environment_from_reads(
+            &thegn_core::config::Config::default(),
+            root.path(),
+            root.path(),
+            Ok(None),
+            Err(anyhow::anyhow!("database is locked")),
+            &thegn_core::config_resolve::Approvals::deny_all(),
+        )
+        .unwrap();
+
+        assert_eq!(environment.name, "default");
     }
 
     #[test]

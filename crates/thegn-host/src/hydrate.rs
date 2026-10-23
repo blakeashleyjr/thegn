@@ -1629,17 +1629,24 @@ fn collect_sidebar_status(
             continue;
         }
         let approvals = crate::handlers::repo_trust::approvals_for(db, &wt.repo_root);
-        // An unreadable environment has no devcontainer status; do not report
-        // the default environment's status for this worktree.
-        let Ok(environment) = crate::handlers::repo_trust::effective_environment_for_worktree(
+        let environment = match crate::handlers::repo_trust::effective_environment_for_worktree(
             app_cfg,
             Some(db),
             std::path::Path::new(&wt.repo_root),
             std::path::Path::new(&wt.worktree),
             Some(&wt.location),
             &approvals,
-        ) else {
-            continue;
+        ) {
+            Ok(environment) => environment,
+            Err(error) => {
+                tracing::debug!(
+                    target: "thegn::hydrate",
+                    worktree = %wt.worktree,
+                    error = %format!("{error:#}"),
+                    "skipping sidebar devcontainer status after environment read failure"
+                );
+                continue;
+            }
         };
         if let Some(devcontainer) = crate::devcontainer_provider::status_for_worktree(
             app_cfg,

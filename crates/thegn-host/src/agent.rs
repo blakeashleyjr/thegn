@@ -4458,6 +4458,14 @@ pub fn launch_spec_full(
     // the host store isn't mounted). See [`devenv`].
     let devshell = (!loc.is_remote() && !outcome.is_remote)
         .then(|| {
+            if db.is_none() && !cfg.env.is_empty() {
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    worktree,
+                    "devshell injection skipped: the state database could not be opened"
+                );
+                return false;
+            }
             let approvals = db
                 .as_ref()
                 .map(|db| {
@@ -4474,6 +4482,12 @@ pub fn launch_spec_full(
             ) {
                 Ok(environment) => environment.sandbox.inject_devshell,
                 Err(error) => {
+                    crate::launch_notice::post(
+                        worktree,
+                        &format!(
+                            "devshell injection skipped: the environment could not be resolved: {error:#}"
+                        ),
+                    );
                     tracing::warn!(
                         target: "thegn::sandbox",
                         worktree,
