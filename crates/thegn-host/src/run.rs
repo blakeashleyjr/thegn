@@ -557,6 +557,7 @@ pub async fn main(
     // logging or report writing, so the terminal is always left usable. The
     // swap-once guard means hook and normal teardown never double-run it; it is
     // cleared in teardown below.
+    let raw_restore_owned = term_restore.is_some();
     if let Some(r) = term_restore {
         let r = std::sync::Arc::new(r);
         thegn_core::log_trace::register_panic_restore(move || r.restore());
@@ -1327,7 +1328,7 @@ pub async fn main(
         // no-op in the kitty spec, and it is defensive against an inner app
         // that pushed flags and died without popping them. Leave the bytes.
         let outcome = crate::frame_writer::write_terminal_teardown(
-            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h",
+            b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l\x1b[?2004l",
         );
         if outcome != crate::frame_writer::TeardownWrite::Written {
             tracing::warn!(
@@ -1340,11 +1341,10 @@ pub async fn main(
     // Share the one restore path with the panic hook behind the swap-once guard:
     // if a panic already restored the terminal this is a no-op, and once this
     // runs a later panic-in-Drop won't double-restore. Then clear the callback
-    // (we no longer own the screen) before termwiz tears the buffer down.
+    // before releasing termwiz; the raw restore owns teardown when available.
     thegn_core::log_trace::run_panic_restore_once();
     thegn_core::log_trace::clear_panic_restore();
-    let _ = buf.terminal().exit_alternate_screen(); // best-effort: terminal teardown: the tty restores itself when the process drops
-    let _ = buf.terminal().set_cooked_mode(); // best-effort: terminal teardown: the tty restores itself when the process drops
+    crate::frame_write::release_terminal(buf, raw_restore_owned);
     // Frame is torn down; branded `msg::*` may print to stderr again.
     thegn_core::msg::set_tui_active(false);
     result
