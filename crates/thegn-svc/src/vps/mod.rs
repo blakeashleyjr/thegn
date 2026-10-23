@@ -744,17 +744,19 @@ impl VpsProvider {
         if let Some(id) = matching_ssh_key(keys, &self.spec.pubkey) {
             return Ok(id);
         }
-        // Name the registered key by its material fingerprint, not a fixed
+        // Name the registered key by the SHA-256 of the decoded key, not a fixed
         // "thegn-managed": vendor key names must be unique, so a fixed name
         // would 409 the moment the managed key material differs from an
         // already-registered same-named key (key rotation, or a stale key from a
-        // reinstall). Keyed by fingerprint, distinct material ⇒ distinct name,
-        // and identical material is already served by the `same_pubkey` fast path.
-        let fp = thegn_core::util::short_hash(self.spec.pubkey.trim(), 8);
+        // reinstall). Keyed by SHA-256 of the decoded key, distinct material ⇒
+        // distinct name. `matching_ssh_key` reuses identical material under any
+        // name, including keys registered with the earlier FNV naming scheme.
+        let name = thegn_core::managed_ssh::vendor_key_name(self.spec.pubkey.trim())
+            .context("vps: the managed public key is not a valid OpenSSH key")?;
         let created = self
             .post_json(
                 &shaper.ssh_keys_url(base),
-                &shaper.ssh_key_body(&format!("thegn-managed-{fp}"), self.spec.pubkey.trim()),
+                &shaper.ssh_key_body(&name, self.spec.pubkey.trim()),
             )
             .await?;
         shaper
