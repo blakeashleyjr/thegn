@@ -12,8 +12,10 @@ Two ways a worktree's dev server reaches a browser.
 
 ## Ingress shares (`[share]`)
 
-`Alt-Shift-S` (share-worktree-port) exposes a port from the focused
-worktree at a public URL. The [[panel]]'s **system → share** section
+`Alt-Shift-S` (share-worktree-port) shares a port from the focused
+worktree at a URL or ticket whose reach depends on the provider: bore and
+frp are public, a Tailscale share is tailnet-only unless `funnel = true`,
+and an iroh share is a peer-to-peer ticket. The [[panel]]'s **system → share** section
 lists every active share: `↵` copies the URL, `o` opens it in the
 browser, `n` starts a share, and `x` stops the highlighted share (the
 stop-share action stops them all). The row stays `stopping…` until the tunnel
@@ -71,9 +73,10 @@ secret passed through `extra_args` to `[share.bore] secret` instead.
 
 ## Auto port forwards (`[forward]`)
 
-For sandboxed worktrees ([[sandboxing]]), dev-server ports detected
-inside the container are forwarded to the host's loopback automatically
-for local browser preview. The **system → forward** section lists the
+For sandboxed worktrees ([[sandboxing]]), dev-server ports detected inside
+the local container sandbox (podman or docker) are forwarded to the host for
+local browser preview. `bind` defaults to loopback; a non-loopback bind is
+refused unless `[forward] allow_external_bind = true`. The **system → forward** section lists the
 active forwards: `↵` copies the preview URL, `o` opens it, `n` starts
 watching a port, and `x` removes a forward.
 
