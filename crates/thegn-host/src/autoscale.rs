@@ -53,9 +53,9 @@ fn lane_provider_config(cfg: &Config, t: &ManagedTemplate) -> EnvProviderConfig 
 }
 
 /// Create + register one engine host from `template`. Returns the host NAME
-/// (a `[host.<name>]`-shaped def persisted to the DB). On create failure the
-/// lane is cooled down (escalating, capped) and the error propagates so the
-/// broker walks the next lane on the next decision.
+/// (a `[host.<name>]`-shaped def persisted to the DB). On create or
+/// post-create registration failure the lane is cooled down (escalating,
+/// capped) and the error propagates.
 pub(crate) fn provision_managed(
     cfg: &Config,
     db: &Db,
@@ -87,28 +87,42 @@ pub(crate) fn provision_managed(
         cool_lane(db, template, &format!("create failed: {e}"), cfg);
         return Err(e).context(format!("autoscale create ({})", template.lane_key()));
     }
-    let ip = crate::agent::block_on_provider(|| async { provider.resolve_ip(&name).await })
-        .context("resolve fresh host ip")?;
+    let registration = (|| -> Result<String> {
+        let ip = crate::agent::block_on_provider(|| async { provider.resolve_ip(&name).await })
+            .context("resolve fresh host ip")?;
 
-    // Register: a DB host def (merged into the config catalog on next load;
-    // `db_host_binding` synthesizes a binding for THIS process) + the
-    // authoritative capacity spec from the template.
-    let hc = engine_host_config(&name, &ip)?;
-    db.put_host_def(&name, &hc, unix_now())
-        .context("persist engine host def")?;
-    db.capacity_put(&HostCapacityRow {
-        host: HostId::named(&name),
-        ownership: HostOwnership::Managed,
-        spec: template.spec(),
-        overcommit_cpu_pct: 0, // 0 ⇒ resolved config overcommit applies
-        overcommit_mem_pct: 0,
-        provider: template.provider.trim().to_string(),
-        template: template.size.trim().to_string(),
-        created_at: Some(unix_now()),
-        measured: None,
-        updated_at: unix_now(),
-    })
-    .context("persist engine host capacity")?;
+        // Register the host def (merged into the config catalog on next load)
+        // and the authoritative capacity spec from the template.
+        let hc = engine_host_config(&name, &ip)?;
+        db.put_host_def(&name, &hc, unix_now())
+            .context("persist engine host def")?;
+        db.capacity_put(&HostCapacityRow {
+            host: HostId::named(&name),
+            ownership: HostOwnership::Managed,
+            spec: template.spec(),
+            overcommit_cpu_pct: 0, // 0 ⇒ resolved config overcommit applies
+            overcommit_mem_pct: 0,
+            provider: template.provider.trim().to_string(),
+            template: template.size.trim().to_string(),
+            created_at: Some(unix_now()),
+            measured: None,
+            updated_at: unix_now(),
+        })
+        .context("persist engine host capacity")?;
+        Ok(ip)
+    })();
+    let ip = match registration {
+        Ok(ip) => ip,
+        Err(error) => {
+            cool_lane(
+                db,
+                template,
+                &format!("post-create failure: {error:#}"),
+                cfg,
+            );
+            return Err(error);
+        }
+    };
     // A successful create clears the lane's marker (explicit fail-back).
     let _ = db.health_clear(&template.lane_key()); // best-effort: cache write: the successful create already reported; the marker clear is bookkeeping
     // Fixed-cost meter: an engine host bills from create to destroy. Rate
