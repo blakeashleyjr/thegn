@@ -319,6 +319,27 @@ pub(super) fn sensors(grid: &mut CellGrid, rect: Rect, sensors: &[SensorRow]) {
             fmt: kit::edge_fmt(NumFmt::default()),
         },
     );
+    let bar_x = SENSOR_COLUMN_WIDTHS[..4].iter().sum::<usize>() + 4;
+    let track = caps::raster_table().track;
+    for (row, bar) in bars.iter().enumerate() {
+        for (offset, ch) in bar.chars().take(bar_width).enumerate() {
+            if ch == track {
+                continue;
+            }
+            let level = (offset.saturating_mul(7) / bar_width.max(1)) as u8;
+            if let Some(fg) = StyleTok::from_tok(Tok::Ramp(RampId::Temp, level)) {
+                grid.view(rect).put(
+                    bar_x + offset,
+                    row + 1,
+                    CellStyle {
+                        ch,
+                        fg,
+                        ..CellStyle::default()
+                    },
+                );
+            }
+        }
+    }
 }
 
 pub(super) fn zones(
