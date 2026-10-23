@@ -4213,9 +4213,9 @@ unsafe_allow_plaintext_non_loopback = false
 # is the credential.
 require_approval = false
 # Local unix-socket peers get implicit admin only when native peer credentials
-# match the daemon's effective uid. The 0700 run-dir and 0600 socket are strict
-# startup invariants in this mode. Set false to require scoped bearer tokens on
-# Unix too (useful where peer credentials or filesystem modes are unavailable).
+# match the daemon's effective uid. The owner-only 0700 parent and 0600 socket
+# are enforced in both modes; setting false requires scoped bearer tokens on
+# Unix too and does not relax these invariants.
 # Tokens are always required on TCP.
 local_admin = true
 # Cross-origin allowlist for a browser-hosted thin client. Empty (default) = NO
