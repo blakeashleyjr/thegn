@@ -1152,7 +1152,7 @@ _apply-backend backend="":
       if [ "$backend" = sprites ] && ! grep -q '^\[env\.sprites\]' "$cfg" 2>/dev/null; then \
         command -v python3 >/dev/null 2>&1 || { echo "python3 is required to validate $cfg before scaffolding [env.sprites]; add the block by hand" >&2; exit 1; }; \
         command -v sprite >/dev/null 2>&1 || echo "note: sprite CLI not on PATH — fine for native exec (the default exec=auto attaches over the WSS API with just SPRITES_TOKEN); the CLI is only the fallback transport" >&2; \
-        if [ -e "$cfg" ] && ! python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$cfg"; then \
+        if [ -e "$cfg" ] && ! python3 -c 'import sys, tomllib; exec("try:\n tomllib.load(open(sys.argv[1], \"rb\"))\nexcept tomllib.TOMLDecodeError as error:\n sys.exit(f\"{sys.argv[1]}: {error}\")")' "$cfg"; then \
           echo "$cfg is not valid TOML — not modified" >&2; exit 1; \
         fi; \
         cfg_observed=absent; \
@@ -1161,10 +1161,10 @@ _apply-backend backend="":
         cfg_stage="$(mktemp "$(dirname "$cfg")/.config.toml.XXXXXX")" || { echo "could not stage $cfg" >&2; exit 1; }; \
         if [ -e "$cfg" ]; then \
           cfg_backup="$(mktemp "$(dirname "$cfg")/.config.toml.restore.XXXXXX")" || { rm -f -- "$cfg_stage"; echo "could not stage a restore copy of $cfg" >&2; exit 1; }; \
-          if ! cat "$cfg" > "$cfg_backup" || ! cat "$cfg" > "$cfg_stage"; then rm -f -- "$cfg_stage" "$cfg_backup"; echo "could not copy $cfg into its stage" >&2; exit 1; fi; \
+          if ! cp -p -- "$cfg" "$cfg_backup" || ! cat "$cfg" > "$cfg_stage"; then rm -f -- "$cfg_stage" "$cfg_backup"; echo "could not copy $cfg into its stage" >&2; exit 1; fi; \
         fi; \
         if ! printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\n# Per-worktree sprite name. Tokens: {repo}=repo name, {worktree}=dir basename,\n# {hash}=stable path digest (collision-defuser), {slug}=full-path. Default is\n# conflict-free across repos; "" is equivalent. A no-token literal = one shared sprite.\nid = "{repo}-{worktree}-{hash}"\napi_key_env = "SPRITES_TOKEN"\nexec = "auto"\nauto_provision = true\nauto_checkpoint = true\n# CLI bridge — only used if you set exec = "cli"; lifecycle is API (auto_provision/auto_checkpoint).\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\n' >> "$cfg_stage"; then rm -f -- "$cfg_stage"; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; echo "could not append the [env.sprites] scaffold to its stage" >&2; exit 1; fi; \
-        if ! python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$cfg_stage"; then rm -f -- "$cfg_stage"; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; echo "$cfg is not valid TOML after adding [env.sprites] — not modified" >&2; exit 1; fi; \
+        if ! python3 -c 'import sys, tomllib; exec("try:\n tomllib.load(open(sys.argv[1], \"rb\"))\nexcept tomllib.TOMLDecodeError as error:\n sys.exit(f\"{sys.argv[1]}: {error}\")")' "$cfg_stage"; then rm -f -- "$cfg_stage"; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; echo "$cfg is not valid TOML after adding [env.sprites] — not modified" >&2; exit 1; fi; \
         scaffold_cfg=true; \
       fi; \
       if [ "$overlay_current" != true ]; then \
