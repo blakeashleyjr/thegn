@@ -2696,6 +2696,29 @@ pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
     )
 }
 
+/// The tab-bar chip triple `(placement kind, placement label, backend)` shown
+/// while the active worktree's environment selection cannot be read. `None`
+/// when the read succeeded, or when no non-local `[env.*]` is configured (the
+/// only possible environment is then local, so the default chips are true).
+pub(crate) fn unreadable_env_chips(
+    cfg: &thegn_core::config::Config,
+    error: Option<&str>,
+) -> Option<(Option<String>, Option<String>, String)> {
+    let error = error?;
+    if !cfg
+        .env
+        .values()
+        .any(|e| e.placement != thegn_core::config::PlacementMode::Local)
+    {
+        return None;
+    }
+    Some((
+        Some("env?".to_string()),
+        Some(format!("environment selection unreadable: {error}")),
+        String::new(),
+    ))
+}
+
 /// Build the chrome model from the resurrected session + the current worktree's
 /// git state (best-effort — the host stays up even with no repo / no DB). This
 /// is the in-process data flow the chrome relies on: read core + svc directly,
@@ -2816,15 +2839,17 @@ pub(crate) fn build_model(
     // Use the EFFECTIVE env selection (per-worktree override, else the
     // workspace default) — the same source the loading splash's
     // `agent::loading_context` uses. Reading raw `worktree_env` here missed the
-    // workspace-default case: a worktree created under a workspace whose default
-    // env is a provider (e.g. `sprites`) has no per-worktree row, so the tab bar
-    // resolved it as Local — no `[sprites]` chip and a bogus `(bwrap)` backend
-    // chip — while the splash correctly showed the provider placement.
+    // workspace-default case. An unreadable selection shows the `env?` chip,
+    // see `unreadable_env_chips`.
+    let selection = db.effective_env_checked(&active_path, &active_repo);
+    let selection_error: Option<String> =
+        selection.as_ref().err().map(|error| format!("{error:#}"));
+    let selected: Option<String> = selection.unwrap_or_default();
     let active_env = app_cfg.resolve_env(
         std::path::Path::new(&active_repo),
         &loc,
         std::path::Path::new(&active_path),
-        db.effective_env(&active_path, &active_repo).as_deref(),
+        selected.as_deref(),
     );
     // A provider env whose CONTENT resolved local has degraded to the host
     // (provider unavailable + `failover`, or a stale remote location healed back
@@ -2879,6 +2904,15 @@ pub(crate) fn build_model(
     } else {
         String::new()
     };
+    let (active_placement_kind, active_placement_label, active_sandbox_backend) =
+        match unreadable_env_chips(&app_cfg, selection_error.as_deref()) {
+            Some(chips) => chips,
+            None => (
+                active_placement_kind,
+                active_placement_label,
+                active_sandbox_backend,
+            ),
+        };
 
     // A TERMINAL tab has no worktree path, so the `resolve_env` above resolved the
     // launch cwd's workspace/global `[sandbox] default_env` — which wrongly labeled
