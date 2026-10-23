@@ -137,6 +137,8 @@ as plain text that may contain anything a tool printed. These values are
 omitted from human and JSON audit output. Thegn never reads or copies
 credentials, tokens, identities, accounts, pairings, or profile configuration;
 content history crosses only with `--include-history`.
+Pane working directories outside the moved worktree are dropped in both modes;
+those panes start in the worktree root.
 
 The move is target-first: the target rows are committed and read back under a
 sanitized fingerprint before exact source rows are deleted. Dispatch IDs are
