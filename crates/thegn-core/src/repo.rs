@@ -237,6 +237,16 @@ pub fn repo_slug_with_checked(db: &crate::db::Db, root: &Path) -> anyhow::Result
     )
 }
 
+/// [`repo_slug_with_checked`] for startup and the UI loop: a slug claim under
+/// another process's held write lock fails at once instead of waiting out the
+/// busy timeout. Existing slugs are a plain read.
+pub fn repo_slug_with_checked_nowait(db: &crate::db::Db, root: &Path) -> anyhow::Result<String> {
+    db.slug_for_repo_nowait(
+        &root.to_string_lossy(),
+        &slug_base(&repo_name_from_path(root)),
+    )
+}
+
 fn slug_base(name: &str) -> String {
     let s = util::slugify(name);
     if s.is_empty() { "repo".to_string() } else { s }

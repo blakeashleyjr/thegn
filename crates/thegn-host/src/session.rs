@@ -488,8 +488,10 @@ impl Session {
         // path-keyed sessions have one. For non-path session names fall back
         // to the name itself for registry matching (legacy behavior).
         let session_path = std::path::Path::new(session);
+        // Resurrect runs on the startup path: never wait on another process's
+        // held write lock for a first-time slug claim.
         let canonical = if session_path.is_absolute() {
-            match thegn_core::repo::repo_slug_with_checked(db, session_path) {
+            match thegn_core::repo::repo_slug_with_checked_nowait(db, session_path) {
                 Ok(slug) => Some(slug),
                 Err(error) => {
                     tracing::warn!(target: "thegn::session", %error, session, "workspace slug unresolved; skipping slug-keyed adoption, renames and pruning");
