@@ -1387,7 +1387,19 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
-    crate::daemon::control_publish::publish_for_config(&cfg.daemon);
+    let daemon_uses_socket_override = matches!(
+        &command,
+        Command::Daemon {
+            socket: Some(_),
+            action: None
+        }
+    );
+    // The foreground daemon publishes its hardened, effective endpoint and
+    // locator during startup. Let it prepare the locator on the override path
+    // instead of initializing it here before the daemon has bound its socket.
+    if !daemon_uses_socket_override {
+        crate::daemon::control_publish::publish_for_config(&cfg.daemon);
+    }
     crate::automation_runtime::install(&cfg);
     let config_path = cli
         .config
