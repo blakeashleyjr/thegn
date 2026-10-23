@@ -2847,7 +2847,7 @@ pub(crate) fn attempt_land(
     branch_name: &str,
     branch_loc: &GitLoc,
 ) -> Result<AttemptOutcome> {
-    attempt_land_admitted(cfg, repo_root, branch_name, branch_loc).or_else(|error| {
+    attempt_land_admitted(cfg, repo_root, branch_name, branch_loc, None).or_else(|error| {
         Ok(AttemptOutcome::GateError {
             reason: "merge preparation or canonical history unavailable".into(),
             log: tail(&format!("{error:#}"), 4000),
@@ -2857,11 +2857,33 @@ pub(crate) fn attempt_land(
     })
 }
 
+/// Like [`attempt_land`], but only lands when the branch tip still equals `expected_tip`,
+/// the commit the queue verified.
+pub(crate) fn attempt_land_pinned(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    branch_name: &str,
+    branch_loc: &GitLoc,
+    expected_tip: &str,
+) -> Result<AttemptOutcome> {
+    attempt_land_admitted(cfg, repo_root, branch_name, branch_loc, Some(expected_tip)).or_else(
+        |error| {
+            Ok(AttemptOutcome::GateError {
+                reason: "merge preparation or canonical history unavailable".into(),
+                log: tail(&format!("{error:#}"), 4000),
+                phase: GatePhase::Preparation,
+                class: GateErrorClass::Preparation,
+            })
+        },
+    )
+}
+
 fn attempt_land_admitted(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
     branch_name: &str,
     branch_loc: &GitLoc,
+    expected_tip: Option<&str>,
 ) -> Result<AttemptOutcome> {
     let (loc, history) = CanonicalHistory::worktree_loc(repo_root)?;
     // A target-store observation is not proof about a remote/provider source.
@@ -2919,6 +2941,16 @@ fn attempt_land_admitted(
         source_history.revalidate()?;
         let base = CliGit.rev_parse(&loc, &target_ref)?;
         let branch_tip = CliGit.rev_parse(&loc, &branch_ref)?;
+        if let Some(expected) = expected_tip
+            && !branch_tip.eq_ignore_ascii_case(expected)
+        {
+            return Ok(AttemptOutcome::GateError {
+                reason: "branch moved after the queue verified it; run `thegn merge drain` to verify the new commits".into(),
+                log: format!("expected {expected}, found {branch_tip}"),
+                phase: GatePhase::Preparation,
+                class: GateErrorClass::SourceMoved,
+            });
+        }
         if let Some(ingested_oid) = &ingested.oid
             && branch_tip != *ingested_oid
         {
@@ -6454,6 +6486,58 @@ mod tests {
             attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap(),
             AttemptOutcome::UpToDate { .. }
         ));
+    }
+
+    #[test]
+    fn attempt_land_pinned_refuses_a_branch_that_moved_after_verification() {
+        let repo = Repo::new("al-pinned-moved");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature_multi("b1", &[("a.txt", "a\n", "one"), ("b.txt", "b\n", "two")]);
+        let verified = repo.out(&["rev-parse", "b1~1"]);
+        let before = repo.out(&["rev-parse", "main"]);
+
+        assert!(matches!(
+            attempt_land_pinned(
+                &cfg(""),
+                &repo.dir,
+                "b1",
+                &GitLoc::Local(repo.dir.clone()),
+                &verified,
+            )
+            .unwrap(),
+            AttemptOutcome::GateError {
+                class: GateErrorClass::SourceMoved,
+                phase: GatePhase::Preparation,
+                ..
+            }
+        ));
+        assert_eq!(repo.out(&["rev-parse", "main"]), before);
+    }
+
+    #[test]
+    fn attempt_land_pinned_lands_the_verified_tip() {
+        let repo = Repo::new("al-pinned-current");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature_multi("b1", &[("a.txt", "a\n", "one"), ("b.txt", "b\n", "two")]);
+        let verified = repo.out(&["rev-parse", "b1"]);
+        let before = repo.out(&["rev-parse", "main"]);
+
+        assert!(matches!(
+            attempt_land_pinned(
+                &cfg(""),
+                &repo.dir,
+                "b1",
+                &GitLoc::Local(repo.dir.clone()),
+                &verified,
+            )
+            .unwrap(),
+            AttemptOutcome::Landed { .. }
+        ));
+        assert_ne!(repo.out(&["rev-parse", "main"]), before);
     }
 
     #[test]
