@@ -276,10 +276,7 @@ fn rm(number: u64) -> Result<()> {
         .into_iter()
         .filter(|row| row.number == number)
         .collect();
-    anyhow::ensure!(
-        !matches.is_empty(),
-        "PR #{number} is no longer in the queue"
-    );
+    anyhow::ensure!(!matches.is_empty(), "PR #{number} is not in the queue");
     anyhow::ensure!(
         matches.len() == 1,
         "PR #{number} is ambiguous; matching queue keys: {}",
