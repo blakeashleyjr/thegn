@@ -2133,6 +2133,7 @@ pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
     let Some(selected_env) = env_selection_or_refuse(worktree, "native exec cooldown clear", read)
     else {
+        clear_configured_provider_cooldowns(cfg);
         return;
     };
     let environment = cfg.resolve_env(
@@ -2195,7 +2196,10 @@ pub fn provision_worktree(
         .unwrap_or_else(|| PathBuf::from(worktree));
     let read =
         Db::open().and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()));
-    let selected_env = provision_selection(read)?;
+    let selected_env = match provision_selection(cfg, read)? {
+        ProvisionSelection::Resolve(selected_env) => selected_env,
+        ProvisionSelection::Skip => return Ok(false),
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -2236,15 +2240,46 @@ fn env_selection_or_refuse(
 }
 
 /// The env selection for provisioning: a failed read is an error naming the cause.
-fn provision_selection(read: anyhow::Result<Option<String>>) -> anyhow::Result<Option<String>> {
-    read.context(
-        "provisioning refused: the environment selection could not be read (the default environment is never used instead)",
-    )
+enum ProvisionSelection {
+    Resolve(Option<String>),
+    Skip,
+}
+
+fn provision_selection(
+    cfg: &Config,
+    read: anyhow::Result<Option<String>>,
+) -> anyhow::Result<ProvisionSelection> {
+    match read {
+        Ok(selected) => Ok(ProvisionSelection::Resolve(selected)),
+        Err(_) if !cfg.env.values().any(|env| {
+            env.placement == thegn_core::config::PlacementMode::Provider
+        }) => Ok(ProvisionSelection::Skip),
+        Err(error) => Err(error).context(
+            "provisioning refused: the environment selection could not be read (the default environment is never used instead)",
+        ),
+    }
+}
+
+/// Retry cannot identify the selected provider while the DB read is failing.
+/// Clear configured provider cooldowns so the retry can proceed once selection
+/// becomes readable again.
+fn clear_configured_provider_cooldowns(cfg: &Config) {
+    for env in cfg
+        .env
+        .values()
+        .filter(|env| env.placement == thegn_core::config::PlacementMode::Provider)
+    {
+        native_exec_report(&env.provider.provider, true);
+    }
 }
 
 #[cfg(test)]
 mod env_selection_tests {
-    use super::{env_selection_or_refuse, provision_selection};
+    use super::{
+        ProvisionSelection, clear_configured_provider_cooldowns, env_selection_or_refuse,
+        native_exec_healthy, native_exec_report, provision_selection,
+    };
+    use thegn_core::config::{Config, EnvConfig, PlacementMode};
 
     #[test]
     fn env_selection_or_refuse_refuses_an_unreadable_selection() {
@@ -2272,7 +2307,17 @@ mod env_selection_tests {
 
     #[test]
     fn provision_selection_errors_on_an_unreadable_selection() {
-        let result = provision_selection(Err(anyhow::anyhow!("database is locked")));
+        let cfg = Config {
+            env: std::collections::BTreeMap::from([(
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    ..EnvConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let result = provision_selection(&cfg, Err(anyhow::anyhow!("database is locked")));
         let error = match result {
             Err(error) => error,
             Ok(_) => panic!("selection read must be refused"),
@@ -2284,11 +2329,52 @@ mod env_selection_tests {
 
     #[test]
     fn provision_selection_passes_a_read_through() {
-        assert_eq!(provision_selection(Ok(None)).unwrap(), None);
+        let cfg = Config::default();
+        assert!(matches!(
+            provision_selection(&cfg, Ok(None)).unwrap(),
+            ProvisionSelection::Resolve(None)
+        ));
         assert_eq!(
-            provision_selection(Ok(Some("box".into()))).unwrap(),
+            match provision_selection(&cfg, Ok(Some("box".into()))).unwrap() {
+                ProvisionSelection::Resolve(selected) => selected,
+                ProvisionSelection::Skip => panic!("successful read must be resolved"),
+            },
             Some("box".into())
         );
+    }
+
+    #[test]
+    fn provision_selection_allows_unreadable_selection_without_provider_envs() {
+        let cfg = Config::default();
+        assert!(
+            matches!(
+                provision_selection(&cfg, Err(anyhow::anyhow!("database is locked"))),
+                Ok(ProvisionSelection::Skip)
+            ),
+            "a local-only config must skip provisioning so a plain shell can launch"
+        );
+    }
+
+    #[test]
+    fn clear_configured_provider_cooldowns_clears_the_retry_cooldown() {
+        let cfg = Config {
+            env: std::collections::BTreeMap::from([(
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    provider: thegn_core::config::EnvProviderConfig {
+                        provider: "env-selection-test-provider".into(),
+                        ..thegn_core::config::EnvProviderConfig::default()
+                    },
+                    ..EnvConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        native_exec_report("env-selection-test-provider", false);
+        assert!(!native_exec_healthy("env-selection-test-provider"));
+        clear_configured_provider_cooldowns(&cfg);
+        assert!(native_exec_healthy("env-selection-test-provider"));
     }
 }
 
