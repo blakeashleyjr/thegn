@@ -229,9 +229,13 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     // The worktree's EFFECTIVE env (its DB selection), exactly as the exec/
     // provision paths resolve it — claiming under the ambient default while the
     // worktree runs a picked env hands over a spare from the wrong pool.
-    let selected = db
-        .as_ref()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let read = match db.as_ref() {
+        Some(db) => db.effective_env_checked(worktree, &repo_root.to_string_lossy()),
+        None => Err(anyhow::anyhow!("the state database could not be opened")),
+    };
+    let Some(selected) = claim_selection(worktree, read) else {
+        return false;
+    };
     let env_name = cfg
         .resolve_env(
             &repo_root,
@@ -303,9 +307,11 @@ pub(crate) fn guard_unprovisioned_attach(
         .map(std::path::PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(worktree)))
         .unwrap_or_else(|| std::path::PathBuf::from(worktree));
-    let selected_env = thegn_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let selected_env = attach_selection(
+        thegn_core::db::Db::open()
+            .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy())),
+    )
+    .map_err(anyhow::Error::from)?;
     let env_name = cfg
         .resolve_env(
             &repo_root,
@@ -328,6 +334,33 @@ pub(crate) fn guard_unprovisioned_attach(
         dormant: None,
     }
     .into())
+}
+
+fn claim_selection(worktree: &str, read: anyhow::Result<Option<String>>) -> Option<Option<String>> {
+    match read {
+        Ok(selected) => Some(selected),
+        Err(error) => {
+            tracing::warn!(target: "thegn::lifecycle", worktree = %worktree, error = %format!("{error:#}"), "warm-pool claim skipped: environment selection could not be read");
+            None
+        }
+    }
+}
+
+fn attach_selection(
+    read: anyhow::Result<Option<String>>,
+) -> Result<Option<String>, crate::agent::SandboxHalt> {
+    match read {
+        Ok(selected) => Ok(selected),
+        Err(error) => Err(crate::agent::SandboxHalt {
+            env_name: String::new(),
+            placement: "provider".into(),
+            reason: format!(
+                "the environment selection could not be read ({error:#}); retry once the state database is readable"
+            ),
+            ask: false,
+            dormant: None,
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,5 +1200,34 @@ mod tests {
         let succeeded = Ok(());
         assert_eq!(spare_row_after_destroy(&failed), SpareRow::Keep);
         assert_eq!(spare_row_after_destroy(&succeeded), SpareRow::Drop);
+    }
+
+    #[test]
+    fn claim_selection_never_claims_on_an_unreadable_selection() {
+        assert!(claim_selection("/wt", Err(anyhow::anyhow!("locked"))).is_none());
+    }
+
+    #[test]
+    fn claim_selection_passes_a_read_through() {
+        assert_eq!(
+            claim_selection("/wt", Ok(Some("picked".into()))),
+            Some(Some("picked".into()))
+        );
+    }
+
+    #[test]
+    fn attach_selection_halts_on_an_unreadable_selection() {
+        match attach_selection(Err(anyhow::anyhow!("locked"))) {
+            Err(halt) => assert!(halt.reason.contains("could not be read")),
+            Ok(_) => panic!("unreadable selection must halt attach"),
+        }
+    }
+
+    #[test]
+    fn attach_selection_passes_a_read_through() {
+        assert_eq!(
+            attach_selection(Ok(Some("picked".into()))).unwrap(),
+            Some("picked".into())
+        );
     }
 }

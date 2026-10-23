@@ -9913,8 +9913,19 @@ async fn event_loop<T: Terminal>(
                             // (repo_root, repo, env) via the worktree's EFFECTIVE
                             // env — see `lifecycle::pool_context` for why never
                             // the default.
-                            let (repo_root, repo, env_name) =
-                                crate::lifecycle::pool_context(&db, &cfg, &wt, &loc);
+                            let (repo_root, repo, env_name) = match crate::lifecycle::pool_context(
+                                &db, &cfg, &wt, &loc,
+                            ) {
+                                Ok(context) => context,
+                                Err(error) => {
+                                    tracing::warn!(target: "thegn::lifecycle", worktree = %wt, error = %format!("{error:#}"), "warm pool maintainer skipped");
+                                    *crate::lifecycle::pool_chip()
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = Some((wt, None));
+                                    let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                                    return;
+                                }
+                            };
                             // Hide the display-only chip on a target read error; reconcile_pool
                             // below halts and warns on that same error before changing the pool.
                             let target = crate::lifecycle::effective_pool_target(
