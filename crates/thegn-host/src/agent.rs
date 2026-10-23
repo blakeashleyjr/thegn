@@ -4028,7 +4028,7 @@ pub fn launch_spec_full(
             launch_state_gate(
                 cfg,
                 choice,
-                "the state database could not be opened, so this worktree's saved sandbox override and credential-overlay gate cannot be checked",
+                "the state database could not be opened, so this worktree's saved sandbox override, selected environment and credential-overlay gate cannot be checked",
                 &error,
             )?;
             None
@@ -4067,9 +4067,20 @@ pub fn launch_spec_full(
 
     // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
     // DB (carries remote worktrees with no local cwd), else climb from the path.
-    let repo_root: PathBuf = db
-        .as_ref()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+    let recorded_root = match db.as_ref().map(|db| db.repo_root_for(worktree)) {
+        Some(Ok(root)) => root,
+        Some(Err(error)) => {
+            launch_state_gate(
+                cfg,
+                choice,
+                "this worktree's repository root could not be read",
+                &error,
+            )?;
+            None
+        }
+        None => None,
+    };
+    let repo_root: PathBuf = recorded_root
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
@@ -4077,9 +4088,21 @@ pub fn launch_spec_full(
 
     // The selected execution environment: the worktree's own `env_name`, else
     // its workspace's. `resolve_env` falls through to the repo/global default.
-    let selected_env = db
-        .as_ref()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let selected_env = match db.as_ref() {
+        Some(db) => match db.effective_env_checked(worktree, &repo_root.to_string_lossy()) {
+            Ok(selected) => selected,
+            Err(error) => {
+                launch_state_gate(
+                    cfg,
+                    choice,
+                    "this worktree's selected execution environment could not be read",
+                    &error,
+                )?;
+                None
+            }
+        },
+        None => None,
+    };
 
     // A recorded per-worktree backend is a deliberate override (only the wizard
     // writes it, when divergent); honour it as explicit so it sticks across
