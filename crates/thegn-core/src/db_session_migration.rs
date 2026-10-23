@@ -742,6 +742,31 @@ mod tests {
     }
 
     #[test]
+    fn db_import_scopes_pane_cwds_to_the_moved_worktree() {
+        let (_source, target, mut bundle) = history_fixture();
+        bundle.groups[0].tabs[0].pane_cwds = r#"{"1":"/history/sub","2":"/elsewhere"}"#.into();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("source", "/history")
+                .unwrap(),
+            HistoryPolicy::Drop,
+        )
+        .unwrap();
+
+        target.import_migration(&plan).unwrap();
+
+        let tabs = session_tabs(&target, "source").unwrap();
+        let cwds: BTreeMap<u32, String> = serde_json::from_str(&tabs[0].pane_cwds).unwrap();
+        assert_eq!(cwds, BTreeMap::from([(1, "/history/sub".into())]));
+        assert!(target.confirm_migration(&plan).unwrap());
+        assert_eq!(
+            target.import_migration(&plan).unwrap().counts,
+            MigrationCounts::default()
+        );
+    }
+
+    #[test]
     fn db_import_include_history_carries_content_unchanged() {
         let (_source, target, bundle) = history_fixture();
         let plan = plan_migration(
