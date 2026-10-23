@@ -1371,9 +1371,7 @@ mod tests {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            if socket.write_all(b"OK MPD 0.23.0\n").await.is_err() {
-                return;
-            }
+            socket.write_all(b"OK MPD 0.23.0\n").await.unwrap();
         });
         MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap()
     }
@@ -1555,6 +1553,7 @@ mod tests {
         }
     }
 
+    // Positive control at 1244379d1, except where the fixture had commands: vec![].
     #[tokio::test]
     async fn control_matrix_success_ack_and_closed_connection() {
         for case in control_cases() {
@@ -1593,7 +1592,15 @@ mod tests {
                 commands: all_commands(),
             };
             let result = run_control(&m, case.control).await;
-            assert!(result.is_err(), "{}: ACK must not return Ok", case.name);
+            if matches!(case.control, TestControl::Loop) {
+                assert!(result.is_err(), "{}: {result:?}", case.name);
+            } else {
+                assert!(
+                    matches!(&result, Err(MediaError::Backend(_))),
+                    "{}: {result:?}",
+                    case.name
+                );
+            }
 
             let ep = closed_connection_server().await;
             let m = Mpd {
@@ -1602,11 +1609,7 @@ mod tests {
                 commands: all_commands(),
             };
             let result = run_control(&m, case.control).await;
-            assert!(
-                result.is_err(),
-                "{}: closed connection must error",
-                case.name
-            );
+            assert!(result.is_err(), "{}: {result:?}", case.name);
         }
     }
 
