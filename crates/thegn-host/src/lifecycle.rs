@@ -182,7 +182,7 @@ fn warm_candidates(
 /// can't attach to the just-parked VM.
 fn explicit_park(app_cfg: &thegn_core::config::Config, worktree: &str, loc: &GitLoc) {
     use std::path::{Path, PathBuf};
-    use thegn_core::store::{PoolStore, WorkspaceStore};
+    use thegn_core::store::WorkspaceStore;
     if !loc.is_remote() {
         return;
     }
