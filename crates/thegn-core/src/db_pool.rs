@@ -282,6 +282,33 @@ impl PoolStore for Db {
         }
     }
 
+    fn unattended_pool_spares(&self) -> Result<Vec<PoolSpare>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT s.sandbox_name,s.repo_path,s.env_name,s.state,s.checkpoint_id,s.lock_hash,s.created_at,s.updated_at
+             FROM pool_spares s
+             WHERE s.state='quarantined' OR (s.state='claimed' AND NOT EXISTS (
+                 SELECT 1 FROM worktrees w WHERE w.provider_sandbox_id=s.sandbox_name
+             ))
+             ORDER BY s.updated_at, s.sandbox_name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PoolSpare {
+                    sandbox_name: r.get(0)?,
+                    repo_path: r.get(1)?,
+                    env_name: r.get(2)?,
+                    state: r.get(3)?,
+                    checkpoint_id: r.get(4)?,
+                    lock_hash: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("warm pool: undecodable spare ledger row")?;
+        Ok(rows)
+    }
+
     fn pool_target(&self, repo: &str, env: &str) -> Result<Option<i64>> {
         let res = self.conn().query_row(
             "SELECT target FROM pool_targets WHERE repo_path=?1 AND env_name=?2",
@@ -354,6 +381,121 @@ mod tests {
             .unwrap();
 
         assert!(db.pool_spares_for("/repo", "sprites").is_err());
+    }
+
+    #[test]
+    fn unattended_spares_list_a_claimed_row_whose_worktree_row_is_gone() {
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/x", "tg/x", None, None)
+            .unwrap();
+        db.insert_pool_spare("s1", "/repo", "sprites").unwrap();
+        db.set_pool_spare_ready("s1", Some("cp"), "lock").unwrap();
+
+        assert!(
+            db.claim_pool_spare("/repo", "sprites", "/wt/x")
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.unattended_pool_spares().unwrap().is_empty());
+
+        db.del_worktree("/wt/x").unwrap();
+        let rows = db.unattended_pool_spares().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sandbox_name, "s1");
+        assert_eq!(rows[0].state, "claimed");
+    }
+
+    #[test]
+    fn unattended_spares_list_quarantined_rows() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("q1", "/repo", "sprites").unwrap();
+        db.set_pool_spare_ready("q1", Some("cp"), "lock").unwrap();
+        assert!(
+            db.begin_pool_spare_claim("/repo", "sprites")
+                .unwrap()
+                .is_some()
+        );
+        db.quarantine_pool_spare("q1", "claiming").unwrap();
+
+        let rows = db.unattended_pool_spares().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.sandbox_name.as_str(), row.state.as_str()))
+                .collect::<Vec<_>>(),
+            [("q1", "quarantined")]
+        );
+    }
+
+    #[test]
+    fn unattended_spares_skip_ready_provisioning_claiming_and_bound_rows() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("provisioning", "/repo", "sprites")
+            .unwrap();
+        db.insert_pool_spare("ready", "/r1", "sprites").unwrap();
+        db.set_pool_spare_ready("ready", None, "lock").unwrap();
+        db.insert_pool_spare("claiming", "/r2", "sprites").unwrap();
+        db.set_pool_spare_ready("claiming", None, "lock").unwrap();
+        assert!(
+            db.begin_pool_spare_claim("/r2", "sprites")
+                .unwrap()
+                .is_some()
+        );
+        db.put_worktree("tab", "/repo", "/wt/x", "tg/x", None, None)
+            .unwrap();
+        db.insert_pool_spare("bound", "/repo", "sprites").unwrap();
+        db.set_pool_spare_ready("bound", None, "lock").unwrap();
+        assert!(
+            db.claim_pool_spare("/repo", "sprites", "/wt/x")
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(db.unattended_pool_spares().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unattended_spares_order_oldest_first() {
+        let db = Db::open_memory().unwrap();
+        for name in ["a", "b"] {
+            db.insert_pool_spare(name, "/repo", "sprites").unwrap();
+            db.quarantine_pool_spare(name, "provisioning").unwrap();
+        }
+        db.conn()
+            .execute(
+                "UPDATE pool_spares SET updated_at=?1 WHERE sandbox_name=?2",
+                rusqlite::params![200, "a"],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE pool_spares SET updated_at=?1 WHERE sandbox_name=?2",
+                rusqlite::params![100, "b"],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.unattended_pool_spares()
+                .unwrap()
+                .iter()
+                .map(|row| row.sandbox_name.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn unattended_spares_undecodable_row_is_an_error() {
+        let db = Db::open_memory().unwrap();
+        db.insert_pool_spare("bad", "/repo", "sprites").unwrap();
+        db.quarantine_pool_spare("bad", "provisioning").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE pool_spares SET created_at='not-a-number' WHERE sandbox_name='bad'",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.unattended_pool_spares().is_err());
     }
 
     #[test]

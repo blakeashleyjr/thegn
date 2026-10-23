@@ -439,7 +439,6 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
         ));
     }
     let sock = super::socket_path(dcfg);
-    let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
     if let Some(error) = startup_refusal(&scan, &sock.display().to_string()) {
         return Err(error);
     }
@@ -458,26 +457,44 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     cmd.arg("daemon").arg("--socket").arg(&sock);
     let child = cmd.spawn().context("spawn pane daemon")?;
     own_spawned_daemon(child);
-    let probe_client = client.clone();
+    let probe_dcfg = dcfg.clone();
+    let last_probe_socket = std::sync::Arc::new(std::sync::Mutex::new(sock.clone()));
+    let probe_socket = std::sync::Arc::clone(&last_probe_socket);
     let probe = move || {
-        let client = probe_client.clone();
+        let socket = super::socket_path(&probe_dcfg);
+        *probe_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = socket.clone();
+        let client = ControlClient::new(ControlAddr::Unix(socket));
         let scopes = scopes.clone();
         Box::pin(async move { probe_stop_target(&client, &scopes).await })
             as BoxFuture<'static, StopProbe>
     };
+    let probed_socket = || {
+        last_probe_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
     match wait_for_spawned_daemon(SPAWN_WAIT_DEADLINE, SPAWN_WAIT_POLL, probe).await {
         SpawnWait::Up => {
+            let sock = probed_socket();
+            let client = ControlClient::new(ControlAddr::Unix(sock));
             start_error_state_bridge(&client);
             Ok(client)
         }
         SpawnWait::Foreign(actual) => {
+            let sock = probed_socket();
             Err(scope_mismatch_error(&sock.display().to_string(), &actual))
         }
-        SpawnWait::TimedOut => Err(anyhow!(
-            "pane daemon did not come up on {} within {}s",
-            sock.display(),
-            SPAWN_WAIT_DEADLINE.as_secs()
-        )),
+        SpawnWait::TimedOut => {
+            let sock = probed_socket();
+            Err(anyhow!(
+                "pane daemon did not come up on {} within {}s",
+                sock.display(),
+                SPAWN_WAIT_DEADLINE.as_secs()
+            ))
+        }
     }
 }
 

@@ -9,7 +9,7 @@
 use anyhow::Result;
 use thegn_core::db::Db;
 use thegn_core::forge::model::{CreateOpts, MergeMethod, PanelState, PrPanel, ReviewState};
-use thegn_core::forge::{Forge, PrDepth, PrRef};
+use thegn_core::forge::{Forge, ForgeError, PrDepth, PrRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::CacheStore;
 use thegn_core::{msg, outln};
@@ -252,13 +252,30 @@ fn open(worktree: Option<String>) -> Result<()> {
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forges().for_loc(&loc).submit_review(
+    let registry = forges();
+    let forge = registry.for_loc(&loc);
+    let pr = match forge.pr_status(&loc, PrRef::Current) {
+        Ok(pr) => pr,
+        Err(e) => msg::die(&format!(
+            "pr approve failed: could not read the PR: {}",
+            e.describe()
+        )),
+    };
+    match review_reviewed_head(
+        forge,
         &loc,
-        PrRef::Current,
+        &ReviewedPr {
+            number: pr.number,
+            head: &pr.head_ref_oid,
+        },
         ReviewState::Approve,
         body.as_deref(),
     ) {
-        Ok(()) => msg::info("PR approved"),
+        Ok(()) => msg::info(&format!(
+            "PR #{} approved at {}",
+            pr.number,
+            pr.head_ref_oid.chars().take(12).collect::<String>()
+        )),
         Err(e) => msg::die(&format!("pr approve failed: {}", e.describe())),
     }
     Ok(())
@@ -344,6 +361,44 @@ pub(crate) fn merge_reviewed_head(
     classify_merge(!auto, &result, after.as_ref(), Some(reviewed.head))
 }
 
+/// Re-attest the displayed PR number and head before submitting a review.
+/// The re-read narrows but does not close the window between the read and the
+/// forge accepting the review; a commit-pinned review API call is a later slice.
+pub(crate) fn review_reviewed_head(
+    forge: &dyn Forge,
+    loc: &GitLoc,
+    reviewed: &ReviewedPr<'_>,
+    state: ReviewState,
+    body: Option<&str>,
+) -> std::result::Result<(), ForgeError> {
+    if reviewed.number == 0
+        || !matches!(reviewed.head.len(), 40 | 64)
+        || !reviewed.head.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ForgeError::Other(
+            "PR head unknown; refresh before reviewing".into(),
+        ));
+    }
+
+    let pr = PrRef::Number(reviewed.number);
+    let current = forge.pr_status(loc, pr)?;
+    if current.number != reviewed.number {
+        return Err(ForgeError::Other(format!(
+            "forge returned PR #{} for #{}; nothing was submitted",
+            current.number, reviewed.number
+        )));
+    }
+    if !current.head_ref_oid.eq_ignore_ascii_case(reviewed.head) {
+        let old = reviewed.head.chars().take(12).collect::<String>();
+        let new = current.head_ref_oid.chars().take(12).collect::<String>();
+        return Err(ForgeError::Other(format!(
+            "PR #{} moved from {old} to {new} since it was shown; refresh and review again — nothing was submitted",
+            reviewed.number
+        )));
+    }
+    forge.submit_review(loc, pr, state, body)
+}
+
 pub(crate) fn merge_outcome_text(
     outcome: &thegn_core::pr_merge_outcome::MergeOutcome,
 ) -> std::result::Result<String, String> {
@@ -396,11 +451,30 @@ fn comment(worktree: Option<String>, body: String) -> Result<()> {
 
 fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forges()
-        .for_loc(&loc)
-        .submit_review(&loc, PrRef::Current, state, body.as_deref())
-    {
-        Ok(()) => msg::info("review submitted"),
+    let registry = forges();
+    let forge = registry.for_loc(&loc);
+    let pr = match forge.pr_status(&loc, PrRef::Current) {
+        Ok(pr) => pr,
+        Err(e) => msg::die(&format!(
+            "pr review failed: could not read the PR: {}",
+            e.describe()
+        )),
+    };
+    match review_reviewed_head(
+        forge,
+        &loc,
+        &ReviewedPr {
+            number: pr.number,
+            head: &pr.head_ref_oid,
+        },
+        state,
+        body.as_deref(),
+    ) {
+        Ok(()) => msg::info(&format!(
+            "review submitted on PR #{} at {}",
+            pr.number,
+            pr.head_ref_oid.chars().take(12).collect::<String>()
+        )),
         Err(e) => msg::die(&format!("pr review failed: {}", e.describe())),
     }
     Ok(())
@@ -449,9 +523,9 @@ fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewedPr, merge_outcome_text, merge_reviewed_head};
+    use super::{ReviewedPr, merge_outcome_text, merge_reviewed_head, review_reviewed_head};
     use std::sync::Mutex;
-    use thegn_core::forge::model::{MergeMethod, PrHeader, PrStatus};
+    use thegn_core::forge::model::{MergeMethod, PrHeader, PrStatus, ReviewState};
     use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef};
     use thegn_core::remote::GitLoc;
     use thegn_core::seam::{Availability, Probe, ProbeReport};
@@ -521,6 +595,20 @@ mod tests {
             ));
             self.result.lock().unwrap().clone()
         }
+
+        fn submit_review(
+            &self,
+            _: &GitLoc,
+            pr: PrRef,
+            state: ReviewState,
+            body: Option<&str>,
+        ) -> std::result::Result<(), ForgeError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("review {pr:?} {state:?} {body:?}"));
+            self.result.lock().unwrap().clone()
+        }
     }
 
     fn status(number: u64, state: &str, head: &str) -> PrStatus {
@@ -541,6 +629,64 @@ mod tests {
             number,
             head: "0123456789abcdef0123456789abcdef01234567",
         }
+    }
+
+    #[test]
+    fn review_reviewed_head_submits_by_number_when_the_head_matches() {
+        let forge = FakeForge::new(Ok(()), Ok(status(7, "OPEN", reviewed(7).head)));
+        assert!(
+            review_reviewed_head(&forge, &loc(), &reviewed(7), ReviewState::Approve, None,).is_ok()
+        );
+        assert_eq!(
+            forge.calls(),
+            vec!["status Number(7)", "review Number(7) Approve None"]
+        );
+    }
+
+    #[test]
+    fn review_reviewed_head_refuses_a_moved_head_without_submitting() {
+        let forge = FakeForge::new(
+            Ok(()),
+            Ok(status(
+                7,
+                "OPEN",
+                "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            )),
+        );
+        let error = review_reviewed_head(&forge, &loc(), &reviewed(7), ReviewState::Approve, None)
+            .unwrap_err();
+        assert!(error.describe().contains("abcdefabcdef"));
+        assert!(error.describe().contains("nothing was submitted"));
+        assert_eq!(forge.calls(), vec!["status Number(7)"]);
+    }
+
+    #[test]
+    fn review_reviewed_head_refuses_unknown_head_without_calling_the_forge() {
+        for head in ["", "1234567", "0123456789abcdef0123456789abcdef0123456g"] {
+            let forge = FakeForge::new(Ok(()), Ok(status(7, "OPEN", head)));
+            let reviewed = ReviewedPr { number: 7, head };
+            assert!(
+                review_reviewed_head(&forge, &loc(), &reviewed, ReviewState::Approve, None,)
+                    .is_err()
+            );
+            assert!(forge.calls().is_empty());
+        }
+        let forge = FakeForge::new(Ok(()), Ok(status(0, "OPEN", reviewed(0).head)));
+        assert!(
+            review_reviewed_head(&forge, &loc(), &reviewed(0), ReviewState::Approve, None,)
+                .is_err()
+        );
+        assert!(forge.calls().is_empty());
+    }
+
+    #[test]
+    fn review_reviewed_head_refuses_a_different_pr_number() {
+        let forge = FakeForge::new(Ok(()), Ok(status(8, "OPEN", reviewed(7).head)));
+        let error = review_reviewed_head(&forge, &loc(), &reviewed(7), ReviewState::Approve, None)
+            .unwrap_err();
+        assert!(error.describe().contains("PR #8 for #7"));
+        assert!(error.describe().contains("nothing was submitted"));
+        assert_eq!(forge.calls(), vec!["status Number(7)"]);
     }
 
     #[test]

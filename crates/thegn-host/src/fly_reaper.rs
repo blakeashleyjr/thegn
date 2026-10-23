@@ -101,6 +101,7 @@ pub fn tick(cfg: &Config) {
 /// The ledger lacks an environment/account binding. Refuse ambiguous policies
 /// before provider construction, inventory access or local ledger retirement.
 fn reap(envs: &[EnvProviderConfig]) {
+    let mut kept = crate::reaper_policy::KeptReport::default();
     let lease = match crate::reaper_policy::try_reaper_lease("fly") {
         Ok(Some(lease)) => lease,
         Ok(None) => {
@@ -108,32 +109,39 @@ fn reap(envs: &[EnvProviderConfig]) {
             return;
         }
         Err(reason) => {
-            thegn_core::msg::warn(&format!(
-                "fly reaper: skipped fly: {reason}; no provider or ledger actions attempted"
-            ));
+            kept.keep(
+                "fly",
+                format!(
+                    "fly reaper: skipped fly: {reason}; no provider or ledger actions attempted"
+                ),
+            );
+            kept.publish("fly");
             return;
         }
     };
     let _lease = lease;
-    if let Err(reason) = crate::reaper_policy::with_unambiguous(envs, reap_unambiguous) {
-        thegn_core::msg::warn(&format!(
+    if let Err(reason) =
+        crate::reaper_policy::with_unambiguous(envs, |pc| reap_unambiguous(pc, &mut kept))
+    {
+        kept.keep("fly", format!(
             "fly reaper: quarantined provider kind: {reason}; no provider or ledger actions attempted"
         ));
     }
+    kept.publish("fly");
 }
 
-fn reap_unambiguous(pc: &EnvProviderConfig) {
+fn reap_unambiguous(pc: &EnvProviderConfig, kept: &mut crate::reaper_policy::KeptReport) {
     let view = match registry::list_checked() {
         Ok(view) => view,
         Err(error) => {
-            thegn_core::msg::warn(&format!(
+            kept.keep("fly", format!(
                 "fly reaper: skipped fly: ledger unreadable ({error:#}); no provider or ledger actions attempted"
             ));
             return;
         }
     };
     for name in &view.unreadable {
-        thegn_core::msg::warn(&format!(
+        kept.keep(name, format!(
             "fly reaper: ledger record {name} unreadable (provider unknown); reconcile ownership; no deletion attempted"
         ));
     }
@@ -145,24 +153,27 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
             continue;
         }
         if pc.max_lifetime_secs > thegn_core::time_policy::MAX_DURATION_SECS {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&rec.name, format!(
                 "fly reaper: quarantined {}: unsupported lifetime policy; repair duration configuration; no deletion attempted",
                 rec.name
             ));
             continue;
         }
         let Some(provider) = crate::provider_factory::fly_provider_for(pc, &rec.name) else {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&rec.name, format!(
                 "fly reaper: quarantined {}: managed identity or credentials unavailable; no deletion attempted",
                 rec.name
             ));
             continue;
         };
         if let Some(reason) = account_quarantine(&rec, &provider.account()) {
-            thegn_core::msg::warn(&format!(
-                "fly reaper: quarantined {}: {reason}; no deletion attempted",
-                rec.name
-            ));
+            kept.keep(
+                &rec.name,
+                format!(
+                    "fly reaper: quarantined {}: {reason}; no deletion attempted",
+                    rec.name
+                ),
+            );
             continue;
         }
         let created = match crate::agent::block_on_provider(|| async {
@@ -172,7 +183,7 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
         }) {
             Ok(created) => created,
             Err(error) => {
-                thegn_core::msg::warn(&format!(
+                kept.keep(&rec.name, format!(
                     "fly reaper: quarantined {}: creation time/identity could not be reconciled ({error:#}); no deletion attempted; next pass will retry",
                     rec.name
                 ));
@@ -188,10 +199,13 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
         match decision {
             thegn_core::time_policy::ResourceExpiry::Keep => continue,
             thegn_core::time_policy::ResourceExpiry::Quarantine(reason) => {
-                thegn_core::msg::warn(&format!(
-                    "fly reaper: quarantined {}: {reason}; no deletion attempted",
-                    rec.name
-                ));
+                kept.keep(
+                    &rec.name,
+                    format!(
+                        "fly reaper: quarantined {}: {reason}; no deletion attempted",
+                        rec.name
+                    ),
+                );
                 continue;
             }
             thegn_core::time_policy::ResourceExpiry::Expired => {}
@@ -212,7 +226,7 @@ fn reap_unambiguous(pc: &EnvProviderConfig) {
             |provider| provider.retire_destroyed(&rec.name),
         );
         if let Err(error) = result {
-            thegn_core::msg::warn(&format!(
+            kept.keep(&rec.name, format!(
                 "fly reaper: lifecycle for {} failed: {error:#}; ownership records remain for the next pass",
                 rec.name
             ));

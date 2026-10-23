@@ -18,18 +18,25 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    provider bridge — because building the bridge doubles the job. `nix profile
 install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    so it must be proven before a tag even though no release asset comes from it.
-5. **Rehearse the build locally** — with remote CI paused, this is the only way
-   to learn that a release build is broken _before_ the tag is public:
+5. **Rehearse the build locally** before tagging:
 
    ```sh
-   just release-artifacts v<version>   # same archive + checksum shape as CI
-   just release-verify   v<version>    # layout, runs, no quarantine
+   just release-artifacts v<version>   # local archive + checksum
+   just release-verify v<version>      # strict archive validation + local run
    ```
 
+   `release-verify` runs the package job's strict archive validator for this
+   host's target, then checks that the binary runs here. It refuses a Linux
+   binary whose ELF interpreter is under `/nix/store`, because that binary
+   depends on this host's Nix store; pass `host_only=1` to allow it with a loud
+   warning while still validating the archive. A Nix-shell build does not prove
+   portability to ordinary Linux distributions. On Linux, no local rehearsal
+   covers the musl or darwin legs (a Mac rehearses only the darwin archive);
+   the deb/rpm assets and provenance attestations can be rehearsed only from a
+   CI draft release.
+
    The package renderer consumes the generated checksum; no release version or
-   digest is pasted into a formula or package manifest. Note the archive is
-   built for _this_ machine's target, so it rehearses the
-   darwin leg on a Mac and the linux-gnu leg on Linux — not the musl one.
+   digest is pasted into a formula or package manifest.
 
    After downloading a draft release's `.deb`/`.rpm` assets and manifest with
    `gh release download <tag> --pattern 'thegn_*_amd64.deb' --pattern 'thegn-*-1.x86_64.rpm' --pattern 'thegn-<tag>-manifest.json'`,
@@ -51,6 +58,14 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    git tag -a v<version> -m "thegn v<version>"
    git push origin v<version>
    ```
+
+   Release tags must be annotated, SemVer-shaped, and equal
+   `v<workspace version>`. The `admit` job runs in the protected
+   `release-admission` environment; no job with write permission starts until
+   that approval. One-time owner setup: create `release-admission` with a
+   required reviewer and a deployment rule allowing the protected `main`
+   branch and `v*` tags, and create a tag ruleset that restricts creating,
+   updating, and deleting `v*` tags to maintainers.
 
    The [`release`](.github/workflows/release.yml) workflow builds the `thegn`
    binary for **x86_64 linux (gnu + musl)** and **aarch64-apple-darwin** in
@@ -186,8 +201,8 @@ workflow can render other outputs without making them supported channels:
 
 | Channel                           | Current decision                                                                                                                 |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Homebrew tap / AUR                | pending public repository setup and same-release clean-host rehearsal                                                            |
-| standalone `.deb` / `.rpm` assets | pending clean-system install, upgrade, and uninstall rehearsal; no hosted apt/rpm repository                                     |
+| Homebrew tap / AUR                | pending owner setup (tap repository, publication environments, AUR host key) and same-release clean-host rehearsal               |
+| standalone `.deb` / `.rpm` assets | standalone assets, unrehearsed, not a supported channel; clean-system install, upgrade, and uninstall rehearsal still required   |
 | Scoop / winget                    | deferred until THE-140's Windows artifact gate and THE-145's interactive parity evidence are green                               |
 | hosted apt/rpm repositories       | deferred through the public-alpha cycle; their operational ownership is not justified while standalone assets remain unrehearsed |
 | crates.io / `cargo binstall`      | deferred through the public-alpha cycle; source installs use this repository and no crate-publication contract is accepted       |
@@ -196,30 +211,38 @@ Enabling one of the deferred channels requires a separate bounded change with
 an owner, credentials/operational model, and rehearsal evidence. It is not an
 automatic consequence of producing another archive.
 
-- **Prebuilt binary** — download the linux-gnu, linux-musl, or
-  aarch64-apple-darwin archive from the release page, verify the `.sha256`,
-  extract `thegn` onto your `PATH`. On macOS see the Gatekeeper note below.
+- **Release tarball** — the supported Linux x86_64 install path. Download the
+  linux-gnu or linux-musl archive and its `.sha256` sidecar from the release
+  page, verify the checksum and build-provenance attestation, then extract
+  `thegn` onto `PATH`. The aarch64-apple-darwin archive is best-effort; on macOS
+  see the Gatekeeper note below. Runtime requires `git`; `gh` and `ssh` are used
+  as needed for integrations, and `lazygit` is optional. Diff highlighting is
+  built in.
 - **Nix** — `nix profile install github:blakeashleyjr/thegn` (works off any ref,
   no release needed). The flake has no private inputs, so this works for anyone;
   keep it that way — adding a private input silently breaks this path for
   everyone but the maintainer.
-- **From source** — `./install.sh` (needs Rust/Cargo). On macOS it also generates
-  the `thegn.app` launcher; `just macos-app` does the same for the other paths.
-- **Homebrew / AUR** — only after step 7's publication job has pushed and the
-  resulting repositories have been verified.
+- **From source** — from a thegn source checkout, `./install.sh` (needs
+  Rust/Cargo). It is not included in the release archive. On macOS it also
+  generates the `thegn.app` launcher; `just macos-app` does the same for the
+  other paths.
+- **Homebrew / AUR** — pending the owner's one-time setup (the tap repository,
+  publication environments, and AUR host key) and clean-host rehearsal. Step 7
+  publishes only after that setup is complete and the resulting repositories
+  are verified.
 
 ## macOS code signing and notarization — the decision
 
-**thegn does not sign or notarize its releases, and the supported macOS install
-paths are chosen so that it does not have to.** (Precisely: arm64 binaries are
-_ad-hoc_ signed by the linker — `codesign -dv` reports `adhoc, linker-signed` —
+**thegn does not sign or notarize its releases, and its best-effort macOS
+install paths are chosen so that they do not require it.** (Precisely: arm64
+binaries are _ad-hoc_ signed by the linker — `codesign -dv` reports
+`adhoc, linker-signed` —
 because Apple silicon requires a signature to execute at all. That is not a
 Developer ID signature and does not satisfy notarization; `spctl -a` rejects the
 binary either way.) Notarization requires a paid
 Apple Developer account ($99/yr), a Developer ID certificate held as a CI
 secret, and a `notarytool` submit-and-staple step on every release. That is a
-recurring cost and a key-management burden for a pre-alpha project with a
-handful of users.
+recurring cost and a key-management burden for an alpha project.
 
 What that decision costs, precisely:
 
@@ -251,6 +274,12 @@ quarantine prompt that the support cost exceeds the certificate's.
 
 ## Deferred release channels
 
+- **Homebrew and AUR** are pending the owner's one-time publication setup and a
+  clean-host rehearsal: the Homebrew tap repository, publication environments,
+  and AUR host key must be in place first.
+- **Standalone `.deb` and `.rpm` assets** are unrehearsed and are not a
+  supported channel. Clean-system install, upgrade, and uninstall evidence is
+  still required.
 - **Scoop and winget** require a green Windows MSVC release archive before
   their generated manifests can be enabled.
 - **Hosted apt/rpm repositories** require an owner for hosting, repository
