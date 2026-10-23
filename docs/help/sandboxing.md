@@ -192,11 +192,17 @@ start.
 If a control socket directory is visible through a sandbox bind (for example,
 explicit `[daemon] socket` or `XDG_RUNTIME_DIR` under `$HOME` or the worktree),
 bwrap hides it with a tmpfs. systemd makes it inaccessible unless that would hide
-the worktree or a carved-back mount, in which case it refuses. OCI refuses any
-mount exposing it. The relocated private `/tmp` directory is guarded with the
-predictable fallback. State `run/` (locator and lock) is write-protected: bwrap
-hides it when present, systemd makes it inaccessible, and OCI refuses writable
-mounts covering it while admitting read-only `$HOME`. `file_access = "all"` or `"host"` exposes the host by design.
+the worktree or a carved-back mount, in which case it refuses when
+`read_only_root = true`. OCI refuses any mount exposing it. The relocated
+private `/tmp` directory is guarded with the predictable fallback. State `run/`
+(locator and lock) is write-protected: bwrap hides it when present and refuses
+if it is absent under a writable bind; systemd makes it inaccessible only when
+`read_only_root = true`; OCI refuses writable mounts covering it while admitting
+read-only `$HOME`. With `[daemon] enabled = false`, the compositor prepares
+`run/` before launching panes, so writable-root profiles can mask it. The
+hardcoded writable parents are private tmpfs mounts at `/tmp` and the sealed
+`$HOME`; neither exposes host state. The `--dev-bind / /` used by `all` and
+`host` is excluded by the guard. Those access modes expose the host by design.
 
 Standard, hardened, and sealed panes do not inherit `DBUS_SESSION_BUS_ADDRESS`.
 Bwrap unsets it, and systemd panes also cannot reach `$XDG_RUNTIME_DIR/bus` or

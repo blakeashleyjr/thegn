@@ -3700,10 +3700,8 @@ fn backend_enter_argv_guarded_with_env(
                         ),
                     ));
                 }
-                let mut writable_roots: Vec<&std::path::Path> = writable_dests
-                    .iter()
-                    .map(|dest| std::path::Path::new(dest))
-                    .collect();
+                let mut writable_roots: Vec<&std::path::Path> =
+                    writable_dests.iter().map(std::path::Path::new).collect();
                 writable_roots.push(&spec.worktree);
                 match crate::sandbox_control_guard::plan_protected(
                     &mapped_protected,

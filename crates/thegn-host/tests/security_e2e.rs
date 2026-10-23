@@ -364,9 +364,11 @@ impl Fixture {
 
         if state_run_probe {
             let state_home = state.root().join("state");
-            let _run_dir =
-                thegn_core::fsperm::ensure_private_dir_beneath(&state_home, Path::new("thegn/run"))
-                    .expect("create private state run directory before daemon startup");
+            let _run_dir = thegn_core::fsperm::ensure_private_dir_beneath(
+                state.root(),
+                Path::new("state/thegn/run"),
+            )
+            .expect("create private state run directory before daemon startup");
             let run_dir = state_home.join("thegn/run");
             thegn_core::fsperm::write_owner_only_new(
                 &run_dir.join("tg-sentinel"),
@@ -374,22 +376,21 @@ impl Fixture {
             )
             .expect("write owner-only run sentinel");
             let result = worktree.path().join("state-run-result");
+            let sentinel_path = shell_quote(
+                run_dir
+                    .join("tg-sentinel")
+                    .to_str()
+                    .expect("sentinel path is UTF-8"),
+            );
+            let pane_write_path = shell_quote(
+                run_dir
+                    .join("tg-pane-write")
+                    .to_str()
+                    .expect("write path is UTF-8"),
+            );
+            let result_path = shell_quote(result.to_str().expect("result path is UTF-8"));
             let command = format!(
-                "if test -e {}; then printf visible > {}; else printf hidden > {}; fi; touch {}",
-                shell_quote(
-                    run_dir
-                        .join("tg-sentinel")
-                        .to_str()
-                        .expect("sentinel path is UTF-8")
-                ),
-                shell_quote(result.to_str().expect("result path is UTF-8")),
-                shell_quote(result.to_str().expect("result path is UTF-8")),
-                shell_quote(
-                    run_dir
-                        .join("tg-pane-write")
-                        .to_str()
-                        .expect("write path is UTF-8")
-                ),
+                "if touch {pane_write_path}; then write=written; else write=blocked; fi; if test -e {sentinel_path}; then visibility=visible; else visibility=hidden; fi; printf '%s:%s' \"$visibility\" \"$write\" > {result_path}.tmp && mv {result_path}.tmp {result_path}"
             );
             let config_dir = state.root().join(".config/thegn");
             fs::create_dir_all(&config_dir).expect("create daemon config directory");
@@ -424,6 +425,12 @@ impl Fixture {
             .env_remove("THEGN_LOG")
             .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
             .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY");
+        if state_run_probe {
+            daemon_cmd
+                .env_remove("XDG_DATA_HOME")
+                .env_remove("XDG_CACHE_HOME")
+                .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL);
+        }
         if let Some(runtime) = runtime.as_ref() {
             daemon_cmd.env("XDG_RUNTIME_DIR", runtime.path());
         } else {
@@ -799,14 +806,14 @@ fn security_e2e_daemon_pane_cannot_see_or_write_the_state_run_dir() {
         String::from_utf8_lossy(&opened.stderr)
     );
     let deadline = Instant::now() + PROCESS_TIMEOUT;
-    while !result_path.exists() && Instant::now() < deadline {
+    while Instant::now() < deadline
+        && !fs::read_to_string(&result_path).is_ok_and(|result| !result.is_empty())
+    {
         thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        result_path.exists(),
-        "daemon agent did not write its result before timeout"
-    );
-    assert_eq!(fs::read_to_string(&result_path).unwrap(), "hidden");
+    let result = fs::read_to_string(&result_path)
+        .expect("daemon agent did not write its result before timeout");
+    assert_eq!(result, "hidden:written");
     assert!(
         !pane_write.exists(),
         "daemon agent wrote through the protected state run directory"
