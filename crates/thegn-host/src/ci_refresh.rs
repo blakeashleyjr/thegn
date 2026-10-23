@@ -548,6 +548,8 @@ pub(crate) struct LastGoodRuns {
     pub(crate) fetched_at: i64,
 }
 
+/// A daemon reply for CI runs. `source` is `cache`, `provider`, or `stale-cache`;
+/// `write_cache` is true only for a complete provider list that may replace the cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DaemonRunsReply {
     pub(crate) runs: Vec<thegn_core::ci::CiRun>,
@@ -558,6 +560,8 @@ pub(crate) struct DaemonRunsReply {
     pub(crate) write_cache: bool,
 }
 
+/// Whether a cached list matches the request's known branch and provider context;
+/// last-good eligibility has no age check.
 pub(crate) fn daemon_ci_cache_last_good(
     cached_branch: &str,
     current_branch: Option<&str>,
@@ -568,6 +572,10 @@ pub(crate) fn daemon_ci_cache_last_good(
         && thegn_core::ci::cache_context_matches(cached_context, current_context)
 }
 
+/// Resolve provider outcomes: (a) complete lists are returned and cacheable;
+/// (b) partial lists use last-good when available; (c) otherwise partial lists
+/// are returned with their discarded count; (d) errors use last-good when
+/// available; (e) errors without last-good remain errors.
 pub(crate) fn daemon_runs_after_provider(
     fetched: Result<thegn_svc::ci::CiRunList, String>,
     last_good: Option<LastGoodRuns>,
@@ -605,29 +613,24 @@ pub(crate) fn daemon_runs_after_provider(
             stale_reason: None,
             write_cache: true,
         }),
-        Ok(list) => {
-            if list.discarded_rows > 0
-                && let Some(last_good) = last_good
-            {
-                Ok(stale_reply(
-                    last_good,
-                    format!(
-                        "CI provider returned an incomplete run list ({} malformed row(s)); showing the last complete list",
-                        list.discarded_rows
-                    ),
-                    requested,
-                ))
-            } else {
-                Ok(DaemonRunsReply {
-                    runs: list.runs,
-                    discarded_rows: list.discarded_rows,
-                    source: "provider",
-                    fetched_at: now,
-                    stale_reason: None,
-                    write_cache: false,
-                })
-            }
-        }
+        Ok(list) => match last_good {
+            Some(last_good) => Ok(stale_reply(
+                last_good,
+                format!(
+                    "CI provider returned an incomplete run list ({} malformed row(s)); showing the last complete list",
+                    list.discarded_rows
+                ),
+                requested,
+            )),
+            None => Ok(DaemonRunsReply {
+                runs: list.runs,
+                discarded_rows: list.discarded_rows,
+                source: "provider",
+                fetched_at: now,
+                stale_reason: None,
+                write_cache: false,
+            }),
+        },
         Err(error) => match last_good {
             Some(last_good) => Ok(stale_reply(
                 last_good,
