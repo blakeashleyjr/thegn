@@ -177,6 +177,7 @@ fn target_worktree(arg: Option<String>) -> Result<std::path::PathBuf> {
         arg,
         resolve_worktree,
         thegn_core::repo::worktree_root_for_cwd,
+        |path| !matches!(GitLoc::for_worktree(path), GitLoc::Local(_)),
     )
 }
 
@@ -184,12 +185,27 @@ fn target_worktree_with(
     arg: Option<String>,
     default: impl FnOnce(Option<String>) -> std::path::PathBuf,
     root_of: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+    is_registered_remote: impl Fn(&std::path::Path) -> bool,
 ) -> Result<std::path::PathBuf> {
     match arg {
         None => Ok(default(None)),
-        Some(raw) => root_of(std::path::Path::new(&raw)).ok_or_else(|| {
-            anyhow::anyhow!("--worktree {raw} is not a git worktree; nothing was sent to the forge")
-        }),
+        Some(raw) => {
+            let path = std::path::Path::new(&raw);
+            if is_registered_remote(path) {
+                return Ok(std::path::PathBuf::from(raw));
+            }
+
+            let root = root_of(path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--worktree {raw} is not a git worktree; nothing was sent to the forge"
+                )
+            })?;
+            if std::fs::canonicalize(path).is_ok_and(|canonical| canonical == root) {
+                Ok(std::path::PathBuf::from(raw))
+            } else {
+                Ok(root)
+            }
+        }
     }
 }
 
@@ -547,15 +563,25 @@ fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReviewedPr, merge_outcome_text, merge_reviewed_head, review_reviewed_head, target_worktree,
+        ReviewedPr, merge_outcome_text, merge_reviewed_head, review_reviewed_head,
         target_worktree_with,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
     use thegn_core::forge::model::{MergeMethod, PrHeader, PrStatus, ReviewState};
     use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef};
+
     use thegn_core::remote::GitLoc;
     use thegn_core::seam::{Availability, Probe, ProbeReport};
+
+    fn resolve_local_target(arg: Option<String>) -> anyhow::Result<PathBuf> {
+        target_worktree_with(
+            arg,
+            super::resolve_worktree,
+            thegn_core::repo::worktree_root_for_cwd,
+            |_| false,
+        )
+    }
 
     struct FakeForge {
         result: Mutex<std::result::Result<(), ForgeError>>,
@@ -916,13 +942,36 @@ mod tests {
             Some("/definitely/not/here".into()),
             |_| panic!("default must not run"),
             |_| None,
+            |_| false,
         );
         let error = result.expect_err("an explicit non-repository path must be refused");
         assert!(error.to_string().contains("is not a git worktree"));
 
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
-        assert!(target_worktree(Some(missing.display().to_string())).is_err());
+        assert!(resolve_local_target(Some(missing.display().to_string())).is_err());
+    }
+
+    #[test]
+    fn registered_remote_missing_path_is_kept_and_unregistered_missing_path_is_refused() {
+        let remote = std::path::PathBuf::from("/registered/provider/worktree");
+        let unregistered = std::path::PathBuf::from("/unregistered/missing/worktree");
+        let cases = [(&remote, true), (&unregistered, false)];
+
+        for (path, accepted) in cases {
+            let result = target_worktree_with(
+                Some(path.display().to_string()),
+                |_| panic!("default must not run"),
+                |_| None,
+                |candidate| candidate == remote.as_path(),
+            );
+
+            if accepted {
+                assert_eq!(result.unwrap(), path.clone());
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[test]
@@ -948,8 +997,12 @@ mod tests {
         let nested = repo.join("sub/dir");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let resolved = target_worktree(Some(nested.display().to_string())).unwrap();
+        let resolved = resolve_local_target(Some(nested.display().to_string())).unwrap();
         assert_eq!(resolved, std::fs::canonicalize(repo).unwrap());
+
+        let explicit_root = repo.display().to_string();
+        let resolved_root = resolve_local_target(Some(explicit_root.clone())).unwrap();
+        assert_eq!(resolved_root, PathBuf::from(explicit_root));
     }
 
     #[test]
@@ -958,6 +1011,7 @@ mod tests {
             None,
             |_| PathBuf::from("/default"),
             |_| panic!("root_of must not run"),
+            |_| panic!("is_registered_remote must not run"),
         )
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/default"));
