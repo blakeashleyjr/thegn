@@ -2119,7 +2119,8 @@ mod tests {
     fn git_with_stdin_pipes_bytes_through() {
         // `git hash-object --stdin` works without a repo and echoes a stable
         // sha for known input — a hermetic stdin round-trip.
-        let loc = GitLoc::Local(std::env::temp_dir());
+        let root = tempfile::tempdir().unwrap();
+        let loc = GitLoc::Local(root.path().to_path_buf());
         let out = loc
             .git_with_stdin(&[], &["hash-object", "--stdin"], b"hello\n")
             .unwrap();
