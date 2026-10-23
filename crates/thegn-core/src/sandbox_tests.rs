@@ -5221,11 +5221,7 @@ fn control_socket_oci_read_only_mount_covering_the_run_dir_is_admitted() {
             ro: true,
             cache: false,
         });
-        assert!(!matches!(
-            launchable_guarded(&sandbox, &[], std::slice::from_ref(&run)),
-            Err(EnterError::Refused(refusal))
-                if refusal.class == RefusalClass::ControlSocketReachable
-        ));
+        assert!(launchable_guarded(&sandbox, &[], std::slice::from_ref(&run)).is_ok());
     }
 }
 
@@ -5235,21 +5231,50 @@ fn control_socket_oci_writable_mount_covering_the_run_dir_is_refused() {
     let run = temp.path().join("state/thegn/run");
     std::fs::create_dir_all(run.parent().unwrap()).unwrap();
     std::fs::create_dir(&run).unwrap();
-    let mut sandbox = spec(Backend::Podman);
+    for backend in [Backend::Podman, Backend::Docker] {
+        let mut sandbox = spec(backend);
+        sandbox.mounts.push(Mount {
+            host: temp.path().display().to_string(),
+            dest: temp.path().display().to_string(),
+            ro: false,
+            cache: false,
+        });
+        let result = launchable_guarded(&sandbox, &[], std::slice::from_ref(&run));
+        let expected = run.display().to_string();
+        assert!(matches!(
+            result,
+            Err(EnterError::Refused(refusal))
+                if refusal.class == RefusalClass::ControlSocketReachable
+                    && refusal.path.as_deref() == Some(expected.as_str())
+        ));
+    }
+}
+
+#[test]
+fn control_socket_bwrap_masks_a_prepared_run_dir_under_a_writable_root() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let run = temp.path().join("state/thegn/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let mut sandbox = spec(Backend::Bwrap);
     sandbox.mounts.push(Mount {
         host: temp.path().display().to_string(),
         dest: temp.path().display().to_string(),
         ro: false,
         cache: false,
     });
-    let result = launchable_guarded(&sandbox, &[], std::slice::from_ref(&run));
-    let expected = run.display().to_string();
-    assert!(matches!(
-        result,
-        Err(EnterError::Refused(refusal))
-            if refusal.class == RefusalClass::ControlSocketReachable
-                && refusal.path.as_deref() == Some(expected.as_str())
-    ));
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            protected_dirs: vec![run.clone()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| { pair[0] == "--tmpfs" && pair[1] == run.display().to_string() })
+    );
 }
 
 #[test]

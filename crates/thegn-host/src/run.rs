@@ -717,7 +717,11 @@ pub async fn main(
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
-    crate::daemon::control_publish::publish_for_socket(&crate::daemon::socket_path(&cfg.daemon));
+    let control_socket = crate::daemon::socket_path(&cfg.daemon);
+    tokio::task::spawn_blocking(move || {
+        crate::daemon::control_publish::publish_for_socket(&control_socket);
+    })
+    .await?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // The refresh channel is created HERE rather than at the ticker spawn below

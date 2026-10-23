@@ -19,17 +19,38 @@ pub(crate) fn publish(socket: &Path, state_dir: &Path) {
 }
 
 pub(crate) fn publish_for_socket(socket: &Path) {
-    publish(socket, &thegn_core::util::xdg_state_home().join("thegn"));
+    let state_dir = thegn_core::util::xdg_state_home().join("thegn");
+    publish_for_socket_at(socket, &state_dir);
+}
+
+fn publish_for_socket_at(socket: &Path, state_dir: &Path) {
+    if let Err(error) = prepare_run_dir(state_dir) {
+        tracing::warn!(target: "thegn::sandbox", path = %state_dir.display(), %error, "could not create the private control locator directory; writable-root panes may be refused");
+    }
+    publish(socket, state_dir);
 }
 
 pub(crate) fn prepare_run_dir(state_dir: &Path) -> std::io::Result<()> {
-    let _run_dir = thegn_core::fsperm::ensure_private_dir_beneath(state_dir, Path::new("run"))?;
+    let run_dir = run_dir(state_dir);
+    let mut anchor = state_dir;
+    while !anchor.is_dir() {
+        anchor = anchor.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no existing ancestor for the control state directory",
+            )
+        })?;
+    }
+    let relative = run_dir.strip_prefix(anchor).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+    })?;
+    let _run_dir = thegn_core::fsperm::ensure_private_dir_beneath(anchor, relative)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_run_dir, run_dir, socket_dir};
+    use super::{prepare_run_dir, publish_for_socket_at, run_dir, socket_dir};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -55,5 +76,14 @@ mod tests {
         prepare_run_dir(state.path()).unwrap();
         assert!(state.path().join("run").is_dir());
         prepare_run_dir(state.path()).unwrap();
+    }
+
+    #[test]
+    fn publisher_prepares_the_run_directory_before_publishing() {
+        let state = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = state.path().join("runtime/daemon.sock");
+        let state_dir = state.path().join("state/thegn");
+        publish_for_socket_at(&socket, &state_dir);
+        assert!(run_dir(&state_dir).is_dir());
     }
 }
