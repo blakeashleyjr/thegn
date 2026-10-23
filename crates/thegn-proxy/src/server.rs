@@ -500,6 +500,7 @@ mod tests {
             .tempdir()
             .unwrap();
         std::fs::write(dir.path().join("provider-key"), "test-upstream-key\n").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&dir.path().join("provider-key")).unwrap();
         let mut raw = ModelProxyConfig {
             enabled: true,
             ..Default::default()
