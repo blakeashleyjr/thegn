@@ -298,6 +298,9 @@ pub trait WorkspaceStore {
     /// global default in [`crate::config::Config::resolve_env`].)
     fn effective_env(&self, wt: &str, repo_path: &str) -> Option<String>;
 
+    /// Like [`Self::effective_env`], but a read failure is an error, never a silent fall-through to the default env.
+    fn effective_env_checked(&self, wt: &str, repo_path: &str) -> Result<Option<String>>;
+
     /// Save (or replace) a named layout snapshot. `spec` is a serialized
     /// `LayoutSpec` JSON string.
     fn put_layout(&self, name: &str, spec: &str) -> Result<()>;
