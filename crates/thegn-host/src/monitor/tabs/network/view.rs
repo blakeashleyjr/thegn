@@ -648,6 +648,45 @@ mod tests {
     }
 
     #[test]
+    fn mirrored_rx_graph_uses_its_ramp_color() {
+        use crate::compositor::Rect;
+        use crate::monitor::kit::grid::CellGrid;
+        use crate::seg::{StyleTok, Tok};
+        use thegn_core::theme::RampId;
+
+        let mut grid = CellGrid::new(4, 3);
+        let table = crate::monitor::graphs::table();
+        let values = [0.9; 4];
+        super::paint::paint_mirrored_finite_runs(
+            &values,
+            true,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 4,
+                rows: 2,
+            },
+            2,
+            0,
+            &mut grid.view(Rect::full(4, 3)),
+        );
+        let mut ink = 0;
+        for x in 0..4 {
+            let cell = grid.get(x, 1).unwrap();
+            if cell.ch == table.blank || cell.ch == table.cell_blank {
+                continue;
+            }
+            ink += 1;
+            assert_eq!(
+                cell.fg,
+                StyleTok::from_tok(Tok::Ramp(RampId::Rx, 6)).unwrap(),
+                "mirrored receive ink must retain its rx ramp"
+            );
+        }
+        assert!(ink > 0, "fixture must contain mirrored graph ink");
+    }
+
+    #[test]
     fn telemetry_series_storage_stays_warm_after_one_thousand_rebuilds() {
         let mut history = TelemetryHistory::default();
         for tick in 0..120_u64 {

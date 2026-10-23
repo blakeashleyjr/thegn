@@ -324,6 +324,68 @@ mod tests {
     }
 
     #[test]
+    fn graph_cells_sit_on_the_panel_surface_and_keep_their_color() {
+        for depth in [ColorDepth::Truecolor, ColorDepth::Ansi256] {
+            crate::caps::test_override::with_color(depth, || {
+                let (panel, dim, text) = crate::chrome::with_palette(|palette| {
+                    (
+                        crate::wire::color_spec(crate::chrome::theme_color(&palette.panel), depth),
+                        crate::wire::color_spec(crate::chrome::theme_color(&palette.dim), depth),
+                        crate::wire::color_spec(crate::chrome::theme_color(&palette.text), depth),
+                    )
+                });
+                assert!(
+                    thegn_core::theme::relative_luminance(&crate::chrome::palette_snapshot().panel)
+                        < 0.1,
+                    "fixture palette must be the dark default"
+                );
+                assert_ne!(panel, dim);
+                let mut total_graph_cells = 0;
+                for tab in MonitorTab::visible_for(&crate::e2e_freeze::stats(), true, false) {
+                    let overlay = frozen_overlay(tab, Rect::full(100, 32));
+                    let mut surface = Surface::new(100, 32);
+                    overlay.render(&mut surface, Rect::full(100, 32));
+                    for (y, line) in surface.screen_lines().iter().enumerate() {
+                        for cell in line.visible_cells() {
+                            let ch = cell.str().chars().next().unwrap_or(' ');
+                            let graph_glyph = ('\u{2580}'..='\u{259F}').contains(&ch)
+                                || ('\u{2800}'..='\u{28FF}').contains(&ch);
+                            if !graph_glyph {
+                                continue;
+                            }
+                            total_graph_cells += 1;
+                            let x = cell.cell_index();
+                            let attrs = cell.attrs();
+                            let bg = crate::wire::color_spec(attrs.background(), depth);
+                            let fg = crate::wire::color_spec(attrs.foreground(), depth);
+                            assert!(
+                                bg != dim && bg != text,
+                                "{tab:?} ({x},{y}) {ch:?} background {bg:?}"
+                            );
+                            if ch == '\u{2800}' {
+                                assert!(
+                                    bg == panel || bg == ColorSpec::Default,
+                                    "{tab:?} ({x},{y}) blank graph background {bg:?}"
+                                );
+                            }
+                            if ch != '\u{2800}' && ch != '░' {
+                                assert!(
+                                    fg != ColorSpec::Default && fg != text,
+                                    "{tab:?} ({x},{y}) {ch:?} foreground {fg:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    total_graph_cells > 0,
+                    "frozen monitor fixture must paint graphs"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn no_colour_runs_are_default() {
         crate::caps::test_override::with_color(ColorDepth::None, || {
             let ov = frozen_overlay(MonitorTab::Cpu, Rect::full(100, 32));
