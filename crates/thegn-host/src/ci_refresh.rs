@@ -642,6 +642,33 @@ pub(crate) fn daemon_runs_after_provider(
     }
 }
 
+/// The stable machine reason the daemon CI routes report when no CI provider
+/// resolves for a worktree (the same word `thegn ci runs --json` prints).
+pub(crate) const NO_PROVIDER_REASON: &str = "no-provider";
+
+/// The typed refusal for a worktree with no CI provider: a failed precondition
+/// (HTTP 412), never an internal error, whose message starts `no-provider:`.
+pub(crate) fn daemon_no_provider_error() -> thegn_svc::control::ControlError {
+    thegn_svc::control::ControlError::FailedPrecondition(format!(
+        "{NO_PROVIDER_REASON}: no CI provider for this worktree (set [ci] provider, or check the remote)"
+    ))
+}
+
+/// `ci.runs` outcome: `None` means no provider resolved, which is refused and
+/// never answered from a cached list; otherwise [`daemon_runs_after_provider`].
+pub(crate) fn daemon_runs_outcome(
+    fetched: Option<Result<thegn_svc::ci::CiRunList, String>>,
+    last_good: Option<LastGoodRuns>,
+    now: i64,
+    requested: usize,
+) -> Result<DaemonRunsReply, thegn_svc::control::ControlError> {
+    let Some(fetched) = fetched else {
+        return Err(daemon_no_provider_error());
+    };
+    daemon_runs_after_provider(fetched, last_good, now, requested)
+        .map_err(|message| thegn_svc::control::ControlError::Internal(anyhow::Error::msg(message)))
+}
+
 pub(crate) fn ci_detail_warnings(detail: &thegn_svc::ci::CiRunDetail) -> Vec<String> {
     let mut warnings = Vec::new();
     if detail.discarded_jobs > 0 {
@@ -2736,6 +2763,65 @@ mod tests {
             vec!["1", "2"]
         );
         assert_eq!(reply.discarded_rows, 5);
+    }
+
+    #[test]
+    fn daemon_runs_no_provider_is_a_typed_precondition() {
+        let error = daemon_runs_outcome(None, None, 120, 10)
+            .expect_err("missing provider is a failed precondition");
+        assert!(matches!(
+            error,
+            thegn_svc::control::ControlError::FailedPrecondition(message)
+                if message.starts_with("no-provider:")
+        ));
+        assert_eq!(
+            daemon_no_provider_error().code(),
+            thegn_core::control_error::ControlErrorCode::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn daemon_runs_no_provider_never_serves_last_good() {
+        let error = daemon_runs_outcome(None, Some(daemon_last_good(&["1"], 0)), 120, 10)
+            .expect_err("missing provider must not fall back to the last-good list");
+        assert!(matches!(
+            error,
+            thegn_svc::control::ControlError::FailedPrecondition(message)
+                if message.starts_with("no-provider:")
+        ));
+    }
+
+    #[test]
+    fn daemon_runs_outcome_keeps_provider_paths() {
+        let complete = daemon_runs_outcome(
+            Some(Ok(thegn_svc::ci::CiRunList {
+                runs: vec![ci_run("1", "sha")],
+                discarded_rows: 0,
+            })),
+            None,
+            120,
+            10,
+        )
+        .expect("complete provider list");
+        assert_eq!(complete.source, "provider");
+        assert!(complete.write_cache);
+
+        let provider_error =
+            daemon_runs_outcome(Some(Err("CI provider: HTTP 502".into())), None, 120, 10);
+        assert!(matches!(
+            provider_error,
+            Err(thegn_svc::control::ControlError::Internal(error))
+                if error.to_string() == "CI provider: HTTP 502"
+        ));
+
+        let stale = daemon_runs_outcome(
+            Some(Err("CI provider: HTTP 502".into())),
+            Some(daemon_last_good(&["1"], 0)),
+            120,
+            10,
+        )
+        .expect("provider error keeps the labelled last-good path");
+        assert_eq!(stale.source, "stale-cache");
     }
 
     #[test]
