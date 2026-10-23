@@ -84,6 +84,17 @@ pub trait NotificationStore {
     /// Mark a single notification as read.
     fn mark_notification_read(&self, id: i64) -> Result<()>;
 
+    /// Mark matching source notifications read after a successful rerun.
+    fn mark_notification_read_by_source(
+        &self,
+        kind: &str,
+        source_ref: &str,
+        worktree_path: &str,
+    ) -> Result<usize>;
+
+    /// Expire old unread failure rows without deleting inbox history.
+    fn expire_failures(&self, cutoff: i64) -> Result<usize>;
+
     /// Mark all notifications as read.
     fn mark_all_notifications_read(&self) -> Result<()>;
     /// Mark read exactly what the repo-scoped inbox DISPLAYS — the same three

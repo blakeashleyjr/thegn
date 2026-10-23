@@ -12094,6 +12094,12 @@ async fn event_loop<T: Terminal>(
             if generation != hydration_gen {
                 continue;
             }
+            if next_model.panel.reconcile_pending_reads(&model.panel) {
+                next_model
+                    .sidebar_status
+                    .acked
+                    .extend(model.sidebar_status.acked.iter().cloned());
+            }
             // A failed hydration is a completion signal, not a replacement
             // model. Keep the last good sidebar/panel and stamp its typed DB
             // availability. In particular, a later generic outage cannot
@@ -23728,25 +23734,24 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
+                                let epoch = crate::hydrate_feed::issue_notification_write();
+                                let refresh = refresh_tx.clone();
+                                let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let Ok(db) = thegn_core::db::Db::open() else {
-                                        return;
-                                    };
-                                    let _ = db.mark_notification_read(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                    if let Err(error) = thegn_core::db::Db::open()
+                                        .and_then(|db| db.mark_notification_read(id))
+                                    {
+                                        tracing::debug!(%error, "could not clear notification");
+                                    }
+                                    crate::hydrate_feed::commit_notification_write(epoch);
+                                    if refresh.send(RefreshKind::Model).is_ok()
+                                        && let Err(error) = wake.wake()
+                                    {
+                                        tracing::debug!(%error, "could not wake after notification clear");
+                                    }
                                 });
+                                model.panel.mark_read_ids_at(epoch, [id]);
                                 hydration_gen += 1;
-                                crate::hydrate::spawn_model_hydration(
-                                    model_tx.clone(),
-                                    hydration_gen,
-                                    session.clone_for_hydrate(),
-                                    Some(waker.clone()),
-                                    crate::hydrate::HydrateHints {
-                                        open: panel_ui.open,
-                                        expanded: panel_ui.width.is_expanded(),
-                                        ..Default::default()
-                                    },
-                                    None,
-                                );
                             }
                             true
                         }
@@ -23787,28 +23792,27 @@ async fn event_loop<T: Terminal>(
                                 model.status = "No notification selected".into();
                             }
                             if let Some(id) = notif_id {
+                                let epoch = crate::hydrate_feed::issue_notification_write();
+                                let refresh = refresh_tx.clone();
+                                let wake = waker.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let Ok(db) = thegn_core::db::Db::open() else {
-                                        return;
-                                    };
-                                    let _ = db.delete_notification(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                                    if let Err(error) = thegn_core::db::Db::open()
+                                        .and_then(|db| db.delete_notification(id))
+                                    {
+                                        tracing::debug!(%error, "could not delete notification");
+                                    }
+                                    crate::hydrate_feed::commit_notification_write(epoch);
+                                    if refresh.send(RefreshKind::Model).is_ok()
+                                        && let Err(error) = wake.wake()
+                                    {
+                                        tracing::debug!(%error, "could not wake after notification delete");
+                                    }
                                 });
+                                model.panel.delete_notification_at(epoch, id);
                                 panel_ui.notifications_cursor =
                                     panel_ui.notifications_cursor.saturating_sub(1);
                                 panel_ui.cursor = panel_ui.notifications_cursor;
                                 hydration_gen += 1;
-                                crate::hydrate::spawn_model_hydration(
-                                    model_tx.clone(),
-                                    hydration_gen,
-                                    session.clone_for_hydrate(),
-                                    Some(waker.clone()),
-                                    crate::hydrate::HydrateHints {
-                                        open: panel_ui.open,
-                                        expanded: panel_ui.width.is_expanded(),
-                                        ..Default::default()
-                                    },
-                                    None,
-                                );
                             }
                             true
                         }
