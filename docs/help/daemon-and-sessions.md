@@ -256,13 +256,20 @@ filesystem namespace. Its parent directory is owner-only (`0700`) and its
 socket is `0600` in both `[serve] local_admin` modes. Before sending a token,
 the client checks the parent and verifies that the connected socket peer has
 the same uid; lock acquisition and stale-socket probing are bounded and fail
-closed. Sandboxes cannot access the control directory; see Sandboxing. This
-does not distinguish another same-uid process that can reach the parent: it is
-the same filesystem principal, and there is no cryptographic server identity.
+closed. Sandboxed panes cannot reach the control directory: bwrap hides it,
+systemd makes it inaccessible, and container launches that would expose it are
+refused. The exception is bwrap `file_access = "all"` or `"host"`, which
+exposes it by design (see [[sandboxing]]). This does not distinguish another
+same-uid process that can reach the parent: it is the same filesystem
+principal, and there is no cryptographic server identity.
 For token-only setups (`[serve] local_admin = false`) with a custom
-`[daemon] socket`, move the socket into `$XDG_RUNTIME_DIR` or the default
-private location. Never use a shared, group-writable, or sandbox-mounted
-directory; the daemon refuses an unsafe parent at startup.
+`[daemon] socket`, move the socket into a private subdirectory such as
+`$XDG_RUNTIME_DIR/thegn` (the default), or use the default private location.
+Keep it out of shared or sandbox-mounted directories. At startup the daemon
+tightens a parent you own to `0700`, which removes any other user's access to
+that directory, and refuses a symlinked parent or one it cannot chmod or
+verify, such as a directory owned by another user. These Unix mode rules are
+Unix-only; Windows uses a named pipe secured by its DACL instead.
 
 ## Lifetimes
 
