@@ -1,4 +1,4 @@
-//! THE219 Part B: real CLI processes and Git folding, never a real agent.
+//! THE219 Part B: real CLI processes and Git folding with hermetic fake agents.
 #[path = "custody.rs"]
 mod custody;
 
@@ -65,16 +65,24 @@ struct Fixture {
     serial: usize,
     binary_hash: String,
     started: BTreeMap<usize, StartedCommand>,
+    agent_guard: Option<GateReleaseGuard>,
 }
 struct FixtureOpts {
     gate: String,
     auto_land: bool,
+    agent: AgentMode,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentMode {
+    HeldAtFloor,
+    HostFifo,
 }
 impl Fixture {
     fn new() -> Self {
         Self::with(FixtureOpts {
             gate: GATE.to_owned(),
             auto_land: false,
+            agent: AgentMode::HeldAtFloor,
         })
     }
 
@@ -116,14 +124,53 @@ impl Fixture {
         fs::write(root.path().join("gitconfig"), "").unwrap();
         fs::write(root.path().join("empty-rc"), "").unwrap();
         let shell = root.path().join("bin/sh");
+        let fixture_shell = root.path().join("fixture-shell");
+        fs::write(
+            &fixture_shell,
+            format!(
+                "#!{}\n[ \"$#\" -eq 2 ] && {{ [ \"$1\" = -c ] || [ \"$1\" = -lc ]; }} || exit 97\nexec {} -c \"$2\"\n",
+                shell.display(),
+                shell.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fixture_shell, fs::Permissions::from_mode(0o700)).unwrap();
         let sentinel = root.path().join("agent-sentinel");
         fs::write(&sentinel, format!("#!{}\n[ \"$#\" -eq 1 ] || exit 91\nprintf 'unexpected-agent\\n' > \"$1\"\nexit 92\n", shell.display())).unwrap();
         fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o700)).unwrap();
-        let command = format!(
-            "{} {}",
-            thegn_core::util::sh_quote(sentinel.to_str().unwrap()),
-            thegn_core::util::sh_quote(root.path().join("agent-ran").to_str().unwrap())
-        );
+        let (command, agent_sandbox, agent_timeout_secs, isolation_floor) = match options.agent {
+            AgentMode::HeldAtFloor => (
+                format!(
+                    "{} {}",
+                    thegn_core::util::sh_quote(sentinel.to_str().unwrap()),
+                    thegn_core::util::sh_quote(root.path().join("agent-ran").to_str().unwrap())
+                ),
+                true,
+                1,
+                String::new(),
+            ),
+            AgentMode::HostFifo => {
+                let agent = root.path().join("fake-agent");
+                let starts =
+                    thegn_core::util::sh_quote(root.path().join("agent-runs").to_str().unwrap());
+                let hold =
+                    thegn_core::util::sh_quote(root.path().join("agent-hold").to_str().unwrap());
+                let open =
+                    thegn_core::util::sh_quote(root.path().join("agent-open").to_str().unwrap());
+                let script = format!(
+                    "#!{}\nprintf 'agent-start %s\\n' \"$$\" >> {starts}; if [ -p {hold} ] && [ ! -e {open} ]; then IFS= read -r _ < {hold}; fi; printf 'agent-end %s\\n' \"$$\" >> {starts}; exit 0\n",
+                    shell.display()
+                );
+                fs::write(&agent, script).unwrap();
+                fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+                (
+                    thegn_core::util::sh_quote(agent.to_str().unwrap()),
+                    false,
+                    120,
+                    "isolation_floor = \"off\"\n".to_owned(),
+                )
+            }
+        };
         // JSON basic strings are valid TOML basic strings for these fixed ASCII
         // fixture paths/commands. No path is interpolated into shell source.
         let text = format!(
@@ -135,6 +182,7 @@ enabled = false
 [sandbox]
 enabled = false
 backend = "none"
+{isolation_floor}
 warm_direnv = "off"
 inject_devshell = false
 [sandbox.limits]
@@ -160,14 +208,17 @@ remote_mode = "route_to_host"
 conflict_handoff = "agent"
 agent_command = {command}
 agent_max_attempts = 3
-agent_timeout_secs = 1
-agent_sandbox = true
+agent_timeout_secs = {agent_timeout_secs}
+agent_sandbox = {agent_sandbox}
 agent_isolation_floor = "guest-kernel"
 agent_on_floor_miss = "fail"
 "#,
             gate = serde_json::to_string(&gate_command).unwrap(),
             auto_land = options.auto_land,
-            command = serde_json::to_string(&command).unwrap()
+            command = serde_json::to_string(&command).unwrap(),
+            agent_sandbox = agent_sandbox,
+            agent_timeout_secs = agent_timeout_secs,
+            isolation_floor = isolation_floor
         );
         let errors = thegn_core::config::validate_str(&text);
         assert!(
@@ -185,7 +236,11 @@ agent_on_floor_miss = "fail"
         assert_eq!(cfg.sandbox.limits.memory.as_deref(), Some(""));
         assert_eq!(cfg.sandbox.limits.memory_total.as_deref(), Some("off"));
         let mq = &cfg.merge_queue;
-        assert!(mq.enabled && mq.gate_on && mq.agent_sandbox);
+        assert!(mq.enabled && mq.gate_on);
+        match options.agent {
+            AgentMode::HeldAtFloor => assert!(mq.agent_sandbox),
+            AgentMode::HostFifo => assert!(!mq.agent_sandbox),
+        }
         if !options.auto_land && gate_command == GATE {
             assert!(
                 !mq.auto_land
@@ -208,6 +263,13 @@ agent_on_floor_miss = "fail"
         assert_eq!(mq.on_landed, OnLanded::Off);
         assert_eq!(mq.conflict_handoff, ConflictHandoff::Agent);
         assert_eq!(mq.agent_isolation_floor, IsolationFloor::GuestKernel);
+        if options.agent == AgentMode::HostFifo {
+            assert_eq!(mq.agent_timeout_secs, 120);
+            assert_eq!(cfg.sandbox.isolation_floor, Some(IsolationFloor::Off));
+        } else {
+            assert_eq!(mq.agent_timeout_secs, 1);
+            assert_eq!(mq.agent_isolation_floor, IsolationFloor::GuestKernel);
+        }
         assert_eq!(mq.agent_on_floor_miss, OnFloorMiss::Fail);
         assert_eq!(mq.agent_max_attempts, 3);
         assert!(mq.regenerate_paths.is_empty() && mq.gate_target_dir.is_empty());
@@ -225,6 +287,7 @@ agent_on_floor_miss = "fail"
             serial: 0,
             binary_hash: digest(Path::new(env!("CARGO_BIN_EXE_thegn"))),
             started: BTreeMap::new(),
+            agent_guard: None,
             root,
         };
         assert!(!fixture.db_path().exists());
@@ -260,7 +323,7 @@ agent_on_floor_miss = "fail"
             .env("GIT_CONFIG_GLOBAL", self.root.path().join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("SHELL", self.root.path().join("bin/sh"))
+            .env("SHELL", self.root.path().join("fixture-shell"))
             .env("ENV", self.root.path().join("empty-rc"))
             .env("BASH_ENV", self.root.path().join("empty-rc"));
         cmd
@@ -480,8 +543,8 @@ fn race_gate(root: &Path) -> String {
     )
 }
 
-fn make_gate_fifo(root: &Path) {
-    let path = std::ffi::CString::new(root.join("gate-hold").to_str().unwrap()).unwrap();
+fn make_gate_fifo(root: &Path, name: &str) {
+    let path = std::ffi::CString::new(root.join(name).to_str().unwrap()).unwrap();
     // SAFETY: path is a valid NUL-terminated private fixture path; mode limits
     // the FIFO to the test's owner.
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
@@ -489,13 +552,17 @@ fn make_gate_fifo(root: &Path) {
 
 struct GateReleaseGuard {
     root: PathBuf,
+    fifo_name: String,
+    open_name: String,
     armed: bool,
 }
 
 impl GateReleaseGuard {
-    fn new(root: &Path) -> Self {
+    fn new(root: &Path, fifo_name: &str, open_name: &str) -> Self {
         Self {
             root: root.to_path_buf(),
+            fifo_name: fifo_name.to_owned(),
+            open_name: open_name.to_owned(),
             armed: true,
         }
     }
@@ -510,12 +577,12 @@ impl Drop for GateReleaseGuard {
         if !self.armed {
             return;
         }
-        let open = self.root.join("gate-open");
+        let open = self.root.join(&self.open_name);
         if let Err(error) = fs::write(&open, "open\n") {
             tracing::debug!(path = %open.display(), %error, "could not mark race gate open during cleanup");
         }
 
-        let fifo_path = self.root.join("gate-hold");
+        let fifo_path = self.root.join(&self.fifo_name);
         match OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -533,8 +600,8 @@ impl Drop for GateReleaseGuard {
     }
 }
 
-fn release_gate(root: &Path) {
-    let path = root.join("gate-hold");
+fn release_gate(root: &Path, fifo_name: &str, open_name: &str) {
+    let path = root.join(fifo_name);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut fifo = loop {
         match OpenOptions::new()
@@ -553,41 +620,46 @@ fn release_gate(root: &Path) {
             Err(error) => panic!("could not open gate FIFO for release: {error}"),
         }
     };
+    fs::write(root.join(open_name), "open\n").unwrap();
     fifo.write_all(b"continue\n").unwrap();
 }
 
-fn gate_log(root: &Path) -> String {
-    match fs::read_to_string(root.join("gate-runs")) {
+fn gate_log(root: &Path, log_name: &str) -> String {
+    match fs::read_to_string(root.join(log_name)) {
         Ok(log) => log,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => panic!("could not read gate log: {error}"),
     }
 }
 
-fn gate_count(root: &Path, event: &str) -> usize {
-    gate_log(root)
+fn gate_count(root: &Path, log_name: &str, event: &str) -> usize {
+    gate_log(root, log_name)
         .lines()
         .filter(|line| line.starts_with(event))
         .count()
 }
 
-fn wait_gate_count(root: &Path, event: &str, expected: usize) {
+fn wait_gate_count(root: &Path, log_name: &str, event: &str, expected: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let observed = gate_count(root, event);
+        let observed = gate_count(root, log_name, event);
         if observed == expected {
             return;
         }
         assert!(
             observed < expected && std::time::Instant::now() < deadline,
             "timed out waiting for {expected} `{event}` gate records (observed {observed}); log: {}",
-            gate_log(root)
+            gate_log(root, log_name)
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
 fn one_row_fixture(options: FixtureOpts) -> Fixture {
+    one_row_fixture_with_red_gate(options, false)
+}
+
+fn one_row_fixture_with_red_gate(options: FixtureOpts, red_gate: bool) -> Fixture {
     let mut fixture = Fixture::with(options);
     let repo = fixture.repo.clone();
     let feature = fixture.held.clone();
@@ -624,9 +696,45 @@ fn one_row_fixture(options: FixtureOpts) -> Fixture {
         ],
     );
     fs::write(feature.join("feature.txt"), "feature\n").unwrap();
-    fixture.git(&feature, &["add", "feature.txt"]);
-    fixture.git(&feature, &["commit", "-qm", "feature"]);
+    if red_gate {
+        fs::write(feature.join("red-gate-marker"), "always red\n").unwrap();
+        fixture.git(&feature, &["add", "feature.txt", "red-gate-marker"]);
+    } else {
+        fixture.git(&feature, &["add", "feature.txt"]);
+    }
+    if red_gate {
+        fixture.git(
+            &feature,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "feature with red gate marker",
+            ],
+        );
+    } else {
+        fixture.git(&feature, &["commit", "-qm", "feature"]);
+    }
     fixture.cli(&["merge", "add", feature.to_str().unwrap()]);
+    fixture
+}
+
+fn agent_row_fixture() -> Fixture {
+    let mut fixture = one_row_fixture_with_red_gate(
+        FixtureOpts {
+            gate: GATE.to_owned(),
+            auto_land: false,
+            agent: AgentMode::HostFifo,
+        },
+        true,
+    );
+    make_gate_fifo(fixture.root.path(), "agent-hold");
+    fixture.agent_guard = Some(GateReleaseGuard::new(
+        fixture.root.path(),
+        "agent-hold",
+        "agent-open",
+    ));
     fixture
 }
 
@@ -977,6 +1085,121 @@ fn real_cli_red_gate_hold_continues_then_plain_drain_recovers_same_row() {
     exercise(Case::RedGate);
 }
 
+// Both drains are custody-owned CLI groups, while each host fake agent runs in
+// the separate group created by agent_run. The feature commit contains
+// `red-gate-marker`, so every fold reaches the red gate (GATE). In
+// merge_driver.rs, the agent branch consumes the claim attempt and writes
+// `agent_running` before runner start (the `agent fixing (n/3)` status write at
+// 1316-1318), leaving phase `claimed_no_child`. cmd/merge.rs's live-claim
+// `TargetStampAction::SkipHeld` path (961-985) makes the second CLI emit
+// "claimed by another drain" without changing status, attempts, or generation.
+// Releasing the first agent lets that owner repeat the red gate and agent cycle
+// through attempt 3; merge_driver.rs's terminal `agent_runs > 0` arm (1406+)
+// writes `needs_human`, then claim finish leaves phase `unclaimed` (1478-1481).
+// The guard records one `agent-start`/`agent-end` pair per owner attempt, and
+// auto-land is disabled so `refs/heads/main` stays at its captured commit.
+#[test]
+fn race_agent_two_cli_drains_dispatch_one_agent() {
+    let mut f = agent_row_fixture();
+    let mut agent_release = f.agent_guard.take().unwrap();
+    let repo = f.repo.clone();
+    let root = f.root.path().to_path_buf();
+    let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    assert!(owner.pid() > 0);
+    wait_gate_count(&root, "agent-runs", "agent-start ", 1);
+    let owner_state = row_state(&f);
+    assert_eq!(owner_state.status, "agent_running");
+    assert_eq!(owner_state.agent_attempts, 1);
+    assert_eq!(owner_state.phase, "claimed_no_child");
+
+    let loser = f.json(&["merge", "drain", "--json"]);
+    assert!(loser["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning.as_str().is_some_and(|warning| {
+            warning.contains("feature") && warning.contains("claimed by another drain")
+        })
+    }));
+    assert_eq!(gate_count(&root, "agent-runs", "agent-start "), 1);
+    let after_loser = row_state(&f);
+    assert_eq!(after_loser.agent_attempts, owner_state.agent_attempts);
+    assert_eq!(after_loser.generation, owner_state.generation);
+    assert_eq!(after_loser.status, owner_state.status);
+
+    release_gate(&root, "agent-hold", "agent-open");
+    let winner = f.finish_cli(owner);
+    assert!(winner.status.success());
+    let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
+    assert_eq!(winner_json["needs_human"], json!(["feature"]));
+    let final_row = row_state(&f);
+    assert_eq!(final_row.status, "needs_human");
+    assert_eq!(final_row.agent_attempts, 3);
+    assert_eq!(final_row.phase, "unclaimed");
+    assert_eq!(gate_count(&root, "agent-runs", "agent-start "), 3);
+    assert_eq!(gate_count(&root, "agent-runs", "agent-end "), 3);
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before
+    );
+    agent_release.disarm();
+    f.close();
+}
+
+// The drain CLI is killed in its custody-owned group, but agent_run starts its
+// child in a separate owned group, so the blocked fake agent survives. Its
+// completed attempt leaves `agent_running`/`claimed_no_child`; status and phase
+// are written before runner start (merge_driver.rs:1316-1318). After the test
+// expires only the persisted claim lease, merge_driver.rs's
+// `recoverable_in_progress_status` admits `folding`/`verifying` only
+// (642-651), and the stale `agent_running` branch reports "not claimable"
+// (751-800) without claiming or dispatching it. Therefore status, attempts,
+// generation and phase remain the crashed values, the start count is still
+// one, and the non-auto-land target ref is unchanged.
+#[test]
+fn race_agent_killed_owner_row_is_not_recovered_after_lease_expiry() {
+    let mut f = agent_row_fixture();
+    let mut agent_release = f.agent_guard.take().unwrap();
+    let repo = f.repo.clone();
+    let root = f.root.path().to_path_buf();
+    let worktree = f.held.to_string_lossy().into_owned();
+    let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    wait_gate_count(&root, "agent-runs", "agent-start ", 1);
+    let killed = f.kill_cli(owner);
+    assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
+    let crashed = row_state(&f);
+    assert_eq!(crashed.status, "agent_running");
+    assert_eq!(crashed.agent_attempts, 1);
+    assert_eq!(crashed.phase, "claimed_no_child");
+
+    release_gate(&root, "agent-hold", "agent-open");
+    wait_gate_count(&root, "agent-runs", "agent-end ", 1);
+    expire_lease(&f, &worktree);
+    let recovered = f.json(&["merge", "drain", "--json"]);
+    assert!(
+        recovered["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                warning.as_str().is_some_and(|warning| {
+                    warning.contains("feature: agent_running row is not claimable")
+                })
+            })
+    );
+    let after = row_state(&f);
+    assert_eq!(after.status, crashed.status);
+    assert_eq!(after.agent_attempts, crashed.agent_attempts);
+    assert_eq!(after.generation, crashed.generation);
+    assert_eq!(after.phase, crashed.phase);
+    assert_eq!(gate_count(&root, "agent-runs", "agent-start "), 1);
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before
+    );
+    agent_release.disarm();
+    f.close();
+}
+
 // Both CLI processes use custody-owned groups and the same private fixture DB.
 // A holds its gate in the gate runner's separate group after RowClaim admission;
 // no lease time is simulated, so B observes A's live claim and emits the
@@ -990,15 +1213,16 @@ fn race_two_cli_drains_have_one_owner() {
     let mut f = one_row_fixture(FixtureOpts {
         gate: String::new(),
         auto_land: false,
+        agent: AgentMode::HeldAtFloor,
     });
     let repo = f.repo.clone();
     let before_ref = f.git(&repo, &["rev-parse", "refs/heads/main"]);
     let root = f.root.path().to_path_buf();
-    make_gate_fifo(&root);
-    let mut gate_release = GateReleaseGuard::new(&root);
+    make_gate_fifo(&root, "gate-hold");
+    let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     assert!(owner.pid() > 0);
-    wait_gate_count(&root, "start ", 1);
+    wait_gate_count(&root, "gate-runs", "start ", 1);
     let owner_claimed = row_state(&f);
     let loser = f.json(&["merge", "drain", "--json"]);
     assert!(loser["warnings"].as_array().unwrap().iter().any(|warning| {
@@ -1006,7 +1230,7 @@ fn race_two_cli_drains_have_one_owner() {
             warning.contains("feature") && warning.contains("claimed by another drain")
         })
     }));
-    assert_eq!(gate_count(&root, "start "), 1);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
     let after_loser = row_state(&f);
     assert_eq!(
         after_loser.agent_attempts, owner_claimed.agent_attempts,
@@ -1017,14 +1241,14 @@ fn race_two_cli_drains_have_one_owner() {
         "loser must not claim the row"
     );
     assert_eq!(after_loser.status, owner_claimed.status);
-    release_gate(&root);
+    release_gate(&root, "gate-hold", "gate-open");
     let winner = f.finish_cli(owner);
     assert!(winner.status.success());
     let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
     assert_eq!(winner_json["ready"], json!(["feature"]));
     assert_eq!(row_state(&f).status, "ready");
     assert_eq!(row_state(&f).phase, "unclaimed");
-    assert_eq!(gate_count(&root, "start "), 1);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
     assert_eq!(f.git(&repo, &["rev-parse", "refs/heads/main"]), before_ref);
     gate_release.disarm();
     f.close();
@@ -1045,22 +1269,23 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
     let mut f = one_row_fixture(FixtureOpts {
         gate: String::new(),
         auto_land: false,
+        agent: AgentMode::HeldAtFloor,
     });
     let root = f.root.path().to_path_buf();
     let worktree = f.held.to_string_lossy().into_owned();
-    make_gate_fifo(&root);
-    let mut gate_release = GateReleaseGuard::new(&root);
+    make_gate_fifo(&root, "gate-hold");
+    let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
     let before = row_state(&f);
     let owner = f.start_cli(&["merge", "drain", "--json"]);
-    wait_gate_count(&root, "start ", 1);
+    wait_gate_count(&root, "gate-runs", "start ", 1);
     let killed = f.kill_cli(owner);
     assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
     let crashed = row_state(&f);
     assert_eq!(crashed.status, "folding");
     assert_ne!(crashed.phase, "unclaimed");
     // The gate runs in its own process group and outlives the killed drain.
-    release_gate(&root);
-    wait_gate_count(&root, "end ", 1);
+    release_gate(&root, "gate-hold", "gate-open");
+    wait_gate_count(&root, "gate-runs", "end ", 1);
     // Only the lease clock is simulated; claim generation, status, and owner
     // state were written by the killed CLI process itself.
     expire_lease(&f, &worktree);
@@ -1088,8 +1313,8 @@ fn race_killed_owner_row_is_recovered_after_lease_expiry() {
                     .is_none_or(|warning| !warning.contains("not claimable"))
             })
     );
-    assert_eq!(gate_count(&root, "start "), 2);
-    assert_eq!(gate_count(&root, "end "), 2);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 2);
+    assert_eq!(gate_count(&root, "gate-runs", "end "), 2);
     gate_release.disarm();
     f.close();
 }
@@ -1109,15 +1334,16 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
     let mut f = one_row_fixture(FixtureOpts {
         gate: String::new(),
         auto_land: true,
+        agent: AgentMode::HeldAtFloor,
     });
     let root = f.root.path().to_path_buf();
     let repo = f.repo.clone();
     let worktree = f.held.to_string_lossy().into_owned();
-    make_gate_fifo(&root);
-    let mut gate_release = GateReleaseGuard::new(&root);
+    make_gate_fifo(&root, "gate-hold");
+    let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
     let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
     let owner = f.start_cli(&["merge", "drain", "--json"]);
-    wait_gate_count(&root, "start ", 1);
+    wait_gate_count(&root, "gate-runs", "start ", 1);
     expire_lease(&f, &worktree);
     fs::write(root.join("gate-open"), "open\n").unwrap();
     let recovered = f.json(&["merge", "drain", "--json"]);
@@ -1136,7 +1362,7 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
     );
     let target_after_recovery = f.git(&repo, &["rev-parse", "refs/heads/main"]);
     assert_eq!(target_after_recovery, result_oid);
-    release_gate(&root);
+    release_gate(&root, "gate-hold", "gate-open");
     let former = f.finish_cli(owner);
     assert_eq!(former.status.code(), Some(0));
     let former_json: Value = serde_json::from_str(&former.stdout).unwrap();
@@ -1160,8 +1386,8 @@ fn race_late_former_owner_cannot_overwrite_recovered_row() {
         target_after_recovery,
         "late former owner must not move target after recovery"
     );
-    assert_eq!(gate_count(&root, "start "), 2);
-    assert_eq!(gate_count(&root, "end "), 2);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 2);
+    assert_eq!(gate_count(&root, "gate-runs", "end "), 2);
     gate_release.disarm();
     f.close();
 }
