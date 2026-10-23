@@ -588,6 +588,64 @@ pub fn failure_excerpt(text: &str, max_bytes: usize) -> String {
     excerpt
 }
 
+/// Bounded, redacted CI-log evidence for a PR repair prompt.
+///
+/// Only cached entries captured for `head_sha` are included. When no cached
+/// entry was captured for this head, callers keep their URL fallback.
+pub fn pr_repair_excerpt(
+    entries: &[CiLogEntry],
+    head_sha: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    if head_sha.trim().is_empty() {
+        return None;
+    }
+
+    let mut matching: Vec<&CiLogEntry> = entries
+        .iter()
+        .filter(|entry| entry.head_sha == head_sha && !entry.text.trim().is_empty())
+        .collect();
+    matching.sort_by(|left, right| {
+        right
+            .fetched_at
+            .cmp(&left.fetched_at)
+            .then_with(|| left.run_id.cmp(&right.run_id))
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    });
+
+    let mut out = String::new();
+    let mut remaining = max_bytes;
+    for entry in matching {
+        let name: String = entry
+            .job_name
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        let heading = format!("--- job {name} (run {}) ---\n", entry.run_id);
+        if heading.len() >= remaining {
+            break;
+        }
+
+        out.push_str(&heading);
+        remaining -= heading.len();
+        let body = failure_excerpt(&redact(&entry.text), remaining);
+        out.push_str(&body);
+        remaining -= body.len();
+        if !body.ends_with('\n') && remaining > 0 {
+            out.push('\n');
+            remaining -= 1;
+        }
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
 fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
     byte = byte.min(text.len());
     while !text.is_char_boundary(byte) {
@@ -1177,5 +1235,113 @@ mod tests {
         assert!(entry.text.lines().count() <= HARD_MAX_LOG_LINES);
         assert!(!entry.text.contains("token=a"));
         assert!(entry.text.ends_with("latest\n"));
+    }
+
+    fn pr_repair_entry(
+        head_sha: &str,
+        run_id: &str,
+        job_id: &str,
+        job_name: &str,
+        text: &str,
+        fetched_at: i64,
+    ) -> CiLogEntry {
+        CiLogEntry {
+            worktree: "/w/feat".into(),
+            run_id: run_id.into(),
+            job_id: job_id.into(),
+            job_name: job_name.into(),
+            text: text.into(),
+            head_sha: head_sha.into(),
+            fetched_at,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pr_repair_excerpt_keeps_only_entries_for_the_head() {
+        let entries = [
+            pr_repair_entry("old", "1", "1", "old", "old log", 2),
+            pr_repair_entry("abc", "2", "2", "current", "current log", 1),
+        ];
+        let excerpt = pr_repair_excerpt(&entries, "abc", 1024).unwrap();
+        assert!(excerpt.contains("current log"));
+        assert!(!excerpt.contains("old log"));
+    }
+
+    #[test]
+    fn pr_repair_excerpt_is_none_without_head_evidence() {
+        let entry = pr_repair_entry("abc", "1", "1", "test", "log", 1);
+        assert_eq!(
+            pr_repair_excerpt(std::slice::from_ref(&entry), "", 1024),
+            None
+        );
+        assert_eq!(
+            pr_repair_excerpt(std::slice::from_ref(&entry), "  \n", 1024),
+            None
+        );
+        assert_eq!(pr_repair_excerpt(&[entry], "other", 1024), None);
+        let blank = pr_repair_entry("abc", "1", "1", "test", " \n", 1);
+        assert_eq!(pr_repair_excerpt(&[blank], "abc", 1024), None);
+    }
+
+    #[test]
+    fn pr_repair_excerpt_re_redacts_cached_text() {
+        let token = format!("ghp_{}", "a".repeat(36));
+        let text = format!("token {token}\n");
+        let entry = pr_repair_entry("abc", "1", "1", "test", &text, 1);
+        let excerpt = pr_repair_excerpt(&[entry], "abc", 1024).unwrap();
+        assert!(excerpt.contains(REDACTION_MARKER));
+        assert!(!excerpt.contains(&token));
+    }
+
+    #[test]
+    fn pr_repair_excerpt_windows_each_job_within_the_budget() {
+        let text = (0..500)
+            .map(|line| {
+                if line == 250 {
+                    "error: boom\n".to_owned()
+                } else {
+                    format!("line {line}\n")
+                }
+            })
+            .collect::<String>();
+        let entry = pr_repair_entry("abc", "1", "1", "tést", &text, 1);
+        let excerpt = pr_repair_excerpt(&[entry], "abc", 2048).unwrap();
+        assert!(excerpt.len() <= 2048);
+        assert!(excerpt.contains("error: boom"));
+        assert!(excerpt.contains(EARLIER_OMITTED));
+
+        let unicode = pr_repair_entry("abc", "2", "2", "界", "ééééé", 2);
+        let clipped = pr_repair_excerpt(&[unicode], "abc", 33).unwrap();
+        assert!(
+            clipped.len() <= 33,
+            "multi-byte text must fit the byte budget"
+        );
+    }
+
+    #[test]
+    fn pr_repair_excerpt_orders_newest_first_then_run_and_job() {
+        let entries = [
+            pr_repair_entry("abc", "b", "z", "tie-later-job", "z", 10),
+            pr_repair_entry("abc", "a", "b", "tie-earlier-run", "a", 10),
+            pr_repair_entry("abc", "a", "a", "tie-earlier-job", "a", 10),
+            pr_repair_entry("abc", "new", "1", "newest", "new", 20),
+        ];
+        let excerpt = pr_repair_excerpt(&entries, "abc", 2048).unwrap();
+        let newest = excerpt.find("job newest").unwrap();
+        let run_a_job_a = excerpt.find("job tie-earlier-job").unwrap();
+        let run_a_job_b = excerpt.find("job tie-earlier-run").unwrap();
+        let run_b_job_z = excerpt.find("job tie-later-job").unwrap();
+        assert!(newest < run_a_job_a && run_a_job_a < run_a_job_b && run_a_job_b < run_b_job_z);
+    }
+
+    #[test]
+    fn pr_repair_excerpt_stops_when_the_next_heading_does_not_fit() {
+        let first = pr_repair_entry("abc", "1", "1", "first", "body\n", 2);
+        let first_chunk = pr_repair_excerpt(std::slice::from_ref(&first), "abc", 1024).unwrap();
+        let second = pr_repair_entry("abc", "2", "2", "second", "body\n", 1);
+        let excerpt = pr_repair_excerpt(&[first, second], "abc", first_chunk.len() + 3).unwrap();
+        assert!(excerpt.contains("job first"));
+        assert!(!excerpt.contains("job second"));
     }
 }

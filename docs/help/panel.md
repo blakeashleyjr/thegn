@@ -300,6 +300,26 @@ It also skips runs cached for another branch, or with no recorded branch, in
 the sidebar and **across**; when the current branch is unknown, cached runs
 still count.
 
+#### CI log retention and privacy
+
+The CI cache keeps logs for the newest `log_cache_runs` terminal runs per
+worktree (default 10). Each job is limited by `log_tail_lines` (default 2000)
+and `log_max_bytes` (default 1 MiB), with hard caps of 100,000 lines and
+4 MiB. Logs are stored only in the local state database; thegn itself never
+uploads them, but redacted excerpts are passed to the agent command you
+configure for the PR queue and CI autofix. They are purged when provider
+context changes. Redaction is pattern-based and best-effort, so treat cached
+logs as sensitive. Set `log_cache_runs = 0` to disable persistence.
+
+Thegn does not run workflows locally. To run them locally, add a tool such as
+`act` and launch it from the tool picker:
+
+```toml
+[[tools]]
+name = "act"
+command = "act"
+```
+
 ### merge — the local merge queue
 
 The fold-actor's per-branch land/defer status. Scoped to the active
