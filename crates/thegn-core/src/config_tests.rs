@@ -3342,6 +3342,114 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
 }
 
 #[test]
+fn clamp_to_channel_drops_ssh_and_provider_envs_in_stable() {
+    use crate::channel::{Channel, Feature};
+    use crate::config::{EnvConfig, PlacementMode};
+
+    let mut cfg = Config {
+        env: BTreeMap::from([
+            (
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Ssh,
+                    ssh: EnvSshConfig {
+                        host: "box.example".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "fly".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "hinted".into(),
+                EnvConfig {
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            ("plain".into(), EnvConfig::default()),
+            (
+                "pod".into(),
+                EnvConfig {
+                    placement: PlacementMode::K8s,
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+
+    let clamped = cfg.clamp_to_channel(Channel::Stable);
+    assert_eq!(
+        cfg.env.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["plain", "pod"]
+    );
+    assert!(clamped.contains(&Feature::Remote));
+    assert!(clamped.contains(&Feature::Providers));
+
+    let mut dev = Config {
+        env: BTreeMap::from([
+            (
+                "box".into(),
+                EnvConfig {
+                    placement: PlacementMode::Ssh,
+                    ssh: EnvSshConfig {
+                        host: "box.example".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "fly".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "hinted".into(),
+                EnvConfig {
+                    provider: EnvProviderConfig {
+                        provider: "fly".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            ("plain".into(), EnvConfig::default()),
+            (
+                "pod".into(),
+                EnvConfig {
+                    placement: PlacementMode::K8s,
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    assert!(dev.clamp_to_channel(Channel::Dev).is_empty());
+    assert_eq!(dev.env.len(), 5);
+}
+
+#[test]
 fn stable_layered_config_keeps_linear_trackers_across_base_profile_and_repo_overlay() {
     use crate::channel::Channel;
 
