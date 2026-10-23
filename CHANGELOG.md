@@ -9,28 +9,30 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.38] — 2026-10-23 (maintenance batch 75)
 
-### Changed
-
-- PR queue and CI autofix report why an agent did not start instead of treating
-  a refused launch as an ordinary agent failure. The attempt is still counted.
-- `thegn forward list`, `thegn forward stop` and `thegn placement list` report
-  unreadable recorded state as an error. `forward stop` says when no record
-  exists. `thegn placement list` reports unreadable placement state as an
-  error; `thegn host rm` refuses removal when it cannot read placement tenants
-  (dev channel).
-
 ### Fixed
 
+- PR queue and CI autofix report why an agent did not start instead of treating
+  a refused launch as an ordinary agent failure. The attempt was still counted.
+- `thegn forward list` and `thegn forward stop` report unreadable recorded
+  state as an error instead of an empty answer, and `forward stop` says when no
+  forward was recorded for that port.
+- `thegn placement list` reports unreadable placement state as an error, and
+  `thegn host rm` refuses, removing nothing, when it cannot read the host's
+  placement tenants (dev channel).
+- One one-minute deadline bounds a whole GitLab run detail. When it cuts off a
+  later job page, `thegn ci view` and `ci logs` warn that the job list is
+  incomplete and show the jobs read so far; a cut-off first page is an error.
 - The merge-queue drain lands the commit it verified; it refuses a branch that
   moved after verification. A failed PR fetch no longer changes the queue
   row's status. Local worktree listing preserves paths containing newlines.
 - A workspace with an unreadable removal record starts as a temporary
   workspace with a warning instead of being registered again. Late lifecycle
   messages from a reloaded plugin no longer change the new plugin's state.
-- The Sprites list follows every page and refuses incomplete results; warm-pool
-  recycle destroys a spare when its base checkpoint cannot be confirmed.
-  Machine0 creates keep a pending reservation across an unknown outcome, count
-  it toward `max_instances`, and adopt the VM on retry (dev channel).
+- On the dev channel, the Sprites list follows every page and refuses
+  incomplete results; warm-pool recycle destroys a spare when its base
+  checkpoint cannot be confirmed. Machine0 creates keep a pending reservation
+  across an unknown outcome, count it toward `max_instances`, and adopt the VM
+  on retry.
 
 ### Security
 
