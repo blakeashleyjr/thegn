@@ -891,9 +891,13 @@ mod tests {
         }));
         let outside = temp.path().join("outside.pdf");
         std::fs::write(&outside, b"pdf").unwrap();
-        assert_eq!(
-            untrusted_roots_for(&outside).unwrap(),
-            Vec::<PathBuf>::new()
+        // A file outside the fixture repository is never attributed to it (an unrelated repository higher up
+        // the host filesystem, e.g. a stray `/tmp/.git`, is out of this test's control).
+        assert!(
+            untrusted_roots_for(&outside)
+                .unwrap()
+                .iter()
+                .all(|root| !root.starts_with(temp.path()) && !root.starts_with(&repo))
         );
     }
 
