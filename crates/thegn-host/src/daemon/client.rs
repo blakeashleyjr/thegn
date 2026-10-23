@@ -27,7 +27,7 @@ const SCOPE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_DAEMON_TOTAL_DEADLINE: Duration = SCOPE_PROBE_TIMEOUT;
 /// The spawn wait is bounded by the 3 s already promised by its timeout error
 /// (the old 60 x 50 ms loop).
-const SPAWN_WAIT_DEADLINE: Duration = Duration::from_secs(3);
+pub(super) const SPAWN_WAIT_DEADLINE: Duration = Duration::from_secs(3);
 /// Interval between checks while waiting for the spawned daemon to start.
 const SPAWN_WAIT_POLL: Duration = Duration::from_millis(50);
 

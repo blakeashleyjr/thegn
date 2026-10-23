@@ -423,10 +423,63 @@ fn private_tmp_socket_resolved_with(
 }
 
 #[cfg(unix)]
+/// The client stops waiting for a spawned daemon after this, so a longer
+/// allocation-lock wait only leaves a wedged daemon behind.
+const ALLOC_LOCK_WAIT: std::time::Duration = client::SPAWN_WAIT_DEADLINE;
+
+#[cfg(unix)]
 fn allocate_private_tmp_fallback_in(
     tmp_root: &std::path::Path,
     state_dir: &std::path::Path,
     euid: u32,
+) -> Result<PathBuf> {
+    allocate_private_tmp_fallback_within(tmp_root, state_dir, euid, ALLOC_LOCK_WAIT)
+}
+
+#[cfg(unix)]
+#[allow(deprecated)]
+fn lock_allocation_file_within(
+    lock: &std::fs::File,
+    lock_path: &std::path::Path,
+    wait: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now().checked_add(wait).ok_or_else(|| {
+        anyhow::anyhow!(
+            "daemon allocation lock wait is too large for {}",
+            lock_path.display()
+        )
+    })?;
+    let mut backoff = std::time::Duration::from_millis(5);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| {
+                    format!("lock daemon allocation file {}", lock_path.display())
+                });
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    anyhow::bail!(
+                        "daemon allocation lock {} is held by another thegn process (waited {:?}); stop the stuck daemon or retry",
+                        lock_path.display(),
+                        wait
+                    );
+                }
+                std::thread::sleep(backoff.min(deadline.saturating_duration_since(now)));
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn allocate_private_tmp_fallback_within(
+    tmp_root: &std::path::Path,
+    state_dir: &std::path::Path,
+    euid: u32,
+    wait: std::time::Duration,
 ) -> Result<PathBuf> {
     let _run =
         thegn_core::fsperm::ensure_private_dir_beneath(state_dir, std::path::Path::new("run"))
@@ -467,8 +520,7 @@ fn allocate_private_tmp_fallback_in(
                 .with_context(|| format!("create daemon allocation lock {}", lock_path.display()));
         }
     };
-    lock.lock()
-        .with_context(|| format!("lock daemon allocation file {}", lock_path.display()))?;
+    lock_allocation_file_within(&lock, &lock_path, wait)?;
 
     let state_key = thegn_core::config_daemon::state_endpoint_key(state_dir);
     if let Some(name) = read_tmp_fallback_locator_at(&locator) {
@@ -2499,5 +2551,101 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
             .count();
         assert_eq!(siblings, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_allocator_times_out_on_a_held_lock() {
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let state = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let first =
+            allocate_private_tmp_fallback_in(tmp.path(), state.path(), effective_uid()).unwrap();
+        let locator = state.path().join("run").join("tmp-fallback-dir");
+        let original_name = read_tmp_fallback_locator_at(&locator).unwrap();
+        let lock_path = state.path().join("run").join("daemon-alloc.lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.lock().unwrap();
+
+        let wait = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let result =
+            allocate_private_tmp_fallback_within(tmp.path(), state.path(), effective_uid(), wait);
+        let elapsed = started.elapsed();
+        let error = result.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("daemon allocation lock"), "{message}");
+        assert!(message.contains("held by another"), "{message}");
+        assert!(
+            elapsed >= wait,
+            "waited {elapsed:?}, expected at least {wait:?}"
+        );
+        assert!(
+            elapsed < ALLOC_LOCK_WAIT,
+            "waited {elapsed:?}, exceeding allocation bound {ALLOC_LOCK_WAIT:?}"
+        );
+        assert_eq!(
+            read_tmp_fallback_locator_at(&locator),
+            Some(original_name.clone())
+        );
+        let key = thegn_core::config_daemon::state_endpoint_key(state.path());
+        let prefix = format!("thegn-{}-{key}-", effective_uid());
+        let siblings = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(siblings, 1);
+        assert_eq!(
+            first
+                .parent()
+                .unwrap()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str),
+            Some(original_name.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmp_fallback_allocator_succeeds_once_the_lock_is_released() {
+        // Positive control: once released, the existing locator-reuse path
+        // succeeds; this would also pass with the old blocking acquisition.
+        let tmp = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let state = tempfile::Builder::new()
+            .prefix("tg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let first =
+            allocate_private_tmp_fallback_in(tmp.path(), state.path(), effective_uid()).unwrap();
+        let lock_path = state.path().join("run").join("daemon-alloc.lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.lock().unwrap();
+        drop(holder);
+
+        let reused = allocate_private_tmp_fallback_within(
+            tmp.path(),
+            state.path(),
+            effective_uid(),
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        assert_eq!(reused, first);
     }
 }
