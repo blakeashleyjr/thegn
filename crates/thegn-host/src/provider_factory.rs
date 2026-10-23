@@ -7,6 +7,11 @@ use anyhow::Context;
 use thegn_svc::fly::{FlyProvider, FlySpec};
 use thegn_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
 
+const UNREADABLE_BINDING_CONTEXT: &str = concat!(
+    "the worktree's warm-pool sandbox binding is unreadable; ",
+    "refusing to fall back to the derived sandbox id",
+);
+
 static MANAGED_KEY_SCOPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
 /// Publish the configured managed-key scope for provider factories. Factories
@@ -497,9 +502,9 @@ fn resolve_provider_env(
         return Ok(None);
     }
     let db = db.context("open the state database to read the warm-pool sandbox binding")?;
-    let bound = db.worktree_provider_sandbox(worktree).context(
-        "the worktree's warm-pool sandbox binding is unreadable; refusing to fall back to the derived sandbox id",
-    )?;
+    let bound = db
+        .worktree_provider_sandbox(worktree)
+        .context(UNREADABLE_BINDING_CONTEXT)?;
     Ok(Some((env, bound)))
 }
 
@@ -517,9 +522,7 @@ fn sandbox_id_from(
     match binding {
         Ok(Some(bound)) => Ok(bound),
         Ok(None) => Ok(derived.to_string()),
-        Err(error) => Err(error.context(
-            "the worktree's warm-pool sandbox binding is unreadable; refusing to fall back to the derived sandbox id",
-        )),
+        Err(error) => Err(error.context(UNREADABLE_BINDING_CONTEXT)),
     }
 }
 

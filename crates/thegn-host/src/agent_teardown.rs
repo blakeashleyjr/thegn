@@ -79,9 +79,8 @@ pub fn destroy_provider_sandbox_with(
     {
         Ok(name) => name,
         Err(error) => {
-            return Err(format!(
-                "resolve the worktree's provider sandbox: {error:#}"
-            ));
+            let message = format!("resolve the worktree's provider sandbox: {error:#}");
+            return Err(message);
         }
     };
     let Some(name) = name.filter(|s| !s.is_empty()) else {
