@@ -579,6 +579,16 @@ pub(crate) fn drive_queue(
     )
 }
 
+/// Whether a `git worktree list --porcelain -z` listing registers exactly `worktree` (THE-376 slice d). A malformed
+/// listing is an error, never "not registered".
+fn listing_registers(listing: &str, worktree: &Path) -> Result<bool, String> {
+    let entries = util::parse_worktree_branches(listing)
+        .ok_or_else(|| "the queued repository's worktree list is malformed".to_string())?;
+    Ok(entries
+        .iter()
+        .any(|(path, _branch)| Path::new(path) == worktree))
+}
+
 /// Confirm the queued local checkout still names the same registered Git
 /// repository, branch, and candidate commit before dispatching a fixer.
 fn verify_fixer_checkout(
@@ -623,11 +633,16 @@ fn verify_fixer_checkout(
     if actual_common != expected_common {
         return Err("worktree belongs to a different Git repository".into());
     }
-    let listing = local_git_text(repo_root, &["worktree", "list", "--porcelain"])
-        .map_err(|error| format!("could not list the queued repository's worktrees: {error}"))?;
-    let registered = listing.lines().any(|line| {
-        line.strip_prefix("worktree ") == Some(canonical_worktree.to_string_lossy().as_ref())
-    });
+    let cancel = AtomicBool::new(false);
+    let listing = thegn_core::git_run::git_run(
+        repo_root,
+        &util::WORKTREE_LIST_Z,
+        &thegn_core::git_run::GitPolicy::read(thegn_core::remote::GITLOC_READ_DEADLINE),
+        &cancel,
+    )
+    .into_text()
+    .map_err(|error| format!("could not list the queued repository's worktrees: {error}"))?;
+    let registered = listing_registers(&listing, &canonical_worktree)?;
     if !registered {
         return Err("path is not a registered worktree of the queued repository".into());
     }
@@ -1755,6 +1770,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixer_registration_ignores_a_newline_forged_record() {
+        let oid = "a".repeat(40);
+        let listing = format!(
+            "worktree /r\0HEAD {oid}\0branch refs/heads/main\0\0\
+             worktree /tmp/a\nworktree /tmp/target\0HEAD {oid}\0detached\0\0"
+        );
+        assert_eq!(
+            listing_registers(&listing, Path::new("/tmp/target")),
+            Ok(false)
+        );
+        assert_eq!(
+            listing_registers(&listing, Path::new("/tmp/a\nworktree /tmp/target")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn fixer_registration_refuses_a_malformed_listing() {
+        let error = listing_registers(
+            "worktree /r\0HEAD 0000000000000000000000000000000000000000\0detached\0",
+            Path::new("/r"),
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed"));
+    }
+
     fn uncontained_config() -> Config {
         Config {
             sandbox: thegn_core::config::SandboxConfig {
@@ -2228,6 +2270,25 @@ mod tests {
             let alias = feat_wt.with_file_name("feature-alias");
             std::os::unix::fs::symlink(&feat_wt, &alias).unwrap();
             assert!(verify_fixer_checkout(&root, alias.to_str().unwrap(), "feat", None).is_err());
+        }
+
+        #[test]
+        fn fixer_registration_accepts_a_registered_newline_worktree() {
+            let (_fixture, root, _feat_wt) = conflicting_repo("nl-reg");
+            let nl = root.parent().unwrap().join("nl\nwt");
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "nlb",
+                    nl.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            verify_fixer_checkout(&root, nl.to_str().unwrap(), "nlb", None).unwrap();
         }
 
         #[test]
