@@ -108,13 +108,6 @@
       ]
     },
     {
-      "issue": "THE-114",
-      "project": "Agent & Workflow Platform",
-      "changes": [
-        "add-ci-logs-and-autofix"
-      ]
-    },
-    {
       "issue": "THE-115",
       "project": "Runtime Security & Host Architecture",
       "changes": [
@@ -302,13 +295,6 @@
       ]
     },
     {
-      "issue": "THE-154",
-      "project": "Plugin UI Platform",
-      "changes": [
-        "repair-resident-plugin-lifecycle"
-      ]
-    },
-    {
       "issue": "THE-325",
       "project": "Client API & Remote Access",
       "changes": [],
@@ -357,62 +343,13 @@
       ]
     },
     {
-      "issue": "THE-615",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "repair-session-recovery-and-terminal-teardown"
-      ]
-    },
-    {
-      "issue": "THE-616",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "repair-session-recovery-and-terminal-teardown"
-      ]
-    },
-    {
-      "issue": "THE-617",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "repair-session-recovery-and-terminal-teardown"
-      ]
-    },
-    {
-      "issue": "THE-618",
-      "project": "Alpha Reliability & State Compatibility",
-      "changes": [
-        "repair-session-recovery-and-terminal-teardown"
-      ]
-    },
-    {
-      "issue": "THE-625",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "repair-performance-evidence-and-log-tail"
-      ]
-    },
-    {
-      "issue": "THE-626",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "repair-performance-evidence-and-log-tail"
-      ]
-    },
-    {
-      "issue": "THE-627",
-      "project": "Workspace Product & Observability",
-      "changes": [
-        "repair-performance-evidence-and-log-tail"
-      ]
-    },
-    {
       "issue": "THE-703",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [],
       "no_spec_rationale": "Phase 1 (classify, approve, plan) archived as add-pipeline-supervisor-policy. Phases 2-4 of the supervisor policy layer are still open and have no proposal yet."
     },
     {
-      "issue": "THE-829",
+      "issue": "THE-1362",
       "project": "Workspace Product & Observability",
       "changes": [
         "monitor-framework"
