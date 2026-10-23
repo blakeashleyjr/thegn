@@ -1107,7 +1107,8 @@ term-check: build
 # provider. Writes a per-repo `.thegn.toml` overlay at the main worktree.
 # Existing overlays are replaced only when absent or byte-for-byte equal to a
 # backend value generated here; unrelated hand-written content must be edited
-# by hand. Sprites may also append its default provider block to global config.
+# by hand. Sprites validates a staged global-config scaffold, then installs it
+# owner-only after staging the overlay; the overlay is installed last.
 # Empty `backend` is a no-op. To revert the overlay, remove it from the main
 # checkout (`rm "$(git rev-parse --show-toplevel)/.thegn.toml"`).
 _apply-backend backend="":
@@ -1144,18 +1145,52 @@ _apply-backend backend="":
       fi; \
       overlay_current=false; \
       if [ -e "$overlay" ] && printf '%s\n' "$overlay_body" | cmp -s - "$overlay"; then overlay_current=true; fi; \
+      cfg_stage=""; \
+      cfg_backup=""; \
+      staged=""; \
+      scaffold_cfg=false; \
       if [ "$backend" = sprites ] && ! grep -q '^\[env\.sprites\]' "$cfg" 2>/dev/null; then \
+        command -v python3 >/dev/null 2>&1 || { echo "python3 is required to validate $cfg before scaffolding [env.sprites]; add the block by hand" >&2; exit 1; }; \
         command -v sprite >/dev/null 2>&1 || echo "note: sprite CLI not on PATH — fine for native exec (the default exec=auto attaches over the WSS API with just SPRITES_TOKEN); the CLI is only the fallback transport" >&2; \
-        mkdir -p "$(dirname "$cfg")"; \
-        printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\n# Per-worktree sprite name. Tokens: {repo}=repo name, {worktree}=dir basename,\n# {hash}=stable path digest (collision-defuser), {slug}=full-path. Default is\n# conflict-free across repos; "" is equivalent. A no-token literal = one shared sprite.\nid = "{repo}-{worktree}-{hash}"\napi_key_env = "SPRITES_TOKEN"\nexec = "auto"\nauto_provision = true\nauto_checkpoint = true\n# CLI bridge — only used if you set exec = "cli"; lifecycle is API (auto_provision/auto_checkpoint).\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\n' >> "$cfg"; \
-        echo "scaffolded [env.sprites] into $cfg"; \
+        if [ -e "$cfg" ] && ! python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$cfg"; then \
+          echo "$cfg is not valid TOML — not modified" >&2; exit 1; \
+        fi; \
+        cfg_observed=absent; \
+        if [ -e "$cfg" ]; then cfg_observed="$(cksum < "$cfg")"; fi; \
+        mkdir -p "$(dirname "$cfg")" || { echo "could not create config directory for $cfg" >&2; exit 1; }; \
+        cfg_stage="$(mktemp "$(dirname "$cfg")/.config.toml.XXXXXX")" || { echo "could not stage $cfg" >&2; exit 1; }; \
+        if [ -e "$cfg" ]; then \
+          cfg_backup="$(mktemp "$(dirname "$cfg")/.config.toml.restore.XXXXXX")" || { rm -f -- "$cfg_stage"; echo "could not stage a restore copy of $cfg" >&2; exit 1; }; \
+          if ! cat "$cfg" > "$cfg_backup" || ! cat "$cfg" > "$cfg_stage"; then rm -f -- "$cfg_stage" "$cfg_backup"; echo "could not copy $cfg into its stage" >&2; exit 1; fi; \
+        fi; \
+        if ! printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\n# Per-worktree sprite name. Tokens: {repo}=repo name, {worktree}=dir basename,\n# {hash}=stable path digest (collision-defuser), {slug}=full-path. Default is\n# conflict-free across repos; "" is equivalent. A no-token literal = one shared sprite.\nid = "{repo}-{worktree}-{hash}"\napi_key_env = "SPRITES_TOKEN"\nexec = "auto"\nauto_provision = true\nauto_checkpoint = true\n# CLI bridge — only used if you set exec = "cli"; lifecycle is API (auto_provision/auto_checkpoint).\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\n' >> "$cfg_stage"; then rm -f -- "$cfg_stage"; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; echo "could not append the [env.sprites] scaffold to its stage" >&2; exit 1; fi; \
+        if ! python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$cfg_stage"; then rm -f -- "$cfg_stage"; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; echo "$cfg is not valid TOML after adding [env.sprites] — not modified" >&2; exit 1; fi; \
+        scaffold_cfg=true; \
       fi; \
       if [ "$overlay_current" != true ]; then \
-        staged="$(mktemp "$root/.thegn.toml.XXXXXX")"; \
-        printf '%s\n' "$overlay_body" > "$staged"; \
-        mv -f -- "$staged" "$overlay"; \
+        staged="$(mktemp "$root/.thegn.toml.XXXXXX")" || { if [ -n "$cfg_stage" ]; then rm -f -- "$cfg_stage"; fi; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; echo "could not stage $overlay" >&2; exit 1; }; \
+        if ! printf '%s\n' "$overlay_body" > "$staged"; then rm -f -- "$staged"; if [ -n "$cfg_stage" ]; then rm -f -- "$cfg_stage"; fi; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; echo "could not write staged overlay $overlay" >&2; exit 1; fi; \
+      fi; \
+      if [ "$scaffold_cfg" = true ]; then \
+        cfg_now=absent; \
+        if [ -e "$cfg" ]; then cfg_now="$(cksum < "$cfg")"; fi; \
+        if [ "$cfg_now" != "$cfg_observed" ]; then rm -f -- "$cfg_stage"; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; if [ -n "$staged" ]; then rm -f -- "$staged"; fi; echo "$cfg changed while staging — not modified" >&2; exit 1; fi; \
+        if ! mv -f -- "$cfg_stage" "$cfg"; then rm -f -- "$cfg_stage"; if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; if [ -n "$staged" ]; then rm -f -- "$staged"; fi; echo "could not install staged config $cfg" >&2; exit 1; fi; \
+        echo "scaffolded [env.sprites] into $cfg"; \
+      fi; \
+      if [ -n "$staged" ]; then \
+        if ! mv -f -- "$staged" "$overlay"; then \
+          rm -f -- "$staged"; \
+          if [ "$scaffold_cfg" = true ]; then \
+            if [ -n "$cfg_backup" ]; then \
+              if ! mv -f -- "$cfg_backup" "$cfg"; then echo "could not install staged overlay $overlay or restore $cfg" >&2; exit 1; fi; \
+            elif ! rm -f -- "$cfg"; then echo "could not install staged overlay $overlay or remove new config $cfg" >&2; exit 1; fi; \
+          fi; \
+          echo "could not install staged overlay $overlay; restored the prior config state" >&2; exit 1; \
+        fi; \
         echo "set $overlay -> $overlay_body (applies to all worktrees under $root)"; \
       fi; \
+      if [ -n "$cfg_backup" ]; then rm -f -- "$cfg_backup"; fi; \
     fi
 
 # Dogfood the local merge queue (the fold-actor): same isolated state root as
