@@ -4095,10 +4095,11 @@ impl ShareConfig {
     }
 }
 /// `[forward]` — automatically forward dev-server ports bound *inside* a
-/// worktree's sandbox to the host's loopback for browser preview. The
+/// worktree's local container sandbox to the host for browser preview. The
 /// *outbound-localhost* sibling of [`ShareConfig`]: `[share]` exposes a port at a
 /// public URL; `[forward]` makes a sandbox-internal port reachable on the host.
-/// On by default — forwards bind loopback only, so this is safe.
+/// Forwards bind loopback by default; non-loopback binds are refused unless
+/// `allow_external_bind` is enabled.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ForwardConfig {
@@ -4134,7 +4135,8 @@ pub struct ForwardConfig {
     pub ignore: Vec<u16>,
     /// If non-empty, an allowlist: ONLY these container ports are forwarded.
     pub only: Vec<u16>,
-    /// Host interface to bind forwards on. Loopback keeps previews host-local.
+    /// Host interface to bind forwards on. Non-loopback binds are refused by
+    /// default; enabling `allow_external_bind` exposes forwarded ports there.
     pub bind: String,
     /// Detector poll cadence in seconds (how often the sandbox is scanned for
     /// newly-bound listening ports).
@@ -4148,6 +4150,9 @@ pub struct ForwardConfig {
     pub browser: String,
     /// Open the browser automatically when a new forward comes up.
     pub open_on_detect: bool,
+    /// Permit a non-loopback `bind`. Off by default: a non-loopback bind exposes
+    /// every forwarded sandbox port on that interface.
+    pub allow_external_bind: bool,
 }
 
 impl Default for ForwardConfig {
@@ -4166,6 +4171,7 @@ impl Default for ForwardConfig {
             poll_secs: 2,
             browser: String::new(),
             open_on_detect: false,
+            allow_external_bind: false,
         }
     }
 }

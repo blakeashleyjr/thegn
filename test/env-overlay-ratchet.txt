@@ -125,6 +125,7 @@ forges.host
 forges.kind
 forges.name
 forges.token
+forward.allow_external_bind
 forward.auto
 forward.bind
 forward.browser
