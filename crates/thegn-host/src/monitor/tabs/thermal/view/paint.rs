@@ -171,8 +171,8 @@ pub(super) fn cores(grid: &mut CellGrid, rect: Rect, cores: &[Option<f32>; 16]) 
         crate::monitor::kit::raster::draw_raster(
             grid,
             Rect {
-                x,
-                y,
+                x: rect.x + x,
+                y: rect.y + y,
                 cols: 1,
                 rows: 1,
             },
@@ -206,7 +206,7 @@ pub(super) fn draw_graph(
         Rect {
             x: rect.x + x,
             y: rect.y + y,
-            cols: raster.width(),
+            cols: rect.cols.saturating_sub(x),
             rows: max_rows,
         },
         raster,

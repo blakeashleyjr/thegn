@@ -674,7 +674,7 @@ fn unresolved_stacked_background_inherits_instead_of_using_dim() {
         ColorDepth::Truecolor,
     );
     let style = resolved.cell(viz_raster::RCell {
-        ch: '█',
+        ch: '\u{2588}',
         fg: 0,
         bg: Some(7),
     });

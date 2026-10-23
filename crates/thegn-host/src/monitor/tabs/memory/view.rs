@@ -8,7 +8,7 @@ use crate::{
             grid::CellGrid,
             meter::Meter,
             panel::panel,
-            raster::{self, RasterStyle},
+            raster::{RasterStyle, draw_raster},
         },
         layout::{Node, PanelId, PanelSpec, Placed, Size, Variant, VariantKind},
     },
@@ -725,7 +725,7 @@ fn draw_runs(
             let mut raster = CellBuf::new();
             raster.reset(end_cell - first_cell, chart.rows);
             rasterize(&values[run_start..sample], table, &mut raster);
-            raster::draw_raster(
+            draw_raster(
                 grid,
                 Rect {
                     x: chart.x + first_cell,
@@ -1164,7 +1164,7 @@ impl MemoryView<'_> {
                     crate::monitor::graphs::table(),
                     &mut raster,
                 );
-                raster::draw_raster(
+                draw_raster(
                     grid,
                     chart,
                     &raster,
@@ -1437,7 +1437,7 @@ impl MemoryView<'_> {
                     table,
                     &mut raster,
                 );
-                raster::draw_raster(
+                draw_raster(
                     grid,
                     Rect {
                         x: chart.x + run_start,
