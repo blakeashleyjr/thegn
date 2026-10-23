@@ -502,20 +502,30 @@ fn clone_workspace_repo_with_deadline(
     on_progress: impl FnMut(String) + Send + 'static,
 ) -> Result<()> {
     let mut staging = None;
+    let mut parent_pin = None;
     let result = (|| {
         anyhow::ensure!(!cancelled(), "git clone cancelled");
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        let parent = dest.parent().unwrap_or(std::path::Path::new("."));
-        let name = dest
+        let parent_path = dest.parent().unwrap_or(std::path::Path::new("."));
+        let parent = std::fs::canonicalize(parent_path)
+            .with_context(|| format!("canonicalize workspace parent {}", parent_path.display()))?;
+        parent_pin = Some(
+            thegn_core::fsperm::open_rooted_dir(&parent)
+                .with_context(|| format!("pin workspace parent {}", parent.display()))?,
+        );
+        let pin = parent_pin.as_ref().expect("workspace parent was pinned");
+        let dest_name = dest
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("workspace"))
-            .to_string_lossy();
+            .to_string_lossy()
+            .into_owned();
+        let name = dest_name.as_str();
         let reclaimed = reclaim_stale_clone_staging(
-            parent,
-            &name,
+            &parent,
+            name,
             std::process::id(),
             crate::platform::pid_alive,
         );
@@ -523,8 +533,8 @@ fn clone_workspace_repo_with_deadline(
             tracing::debug!(reclaimed, path = %parent.display(), "reclaimed stale workspace clone staging");
         }
         // Leftovers from a crashed run are reclaimed here before staging is checked.
-        let staging_path =
-            parent.join(format!(".{name}.clone-{generation}-{}", std::process::id()));
+        let staging_name = format!(".{name}.clone-{generation}-{}", std::process::id());
+        let staging_path = parent.join(&staging_name);
         match std::fs::symlink_metadata(&staging_path) {
             Ok(_) => anyhow::bail!(
                 "workspace clone staging path already exists: {}",
@@ -549,7 +559,7 @@ fn clone_workspace_repo_with_deadline(
         staging = Some(staging_path.clone());
         // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
         // clone; the staging path is absolute, so the `-C` only sets the working dir.
-        let cwd = parent;
+        let cwd = &parent;
         // `--progress` forces git to emit its transfer counters even though stderr
         // is a pipe, not a TTY; we stream them to the picker's cloning panel.
         let mut command = thegn_core::util::git_cmd(cwd);
@@ -684,13 +694,25 @@ fn clone_workspace_repo_with_deadline(
         }
         validate_staged_clone(&staging_path, expected_origin)?;
         staging = None;
-        promote_staged_clone(&staging_path, dest)?;
+        promote_staged_clone(pin, &staging_name, name)?;
         Ok(())
     })();
     if result.is_err()
         && let Some(staging) = staging
+        && let Some(pin) = parent_pin.as_ref()
     {
-        remove_partial_clone_dest(&staging, false);
+        match pin.same_dir_as(pin.path()) {
+            Ok(true) => remove_partial_clone_dest(&staging, false),
+            Ok(false) => tracing::debug!(
+                path = %staging.display(),
+                "workspace clone parent was replaced; leaving staging for startup sweep"
+            ),
+            Err(error) => tracing::debug!(
+                path = %staging.display(),
+                %error,
+                "could not verify workspace clone parent; leaving staging for startup sweep"
+            ),
+        }
     }
     result
 }
@@ -740,9 +762,20 @@ fn validate_staged_clone(staging: &std::path::Path, expected_origin: Option<&str
     Ok(())
 }
 
-fn promote_staged_clone(staging: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+fn promote_staged_clone(
+    pin: &thegn_core::fsperm::RootedDir,
+    staging_name: &str,
+    dest_name: &str,
+) -> Result<()> {
+    let staging = pin.path().join(staging_name);
+    let dest = pin.path().join(dest_name);
     let result = (|| {
-        match std::fs::symlink_metadata(dest) {
+        anyhow::ensure!(
+            pin.same_dir_as(pin.path())?,
+            "workspace parent {} was replaced while cloning; not promoted",
+            pin.path().display()
+        );
+        match std::fs::symlink_metadata(&dest) {
             Ok(_) => anyhow::bail!(
                 "workspace destination appeared while cloning: {}; not replaced",
                 dest.display()
@@ -753,9 +786,9 @@ fn promote_staged_clone(staging: &std::path::Path, dest: &std::path::Path) -> Re
                     .with_context(|| format!("inspect workspace destination {}", dest.display()));
             }
         }
-        thegn_core::fsperm::restore_normal_directory_mode(staging)
+        thegn_core::fsperm::restore_normal_directory_mode(&staging)
             .with_context(|| format!("restore workspace directory mode {}", staging.display()))?;
-        match crate::platform::rename_noreplace::rename_dir_noreplace(staging, dest) {
+        match pin.rename_child_noreplace(staging_name, dest_name) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 anyhow::bail!(
@@ -769,7 +802,18 @@ fn promote_staged_clone(staging: &std::path::Path, dest: &std::path::Path) -> Re
         }
     })();
     if result.is_err() {
-        remove_partial_clone_dest(staging, false);
+        match pin.same_dir_as(pin.path()) {
+            Ok(true) => remove_partial_clone_dest(&staging, false),
+            Ok(false) => tracing::debug!(
+                path = %staging.display(),
+                "workspace clone parent was replaced; leaving staging for startup sweep"
+            ),
+            Err(error) => tracing::debug!(
+                path = %staging.display(),
+                %error,
+                "could not verify workspace clone parent; leaving staging for startup sweep"
+            ),
+        }
     }
     result
 }
@@ -2360,10 +2404,83 @@ Receiving objects: 100% (10/10)\rdone.\n";
         std::fs::write(staging.join("from-stage"), b"staged").unwrap();
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(dest.join("keep"), b"existing").unwrap();
-        let result = promote_staged_clone(&staging, &dest);
+        let pin = thegn_core::fsperm::open_rooted_dir(temp.path()).unwrap();
+        let result = promote_staged_clone(&pin, "staging", "dest");
         assert!(result.is_err());
         assert_eq!(std::fs::read(dest.join("keep")).unwrap(), b"existing");
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn staged_clone_refuses_promotion_when_the_parent_was_swapped() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("ws");
+        let elsewhere = temp.path().join("elsewhere");
+        let moved = temp.path().join("ws-moved");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::create_dir(parent.join(".x.clone-1-1")).unwrap();
+        std::fs::write(parent.join(".x.clone-1-1/marker"), b"staged").unwrap();
+        let pin = thegn_core::fsperm::open_rooted_dir(&parent).unwrap();
+
+        std::fs::rename(&parent, &moved).unwrap();
+        if let Err(error) = crate::platform::symlink_file_for_test(&elsewhere, &parent) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create swapped workspace parent symlink: {error}");
+        }
+
+        let result = promote_staged_clone(&pin, ".x.clone-1-1", "x");
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("replaced while cloning")
+        ));
+        assert!(!elsewhere.join("x").exists());
+        assert_eq!(
+            std::fs::read(moved.join(".x.clone-1-1/marker")).unwrap(),
+            b"staged"
+        );
+    }
+
+    #[test]
+    fn staged_clone_promotes_through_a_symlinked_workspaces_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = committed_fixture_repo(temp.path());
+        let source_url = source.to_string_lossy().into_owned();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        if let Err(error) = crate::platform::symlink_file_for_test(&real, &link) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create symlinked workspaces directory fixture: {error}");
+        }
+        let dest = link.join("workspace");
+
+        clone_workspace_repo_with_deadline(
+            &source_url,
+            &dest,
+            45,
+            None,
+            CloneLimits {
+                total: Duration::from_secs(30),
+                connect: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+            || false,
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(real.join("workspace/.git/HEAD").is_file());
     }
 
     #[test]
