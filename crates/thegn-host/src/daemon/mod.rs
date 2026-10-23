@@ -479,6 +479,8 @@ fn lock_allocation_file_within(
 fn tmp_fallback_socket_live(socket: &std::path::Path) -> bool {
     use std::os::unix::net::UnixStream;
 
+    // UnixStream::connect is blocking; a live listener with a full backlog can
+    // hold the allocation lock until the connect resolves, like the legacy probe.
     match UnixStream::connect(socket) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -2895,7 +2897,7 @@ mod tests {
 
         let listener = UnixListener::bind(dir.join("daemon.sock")).unwrap();
         drop(listener);
-        std::fs::write(dir.join("daemon.sock.lock"), []).unwrap();
+        std::fs::write(dir.join("daemon.sock.lock"), b"").unwrap();
     }
 
     #[cfg(unix)]
@@ -2949,8 +2951,9 @@ mod tests {
         let mode_dir = tmp_fallback_test_sibling(tmp.path(), &mode_name);
         std::fs::set_permissions(&mode_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let target_name = name_for(effective_uid(), key, 'd');
-        let target_dir = tmp_fallback_test_sibling(tmp.path(), &target_name);
+        let target_dir = tmp.path().join("symlink-target");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         tmp_fallback_test_dead_socket(&target_dir);
         let symlink_name = name_for(effective_uid(), key, 'e');
         let symlink_path = tmp.path().join(&symlink_name);
@@ -2963,7 +2966,7 @@ mod tests {
         let held_name = name_for(effective_uid(), key, '1');
         let held_dir = tmp_fallback_test_sibling(tmp.path(), &held_name);
         let held_lock_path = held_dir.join("daemon.sock.lock");
-        std::fs::write(&held_lock_path, []).unwrap();
+        std::fs::write(&held_lock_path, b"").unwrap();
         let held_lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -3045,7 +3048,7 @@ mod tests {
         let stale_dir = tmp_fallback_test_sibling(tmp.path(), &stale_name);
         let listener = UnixListener::bind(stale_dir.join("daemon.sock")).unwrap();
         drop(listener);
-        std::fs::write(stale_dir.join("daemon.sock.lock"), []).unwrap();
+        std::fs::write(stale_dir.join("daemon.sock.lock"), b"").unwrap();
 
         let second = allocate_private_tmp_fallback_in(tmp.path(), state.path(), euid).unwrap();
         assert_eq!(
