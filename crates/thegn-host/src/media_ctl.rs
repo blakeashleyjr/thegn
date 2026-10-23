@@ -999,7 +999,7 @@ mod tests {
         within_media_budget,
     };
     use crate::panel::media::QueueItemLease;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use thegn_core::media::{LoopMode, MediaCaps, MediaSnapshot, MediaState};
 
@@ -1925,6 +1925,8 @@ mod tests {
         let pending = Arc::new(AtomicUsize::new(0));
         let outcome = Arc::new(Mutex::new(None));
         let task_outcome = outcome.clone();
+        let post_read_completed = Arc::new(AtomicBool::new(false));
+        let task_post_read_completed = post_read_completed.clone();
         assert!(chain_op_inner(
             &tail,
             &pending,
@@ -1933,16 +1935,21 @@ mod tests {
             None,
             Some(&outcome),
             async move {
-                assert!(
-                    run_transport_op(&client, &cfg, &MediaOp::PlayPause, &|| true, &task_outcome,)
-                        .await
-                        .is_some()
-                );
+                let read =
+                    run_transport_op(&client, &cfg, &MediaOp::PlayPause, &|| true, &task_outcome)
+                        .await;
+                if matches!(read, Some(Ok(Some(_)))) {
+                    task_post_read_completed.store(true, std::sync::atomic::Ordering::Release);
+                }
             }
         ));
         finish_op_chain(&tail).await;
 
         assert_eq!(effects.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert!(
+            post_read_completed.load(std::sync::atomic::Ordering::Acquire),
+            "the chained transport operation must complete its successful post-read"
+        );
         assert_eq!(take_outcome(&outcome), None);
     }
 
