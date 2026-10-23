@@ -459,21 +459,30 @@ impl FlyProvider {
             key_path: self.spec.key_path.clone(),
         };
         let probe = vec!["true".to_string()];
-        let start = std::time::Instant::now();
+        let budget = crate::op_budget::OpBudget::start(BUDGET);
         loop {
             // `run_exec` returns Ok((255, "")) on an ssh CONNECT failure (ssh's
             // own exit code), so a bare `is_ok()` would pass before sshd is up —
             // gate on the exit code actually being 0.
-            if matches!(shim.run_exec(&probe, None, &[]).await, Ok((0, _))) {
-                return Ok(());
+            match budget.within(shim.run_exec(&probe, None, &[])).await {
+                Some(Ok((0, _))) => return Ok(()),
+                Some(Ok(_)) | Some(Err(_)) => {}
+                // SshShim kills the ssh child on drop, so cancelling this exec
+                // bounds the sshd probe without leaving a process behind.
+                None => {
+                    return Err(anyhow!(
+                        "fly: {name} ({ip}) sshd not reachable after {}s",
+                        BUDGET.as_secs()
+                    ));
+                }
             }
-            if start.elapsed() >= BUDGET {
+            if budget.expired() {
                 return Err(anyhow!(
                     "fly: {name} ({ip}) sshd not reachable after {}s",
                     BUDGET.as_secs()
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            budget.pause(std::time::Duration::from_secs(3)).await;
         }
     }
 
