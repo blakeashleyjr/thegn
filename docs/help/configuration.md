@@ -264,9 +264,14 @@ permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-l
   A model on a harness thegn has no flag for fails `thegn config validate` —
   it is never silently dropped.
 - **`env`** is applied last, so it wins over the composed identity env. Values
-  expand `env:VAR` and `file:PATH`; never write a raw secret here. This is how
-  one entry runs under a second account (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) or
-  a relocated pi home (`PI_CODING_AGENT_DIR`).
+  expand `env:VAR` and `file:PATH`; never write a raw secret here. A `file:`
+  reference follows symlinks and checks the resolved target: it must be a
+  regular file owned by you or root, have no world permission bits, one link,
+  and be at most 64 KiB. Group-readable files such as agenix's 0440 secrets
+  are allowed with a one-time warning naming the path. World-readable files,
+  extra hard links, dangling symlinks and non-regular targets are refused.
+  This lets one entry run under a second account (`CLAUDE_CONFIG_DIR`,
+  `CODEX_HOME`) or a relocated pi home (`PI_CODING_AGENT_DIR`).
 - **`permissions`** is granted to that one launch on the command line, so a
   headless worker never auto-denies its first tool. For claude it rides
   `--settings '{"permissions":{"allow":[…]}}'`: a per-session layer that

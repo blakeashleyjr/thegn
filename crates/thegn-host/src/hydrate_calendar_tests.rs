@@ -1729,6 +1729,7 @@ fn calendar_token_resolution_audits_each_account_without_values() {
     let token_path = fixture.path().join("calendar-token");
     let file_sentinel = "cal-file-sentinel-b72c";
     std::fs::write(&token_path, file_sentinel).unwrap();
+    thegn_core::fsperm::restrict_to_owner(&token_path).unwrap();
     let literal_sentinel = "cal-lit-sentinel-a41f";
     let literal_ref = format!("literal:{}", thegn_core::redact::PLACEHOLDER);
     let cfg = calendar_audit_config(literal_sentinel, &format!("file:{}", token_path.display()));
@@ -1776,6 +1777,7 @@ fn calendar_token_reload_rebinds_audit_events_to_their_own_accounts() {
     let token_path = fixture.path().join("calendar-token");
     let file_sentinel = "cal-file-sentinel-b72c";
     std::fs::write(&token_path, file_sentinel).unwrap();
+    thegn_core::fsperm::restrict_to_owner(&token_path).unwrap();
     let literal_sentinel = "cal-lit-sentinel-a41f";
     let literal_ref = format!("literal:{}", thegn_core::redact::PLACEHOLDER);
     let initial =

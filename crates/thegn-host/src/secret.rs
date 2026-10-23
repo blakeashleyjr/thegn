@@ -9,8 +9,8 @@
 //!   Windows Credential Manager), via the pure-Rust `keyring` crate. On a headless
 //!   box with no Secret Service explicit reads report unavailable; broker writes
 //!   may choose the owner-only file backend instead.
-//! - `env:VAR` / `file:PATH` — delegated to
-//!   [`thegn_core::config::expand_env_ref`] (unchanged behavior).
+//! - `env:VAR` — read directly; `file:PATH` — read through the shared checked
+//!   owner-only secret-file helper.
 //! - a bare string (`FLY_API_TOKEN`) — an **env var name**, matching the historic
 //!   `api_key_env` meaning, so existing configs keep working untouched.
 //!
@@ -104,7 +104,7 @@ pub fn resolve_ref_for_outcome(
 fn resolve_ref_for_outcome_with(
     r: &SecretRef,
     consumer: &str,
-    keyring_get: impl Fn(&str) -> Result<Option<String>>,
+    keyring_get: impl Fn(&str) -> Result<Option<String>, KeyringReadError>,
     keyring_available: impl Fn() -> bool,
 ) -> Result<Option<String>, SecretResolveFailure> {
     // An unconfigured/empty ref is "not set" — no fetch, no audit noise.
@@ -115,7 +115,15 @@ fn resolve_ref_for_outcome_with(
         SecretRef::Keyring { account } => match keyring_get(account) {
             Ok(Some(v)) => (Some(v), SecretOutcome::Resolved),
             Ok(None) if keyring_available() => (None, SecretOutcome::Missing),
-            Ok(None) | Err(_) => (None, SecretOutcome::Unavailable),
+            Ok(None) => (None, SecretOutcome::Unavailable),
+            Err(error @ KeyringReadError::Denied(_)) => {
+                tracing::debug!(target: "thegn::secret", reason = %error, "keyring read failed");
+                (None, SecretOutcome::Denied)
+            }
+            Err(error @ KeyringReadError::Unavailable(_)) => {
+                tracing::debug!(target: "thegn::secret", reason = %error, "keyring read failed");
+                (None, SecretOutcome::Unavailable)
+            }
         },
         SecretRef::Env { var } => match std::env::var(var).ok().filter(|s| !s.trim().is_empty()) {
             Some(v) => (Some(v), SecretOutcome::Resolved),
@@ -123,13 +131,18 @@ fn resolve_ref_for_outcome_with(
         },
         SecretRef::File { path } => {
             let p = thegn_core::util::expand_tilde(path);
-            match std::fs::read_to_string(&p)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                Some(v) => (Some(v), SecretOutcome::Resolved),
-                None => (None, SecretOutcome::Missing),
+            match thegn_core::fsperm::read_owner_only_secret_file(
+                std::path::Path::new(&p),
+                MAX_SECRET_BYTES,
+            ) {
+                Ok(value) if !value.is_empty() => (Some(value), SecretOutcome::Resolved),
+                Ok(_) | Err(thegn_core::fsperm::SecretFileError::NotFound) => {
+                    (None, SecretOutcome::Missing)
+                }
+                Err(thegn_core::fsperm::SecretFileError::Refused(reason)) => {
+                    tracing::warn!(target: "thegn::secret", %reason, "file secret refused");
+                    (None, SecretOutcome::Denied)
+                }
             }
         }
         SecretRef::Literal(_) => match r.expose_literal().filter(|s| !s.trim().is_empty()) {
@@ -497,6 +510,51 @@ enum KeyringOutcome<T> {
     NotStarted(&'static str),
 }
 
+/// Why a keyring read produced no value beyond an absent entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyringReadError {
+    /// The store answered but refused this entry or its contents.
+    Denied(String),
+    /// The store could not be used, or the bounded worker could not complete it.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for KeyringReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied(reason) | Self::Unavailable(reason) => f.write_str(reason),
+        }
+    }
+}
+
+fn keyring_read_outcome(
+    result: keyring::Result<String>,
+) -> Result<Option<String>, KeyringReadError> {
+    match result {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(keyring::Error::NoStorageAccess(error)) => Err(KeyringReadError::Denied(format!(
+            "keyring access denied: {error}"
+        ))),
+        Err(keyring::Error::PlatformFailure(error)) => Err(KeyringReadError::Unavailable(format!(
+            "keyring platform failure: {error}"
+        ))),
+        Err(keyring::Error::Ambiguous(_)) => Err(KeyringReadError::Denied(
+            "keyring entry is ambiguous".into(),
+        )),
+        Err(keyring::Error::BadEncoding(_)) => Err(KeyringReadError::Denied(
+            "keyring entry is not valid UTF-8".into(),
+        )),
+        Err(error @ keyring::Error::TooLong(..)) | Err(error @ keyring::Error::Invalid(..)) => Err(
+            KeyringReadError::Denied(format!("keyring entry is unusable: {error}")),
+        ),
+        Err(error) => Err(KeyringReadError::Unavailable(format!(
+            "keyring error: {error}"
+        ))),
+    }
+}
+
 const KEYRING_QUEUE: usize = 32;
 const QUEUED: u8 = 0;
 const STARTED: u8 = 1;
@@ -654,20 +712,21 @@ fn run_keyring_op_with_timeout<T: Send + 'static>(
     keyring_worker().run(operation, timeout, op)
 }
 
-fn keyring_get(account: &str) -> Result<Option<String>> {
+fn keyring_get(account: &str) -> Result<Option<String>, KeyringReadError> {
     let account = account.to_string();
     match run_keyring_op_with_timeout("get", KEYRING_PROBE_TIMEOUT, move || {
-        keyring::Entry::new(KEYRING_SERVICE, &account)
-            .ok()
-            .and_then(|entry| entry.get_password().ok())
-            .filter(|value| !value.trim().is_empty())
+        keyring_read_outcome(
+            keyring::Entry::new(KEYRING_SERVICE, &account).and_then(|entry| entry.get_password()),
+        )
     }) {
-        KeyringOutcome::Completed(value) => Ok(value),
-        KeyringOutcome::TimedOut => Err(anyhow::anyhow!(
+        KeyringOutcome::Completed(value) => value,
+        KeyringOutcome::TimedOut => Err(KeyringReadError::Unavailable(format!(
             "keyring get timed out after {}ms",
             KEYRING_PROBE_TIMEOUT.as_millis()
-        )),
-        KeyringOutcome::NotStarted(reason) => Err(anyhow::anyhow!(reason)),
+        ))),
+        KeyringOutcome::NotStarted(reason) => {
+            Err(KeyringReadError::Unavailable(reason.to_string()))
+        }
     }
 }
 
@@ -957,7 +1016,9 @@ impl SecretStore for KeyringStore {
         match keyring_get(account) {
             Ok(Some(v)) => Ok(v),
             Ok(None) if keyring_available() => Err(SecretError::not_found(account.to_string())),
-            Ok(None) | Err(_) => Err(SecretError::unavailable("no usable OS credential store")),
+            Ok(None) => Err(SecretError::unavailable("no usable OS credential store")),
+            Err(KeyringReadError::Denied(reason)) => Err(SecretError::denied(reason)),
+            Err(KeyringReadError::Unavailable(reason)) => Err(SecretError::unavailable(reason)),
         }
     }
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
@@ -1572,12 +1633,78 @@ mod tests {
         let unavailable = resolve_ref_for_outcome_with(
             &reference,
             "media:mpd",
-            |_| Err(anyhow::anyhow!("test backend unavailable")),
+            |_| {
+                Err(KeyringReadError::Unavailable(
+                    "test backend unavailable".into(),
+                ))
+            },
             || false,
         );
         assert_eq!(missing, Err(SecretResolveFailure::Missing));
         assert_eq!(unavailable, Err(SecretResolveFailure::Unavailable));
         assert_ne!(missing, unavailable);
+    }
+
+    #[test]
+    fn keyring_read_outcome_keeps_missing_denied_and_unavailable_apart() {
+        assert_eq!(keyring_read_outcome(Err(keyring::Error::NoEntry)), Ok(None));
+        assert_eq!(keyring_read_outcome(Ok("  ".into())), Ok(None));
+        assert_eq!(
+            keyring_read_outcome(Ok("tok".into())),
+            Ok(Some("tok".into()))
+        );
+        assert!(matches!(
+            keyring_read_outcome(Err(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("locked")
+            )))),
+            Err(KeyringReadError::Denied(_))
+        ));
+        assert!(matches!(
+            keyring_read_outcome(Err(keyring::Error::PlatformFailure(Box::new(
+                std::io::Error::other("dbus down")
+            )))),
+            Err(KeyringReadError::Unavailable(_))
+        ));
+        assert!(matches!(
+            keyring_read_outcome(Err(keyring::Error::Ambiguous(Vec::new()))),
+            Err(KeyringReadError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn typed_broker_reports_a_denied_keyring_read_as_denied() {
+        let reference = SecretRef::Keyring {
+            account: "media-mpd-test-account".into(),
+        };
+        let capture = AuditCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            resolve_ref_for_outcome_with(
+                &reference,
+                "media:mpd",
+                |_| Err(KeyringReadError::Denied("locked".into())),
+                || true,
+            )
+        });
+        assert_eq!(result, Err(SecretResolveFailure::Denied));
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("keyring read failed"), "{log}");
+        assert!(log.contains(r#"outcome="denied""#), "{log}");
+        let read_failure = log
+            .lines()
+            .find(|line| line.contains("keyring read failed"))
+            .expect("keyring read failure is logged");
+        assert!(read_failure.contains("reason=locked"), "{read_failure}");
+        assert!(
+            !read_failure.contains("media-mpd-test-account"),
+            "{read_failure}"
+        );
     }
 
     #[test]
@@ -1592,14 +1719,15 @@ mod tests {
         unsafe { std::env::remove_var("TG_MPD_SECRET_TEST") };
         assert_eq!(env.as_deref(), Some("mpd-test-value"));
 
-        let file = std::env::temp_dir().join(format!("tg-mpd-secret-{}.tok", std::process::id()));
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("token.tok");
         std::fs::write(&file, "mpd-file-value").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&file).unwrap();
         let from_file = resolve_ref_for_outcome(
             &SecretRef::parse(&format!("file:{}", file.display()), BareAs::Literal),
             "media:mpd",
         )
         .unwrap();
-        let _ = std::fs::remove_file(file); // best-effort: test cleanup after broker read
         assert_eq!(from_file.as_deref(), Some("mpd-file-value"));
     }
 
@@ -1623,10 +1751,100 @@ mod tests {
         thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
         let f = temp.path().join("secret.tok");
         std::fs::write(&f, "  filetoken\n").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&f).unwrap();
         assert_eq!(
             resolve(&format!("file:{}", f.display())).as_deref(),
             Some("filetoken")
         );
+    }
+
+    #[test]
+    fn file_ref_read_error_is_denied_not_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let directory_result = resolve_ref_for_outcome(
+            &SecretRef::parse(&format!("file:{}", directory.display()), BareAs::Literal),
+            "test",
+        );
+        assert_eq!(directory_result, Err(SecretResolveFailure::Denied));
+
+        let missing = resolve_ref_for_outcome(
+            &SecretRef::parse(
+                &format!("file:{}", temp.path().join("missing").display()),
+                BareAs::Literal,
+            ),
+            "test",
+        );
+        assert_eq!(missing, Err(SecretResolveFailure::Missing));
+    }
+
+    #[test]
+    fn file_ref_with_loose_mode_is_denied_and_audited() {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let path = temp.path().join("token");
+        std::fs::write(&path, "loose-token").unwrap();
+        match thegn_core::fsperm::set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("fixture mode: {error}"),
+        }
+        if thegn_core::fsperm::mode_bits(&path).unwrap().is_none() {
+            return;
+        }
+        let reference = SecretRef::parse(&format!("file:{}", path.display()), BareAs::Literal);
+        let capture = AuditCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let denied = tracing::subscriber::with_default(subscriber, || {
+            resolve_ref_for_outcome(&reference, "test")
+        });
+        assert_eq!(denied, Err(SecretResolveFailure::Denied));
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("world-accessible"), "{log}");
+        assert!(log.contains(r#"outcome="denied""#), "{log}");
+        assert!(!log.contains("loose-token"), "{log}");
+
+        thegn_core::fsperm::restrict_to_owner(&path).unwrap();
+        assert_eq!(
+            resolve_ref_for_outcome(&reference, "test"),
+            Ok(Some("loose-token".into()))
+        );
+    }
+
+    #[test]
+    fn file_ref_symlink_to_owner_only_target_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        thegn_core::fsperm::ensure_private_dir(temp.path()).unwrap();
+        let target = temp.path().join("token");
+        std::fs::write(&target, "symlink-token").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&target).unwrap();
+        let link = temp.path().join("token-link");
+        match thegn_core::fsperm::create_symlink(&target, &link, false) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("fixture symlink: {error}"),
+        }
+        let result = resolve_ref_for_outcome(
+            &SecretRef::parse(&format!("file:{}", link.display()), BareAs::Literal),
+            "test",
+        );
+        assert_eq!(result, Ok(Some("symlink-token".into())));
     }
 
     #[test]
