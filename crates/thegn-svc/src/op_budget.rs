@@ -65,9 +65,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn pause_never_overshoots() {
         let budget = OpBudget::start(Duration::from_secs(2));
+        let before = tokio::time::Instant::now();
 
         budget.pause(Duration::from_secs(4)).await;
 
+        assert_eq!(before.elapsed(), Duration::from_secs(2));
         assert!(budget.expired());
         assert_eq!(budget.remaining(), Duration::ZERO);
     }
