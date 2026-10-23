@@ -31,8 +31,9 @@ this is why:
 
 On the stable channel, SSH and provider `[env.*]` environments are removed
 when the config loads. If a worktree's `[sandbox] default_env` or selection
-names one, its pane halts instead of falling back to a local shell; the message
-explains that the environment is unavailable and points to `THEGN_CHANNEL=dev`.
+names one, its pane halts by default with a hint to set `THEGN_CHANNEL=dev`;
+`failover = "ask"` prompts instead. With `failover = "auto"`, the pane falls
+back to the host.
 
 Issue trackers including Linear, Jira, Kaneo, and GitHub are available in both
 channels. GitHub PR viewing is also stable. See [[review-a-pr]].
