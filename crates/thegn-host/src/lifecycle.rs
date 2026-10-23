@@ -688,6 +688,27 @@ where
 /// this only bounds a hung request so the reconcile/delete thread can't stall).
 const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// What the provider's checkpoint list says about a spare's base checkpoint.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckpointCheck {
+    Present,
+    Absent,
+    Unknown(String),
+}
+
+fn checkpoint_check(
+    listed: anyhow::Result<Vec<thegn_svc::provider::CheckpointInfo>>,
+    cp: &str,
+) -> CheckpointCheck {
+    match listed {
+        Ok(checkpoints) if checkpoints.iter().any(|checkpoint| checkpoint.id == cp) => {
+            CheckpointCheck::Present
+        }
+        Ok(_) => CheckpointCheck::Absent,
+        Err(error) => CheckpointCheck::Unknown(format!("{error:#}")),
+    }
+}
+
 /// Recycle one spare by restoring it in place from its provisioned-base
 /// checkpoint, then mark its row `ready` again (checkpoint kept, idle clock
 /// reset). `false` when the spare isn't recyclable (no checkpoint / lock-hash
@@ -717,20 +738,27 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
     if !provider.caps().checkpoints {
         return false;
     }
-    // Verify the checkpoint still EXISTS before trusting a restore: the Sprites
-    // restore endpoint returns success even for an unknown checkpoint id, so a
-    // provider-GC'd checkpoint whose id lingers in our row would otherwise
-    // "restore" into an unknown state. If listing fails (transient) we proceed —
-    // the restore + post-claim exec are the backstop.
-    let cp_present =
-        crate::agent::block_on_provider(|| async { provider.list_checkpoints(name).await })
-            .map(|cps| cps.iter().any(|c| c.id == cp))
-            .unwrap_or(true);
-    if !cp_present {
-        thegn_core::msg::warn(&format!(
-            "warm pool: checkpoint {cp} for {name} no longer exists; destroying instead of recycling"
-        ));
-        return false;
+    // The provider must confirm the checkpoint exists before we trust a
+    // restore: Sprites reports success for unknown checkpoint ids, which can
+    // leave the spare in an unknown state. An unreadable list cannot prove the
+    // checkpoint is present, so destroy instead of recycling.
+    match checkpoint_check(
+        crate::agent::block_on_provider(|| async { provider.list_checkpoints(name).await }),
+        cp,
+    ) {
+        CheckpointCheck::Present => {}
+        CheckpointCheck::Absent => {
+            thegn_core::msg::warn(&format!(
+                "warm pool: checkpoint {cp} for {name} no longer exists; destroying instead of recycling"
+            ));
+            return false;
+        }
+        CheckpointCheck::Unknown(error) => {
+            thegn_core::msg::warn(&format!(
+                "warm pool: cannot verify checkpoint {cp} for {name} ({error}); destroying instead of recycling"
+            ));
+            return false;
+        }
     }
     let restored = crate::agent::block_on_provider(|| async {
         tokio::time::timeout(RESTORE_TIMEOUT, provider.restore(name, cp))
@@ -1130,6 +1158,37 @@ mod tests {
         assert!(
             !recycle_spare(&cfg, "sprites", &spare, "lock"),
             "recycle=false must fall back to destroy even for a fresh checkpoint"
+        );
+    }
+
+    #[test]
+    fn checkpoint_check_list_error_is_unknown_not_present() {
+        assert!(matches!(
+            checkpoint_check(Err(anyhow::anyhow!("503")), "cp-1"),
+            CheckpointCheck::Unknown(message) if message.contains("503")
+        ));
+    }
+
+    #[test]
+    fn checkpoint_check_present_and_absent() {
+        let listed = Ok(vec![thegn_svc::provider::CheckpointInfo {
+            id: "cp-1".into(),
+            label: None,
+        }]);
+        assert_eq!(checkpoint_check(listed, "cp-1"), CheckpointCheck::Present);
+        assert_eq!(
+            checkpoint_check(
+                Ok(vec![thegn_svc::provider::CheckpointInfo {
+                    id: "cp-1".into(),
+                    label: None,
+                }]),
+                "cp-2"
+            ),
+            CheckpointCheck::Absent
+        );
+        assert_eq!(
+            checkpoint_check(Ok(vec![]), "cp-1"),
+            CheckpointCheck::Absent
         );
     }
 
