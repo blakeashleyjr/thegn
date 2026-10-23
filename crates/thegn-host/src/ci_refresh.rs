@@ -16,8 +16,11 @@ use std::time::{Duration, Instant};
 use termwiz::terminal::TerminalWaker;
 use thegn_core::store::WorkspaceStore;
 
+/// One request's aggregate cap across active and background worktrees, including run lists.
 const MAX_LOG_INGEST_CALLS: usize = 32;
+/// One request's aggregate cap across active and background worktrees, including run lists.
 const MAX_LOG_INGEST_BYTES: usize = 8 * 1024 * 1024;
+/// One request's aggregate cap across active and background worktrees, including run lists.
 const MAX_LOG_INGEST_WALL: Duration = Duration::from_secs(120);
 const MAX_INGEST_MEMO_ENTRIES: usize = 512;
 
@@ -124,6 +127,22 @@ struct CallBudget {
 }
 
 impl CallBudget {
+    fn per_refresh() -> Self {
+        Self {
+            remaining: MAX_LOG_INGEST_CALLS,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: Some(Instant::now() + MAX_LOG_INGEST_WALL),
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining == 0
+            || self.bytes_remaining == 0
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     fn take(&mut self) -> bool {
         if self
             .deadline
@@ -218,9 +237,10 @@ struct RefreshRequest {
     generation: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
 }
 
-struct RefreshContext {
+struct RefreshContext<'a> {
     generation: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
     cancel: Arc<AtomicBool>,
+    budget: &'a mut CallBudget,
 }
 
 #[derive(Default)]
@@ -943,6 +963,7 @@ fn run_ci_refresh_worker(mut request: RefreshRequest) {
 }
 
 fn run_ci_refresh_request(request: &RefreshRequest) {
+    let mut budget = CallBudget::per_refresh();
     let cfg = request.full.ci.clone();
     let cwd = request
         .token
@@ -963,18 +984,32 @@ fn run_ci_refresh_request(request: &RefreshRequest) {
             RefreshContext {
                 generation: request.generation.clone(),
                 cancel: Arc::clone(&request.token.cancel),
+                budget: &mut budget,
             },
         );
     }
-    sweep_one_background(
-        &request.session,
-        cwd,
-        &cfg,
-        &request.full,
-        request.waker.as_ref(),
-        request.generation.clone(),
-        Arc::clone(&request.token.cancel),
-    );
+    if !budget.exhausted() {
+        sweep_one_background(
+            &request.session,
+            cwd,
+            &cfg,
+            &request.full,
+            request.waker.as_ref(),
+            RefreshContext {
+                generation: request.generation.clone(),
+                cancel: Arc::clone(&request.token.cancel),
+                budget: &mut budget,
+            },
+        );
+    }
+    if budget.exhausted() {
+        tracing::info!(
+            target: "thegn::ci",
+            remaining = budget.remaining,
+            bytes_remaining = budget.bytes_remaining,
+            "CI refresh budget exhausted; remaining CI work waits for the next refresh"
+        );
+    }
 }
 
 /// Round-robin cursor over background worktrees, advanced once per sweep so
@@ -990,8 +1025,7 @@ fn sweep_one_background(
     cfg: &thegn_core::config::CiConfig,
     full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
-    generation: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
-    cancel: Arc<AtomicBool>,
+    mut context: RefreshContext<'_>,
 ) {
     let others: Vec<&str> = session
         .worktrees
@@ -1015,7 +1049,10 @@ fn sweep_one_background(
         let loc = locations.loc(p);
         // First worktree that actually fetched (fresh ones are skipped by the
         // guard) ends the sweep — one provider subprocess per tick, max.
-        if cancel.load(Ordering::Relaxed) {
+        if context.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        if context.budget.exhausted() {
             return;
         }
         if refresh_ci_cache_for(
@@ -1026,8 +1063,9 @@ fn sweep_one_background(
             waker,
             false,
             RefreshContext {
-                generation: generation.clone(),
-                cancel: Arc::clone(&cancel),
+                generation: context.generation.clone(),
+                cancel: Arc::clone(&context.cancel),
+                budget: &mut *context.budget,
             },
         ) {
             return;
@@ -1051,9 +1089,13 @@ fn refresh_ci_cache_for(
     full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
     force: bool,
-    context: RefreshContext,
+    context: RefreshContext<'_>,
 ) -> bool {
-    let RefreshContext { generation, cancel } = context;
+    let RefreshContext {
+        generation,
+        cancel,
+        budget,
+    } = context;
     use thegn_core::store::CacheStore;
     let Ok(db) = thegn_core::db::Db::open() else {
         return false;
@@ -1083,6 +1125,9 @@ fn refresh_ci_cache_for(
     } else {
         local_ci_cache_branch(loc)
     };
+    if !budget.take() {
+        return false;
+    }
     match client.runs(
         loc,
         branch.as_deref(),
@@ -1126,11 +1171,6 @@ fn refresh_ci_cache_for(
                 {
                     tracing::debug!(target: "thegn::ci", %error, "could not update cached CI runs");
                 }
-                let mut ingest_budget = CallBudget {
-                    remaining: MAX_LOG_INGEST_CALLS,
-                    bytes_remaining: MAX_LOG_INGEST_BYTES,
-                    deadline: Some(Instant::now() + MAX_LOG_INGEST_WALL),
-                };
                 ingest_failed_logs_with(IngestArgs {
                     host_path,
                     loc,
@@ -1139,7 +1179,7 @@ fn refresh_ci_cache_for(
                     full,
                     db: &db,
                     runs: &runs,
-                    budget: &mut ingest_budget,
+                    budget,
                     waker,
                     generation: generation.clone(),
                     now: thegn_core::util::now(),
@@ -1926,6 +1966,98 @@ mod tests {
         assert!(budget.take());
         assert!(!budget.take());
         assert!(!budget.take());
+    }
+
+    #[test]
+    fn refresh_budget_per_refresh_uses_the_ingest_caps() {
+        let budget = CallBudget::per_refresh();
+        assert_eq!(budget.remaining, MAX_LOG_INGEST_CALLS);
+        assert_eq!(budget.bytes_remaining, MAX_LOG_INGEST_BYTES);
+        assert!(budget.deadline.is_some());
+        assert!(!budget.exhausted());
+    }
+
+    #[test]
+    fn refresh_budget_reports_exhausted_calls_bytes_and_deadline() {
+        let calls = CallBudget {
+            remaining: 0,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: None,
+        };
+        let bytes = CallBudget {
+            remaining: MAX_LOG_INGEST_CALLS,
+            bytes_remaining: 0,
+            deadline: None,
+        };
+        let expired = CallBudget {
+            remaining: MAX_LOG_INGEST_CALLS,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("a past deadline"),
+            ),
+        };
+
+        assert!(calls.exhausted());
+        assert!(bytes.exhausted());
+        assert!(expired.exhausted());
+        assert!(!CallBudget::per_refresh().exhausted());
+    }
+
+    // The base already supports manual budget sharing in this helper; the
+    // exhausted assertion fails to compile there because exhausted() is new.
+    #[test]
+    fn refresh_budget_is_shared_across_two_worktrees() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let provider = FakeCi::new(&[])
+            .with_detail("run-a", "sha-a")
+            .with_detail("run-b", "sha-b");
+        let first_runs = [ci_run("run-a", "sha-a")];
+        let second_runs = [ci_run("run-b", "sha-b")];
+        let mut budget = CallBudget {
+            remaining: 3,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: None,
+        };
+
+        ingest_shared(&first, &provider, &first_runs, &mut budget, 70_000);
+        ingest_shared(&second, &provider, &second_runs, &mut budget, 70_001);
+
+        assert_eq!(
+            provider.detail_calls.load(Ordering::Relaxed)
+                + provider.log_calls.lock().expect("calls").len(),
+            3
+        );
+        assert!(budget.exhausted());
+    }
+
+    fn ingest_shared(
+        temp: &tempfile::TempDir,
+        client: &FakeCi,
+        runs: &[thegn_core::ci::CiRun],
+        budget: &mut CallBudget,
+        now: i64,
+    ) {
+        let db = thegn_core::db::Db::open_at(&temp.path().join("ci.db")).expect("temp DB");
+        let loc = thegn_core::remote::GitLoc::for_worktree(temp.path());
+        let cfg = thegn_core::config::CiConfig::default();
+        let full = thegn_core::config::Config::default();
+        ingest_failed_logs_with(IngestArgs {
+            host_path: temp.path(),
+            loc: &loc,
+            client,
+            cfg: &cfg,
+            full: &full,
+            db: &db,
+            runs,
+            budget,
+            waker: None,
+            generation: None,
+            now,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
     }
 
     #[test]
