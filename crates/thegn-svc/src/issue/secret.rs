@@ -41,8 +41,10 @@ mod tests {
 
     #[test]
     fn file_ref_reads_and_trims() {
-        let f = std::env::temp_dir().join(format!("tg-issue-token-{}.tok", std::process::id()));
+        let temp = tempfile::tempdir().unwrap();
+        let f = temp.path().join("issue-token.tok");
         std::fs::write(&f, "  lin_file\n").unwrap();
+        thegn_core::fsperm::restrict_to_owner(&f).unwrap();
         assert_eq!(
             resolve_account_token(&format!("file:{}", f.display()), "linear").as_deref(),
             Some("lin_file")
