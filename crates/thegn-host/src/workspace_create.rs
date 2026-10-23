@@ -512,17 +512,20 @@ fn clone_workspace_repo_with_deadline(
         let parent_path = dest.parent().unwrap_or(std::path::Path::new("."));
         let parent = std::fs::canonicalize(parent_path)
             .with_context(|| format!("canonicalize workspace parent {}", parent_path.display()))?;
-        parent_pin = Some(
-            thegn_core::fsperm::open_rooted_dir(&parent)
-                .with_context(|| format!("pin workspace parent {}", parent.display()))?,
-        );
-        let pin = parent_pin.as_ref().expect("workspace parent was pinned");
+        let pin = &*parent_pin.insert(thegn_core::fsperm::open_rooted_dir(&parent).with_context(
+            || {
+                format!(
+                    "pin workspace parent {} (the parent directory must be owned by you)",
+                    parent.display()
+                )
+            },
+        )?);
         let dest_name = dest
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("workspace"))
-            .to_string_lossy()
-            .into_owned();
-        let name = dest_name.as_str();
+            .to_str()
+            .context("workspace destination name must be valid UTF-8")?;
+        let name = dest_name;
         let reclaimed = reclaim_stale_clone_staging(
             &parent,
             name,
@@ -2409,6 +2412,37 @@ Receiving objects: 100% (10/10)\rdone.\n";
         assert!(result.is_err());
         assert_eq!(std::fs::read(dest.join("keep")).unwrap(), b"existing");
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn staged_clone_rejects_a_non_utf8_destination_name() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        // SAFETY: the runtime guard above ensures these bytes use Unix OsStr encoding.
+        let name = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(b"\xff") };
+        let dest = temp.path().join(name);
+
+        let result = clone_workspace_repo_with_deadline(
+            "unused-source",
+            &dest,
+            43,
+            None,
+            CloneLimits {
+                total: Duration::from_secs(30),
+                connect: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+            || false,
+            |_| {},
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("destination name must be valid UTF-8")
+        ));
+        assert_no_clone_staging(temp.path());
     }
 
     #[test]
