@@ -1576,7 +1576,7 @@ pub fn resolve_environment(
             let unresolved = name != "default";
             if unresolved {
                 crate::config::config_warn(&format!(
-                    "execution environment {name:?} is not defined under [env.{name}]; using the default"
+                    "execution environment {name:?} is not defined under [env.{name}] or is dev-channel only; using the default"
                 ));
             }
             let data = crate::config::data_mode_from_remote(base.remote.mode);

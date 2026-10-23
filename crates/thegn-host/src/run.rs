@@ -1044,7 +1044,10 @@ pub async fn main(
                         continue;
                     };
                     let new_cfg_res = update.map(|admitted| {
-                        let mut c = admitted.config().clone();
+                        let mut c = crate::channel_state::runtime_config(
+                            admitted.config().clone(),
+                            crate::channel_state::current(),
+                        );
                         crate::e2e_freeze::apply_to_config(&mut c);
                         c
                     });
