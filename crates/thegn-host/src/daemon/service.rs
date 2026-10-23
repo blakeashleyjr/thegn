@@ -1846,7 +1846,7 @@ impl ControlApi for DaemonService {
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
-            .map_err(ControlError::Internal)
+            .map_err(merge_queue_control_error)
         })
     }
 
@@ -1862,7 +1862,7 @@ impl ControlApi for DaemonService {
             })
             .await
             .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
-            .map_err(ControlError::Internal)
+            .map_err(merge_queue_control_error)
         })
     }
 
@@ -3133,6 +3133,20 @@ impl ControlApi for DaemonService {
             self.shutdown_sessions().await;
             self.shutdown.notify_waiters();
         })
+    }
+}
+
+fn merge_queue_control_error(error: anyhow::Error) -> ControlError {
+    if error
+        .chain()
+        .any(|cause| cause.is::<thegn_core::store::MergeClaimActive>())
+        || error
+            .downcast_ref::<crate::merge_ops::ClearKeptClaimed>()
+            .is_some()
+    {
+        ControlError::Conflict(format!("{error:#}"))
+    } else {
+        ControlError::Internal(error)
     }
 }
 
@@ -7363,5 +7377,29 @@ mod identity_env_tests {
         assert!(out.iter().all(|(key, _)| {
             key != thegn_core::pipeline_launch_digest::STAGE_CONFIG_DIGEST_ENV
         }));
+    }
+}
+
+#[cfg(test)]
+mod merge_claim_conflict_tests {
+    use super::*;
+    use thegn_svc::control::ControlErrorCode;
+
+    #[test]
+    fn claimed_refusal_is_a_conflict() {
+        let claim =
+            merge_queue_control_error(anyhow::Error::new(thegn_core::store::MergeClaimActive));
+        assert!(matches!(&claim, ControlError::Conflict(_)));
+        assert_eq!(claim.code(), ControlErrorCode::Conflict);
+
+        let kept =
+            merge_queue_control_error(anyhow::Error::new(crate::merge_ops::ClearKeptClaimed {
+                removed: 1,
+                kept: vec!["/r/a".into()],
+            }));
+        assert!(matches!(&kept, ControlError::Conflict(_)));
+
+        let internal = merge_queue_control_error(anyhow::anyhow!("x"));
+        assert!(matches!(&internal, ControlError::Internal(_)));
     }
 }
