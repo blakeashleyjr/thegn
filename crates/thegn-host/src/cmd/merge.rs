@@ -58,6 +58,9 @@ pub enum Action {
         /// Collect every merged worktree now, ignoring the remaining grace period.
         #[arg(long)]
         force: bool,
+        /// Emit a JSON report instead of the human log.
+        #[arg(long)]
+        json: bool,
     },
     /// Process the queue one branch at a time (the agent autopilot).
     Drain {
@@ -155,7 +158,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         }
         Action::Rm { target } => rm(cfg, target.get()),
         Action::Clear => clear(cfg),
-        Action::Sweep { force } => sweep(cfg, force),
+        Action::Sweep { force, json } => sweep(cfg, force, json),
         Action::Drain { all, json } => drain(cfg, all, json),
         Action::Land { target } => land(cfg, target.get()),
         Action::Retry { target } => retry(target.get()),
@@ -770,14 +773,23 @@ fn clear(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// `merge sweep [--force]` — collect merged worktrees past their grace period.
-fn sweep(cfg: &Config, force: bool) -> Result<()> {
+/// `merge sweep [--force] [--json]` — collect merged worktrees past their grace period.
+fn sweep(cfg: &Config, force: bool, json: bool) -> Result<()> {
     let root = repo_root()?;
     let mq = cfg.repo_merge_queue(&root);
     // Say why nothing happened rather than printing a bare zero: under any other
     // `on_landed` there is no grace period for a sweep to end, and a silent no-op
     // reads as "there was nothing merged", which is a different fact.
     if mq.on_landed != thegn_core::config::OnLanded::Expire {
+        if json {
+            let mut doc =
+                crate::merge_sweep::sweep_json(&crate::merge_sweep::SweepReport::default());
+            doc["skipped"] = serde_json::json!({
+                "reason": "on_landed",
+                "on_landed": mq.on_landed.as_str(),
+            });
+            return super::emit_json(&doc);
+        }
         outln!(
             "Nothing to sweep: [merge_queue] on_landed = \"{}\", so merged worktrees are not held for a grace period.",
             mq.on_landed.as_str()
@@ -785,67 +797,71 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
         return Ok(());
     }
     let report = crate::merge_sweep::sweep(cfg, &root, force);
-    use crate::merge_sweep::safe_display;
-    for b in &report.collected {
-        let discarded_build = report
-            .discarded_build_state
-            .iter()
-            .any(|discarded| discarded == b);
-        let discarded_tool = report
-            .discarded_tool_state
-            .iter()
-            .any(|discarded| discarded == b);
-        let reason = match (discarded_build, discarded_tool) {
-            (true, true) => " (discarded build and seeded tool state)",
-            (true, false) => " (discarded build state)",
-            (false, true) => " (discarded seeded tool state)",
-            (false, false) => "",
-        };
-        outln!("  ⌫ swept {}{}", safe_display(b), reason);
-    }
-    for (branch, errors) in &report.collected_partial {
-        outln!(
-            "  ⌫ swept {} (incomplete: {})",
-            safe_display(branch),
-            safe_display(&errors.join("; "))
-        );
-    }
-    for branch in &report.held_branches {
-        outln!(
-            "  • worktree previously collected; branch {} and queue evidence retained for explicit cleanup (THE-596)",
-            safe_display(branch)
-        );
-    }
-    for (branch, reason) in &report.informational {
-        outln!(
-            "  • left {} untouched — {}",
-            safe_display(branch),
-            safe_display(reason)
-        );
-    }
-    for b in &report.kept_dirty {
-        outln!("  • kept {} — edited since landing", safe_display(b));
-    }
-    for b in &report.kept_changed {
-        outln!("  • kept {} — changed during cleanup", safe_display(b));
-    }
-    for (branch, reason) in &report.kept {
-        outln!(
-            "  • kept {} — {}",
-            safe_display(branch),
-            safe_display(reason)
-        );
-    }
-    for error in &report.bookkeeping_errors {
-        outln!("  ! cleanup bookkeeping: {}", safe_display(error));
-    }
-    if report.is_empty() {
-        outln!("Nothing to sweep.");
+    if json {
+        super::emit_json(&crate::merge_sweep::sweep_json(&report))?;
     } else {
-        outln!(
-            "Swept {} merged worktree(s).",
-            report.collected.len() + report.collected_partial.len()
-        );
+        use crate::merge_sweep::safe_display;
+        for b in &report.collected {
+            let discarded_build = report
+                .discarded_build_state
+                .iter()
+                .any(|discarded| discarded == b);
+            let discarded_tool = report
+                .discarded_tool_state
+                .iter()
+                .any(|discarded| discarded == b);
+            let reason = match (discarded_build, discarded_tool) {
+                (true, true) => " (discarded build and seeded tool state)",
+                (true, false) => " (discarded build state)",
+                (false, true) => " (discarded seeded tool state)",
+                (false, false) => "",
+            };
+            outln!("  ⌫ swept {}{}", safe_display(b), reason);
+        }
+        for (branch, errors) in &report.collected_partial {
+            outln!(
+                "  ⌫ swept {} (incomplete: {})",
+                safe_display(branch),
+                safe_display(&errors.join("; "))
+            );
+        }
+        for branch in &report.held_branches {
+            outln!(
+                "  • worktree previously collected; branch {} and queue evidence retained for explicit cleanup (THE-596)",
+                safe_display(branch)
+            );
+        }
+        for (branch, reason) in &report.informational {
+            outln!(
+                "  • left {} untouched — {}",
+                safe_display(branch),
+                safe_display(reason)
+            );
+        }
+        for b in &report.kept_dirty {
+            outln!("  • kept {} — edited since landing", safe_display(b));
+        }
+        for b in &report.kept_changed {
+            outln!("  • kept {} — changed during cleanup", safe_display(b));
+        }
+        for kept in &report.kept {
+            outln!(
+                "  • kept {} — {}",
+                safe_display(&kept.branch),
+                safe_display(&kept.reason)
+            );
+        }
+        for error in &report.bookkeeping_errors {
+            outln!("  ! cleanup bookkeeping: {}", safe_display(error));
+        }
+        if report.is_empty() {
+            outln!("Nothing to sweep.");
+        } else {
+            outln!(
+                "Swept {} merged worktree(s).",
+                report.collected.len() + report.collected_partial.len()
+            );
+        }
     }
     if report.is_incomplete() {
         anyhow::bail!(
