@@ -201,6 +201,8 @@ global caches, transports, git files/objects, branches, and worktree disk
 locations are not moved. Thegn never reads or copies credentials, tokens,
 identities, accounts, pairings, or profile configuration; content history
 crosses only with `--include-history`.
+Pane working directories outside the moved worktree are dropped in both modes;
+those panes start in the worktree root.
 
 The target transaction commits first and is read back using a sanitized
 fingerprint. Only after confirmation are the selected source rows deleted;
