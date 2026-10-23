@@ -121,6 +121,10 @@ While a PR agent's lease is live, other refresh passes skip that PR entirely: no
 If thegn cannot confirm a running PR agent's lease before it expires, it stops
 the agent and reports that the next refresh re-evaluates the row.
 CI autofix reports the same lost-lease condition when it stops its PR agent.
+After a PR-queue or CI-autofix agent returns, thegn re-reads the PR and checks
+its author, forge account, repository and head before recording a push or
+updating the row. If any check changes or cannot be verified, the row is held
+as `needs_human`.
 
 ## Review comment tasks
 
