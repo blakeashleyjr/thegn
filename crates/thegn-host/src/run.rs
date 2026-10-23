@@ -15154,10 +15154,21 @@ async fn event_loop<T: Terminal>(
         // update the supervisor, and re-sync the model so the badge + Share
         // panel repaint (a chrome change ⇒ Full frame).
         while let Ok(ev) = share_rx.try_recv() {
+            let stopping_generation = match &ev {
+                crate::share::ShareEvent::Down {
+                    worktree,
+                    port,
+                    generation,
+                } => share_supervisor.is_stopping(worktree, *port, *generation),
+                _ => false,
+            };
             if share_supervisor.on_event(ev.clone()) {
                 // Surface an accepted failure where the user is looking.
                 if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
                     model.status = format!("Share :{port} failed: {error}");
+                }
+                if stopping_generation && let crate::share::ShareEvent::Down { port, .. } = &ev {
+                    model.status = format!("Stopped share :{port}");
                 }
                 let replaced_generation_is_live = match &ev {
                     crate::share::ShareEvent::Down {
@@ -23531,8 +23542,6 @@ async fn event_loop<T: Terminal>(
                             match target {
                                 Some((wt, port)) => {
                                     let stopped = share_supervisor.stop(&wt, Some(port));
-                                    let did_stop =
-                                        !stopped.removed.is_empty() || !stopped.pending.is_empty();
                                     crate::handlers::host::queue_stopped_share_deletes(
                                         wt.clone(),
                                         stopped.removed,
@@ -23542,16 +23551,7 @@ async fn event_loop<T: Terminal>(
                                         stopped.failed.clone(),
                                     );
                                     model.shares = current_share_views(&share_supervisor, &session);
-                                    model.status = if let Some(failure) = stopped.failed.first() {
-                                        format!(
-                                            "Share :{port} could not be stopped: {}; press x to retry",
-                                            failure.error
-                                        )
-                                    } else if !did_stop {
-                                        format!("Share :{port} was already down")
-                                    } else {
-                                        format!("Stopped share :{port}")
-                                    };
+                                    model.status = crate::share::stop_status(&stopped, Some(port));
                                 }
                                 None => model.status = "No share selected".into(),
                             }
