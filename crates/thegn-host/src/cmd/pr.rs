@@ -569,7 +569,7 @@ fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReviewedPr, merge_outcome_text, merge_reviewed_head, mutation_loc, review_reviewed_head,
+        ReviewedPr, merge_outcome_text, merge_reviewed_head, review_reviewed_head,
         target_worktree_with,
     };
     use std::path::PathBuf;
