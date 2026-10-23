@@ -315,14 +315,10 @@ pub(crate) fn drive_queue(
                     describe(&e)
                 );
                 tracing::warn!(target: "thegn::prq", "{msg}");
-                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                let _ = db.update_pr_status(
-                    &item.key,
-                    &current_status(db, &item.key),
-                    None,
-                    Some(&msg),
-                    None,
-                );
+                // best-effort: cache write: the note is a cache; the status column is never written on a failed fetch
+                if let Err(error) = db.update_pr_detail(&item.key, &msg) {
+                    tracing::debug!(target: "thegn::prq", %error, "could not persist forge fetch retry note");
+                }
                 out.warnings.push(msg);
                 continue;
             }
@@ -2851,6 +2847,65 @@ mod tests {
             "never merges what it could not fetch: {:?}",
             forge.calls()
         );
+    }
+
+    #[test]
+    fn fetch_failure_never_writes_status() {
+        let (dir, db) = temp_db("prq-hold");
+        let saved = saved_bound_item(
+            &dir,
+            &db,
+            PrItem {
+                key: String::new(),
+                number: 8754,
+                pr_url: Some("https://github.com/me/repo/pull/8754".into()),
+                ..item()
+            },
+        );
+        db.update_pr_status(
+            &saved.key,
+            PrqStatus::NeedsHuman.as_str(),
+            Some("ci"),
+            Some("held by a human"),
+            None,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(dir.path().join("prq-hold.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE status_writes(n INTEGER);
+             CREATE TRIGGER count_status_writes AFTER UPDATE OF status ON pr_queue
+             BEGIN INSERT INTO status_writes VALUES (1); END;",
+        )
+        .unwrap();
+
+        drive_queue(
+            &cfg(),
+            &Config::default(),
+            &FakeForge::new(None),
+            Path::new("/repo"),
+            &db,
+            vec![saved.clone()],
+            |_| {},
+        );
+
+        let status_writes = conn
+            .query_row("SELECT COUNT(*) FROM status_writes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(
+            status_writes, 0,
+            "fetch failure must not issue UPDATE OF status"
+        );
+        let row = db
+            .list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == saved.key)
+            .unwrap();
+        assert_eq!(row.status, PrqStatus::NeedsHuman.as_str());
+        assert!(row.detail.as_deref().unwrap().starts_with("PR #8754: "));
     }
 
     #[test]
