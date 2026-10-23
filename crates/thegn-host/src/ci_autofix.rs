@@ -628,8 +628,8 @@ fn head_is_current(
         && !forge.id().is_empty()
 }
 
-/// The PR-queue detail recorded when a CI autofix run ends. An agent that never started is an
-/// infrastructure failure, not a failed exit, and says why.
+/// The PR-queue detail recorded when a CI autofix run ends. A not-started run is held earlier
+/// through `finish_not_started` and never reaches this function.
 fn autofix_finish_detail(verdict: &crate::agent_run::AgentRunVerdict) -> String {
     let outcome = if verdict.exited_zero() {
         "exit ok".to_string()
