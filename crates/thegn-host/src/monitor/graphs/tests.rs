@@ -684,6 +684,6 @@ fn unresolved_stacked_background_inherits_instead_of_using_dim() {
     );
     assert_eq!(
         style.fg,
-        chrome::theme_color(&palette.series(SeriesRole::MemAnon))
+        chrome::theme_color(palette.series(SeriesRole::MemAnon))
     );
 }
