@@ -113,7 +113,7 @@ fn managed_keypair(
         return crate::agent_ssh::existing_managed_ssh_keypair(&record.key_path);
     }
     if managed_key_scope() == thegn_core::config::ManagedKeyScope::PerAccount
-        && thegn_svc::vps::registry::read(name)
+        && thegn_svc::vps::registry::read_checked(name)?
             .is_some_and(|record| record.provider.eq_ignore_ascii_case(provider))
     {
         // VPS/Fly instances created before the custody ledger were authorized
