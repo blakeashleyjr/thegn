@@ -9909,7 +9909,6 @@ async fn event_loop<T: Terminal>(
                                     return;
                                 }
                             };
-                            crate::lifecycle::clear_pool_ledger_open_failure(&wt);
                             // (repo_root, repo, env) via the worktree's EFFECTIVE
                             // env — see `lifecycle::pool_context` for why never
                             // the default.
@@ -9919,6 +9918,19 @@ async fn event_loop<T: Terminal>(
                                 Ok(context) => context,
                                 Err(error) => {
                                     tracing::warn!(target: "thegn::lifecycle", worktree = %wt, error = %format!("{error:#}"), "warm pool maintainer skipped");
+                                    if let Some(message) =
+                                        crate::lifecycle::pool_selection_read_failed(&wt, &error)
+                                        && let Err(send_error) = tx.send(RefreshKind::Toast {
+                                            message,
+                                            priority: thegn_core::notification::Priority::Alert,
+                                        })
+                                    {
+                                        tracing::debug!(
+                                            target: "thegn::lifecycle",
+                                            %send_error,
+                                            "pool halt toast receiver is gone"
+                                        );
+                                    }
                                     *crate::lifecycle::pool_chip()
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner()) = Some((wt, None));
@@ -9926,6 +9938,7 @@ async fn event_loop<T: Terminal>(
                                     return;
                                 }
                             };
+                            crate::lifecycle::clear_pool_pre_reconcile_failure(&wt);
                             // Hide the display-only chip on a target read error; reconcile_pool
                             // below halts and warns on that same error before changing the pool.
                             let target = crate::lifecycle::effective_pool_target(
@@ -9963,7 +9976,7 @@ async fn event_loop<T: Terminal>(
                             (target > 0).then_some((ready, target))
                         }
                         Ok(_) => {
-                            crate::lifecycle::clear_pool_ledger_open_failure(&wt);
+                            crate::lifecycle::clear_pool_pre_reconcile_failure(&wt);
                             None
                         }
                     };

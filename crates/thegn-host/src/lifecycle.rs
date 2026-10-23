@@ -267,13 +267,6 @@ pub(crate) fn idle_secs(worktree: &str) -> Option<u64> {
         .map(|t| t.elapsed().as_secs())
 }
 
-/// Resolve the `(repo_root, repo, env_name)` triple the warm pool operates on
-/// for the active worktree — using the worktree's EFFECTIVE env (its DB
-/// selection, falling back through the normal repo/global layering via
-/// `resolve_env`), never the bare ambient default: reconciling under the default
-/// while the worktree runs a picked env warms — and claims! — spares for the
-/// wrong env (the phantom-spare / bare-sprite-shell incident). A failed selection
-/// read is an error; no caller may fall back to the default env.
 /// The sidebar warm-pool chip's latest value, computed OFF-loop and mirrored
 /// into the model by the event loop: `(worktree it was computed for,
 /// Some((ready, target)) when a pool applies)`. The worktree key lets the
@@ -286,6 +279,13 @@ pub(crate) fn pool_chip() -> &'static Mutex<Option<(String, Option<(usize, usize
     CHIP.get_or_init(|| Mutex::new(None))
 }
 
+/// Resolve the `(repo_root, repo, env_name)` triple the warm pool operates on
+/// for the active worktree — using the worktree's EFFECTIVE env (its DB
+/// selection, falling back through the normal repo/global layering via
+/// `resolve_env`), never the bare ambient default: reconciling under the default
+/// while the worktree runs a picked env warms — and claims! — spares for the
+/// wrong env (the phantom-spare / bare-sprite-shell incident). A failed selection
+/// read is an error; no caller may fall back to the default env.
 pub fn pool_context(
     db: &thegn_core::db::Db,
     cfg: &Config,
@@ -483,9 +483,18 @@ pub(crate) fn pool_ledger_open_failed(worktree: &str) -> Option<String> {
     )
 }
 
-/// Clear the fallback DB-failure latch once the maintainer can resolve the
-/// worktree's normal repo/env key again.
-pub(crate) fn clear_pool_ledger_open_failure(worktree: &str) {
+/// Report a selection lookup failure from the maintainer tick before it has a
+/// repo/env pair to reconcile. The worktree is the stable fallback key.
+pub(crate) fn pool_selection_read_failed(worktree: &str, error: &anyhow::Error) -> Option<String> {
+    let message = format!(
+        "warm pool: cannot read environment selection for {worktree}; no pool changes made ({error:#})"
+    );
+    halt_toast(worktree, "", &PoolReconcile::Halted(PoolHalt { message }))
+}
+
+/// Clear the fallback pre-reconcile failure latch once the maintainer can
+/// resolve the worktree's normal repo/env key again.
+pub(crate) fn clear_pool_pre_reconcile_failure(worktree: &str) {
     halt_toast(worktree, "", &PoolReconcile::Ran);
 }
 
@@ -1475,7 +1484,7 @@ mod tests {
         );
         assert_eq!(pool_ledger_open_failed(worktree), None);
 
-        clear_pool_ledger_open_failure(worktree);
+        clear_pool_pre_reconcile_failure(worktree);
 
         assert_eq!(
             pool_ledger_open_failed(worktree),
@@ -1502,6 +1511,7 @@ mod tests {
 
     #[test]
     fn pool_env_uses_the_default_only_when_nothing_is_selected() {
+        let _state = crate::testenv::IsolatedState::new();
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
         let loc = GitLoc::Local(dir.path().into());
@@ -1512,6 +1522,22 @@ mod tests {
             pool_env(&cfg, dir.path(), &loc, "/wt", Ok(None)).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn pool_selection_read_failure_toasts_once_until_recovery() {
+        let worktree = "/selection-read-failure-test";
+        let error = anyhow::anyhow!("database is locked");
+        let first = pool_selection_read_failed(worktree, &error);
+        assert!(
+            first
+                .as_deref()
+                .is_some_and(|message| message.contains("database is locked"))
+        );
+        assert_eq!(pool_selection_read_failed(worktree, &error), None);
+        clear_pool_pre_reconcile_failure(worktree);
+        assert!(pool_selection_read_failed(worktree, &error).is_some());
+        clear_pool_pre_reconcile_failure(worktree);
     }
 
     #[test]
