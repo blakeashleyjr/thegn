@@ -10,6 +10,9 @@ use std::time::Duration;
 /// Maximum normalized display-label characters retained for media metadata.
 /// Host-panel collection row limits are defined alongside this display cap.
 pub const MAX_LABEL_CHARS: usize = 256;
+/// Maximum combining marks kept after one base character in a display label: the Unicode
+/// Stream-Safe Text Format limit (UAX #15). Further marks in the same run are dropped.
+pub const MAX_COMBINING_RUN: usize = 30;
 /// Maximum UTF-8 bytes retained for each provider supplied display field.
 /// Fields are cut only at character boundaries by the canonical ingress
 /// admission step.
@@ -207,7 +210,8 @@ fn percent_decode(value: &str) -> Option<String> {
 }
 
 /// Normalize provider-controlled text before it is displayed in terminal UI.
-/// C0/C1 controls become spaces; bidi and zero-width formatting controls drop.
+/// C0/C1 controls and U+2028/U+2029 line separators become spaces; bidi and invisible format
+/// characters drop. At most `MAX_COMBINING_RUN` combining marks are kept per base character.
 /// Output is capped at `MAX_LABEL_CHARS` normalized characters, with `...` when visible text is
 /// omitted.
 pub fn display_text(value: &str) -> String {
@@ -216,24 +220,66 @@ pub fn display_text(value: &str) -> String {
 
 fn normalize_display_char(ch: char) -> Option<char> {
     match ch {
-        '\u{061c}'
+        '\u{00ad}'
+        | '\u{034f}'
+        | '\u{061c}'
+        | '\u{180e}'
         | '\u{200e}'
         | '\u{200f}'
         | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}'
         | '\u{2066}'..='\u{2069}'
+        | '\u{206a}'..='\u{206f}'
         | '\u{200b}'..='\u{200d}'
         | '\u{feff}' => None,
+        '\u{2028}' | '\u{2029}' => Some(' '),
         ch if ch.is_control() => Some(' '),
         ch => Some(ch),
+    }
+}
+
+/// Match the generic combining-diacritic blocks; not the full Mn category, which needs Unicode
+/// data this leaf crate does not carry.
+fn is_combining_mark(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0300}'..='\u{036f}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe20}'..='\u{fe2f}'
+    )
+}
+
+#[derive(Default)]
+struct DisplayFilter {
+    combining_run: usize,
+}
+
+impl DisplayFilter {
+    fn admit(&mut self, ch: char) -> Option<char> {
+        let out = normalize_display_char(ch)?;
+        let is_mark = is_combining_mark(out);
+        if is_mark && self.combining_run >= MAX_COMBINING_RUN {
+            return None;
+        }
+        if is_mark {
+            self.combining_run += 1;
+        } else {
+            self.combining_run = 0;
+        }
+        Some(out)
     }
 }
 
 fn display_text_parts(parts: &[&str]) -> String {
     let mut chars = parts.iter().flat_map(|part| part.chars());
     let mut output = String::with_capacity(MAX_LABEL_CHARS + 3);
+    let mut filter = DisplayFilter::default();
     let mut count = 0;
     for ch in chars.by_ref() {
-        let normalized = normalize_display_char(ch);
+        let normalized = filter.admit(ch);
         if let Some(normalized) = normalized {
             output.push(normalized);
             count += 1;
@@ -242,7 +288,7 @@ fn display_text_parts(parts: &[&str]) -> String {
             }
         }
     }
-    if count == MAX_LABEL_CHARS && chars.any(|ch| normalize_display_char(ch).is_some()) {
+    if count == MAX_LABEL_CHARS && chars.any(|ch| filter.admit(ch).is_some()) {
         output.push_str("...");
     }
     output
@@ -625,6 +671,50 @@ mod tests {
     fn display_text_does_not_mark_dropped_tail_as_truncated() {
         let value = format!("{}\u{200b}", "x".repeat(MAX_LABEL_CHARS));
         assert_eq!(display_text(&value), "x".repeat(MAX_LABEL_CHARS));
+    }
+
+    #[test]
+    fn display_text_drops_invisible_format_characters() {
+        assert_eq!(
+            display_text("a\u{ad}b\u{2060}c\u{180e}d\u{34f}e\u{2063}f\u{206a}g"),
+            "abcdefg"
+        );
+        assert_eq!(display_text("a\u{2028}b\u{2029}c"), "a b c");
+    }
+
+    #[test]
+    fn display_text_caps_combining_mark_runs() {
+        let zalgo = format!("e{}x", "\u{301}".repeat(200));
+        let normalized = display_text(&zalgo);
+        assert_eq!(
+            normalized,
+            format!("e{}x", "\u{301}".repeat(MAX_COMBINING_RUN))
+        );
+        assert_eq!(normalized.chars().count(), MAX_COMBINING_RUN + 2);
+        assert!(!normalized.ends_with("..."));
+        assert_eq!(MAX_COMBINING_RUN, 30);
+    }
+
+    #[test]
+    fn display_text_combining_run_resets_at_each_base() {
+        let marks = "\u{301}".repeat(MAX_COMBINING_RUN);
+        let separate_runs = format!("a{marks}b{marks}");
+        // Positive control: each base starts a new combining run; this passes without the fix.
+        assert_eq!(display_text(&separate_runs), separate_runs);
+
+        let joined_marks = format!("a{}\u{200d}{}", marks, "\u{301}");
+        assert_eq!(display_text(&joined_marks), format!("a{marks}"));
+    }
+
+    #[test]
+    fn display_text_does_not_mark_capped_combining_tail_as_truncated() {
+        let head = format!(
+            "{}e{}",
+            "x".repeat(MAX_LABEL_CHARS - MAX_COMBINING_RUN - 1),
+            "\u{301}".repeat(MAX_COMBINING_RUN)
+        );
+        let value = format!("{head}{}", "\u{301}".repeat(5));
+        assert_eq!(display_text(&value), head);
     }
 
     #[test]
