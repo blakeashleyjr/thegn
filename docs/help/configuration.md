@@ -109,6 +109,10 @@ The file is watched: edits apply live, no restart.
   A config reload restarts only servers whose registry entry changed; turning
   LSP off retires every server, while unchanged servers stay running. A changed
   server is not held back by an earlier unavailable or backoff result.
+  If `[sandbox.limits]` sets a CPU or memory cap (`cpu_total` / `memory_total`)
+  but the systemd scope is unavailable, language servers still start outside
+  the thegn slice. thegn logs one warning per run that the cap could not be
+  applied.
 - `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
   persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
   and reuses the existing trusted PR-queue agent policy.

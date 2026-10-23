@@ -661,6 +661,10 @@ the first and counting the rest. An unchanged set does not repeat it.
 A VPS or Fly `max_instances` cap
 counts sandboxes for the same provider account; records without an account or
 that cannot be read count against every account.
+On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
+(Hetzner and DigitalOcean). Providers without a lifetime reaper, such as
+machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
+is set. Destroy those instances yourself or set the value to `0`.
 
 On the dev channel, the Fly backend strictly parses an app's machine list and
 rejects malformed lists or duplicate machine IDs. If more than one live
