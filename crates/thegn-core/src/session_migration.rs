@@ -11,7 +11,7 @@ use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// A worktree row explicitly allowlisted for migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -854,6 +854,9 @@ fn scoped_pane_cwds(pane_cwds: &str, worktree_path: &str) -> String {
             !worktree_path.is_empty()
                 && Path::new(cwd).is_absolute()
                 && Path::new(cwd).starts_with(worktree)
+                && !Path::new(cwd)
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
         })
         .collect();
     serde_json::to_string(&kept).unwrap_or_default()
@@ -1661,7 +1664,7 @@ mod tests {
     fn pane_cwds_outside_the_worktree_are_dropped_on_import() {
         let mut source = bundle();
         source.groups[0].tabs[0].pane_cwds =
-            r#"{"1":"/wt/api/src","2":"/home/u/.config/work","3":"/wt/api-v2","4":"/wt/api"}"#
+            r#"{"1":"/wt/api/src","2":"/home/u/.config/work","3":"/wt/api-v2","4":"/wt/api","5":"/wt/api/../../home/u"}"#
                 .into();
 
         for history in [HistoryPolicy::Include, HistoryPolicy::Drop] {
