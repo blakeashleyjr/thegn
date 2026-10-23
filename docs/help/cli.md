@@ -73,6 +73,11 @@ changes.
 Keyring operations run on one worker. While an earlier keyring call is stuck
 past its timeout, further keyring operations fail at once without starting,
 and nothing is written to a file instead.
+
+The file secret store refuses to read token files accessible to other users or
+with extra hard links. Its message names the file and tells you to run
+`chmod 600` on it, or remove the extra link and store the secret again.
+
 Remote calendar account tokens appear in `thegn secret list` and `audit` as
 `calendar.accounts[<name>].token`. `thegn secret migrate` moves a literal token
 to a 0600 file reference and rewrites only that account's token; an account

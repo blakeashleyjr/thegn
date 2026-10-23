@@ -68,6 +68,11 @@ the other verbs take:
 | `thegn session fork <id>`                  | start a new daemon session from a live session; `--tab` places it in a new tab  |
 | `thegn session record <id>`                | record its output to a `.cast` file; `--stop` finalizes, `--status` reports     |
 
+Session output replaces terminal control and invisible formatting characters
+in ids, programs, worktree paths, and fork sources with U+FFFD. `--json` escapes
+those characters as `\uXXXX`, preserving parsed values and the layout of clean
+output.
+
 ## Recording a session
 
 `thegn session record <id>` starts a server-side asciicast recording of one
