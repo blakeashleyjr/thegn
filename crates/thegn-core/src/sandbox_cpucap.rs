@@ -825,7 +825,44 @@ fn background_scope_usable() -> bool {
 ///
 /// Callers must be off the event loop — the probe spawns.
 pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
-    wrap_control_argv(argv, false)
+    wrap_background_argv_reporting(argv).0
+}
+
+/// How a background/control argv was wrapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundWrap {
+    /// Joined the aggregate slice (scope or nice prefix applied).
+    Wrapped,
+    /// The caller declared the argv already capped.
+    AlreadyCapped,
+    /// No resource policy was published.
+    NoPolicy,
+    /// A policy is published but `systemd-run --user --scope` does not work here.
+    ScopeUnusable,
+}
+
+fn background_wrap_outcome(
+    already_capped: bool,
+    has_policy: bool,
+    wraps_with_scope: bool,
+    scope_usable: bool,
+) -> BackgroundWrap {
+    if already_capped {
+        BackgroundWrap::AlreadyCapped
+    } else if !has_policy {
+        BackgroundWrap::NoPolicy
+    } else if wraps_with_scope && !scope_usable {
+        BackgroundWrap::ScopeUnusable
+    } else {
+        BackgroundWrap::Wrapped
+    }
+}
+
+/// Like [`wrap_background_argv`], and report whether the aggregate cap applied.
+///
+/// Callers must be off the event loop — the scope usability probe can spawn.
+pub fn wrap_background_argv_reporting(argv: Vec<String>) -> (Vec<String>, BackgroundWrap) {
+    wrap_control_argv_reporting(argv, false)
 }
 
 /// Wrap an argv the **control plane** is about to spawn (the pane daemon's
@@ -854,11 +891,21 @@ pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
 ///
 /// Callers must be off the event loop — the probe spawns.
 pub fn wrap_control_argv(argv: Vec<String>, already_capped: bool) -> Vec<String> {
+    wrap_control_argv_reporting(argv, already_capped).0
+}
+
+/// Like [`wrap_control_argv`], and report whether the aggregate cap applied.
+///
+/// Callers must be off the event loop — the scope usability probe can spawn.
+pub fn wrap_control_argv_reporting(
+    argv: Vec<String>,
+    already_capped: bool,
+) -> (Vec<String>, BackgroundWrap) {
     if already_capped {
-        return argv;
+        return (argv, background_wrap_outcome(true, false, false, false));
     }
     let Some(limits) = BACKGROUND_LIMITS.get() else {
-        return argv;
+        return (argv, background_wrap_outcome(false, false, false, false));
     };
     let wrapped = cap_prefix(
         Backend::None,
@@ -869,10 +916,17 @@ pub fn wrap_control_argv(argv: Vec<String>, already_capped: bool) -> Vec<String>
         CapRole::Background,
     );
     // Only the scope path can break the inner command; `nice` cannot.
-    if wrapped.first().map(String::as_str) == Some("systemd-run") && !background_scope_usable() {
-        return argv;
+    let wraps_with_scope = wrapped.first().map(String::as_str) == Some("systemd-run");
+    let scope_usable = if wraps_with_scope {
+        background_scope_usable()
+    } else {
+        false
+    };
+    let outcome = background_wrap_outcome(false, true, wraps_with_scope, scope_usable);
+    if outcome == BackgroundWrap::ScopeUnusable {
+        return (argv, outcome);
     }
-    wrapped
+    (wrapped, outcome)
 }
 
 /// Force the memoized scope probe now, and report whether scopes are usable.
@@ -1689,6 +1743,43 @@ mod tests {
         let argv: Vec<String> = vec!["claude".into(), "-p".into()];
         assert_eq!(wrap_control_argv(argv.clone(), false), argv);
         assert_eq!(wrap_background_argv(argv.clone()), argv);
+    }
+
+    #[test]
+    fn background_wrap_outcome_names_every_case() {
+        assert_eq!(
+            background_wrap_outcome(false, false, false, false),
+            BackgroundWrap::NoPolicy
+        );
+        assert_eq!(
+            background_wrap_outcome(true, false, false, false),
+            BackgroundWrap::AlreadyCapped
+        );
+        assert_eq!(
+            background_wrap_outcome(false, true, true, true),
+            BackgroundWrap::Wrapped
+        );
+        assert_eq!(
+            background_wrap_outcome(false, true, false, false),
+            BackgroundWrap::Wrapped
+        );
+        assert_eq!(
+            background_wrap_outcome(false, true, true, false),
+            BackgroundWrap::ScopeUnusable
+        );
+    }
+
+    #[test]
+    fn reporting_wrap_without_policy_is_unchanged_and_says_so() {
+        let argv = sv(&["claude", "-p"]);
+        assert_eq!(
+            wrap_background_argv_reporting(argv.clone()),
+            (argv.clone(), BackgroundWrap::NoPolicy)
+        );
+        assert_eq!(
+            wrap_control_argv_reporting(argv.clone(), true),
+            (argv, BackgroundWrap::AlreadyCapped)
+        );
     }
 
     fn sv(words: &[&str]) -> Vec<String> {
