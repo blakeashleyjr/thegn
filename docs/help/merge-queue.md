@@ -91,7 +91,7 @@ the reason; use `thegn land` to land that branch outside the queue.
   refuse and name the drain; `thegn merge retry` and `thegn merge land` refuse;
   `thegn merge clear` removes unclaimed rows, names kept claimed rows, and exits
   non-zero; deleting the worktree keeps its row. The control API answers
-  `conflict` for a claimed-row refusal.
+  `conflict` for a local row's claimed-row refusal on add and clear.
 - An unrecognised stored queue status is shown as such and has no land or
   retry key.
 - `thegn land` and `thegn integrate` can finish a land while an active drain
