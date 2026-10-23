@@ -30,16 +30,24 @@ use inbox::PluginInbox;
 
 pub(crate) type SessionGen = u64;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+pub(crate) type HostGen = u64;
+static NEXT_HOST: AtomicU64 = AtomicU64::new(1);
+
+fn next_host_generation() -> HostGen {
+    NEXT_HOST.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone)]
 pub(crate) struct PluginTx {
-    lifecycle: tokio_mpsc::UnboundedSender<PluginMsg>,
+    lifecycle: tokio_mpsc::UnboundedSender<(HostGen, PluginMsg)>,
     inbox: Arc<PluginInbox>,
+    host: HostGen,
 }
 
 pub(crate) struct PluginRx {
-    lifecycle: tokio_mpsc::UnboundedReceiver<PluginMsg>,
+    lifecycle: tokio_mpsc::UnboundedReceiver<(HostGen, PluginMsg)>,
     inbox: Arc<PluginInbox>,
+    current: Option<HostGen>,
 }
 
 pub(crate) fn plugin_channel() -> (PluginTx, PluginRx) {
@@ -49,15 +57,23 @@ pub(crate) fn plugin_channel() -> (PluginTx, PluginRx) {
         PluginTx {
             lifecycle: lifecycle_tx,
             inbox: inbox.clone(),
+            host: 0,
         },
         PluginRx {
             lifecycle: lifecycle_rx,
             inbox,
+            current: None,
         },
     )
 }
 
 impl PluginTx {
+    pub(crate) fn for_host(&self, host: HostGen) -> PluginTx {
+        let mut tx = self.clone();
+        tx.host = host;
+        tx
+    }
+
     pub(crate) fn send(
         &self,
         message: PluginMsg,
@@ -71,12 +87,19 @@ impl PluginTx {
                 self.inbox.push(plugin, session, event);
                 Ok(())
             }
-            message => self.lifecycle.send(message).map_err(Box::new),
+            message => self
+                .lifecycle
+                .send((self.host, message))
+                .map_err(|error| Box::new(tokio_mpsc::error::SendError((error.0).1))),
         }
     }
 }
 
 impl PluginRx {
+    pub(crate) fn bind_host(&mut self, host: HostGen) {
+        self.current = Some(host);
+    }
+
     pub(crate) fn try_recv(&mut self) -> Result<PluginMsg, tokio_mpsc::error::TryRecvError> {
         if let Some((plugin, session, event)) = self.inbox.pop_exit() {
             return Ok(PluginMsg::Event {
@@ -85,26 +108,35 @@ impl PluginRx {
                 event,
             });
         }
-        match self.lifecycle.try_recv() {
-            Ok(message) => Ok(message),
-            Err(tokio_mpsc::error::TryRecvError::Disconnected) => self
-                .inbox
-                .pop()
-                .map(|(plugin, session, event)| PluginMsg::Event {
-                    plugin,
-                    session,
-                    event,
-                })
-                .ok_or(tokio_mpsc::error::TryRecvError::Disconnected),
-            Err(tokio_mpsc::error::TryRecvError::Empty) => self
-                .inbox
-                .pop()
-                .map(|(plugin, session, event)| PluginMsg::Event {
-                    plugin,
-                    session,
-                    event,
-                })
-                .ok_or(tokio_mpsc::error::TryRecvError::Empty),
+        loop {
+            match self.lifecycle.try_recv() {
+                Ok((host, _message)) if self.current.is_some_and(|current| current != host) => {
+                    tracing::debug!(target: "thegn::plugin", host, current = ?self.current, "lifecycle message from a replaced plugin host dropped");
+                }
+                Ok((_, message)) => return Ok(message),
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    return self
+                        .inbox
+                        .pop()
+                        .map(|(plugin, session, event)| PluginMsg::Event {
+                            plugin,
+                            session,
+                            event,
+                        })
+                        .ok_or(tokio_mpsc::error::TryRecvError::Disconnected);
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                    return self
+                        .inbox
+                        .pop()
+                        .map(|(plugin, session, event)| PluginMsg::Event {
+                            plugin,
+                            session,
+                            event,
+                        })
+                        .ok_or(tokio_mpsc::error::TryRecvError::Empty);
+                }
+            }
         }
     }
 
@@ -132,7 +164,7 @@ impl PluginRx {
     #[cfg(test)]
     pub(crate) fn blocking_recv(&mut self) -> Option<PluginMsg> {
         match self.lifecycle.blocking_recv() {
-            Some(message) => Some(message),
+            Some((_, message)) => Some(message),
             None => self
                 .inbox
                 .pop()
@@ -499,6 +531,7 @@ fn admit_unless_stopped<T>(
 /// (or calling [`PluginsHost::shutdown`]) best-effort-deactivates and kills
 /// every resident session.
 pub(crate) struct PluginsHost {
+    generation: HostGen,
     stop: Arc<StopSignal>,
     supervisor: ResidentSupervisor,
     sessions: Sessions,
@@ -522,6 +555,8 @@ pub(crate) fn spawn_plugins_host(
     tx: PluginTx,
     waker: TerminalWaker,
 ) -> PluginsHost {
+    let generation = next_host_generation();
+    let tx = tx.for_host(generation);
     let stop = Arc::new(StopSignal::default());
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
@@ -529,6 +564,7 @@ pub(crate) fn spawn_plugins_host(
     let respawns = Arc::new(RespawnTimers::default());
     let state_anchor = thegn_core::util::xdg_state_home().join("thegn");
     let host = PluginsHost {
+        generation,
         stop: stop.clone(),
         supervisor: supervisor.clone(),
         sessions: sessions.clone(),
@@ -567,6 +603,10 @@ pub(crate) fn spawn_plugins_host(
 }
 
 impl PluginsHost {
+    pub(crate) fn generation(&self) -> HostGen {
+        self.generation
+    }
+
     fn respawn_worker_failed(&self, id: &str, error: &std::io::Error) {
         {
             let mut state = lock(&self.respawns.state);
@@ -600,8 +640,13 @@ impl PluginsHost {
     ) {
         let tx = self.tx.clone();
         let waker = self.waker.clone();
+        let stop = self.stop.clone();
         self.retry_runtime.spawn(async move {
             tokio::time::sleep(delay).await;
+            if stop.is_stopped() {
+                tracing::debug!(target: "thegn::plugin", "delayed restart canceled because plugin host stopped");
+                return;
+            }
             if let Err(send_error) = tx.send(PluginMsg::RetryRespawn { plugin }) {
                 tracing::debug!(target: "thegn::plugin", %send_error, "delayed restart consumer is gone");
             }
@@ -1296,6 +1341,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_generation_receiver_drops_other_hosts_lifecycle() {
+        let (tx, mut rx) = plugin_channel();
+        rx.bind_host(7);
+        tx.for_host(6)
+            .send(PluginMsg::RespawnWorkerStartFailed { plugin: "a".into() })
+            .unwrap();
+        tx.for_host(7)
+            .send(PluginMsg::RespawnWorkerStartFailed { plugin: "b".into() })
+            .unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PluginMsg::RespawnWorkerStartFailed { plugin }) if plugin == "b"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio_mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn host_generation_unbound_receiver_accepts_every_host() {
+        let (tx, mut rx) = plugin_channel();
+        tx.for_host(6)
+            .send(PluginMsg::RespawnWorkerStartFailed { plugin: "a".into() })
+            .unwrap();
+        tx.for_host(7)
+            .send(PluginMsg::RespawnWorkerStartFailed { plugin: "b".into() })
+            .unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PluginMsg::RespawnWorkerStartFailed { plugin }) if plugin == "a"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PluginMsg::RespawnWorkerStartFailed { plugin }) if plugin == "b"
+        ));
+    }
+
+    #[test]
+    fn host_generation_ids_are_unique_and_nonzero() {
+        let first = next_host_generation();
+        let second = next_host_generation();
+
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+    }
+
     fn poll_job(plugin: &str) -> PollJob {
         PollJob {
             plugin: plugin.to_string(),
@@ -1452,6 +1548,7 @@ mod tests {
             crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
+            generation: 0,
             stop: Arc::new(StopSignal::default()),
             supervisor: ResidentSupervisor::new(runtime.handle().clone()),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1519,6 +1616,7 @@ mod tests {
             crate::platform::sound_process::test_support::test_waker();
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
+            generation: 0,
             stop: Arc::new(StopSignal::default()),
             supervisor: ResidentSupervisor::new(runtime.clone()),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1545,6 +1643,42 @@ mod tests {
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert!(matches!(rx.try_recv(), Ok(PluginMsg::RetryRespawn { .. })));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_generation_stopped_retry_task_does_not_send() {
+        let runtime = tokio::runtime::Handle::current();
+        let (waker, _master, _terminal) =
+            crate::platform::sound_process::test_support::test_waker();
+        let (tx, mut rx) = plugin_channel();
+        let host = PluginsHost {
+            generation: 0,
+            stop: Arc::new(StopSignal::default()),
+            supervisor: ResidentSupervisor::new(runtime.clone()),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            disabled: Arc::new(Mutex::new(Default::default())),
+            tx,
+            waker,
+            one_shot_gate: OneShotGate::default(),
+            state_anchor: PathBuf::new(),
+            respawns: Arc::new(RespawnTimers::default()),
+            retry_runtime: runtime,
+        };
+        let mut spec = example_spec();
+        spec.manifest.id = PluginId::new("p");
+        let plugin = LoadedPlugin {
+            spec,
+            dir: None,
+            trusted_native_ignored: false,
+        };
+
+        host.retry_respawn_after_worker_start_failure(plugin, Duration::from_secs(5));
+        tokio::task::yield_now().await;
+        host.stop.stop();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
         assert!(rx.try_recv().is_err());
     }
 
@@ -1809,6 +1943,7 @@ mod tests {
             crate::platform::sound_process::test_support::test_waker();
         let (tx, _rx) = plugin_channel();
         let host = Arc::new(PluginsHost {
+            generation: 0,
             stop: Arc::new(StopSignal::default()),
             supervisor: ResidentSupervisor::new(runtime.handle().clone()),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2125,6 +2260,7 @@ mod tests {
         let supervisor = ResidentSupervisor::new(runtime.handle().clone());
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
+            generation: 0,
             stop: Arc::new(StopSignal::default()),
             supervisor,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2174,6 +2310,7 @@ mod tests {
         let (tx, mut rx) = plugin_channel();
         let gate = OneShotGate::default();
         let host = PluginsHost {
+            generation: 0,
             stop: Arc::new(StopSignal::default()),
             supervisor,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3174,6 +3311,7 @@ mod tests {
             .unwrap();
         let (tx, mut rx) = plugin_channel();
         let host = PluginsHost {
+            generation: 0,
             stop: Arc::new(StopSignal::default()),
             supervisor: ResidentSupervisor::new(runtime.handle().clone()),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
