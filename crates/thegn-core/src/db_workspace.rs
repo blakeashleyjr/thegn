@@ -621,6 +621,14 @@ impl WorkspaceStore for Db {
                 "kept the merge-queue row of a removed worktree: claimed by an active drain"
             );
         }
+        // Audit events follow their queue row: a row kept above (claimed by a
+        // drain, or a retained cleanup hold) keeps its events; otherwise the
+        // path's events go with the worktree.
+        self.conn().execute(
+            "DELETE FROM merge_queue_events WHERE worktree=?1 \
+             AND NOT EXISTS (SELECT 1 FROM merge_queue WHERE worktree=?1)",
+            params![wt],
+        )?;
         Ok(())
     }
 
@@ -660,10 +668,28 @@ impl WorkspaceStore for Db {
         new_tab: &str,
         new_branch: &str,
     ) -> Result<()> {
-        self.conn().execute(
+        let base_conn = self.conn();
+        // Keep standalone rekeys atomic, while joining a caller's transaction
+        // when this method is used during transactional cleanup.
+        let tx = if base_conn.is_autocommit() {
+            Some(base_conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let conn = tx.as_deref().unwrap_or(base_conn);
+        conn.execute(
             "UPDATE worktrees SET worktree=?2, tab_name=?3, branch=?4 WHERE worktree=?1",
             params![old_path, new_path, new_tab, new_branch],
         )?;
+        // Audit events follow their queue row, so keep them while the row is keyed at the old path.
+        conn.execute(
+            "DELETE FROM merge_queue_events WHERE worktree=?1 \
+             AND NOT EXISTS (SELECT 1 FROM merge_queue WHERE worktree=?1)",
+            params![old_path],
+        )?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(())
     }
 

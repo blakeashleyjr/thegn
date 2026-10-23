@@ -103,6 +103,7 @@ pub struct MaintenanceReport {
     pub pruned_removed_notifications: usize,
     pub pruned_issue_links: usize,
     pub pruned_dispatches: usize,
+    pub pruned_merge_events: usize,
     pub reclaimed_pages: u64,
     pub conversion: Option<ConvertOutcome>,
 }
@@ -145,6 +146,41 @@ impl Db {
             tx.commit()?;
         }
         Ok((notifications, issue_links))
+    }
+
+    /// Retire merge-queue audit events of removed roots that no queue row still names.
+    pub(crate) fn prune_removed_merge_events(&self, max_keys: usize) -> Result<usize> {
+        if max_keys == 0 {
+            return Ok(0);
+        }
+        let conn = self.conn();
+        let keys = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT e.worktree FROM merge_queue_events e \
+                 WHERE e.worktree != '' \
+                   AND NOT EXISTS (SELECT 1 FROM merge_queue q WHERE q.worktree=e.worktree) \
+                 ORDER BY e.worktree",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let registered = registered_roots(conn)?;
+        let removed: Vec<String> = keys
+            .into_iter()
+            .filter(|key| is_removed_root(&registered, key))
+            .take(max_keys.min(ORPHAN_CACHE_SWEEP_MAX_KEYS))
+            .collect();
+        let mut pruned = 0;
+        for key in removed {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            pruned += tx.execute(
+                "DELETE FROM merge_queue_events WHERE worktree=?1 \
+                 AND NOT EXISTS (SELECT 1 FROM merge_queue WHERE worktree=?1)",
+                params![key],
+            )?;
+            tx.commit()?;
+        }
+        Ok(pruned)
     }
 
     /// Prune old terminal dispatch history while preserving rows still used by admission or supervision.
@@ -302,11 +338,15 @@ impl Db {
         let pruned_dispatches = self
             .prune_terminal_dispatches(now_secs.saturating_mul(1000))
             .map_err(map_busy_any)?;
+        let pruned_merge_events = self
+            .prune_removed_merge_events(ORPHAN_CACHE_SWEEP_MAX_KEYS)
+            .map_err(map_busy_any)?;
         let mut report = MaintenanceReport {
             pruned_notifications,
             pruned_removed_notifications,
             pruned_issue_links,
             pruned_dispatches,
+            pruned_merge_events,
             reclaimed_pages: 0,
             conversion: None,
         };
@@ -402,7 +442,7 @@ pub fn plan_maintenance(space: &DbSpace, auto_attempts_left: u32) -> Maintenance
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::NotificationStore;
+    use crate::store::{NotificationStore, WorktreeAuxStore};
     use rusqlite::Connection;
 
     fn temp_db() -> (tempfile::TempDir, Db) {
@@ -736,6 +776,80 @@ mod tests {
         assert_eq!(count, 3);
     }
 
+    fn merge_events(db: &Db, worktree: &str, keep_row: bool) {
+        db.enqueue_merge(worktree, "feature", "main").unwrap();
+        db.update_merge_status(worktree, "deferred", None, None, None)
+            .unwrap();
+        assert_eq!(
+            db.retry_held_merge_entry(worktree).unwrap(),
+            crate::store::MergeRetryOutcome::Rearmed
+        );
+        if !keep_row {
+            db.remove_merge_entry(worktree).unwrap();
+        }
+    }
+
+    #[test]
+    fn merge_events_of_removed_unqueued_worktrees_are_pruned() {
+        let (dir, db) = temp_db();
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        let queued = dir.path().join("queued").to_string_lossy().into_owned();
+        let registered = dir.path().join("registered").to_string_lossy().into_owned();
+        let existing_path = dir.path().join("existing");
+        std::fs::create_dir(&existing_path).unwrap();
+        let existing = existing_path.to_string_lossy().into_owned();
+        let ancestor = dir.path().join("ancestor").to_string_lossy().into_owned();
+        let descendant_registration = format!("{ancestor}/registered-child");
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,location) VALUES(?1,'local'),(?2,'local')",
+                params![registered, descendant_registration],
+            )
+            .unwrap();
+        for (path, keep_row) in [
+            (gone.as_str(), false),
+            (queued.as_str(), true),
+            (registered.as_str(), false),
+            (existing.as_str(), false),
+            (ancestor.as_str(), false),
+        ] {
+            merge_events(&db, path, keep_row);
+        }
+
+        assert_eq!(db.prune_removed_merge_events(0).unwrap(), 0);
+        assert_eq!(db.prune_removed_merge_events(8).unwrap(), 2);
+        assert!(db.merge_queue_events(&gone, 10).unwrap().is_empty());
+        assert_eq!(db.merge_queue_events(&queued, 10).unwrap().len(), 1);
+        assert_eq!(db.merge_queue_events(&registered, 10).unwrap().len(), 2);
+        assert_eq!(db.merge_queue_events(&existing, 10).unwrap().len(), 2);
+        assert_eq!(db.merge_queue_events(&ancestor, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn merge_event_sweep_respects_max_keys() {
+        let (dir, db) = temp_db();
+        let paths = ["gone-a", "gone-b", "gone-c"]
+            .map(|name| dir.path().join(name).to_string_lossy().into_owned());
+        for path in &paths {
+            merge_events(&db, path, false);
+        }
+
+        assert_eq!(db.prune_removed_merge_events(2).unwrap(), 4);
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| db.merge_queue_events(path, 10).unwrap().is_empty())
+                .count(),
+            2
+        );
+        assert_eq!(db.prune_removed_merge_events(2).unwrap(), 2);
+        assert!(
+            paths
+                .iter()
+                .all(|path| db.merge_queue_events(path, 10).unwrap().is_empty())
+        );
+    }
+
     fn dispatch(
         db: &Db,
         worktree: &str,
@@ -1008,10 +1122,12 @@ mod tests {
             None,
             None,
         );
+        merge_events(&db, &gone, false);
         let report = db.maintain(now, MaintenanceStep::Nothing).unwrap();
         assert_eq!(report.pruned_removed_notifications, 1);
         assert_eq!(report.pruned_issue_links, 1);
         assert_eq!(report.pruned_dispatches, 1);
+        assert_eq!(report.pruned_merge_events, 2);
     }
 
     #[test]
