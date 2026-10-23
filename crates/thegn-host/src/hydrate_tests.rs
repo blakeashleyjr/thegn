@@ -3185,3 +3185,47 @@ fn ls_files_real_git_lists_a_newline_filename_exactly() {
     paths.sort();
     assert_eq!(paths, vec!["a\nb", "é.txt"]);
 }
+
+#[test]
+fn startup_registration_read_error_never_registers() {
+    let registration = startup_registration(Err(anyhow::anyhow!("database is locked")), true);
+    match &registration {
+        StartupRegistration::Unknown(reason) => {
+            assert!(reason.contains("database is locked"));
+        }
+        other => panic!("expected an unknown removal record, got {other:?}"),
+    }
+    assert_ne!(registration, StartupRegistration::Register);
+}
+
+#[test]
+fn startup_registration_removed_workspace_is_not_registered() {
+    assert_eq!(
+        startup_registration(Ok(true), true),
+        StartupRegistration::Removed
+    );
+}
+
+#[test]
+fn startup_registration_live_workspace_is_registered() {
+    assert_eq!(
+        startup_registration(Ok(false), true),
+        StartupRegistration::Register
+    );
+}
+
+#[test]
+fn startup_registration_missing_dir_is_never_registered() {
+    assert_eq!(
+        startup_registration(Ok(false), false),
+        StartupRegistration::NotADir
+    );
+    assert_eq!(
+        startup_registration(Ok(true), false),
+        StartupRegistration::NotADir
+    );
+    assert_eq!(
+        startup_registration(Err(anyhow::anyhow!("x")), false),
+        StartupRegistration::NotADir
+    );
+}
