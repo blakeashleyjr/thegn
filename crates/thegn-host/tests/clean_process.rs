@@ -10,6 +10,43 @@ struct Fixture {
     path: PathBuf,
 }
 
+struct RestoreMode {
+    path: PathBuf,
+    mode: u32,
+    armed: bool,
+}
+
+impl RestoreMode {
+    fn new(path: &Path, mode: u32) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            mode,
+            armed: true,
+        }
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for RestoreMode {
+    #[allow(
+        clippy::disallowed_macros,
+        reason = "best-effort fixture teardown reporting"
+    )]
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) =
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode))
+        {
+            eprintln!("best-effort: failed to restore fixture permissions: {error}");
+        }
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -148,7 +185,9 @@ fn cli_clean_reports_a_failed_target_nonzero() {
     let locked = worktree.join("target/locked");
     fs::create_dir(&locked).unwrap();
     fs::write(locked.join("payload"), b"locked\n").unwrap();
+    let original_mode = fs::metadata(&locked).unwrap().permissions().mode();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    let mut restore_mode = RestoreMode::new(&locked, original_mode);
 
     let output = run(
         &fixture,
@@ -161,7 +200,7 @@ fn cli_clean_reports_a_failed_target_nonzero() {
         ],
         None,
     );
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    restore_mode.restore().unwrap();
     assert!(!output.status.success());
     assert!(
         String::from_utf8(output.stdout)

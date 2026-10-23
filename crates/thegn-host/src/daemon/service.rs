@@ -6313,10 +6313,13 @@ mod tests {
             event_streams: Default::default(),
         };
         let app = thegn_svc::control::http::router(state);
-        let server = tokio::spawn(axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
-        ));
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+            )
+            .into_future(),
+        );
 
         let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
         let cat = thegn_core::util::which_path("cat").unwrap_or_else(|| "/bin/cat".into());
