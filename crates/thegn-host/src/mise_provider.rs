@@ -716,7 +716,10 @@ pub(crate) fn install(cfg: &Config, worktree: &Path, repo_root: &Path) -> Result
     if !worktree.is_dir() {
         return Err("active worktree is unavailable".into());
     }
-    match GitLoc::for_worktree_checked(worktree) {
+    // The checked resolver requires UTF-8; use the same lossy spelling as
+    // the former resolver while keeping DB open/query failures checked.
+    let worktree_path = worktree.to_string_lossy();
+    match GitLoc::for_worktree_checked(Path::new(worktree_path.as_ref())) {
         Ok(loc) if loc.is_remote() => {
             return Err("selected worktree is remote; install its toolchain there".into());
         }

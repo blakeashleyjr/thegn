@@ -172,7 +172,10 @@ fn run_control(
     wt: &std::path::Path,
     req: &ControlRequest,
 ) -> (String, thegn_core::notification::Priority) {
-    match GitLoc::for_worktree_checked(wt) {
+    // Preserve the lenient resolver's path spelling for non-UTF-8 worktrees,
+    // but keep the DB lookup checked so an unreadable location still refuses.
+    let worktree_path = wt.to_string_lossy();
+    match GitLoc::for_worktree_checked(std::path::Path::new(worktree_path.as_ref())) {
         Err(error) => (
             format!(
                 "{}: {} refused: cannot read where this worktree lives ({error})",
