@@ -2593,7 +2593,10 @@ mod tests {
             elapsed < ALLOC_LOCK_WAIT,
             "waited {elapsed:?}, exceeding allocation bound {ALLOC_LOCK_WAIT:?}"
         );
-        assert_eq!(read_tmp_fallback_locator_at(&locator), Some(original_name));
+        assert_eq!(
+            read_tmp_fallback_locator_at(&locator),
+            Some(original_name.clone())
+        );
         let key = thegn_core::config_daemon::state_endpoint_key(state.path());
         let prefix = format!("thegn-{}-{key}-", effective_uid());
         let siblings = std::fs::read_dir(tmp.path())
