@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn enqueue_identity_records_repository_and_worktree_registration() {
-        let (_temp, _repo, worktree, db, cfg) = local_candidate_fixture();
+        let (_temp, repo, worktree, db, cfg) = local_candidate_fixture();
         let _queued = enqueue_worktree(&cfg, &db, &worktree).unwrap();
         let wt = crate::merge_ops::canonical_worktree(&worktree)
             .to_string_lossy()
@@ -939,12 +939,11 @@ mod tests {
             db.merge_enqueue_identity(&wt).unwrap(),
             Some(expected.clone())
         );
-        assert!(
-            expected
-                .admin_dir
-                .starts_with(&format!("{}/worktrees/", expected.common_dir))
+        assert!(expected.admin_dir.ends_with("/worktrees/feat"));
+        assert_eq!(
+            expected.common_dir,
+            format!("{}/.git", repo.canonicalize().unwrap().display())
         );
-        assert!(expected.common_dir.ends_with("/.git"));
     }
 
     #[test]

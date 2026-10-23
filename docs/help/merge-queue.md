@@ -76,8 +76,10 @@ refuse with the reason; use `thegn land` to land that branch outside the queue.
   `identity drift:` reason and no attempt spent. `thegn merge add` re-enqueues
   it against the current tip.
   The row also records which repository and Git worktree registration the path
-  belonged to; if the worktree is removed, re-created, or now belongs to another
-  repository, the row is held the same way before any fold.
+  belonged to; if the worktree is gone, now belongs to another repository, or
+  has a different registration, the row is held the same way before any fold.
+  A worktree re-created at the same path in the same repository reuses its
+  registration and is caught only by the branch-tip check above.
 - If a fixing agent does not start, the row is held `agent_blocked` with no
   attempt spent; `thegn merge retry` re-arms it.
 - If Git cannot read the queued branch or fixer's checkout during a drain, the
