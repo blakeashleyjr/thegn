@@ -22454,42 +22454,40 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Share => {
-                                            // Enter copies the focused endpoint as data.
-                                            if let Some(url) = model
-                                                .shares
-                                                .get(panel_ui.cursor)
-                                                .and_then(crate::share::ShareView::copy_value)
+                                            if let Some(decision) =
+                                                crate::handlers::share_panel::share_enter(
+                                                    &model.shares,
+                                                    panel_ui.cursor,
+                                                )
                                             {
-                                                pending_clipboard_oob
-                                                    .offer(crate::copymode::osc52(&url), |bytes| {
-                                                        writer.try_submit_host_clipboard(bytes)
-                                                    });
-                                                model.status = match crate::clipboard::copy(&url) {
-                                                    Ok(()) => "Copying link to clipboard…".into(),
-                                                    Err(error) => {
-                                                        format!("Clipboard copy failed: {error}")
+                                                match decision {
+                                                    crate::handlers::share_panel::ShareEnter::Copy(
+                                                        url,
+                                                    ) => {
+                                                        pending_clipboard_oob.offer(
+                                                            crate::copymode::osc52(&url),
+                                                            |bytes| {
+                                                                writer
+                                                                    .try_submit_host_clipboard(
+                                                                        bytes,
+                                                                    )
+                                                            },
+                                                        );
+                                                        model.status =
+                                                            match crate::clipboard::copy(&url) {
+                                                                Ok(()) => {
+                                                                    "Copying link to clipboard…"
+                                                                        .into()
+                                                                }
+                                                                Err(error) => format!(
+                                                                    "Clipboard copy failed: {error}"
+                                                                ),
+                                                            };
                                                     }
-                                                };
-                                            } else if let Some(share) =
-                                                model.shares.get(panel_ui.cursor)
-                                            {
-                                                model.status = if share.stopping {
-                                                    format!("Share :{} is stopping", share.port)
-                                                } else if share.failed {
-                                                    format!(
-                                                        "Share :{} failed: {} — `x` clears it, `n` retries",
-                                                        share.port,
-                                                        share
-                                                            .error
-                                                            .as_deref()
-                                                            .unwrap_or("unknown error")
-                                                    )
-                                                } else {
-                                                    format!(
-                                                        "Share :{} is still starting…",
-                                                        share.port
-                                                    )
-                                                };
+                                                    crate::handlers::share_panel::ShareEnter::Status(
+                                                        status,
+                                                    ) => model.status = status,
+                                                }
                                             }
                                         }
                                         Section::Forward => {
@@ -23531,28 +23529,18 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- share: open in browser / stop the highlighted one.
                         (Section::Share, KeyCode::Char('o')) => {
-                            match model
-                                .shares
-                                .get(panel_ui.cursor)
-                                .and_then(|s| s.browser_url().map(str::to_owned))
-                            {
-                                Some(url) => {
+                            match crate::handlers::share_panel::share_open(
+                                &model.shares,
+                                panel_ui.cursor,
+                            ) {
+                                crate::handlers::share_panel::ShareOpen::Open(url) => {
                                     model.status = crate::actions::open_status(
                                         open_url_detached(&url),
                                         || "Opened share link in browser".to_string(),
                                     );
                                 }
-                                None => {
-                                    model.status = model.shares.get(panel_ui.cursor).map_or_else(
-                                        || "No share URL to open".into(),
-                                        |share| if share.stopping {
-                                            format!("Share :{} is stopping", share.port)
-                                        } else if share.failed {
-                                            format!("Share :{} failed: {} — `x` clears it, `n` retries", share.port, share.error.as_deref().unwrap_or("unknown error"))
-                                        } else {
-                                            format!("Share :{} is still starting…", share.port)
-                                        },
-                                    );
+                                crate::handlers::share_panel::ShareOpen::Status(status) => {
+                                    model.status = status;
                                 }
                             }
                             true
