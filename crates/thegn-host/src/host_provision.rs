@@ -7,13 +7,15 @@
 //!
 //! Everything here BLOCKS (subprocess over the multiplexed control channel)
 //! and runs inside the same `spawn_blocking` context as `ensure_ready`.
-//! All steps are BEST-EFFORT: a failed tool install or dotfile push warns and
-//! continues (the pane still opens on the base image), mirroring the sprites
-//! pipeline's fatal-vs-best-effort split where only workspace/clone are fatal
-//! — and neither exists here (the worktree is already bind-mounted).
+//! A failed tool install or dotfile push warns and continues (the pane still
+//! opens on the base image), mirroring the sprites pipeline's fatal-vs-best-
+//! effort split where only workspace/clone are fatal — and neither exists here
+//! (the worktree is already bind-mounted). Delivery attestation failures fail
+//! their step and withhold the provision marker.
 
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use thegn_core::config::Config;
 use thegn_core::envplan::{self, EnvPlan, StepKind};
 use thegn_core::host_config::HostBinding;
@@ -116,19 +118,6 @@ pub(crate) fn provision_worktree_on_host(
     //    exist on the host — detect over exec, parse with the pure core fn).
     let home =
         container_home(runner.exec_in_container(&container, "printf %s \"$HOME\"", secs(30)));
-    let marker_version = thegn_core::util::sh_quote(MARKER_VERSION);
-    let already = if let Ok(home) = &home {
-        let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
-        let marker_probe = format!(
-            "test -f {marker_path} && grep -Fxq {marker_version} {marker_path} && echo HAVE || echo NEED"
-        );
-        matches!(
-            runner.exec_in_container(&container, &marker_probe, secs(30)),
-            Ok((true, ref out, _)) if out.contains("HAVE")
-        )
-    } else {
-        false
-    };
     let (req, detect_error) =
         match crate::mise_provider::detect_on_target(runner, &container, worktree) {
             Ok(req) => (req, None),
@@ -187,6 +176,21 @@ pub(crate) fn provision_worktree_on_host(
         .extend(crate::handlers::repo_trust::devcontainer_lifecycle_steps(
             &repo_root, worktree, worktree,
         ));
+
+    let marker_generation = provision_generation(&plan);
+    let marker_value = thegn_core::util::sh_quote(&marker_generation);
+    let already = if let Ok(home) = &home {
+        let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
+        let marker_probe = format!(
+            "test -f {marker_path} && grep -Fxq {marker_value} {marker_path} && echo HAVE || echo NEED"
+        );
+        matches!(
+            runner.exec_in_container(&container, &marker_probe, secs(30)),
+            Ok((true, ref out, _)) if out.contains("HAVE")
+        )
+    } else {
+        false
+    };
 
     // The pane-entry hook is derived purely — compute it even when the marker
     // short-circuits the replay (a fresh thegn process still needs it).
@@ -293,7 +297,7 @@ pub(crate) fn provision_worktree_on_host(
     }
     if all_succeeded && let Ok(home) = &home {
         let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
-        let marker_write = format!("printf '%s\\n' {marker_version} > {marker_path}");
+        let marker_write = format!("printf '%s\\n' {marker_value} > {marker_path}");
         let _ = runner.exec_in_container(&container, &marker_write, secs(30)); // best-effort: marker write: a failed write just re-runs init on the next claim
     } else if let Err(reason) = &home
         && !home_error_reported
@@ -335,8 +339,27 @@ fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
+fn provision_generation(plan: &EnvPlan) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"thegn.host-provision.v1\0");
+    for step in &plan.steps {
+        hash.update(step.id.as_bytes());
+        hash.update([0_u8]);
+        hash.update(format!("{:?}", step.kind).as_bytes());
+        hash.update([0_u8]);
+    }
+    let digest = hash.finalize();
+    let hex = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{MARKER_VERSION}:{hex}")
+}
+
 /// Stage files into a private, exclusive temp dir via `fill`, then tar-push
-/// them into the container `$HOME`. An empty transaction is an error.
+/// them into the container `$HOME`, then attest every extracted regular file
+/// is owned by the container user and remains owner-only. An empty transaction
+/// is an error unless explicitly allowed.
 fn stage_and_push(
     runner: &OciRunner,
     container: &str,
@@ -345,8 +368,127 @@ fn stage_and_push(
     fill: impl FnOnce(&std::path::Path) -> Result<(), String>,
 ) -> Result<(), String> {
     with_private_staging(fill, allow_empty, |staging| {
-        runner.push_dir_to_container(container, staging, home, secs(120))
+        let rels = staged_files(staging)?;
+        runner.push_dir_to_container(container, staging, home, secs(120))?;
+        attest_delivery(runner, container, home, &rels)
     })
+}
+
+fn staged_files(root: &std::path::Path) -> Result<Vec<String>, String> {
+    fn walk(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        files: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(current)
+            .map_err(|error| format!("inspect staging directory {}: {error}", current.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("inspect staging entry: {error}"))?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("inspect staging entry {}: {error}", path.display()))?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                walk(root, &path, files)?;
+            } else if file_type.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| format!("staging entry escaped root: {}", path.display()))?;
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            } else {
+                return Err(format!(
+                    "staging entry is not a regular file or directory: {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn attestation_script(home: &str, rels: &[String]) -> String {
+    let stats = rels
+        .iter()
+        .map(|rel| {
+            let path = format!("{home}/{rel}");
+            format!(
+                "stat -c '%F|%a|%u' -- {}",
+                thegn_core::util::sh_quote(&path)
+            )
+        })
+        .collect::<Vec<_>>();
+    if stats.is_empty() {
+        "id -u".to_string()
+    } else {
+        format!("id -u && {}", stats.join(" && "))
+    }
+}
+
+fn check_delivery(stdout: &str, rels: &[String]) -> Result<(), String> {
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let first_path = rels.first().map(String::as_str).unwrap_or("<uid>");
+    let uid = lines
+        .first()
+        .ok_or_else(|| format!("delivery attestation missing container uid for {first_path}"))?
+        .parse::<u32>()
+        .map_err(|_| format!("delivery attestation has invalid container uid for {first_path}"))?;
+    if lines.len() != rels.len() + 1 {
+        let path = rels
+            .get(lines.len().saturating_sub(1))
+            .or_else(|| rels.last())
+            .map(String::as_str)
+            .unwrap_or("<uid>");
+        return Err(format!(
+            "delivery attestation line count mismatch at {path}: expected {}, got {}",
+            rels.len() + 1,
+            lines.len()
+        ));
+    }
+    for (index, rel) in rels.iter().enumerate() {
+        let line = lines[index + 1];
+        let fields = line.split('|').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(format!("delivery attestation has invalid shape for {rel}"));
+        }
+        if !matches!(fields[0], "regular file" | "regular empty file") {
+            return Err(format!("delivery attestation found {} at {rel}", fields[0]));
+        }
+        let mode = u32::from_str_radix(fields[1], 8)
+            .map_err(|_| format!("delivery attestation has invalid mode for {rel}"))?;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "delivery attestation permissions are not owner-only for {rel}"
+            ));
+        }
+        let file_uid = fields[2]
+            .parse::<u32>()
+            .map_err(|_| format!("delivery attestation has invalid owner uid for {rel}"))?;
+        if file_uid != uid {
+            return Err(format!(
+                "delivery attestation owner uid does not match container uid for {rel}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn attest_delivery(
+    runner: &OciRunner,
+    container: &str,
+    home: &str,
+    rels: &[String],
+) -> Result<(), String> {
+    let script = attestation_script(home, rels);
+    match runner.exec_in_container(container, &script, secs(30)) {
+        Ok((true, out, _)) => check_delivery(&out, rels),
+        Ok((false, _, err)) => Err(err.lines().last().unwrap_or("failed").to_string()),
+        Err(error) => Err(error),
+    }
 }
 
 /// agent config staging is disabled pending an explicit policy decision; see the follow-up issue
@@ -554,6 +696,128 @@ pub(crate) fn plan_summary(req: &envplan::EnvRequirements, cfg: &Config) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provision_generation_changes_with_the_plan() {
+        let make_plan = |name: &str, label: &str, extra: bool| EnvPlan {
+            steps: {
+                let mut steps = vec![envplan::ProvisionStep {
+                    id: "dotfiles".into(),
+                    label: label.into(),
+                    kind: StepKind::Dotfiles(vec![name.into()]),
+                }];
+                if extra {
+                    steps.push(envplan::ProvisionStep {
+                        id: "setup".into(),
+                        label: "Setup".into(),
+                        kind: StepKind::Exec("true".into()),
+                    });
+                }
+                steps
+            },
+            tier: envplan::Tier::Bare,
+        };
+
+        let first = make_plan(".gitconfig", "Dotfiles", false);
+        let same = make_plan(".gitconfig", "Dotfiles", false);
+        let renamed = make_plan(".zshrc", "Dotfiles", false);
+        let relabeled = make_plan(".gitconfig", "Personal files", false);
+        let added_step = make_plan(".gitconfig", "Dotfiles", true);
+        let generation = provision_generation(&first);
+
+        assert!(generation.starts_with("2:"), "{generation}");
+        assert_eq!(generation, provision_generation(&same));
+        assert_eq!(generation, provision_generation(&relabeled));
+        assert_ne!(generation, provision_generation(&renamed));
+        assert_ne!(generation, provision_generation(&added_step));
+    }
+
+    #[test]
+    fn check_delivery_accepts_owner_only_regular_files() {
+        let rels = vec!["a".into(), "d/empty".into()];
+        assert!(
+            check_delivery(
+                "1000\nregular file|600|1000\nregular empty file|600|1000\n",
+                &rels
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_delivery_refuses_bad_shapes() {
+        let rels = vec!["a".into(), "b".into()];
+        let cases = [
+            (
+                "1000\nregular file|640|1000\nregular file|600|1000\n",
+                Some("a"),
+            ),
+            (
+                "1000\nregular file|604|1000\nregular file|600|1000\n",
+                Some("a"),
+            ),
+            (
+                "1000\nregular file|600|0\nregular file|600|1000\n",
+                Some("a"),
+            ),
+            (
+                "1000\nsymbolic link|600|1000\nregular file|600|1000\n",
+                Some("a"),
+            ),
+            (
+                "1000\ndirectory|700|1000\nregular file|600|1000\n",
+                Some("a"),
+            ),
+            ("1000\nregular file|600|1000\n", Some("b")),
+            (
+                "1000\nregular file|600|1000\nregular file|600|1000\nextra\n",
+                Some("b"),
+            ),
+            (
+                "not-a-uid\nregular file|600|1000\nregular file|600|1000\n",
+                Some("a"),
+            ),
+            (
+                "1000\nregular file|not-octal|1000\nregular file|600|1000\n",
+                Some("a"),
+            ),
+            ("", Some("a")),
+        ];
+        for (stdout, expected_path) in cases {
+            let error = check_delivery(stdout, &rels).unwrap_err();
+            if let Some(path) = expected_path {
+                assert!(error.contains(path), "{error:?} did not name {path:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn staged_files_lists_regular_files_and_refuses_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("d")).unwrap();
+        std::fs::write(root.path().join("a"), b"a").unwrap();
+        std::fs::write(root.path().join("d/b"), b"b").unwrap();
+        assert_eq!(
+            staged_files(root.path()).unwrap(),
+            vec![String::from("a"), String::from("d/b")]
+        );
+
+        if crate::platform::test_symlink_supported() {
+            let target = root.path().join("a");
+            let link = root.path().join("link");
+            crate::platform::test_symlink(&target, &link).unwrap();
+            assert!(staged_files(root.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn attestation_script_quotes_every_path() {
+        let rels = vec!["x'y".into(), "nested/file".into()];
+        let script = attestation_script("/home/user space", &rels);
+        assert!(script.starts_with("id -u && stat -c '%F|%a|%u' -- "));
+        assert!(script.contains(&thegn_core::util::sh_quote("/home/user space/x'y")));
+        assert!(script.contains(&thegn_core::util::sh_quote("/home/user space/nested/file")));
+    }
 
     #[test]
     fn synth_init_only_for_synthnix_and_respects_mode() {
