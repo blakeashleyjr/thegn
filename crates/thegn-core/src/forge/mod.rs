@@ -569,14 +569,15 @@ mod tests {
         }
     }
 
-    fn loc() -> GitLoc {
-        GitLoc::Local(std::env::temp_dir())
+    fn loc(root: &tempfile::TempDir) -> GitLoc {
+        GitLoc::Local(root.path().to_path_buf())
     }
 
     #[test]
     fn optional_ops_default_to_unsupported_and_never_panic() {
+        let root = tempfile::tempdir().unwrap();
         let f = Bare;
-        let l = loc();
+        let l = loc(&root);
         let repo = RepoRef {
             owner: "a".into(),
             repo: "b".into(),
@@ -636,21 +637,23 @@ mod tests {
 
     #[test]
     fn fetch_pr_composes_status_and_threads() {
+        let root = tempfile::tempdir().unwrap();
         let f = Bare;
-        let got = f.fetch_pr(&loc(), 7).unwrap();
+        let got = f.fetch_pr(&loc(&root), 7).unwrap();
         assert_eq!(got.pr.number, 7);
         // review_threads is unsupported → threads empty, fetch still Ok.
         assert!(got.threads.is_empty());
-        assert!(matches!(f.fetch_pr(&loc(), 8), Err(ForgeError::NoPr)));
+        assert!(matches!(f.fetch_pr(&loc(&root), 8), Err(ForgeError::NoPr)));
     }
 
     #[test]
     fn pr_panel_folds_errors_into_states() {
+        let root = tempfile::tempdir().unwrap();
         let f = Bare;
-        let p = f.pr_panel(&loc(), PrRef::Current, PrDepth::Full);
+        let p = f.pr_panel(&loc(&root), PrRef::Current, PrDepth::Full);
         assert!(matches!(p.state, PanelState::Offline));
         assert!(p.threads.is_empty() && p.issues.is_empty());
-        let p = f.pr_panel(&loc(), PrRef::Number(7), PrDepth::Threads);
+        let p = f.pr_panel(&loc(&root), PrRef::Number(7), PrDepth::Threads);
         assert!(matches!(&p.state, PanelState::Pr(pr) if pr.number == 7));
     }
 
@@ -754,6 +757,7 @@ mod tests {
 
     #[test]
     fn pr_panel_full_skips_issue_rows_for_non_definitive_status_errors() {
+        let root = tempfile::tempdir().unwrap();
         for error in [
             ForgeError::RateLimited,
             ForgeError::Other("temporary failure".into()),
@@ -763,7 +767,7 @@ mod tests {
                 status_error: Some(error),
                 issue_calls: std::sync::atomic::AtomicUsize::new(0),
             };
-            let panel = forge.pr_panel(&loc(), PrRef::Current, PrDepth::Full);
+            let panel = forge.pr_panel(&loc(&root), PrRef::Current, PrDepth::Full);
             assert!(panel.issues.is_empty());
             assert_eq!(
                 forge.issue_calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -775,7 +779,7 @@ mod tests {
                 status_error,
                 issue_calls: std::sync::atomic::AtomicUsize::new(0),
             };
-            forge.pr_panel(&loc(), PrRef::Current, PrDepth::Full);
+            forge.pr_panel(&loc(&root), PrRef::Current, PrDepth::Full);
             assert_eq!(
                 forge.issue_calls.load(std::sync::atomic::Ordering::Relaxed),
                 1

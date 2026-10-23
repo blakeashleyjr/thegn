@@ -193,13 +193,14 @@ mod resolve_worktree_tests {
     #[test]
     fn existing_env_worktree_is_used() {
         // A $THEGN_WORKTREE that exists (a local sandbox's bind-mounted path).
-        let dir = std::env::temp_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
         let got = resolve_worktree_from(
             None,
-            Some(dir.to_string_lossy().into()),
+            Some(dir_path.to_string_lossy().into()),
             Path::new("/nonexistent/cwd"),
         );
-        assert_eq!(got, dir);
+        assert_eq!(got, dir_path);
     }
 
     #[test]
@@ -207,10 +208,11 @@ mod resolve_worktree_tests {
         // The remote-sprite case: the host path isn't mounted here, so it must be
         // ignored rather than trusted. The cwd (a temp dir, not a git repo) has no
         // toplevel, so resolution lands on the cwd itself — never the dead path.
-        let cwd = std::env::temp_dir();
+        let cwd = tempfile::tempdir().unwrap();
+        let cwd_path = cwd.path().to_path_buf();
         let dead = "/definitely/not/here/thegn-xyz";
-        let got = resolve_worktree_from(None, Some(dead.into()), &cwd);
+        let got = resolve_worktree_from(None, Some(dead.into()), &cwd_path);
         assert_ne!(got, PathBuf::from(dead));
-        assert_eq!(got, cwd);
+        assert_eq!(got, cwd_path);
     }
 }

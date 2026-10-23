@@ -52,6 +52,8 @@ mod completions_health;
 mod compositor;
 mod fold_cancel;
 mod gate_capture;
+#[cfg(test)]
+mod tmp_root_ratchet_tests;
 // THE-505 process-source capture, wired through `config_startup`.
 mod config_capture;
 mod config_source;
