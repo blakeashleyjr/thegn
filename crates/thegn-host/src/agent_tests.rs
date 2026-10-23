@@ -2853,7 +2853,13 @@ fn compose_guard_protects_host_credentials_sockets_state_runtime_and_extra_paths
 fn launch_state_gate_refuses_a_configured_agent() {
     let agent_cfg = cfg_with(&[("codex", "codex")], &[]);
     let error = anyhow::anyhow!("disk I/O error");
-    let result = launch_state_gate(&agent_cfg, "codex", "saved override unreadable", &error);
+    let result = launch_state_gate(
+        &agent_cfg,
+        "/wt/a",
+        "codex",
+        "saved override unreadable",
+        &error,
+    );
     let Err(error) = result else {
         panic!("configured agent must be refused");
     };
@@ -2864,7 +2870,13 @@ fn launch_state_gate_refuses_a_configured_agent() {
 
     let tool_cfg = cfg_with(&[], &[("lazygit", "lazygit")]);
     let error = anyhow::anyhow!("disk I/O error");
-    let result = launch_state_gate(&tool_cfg, "lazygit", "saved override unreadable", &error);
+    let result = launch_state_gate(
+        &tool_cfg,
+        "/wt/a",
+        "lazygit",
+        "saved override unreadable",
+        &error,
+    );
     let Err(error) = result else {
         panic!("configured tool must be refused");
     };
@@ -2878,7 +2890,7 @@ fn launch_state_gate_refuses_a_configured_agent() {
 fn launch_state_gate_lets_a_shell_launch_with_a_warning() {
     let cfg = cfg_with(&[("codex", "codex")], &[]);
     let error = anyhow::anyhow!("disk I/O error");
-    assert!(launch_state_gate(&cfg, "shell", "saved override unreadable", &error).is_ok());
+    assert!(launch_state_gate(&cfg, "/wt/a", "shell", "saved override unreadable", &error).is_ok());
 }
 
 #[test]

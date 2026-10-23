@@ -4027,6 +4027,7 @@ pub fn launch_spec_full(
         Err(error) => {
             launch_state_gate(
                 cfg,
+                worktree,
                 choice,
                 "the state database could not be opened, so this worktree's saved sandbox override, selected environment and credential-overlay gate cannot be checked",
                 &error,
@@ -4054,6 +4055,7 @@ pub fn launch_spec_full(
                 Err(error) => {
                     launch_state_gate(
                         cfg,
+                        worktree,
                         choice,
                         "this worktree's saved sandbox override could not be read",
                         &error,
@@ -4072,6 +4074,7 @@ pub fn launch_spec_full(
         Some(Err(error)) => {
             launch_state_gate(
                 cfg,
+                worktree,
                 choice,
                 "this worktree's repository root could not be read",
                 &error,
@@ -4094,6 +4097,7 @@ pub fn launch_spec_full(
             Err(error) => {
                 launch_state_gate(
                     cfg,
+                    worktree,
                     choice,
                     "this worktree's selected execution environment could not be read",
                     &error,
@@ -4186,6 +4190,7 @@ pub fn launch_spec_full(
             Ok(None) => {}
             Err(error) => launch_state_gate(
                 cfg,
+                worktree,
                 choice,
                 "the workspace slug for the credential-overlay gate could not be read",
                 &error,
@@ -4206,6 +4211,7 @@ pub fn launch_spec_full(
         if let Err(error) = std::fs::create_dir_all(dir) {
             dotfiles_launch_gate(
                 cfg,
+                worktree,
                 choice,
                 anyhow::Error::new(error).context(format!("cannot create {dir}")),
             )?;
@@ -4220,6 +4226,7 @@ pub fn launch_spec_full(
             }) {
                 dotfiles_launch_gate(
                     cfg,
+                    worktree,
                     choice,
                     anyhow::Error::new(error)
                         .context(format!("bundle dotfiles into {}", home.display())),
@@ -4564,6 +4571,7 @@ pub(crate) fn credential_overlay_gate(
 
 pub(crate) fn dotfiles_launch_gate(
     cfg: &Config,
+    worktree: &str,
     choice: &str,
     failure: anyhow::Error,
 ) -> anyhow::Result<()> {
@@ -4573,7 +4581,9 @@ pub(crate) fn dotfiles_launch_gate(
             "refusing to launch `{choice}`: its bundle HOME could not be prepared: {detail}"
         )));
     }
-    thegn_core::msg::warn(&format!("{failure:#}; the shell launches without it"));
+    let text = format!("{failure:#}; the shell launches without it");
+    thegn_core::msg::warn(&text);
+    crate::launch_notice::post(worktree, &text);
     Ok(())
 }
 
@@ -4586,6 +4596,7 @@ fn is_configured_entry(cfg: &Config, choice: &str) -> bool {
 
 pub(crate) fn launch_state_gate(
     cfg: &Config,
+    worktree: &str,
     choice: &str,
     what: &str,
     error: &anyhow::Error,
@@ -4593,7 +4604,9 @@ pub(crate) fn launch_state_gate(
     if is_configured_entry(cfg, choice) {
         anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");
     }
-    thegn_core::msg::warn(&format!("{what}: {error:#}; the shell launches without it"));
+    let text = format!("{what}: {error:#}; the shell launches without it");
+    thegn_core::msg::warn(&text);
+    crate::launch_notice::post(worktree, &text);
     Ok(())
 }
 
