@@ -2499,6 +2499,9 @@ fn permissioned_launch_is_command_scoped_and_never_touches_the_repository() {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 
     with_temp_state("the440-perm-seam", || {
+        // Initialize the isolated database schema before concurrent launch
+        // resolution opens independent handles to read the saved override.
+        thegn_core::db::Db::open().expect("initialize isolated launch database");
         let root = std::env::temp_dir().join(format!("tg-the440-perm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup: stale scratch from a prior run
         let outside = root.join("outside");

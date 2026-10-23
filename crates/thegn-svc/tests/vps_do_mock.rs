@@ -11,7 +11,10 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 
 use thegn_svc::provider::RemoteProvider;
@@ -30,16 +33,19 @@ fn start_mock() -> (String, Arc<Mutex<Vec<Recorded>>>) {
     let port = listener.local_addr().unwrap().port();
     let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
     let rec = recorded.clone();
+    let instance_present = Arc::new(AtomicBool::new(true));
+    let server_instance_present = instance_present.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let rec = rec.clone();
-            thread::spawn(move || handle(stream, rec));
+            let instance_present = server_instance_present.clone();
+            thread::spawn(move || handle(stream, rec, instance_present));
         }
     });
     (format!("http://127.0.0.1:{port}/v2"), recorded)
 }
 
-fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
+fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, instance_present: Arc<AtomicBool>) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -91,9 +97,16 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
             r#"{"droplet":{"id":101,"name":"tg-do-1","status":"new","created_at":"2026-07-01T12:00:00Z"}}"#.to_string()
         }
         (m, p) if m == "GET" && p.starts_with("/v2/droplets?") => {
-            r#"{"droplets":[{"id":101,"name":"tg-do-1","status":"active","created_at":"2026-07-01T12:00:00Z","networks":{"v4":[{"ip_address":"10.1.0.5","type":"private"},{"ip_address":"203.0.113.9","type":"public"}]},"tags":["tg-managed","tg-host:h1"]}],"meta":{"total":1}}"#.to_string()
+            if instance_present.load(Ordering::Acquire) {
+                r#"{"droplets":[{"id":101,"name":"tg-do-1","status":"active","created_at":"2026-07-01T12:00:00Z","networks":{"v4":[{"ip_address":"10.1.0.5","type":"private"},{"ip_address":"203.0.113.9","type":"public"}]},"tags":["tg-managed","tg-host:h1"]}],"meta":{"total":1}}"#.to_string()
+            } else {
+                r#"{"droplets":[],"meta":{"total":0}}"#.to_string()
+            }
         }
-        ("DELETE", "/v2/droplets/101") => String::new(),
+        ("DELETE", "/v2/droplets/101") => {
+            instance_present.store(false, Ordering::Release);
+            String::new()
+        }
         _ => {
             let _ = writer.write_all( // best-effort: client may have disconnected
                 b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
