@@ -22,7 +22,9 @@ use std::sync::atomic::AtomicBool;
 use thegn_core::attention::MqStatus;
 use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
-use thegn_core::store::{MergeCandidate, MergeStatusFields, WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{
+    MergeCandidate, MergeEnqueueIdentity, MergeStatusFields, WorkspaceStore, WorktreeAuxStore,
+};
 use thegn_core::util;
 
 use crate::integrate::{self, AttemptOutcome};
@@ -126,6 +128,26 @@ struct CandidateDrift {
 #[derive(Debug)]
 struct CandidateUnreadable {
     reason: String,
+}
+
+fn enqueue_identity_drift(
+    recorded: &MergeEnqueueIdentity,
+    live: std::result::Result<&MergeEnqueueIdentity, &str>,
+    drain_common: std::result::Result<&str, &str>,
+) -> std::result::Result<(), String> {
+    let live = live.map_err(|reason| format!("worktree identity unavailable: {reason}"))?;
+    let drain_common = drain_common
+        .map_err(|reason| format!("drain repository identity unavailable: {reason}"))?;
+    if drain_common != recorded.common_dir {
+        return Err("queued for a different repository than this drain".into());
+    }
+    if live.common_dir != recorded.common_dir {
+        return Err("worktree now belongs to a different repository than at enqueue".into());
+    }
+    if live.admin_dir != recorded.admin_dir {
+        return Err("worktree registration changed since enqueue (removed and re-created?)".into());
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for CandidateDrift {
@@ -322,6 +344,29 @@ pub(crate) fn drive_queue(
             attempt: |branch: &str, location: &thegn_core::remote::GitLoc, held: bool| {
                 if let thegn_core::remote::GitLoc::Local(worktree) = location {
                     let key = worktree.to_string_lossy().into_owned();
+                    if let Some(recorded) = db.merge_enqueue_identity(&key)? {
+                        let live = crate::merge_ops::local_enqueue_identity(worktree);
+                        let drain_common = repo_root
+                            .canonicalize()
+                            .map_err(|error| error.to_string())
+                            .and_then(|root| {
+                                util::git_common_dir(&root)
+                                    .canonicalize()
+                                    .map_err(|error| error.to_string())
+                            })
+                            .and_then(|path| {
+                                path.to_str()
+                                    .map(str::to_owned)
+                                    .ok_or_else(|| "not valid UTF-8".to_string())
+                            });
+                        if let Err(reason) = enqueue_identity_drift(
+                            &recorded,
+                            live.as_ref().map_err(String::as_str),
+                            drain_common.as_deref().map_err(String::as_str),
+                        ) {
+                            return Err(anyhow::Error::new(CandidateDrift { reason }));
+                        }
+                    }
                     let candidate = db.merge_candidate(&key)?;
                     if let Some(candidate) = candidate.as_ref() {
                         let expected_ref = format!("refs/heads/{branch}");
@@ -1748,6 +1793,59 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_identity_drift_table() {
+        let recorded = MergeEnqueueIdentity {
+            common_dir: "/private/repo/.git".into(),
+            admin_dir: "/private/repo/.git/worktrees/feature".into(),
+        };
+        let same = recorded.clone();
+        let other_repo = MergeEnqueueIdentity {
+            common_dir: "/private/other/.git".into(),
+            admin_dir: "/private/other/.git/worktrees/feature".into(),
+        };
+        let new_registration = MergeEnqueueIdentity {
+            admin_dir: "/private/repo/.git/worktrees/feature-2".into(),
+            ..recorded.clone()
+        };
+        let cases = [
+            (
+                Err("gone"),
+                Ok("/private/repo/.git"),
+                Some("worktree identity unavailable: gone"),
+            ),
+            (
+                Ok(&same),
+                Err("missing"),
+                Some("drain repository identity unavailable: missing"),
+            ),
+            (
+                Ok(&same),
+                Ok("/private/other/.git"),
+                Some("queued for a different repository than this drain"),
+            ),
+            (
+                Ok(&other_repo),
+                Ok("/private/repo/.git"),
+                Some("worktree now belongs to a different repository than at enqueue"),
+            ),
+            (
+                Ok(&new_registration),
+                Ok("/private/repo/.git"),
+                Some("worktree registration changed since enqueue (removed and re-created?)"),
+            ),
+            (Ok(&same), Ok("/private/repo/.git"), None),
+        ];
+        for (live, drain, expected) in cases {
+            assert_eq!(
+                enqueue_identity_drift(&recorded, live, drain)
+                    .err()
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn candidate_drift_held_fast_forward_is_adoptable_but_rewrite_is_held() {
         let candidate = MergeCandidate {
             branch_ref: "refs/heads/feat".into(),
@@ -2353,6 +2451,155 @@ mod tests {
                 branch: "feat".into(),
                 location: String::new(),
             }
+        }
+
+        fn identity_item(db: &Db, feat_wt: &Path) -> QueueItem {
+            let worktree = feat_wt.to_string_lossy().into_owned();
+            db.enqueue_merge_candidate_with_identity(
+                &worktree,
+                "feat",
+                "main",
+                &MergeCandidate {
+                    branch_ref: "refs/heads/feat".into(),
+                    candidate_oid: out(feat_wt, &["rev-parse", "HEAD"]),
+                },
+                &crate::merge_ops::local_enqueue_identity(feat_wt).unwrap(),
+            )
+            .unwrap();
+            QueueItem {
+                worktree,
+                branch: "feat".into(),
+                location: String::new(),
+            }
+        }
+
+        #[test]
+        fn enqueue_identity_recreated_in_other_repo_holds_without_fold_or_agent() {
+            let (_fixture, root, feat_wt) = clean_repo("enqueue-identity-recreated");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = identity_item(&db, &feat_wt);
+            git(
+                &root,
+                &["worktree", "remove", "--force", feat_wt.to_str().unwrap()],
+            );
+
+            let other = root.parent().unwrap().join("other");
+            std::fs::create_dir_all(&other).unwrap();
+            git(&other, &["init", "-q", "-b", "main"]);
+            git(&other, &["config", "user.name", "t"]);
+            git(&other, &["config", "user.email", "t@e"]);
+            git(&other, &["config", "commit.gpgsign", "false"]);
+            std::fs::write(other.join("base.txt"), "other base\n").unwrap();
+            git(&other, &["add", "-A"]);
+            git(&other, &["commit", "-q", "-m", "other base"]);
+            git(
+                &other,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "feat",
+                    feat_wt.to_str().unwrap(),
+                    "main",
+                ],
+            );
+
+            let sentinel = root.join("fixer-ran");
+            let outcome = drive_queue(
+                &cfg(&format!("touch {}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert!(outcome.landed.is_empty());
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert!(!sentinel.exists());
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 0);
+            let detail = row.error_detail.unwrap();
+            assert!(detail.contains("identity drift"), "{detail}");
+            assert!(detail.contains("different repository"), "{detail}");
+        }
+
+        #[test]
+        fn enqueue_identity_deleted_worktree_holds_without_fold() {
+            let (_fixture, root, feat_wt) = clean_repo("enqueue-identity-deleted");
+            let main_before = out(&root, &["rev-parse", "main"]);
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = identity_item(&db, &feat_wt);
+            git(
+                &root,
+                &["worktree", "remove", "--force", feat_wt.to_str().unwrap()],
+            );
+
+            let sentinel = root.join("fixer-ran");
+            let outcome = drive_queue(
+                &cfg(&format!("touch {}", sentinel.display()), 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert!(outcome.landed.is_empty());
+            assert_eq!(outcome.agent_blocked, ["feat"]);
+            assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
+            assert!(!sentinel.exists());
+            let row = db.list_merge_queue().unwrap().remove(0);
+            assert_eq!(row.status, "agent_blocked");
+            assert_eq!(row.agent_attempts, 0);
+            let detail = row.error_detail.unwrap();
+            assert!(detail.contains("identity drift"), "{detail}");
+            assert!(detail.contains("worktree identity unavailable"), "{detail}");
+        }
+
+        #[test]
+        fn enqueue_identity_unchanged_row_lands() {
+            let (_fixture, root, feat_wt) = clean_repo("enqueue-identity-unchanged");
+            let db = Db::open_memory().unwrap();
+            db.put_worktree(
+                "feat",
+                root.to_str().unwrap(),
+                feat_wt.to_str().unwrap(),
+                "feat",
+                None,
+                None,
+            )
+            .unwrap();
+            let queued = identity_item(&db, &feat_wt);
+            let outcome = drive_queue(
+                &cfg("", 2),
+                &Config::default(),
+                &root,
+                &db,
+                vec![queued],
+                |_| {},
+            );
+            assert_eq!(outcome.landed, ["feat"]);
         }
 
         #[test]
