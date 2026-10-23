@@ -279,7 +279,7 @@ impl std::fmt::Display for LandRefusal {
             } => format!("checked-out branch {checked_out} does not match queued branch {queued}"),
             Self::NoCandidate => "ready merge-queue row has no recorded candidate commit; re-enqueue it with `thegn merge add` and drain it".to_owned(),
             Self::CandidateMoved { recorded, current } => format!(
-                "branch moved after the queue verified it (verified {}, now {}); run `thegn merge drain` to verify the new commits",
+                "branch moved after the queue verified it (verified {}, now {}); re-enqueue it with `thegn merge add` so the queue verifies the new commits",
                 recorded.chars().take(12).collect::<String>(),
                 current.chars().take(12).collect::<String>()
             ),
@@ -963,7 +963,8 @@ mod tests {
         }
         .to_string();
         assert!(refusal.contains("verified aaaaaaaaaaaa, now bbbbbbbbbbbb"));
-        assert!(refusal.contains("thegn merge drain"));
+        assert!(refusal.contains("thegn merge add"));
+        assert!(!refusal.contains("thegn merge drain"));
         assert!(refusal.contains("thegn land"));
     }
 
