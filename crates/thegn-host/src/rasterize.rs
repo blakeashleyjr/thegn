@@ -234,7 +234,12 @@ fn resolve_renderer(
     let mut first_shadowed = None;
     for entry in std::env::split_paths(path_var).filter(|entry| entry.is_absolute()) {
         let candidate = entry.join(program);
-        if !std::fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_file()) {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file()
+            || crate::platform::gate_path::executable_bit(&metadata) == Some(false)
+        {
             continue;
         }
         let Ok(canonical) = candidate.canonicalize() else {
@@ -555,6 +560,9 @@ mod tests {
         std::fs::write(repo_bin.join("pdftoppm"), b"repo renderer").unwrap();
         std::fs::write(system.join("pdftoppm"), b"system renderer").unwrap();
         std::fs::write(other.join("pdftoppm"), b"other renderer").unwrap();
+        crate::platform::set_owner_executable(&repo_bin.join("pdftoppm")).unwrap();
+        crate::platform::set_owner_executable(&system.join("pdftoppm")).unwrap();
+        crate::platform::set_owner_executable(&other.join("pdftoppm")).unwrap();
         std::fs::write(repo.join("doc.pdf"), b"pdf").unwrap();
         RendererFixture {
             repo,
@@ -664,6 +672,28 @@ mod tests {
         assert_eq!(
             resolve_renderer("absent-renderer", Some(&missing_path), None),
             Err(RendererLookup::Missing)
+        );
+    }
+
+    #[test]
+    fn renderer_resolution_skips_a_non_executable_path_hit() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = renderer_fixture(temp.path());
+        let earlier = temp.path().join("earlier");
+        std::fs::create_dir(&earlier).unwrap();
+        let non_executable = earlier.join("pdftoppm");
+        std::fs::write(&non_executable, b"not executable").unwrap();
+        let metadata = std::fs::metadata(&non_executable).unwrap();
+        let path = std::env::join_paths([earlier.as_os_str(), fixture.system.as_os_str()]).unwrap();
+
+        let expected = match crate::platform::gate_path::executable_bit(&metadata) {
+            Some(false) => fixture.system.join("pdftoppm"),
+            Some(true) | None => non_executable,
+        };
+        assert_eq!(
+            resolve_renderer("pdftoppm", Some(&path), None),
+            Ok(expected),
+            "Unix PATH lookup skips a regular file without any execute bit"
         );
     }
 
