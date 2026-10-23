@@ -475,7 +475,7 @@ fn consider_candidate_with_forge(
         }
     };
     tracing::debug!(target: "thegn::ci_autofix", pr = item.number, attempt = guard.attempt(), "CI autofix agent admitted under PR lease");
-    let exited_zero = crate::agent_run::run_outcome_cancellable(
+    let verdict = crate::agent_run::run_outcome_cancellable(
         &crate::agent_run::AgentTaskRun {
             kind: thegn_core::agent_task::TaskKind::PrCiFailure,
             worktree,
@@ -487,8 +487,14 @@ fn consider_candidate_with_forge(
             credential_free: true,
         },
         guard.cancel_flag(),
-    )
-    .exited_zero();
+    );
+    if let Some(reason) = verdict.not_started() {
+        tracing::warn!(target: "thegn::ci_autofix", pr = item.number, %reason, "CI autofix agent did not start");
+        notify(format!(
+            "CI autofix for PR #{} did not start: {reason}; the attempt was still counted",
+            item.number
+        ));
+    }
     if guard.lease_lost() {
         notify(format!(
             "CI autofix for PR #{} stopped: its PR-agent lease could not be confirmed; the next refresh re-evaluates the row",
@@ -559,12 +565,7 @@ fn consider_candidate_with_forge(
                 }
             }
         }
-        let outcome = if exited_zero {
-            "exit ok"
-        } else {
-            "exit failed"
-        };
-        let finished = format!("CI autofix finished ({outcome}); awaiting the next PR refresh");
+        let finished = autofix_finish_detail(&verdict);
         match guard.finish(db, Some((PrqStatus::BlockedCi.as_str(), &finished))) {
             Ok(true) => {}
             Ok(false) => {
@@ -606,6 +607,17 @@ fn head_is_current(
         && fetched.pr.head_ref_oid == expected
         && loc.git_out(&["rev-parse", "HEAD"]).as_deref() == Some(expected)
         && !forge.id().is_empty()
+}
+
+/// The PR-queue detail recorded when a CI autofix run ends. An agent that never started is an
+/// infrastructure failure, not a failed exit, and says why.
+fn autofix_finish_detail(verdict: &crate::agent_run::AgentRunVerdict) -> String {
+    let outcome = match verdict.not_started() {
+        Some(reason) => format!("agent did not start: {reason}; the attempt was still counted"),
+        None if verdict.exited_zero() => "exit ok".to_string(),
+        None => "exit failed".to_string(),
+    };
+    format!("CI autofix finished ({outcome}); awaiting the next PR refresh")
 }
 
 /// Which PR queue row owns a worktree's CI evidence.
@@ -1763,5 +1775,65 @@ mod tests {
                 "row={row_after:?}; notifications={notifications:?}"
             );
         }
+    }
+
+    #[test]
+    fn not_started_finish_detail_names_the_reason() {
+        let finished = autofix_finish_detail(&crate::agent_run::AgentRunVerdict::NotStarted(
+            "sandbox entry refused".into(),
+        ));
+
+        assert!(
+            finished.starts_with("CI autofix finished (agent did not start: sandbox entry refused")
+        );
+    }
+
+    #[test]
+    fn finish_detail_keeps_exit_wording_for_runs_that_started() {
+        assert_eq!(
+            autofix_finish_detail(&crate::agent_run::AgentRunVerdict::Exited(Some(0))),
+            "CI autofix finished (exit ok); awaiting the next PR refresh"
+        );
+        for verdict in [
+            crate::agent_run::AgentRunVerdict::Exited(Some(1)),
+            crate::agent_run::AgentRunVerdict::Exited(None),
+            crate::agent_run::AgentRunVerdict::Interrupted("timed out".into()),
+        ] {
+            assert_eq!(
+                autofix_finish_detail(&verdict),
+                "CI autofix finished (exit failed); awaiting the next PR refresh"
+            );
+        }
+    }
+
+    #[test]
+    fn not_started_agent_is_reported_instead_of_a_failed_exit() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        handoff.config.pr_queue.agent_command = format!(
+            "touch {} {{prompt}} {}",
+            handoff.sentinel.display(),
+            "x".repeat(101 * 1024)
+        );
+
+        consider(&handoff, false);
+
+        assert!(!handoff.sentinel.exists());
+        let row = handoff.db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(row.agent_attempts, 1);
+        assert_eq!(row.status, PrqStatus::BlockedCi.as_str());
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|detail| { detail.contains("agent did not start:") })
+        );
+        assert!(
+            handoff
+                .db
+                .get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|notification| notification.message.contains("did not start:"))
+        );
     }
 }
