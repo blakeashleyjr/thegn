@@ -256,6 +256,8 @@ pub(crate) enum LandRefusal {
     NotReady { status: String },
     NoResult,
     BranchMismatch { queued: String, checked_out: String },
+    NoCandidate,
+    CandidateMoved { recorded: String, current: String },
     Remote,
     Claimed,
 }
@@ -274,6 +276,12 @@ impl std::fmt::Display for LandRefusal {
                 queued,
                 checked_out,
             } => format!("checked-out branch {checked_out} does not match queued branch {queued}"),
+            Self::NoCandidate => "ready merge-queue row has no recorded candidate commit; re-enqueue it with `thegn merge add` and drain it".to_owned(),
+            Self::CandidateMoved { recorded, current } => format!(
+                "branch moved after the queue verified it (verified {}, now {}); run `thegn merge drain` to verify the new commits",
+                recorded.chars().take(12).collect::<String>(),
+                current.chars().take(12).collect::<String>()
+            ),
             Self::Remote => "merge-queue row is not local".to_owned(),
             Self::Claimed => {
                 "merge-queue row is claimed by a drain; run `thegn merge drain` to reclaim it"
@@ -298,6 +306,8 @@ pub(crate) fn ready_land_check(
     row: Option<&MergeQueueRow>,
     claim: Option<&MergeClaimView>,
     checked_out_branch: &str,
+    candidate: Option<&MergeCandidate>,
+    live_tip: Option<&str>,
 ) -> std::result::Result<(), LandRefusal> {
     let Some(row) = row else {
         return Err(LandRefusal::NotQueued);
@@ -322,6 +332,15 @@ pub(crate) fn ready_land_check(
             checked_out: checked_out_branch.to_owned(),
         });
     }
+    let Some(candidate) = candidate else {
+        return Err(LandRefusal::NoCandidate);
+    };
+    if live_tip != Some(candidate.candidate_oid.as_str()) {
+        return Err(LandRefusal::CandidateMoved {
+            recorded: candidate.candidate_oid.clone(),
+            current: live_tip.unwrap_or("missing").to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -339,7 +358,27 @@ pub(crate) fn ready_land_precheck(db: &Db, worktree: &str) -> Result<()> {
         Ok(None) => return Err(anyhow::Error::new(LandRefusal::NotOnBranch)),
         Err(reason) => return Err(anyhow::Error::new(LandRefusal::BranchUnreadable { reason })),
     };
-    ready_land_check(row.as_ref(), claim.as_ref(), &branch).map_err(anyhow::Error::from)
+    let candidate = db.merge_candidate(&canonical_s)?;
+    let live_tip = candidate
+        .as_ref()
+        .map(|candidate| {
+            CliGit
+                .rev_parse(&GitLoc::from_db(&canonical_s, None), &candidate.branch_ref)
+                .map_err(|error| {
+                    anyhow::Error::new(LandRefusal::BranchUnreadable {
+                        reason: error.to_string(),
+                    })
+                })
+        })
+        .transpose()?;
+    ready_land_check(
+        row.as_ref(),
+        claim.as_ref(),
+        &branch,
+        candidate.as_ref(),
+        live_tip.as_deref(),
+    )
+    .map_err(anyhow::Error::from)
 }
 
 /// The repo root for a worktree, with an error that names the actual problem.
@@ -715,7 +754,7 @@ mod tests {
     fn ready_land_check_refuses_every_non_ready_shape() {
         let ready = land_row("ready", Some("fold-oid"), "local", "feature");
         assert_eq!(
-            ready_land_check(None, None, "feature"),
+            ready_land_check(None, None, "feature", None, None),
             Err(LandRefusal::NotQueued)
         );
 
@@ -735,7 +774,9 @@ mod tests {
                 ready_land_check(
                     Some(&land_row(status, Some("fold-oid"), "local", "feature")),
                     None,
-                    "feature"
+                    "feature",
+                    None,
+                    None
                 ),
                 Err(LandRefusal::NotReady {
                     status: status.to_owned(),
@@ -747,7 +788,9 @@ mod tests {
             ready_land_check(
                 Some(&land_row("ready", None, "local", "feature")),
                 None,
-                "feature"
+                "feature",
+                None,
+                None
             ),
             Err(LandRefusal::NoResult)
         );
@@ -755,7 +798,9 @@ mod tests {
             ready_land_check(
                 Some(&land_row("ready", Some(""), "local", "feature")),
                 None,
-                "feature"
+                "feature",
+                None,
+                None
             ),
             Err(LandRefusal::NoResult)
         );
@@ -768,16 +813,24 @@ mod tests {
                     "feature"
                 )),
                 None,
-                "feature"
+                "feature",
+                None,
+                None
             ),
             Err(LandRefusal::Remote)
         );
         assert_eq!(
-            ready_land_check(Some(&ready), Some(&land_claim("claimed")), "feature"),
+            ready_land_check(
+                Some(&ready),
+                Some(&land_claim("claimed")),
+                "feature",
+                None,
+                None
+            ),
             Err(LandRefusal::Claimed)
         );
         assert_eq!(
-            ready_land_check(Some(&ready), None, "other-branch"),
+            ready_land_check(Some(&ready), None, "other-branch", None, None),
             Err(LandRefusal::BranchMismatch {
                 queued: "feature".to_owned(),
                 checked_out: "other-branch".to_owned(),
@@ -788,11 +841,80 @@ mod tests {
     #[test]
     fn ready_land_check_accepts_a_ready_local_row() {
         let ready = land_row("ready", Some("fold-oid"), "local", "feature");
-        assert_eq!(ready_land_check(Some(&ready), None, "feature"), Ok(()));
+        let candidate = MergeCandidate {
+            branch_ref: "refs/heads/feature".to_owned(),
+            candidate_oid: "a".repeat(40),
+        };
         assert_eq!(
-            ready_land_check(Some(&ready), Some(&land_claim("unclaimed")), "feature"),
+            ready_land_check(
+                Some(&ready),
+                None,
+                "feature",
+                Some(&candidate),
+                Some(&candidate.candidate_oid)
+            ),
             Ok(())
         );
+        assert_eq!(
+            ready_land_check(
+                Some(&ready),
+                Some(&land_claim("unclaimed")),
+                "feature",
+                Some(&candidate),
+                Some(&candidate.candidate_oid)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn ready_land_check_refuses_a_branch_that_moved_after_ready() {
+        let ready = land_row("ready", Some("fold-oid"), "local", "feature");
+        let candidate = MergeCandidate {
+            branch_ref: "refs/heads/feature".to_owned(),
+            candidate_oid: "a".repeat(40),
+        };
+        let moved = "b".repeat(40);
+        assert_eq!(
+            ready_land_check(
+                Some(&ready),
+                None,
+                "feature",
+                Some(&candidate),
+                Some(&moved)
+            ),
+            Err(LandRefusal::CandidateMoved {
+                recorded: candidate.candidate_oid.clone(),
+                current: moved.clone(),
+            })
+        );
+        assert_eq!(
+            ready_land_check(Some(&ready), None, "feature", Some(&candidate), None),
+            Err(LandRefusal::CandidateMoved {
+                recorded: candidate.candidate_oid.clone(),
+                current: "missing".to_owned(),
+            })
+        );
+        let refusal = LandRefusal::CandidateMoved {
+            recorded: candidate.candidate_oid.clone(),
+            current: moved,
+        }
+        .to_string();
+        assert!(refusal.contains("verified aaaaaaaaaaaa, now bbbbbbbbbbbb"));
+        assert!(refusal.contains("thegn merge drain"));
+        assert!(refusal.contains("thegn land"));
+    }
+
+    #[test]
+    fn ready_land_check_refuses_a_ready_row_without_a_candidate() {
+        let ready = land_row("ready", Some("fold-oid"), "local", "feature");
+        assert_eq!(
+            ready_land_check(Some(&ready), None, "feature", None, None),
+            Err(LandRefusal::NoCandidate)
+        );
+        let refusal = LandRefusal::NoCandidate.to_string();
+        assert!(refusal.contains("re-enqueue it with `thegn merge add`"));
+        assert!(refusal.contains("thegn land"));
     }
 
     #[test]
@@ -812,13 +934,22 @@ mod tests {
         let worktree = temp.real_path().to_string_lossy().into_owned();
         db.put_worktree("main", &worktree, &worktree, "main", None, None)
             .unwrap();
-        db.enqueue_merge(&worktree, "main", "main").unwrap();
+        let main_tip = rev_parse_tip(temp.real_path(), "refs/heads/main");
+        db.enqueue_merge_candidate(
+            &worktree,
+            "main",
+            "main",
+            &MergeCandidate {
+                branch_ref: "refs/heads/main".to_owned(),
+                candidate_oid: main_tip,
+            },
+        )
+        .unwrap();
         db.update_merge_status(&worktree, "ready", Some("fold-oid"), None, None)
             .unwrap();
 
         let alias = temp.path().to_string_lossy().into_owned();
         ready_land_precheck(&db, &alias).unwrap();
-
         assert!(
             db.admit_merge_claim(&MergeClaimRequest {
                 worktree,
@@ -895,16 +1026,54 @@ mod tests {
         (temp, repo, worktree, db, cfg)
     }
 
-    #[expect(clippy::disallowed_methods)] // read the real fixture branch tip
     fn branch_tip(path: &Path) -> String {
+        rev_parse_tip(path, "refs/heads/feat")
+    }
+
+    #[expect(clippy::disallowed_methods)] // read a real fixture ref for the precheck
+    fn rev_parse_tip(path: &Path, reference: &str) -> String {
         let output = util::git_cmd(path)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["rev-parse", "refs/heads/feat"])
+            .args(["rev-parse", reference])
             .output()
             .unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn ready_land_precheck_refuses_new_commits_after_ready() {
+        let (_temp, _repo, worktree, db, _cfg) = local_candidate_fixture();
+        let worktree_s = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        enqueue_bound_local(&db, &worktree_s, "feat", "main").unwrap();
+        db.update_merge_status(&worktree_s, "ready", Some("fold-oid"), None, None)
+            .unwrap();
+
+        ready_land_precheck(&db, &worktree_s).unwrap();
+
+        std::fs::write(worktree.join("feat.txt"), "second commit\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(
+            &worktree,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "feature two",
+            ],
+        );
+        let current = branch_tip(&worktree);
+        let error = ready_land_precheck(&db, &worktree_s).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LandRefusal>(),
+            Some(LandRefusal::CandidateMoved { current: found, .. }) if found == &current
+        ));
     }
 
     #[test]
