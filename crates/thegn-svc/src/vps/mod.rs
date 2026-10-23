@@ -41,9 +41,9 @@ pub const MANAGED_VAL: &str = "thegn";
 pub const HOST_KEY: &str = "tg-host";
 pub const CONTROLLER_KEY: &str = "tg-ctl";
 
-const MAX_INVENTORY_PAGES: u32 = 50;
-const MAX_INVENTORY_ROWS: usize = 10_000;
-const INVENTORY_BUDGET: Duration = Duration::from_secs(120);
+pub(crate) const MAX_INVENTORY_PAGES: u32 = 50;
+pub(crate) const MAX_INVENTORY_ROWS: usize = 10_000;
+pub(crate) const INVENTORY_BUDGET: Duration = Duration::from_secs(120);
 const DESTROY_ATTEMPTS: u32 = 3;
 
 /// One validated provider inventory page.
