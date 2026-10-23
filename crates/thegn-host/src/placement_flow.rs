@@ -463,6 +463,10 @@ fn binding_for(cfg: &Config, host: &HostId) -> Option<HostBinding> {
 
 /// Resolve a live tenancy against the loaded config first, then the DB-backed
 /// host catalog. A catalog read failure must never release a live reservation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "short-lived local result of one lookup; boxing buys nothing"
+)]
 enum StickyBinding {
     Found(HostBinding),
     Missing,
