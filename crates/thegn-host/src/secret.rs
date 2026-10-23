@@ -221,7 +221,7 @@ fn store_in(
     dir: &std::path::Path,
     name: &str,
     token: &str,
-    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<()>>,
+    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<(), KeyringWriteError>>,
 ) -> Result<String> {
     store_with_dir(name, token, set, || Ok(dir.to_path_buf()))
 }
@@ -229,7 +229,7 @@ fn store_in(
 fn store_with_dir(
     name: &str,
     token: &str,
-    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<()>>,
+    set: impl FnOnce(&str, &str) -> KeyringOutcome<Result<(), KeyringWriteError>>,
     dir: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<String> {
     match set(name, token) {
@@ -361,7 +361,7 @@ pub fn forget_with_report(name: &str) -> ForgetReport {
 fn forget_in(
     dir: &std::path::Path,
     name: &str,
-    del: impl FnOnce(&str) -> KeyringOutcome<Result<()>>,
+    del: impl FnOnce(&str) -> KeyringOutcome<Result<(), KeyringWriteError>>,
 ) -> ForgetReport {
     let keyring = keyring_removal(del(name));
     // Do not derive and delete the pre-hash fallback filename. That historical
@@ -386,7 +386,7 @@ fn forget_in(
     ForgetReport { keyring, file }
 }
 
-fn keyring_removal(outcome: KeyringOutcome<Result<()>>) -> ForgetKeyringOutcome {
+fn keyring_removal(outcome: KeyringOutcome<Result<(), KeyringWriteError>>) -> ForgetKeyringOutcome {
     match outcome {
         KeyringOutcome::Completed(Ok(())) => ForgetKeyringOutcome::Removed,
         KeyringOutcome::Completed(Err(error)) => ForgetKeyringOutcome::Failed(error.to_string()),
@@ -524,6 +524,64 @@ impl std::fmt::Display for KeyringReadError {
         match self {
             Self::Denied(reason) | Self::Unavailable(reason) => f.write_str(reason),
         }
+    }
+}
+
+/// Why a keyring write or delete failed after it started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyringWriteError {
+    /// The store answered but refused this mutation.
+    Denied(String),
+    /// The keyring backend could not complete the mutation.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for KeyringWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied(reason) | Self::Unavailable(reason) => f.write_str(reason),
+        }
+    }
+}
+
+fn keyring_write_error(error: keyring::Error) -> KeyringWriteError {
+    match error {
+        keyring::Error::NoEntry => KeyringWriteError::Unavailable("keyring entry vanished".into()),
+        keyring::Error::NoStorageAccess(error) => {
+            KeyringWriteError::Denied(format!("keyring access denied: {error}"))
+        }
+        keyring::Error::PlatformFailure(error) => {
+            KeyringWriteError::Unavailable(format!("keyring platform failure: {error}"))
+        }
+        keyring::Error::Ambiguous(_) => {
+            KeyringWriteError::Denied("keyring entry is ambiguous".into())
+        }
+        keyring::Error::BadEncoding(_) => {
+            KeyringWriteError::Denied("keyring entry is not valid UTF-8".into())
+        }
+        error @ keyring::Error::TooLong(..) | error @ keyring::Error::Invalid(..) => {
+            KeyringWriteError::Denied(format!("keyring entry is unusable: {error}"))
+        }
+        error => KeyringWriteError::Unavailable(format!("keyring error: {error}")),
+    }
+}
+
+fn keyring_store_mutation_result(
+    outcome: KeyringOutcome<Result<(), KeyringWriteError>>,
+    verb: &'static str,
+) -> Result<(), SecretError> {
+    match outcome {
+        KeyringOutcome::Completed(Ok(())) => Ok(()),
+        KeyringOutcome::Completed(Err(KeyringWriteError::Denied(reason))) => {
+            Err(SecretError::denied(reason))
+        }
+        KeyringOutcome::Completed(Err(KeyringWriteError::Unavailable(reason))) => {
+            Err(SecretError::unavailable(reason))
+        }
+        KeyringOutcome::TimedOut => Err(SecretError::outcome_unknown(format!(
+            "keyring outcome unknown: {verb} timed out; retry once the keyring responds"
+        ))),
+        KeyringOutcome::NotStarted(reason) => Err(SecretError::unavailable(reason)),
     }
 }
 
@@ -730,24 +788,22 @@ fn keyring_get(account: &str) -> Result<Option<String>, KeyringReadError> {
     }
 }
 
-fn keyring_set(account: &str, token: &str) -> KeyringOutcome<Result<()>> {
+fn keyring_set(account: &str, token: &str) -> KeyringOutcome<Result<(), KeyringWriteError>> {
     let account = account.to_string();
     let token = token.to_string();
     run_keyring_op_with_timeout("set", KEYRING_PROBE_TIMEOUT, move || {
-        keyring::Entry::new(KEYRING_SERVICE, &account)
-            .context("keyring entry")?
-            .set_password(&token)
-            .context("keyring set")
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(keyring_write_error)?;
+        entry.set_password(&token).map_err(keyring_write_error)
     })
 }
 
-fn keyring_del(account: &str) -> KeyringOutcome<Result<()>> {
+fn keyring_del(account: &str) -> KeyringOutcome<Result<(), KeyringWriteError>> {
     let account = account.to_string();
     run_keyring_op_with_timeout("delete", KEYRING_PROBE_TIMEOUT, move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).context("keyring entry")?;
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(keyring_write_error)?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error).context("keyring delete"),
+            Err(error) => Err(keyring_write_error(error)),
         }
     })
 }
@@ -1022,26 +1078,10 @@ impl SecretStore for KeyringStore {
         }
     }
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
-        match keyring_set(account, value) {
-            KeyringOutcome::Completed(result) => {
-                result.map_err(|error| SecretError::denied(error.to_string()))
-            }
-            KeyringOutcome::TimedOut => Err(SecretError::denied(
-                "keyring outcome unknown: write timed out; retry once the keyring responds",
-            )),
-            KeyringOutcome::NotStarted(reason) => Err(SecretError::unavailable(reason)),
-        }
+        keyring_store_mutation_result(keyring_set(account, value), "write")
     }
     fn del(&self, account: &str) -> Result<(), SecretError> {
-        match keyring_del(account) {
-            KeyringOutcome::Completed(result) => {
-                result.map_err(|error| SecretError::denied(error.to_string()))
-            }
-            KeyringOutcome::TimedOut => Err(SecretError::denied(
-                "keyring outcome unknown: removal timed out; retry once the keyring responds",
-            )),
-            KeyringOutcome::NotStarted(reason) => Err(SecretError::unavailable(reason)),
-        }
+        keyring_store_mutation_result(keyring_del(account), "removal")
     }
 }
 
@@ -1672,6 +1712,59 @@ mod tests {
     }
 
     #[test]
+    fn keyring_write_error_classifies_store_errors() {
+        assert!(matches!(
+            keyring_write_error(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("locked")
+            ))),
+            KeyringWriteError::Denied(_)
+        ));
+        assert!(matches!(
+            keyring_write_error(keyring::Error::PlatformFailure(Box::new(
+                std::io::Error::other("offline")
+            ))),
+            KeyringWriteError::Unavailable(_)
+        ));
+        assert!(matches!(
+            keyring_write_error(keyring::Error::Ambiguous(Vec::new())),
+            KeyringWriteError::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn keyring_write_outcomes_keep_denied_unavailable_and_unknown_apart() {
+        use thegn_core::seam::{ErrorClass, SeamError};
+
+        let denied = keyring_store_mutation_result(
+            KeyringOutcome::Completed(Err(KeyringWriteError::Denied("locked".into()))),
+            "write",
+        )
+        .expect_err("denied keyring write must fail");
+        assert_eq!(denied.class(), ErrorClass::Auth);
+        assert!(!denied.falls_through());
+
+        let unavailable = keyring_store_mutation_result(
+            KeyringOutcome::Completed(Err(KeyringWriteError::Unavailable("offline".into()))),
+            "write",
+        )
+        .expect_err("unavailable keyring write must fail");
+        assert_eq!(unavailable.class(), ErrorClass::NotInstalled);
+        assert!(unavailable.falls_through());
+
+        let timed_out = keyring_store_mutation_result(KeyringOutcome::TimedOut, "write")
+            .expect_err("timed out keyring write must fail");
+        assert_eq!(timed_out.class(), ErrorClass::Transient);
+        assert!(!timed_out.falls_through());
+        assert!(timed_out.message().contains("outcome unknown"));
+
+        let not_started =
+            keyring_store_mutation_result(KeyringOutcome::NotStarted("busy"), "write")
+                .expect_err("not-started keyring write must fail");
+        assert_eq!(not_started.class(), ErrorClass::NotInstalled);
+        assert!(not_started.falls_through());
+    }
+
+    #[test]
     fn typed_broker_reports_a_denied_keyring_read_as_denied() {
         let reference = SecretRef::Keyring {
             account: "media-mpd-test-account".into(),
@@ -2061,7 +2154,7 @@ mod tests {
     fn completed_keyring_set_failure_still_falls_back_to_file() {
         let temp = private_temp();
         let result = store_in(temp.path(), "acct", "tok", |_, _| {
-            KeyringOutcome::Completed(Err(anyhow::anyhow!("denied")))
+            KeyringOutcome::Completed(Err(KeyringWriteError::Denied("denied".into())))
         })
         .unwrap();
         assert!(result.starts_with("file:"));
@@ -2401,7 +2494,7 @@ mod tests {
         let temp = private_temp();
         let secrets = temp.path().join("secrets");
         let result = store_in(&secrets, "acct", "tok", |_, _| {
-            KeyringOutcome::Completed(Err(anyhow::anyhow!("denied")))
+            KeyringOutcome::Completed(Err(KeyringWriteError::Denied("denied".into())))
         })
         .unwrap();
 

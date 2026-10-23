@@ -258,6 +258,32 @@ pub(crate) fn spawn_add(tx: &PrqTx, waker: &TerminalWaker, worktree: PathBuf) {
     });
 }
 
+fn pr_removal_message(number: u64, outcome: thegn_core::store::PrRemoval) -> String {
+    match outcome {
+        thegn_core::store::PrRemoval::Removed => {
+            format!("Removed PR #{number} from the queue.")
+        }
+        thegn_core::store::PrRemoval::Missing => format!("PR #{number} is no longer in the queue"),
+        thegn_core::store::PrRemoval::AgentRunning => format!(
+            "PR #{number} was not removed: a PR agent is running for it; remove it after the agent finishes"
+        ),
+    }
+}
+
+fn pr_clear_message(outcome: &thegn_core::store::PrClearOutcome) -> String {
+    let mut message = format!("PR queue cleared ({} removed).", outcome.removed);
+    if !outcome.kept_running.is_empty() {
+        let kept = outcome
+            .kept_running
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!(" kept PR {kept}: a PR agent is running for them"));
+    }
+    message
+}
+
 /// Remove one row, or clear the repo's queue, off the loop.
 pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf, what: Mutation) {
     let tx = tx.clone();
@@ -281,17 +307,31 @@ pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf,
         };
         let root_s = root.to_string_lossy().into_owned();
         let msg = match what {
-            Mutation::Remove { key, number } => {
-                if let Err(e) = db.remove_pr_entry(&key) {
-                    format!("remove failed: {e}")
-                } else {
-                    format!("Removed PR #{number} from the queue")
+            Mutation::Remove { key, number } => match db.remove_pr_entry(&key) {
+                Ok(
+                    outcome @ (thegn_core::store::PrRemoval::AgentRunning
+                    | thegn_core::store::PrRemoval::Missing),
+                ) => {
+                    send(PrqMsg::Failed(pr_removal_message(number, outcome)));
+                    return;
                 }
-            }
-            Mutation::Clear => {
-                let n = db.clear_pr_queue(&root_s).unwrap_or(0);
-                format!("PR queue cleared ({n} removed)")
-            }
+                Ok(outcome) => pr_removal_message(number, outcome),
+                Err(error) => {
+                    send(PrqMsg::Failed(format!("remove failed: {error}")));
+                    return;
+                }
+            },
+            Mutation::Clear => match db.clear_pr_queue(&root_s) {
+                Ok(outcome) if outcome.kept_running.is_empty() => pr_clear_message(&outcome),
+                Ok(outcome) => {
+                    send(PrqMsg::Failed(pr_clear_message(&outcome)));
+                    return;
+                }
+                Err(error) => {
+                    send(PrqMsg::Failed(format!("clear failed: {error}")));
+                    return;
+                }
+            },
             // Re-queue: the same "watch it again" reset the CLI's `add` performs,
             // which is how a `needs_human` row is re-armed.
             Mutation::Rewatch { key, number } => {
@@ -1255,5 +1295,32 @@ mod tests {
         };
         // Row order: PR1, task1, PR2, task2.
         assert_eq!(selected_review_task(&panel, 3).unwrap().id, 10);
+    }
+
+    #[test]
+    fn pr_removal_message_names_a_running_agent() {
+        assert_eq!(
+            pr_removal_message(7, thegn_core::store::PrRemoval::AgentRunning),
+            "PR #7 was not removed: a PR agent is running for it; remove it after the agent finishes"
+        );
+    }
+
+    #[test]
+    fn pr_removal_message_reports_a_missing_row() {
+        assert_eq!(
+            pr_removal_message(7, thegn_core::store::PrRemoval::Missing),
+            "PR #7 is no longer in the queue"
+        );
+    }
+
+    #[test]
+    fn pr_clear_message_lists_kept_prs() {
+        assert_eq!(
+            pr_clear_message(&thegn_core::store::PrClearOutcome {
+                removed: 2,
+                kept_running: vec![3, 8],
+            }),
+            "PR queue cleared (2 removed). kept PR #3, #8: a PR agent is running for them"
+        );
     }
 }

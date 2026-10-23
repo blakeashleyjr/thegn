@@ -44,6 +44,7 @@ pub const CONTROLLER_KEY: &str = "tg-ctl";
 const MAX_INVENTORY_PAGES: u32 = 50;
 const MAX_INVENTORY_ROWS: usize = 10_000;
 const INVENTORY_BUDGET: Duration = Duration::from_secs(120);
+const DESTROY_ATTEMPTS: u32 = 3;
 
 /// One validated provider inventory page.
 pub struct InventoryPage<T> {
@@ -680,6 +681,48 @@ impl VpsProvider {
             .find(|s| s.name == name))
     }
 
+    /// Confirm that a deleted instance is absent from the complete managed inventory.
+    async fn confirm_absent(&self, name: &str, instance_id: &str) -> Result<()> {
+        for check_attempt in 0..DESTROY_ATTEMPTS {
+            let inventory = self.list_detailed().await.map_err(|error| {
+                tracing::debug!(
+                    target: "thegn::vps",
+                    %error,
+                    name,
+                    "could not confirm VPS absence from provider inventory"
+                );
+                anyhow!("vps destroy {name}: cannot confirm the instance is gone (provider inventory lookup failed); keeping the ledger record and SSH custody")
+            })?;
+
+            let still_has_instance_id = inventory.iter().any(|instance| instance.id == instance_id);
+            if !still_has_instance_id && !inventory.iter().any(|instance| instance.name == name) {
+                return Ok(());
+            }
+
+            if !still_has_instance_id
+                && let Some(instance) = inventory.iter().find(|instance| instance.name == name)
+            {
+                let listed_id = instance.id.clone();
+                if let Some(mut record) = registry::read(name) {
+                    record.instance_id.clone_from(&listed_id);
+                    registry::write(&record)
+                        .context("vps: retarget registry record to listed instance")?;
+                }
+                return Err(anyhow!(
+                    "vps destroy {name}: provider still lists an instance of this name under vendor id {listed_id}; retargeting the next destroy while keeping the ledger record and SSH custody"
+                ));
+            }
+
+            if check_attempt + 1 < DESTROY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+
+        Err(anyhow!(
+            "vps destroy {name}: the provider accepted the delete but still lists the instance; keeping the ledger record and SSH custody until a later destroy or reaper pass confirms it is gone"
+        ))
+    }
+
     /// Ensure the managed public key is registered, returning its vendor id;
     /// the existing-key lookup sees a complete inventory or returns Err.
     async fn ensure_ssh_key(&self) -> Result<i64> {
@@ -1269,12 +1312,11 @@ impl RemoteProvider for VpsProvider {
             };
             // Retry transient statuses: a leaked VPS bills forever (same policy as
             // the sprites destroy).
-            const ATTEMPTS: u32 = 3;
             let base = self.spec.validated_api_base()?;
             let authority = crate::provider::authority_key(&base)?;
             let url = self.shaper().server_url(&base, &iid);
             let mut last_status = None;
-            for attempt in 0..ATTEMPTS {
+            for attempt in 0..DESTROY_ATTEMPTS {
                 let status = {
                     let _permit = crate::provider::CONTROL_GATE.acquire(&authority).await?;
                     self.client
@@ -1289,6 +1331,7 @@ impl RemoteProvider for VpsProvider {
                         .status()
                 };
                 if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                    self.confirm_absent(id, &iid).await?;
                     registry::remove(id);
                     thegn_core::managed_ssh::record_revoked(
                         self.spec.kind.as_str(),
@@ -1302,7 +1345,7 @@ impl RemoteProvider for VpsProvider {
                 if !crate::provider::transient_status(status) {
                     break;
                 }
-                if attempt + 1 < ATTEMPTS {
+                if attempt + 1 < DESTROY_ATTEMPTS {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
@@ -1912,5 +1955,177 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("bound to a different worktree"));
+    }
+
+    async fn fake_hetzner_server(
+        delete_status: u16,
+        still_listed: bool,
+        listed_id: u64,
+        list_status: u16,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let first = request.lines().next().unwrap_or_default();
+                    let mut fields = first.split(' ');
+                    let method = fields.next().unwrap_or_default();
+                    let path = fields.next().unwrap_or_default();
+                    let (code, body) = if method == "DELETE" && path == "/servers/42" {
+                        (delete_status, "{}".to_string())
+                    } else if method == "GET" && path.starts_with("/servers?") {
+                        let (code, servers, total) = if list_status == 200 && still_listed {
+                            (
+                                list_status,
+                                format!(
+                                    r#"[{{"id":{listed_id},"name":"tg-vps-destroy-proof","status":"running","labels":{{}}}}]"#
+                                ),
+                                1,
+                            )
+                        } else {
+                            (list_status, "[]".to_string(), 0)
+                        };
+                        let body = if code == 200 {
+                            format!(
+                                r#"{{"servers":{servers},"meta":{{"pagination":{{"next_page":null,"total_entries":{total}}}}}}}"#
+                            )
+                        } else {
+                            "{}".to_string()
+                        };
+                        (code, body)
+                    } else {
+                        (500, "{}".to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if let Err(error) = sock.write_all(response.as_bytes()).await {
+                        tracing::debug!(%error, "best-effort test server response write");
+                    }
+                    if let Err(error) = sock.flush().await {
+                        tracing::debug!(%error, "best-effort test server response flush");
+                    }
+                });
+            }
+        });
+        (base, handle)
+    }
+
+    fn destroy_test_provider(name: &str, api_base: String) -> VpsProvider {
+        VpsProvider::new(VpsSpec {
+            kind: VpsKind::Hetzner,
+            api_base,
+            token: "unused".into(),
+            name: name.into(),
+            region: String::new(),
+            size: String::new(),
+            image: String::new(),
+            max_instances: 0,
+            max_lifetime_secs: 0,
+            key_path: "/tmp/nonexistent-managed-key".into(),
+            pubkey: TEST_PUBKEY.into(),
+            skip_ready_wait: true,
+        })
+    }
+
+    fn write_destroy_test_record(name: &str) {
+        registry::write(&registry::VpsRecord {
+            name: name.into(),
+            provider: "hetzner".into(),
+            state: "creating".into(),
+            instance_id: "42".into(),
+            ip: String::new(),
+            created_at: 1,
+            owner: String::new(),
+            account: String::new(),
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn destroy_keeps_ledger_while_inventory_still_lists_the_instance() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-vps-destroy-proof";
+        write_destroy_test_record(name);
+        let (base, _server) = fake_hetzner_server(200, true, 42, 200).await;
+        let provider = destroy_test_provider(name, base);
+
+        let error = match provider.destroy(name).await {
+            Ok(()) => panic!("destroy must refuse while inventory still lists the instance"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("still lists the instance"));
+        assert_eq!(
+            registry::read(name).map(|record| record.instance_id),
+            Some("42".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_keeps_ledger_when_absence_cannot_be_confirmed() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-vps-destroy-proof";
+        write_destroy_test_record(name);
+        let (base, _server) = fake_hetzner_server(404, false, 42, 500).await;
+        let provider = destroy_test_provider(name, base);
+
+        let error = match provider.destroy(name).await {
+            Ok(()) => panic!("destroy must refuse when inventory cannot confirm absence"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot confirm the instance is gone")
+        );
+        assert_eq!(
+            registry::read(name).map(|record| record.instance_id),
+            Some("42".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_retires_ledger_after_inventory_confirms_absence() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-vps-destroy-proof";
+        write_destroy_test_record(name);
+        let (base, _server) = fake_hetzner_server(200, false, 42, 200).await;
+        let provider = destroy_test_provider(name, base);
+
+        // Positive control: this also passes before the absence-proof change.
+        assert!(provider.destroy(name).await.is_ok());
+        assert!(registry::read(name).is_none());
+    }
+
+    #[tokio::test]
+    async fn destroy_retargets_stale_registry_id_to_same_named_instance() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let name = "tg-vps-destroy-proof";
+        write_destroy_test_record(name);
+        let (base, _server) = fake_hetzner_server(404, true, 84, 200).await;
+        let provider = destroy_test_provider(name, base);
+
+        let error = match provider.destroy(name).await {
+            Ok(()) => {
+                panic!("destroy must retain the ledger while the same-named instance remains")
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("retargeting the next destroy"));
+        assert_eq!(
+            registry::read(name).map(|record| record.instance_id),
+            Some("84".into()),
+            "a name match under a different vendor id retargets the next destroy"
+        );
     }
 }

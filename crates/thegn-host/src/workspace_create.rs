@@ -755,8 +755,18 @@ fn promote_staged_clone(staging: &std::path::Path, dest: &std::path::Path) -> Re
         }
         thegn_core::fsperm::restore_normal_directory_mode(staging)
             .with_context(|| format!("restore workspace directory mode {}", staging.display()))?;
-        std::fs::rename(staging, dest)
-            .with_context(|| format!("promote staged clone to {}", dest.display()))
+        match crate::platform::rename_noreplace::rename_dir_noreplace(staging, dest) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!(
+                    "workspace destination appeared while cloning: {}; not replaced",
+                    dest.display()
+                );
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("promote staged clone to {}", dest.display()))
+            }
+        }
     })();
     if result.is_err() {
         remove_partial_clone_dest(staging, false);
@@ -773,6 +783,24 @@ fn reclaim_stale_clone_staging(
     own_pid: u32,
     pid_alive: impl Fn(i64) -> bool,
 ) -> usize {
+    reclaim_clone_staging(parent, Some(name), own_pid, pid_alive)
+}
+
+/// Reclaim dead-pid clone staging directories for every workspace name.
+pub(crate) fn sweep_stale_clone_staging(
+    workspaces_dir: &std::path::Path,
+    own_pid: u32,
+    pid_alive: impl Fn(i64) -> bool,
+) -> usize {
+    reclaim_clone_staging(workspaces_dir, None, own_pid, pid_alive)
+}
+
+fn reclaim_clone_staging(
+    parent: &std::path::Path,
+    name: Option<&str>,
+    own_pid: u32,
+    pid_alive: impl Fn(i64) -> bool,
+) -> usize {
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(error) => {
@@ -780,7 +808,6 @@ fn reclaim_stale_clone_staging(
             return 0;
         }
     };
-    let prefix = format!(".{name}.clone-");
     let mut removed = 0;
     for entry in entries {
         let entry = match entry {
@@ -794,23 +821,7 @@ fn reclaim_stale_clone_staging(
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        let Some(remainder) = file_name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some((generation, pid)) = remainder.rsplit_once('-') else {
-            continue;
-        };
-        if generation.is_empty()
-            || pid.is_empty()
-            || !generation.bytes().all(|byte| byte.is_ascii_digit())
-            || !pid.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            continue;
-        }
-        let Ok(_generation) = generation.parse::<u64>() else {
-            continue;
-        };
-        let Ok(pid) = pid.parse::<u32>() else {
+        let Some(pid) = stale_staging_pid(file_name, name) else {
             continue;
         };
         if pid == own_pid || pid_alive(i64::from(pid)) {
@@ -839,6 +850,30 @@ fn reclaim_stale_clone_staging(
         }
     }
     removed
+}
+
+fn stale_staging_pid(file_name: &str, name: Option<&str>) -> Option<u32> {
+    let remainder = if let Some(name) = name {
+        file_name.strip_prefix(&format!(".{name}.clone-"))?
+    } else {
+        let marker = file_name.rfind(".clone-")?;
+        if !file_name.starts_with('.') || marker <= 1 {
+            return None;
+        }
+        &file_name[marker + ".clone-".len()..]
+    };
+    let (generation, pid) = remainder.rsplit_once('-')?;
+    if generation.is_empty()
+        || pid.is_empty()
+        || !generation.bytes().all(|byte| byte.is_ascii_digit())
+        || !pid.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    if generation.parse::<u64>().is_err() {
+        return None;
+    }
+    pid.parse::<u32>().ok()
 }
 
 fn remove_partial_clone_dest(dest: &std::path::Path, dest_existed: bool) {
@@ -2134,6 +2169,77 @@ Receiving objects: 100% (10/10)\rdone.\n";
             ".ws.clone-7-4242-extra",
             "ws",
         ] {
+            assert!(temp.path().join(name).is_dir(), "{name} should remain");
+        }
+        assert!(regular_file.is_file());
+    }
+
+    #[test]
+    fn startup_sweep_reclaims_dead_staging_for_every_workspace_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = [".a.clone-7-4242", ".b-c.clone-8-4243", ".d.e.clone-9-4244"];
+        for name in stale {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("partial"), b"interrupted clone").unwrap();
+        }
+
+        assert_eq!(
+            sweep_stale_clone_staging(temp.path(), 1, |_| false),
+            stale.len()
+        );
+        for name in stale {
+            assert!(
+                !temp.path().join(name).exists(),
+                "{name} should be reclaimed"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_sweep_keeps_live_own_symlinked_and_non_matching_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join(".a.clone-7-4242");
+        let own = temp.path().join(".a.clone-8-1");
+        for path in [&live, &own] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("partial"), b"clone in progress").unwrap();
+        }
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("important"), b"keep").unwrap();
+        let link = temp.path().join(".s.clone-7-4244");
+        if crate::platform::symlink_file_for_test(&victim, &link).is_err() {
+            return;
+        }
+        let non_matching_dirs = [
+            ".clone-7-4245",
+            "a.clone-7-4246",
+            ".a.clone-x-4242",
+            ".a.clone-7-",
+            ".a.clone-7-4242-extra",
+            "ws",
+        ];
+        for name in non_matching_dirs {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let regular_file = temp.path().join(".f.clone-9-4247");
+        std::fs::write(&regular_file, b"not a directory").unwrap();
+
+        assert_eq!(
+            sweep_stale_clone_staging(temp.path(), 1, |pid| pid == 4242),
+            0
+        );
+        assert!(live.join("partial").is_file());
+        assert!(own.join("partial").is_file());
+        assert!(victim.join("important").is_file());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        for name in non_matching_dirs {
             assert!(temp.path().join(name).is_dir(), "{name} should remain");
         }
         assert!(regular_file.is_file());

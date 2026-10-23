@@ -1748,10 +1748,13 @@ pub fn provider_proxy_target(
     // Bound-aware id (like `native_exec_for`/`provider_sandbox_name`): a claimed
     // warm-pool spare targets that spare, not the derived husk the pool flow
     // destroyed — else the ssh proxy + p2p push relay into the wrong sandbox.
-    let id = Db::open()
-        .ok()
-        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten())
-        .unwrap_or_else(|| p.id.clone());
+    let id = match crate::provider_factory::sandbox_id_for(worktree, &p.id) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "provider proxy refused: warm-pool sandbox binding unreadable");
+            return None;
+        }
+    };
     let provider = provider_for_named(pc, &id)?;
     let workdir = crate::provider_workdir::resolve(pc, &id);
     let provider_kind = pc.provider.trim().to_string();
@@ -1957,10 +1960,13 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     // A claimed warm-pool spare overrides the derived id (same rule as
     // `provider_sandbox_name`): the pane must attach to the sandbox the
     // worktree is actually bound to, not the derived husk.
-    let bound = Db::open()
-        .ok()
-        .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
-    let sandbox_id = bound.unwrap_or_else(|| p.id.clone());
+    let sandbox_id = match crate::provider_factory::sandbox_id_for(worktree, &p.id) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, error = %format!("{error:#}"), "native exec refused: warm-pool sandbox binding unreadable");
+            return None;
+        }
+    };
     // Resolve the pane cwd against the sandbox's cached `$HOME` (the workspace lives
     // under the login user's home — see `provider_workdir`), so `cd {workdir}` lands
     // in the repo and not a nonexistent `/workspace`.
@@ -2467,7 +2473,7 @@ pub fn provision_provider_env_named(
         })
         .transpose()?;
     if let Some((_, _, pubkey)) = &managed_ssh {
-        setup.push(sprite_sshd_setup_script(pubkey));
+        setup.push(sprite_sshd_setup_script(pubkey)?);
     }
     // mosh transport: install mosh-server (else the pane falls back to plain ssh).
     if pc.transport == thegn_core::config::RemoteTransport::Mosh
@@ -2824,10 +2830,8 @@ pub fn provision_provider_env_named(
         // Verify that the exact key made it into the remote authorization file
         // before publishing custody. A failed SSH setup must not become an
         // apparently-authorized ledger row.
-        let script = format!(
-            "grep -qF -- {} \"$HOME/.ssh/authorized_keys\"",
-            thegn_core::util::sh_quote(public)
-        );
+        let key_id = crate::managed_ssh_rotation::key_id(public)?;
+        let script = crate::managed_ssh_rotation::authorized_probe_script(&key_id);
         let argv = vec!["sh".to_string(), "-lc".to_string(), script];
         let (code, _) =
             block_on_provider(|| async { provider.run_exec(&id, &argv, None, &[]).await })?;
@@ -4018,7 +4022,18 @@ pub fn launch_spec_full(
     let eff_agent = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage).ok();
 
     // One DB handle for the whole spec resolution (each open re-runs pragmas).
-    let db = Db::open().ok(); // best-effort: cache: choice recording and repo-root/sandbox lookups all fall back to local git below
+    let db = match Db::open() {
+        Ok(db) => Some(db),
+        Err(error) => {
+            launch_state_gate(
+                cfg,
+                choice,
+                "the state database could not be opened, so this worktree's saved sandbox override and credential-overlay gate cannot be checked",
+                &error,
+            )?;
+            None
+        }
+    }; // best-effort for shells: choice recording and repo-root lookups fall back to local git below
 
     // Record the choice for the dashboard / `--resume` (keyed by worktree path).
     // Two launches are deliberately NOT recorded as the worktree's remembered
@@ -4026,15 +4041,29 @@ pub fn launch_spec_full(
     // their dotfiles), and tool drawers (yazi/lazygit/editor/diff) — those are
     // overlays, not the worktree's agent, and are auto-prewarmed on every switch,
     // so recording them would clobber the real choice on every worktree.
-    let saved_backend = db.as_ref().and_then(|db| {
-        if !extras.suppress_agent_record
-            && choice != "clean-shell"
-            && cfg.tool_command(choice).is_none()
-        {
-            let _ = db.set_worktree_agent(worktree, choice); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let saved_backend = match db.as_ref() {
+        Some(db) => {
+            if !extras.suppress_agent_record
+                && choice != "clean-shell"
+                && cfg.tool_command(choice).is_none()
+            {
+                let _ = db.set_worktree_agent(worktree, choice); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
+            match db.worktree_sandbox(worktree) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    launch_state_gate(
+                        cfg,
+                        choice,
+                        "this worktree's saved sandbox override could not be read",
+                        &error,
+                    )?;
+                    None
+                }
+            }
         }
-        db.worktree_sandbox(worktree).ok().flatten()
-    });
+        None => None,
+    };
 
     // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
     // DB (carries remote worktrees with no local cwd), else climb from the path.
@@ -4128,9 +4157,17 @@ pub fn launch_spec_full(
     // of a terminal.
     if !loc.is_remote()
         && let Some(db) = db.as_ref()
-        && let Some(slug) = repo_slug(db, &repo_root)
     {
-        credential_overlay_gate(cfg, db, &slug, choice)?;
+        match repo_slug_checked(db, &repo_root) {
+            Ok(Some(slug)) => credential_overlay_gate(cfg, db, &slug, choice)?,
+            Ok(None) => {}
+            Err(error) => launch_state_gate(
+                cfg,
+                choice,
+                "the workspace slug for the credential-overlay gate could not be read",
+                &error,
+            )?,
+        }
     }
     let resolved = (!loc.is_remote())
         .then_some(db.as_ref())
@@ -4490,12 +4527,7 @@ pub(crate) fn credential_overlay_gate(
     // program maps to a known account provider: `env_bundle` redirects HOME for
     // ANY of them, which is exactly the credential the refused block pinned. A
     // choice that is not a configured entry (a shell) always launches.
-    let configured = cfg
-        .agents
-        .iter()
-        .chain(cfg.tools.iter())
-        .any(|entry| entry.name == choice);
-    if !configured {
+    if !is_configured_entry(cfg, choice) {
         return Ok(());
     }
     if let thegn_core::workspace_overlay::WorkspaceOverlay::Refused(refusal) =
@@ -4512,12 +4544,7 @@ pub(crate) fn dotfiles_launch_gate(
     choice: &str,
     failure: anyhow::Error,
 ) -> anyhow::Result<()> {
-    let configured = cfg
-        .agents
-        .iter()
-        .chain(cfg.tools.iter())
-        .any(|entry| entry.name == choice);
-    if configured {
+    if is_configured_entry(cfg, choice) {
         let detail = format!("{failure:#}");
         return Err(failure.context(format!(
             "refusing to launch `{choice}`: its bundle HOME could not be prepared: {detail}"
@@ -4527,11 +4554,39 @@ pub(crate) fn dotfiles_launch_gate(
     Ok(())
 }
 
+fn is_configured_entry(cfg: &Config, choice: &str) -> bool {
+    cfg.agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .any(|entry| entry.name == choice)
+}
+
+pub(crate) fn launch_state_gate(
+    cfg: &Config,
+    choice: &str,
+    what: &str,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    if is_configured_entry(cfg, choice) {
+        anyhow::bail!("refusing to launch `{choice}`: {what}: {error:#}");
+    }
+    thegn_core::msg::warn(&format!("{what}: {error:#}; the shell launches without it"));
+    Ok(())
+}
+
 /// The persisted slug for a repo root (for per-workspace account defaults), or
 /// `None` if the DB has no slug yet.
 pub(crate) fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
-    let base = repo_root.file_name()?.to_string_lossy().into_owned();
-    db.slug_for_repo(&repo_root.to_string_lossy(), &base).ok()
+    repo_slug_checked(db, repo_root).ok().flatten()
+}
+
+pub(crate) fn repo_slug_checked(db: &Db, repo_root: &Path) -> anyhow::Result<Option<String>> {
+    let Some(file_name) = repo_root.file_name() else {
+        return Ok(None);
+    };
+    let base = file_name.to_string_lossy().into_owned();
+    db.slug_for_repo(&repo_root.to_string_lossy(), &base)
+        .map(Some)
 }
 
 fn sandbox_candidates(

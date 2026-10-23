@@ -1266,84 +1266,6 @@ fn valid_remote_component(name: &str) -> bool {
             && name.as_bytes()[1] == b':')
 }
 
-fn ensure_download_dir(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-            anyhow::bail!(
-                "download destination component is not a real directory: {}",
-                path.display()
-            )
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(path).with_context(|| format!("create {}", path.display()))?;
-            let meta = std::fs::symlink_metadata(path)?;
-            anyhow::ensure!(
-                meta.is_dir() && !meta.file_type().is_symlink(),
-                "download destination changed during directory creation: {}",
-                path.display()
-            );
-            Ok(())
-        }
-        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
-    }
-}
-
-fn publish_download_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let parent = path
-        .parent()
-        .context("download destination has no parent")?;
-    let metadata = std::fs::symlink_metadata(path);
-    let existing_permissions = match metadata {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
-            anyhow::bail!(
-                "download destination is not a regular file: {}",
-                path.display()
-            )
-        }
-        Ok(_) => {
-            thegn_core::fsperm::open_regular_file_nofollow(path)?;
-            Some(std::fs::symlink_metadata(path)?.permissions())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
-    };
-    let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp = parent.join(format!(".thegn-sync-{}-{nonce}.tmp", std::process::id()));
-    let staged = (|| -> Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .with_context(|| format!("stage {}", path.display()))?;
-        if let Some(permissions) = existing_permissions {
-            file.set_permissions(permissions)?;
-        }
-        file.write_all(bytes)?;
-        Ok(())
-    })();
-    if let Err(error) = staged {
-        let cleanup = std::fs::remove_file(&temp);
-        if let Err(cleanup_error) = cleanup {
-            return Err(error)
-                .with_context(|| format!("staging failed and cleanup failed ({cleanup_error})"));
-        }
-        return Err(error);
-    }
-    if let Err(error) = thegn_core::fsperm::rename_replace(&temp, path) {
-        let cleanup = std::fs::remove_file(&temp);
-        if let Err(cleanup_error) = cleanup {
-            return Err(error).with_context(|| {
-                format!("publish failed and staging cleanup failed ({cleanup_error})")
-            });
-        }
-        return Err(error).with_context(|| format!("publish {}", path.display()));
-    }
-    Ok(())
-}
-
 /// Join a remote base dir and a relative path into a clean remote path.
 pub(crate) fn join_remote(base: &str, rel: &str) -> String {
     let base = base.trim_end_matches('/');
@@ -1443,21 +1365,29 @@ pub trait ProviderFiles: Send + Sync {
         local: &'a Path,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            anyhow::ensure!(
-                local.is_dir(),
-                "download destination is not a directory: {}",
-                local.display()
-            );
-            anyhow::ensure!(
-                !std::fs::symlink_metadata(local)?.file_type().is_symlink(),
-                "download root is a symlink: {}",
-                local.display()
-            );
-            let mut stack = vec![String::new()]; // rel dirs to visit
+            let root: thegn_core::fsperm::RootedDir = thegn_core::fsperm::open_rooted_dir(local)
+                .with_context(|| {
+                    format!(
+                        "download destination is not a real directory: {}",
+                        local.display()
+                    )
+                })?;
+            // Children are opened only when popped, so the live handles are the current ancestry.
+            let mut stack: Vec<(String, Arc<thegn_core::fsperm::RootedDir>, Option<String>)> =
+                vec![(String::new(), Arc::new(root), None)];
             let mut seen = std::collections::HashSet::new();
             let mut file_count = 0usize;
             let mut total_bytes = 0u64;
-            while let Some(rel) = stack.pop() {
+            while let Some((rel, parent, name)) = stack.pop() {
+                let dir: Arc<thegn_core::fsperm::RootedDir> = match name {
+                    Some(name) => Arc::new(parent.ensure_child_dir(&name).with_context(|| {
+                        format!(
+                            "open download destination directory {}",
+                            local.join(&rel).display()
+                        )
+                    })?),
+                    None => parent,
+                };
                 let depth = if rel.is_empty() {
                     0
                 } else {
@@ -1505,13 +1435,8 @@ pub trait ProviderFiles: Send + Sync {
                     } else {
                         format!("{rel}/{}", e.name)
                     };
-                    let mut dest = local.to_path_buf();
-                    for component in child.split('/') {
-                        dest.push(component);
-                    }
                     if e.is_dir {
-                        ensure_download_dir(&dest)?;
-                        stack.push(child);
+                        stack.push((child, Arc::clone(&dir), Some(e.name)));
                     } else {
                         file_count += 1;
                         anyhow::ensure!(
@@ -1536,7 +1461,12 @@ pub trait ProviderFiles: Send + Sync {
                                 listed_size = e.size, actual_size, "provider file changed between listing and read; entry skipped");
                             continue;
                         }
-                        publish_download_file(&dest, &data)?;
+                        dir.publish_file(&e.name, &data).with_context(|| {
+                            format!(
+                                "publish download destination {}",
+                                local.join(&child).display()
+                            )
+                        })?;
                     }
                 }
             }
@@ -3100,6 +3030,20 @@ pub(crate) fn private_exec_dir_argv(root: &str, dir: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn publish_download_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        let parent = path
+            .parent()
+            .context("download destination has no parent")?;
+        let name: String = path
+            .file_name()
+            .context("download destination has no file name")?
+            .to_string_lossy()
+            .into_owned();
+        thegn_core::fsperm::open_rooted_dir(parent)?
+            .publish_file(&name, bytes)
+            .with_context(|| format!("publish {}", path.display()))
+    }
 
     fn provider() -> DaytonaProvider {
         DaytonaProvider::new("https://app.daytona.io/api/", "tok", "debian:stable")
@@ -4961,5 +4905,241 @@ mod tests {
         assert_eq!(collected.code, Some(0));
         assert_eq!(collected.output, b"");
         assert_eq!(rx.try_recv().unwrap(), ExecFrame::Stdout(b"late".to_vec()));
+    }
+
+    struct SwappingProvider {
+        root: std::path::PathBuf,
+        outside: std::path::PathBuf,
+    }
+
+    struct ManyDirectoriesProvider;
+
+    impl ProviderFiles for ManyDirectoriesProvider {
+        fn read<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _id: &'a str,
+            _path: &'a str,
+            _data: &'a [u8],
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list_dir<'a>(
+            &'a self,
+            _id: &'a str,
+            path: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+            let entries = if path.is_empty() {
+                (0..300)
+                    .map(|index| FileEntry {
+                        name: format!("directory-{index}"),
+                        is_dir: true,
+                        size: 0,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Box::pin(async move { Ok(entries) })
+        }
+
+        fn delete<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ProviderFiles for SwappingProvider {
+        fn read<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async move {
+                let nested = self.root.join("nested");
+                std::fs::rename(&nested, self.root.join("moved"))?;
+                thegn_core::fsperm::create_symlink(&self.outside, &nested, true)?;
+                Ok(b"data".to_vec())
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _id: &'a str,
+            _path: &'a str,
+            _data: &'a [u8],
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list_dir<'a>(
+            &'a self,
+            _id: &'a str,
+            path: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+            let entries = if path.ends_with("/nested") {
+                vec![FileEntry {
+                    name: "file".into(),
+                    is_dir: false,
+                    size: 4,
+                }]
+            } else {
+                vec![FileEntry {
+                    name: "nested".into(),
+                    is_dir: true,
+                    size: 0,
+                }]
+            };
+            Box::pin(async move { Ok(entries) })
+        }
+
+        fn delete<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn download_dir_rooted_swap_between_listing_and_read_cannot_escape() {
+        if !cfg!(unix) {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        let probe = temp.path().join("symlink-probe");
+        if let Err(error) = thegn_core::fsperm::create_symlink(&outside, &probe, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create directory symlink fixture: {error}");
+        }
+        std::fs::remove_file(probe).unwrap();
+
+        let provider = SwappingProvider {
+            root: root.clone(),
+            outside: outside.clone(),
+        };
+        let result = provider.download_dir("id", "/", &root).await;
+        assert!(
+            root.join("moved").is_dir(),
+            "read callback performed the directory swap"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("nested"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "read callback planted the attacker-controlled symlink"
+        );
+        assert!(
+            !outside.join("file").exists(),
+            "a directory swapped during the awaited read must not redirect publication outside the root"
+        );
+        if result.is_ok() {
+            assert_eq!(std::fs::read(root.join("moved/file")).unwrap(), b"data");
+        }
+    }
+
+    #[tokio::test]
+    async fn download_dir_handles_many_sibling_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+
+        ManyDirectoriesProvider
+            .download_dir("id", "/", &root)
+            .await
+            .unwrap();
+
+        for index in 0..300 {
+            assert!(root.join(format!("directory-{index}")).is_dir());
+        }
+    }
+
+    struct HandleCountingProvider {
+        high_water: std::sync::Mutex<usize>,
+    }
+
+    impl ProviderFiles for HandleCountingProvider {
+        fn read<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _id: &'a str,
+            _path: &'a str,
+            _data: &'a [u8],
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list_dir<'a>(
+            &'a self,
+            _id: &'a str,
+            path: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+            let count = std::fs::read_dir("/proc/self/fd").map(|entries| entries.count());
+            if let Ok(count) = count {
+                let mut high_water = self
+                    .high_water
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *high_water = (*high_water).max(count);
+            }
+            let entries = if path.is_empty() {
+                (0..300)
+                    .map(|index| FileEntry {
+                        name: format!("directory-{index}"),
+                        is_dir: true,
+                        size: 0,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Box::pin(async move { Ok(entries) })
+        }
+
+        fn delete<'a>(&'a self, _id: &'a str, _path: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Regression gate for the fd bound: opening siblings only when popped keeps descriptors bounded by depth.
+    #[tokio::test]
+    async fn download_dir_open_handles_stay_bounded_by_depth() {
+        if !cfg!(unix) {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return;
+        };
+        let baseline = entries.count();
+        let provider = HandleCountingProvider {
+            high_water: std::sync::Mutex::new(baseline),
+        };
+
+        provider.download_dir("id", "/", &root).await.unwrap();
+
+        let high_water = *provider
+            .high_water
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            high_water <= baseline + 16,
+            "open handle high-water {high_water} exceeded baseline {baseline} by more than 16"
+        );
     }
 }

@@ -2118,12 +2118,55 @@ fn sealed_tunnel_profile_floors_match_sealed_but_permits_vpn() {
 
 #[test]
 fn expand_env_ref_reads_file_prefix() {
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!("tg-vpn-key-{}.txt", std::process::id()));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tg-vpn-key.txt");
     std::fs::write(&path, "  super-secret-key\n").unwrap();
+    crate::fsperm::restrict_to_owner(&path).unwrap();
     let r = expand_env_ref(&format!("file:{}", path.display()));
     assert_eq!(r.as_deref(), Some("super-secret-key"));
-    std::fs::remove_file(&path).unwrap();
     // Missing file -> None (not an error).
     assert_eq!(expand_env_ref("file:/no/such/tg/file"), None);
+}
+
+#[test]
+fn expand_env_ref_refuses_a_world_readable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secret");
+    std::fs::write(&path, "tok\n").unwrap();
+    match crate::fsperm::set_mode_for_test(&path, 0o644) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+        Err(error) => panic!("could not set fixture mode: {error}"),
+    }
+    assert_eq!(expand_env_ref(&format!("file:{}", path.display())), None);
+}
+
+#[test]
+fn expand_env_ref_refuses_a_hard_linked_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secret");
+    let alias = dir.path().join("alias");
+    std::fs::write(&path, "tok\n").unwrap();
+    crate::fsperm::restrict_to_owner(&path).unwrap();
+    match std::fs::hard_link(&path, &alias) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+        Err(error) => panic!("could not create hard link fixture: {error}"),
+    }
+    for linked_path in [&path, &alias] {
+        assert_eq!(
+            expand_env_ref(&format!("file:{}", linked_path.display())),
+            None
+        );
+    }
+}
+
+#[test]
+fn expand_env_ref_refuses_an_oversized_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secret");
+    let bytes = vec![b'x'; FILE_SECRET_REF_MAX_BYTES as usize + 1];
+    std::fs::write(&path, bytes).unwrap();
+    crate::fsperm::restrict_to_owner(&path).unwrap();
+    assert_eq!(expand_env_ref(&format!("file:{}", path.display())), None);
 }

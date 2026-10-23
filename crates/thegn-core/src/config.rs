@@ -145,13 +145,19 @@ pub fn strftime_seconds_directive(fmt: &str) -> Option<&'static str> {
     (base.format(fmt).to_string() != later.format(fmt).to_string()).then_some("%f")
 }
 
+/// Maximum bytes read from a file-backed SecretRef by the config resolvers.
+pub const FILE_SECRET_REF_MAX_BYTES: u64 = 64 * 1024;
+
 /// Expand a config value that may be an environment-variable reference.
 ///
 /// A string of the form `"env:VAR_NAME"` is replaced by the value of the
 /// environment variable `VAR_NAME`. A string of the form `"file:PATH"` is
-/// replaced by the (trimmed) contents of `PATH` — `~` is expanded to `$HOME`.
-/// Any other non-empty string is returned as-is. An empty string, a missing
-/// environment variable, or an unreadable/empty file all return `None`.
+/// replaced by the contents of `PATH` — `~` is expanded to `$HOME`. The target
+/// must be a regular file owned by the current user or root, not world-accessible,
+/// have one link, and be at most 64 KiB; final symlinks are followed. A refused
+/// file logs a warning and returns `None`. Any other non-empty string is returned
+/// as-is. An empty string, a missing environment variable, or a missing/empty
+/// file also return `None`.
 ///
 /// Used for secrets-refs (API keys, VPN auth keys) so credentials live in the
 /// environment or an out-of-tree file rather than in plaintext in the config.
@@ -166,10 +172,17 @@ pub fn expand_env_ref(value: &str) -> Option<String> {
             .filter(|s| !s.trim().is_empty())
     } else if let Some(path) = v.strip_prefix("file:") {
         let path = expand_tilde(path.trim());
-        std::fs::read_to_string(&path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        match crate::fsperm::read_owner_only_secret_file(
+            std::path::Path::new(&path),
+            FILE_SECRET_REF_MAX_BYTES,
+        ) {
+            Ok(value) => Some(value).filter(|s| !s.is_empty()),
+            Err(crate::fsperm::SecretFileError::NotFound) => None,
+            Err(crate::fsperm::SecretFileError::Refused(reason)) => {
+                tracing::warn!(target: "thegn::secret", %reason, "file secret refused");
+                None
+            }
+        }
     } else {
         Some(v.to_string())
     }

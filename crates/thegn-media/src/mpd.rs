@@ -663,6 +663,17 @@ impl Mpd {
         self.commands.iter().any(|command| command == name)
     }
 
+    fn require_commands(&self, names: &[&str]) -> Result<(), MediaError> {
+        for name in names {
+            if !self.caps_from_command(name) {
+                return Err(MediaError::Unsupported(format!(
+                    "mpd command `{name}` is not permitted for this connection"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Open a push watcher on its own connection.
     pub async fn watch(&self) -> Result<MpdWatch, MediaError> {
         let conn = self.conn().await?;
@@ -765,6 +776,7 @@ impl MediaBackend for Mpd {
 
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
+            self.require_commands(&["status", "play", "pause"])?;
             // `pause` with no argument toggles pause; from stopped, `play` starts.
             let mut c = self.conn().await?;
             let status = c.command("status").await?;
@@ -780,13 +792,20 @@ impl MediaBackend for Mpd {
         })
     }
     fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { self.conn().await?.command("next").await.map(|_| ()) })
+        Box::pin(async move {
+            self.require_commands(&["next"])?;
+            self.conn().await?.command("next").await.map(|_| ())
+        })
     }
     fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async move { self.conn().await?.command("previous").await.map(|_| ()) })
+        Box::pin(async move {
+            self.require_commands(&["previous"])?;
+            self.conn().await?.command("previous").await.map(|_| ())
+        })
     }
     fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
+            self.require_commands(&["random"])?;
             self.conn()
                 .await?
                 .command(&format!("random {}", on as u8))
@@ -796,6 +815,7 @@ impl MediaBackend for Mpd {
     }
     fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
+            self.require_commands(&["status", "repeat", "single"])?;
             let deadline = tokio::time::Instant::now() + LOOP_STAGE_BUDGET;
             let (repeat, single) = match mode {
                 LoopMode::None => (0, "0"),
@@ -836,6 +856,7 @@ impl MediaBackend for Mpd {
     }
     fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
+            self.require_commands(&["status", "setvol"])?;
             // One connection: observe, then write. Never write from a guess.
             let mut c = self.conn().await?;
             let status = c.command("status").await?;
@@ -864,6 +885,7 @@ impl MediaBackend for Mpd {
 
     fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
+            self.require_commands(&["seekcur"])?;
             let sign = if forward { '+' } else { '-' };
             self.conn()
                 .await?
@@ -878,6 +900,7 @@ impl MediaBackend for Mpd {
         _track_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async move {
+            self.require_commands(&["seekcur"])?;
             self.conn()
                 .await?
                 .command(&format!("seekcur {:.3}", pos.as_secs_f64()))
@@ -887,6 +910,7 @@ impl MediaBackend for Mpd {
     }
     fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move {
+            self.require_commands(&["setvol"])?;
             self.conn()
                 .await?
                 .command(&format!("setvol {}", level.min(100)))
@@ -1340,6 +1364,255 @@ mod tests {
         )
     }
 
+    async fn closed_connection_server() -> MpdEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            socket.write_all(b"OK MPD 0.23.0\n").await.unwrap();
+        });
+        MpdEndpoint::resolve(&format!("127.0.0.1:{port}"), None).unwrap()
+    }
+
+    fn all_commands() -> Vec<String> {
+        [
+            "status",
+            "play",
+            "pause",
+            "next",
+            "previous",
+            "random",
+            "repeat",
+            "single",
+            "setvol",
+            "seekcur",
+            "currentsong",
+            "idle",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestControl {
+        PlayPause,
+        Next,
+        Previous,
+        Shuffle,
+        Loop,
+        VolumeStep,
+        Seek,
+        Position,
+        Volume,
+    }
+
+    async fn run_control(m: &Mpd, control: TestControl) -> Result<(), MediaError> {
+        match control {
+            TestControl::PlayPause => m.play_pause().await,
+            TestControl::Next => m.next().await,
+            TestControl::Previous => m.previous().await,
+            TestControl::Shuffle => m.set_shuffle(true).await,
+            TestControl::Loop => m.set_loop(LoopMode::Playlist).await,
+            TestControl::VolumeStep => m.volume_step(0.05).await,
+            TestControl::Seek => m.seek(Duration::from_millis(2500), true).await,
+            TestControl::Position => m.set_position(Duration::from_secs(3), None).await,
+            TestControl::Volume => m.set_volume(30).await,
+        }
+    }
+
+    struct ControlCase {
+        name: &'static str,
+        control: TestControl,
+        expected: &'static [&'static str],
+        first_mutation: &'static str,
+        status_reply: Option<&'static str>,
+        ack_reply: &'static str,
+        success_replies: &'static [&'static str],
+    }
+
+    fn control_cases() -> [ControlCase; 9] {
+        [
+            ControlCase {
+                name: "play_pause",
+                control: TestControl::PlayPause,
+                expected: &["status", "pause"],
+                first_mutation: "pause",
+                status_reply: Some("state: play\nOK\n"),
+                ack_reply: "ACK [4@0] {pause} you don't have permission for \"cmd\"\n",
+                success_replies: &["state: play\nOK\n", "OK\n"],
+            },
+            ControlCase {
+                name: "next",
+                control: TestControl::Next,
+                expected: &["next"],
+                first_mutation: "next",
+                status_reply: None,
+                ack_reply: "ACK [4@0] {next} you don't have permission for \"cmd\"\n",
+                success_replies: &["OK\n"],
+            },
+            ControlCase {
+                name: "previous",
+                control: TestControl::Previous,
+                expected: &["previous"],
+                first_mutation: "previous",
+                status_reply: None,
+                ack_reply: "ACK [4@0] {previous} you don't have permission for \"cmd\"\n",
+                success_replies: &["OK\n"],
+            },
+            ControlCase {
+                name: "set_shuffle",
+                control: TestControl::Shuffle,
+                expected: &["random 1"],
+                first_mutation: "random",
+                status_reply: None,
+                ack_reply: "ACK [4@0] {random} you don't have permission for \"cmd\"\n",
+                success_replies: &["OK\n"],
+            },
+            ControlCase {
+                name: "set_loop",
+                control: TestControl::Loop,
+                expected: &["status", "repeat 1", "single 0"],
+                first_mutation: "repeat",
+                status_reply: Some("repeat: 0\nsingle: 0\nOK\n"),
+                ack_reply: "ACK [4@0] {repeat} you don't have permission for \"cmd\"\n",
+                success_replies: &["repeat: 0\nsingle: 0\nOK\n", "OK\n", "OK\n"],
+            },
+            ControlCase {
+                name: "volume_step",
+                control: TestControl::VolumeStep,
+                expected: &["status", "setvol 45"],
+                first_mutation: "setvol",
+                status_reply: Some("volume: 40\nstate: play\nOK\n"),
+                ack_reply: "ACK [4@0] {setvol} you don't have permission for \"cmd\"\n",
+                success_replies: &["volume: 40\nstate: play\nOK\n", "OK\n"],
+            },
+            ControlCase {
+                name: "seek",
+                control: TestControl::Seek,
+                expected: &["seekcur +2.500"],
+                first_mutation: "seekcur",
+                status_reply: None,
+                ack_reply: "ACK [4@0] {seekcur} you don't have permission for \"cmd\"\n",
+                success_replies: &["OK\n"],
+            },
+            ControlCase {
+                name: "set_position",
+                control: TestControl::Position,
+                expected: &["seekcur 3.000"],
+                first_mutation: "seekcur",
+                status_reply: None,
+                ack_reply: "ACK [4@0] {seekcur} you don't have permission for \"cmd\"\n",
+                success_replies: &["OK\n"],
+            },
+            ControlCase {
+                name: "set_volume",
+                control: TestControl::Volume,
+                expected: &["setvol 30"],
+                first_mutation: "setvol",
+                status_reply: None,
+                ack_reply: "ACK [4@0] {setvol} you don't have permission for \"cmd\"\n",
+                success_replies: &["OK\n"],
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn controls_refuse_commands_the_connection_did_not_advertise() {
+        for case in control_cases() {
+            let (ep, seen) = recording_server("OK\n").await;
+            let mut commands = all_commands();
+            commands.retain(|command| command != case.first_mutation);
+            let m = Mpd {
+                ep,
+                caps: MediaCaps::default(),
+                commands,
+            };
+
+            let result = run_control(&m, case.control).await;
+            assert!(
+                matches!(&result, Err(MediaError::Unsupported(_))),
+                "{}: {result:?}",
+                case.name
+            );
+            if let Err(MediaError::Unsupported(reason)) = &result {
+                assert!(
+                    reason.contains(case.first_mutation),
+                    "{}: refusal must name `{}`: {reason}",
+                    case.name,
+                    case.first_mutation
+                );
+            }
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{}: refused command must not dial or write a frame",
+                case.name
+            );
+        }
+    }
+
+    // Positive control at 1244379d1, except where the fixture had commands: vec![].
+    #[tokio::test]
+    async fn control_matrix_success_ack_and_closed_connection() {
+        for case in control_cases() {
+            let (ep, seen) = scripted_server(case.success_replies.to_vec()).await;
+            let m = Mpd {
+                ep,
+                caps: MediaCaps::default(),
+                commands: all_commands(),
+            };
+            let result = run_control(&m, case.control).await;
+            assert!(result.is_ok(), "{}: {result:?}", case.name);
+            let expected = case
+                .expected
+                .iter()
+                .map(|frame| (*frame).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                seen.lock().unwrap().clone(),
+                expected,
+                "{}: success frames",
+                case.name
+            );
+
+            let mut ack_replies = Vec::new();
+            if let Some(status_reply) = case.status_reply {
+                ack_replies.push(status_reply);
+            }
+            ack_replies.push(case.ack_reply);
+            if matches!(case.control, TestControl::Loop) {
+                ack_replies.push("repeat: 0\nsingle: 0\nOK\n");
+            }
+            let (ep, _) = scripted_server(ack_replies).await;
+            let m = Mpd {
+                ep,
+                caps: MediaCaps::default(),
+                commands: all_commands(),
+            };
+            let result = run_control(&m, case.control).await;
+            if matches!(case.control, TestControl::Loop) {
+                assert!(result.is_err(), "{}: {result:?}", case.name);
+            } else {
+                assert!(
+                    matches!(&result, Err(MediaError::Backend(_))),
+                    "{}: {result:?}",
+                    case.name
+                );
+            }
+
+            let ep = closed_connection_server().await;
+            let m = Mpd {
+                ep,
+                caps: MediaCaps::default(),
+                commands: all_commands(),
+            };
+            let result = run_control(&m, case.control).await;
+            assert!(result.is_err(), "{}: {result:?}", case.name);
+        }
+    }
+
     /// Fake server that leaves `single` unanswered on the first connection,
     /// then answers the rollback only on a newly accepted connection.
     async fn single_timeout_server() -> (MpdEndpoint, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
@@ -1459,7 +1732,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let err = m.volume_step(0.05).await.unwrap_err();
         assert!(matches!(err, MediaError::Unsupported(_)), "{err:?}");
@@ -1473,7 +1746,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         m.volume_step(0.05).await.unwrap();
         let cmds = seen.lock().unwrap().clone();
@@ -1486,7 +1759,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         assert!(m.play_pause().await.is_err());
         assert_eq!(seen.lock().unwrap().clone(), vec!["status".to_string()]);
@@ -1576,7 +1849,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let error = m.set_loop(LoopMode::Track).await.unwrap_err();
         assert!(error.to_string().contains("rolled back"), "{error}");
@@ -1599,7 +1872,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let error = m.set_loop(LoopMode::Track).await.unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
@@ -1623,7 +1896,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         assert!(matches!(
             m.set_loop(LoopMode::Track).await,
@@ -1643,7 +1916,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let error = m.set_loop(LoopMode::Track).await.unwrap_err();
         assert!(error.to_string().contains("unchanged"), "{error}");
@@ -1663,7 +1936,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let error = m.set_loop(LoopMode::Track).await.unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
@@ -1693,7 +1966,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let error = m.set_loop(LoopMode::Playlist).await.unwrap_err();
         assert!(error.to_string().contains("rolled back"), "{error}");
@@ -1724,7 +1997,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let error = m.set_loop(LoopMode::Track).await.unwrap_err();
         assert!(
@@ -1751,7 +2024,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         assert!(matches!(
             m.set_loop(LoopMode::Track).await,
@@ -1774,7 +2047,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let error = m.set_loop(LoopMode::Track).await.unwrap_err();
         assert!(error.to_string().contains("single} late"), "{error}");
@@ -1798,7 +2071,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         m.seek(Duration::from_millis(1500), true).await.unwrap();
         assert_eq!(
@@ -1813,7 +2086,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let result =
             tokio::time::timeout(crate::MEDIA_OP_BUDGET, m.set_loop(LoopMode::Track)).await;
@@ -1842,7 +2115,7 @@ mod tests {
         let m = Mpd {
             ep,
             caps: MediaCaps::default(),
-            commands: vec![],
+            commands: all_commands(),
         };
         let result =
             tokio::time::timeout(crate::MEDIA_OP_BUDGET, m.set_loop(LoopMode::Track)).await;

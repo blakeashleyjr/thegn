@@ -1314,6 +1314,270 @@ pub fn ensure_private_dir_beneath(anchor: &Path, rel: &Path) -> std::io::Result<
     }
 }
 
+/// A worktree directory held open so child operations remain anchored to its
+/// inode if the directory is renamed or its path is replaced.
+#[derive(Debug)]
+pub struct RootedDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+}
+
+/// Open an existing directory without following its leaf symlink.
+pub fn open_rooted_dir(path: &Path) -> std::io::Result<RootedDir> {
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::{Mode, SFlag, fstat};
+        use nix::unistd::geteuid;
+
+        let fd = open(
+            path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_directory_open_error)?;
+        let stat = fstat(&fd).map_err(nix_io_error)?;
+        if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path is not a directory",
+            ));
+        }
+        if stat.st_uid != geteuid().as_raw() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory is owned by another user",
+            ));
+        }
+        Ok(RootedDir {
+            path: path.to_path_buf(),
+            fd,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path is a symlink or not a directory",
+            ));
+        }
+        Ok(RootedDir {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl RootedDir {
+    /// The path used to open this directory. The handle remains authoritative
+    /// if the path is renamed or replaced.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Open or create one child directory without following a symlink.
+    pub fn ensure_child_dir(&self, name: &str) -> std::io::Result<RootedDir> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{OFlag, openat};
+            use nix::sys::stat::{Mode, SFlag, fstat, mkdirat};
+
+            let fd = match openat(
+                &self.fd,
+                name_path,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(nix::errno::Errno::ENOENT) => {
+                    match mkdirat(&self.fd, name_path, Mode::from_bits_truncate(0o777)) {
+                        Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+                        Err(error) => return Err(nix_io_error(error)),
+                    }
+                    openat(
+                        &self.fd,
+                        name_path,
+                        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(map_directory_open_error)?
+                }
+                Err(error) => return Err(map_directory_open_error(error)),
+            };
+            let stat = fstat(&fd).map_err(nix_io_error)?;
+            if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path component is not a directory",
+                ));
+            }
+            Ok(RootedDir {
+                path: self.path.join(name_path),
+                fd,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name_path);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "path component is a symlink or not a directory",
+                    ))
+                }
+                Ok(_) => Ok(RootedDir { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&path)?;
+                    let metadata = std::fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "path component is a symlink or not a directory",
+                        ));
+                    }
+                    Ok(RootedDir { path })
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    /// Atomically replace one regular file relative to this pinned directory.
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "stat device and inode fields vary in width across Unix targets"
+    )]
+    pub fn publish_file(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{AtFlags, OFlag, openat, renameat};
+            use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat};
+            use nix::unistd::{UnlinkatFlags, unlinkat};
+
+            let existing_mode = match fstatat(&self.fd, name_path, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(stat)
+                    if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT
+                        == SFlag::S_IFREG =>
+                {
+                    Some(stat.st_mode & 0o7777)
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "download destination is not a regular file",
+                    ));
+                }
+                Err(nix::errno::Errno::ENOENT) => None,
+                Err(error) => return Err(nix_io_error(error)),
+            };
+
+            for _ in 0..8 {
+                let temporary = format!(".thegn-sync-{}.tmp", temp_token());
+                let fd = match openat(
+                    &self.fd,
+                    temporary.as_str(),
+                    OFlag::O_CREAT
+                        | OFlag::O_EXCL
+                        | OFlag::O_NOFOLLOW
+                        | OFlag::O_WRONLY
+                        | OFlag::O_CLOEXEC,
+                    Mode::from_bits_truncate(0o666),
+                ) {
+                    Ok(fd) => fd,
+                    Err(nix::errno::Errno::EEXIST) => continue,
+                    Err(error) => return Err(nix_io_error(error)),
+                };
+                let stat = fstat(&fd).map_err(nix_io_error)?;
+                let identity = (stat.st_dev as u64, stat.st_ino as u64);
+                let mut file = std::fs::File::from(fd);
+                let staged = (|| {
+                    if let Some(mode) = existing_mode {
+                        fchmod(&file, Mode::from_bits_truncate(mode)).map_err(nix_io_error)?;
+                    }
+                    file.write_all(bytes)
+                })();
+                let result = match staged {
+                    Ok(()) => renameat(&self.fd, temporary.as_str(), &self.fd, name_path)
+                        .map_err(nix_io_error),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    let cleanup =
+                        match fstatat(&self.fd, temporary.as_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                            Ok(current)
+                                if (current.st_dev as u64, current.st_ino as u64) == identity =>
+                            {
+                                unlinkat(&self.fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir)
+                                    .map_err(nix_io_error)
+                            }
+                            Ok(_) | Err(nix::errno::Errno::ENOENT) => Ok(()),
+                            Err(cleanup_error) => Err(nix_io_error(cleanup_error)),
+                        };
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(std::io::Error::new(
+                            error.kind(),
+                            format!("{error}; staging cleanup failed: {cleanup_error}"),
+                        )),
+                    };
+                }
+                return Ok(());
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique download temporary file",
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name_path);
+            let existing_permissions = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "download destination is not a regular file",
+                    ));
+                }
+                Ok(metadata) => Some(metadata.permissions()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let temporary = self.path.join(format!(".thegn-sync-{}.tmp", temp_token()));
+            let result = (|| {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                if let Some(permissions) = existing_permissions {
+                    file.set_permissions(permissions)?;
+                }
+                file.write_all(bytes)?;
+                rename_replace(&temporary, &path)
+            })();
+            if let Err(error) = result {
+                match std::fs::remove_file(&temporary) {
+                    Ok(()) => return Err(error),
+                    Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(error);
+                    }
+                    Err(cleanup_error) => {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!("{error}; staging cleanup failed: {cleanup_error}"),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn invalid_private_name() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -2750,5 +3014,90 @@ mod tests {
         ));
         assert!(owner_uid_allowed(5678, 5678));
         assert!(owner_uid_allowed(0, 5678));
+    }
+
+    #[test]
+    fn rooted_dir_child_handle_survives_symlink_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let child_path = root.join("a");
+        std::fs::create_dir(&child_path).unwrap();
+
+        let rooted = open_rooted_dir(&root).unwrap();
+        let child = rooted.ensure_child_dir("a").unwrap();
+        let moved = root.join("moved");
+        std::fs::rename(&child_path, &moved).unwrap();
+        if let Err(error) = create_symlink(&outside, &child_path, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create directory symlink fixture: {error}");
+        }
+
+        child.publish_file("f", b"x").unwrap();
+        assert!(!outside.join("f").exists());
+        assert_eq!(std::fs::read(moved.join("f")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn rooted_dir_refuses_symlink_root_component_and_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        let root_link = temp.path().join("root-link");
+        if let Err(error) = create_symlink(&root, &root_link, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create root symlink fixture: {error}");
+        }
+        assert!(open_rooted_dir(&root_link).is_err());
+
+        let rooted = open_rooted_dir(&root).unwrap();
+        create_symlink(&outside, &root.join("child-link"), true).unwrap();
+        assert!(matches!(
+            rooted.ensure_child_dir("child-link"),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+
+        let target = outside.join("leaf-target");
+        std::fs::write(&target, b"safe").unwrap();
+        create_symlink(&target, &root.join("leaf-link"), false).unwrap();
+        assert!(matches!(
+            rooted.publish_file("leaf-link", b"overwrite"),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn rooted_dir_publish_keeps_existing_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let file = root.join("file");
+        std::fs::write(&file, b"old").unwrap();
+        if mode_bits(&file).unwrap().is_none() {
+            return;
+        }
+        set_mode_for_test(&file, 0o640).unwrap();
+
+        open_rooted_dir(root)
+            .unwrap()
+            .publish_file("file", b"new")
+            .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(mode_bits(&file).unwrap(), Some(0o640));
     }
 }

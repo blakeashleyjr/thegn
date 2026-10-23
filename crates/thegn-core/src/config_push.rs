@@ -409,7 +409,7 @@ impl PushInboxConfig {
         if self.enabled && self.resolved_secret().is_none() {
             return Some(
                 "[notifications.push.inbox] inbox_secret does not resolve to a value in this \
-                 environment (env var unset or file unreadable/empty)"
+                 environment (env var unset, or file missing, empty or refused: it must be owner-only with one link)"
                     .into(),
             );
         }
@@ -633,6 +633,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inbox-secret");
         std::fs::write(&path, "hunter2\n").unwrap();
+        crate::fsperm::restrict_to_owner(&path).unwrap();
         let inbox = PushInboxConfig {
             enabled: true,
             topic: "cmd".into(),
@@ -645,6 +646,30 @@ mod tests {
         // A validly-shaped, resolvable inbox is startable.
         assert!(inbox.validate_errors().is_empty());
         assert!(inbox.startup_block_reason().is_none());
+    }
+
+    #[test]
+    fn resolved_secret_refuses_a_world_readable_file_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox-secret");
+        std::fs::write(&path, "hunter2\n").unwrap();
+        match crate::fsperm::set_mode_for_test(&path, 0o644) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("could not set fixture mode: {error}"),
+        }
+        let inbox = PushInboxConfig {
+            enabled: true,
+            topic: "cmd".into(),
+            inbox_secret: format!("file:{}", path.display()),
+            allow: vec!["worktrees.list".into()],
+            ..Default::default()
+        };
+        assert_eq!(inbox.resolved_secret(), None);
+        let reason = inbox
+            .startup_block_reason()
+            .expect("refused secret blocks startup");
+        assert!(reason.contains("owner-only"), "{reason}");
     }
 
     #[test]
