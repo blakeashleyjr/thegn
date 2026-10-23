@@ -107,17 +107,15 @@ pub(crate) fn spawn(
     } else {
         crate::platform::qos::Qos::Background
     };
-    let join = std::thread::Builder::new()
-        .name("thegn-desk-ntfy".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(qos);
-            let healthy = run_dispatcher(rx, enabled, min_urgency, worker_stop);
-            if healthy {
-                DISPATCHER_LIVE.store(false, Ordering::Release);
-            }
-            let _ = done_tx.send(());
-        })
-        .ok();
+    let join = thegn_core::thread_name::try_spawn_named("thegn-desk-ntfy", move || {
+        crate::platform::qos::set_self(qos);
+        let healthy = run_dispatcher(rx, enabled, min_urgency, worker_stop);
+        if healthy {
+            DISPATCHER_LIVE.store(false, Ordering::Release);
+        }
+        let _ = done_tx.send(());
+    })
+    .ok();
     if join.is_none() {
         DISPATCHER_LIVE.store(false, Ordering::Release);
     }

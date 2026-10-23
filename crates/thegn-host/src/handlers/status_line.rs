@@ -141,16 +141,14 @@ impl StatusScheduler {
         let worker_state = Arc::clone(&state);
         #[cfg(test)]
         let started_for_worker = _started.clone();
-        let worker = std::thread::Builder::new()
-            .name("thegn-status-tm".into())
-            .spawn(move || {
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                #[cfg(test)]
-                if let Some(started) = started_for_worker {
-                    started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                timer_worker(worker_state, wake);
-            });
+        let worker = thegn_core::thread_name::try_spawn_named("thegn-status-tm", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            #[cfg(test)]
+            if let Some(started) = started_for_worker {
+                started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            timer_worker(worker_state, wake);
+        });
         let worker = match worker {
             Ok(worker) => Some(worker),
             Err(error) => {
