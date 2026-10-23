@@ -627,12 +627,15 @@ impl OciRunner {
                                     if producer_status.success() {
                                         return Ok(());
                                     }
+                                    let stderr_len = producer_stderr
+                                        .metadata()
+                                        .map_err(|e| format!("pipe: producer stderr: {e}"))?
+                                        .len();
                                     producer_stderr
-                                        .seek(SeekFrom::Start(0))
+                                        .seek(SeekFrom::Start(stderr_len.saturating_sub(4096)))
                                         .map_err(|e| format!("pipe: producer stderr: {e}"))?;
                                     let mut stderr = Vec::new();
-                                    Read::by_ref(&mut producer_stderr)
-                                        .take(4096)
+                                    producer_stderr
                                         .read_to_end(&mut stderr)
                                         .map_err(|e| format!("pipe: producer stderr: {e}"))?;
                                     let stderr = String::from_utf8_lossy(&stderr);
@@ -671,32 +674,13 @@ impl OciRunner {
                             }
                         }
                     }
-                    // Keep the consumer's failure primary, but do not let a
-                    // producer blocked on the closed pipe hang this call.
-                    loop {
-                        match producer.try_wait() {
-                            Ok(Some(_)) => break,
-                            Ok(None) if Instant::now() >= deadline => {
-                                if let Err(error) = producer.kill() {
-                                    tracing::debug!(target: "thegn::host::pipe", %error, "failed to stop producer after host command failure");
-                                }
-                                if let Err(error) = producer.wait() {
-                                    tracing::debug!(target: "thegn::host::pipe", %error, "failed to reap producer after host command failure");
-                                }
-                                break;
-                            }
-                            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                            Err(error) => {
-                                tracing::debug!(target: "thegn::host::pipe", %error, "failed to wait for producer after host command failure");
-                                if let Err(kill_error) = producer.kill() {
-                                    tracing::debug!(target: "thegn::host::pipe", %kill_error, "failed to stop producer after wait failure");
-                                }
-                                if let Err(wait_error) = producer.wait() {
-                                    tracing::debug!(target: "thegn::host::pipe", %wait_error, "failed to reap producer after wait failure");
-                                }
-                                break;
-                            }
-                        }
+                    // The transfer has failed; stop the producer and reap it
+                    // now instead of spending the remaining deadline waiting.
+                    if let Err(error) = producer.kill() {
+                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to stop producer after host command failure");
+                    }
+                    if let Err(error) = producer.wait() {
+                        tracing::debug!(target: "thegn::host::pipe", %error, "failed to reap producer after host command failure");
                     }
                     let mut err = String::new();
                     if let Some(mut r) = consumer.stderr.take() {
@@ -1396,6 +1380,50 @@ mod tests {
         assert!(error.contains("pipe: local producer"), "{error}");
         assert!(error.contains("exit 4"), "{error}");
         assert!(error.contains("producer-broke"), "{error}");
+    }
+
+    #[test]
+    fn pipe_producer_failure_reports_the_end_of_chatty_stderr() {
+        let runner = OciRunner::new(Placement::Local);
+        let producer = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'early-warning\\n' >&2; head -c 5000 /dev/zero | tr '\\000' x >&2; printf '\\nfatal-final-line\\n' >&2; exit 4".to_string(),
+        ];
+
+        let error = runner
+            .pipe_local_to_host(&producer, "cat >/dev/null", Duration::from_secs(10))
+            .expect_err("a failed producer must fail the transfer");
+
+        assert!(
+            error.contains("fatal-final-line"),
+            "stderr tail missing: {error}"
+        );
+        assert!(
+            !error.contains("early-warning"),
+            "stderr head should be outside the 4 KiB tail: {error}"
+        );
+    }
+
+    #[test]
+    fn pipe_producer_is_stopped_when_the_host_command_fails() {
+        let runner = OciRunner::new(Placement::Local);
+        let producer = vec!["sleep".to_string(), "30".to_string()];
+        let timeout = Duration::from_secs(30);
+        let started = Instant::now();
+
+        let error = runner
+            .pipe_local_to_host(&producer, "exit 9", timeout)
+            .expect_err("a failed host command must fail the transfer");
+
+        assert!(
+            error.contains("pipe: host cmd") && error.contains("exit 9"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "producer should be stopped without spending the 30-second transfer deadline"
+        );
     }
 
     #[test]
