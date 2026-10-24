@@ -662,6 +662,22 @@ fn account_failure_line(provider_id: &str, identity: &str, reason: &str) -> Stri
     format!("{provider_id}/{identity}: {reason}")
 }
 
+fn account_upload_provider_failure_lines(
+    uploads: &[AccountUpload],
+    written_by_upload: &[usize],
+    error: &str,
+) -> Vec<String> {
+    uploads
+        .iter()
+        .zip(written_by_upload)
+        .filter(|(_, written)| **written == 0)
+        .map(|(upload, _)| {
+            let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
+            account_failure_line(&upload.provider_id, identity, error)
+        })
+        .collect()
+}
+
 /// The Sync agent logins step result: the config upload's own result, plus a failure naming every account home that
 /// did not reach the sandbox (the step is best-effort, so the caller marks it Failed and continues).
 pub(crate) fn agent_configs_step_result(
@@ -671,13 +687,24 @@ pub(crate) fn agent_configs_step_result(
     if account_failures.is_empty() {
         return configs;
     }
+    let account_ids = account_failures
+        .iter()
+        .map(|failure| {
+            failure
+                .split_once(": ")
+                .map_or(failure.as_str(), |(id, _)| id)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let accounts = format!(
-        "account homes not published: {}",
+        "account homes not published ({account_ids}): {}",
         account_failures.join("; ")
     );
     match configs {
         Ok(()) => Err(anyhow::anyhow!("{accounts}")),
-        Err(error) => Err(anyhow::anyhow!("{error:#}; {accounts}")),
+        Err(error) => Err(anyhow::anyhow!(
+            "{accounts}; config upload failed: {error:#}"
+        )),
     }
 }
 
@@ -880,6 +907,11 @@ pub(crate) fn upload_agent_accounts(
             failures.extend(publish_failures);
         }
         Err(error) => {
+            failures.extend(account_upload_provider_failure_lines(
+                &uploads,
+                &written_by_upload,
+                &error.to_string(),
+            ));
             for (upload_index, upload) in uploads.iter().enumerate() {
                 if written_by_upload[upload_index] == 0 {
                     continue;
@@ -1445,12 +1477,16 @@ mod tests {
     #[test]
     fn agent_configs_step_fails_naming_each_unpublished_account() {
         let failures = [
-            "claude/acct1: publish exited 1: boom".to_string(),
+            format!("claude/acct1: publish exited 1: boom {}", "x".repeat(512)),
             "codex/work: write auth.json timed out".to_string(),
         ];
         let error = agent_configs_step_result(Ok(()), &failures).unwrap_err();
         let detail = error.to_string();
         assert!(detail.contains("account homes not published"));
+        assert!(
+            detail.starts_with("account homes not published (claude/acct1, codex/work):"),
+            "account ids must precede long publish reasons so splash truncation retains them: {detail}"
+        );
         assert!(detail.contains("claude/acct1"));
         assert!(detail.contains("publish exited 1: boom"));
         assert!(detail.contains("codex/work"));
@@ -1473,6 +1509,45 @@ mod tests {
             account_failure_line("claude", "acct1", "publish failed: x"),
             "claude/acct1: publish failed: x"
         );
+    }
+
+    #[test]
+    fn provider_error_names_every_account_without_written_files() {
+        let uploads = [
+            AccountUpload {
+                provider_id: "claude".to_string(),
+                dest_root: "/home/.thegn/accounts/claude/acct1".to_string(),
+                stage_root: "/stage/acct1".to_string(),
+                files: Vec::new(),
+                read_failure: None,
+            },
+            AccountUpload {
+                provider_id: "codex".to_string(),
+                dest_root: "/home/.thegn/accounts/codex/work".to_string(),
+                stage_root: "/stage/work".to_string(),
+                files: Vec::new(),
+                read_failure: None,
+            },
+            AccountUpload {
+                provider_id: "pi".to_string(),
+                dest_root: "/home/.thegn/accounts/pi/partial".to_string(),
+                stage_root: "/stage/partial".to_string(),
+                files: Vec::new(),
+                read_failure: None,
+            },
+        ];
+        let failures =
+            account_upload_provider_failure_lines(&uploads, &[0, 0, 1], "runtime failed");
+        assert_eq!(
+            failures,
+            vec![
+                "claude/acct1: runtime failed".to_string(),
+                "codex/work: runtime failed".to_string()
+            ]
+        );
+        let step_error = agent_configs_step_result(Ok(()), &failures).unwrap_err();
+        assert!(step_error.to_string().contains("claude/acct1"));
+        assert!(step_error.to_string().contains("codex/work"));
     }
 
     #[test]
