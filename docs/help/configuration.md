@@ -434,6 +434,10 @@ override, and the reason is logged as a warning. While the UI is running, the
 warning also appears on the status line and is recorded in the notification
 inbox; the CLI still prints it.
 
+Warnings from the launch menu and `thegn open --preset` (including refused
+agents or tools, sandbox halts and fallbacks), and pane spawn failures, also
+appear on the status line, in a toast and in the notification inbox.
+
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,
 `THEGN_LOG_LEVEL`, … (`thegn config explain <key>` shows whether an env var
