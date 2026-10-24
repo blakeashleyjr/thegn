@@ -876,13 +876,14 @@ fn verify_bundle_shape_in(scratch_root: &Path, data: &[u8]) -> anyhow::Result<()
 }
 
 fn bundle_list_heads_command(scratch: &Path, bundle: &Path) -> std::process::Command {
-    let ceiling = scratch
-        .parent()
-        .expect("private bundle scratch directory has a parent");
-    thegn_core::util::git_cmd(scratch)
-        .env("GIT_CEILING_DIRECTORIES", ceiling)
+    // The scratch dir is a private tempdir, so it always has a parent; fall
+    // back to the scratch dir itself rather than panicking.
+    let ceiling = scratch.parent().unwrap_or(scratch);
+    let mut cmd = thegn_core::util::git_cmd(scratch);
+    cmd.env("GIT_CEILING_DIRECTORIES", ceiling)
         .args(["bundle", "list-heads"])
-        .arg(bundle)
+        .arg(bundle);
+    cmd
 }
 
 #[cfg(test)]
