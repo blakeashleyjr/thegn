@@ -1306,10 +1306,7 @@ mod tests {
             dir: Some("/creds/claude-work".into()),
         });
         db.conn().execute_batch("DROP TABLE ui_state;").unwrap();
-        assert!(matches!(
-            launch_env_checked(&cfg, &db, "/wt", None, "claude"),
-            Err(_)
-        ));
+        assert!(launch_env_checked(&cfg, &db, "/wt", None, "claude").is_err());
 
         let db = Db::open_memory().unwrap();
         set_active(&db, Bind::Global, "/wt", None, "claude", "work").unwrap();
