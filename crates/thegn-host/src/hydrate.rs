@@ -1164,7 +1164,7 @@ pub(crate) fn workspace_list(
             };
             let base = thegn_core::util::slugify(&display);
             let slug = db
-                .slug_for_repo(&w.repo_path, &base)
+                .slug_for_repo_nowait(&w.repo_path, &base)
                 .unwrap_or_else(|_| base.clone());
             if !db_backed.iter().any(|(s, _, _, _)| *s == slug) {
                 db_backed.push((slug, display, w.kind.clone(), w.repo_path.clone()));
@@ -1629,14 +1629,25 @@ fn collect_sidebar_status(
             continue;
         }
         let approvals = crate::handlers::repo_trust::approvals_for(db, &wt.repo_root);
-        let environment = crate::handlers::repo_trust::effective_environment_for_worktree(
+        let environment = match crate::handlers::repo_trust::effective_environment_for_worktree(
             app_cfg,
             Some(db),
             std::path::Path::new(&wt.repo_root),
             std::path::Path::new(&wt.worktree),
             Some(&wt.location),
             &approvals,
-        );
+        ) {
+            Ok(environment) => environment,
+            Err(error) => {
+                tracing::debug!(
+                    target: "thegn::hydrate",
+                    worktree = %wt.worktree,
+                    error = %format!("{error:#}"),
+                    "skipping sidebar devcontainer status after environment read failure"
+                );
+                continue;
+            }
+        };
         if let Some(devcontainer) = crate::devcontainer_provider::status_for_worktree(
             app_cfg,
             std::path::Path::new(&wt.repo_root),
@@ -2696,6 +2707,29 @@ pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
     )
 }
 
+/// The tab-bar chip triple `(placement kind, placement label, backend)` shown
+/// while the active worktree's environment selection cannot be read. `None`
+/// when the read succeeded, or when no non-local `[env.*]` is configured (the
+/// only possible environment is then local, so the default chips are true).
+pub(crate) fn unreadable_env_chips(
+    cfg: &thegn_core::config::Config,
+    error: Option<&str>,
+) -> Option<(Option<String>, Option<String>, String)> {
+    let error = error?;
+    if !cfg
+        .env
+        .values()
+        .any(|e| e.placement != thegn_core::config::PlacementMode::Local)
+    {
+        return None;
+    }
+    Some((
+        Some("env?".to_string()),
+        Some(format!("environment selection unreadable: {error}")),
+        String::new(),
+    ))
+}
+
 /// Build the chrome model from the resurrected session + the current worktree's
 /// git state (best-effort — the host stays up even with no repo / no DB). This
 /// is the in-process data flow the chrome relies on: read core + svc directly,
@@ -2818,13 +2852,18 @@ pub(crate) fn build_model(
     // `agent::loading_context` uses. Reading raw `worktree_env` here missed the
     // workspace-default case: a worktree created under a workspace whose default
     // env is a provider (e.g. `sprites`) has no per-worktree row, so the tab bar
-    // resolved it as Local — no `[sprites]` chip and a bogus `(bwrap)` backend
-    // chip — while the splash correctly showed the provider placement.
+    // resolved it as Local — no `[sprites]` chip and a bogus `(bwrap)` chip —
+    // while the splash correctly showed the provider placement. An unreadable
+    // selection shows the `env?` chip, see `unreadable_env_chips`.
+    let selection = db.effective_env_checked(&active_path, &active_repo);
+    let selection_error: Option<String> =
+        selection.as_ref().err().map(|error| format!("{error:#}"));
+    let selected: Option<String> = selection.unwrap_or_default();
     let active_env = app_cfg.resolve_env(
         std::path::Path::new(&active_repo),
         &loc,
         std::path::Path::new(&active_path),
-        db.effective_env(&active_path, &active_repo).as_deref(),
+        selected.as_deref(),
     );
     // A provider env whose CONTENT resolved local has degraded to the host
     // (provider unavailable + `failover`, or a stale remote location healed back
@@ -2861,7 +2900,7 @@ pub(crate) fn build_model(
     // provider/ssh location) must never show a local backend chip, even when
     // env resolution degrades to Local (missing `[env.*]`, config drift).
     // (`loc_is_local` was bound above for the placement-chip degrade check.)
-    if active_env.placement.is_local() && !loc_is_local {
+    if selection_error.is_none() && active_env.placement.is_local() && !loc_is_local {
         tracing::warn!(
             worktree = %active_path,
             env = %active_env.name,
@@ -2879,6 +2918,15 @@ pub(crate) fn build_model(
     } else {
         String::new()
     };
+    let (active_placement_kind, active_placement_label, active_sandbox_backend) =
+        match unreadable_env_chips(&app_cfg, selection_error.as_deref()) {
+            Some(chips) => chips,
+            None => (
+                active_placement_kind,
+                active_placement_label,
+                active_sandbox_backend,
+            ),
+        };
 
     // A TERMINAL tab has no worktree path, so the `resolve_env` above resolved the
     // launch cwd's workspace/global `[sandbox] default_env` — which wrongly labeled

@@ -190,7 +190,9 @@ pub fn repo_slug_with(db: &crate::db::Db, root: &Path) -> String {
         let s = util::slugify(&repo_name_from_path(root));
         if s.is_empty() { "repo".to_string() } else { s }
     };
-    db.slug_for_repo(&root.to_string_lossy(), &base)
+    // Callers run on the UI loop and the startup path: never wait on another
+    // process's held write lock, fall back to the base and claim later.
+    db.slug_for_repo_nowait(&root.to_string_lossy(), &base)
         .unwrap_or(base)
 }
 
@@ -230,6 +232,16 @@ pub fn repo_slug_checked(root: &Path) -> anyhow::Result<String> {
 /// [`repo_slug_checked`]). Path-derived name, no Git, like [`repo_slug_with`].
 pub fn repo_slug_with_checked(db: &crate::db::Db, root: &Path) -> anyhow::Result<String> {
     db.slug_for_repo(
+        &root.to_string_lossy(),
+        &slug_base(&repo_name_from_path(root)),
+    )
+}
+
+/// [`repo_slug_with_checked`] for startup and the UI loop: a slug claim under
+/// another process's held write lock fails at once instead of waiting out the
+/// busy timeout. Existing slugs are a plain read.
+pub fn repo_slug_with_checked_nowait(db: &crate::db::Db, root: &Path) -> anyhow::Result<String> {
+    db.slug_for_repo_nowait(
         &root.to_string_lossy(),
         &slug_base(&repo_name_from_path(root)),
     )

@@ -3022,13 +3022,11 @@ fn enqueue_git_op(
         // silently does nothing, and the only escape is switching worktrees
         // (which resets the whole `GitUi`) or restarting.
         //
-        // `AssertUnwindSafe` because `op` and `loc` are consumed by the call and
+        // `AssertUnwindSafe` because `op` and `wt` are consumed by the call and
         // nothing observable outlives a panic here — the panic becomes an error
         // result, which is what the UI is already built to render.
-        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let worktree_key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::gitmut::execute_at(op, &loc, &worktree_key, override_gpg)
+            crate::gitmut::execute_for_worktree(op, &wt, override_gpg)
         }))
         .unwrap_or_else(|_| {
             tracing::error!(
@@ -5572,8 +5570,7 @@ fn spawn_test_run_task(
             // Resolve the worktree's location off-loop so a remote/provider
             // worktree runs its tests in the env (via the bridge/control
             // transport), not on the host. Local worktrees are unchanged.
-            let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
-            crate::task::run_task(worktree, &loc, generation, task_spec, &limits)
+            crate::task::run_task_resolved(worktree, generation, task_spec, &limits)
         })
         .await;
         let outcome = match result {
@@ -5610,8 +5607,7 @@ fn spawn_test_discovery(
         let outcome_worktree = worktree.clone();
         let outcome_task = task_spec.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let loc = thegn_core::remote::GitLoc::for_worktree(&worktree);
-            crate::task::discover_tests(worktree, &loc, generation, task_spec, &limits)
+            crate::task::discover_tests_resolved(worktree, generation, task_spec, &limits)
         })
         .await;
         let outcome = match result {
@@ -6031,7 +6027,7 @@ fn bundle_scope_slug(db: &thegn_core::db::Db, worktree: &str) -> Option<String> 
         .file_name()?
         .to_string_lossy()
         .into_owned();
-    db.slug_for_repo(&root, &base).ok()
+    db.slug_for_repo_nowait(&root, &base).ok()
 }
 
 /// Spawn the worktree's interactive shell pane in `dir`, routing through the
@@ -14000,6 +13996,8 @@ async fn event_loop<T: Terminal>(
                     // generation untouched.
                     schedule.reconfigure(&current_config);
                     crate::automation_runtime::install(&current_config);
+                    // Live `[model_proxy]` reload: supervisor stops, starts or restarts to match.
+                    crate::model_proxy_daemon::spawn_supervisor(&current_config);
                     preview_supervisor.set_enabled(current_config.preview.enabled);
                     request_preview_scan(
                         &mut preview_supervisor,
@@ -22395,13 +22393,8 @@ async fn event_loop<T: Terminal>(
                                                                     );
                                                                 }
                                                             });
-                                                        let loc =
-                                                            thegn_core::remote::GitLoc::for_worktree(
-                                                                &wt,
-                                                            );
-                                                        let outcome = crate::task::run_job(
+                                                        let outcome = crate::task::run_job_resolved(
                                                             wt,
-                                                            &loc,
                                                             run_gen,
                                                             test_task,
                                                             &limits2,
@@ -23227,10 +23220,8 @@ async fn event_loop<T: Terminal>(
                                                     );
                                                 }
                                             });
-                                        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                                        let outcome = crate::task::run_job(
+                                        let outcome = crate::task::run_job_resolved(
                                             wt,
-                                            &loc,
                                             run_gen,
                                             test_task,
                                             &limits2,
