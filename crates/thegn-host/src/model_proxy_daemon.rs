@@ -165,15 +165,12 @@ fn stop_pid_state(raw: &str) -> bool {
 /// Resolves the `tgproxy` executable: a sibling of the running thegn binary
 /// (how nix/cargo install them together), else `tgproxy` on `PATH`.
 pub fn tgproxy_exe() -> String {
-    if let Some(exe) = thegn_core::util::self_exe_path()
-        && let Some(dir) = exe.parent()
-    {
-        let sibling = dir.join("tgproxy");
-        if sibling.exists() {
-            return sibling.to_string_lossy().into_owned();
-        }
-    }
-    "tgproxy".to_string()
+    tgproxy_exe_in(
+        thegn_core::util::self_exe_path()
+            .as_deref()
+            .and_then(std::path::Path::parent),
+        std::env::var_os("PATH").as_deref(),
+    )
 }
 
 fn executable_regular_file(path: &std::path::Path) -> bool {
@@ -186,10 +183,9 @@ fn find_tgproxy_in(
     self_dir: Option<&std::path::Path>,
     path_var: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    // Match `tgproxy_exe`: runtime selection is based on existence, even when
-    // the sibling cannot be executed. Report that path instead of a PATH copy.
+    // Prefer a usable sibling, then find the first usable executable on PATH.
     if let Some(sibling) = self_dir.map(|dir| dir.join("tgproxy"))
-        && sibling.exists()
+        && executable_regular_file(&sibling)
     {
         return Some(sibling);
     }
@@ -201,8 +197,42 @@ fn find_tgproxy_in(
         .find(|candidate| executable_regular_file(candidate))
 }
 
+fn tgproxy_exe_in(
+    self_dir: Option<&std::path::Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> String {
+    find_tgproxy_in(self_dir, path_var)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tgproxy".to_string())
+}
+
+fn skipped_tgproxy_sibling(self_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    let sibling = self_dir?.join("tgproxy");
+    (sibling.exists() && !executable_regular_file(&sibling)).then_some(sibling)
+}
+
+fn tgproxy_report_in(
+    self_dir: Option<&std::path::Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> String {
+    let mut report = tgproxy_status_line(find_tgproxy_in(self_dir, path_var).as_deref());
+    if let Some(sibling) = skipped_tgproxy_sibling(self_dir) {
+        report.push_str(&format!("; skipped non-executable {}", sibling.display()));
+    }
+    report
+}
+
 pub fn find_tgproxy() -> Option<PathBuf> {
     find_tgproxy_in(
+        thegn_core::util::self_exe_path()
+            .as_deref()
+            .and_then(std::path::Path::parent),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+pub fn tgproxy_report() -> String {
+    tgproxy_report_in(
         thegn_core::util::self_exe_path()
             .as_deref()
             .and_then(std::path::Path::parent),
@@ -1174,24 +1204,75 @@ mod tests {
     }
 
     #[test]
-    fn find_tgproxy_reports_non_executable_sibling_before_path_copy() {
+    fn find_tgproxy_skips_non_executable_sibling_for_path_copy() {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
 
         let sibling_dir = tempfile::tempdir().unwrap();
         let path_dir = tempfile::tempdir().unwrap();
-        let sibling = make_tgproxy(sibling_dir.path(), 0o644);
-        make_tgproxy(path_dir.path(), 0o755);
+        make_tgproxy(sibling_dir.path(), 0o644);
+        let path_copy = make_tgproxy(path_dir.path(), 0o755);
         let path_var = std::env::join_paths([path_dir.path()]).unwrap();
 
         let found = find_tgproxy_in(Some(sibling_dir.path()), Some(&path_var)).unwrap();
-        assert_eq!(found, sibling);
+        assert_eq!(found, path_copy);
+        let report = tgproxy_report_in(Some(sibling_dir.path()), Some(&path_var));
+        assert!(report.contains(&path_copy.display().to_string()));
+        assert!(report.contains("skipped non-executable"));
+    }
+
+    #[test]
+    fn tgproxy_exe_in_uses_the_executable_sibling() {
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let sibling = make_tgproxy(sibling_dir.path(), 0o755);
+        make_tgproxy(path_dir.path(), 0o755);
+        let path_var = std::env::join_paths([path_dir.path()]).unwrap();
+
         assert_eq!(
-            tgproxy_status_line(Some(&found)),
-            format!("{} (present but not executable)", sibling.display()),
-            "doctor must identify the unusable sibling the runtime selects"
+            tgproxy_exe_in(Some(sibling_dir.path()), Some(&path_var)),
+            sibling.to_string_lossy().into_owned()
         );
+    }
+
+    #[test]
+    fn tgproxy_exe_in_skips_a_non_executable_sibling_for_path() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        make_tgproxy(sibling_dir.path(), 0o644);
+        let path_copy = make_tgproxy(path_dir.path(), 0o755);
+        let path_var = std::env::join_paths([path_dir.path()]).unwrap();
+
+        assert_eq!(
+            tgproxy_exe_in(Some(sibling_dir.path()), Some(&path_var)),
+            path_copy.to_string_lossy().into_owned()
+        );
+    }
+
+    #[test]
+    fn tgproxy_exe_in_falls_back_to_bare_name() {
+        assert_eq!(tgproxy_exe_in(None, None), "tgproxy");
+    }
+
+    #[test]
+    fn tgproxy_report_in_names_a_skipped_sibling() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let sibling = make_tgproxy(sibling_dir.path(), 0o644);
+        let empty_path = std::ffi::OsStr::new("");
+        let report = tgproxy_report_in(Some(sibling_dir.path()), Some(empty_path));
+
+        assert!(report.contains("not installed"));
+        assert!(report.contains("skipped non-executable"));
+        assert!(report.contains(&sibling.display().to_string()));
     }
 
     #[test]
