@@ -1487,13 +1487,7 @@ pub(crate) fn managed_install_unavailable(tool: &ManagedTool) -> Option<String> 
     if !matches!(&tool.source, Source::GithubRelease { .. }) {
         return None;
     }
-    let Some(os) = Os::current() else {
-        return Some(format!(
-            "managed download unavailable: unsupported platform; put {} on PATH or set [managed_tools.{}] path",
-            tool.name, tool.name
-        ));
-    };
-    let Some(arch) = Arch::current() else {
+    let (Some(os), Some(arch)) = (Os::current(), Arch::current()) else {
         return Some(format!(
             "managed download unavailable: unsupported platform; put {} on PATH or set [managed_tools.{}] path",
             tool.name, tool.name
