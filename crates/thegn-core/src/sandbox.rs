@@ -3173,6 +3173,8 @@ pub fn enter_argv_guarded(spec: &SandboxSpec, inner: &str) -> Result<EnterArgv, 
         EnterArgv {
             argv,
             env_file: None,
+            omitted_secrets: Vec::new(),
+            sandbox_name: spec.name.clone(),
         }
     } else {
         backend_enter_argv_guarded(spec, &script)?
@@ -3444,6 +3446,7 @@ fn backend_enter_argv_guarded_with_env(
 ) -> Result<EnterArgv, EnterError> {
     let wt = spec.worktree.to_string_lossy().into_owned();
     let mut env_file: Option<SecretEnvFile> = None;
+    let mut omitted_secrets: Vec<String> = Vec::new();
     // Keyed on the backend *family* (one arm per way of driving a sandbox),
     // so a new OCI runtime is a profile row, not a new arm here.
     let argv = match spec.backend.profile().family {
@@ -3965,9 +3968,13 @@ fn backend_enter_argv_guarded_with_env(
                 // Never put host-sourced secrets back on argv if the protected
                 // file cannot be created. A failed tool is safer than a
                 // credential leak.
+                omitted_secrets.extend(secret_env.iter().map(|(key, _)| key.to_string()));
+                omitted_secrets.sort();
+                omitted_secrets.dedup();
                 tracing::error!(
                     target: "thegn::sandbox",
                     name = %spec.name,
+                    keys = %omitted_secrets.join(","),
                     "unable to create protected systemd environment file; omitting host-sourced secrets"
                 );
             } else {
@@ -4000,7 +4007,12 @@ fn backend_enter_argv_guarded_with_env(
             vec!["/bin/sh".into(), "-lc".into(), body]
         }
     };
-    Ok(EnterArgv { argv, env_file })
+    Ok(EnterArgv {
+        argv,
+        env_file,
+        omitted_secrets,
+        sandbox_name: spec.name.clone(),
+    })
 }
 
 /// Borrowed `(key, value)` env pairs from a spec's `env` map.
@@ -4436,11 +4448,25 @@ impl Drop for SecretEnvFile {
 pub struct EnterArgv {
     argv: Vec<String>,
     env_file: Option<SecretEnvFile>,
+    omitted_secrets: Vec<String>,
+    sandbox_name: String,
 }
 
 impl EnterArgv {
     pub fn argv(&self) -> &[String] {
         &self.argv
+    }
+
+    /// A warning naming host-sourced secrets left out because their protected
+    /// env file could not be created (keys only, never values), or `None`.
+    pub fn omitted_secrets_warning(&self) -> Option<String> {
+        (!self.omitted_secrets.is_empty()).then(|| {
+            format!(
+                "the protected environment file for sandbox {} could not be created, so these host-sourced secrets were left out of the pane: {}; the pane runs without them (check that $XDG_STATE_HOME/thegn/sandbox-env is a private directory you own)",
+                self.sandbox_name,
+                self.omitted_secrets.join(", ")
+            )
+        })
     }
 
     /// Mark a launch as handed off; systemd's ExecStopPost removes its file.

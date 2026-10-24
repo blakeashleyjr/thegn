@@ -4139,10 +4139,17 @@ pub fn compose_spec(
                 .into());
             }
         },
-        (Some(spec), _) => sandbox::enter_argv(spec, &cmd).map_err(|error| {
-            let hint = error.remediation_hint();
-            anyhow::Error::new(error).context(hint)
-        })?,
+        (Some(spec), _) => {
+            let entered = sandbox::enter_argv_guarded(spec, &cmd).map_err(|error| {
+                let hint = error.remediation_hint();
+                anyhow::Error::new(error).context(hint)
+            })?;
+            if let Some(warning) = entered.omitted_secrets_warning() {
+                thegn_core::msg::warn(&warning);
+                warnings.push(warning);
+            }
+            entered.into_spawned()
+        }
         (None, None) => {
             // Host fallback: a login shell so PATH/env expand — still CAPPED. There
             // is no sandbox spec here (no container runtime, or one turned off), but

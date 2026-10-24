@@ -2654,6 +2654,120 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
     let _ = std::fs::remove_dir_all(&state); // best-effort test cleanup
 }
 
+#[cfg(unix)]
+#[test]
+fn systemd_env_file_failure_reports_omitted_secret_keys() {
+    let state_home = private_tempdir();
+    let state_home_path = state_home.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home_path)),
+    ]);
+    let thegn_dir = state_home.path().join("thegn");
+    std::fs::create_dir(&thegn_dir).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(target.path(), thegn_dir.join("sandbox-env")).unwrap();
+
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.image = None;
+    sandbox.name = "thegn-test-envfile-failure".into();
+    sandbox.env = vec![("API_KEY".into(), "sk_secret".into())];
+    let entered =
+        backend_enter_argv_guarded_with_env(&sandbox, "exec true", SandboxArgvEnv::default())
+            .unwrap();
+    let argv = entered.argv().join(" ");
+
+    assert!(
+        !argv.contains("EnvironmentFile="),
+        "unexpected env file: {argv}"
+    );
+    assert!(!argv.contains("sk_secret"), "secret leaked in argv: {argv}");
+    let warning = entered
+        .omitted_secrets_warning()
+        .expect("omitted secret warning");
+    assert!(
+        warning.contains("API_KEY"),
+        "warning omitted key: {warning}"
+    );
+    assert!(
+        !warning.contains("sk_secret"),
+        "warning leaked value: {warning}"
+    );
+}
+
+#[test]
+fn systemd_env_file_success_reports_nothing_omitted() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("sk_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
+    ]);
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.image = None;
+    sandbox.name = "thegn-test-envfile-success".into();
+    sandbox.env = vec![("API_KEY".into(), "sk_secret".into())];
+
+    let entered =
+        backend_enter_argv_guarded_with_env(&sandbox, "exec true", SandboxArgvEnv::default())
+            .unwrap();
+    assert!(
+        entered
+            .argv()
+            .iter()
+            .any(|arg| arg.starts_with("EnvironmentFile=")),
+        "successful secret env file missing from argv: {:?}",
+        entered.argv()
+    );
+    assert!(entered.omitted_secrets_warning().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn omitted_secrets_warning_names_keys_never_values() {
+    let state_home = private_tempdir();
+    let state_home_path = state_home.path().to_string_lossy().into_owned();
+    let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+        ("API_KEY", Some("api_secret")),
+        ("GH_TOKEN", Some("gh_secret")),
+        ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home_path)),
+    ]);
+    let thegn_dir = state_home.path().join("thegn");
+    std::fs::create_dir(&thegn_dir).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(target.path(), thegn_dir.join("sandbox-env")).unwrap();
+
+    let mut sandbox = spec(Backend::Systemd);
+    sandbox.image = None;
+    sandbox.name = "thegn-test-envfile-multiple".into();
+    sandbox.env = vec![
+        ("GH_TOKEN".into(), "gh_secret".into()),
+        ("API_KEY".into(), "api_secret".into()),
+    ];
+    let entered =
+        backend_enter_argv_guarded_with_env(&sandbox, "exec true", SandboxArgvEnv::default())
+            .unwrap();
+
+    let warning = entered
+        .omitted_secrets_warning()
+        .expect("omitted secret warning");
+    assert!(
+        warning.contains("API_KEY, GH_TOKEN"),
+        "keys not sorted: {warning}"
+    );
+    assert!(
+        !warning.contains("api_secret"),
+        "warning leaked API value: {warning}"
+    );
+    assert!(
+        !warning.contains("gh_secret"),
+        "warning leaked GH value: {warning}"
+    );
+}
+
 #[test]
 fn systemd_cleanup_property_rejects_systemd_expansion_and_quoting_chars() {
     let path = std::path::Path::new("/state/thegn/sandbox-env/name-1.env");
