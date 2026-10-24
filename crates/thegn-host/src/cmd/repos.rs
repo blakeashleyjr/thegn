@@ -349,6 +349,7 @@ mod tests {
 
     #[test]
     fn trust_target_keeps_a_row_less_start_local() {
+        // Positive control: passes at 774069ac2 too.
         let _state = crate::testenv::IsolatedState::new();
         let db = Db::open().unwrap();
         let dir = tempfile::tempdir().unwrap();
