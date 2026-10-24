@@ -17,7 +17,8 @@
 //! last. A preset's panes deliberately do **not** claim the worktree's
 //! remembered agent (`suppress_agent_record`) — a preset only launches panes.
 //! Resolve warnings and pane spawn failures reach the status line, a toast and
-//! the inbox through `launch_notice` while the TUI runs.
+//! the inbox through `launch_notice` while the TUI runs. A split preset's failed
+//! panes do too, and a launch that spawns nothing adds no tab.
 
 use termwiz::terminal::TerminalWaker;
 
@@ -214,20 +215,39 @@ pub(crate) fn first_agent_of_preset(cfg: &Config, preset: &Preset) -> Option<Str
 /// Spawn a resolved launch into its worktree group (loop-side; openpty + exec
 /// only — the slow work already ran off-loop). Returns the focused pane id, or
 /// `None` if the group is gone or nothing spawned. `split` ⇒ one new tab with
-/// an even split of every spec; else one new tab per spec.
+/// an even split of every spec; else one new tab per successfully spawned spec.
 pub(crate) fn apply_launch(
     apply: LaunchApply,
     session: &mut Session,
     panes: &mut Panes,
     center: Rect,
 ) -> Option<u32> {
-    surface_warnings(&apply.worktree, &apply.warnings, crate::launch_notice::post);
-    let gi = session
-        .worktrees
-        .iter()
-        .position(|g| g.name == apply.group)?;
+    let (focus, replaced) = apply_launch_with(
+        apply,
+        session,
+        &mut |spec| panes.spawn_argv_env(&spec.argv, spec.cwd.as_deref(), &spec.env, center),
+        crate::launch_notice::post,
+    );
+    for old in replaced {
+        panes.table.remove(&old);
+    }
+    focus
+}
+
+/// `apply_launch` with the spawner and notice seam injected (tests pass fakes).
+/// Returns the focused pane and placeholder pane ids the new tabs replaced.
+fn apply_launch_with(
+    apply: LaunchApply,
+    session: &mut Session,
+    spawn: &mut impl FnMut(&LaunchSpec) -> anyhow::Result<u32>,
+    post: impl Fn(&str, &str) + Copy,
+) -> (Option<u32>, Vec<u32>) {
+    surface_warnings(&apply.worktree, &apply.warnings, post);
+    let Some(gi) = session.worktrees.iter().position(|g| g.name == apply.group) else {
+        return (None, Vec::new());
+    };
     if apply.specs.is_empty() {
-        return None;
+        return (None, Vec::new());
     }
     // Make the launched group the active one so the new tab is what the user
     // sees (relevant for an `open --preset` into a background workspace).
@@ -235,56 +255,60 @@ pub(crate) fn apply_launch(
     let worktree = apply.worktree.clone();
 
     if apply.split && apply.specs.len() > 1 {
-        let ti = session.worktrees[gi].add_tab();
         // Reuse the even-split tree builder with a spawn closure that pops the
         // pre-composed specs in order (the leaf command strings are placeholders).
         let placeholders = vec![String::new(); apply.specs.len()];
         let layout = crate::layout_spec::LayoutSpec::even_split(&placeholders);
+        let mut failures = Vec::new();
         let built = {
             let mut it = apply.specs.into_iter();
             let mut spawn = |_cmd: Option<&str>| -> Option<u32> {
                 let spec = it.next()?;
-                panes
-                    .spawn_argv_env(&spec.argv, spec.cwd.as_deref(), &spec.env, center)
-                    .ok()
+                match spawn(&spec) {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        failures.push(format!("launch failed: {error}"));
+                        None
+                    }
+                }
             };
             layout.apply(&mut spawn)
         };
-        let (tree, focus) = built?;
+        surface_warnings(&worktree, &failures, post);
+        let Some((tree, focus)) = built else {
+            return (None, Vec::new());
+        };
+        let ti = session.worktrees[gi].add_tab();
         let g = &mut session.worktrees[gi];
+        let mut replaced = Vec::new();
         if let Some(tab) = g.tabs.get_mut(ti) {
-            for old in tab.center.pane_ids() {
-                panes.table.remove(&old);
-            }
+            replaced = tab.center.pane_ids();
             tab.center = tree;
             tab.focused_pane = focus;
         }
-        Some(focus)
+        (Some(focus), replaced)
     } else {
         // One new tab per spec (also the single-choice / single-command path).
         let mut last = None;
+        let mut replaced = Vec::new();
         for spec in apply.specs {
-            let ti = session.worktrees[gi].add_tab();
-            match panes.spawn_argv_env(&spec.argv, spec.cwd.as_deref(), &spec.env, center) {
+            match spawn(&spec) {
                 Ok(id) => {
+                    let ti = session.worktrees[gi].add_tab();
                     let g = &mut session.worktrees[gi];
                     if let Some(tab) = g.tabs.get_mut(ti) {
-                        for old in tab.center.pane_ids() {
-                            panes.table.remove(&old);
-                        }
+                        replaced.extend(tab.center.pane_ids());
                         tab.center = CenterTree::Leaf(id);
                         tab.focused_pane = id;
                     }
                     last = Some(id);
                 }
-                Err(e) => surface_warnings(
-                    &worktree,
-                    &[format!("launch failed: {e}")],
-                    crate::launch_notice::post,
-                ),
+                Err(error) => {
+                    surface_warnings(&worktree, &[format!("launch failed: {error}")], post)
+                }
             }
         }
-        last
+        (last, replaced)
     }
 }
 
@@ -292,6 +316,7 @@ pub(crate) fn apply_launch(
 mod tests {
     use super::*;
     use crate::hydrate::RefreshKind;
+    use crate::session::{GroupKind, WorktreeGroup};
 
     type Setup = (
         crate::testenv::IsolatedState,
@@ -434,5 +459,142 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(first_agent_of_preset(&cfg, &preset), None);
+    }
+
+    fn spec(argv0: &str) -> LaunchSpec {
+        LaunchSpec {
+            argv: vec![argv0.to_string()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+            remote: false,
+        }
+    }
+
+    fn launch_apply(split: bool, commands: &[&str]) -> LaunchApply {
+        LaunchApply {
+            group: "app/wt".into(),
+            worktree: "/wt/a".into(),
+            label: "test".into(),
+            split,
+            specs: commands.iter().map(|command| spec(command)).collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn session() -> Session {
+        Session {
+            id: "test".into(),
+            worktrees: vec![WorktreeGroup::new("app/wt", GroupKind::Branch, "/wt/a")],
+            active: 0,
+        }
+    }
+
+    fn fake_spawn(next_id: &mut u32) -> impl FnMut(&LaunchSpec) -> anyhow::Result<u32> + '_ {
+        move |launch| {
+            let argv0 = launch.argv.first().map(String::as_str).unwrap_or("");
+            if argv0 == "bad" {
+                Err(anyhow::anyhow!("no such program: {argv0}"))
+            } else {
+                let id = *next_id;
+                *next_id += 1;
+                Ok(id)
+            }
+        }
+    }
+
+    #[test]
+    fn split_reports_each_failed_spawn_and_keeps_the_rest() {
+        let mut session = session();
+        let posted = std::cell::RefCell::new(Vec::new());
+        let mut next_id = 100;
+        let (focus, replaced) = apply_launch_with(
+            launch_apply(true, &["ok", "bad", "ok"]),
+            &mut session,
+            &mut fake_spawn(&mut next_id),
+            |worktree, text| {
+                posted
+                    .borrow_mut()
+                    .push((worktree.to_string(), text.to_string()));
+            },
+        );
+
+        assert!(focus.is_some());
+        assert_eq!(session.worktrees[0].tabs.len(), 2);
+        assert_eq!(session.worktrees[0].tabs[1].center.pane_ids().len(), 2);
+        assert_eq!(replaced, vec![0]);
+        let notices = posted.into_inner();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].1.contains("launch failed"));
+        assert!(notices[0].1.contains("no such program: bad"));
+    }
+
+    #[test]
+    fn split_with_every_spawn_failing_adds_no_tab() {
+        let mut session = session();
+        let posted = std::cell::RefCell::new(Vec::new());
+        let mut next_id = 100;
+        let (focus, replaced) = apply_launch_with(
+            launch_apply(true, &["bad", "bad"]),
+            &mut session,
+            &mut fake_spawn(&mut next_id),
+            |worktree, text| {
+                posted
+                    .borrow_mut()
+                    .push((worktree.to_string(), text.to_string()));
+            },
+        );
+
+        assert_eq!(focus, None);
+        assert!(replaced.is_empty());
+        assert_eq!(session.worktrees[0].tabs.len(), 1);
+        assert_eq!(posted.into_inner().len(), 2);
+    }
+
+    #[test]
+    fn per_command_failure_adds_no_tab() {
+        let mut session = session();
+        let posted = std::cell::RefCell::new(Vec::new());
+        let mut next_id = 100;
+        let (focus, replaced) = apply_launch_with(
+            launch_apply(false, &["bad"]),
+            &mut session,
+            &mut fake_spawn(&mut next_id),
+            |worktree, text| {
+                posted
+                    .borrow_mut()
+                    .push((worktree.to_string(), text.to_string()));
+            },
+        );
+
+        assert_eq!(focus, None);
+        assert!(replaced.is_empty());
+        assert_eq!(session.worktrees[0].tabs.len(), 1);
+        assert_eq!(posted.into_inner().len(), 1);
+    }
+
+    #[test]
+    fn split_success_adds_one_tab_with_every_pane() {
+        let mut session = session();
+        let posted = std::cell::RefCell::new(Vec::new());
+        let mut next_id = 100;
+        let (focus, replaced) = apply_launch_with(
+            launch_apply(true, &["ok", "ok"]),
+            &mut session,
+            &mut fake_spawn(&mut next_id),
+            |worktree, text| {
+                posted
+                    .borrow_mut()
+                    .push((worktree.to_string(), text.to_string()));
+            },
+        );
+
+        assert!(focus.is_some());
+        assert_eq!(session.worktrees[0].tabs.len(), 2);
+        assert_eq!(session.worktrees[0].tabs[1].center.pane_ids().len(), 2);
+        assert_eq!(replaced, vec![0]);
+        assert!(posted.into_inner().is_empty());
     }
 }
