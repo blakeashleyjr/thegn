@@ -775,8 +775,19 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn setsid_available() -> bool {
+        Command::new("setsid")
+            .arg("true")
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn resident_linux_terminate_kills_a_setsid_grandchild() {
+        if !setsid_available() {
+            return;
+        }
         let pid_dir = tempfile::tempdir().unwrap();
         let pid_file = pid_dir.path().join("grandchild.pid");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -823,10 +834,14 @@ mod tests {
             {
                 break start_time;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "setsid grandchild {grandchild_pid} vanished before its stat was read"
-            );
+            if std::time::Instant::now() >= deadline {
+                process.leader.terminate().unwrap();
+                runtime.block_on(async {
+                    process.leader.wait_ready().await.unwrap();
+                });
+                process.leader.reap().unwrap();
+                panic!("setsid grandchild {grandchild_pid} vanished before its stat was read");
+            }
             std::thread::sleep(Duration::from_millis(10));
         };
         let grandchild_group = unsafe { libc::getpgid(grandchild_pid) };
