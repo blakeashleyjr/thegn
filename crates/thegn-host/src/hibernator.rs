@@ -331,9 +331,18 @@ fn finish_destroy(cfg: &Config, row: &HibernationRow) {
                 // best-effort: a claimed spare's pool row must not linger.
                 let _ = db.delete_pool_spare(&row.sandbox_name);
             }
-            let loc = GitLoc::for_worktree(Path::new(&row.worktree_path));
-            if let Some(key) = thegn_svc::bridge::bridge_key(&loc) {
-                thegn_svc::bridge::drop_key(&key);
+            match GitLoc::for_worktree_op(
+                Path::new(&row.worktree_path),
+                "hibernation bridge-key drop",
+            ) {
+                Ok(loc) => {
+                    if let Some(key) = thegn_svc::bridge::bridge_key(&loc) {
+                        thegn_svc::bridge::drop_key(&key);
+                    }
+                }
+                Err(error) => thegn_core::msg::warn(&format!(
+                    "{error}; the sandbox's bridge key was not dropped"
+                )),
             }
             thegn_core::msg::info(&format!(
                 "hibernated {}: compute destroyed, state snapshotted ({})",
@@ -391,7 +400,8 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
     }
 
     let db = thegn_core::db::Db::open()?;
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc =
+        GitLoc::for_worktree_op(Path::new(worktree), "hibernate").map_err(anyhow::Error::msg)?;
     let (repo_root, _repo, _env) = crate::lifecycle::pool_context(&db, cfg, worktree, &loc)?;
     let key = snapshot_key(&db, &repo_root, worktree, env_name)?;
     let store = open_store(&cfg.lifecycle.snapshot)?;
