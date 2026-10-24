@@ -150,9 +150,9 @@ fn drawer_bar_state(
     }
 }
 
-/// The focused workspace's repo root + slug for per-workspace keybind layering.
-/// `session.id` is the workspace's repo path; the active tab's worktree is the
-/// repo-root overlay source. Both are `None` when no workspace is resolvable.
+/// The focused workspace's repo root + existing slug for per-workspace keybind
+/// layering. Slugs come from the session model or a read-only lookup; this
+/// helper never claims one.
 fn workspace_context(
     session: &crate::session::Session,
 ) -> (Option<std::path::PathBuf>, Option<String>) {
@@ -160,15 +160,48 @@ fn workspace_context(
         return (None, None);
     }
     let root = std::path::PathBuf::from(&session.id);
-    let slug = match thegn_core::repo::repo_slug_checked(&root) {
-        Ok(slug) => Some(slug),
-        Err(error) => {
-            tracing::debug!(target: "thegn::session", %error, "workspace slug unresolved; no per-workspace keymap layer");
-            None
-        }
-    };
+    let slug = session
+        .workspace_slug_hint()
+        .or_else(|| lookup_workspace_slug_read_only(&root));
     let root = root.is_dir().then_some(root);
     (root, slug)
+}
+
+fn lookup_workspace_slug_read_only(root: &Path) -> Option<String> {
+    match thegn_core::db::Db::open_read_only_current() {
+        Ok(Some(db)) => match db.repo_slug_lookup(&root.to_string_lossy()) {
+            Ok(slug) => slug,
+            Err(error) => {
+                tracing::debug!(target: "thegn::session", %error, "workspace slug lookup failed; no per-workspace keymap layer");
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(target: "thegn::session", %error, "state database unreadable; no per-workspace keymap layer");
+            None
+        }
+    }
+}
+
+fn delete_workspace_slug(
+    session: &crate::session::Session,
+    repo_path: &str,
+) -> std::result::Result<String, String> {
+    if let Some(slug) = session.workspace_slug_hint() {
+        return Ok(slug);
+    }
+
+    let db = thegn_core::db::Db::open().map_err(|error| {
+        format!("Cannot delete project: its identity is unavailable ({error:#})")
+    })?;
+    thegn_core::repo::repo_slug_with_checked_nowait(&db, Path::new(repo_path)).map_err(|error| {
+        if thegn_core::db::is_transient_lock(&error) {
+            format!("Cannot delete project: the state database is busy ({error:#}); try again")
+        } else {
+            format!("Cannot delete project: its identity is unavailable ({error:#})")
+        }
+    })
 }
 
 /// Rebuild the host keymap for the session's focused workspace (profile +
@@ -2059,9 +2092,25 @@ fn connect_worktree_bridge(
             return;
         }
         let repo_root = thegn_core::repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
-        let env_name = thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.worktree_env(&wt.to_string_lossy()).ok().flatten());
+        let selection = thegn_core::db::Db::open().and_then(|db| {
+            crate::bridge_sup::bridge_env_selection(
+                &db,
+                &wt.to_string_lossy(),
+                &repo_root.to_string_lossy(),
+            )
+        });
+        let env_name = match selection {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::bridge",
+                    worktree = %wt.display(),
+                    error = %format!("{error:#}"),
+                    "resident bridge connect skipped: the environment selection could not be read"
+                );
+                return;
+            }
+        };
         let env = cfg.resolve_env(&repo_root, &loc, &wt, env_name.as_deref());
         // For a managed provider, install and verify the resident bridge before
         // tunneling or connecting; a failed or unverified install skips both.
@@ -2069,11 +2118,7 @@ fn connect_worktree_bridge(
             let Some(bin) = crate::bridge_sup::bridge_binary_path() else {
                 return;
             };
-            let Some(bridge) = crate::agent::ensure_remote_bridge(
-                &cfg,
-                env_name.as_deref().unwrap_or_default(),
-                &bin,
-            ) else {
+            let Some(bridge) = crate::agent::ensure_remote_bridge(&cfg, &env.name, &bin) else {
                 return;
             };
             Some(bridge)
@@ -26910,27 +26955,13 @@ async fn event_loop<T: Terminal>(
                                     .file_name()
                                     .map(|s| s.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| "workspace".into());
-                                // Derive the slug from the active group's own name
-                                // so it matches the `{slug}/…` prefix that
-                                // `remove_workspace_with_db` filters live groups on.
-                                let slug = match session
-                                    .active_group()
-                                    .and_then(|g| crate::sidebar::split_tab(&g.name))
-                                    .map(|(repo, _)| repo)
-                                {
-                                    Some(slug) => slug,
-                                    None => match thegn_core::repo::repo_slug_checked(Path::new(
-                                        &repo_path,
-                                    )) {
-                                        Ok(slug) => slug,
-                                        Err(error) => {
-                                            model.status = format!(
-                                                "Cannot delete project: its identity is unavailable ({error})"
-                                            );
-                                            dirty = true;
-                                            continue;
-                                        }
-                                    },
+                                let slug = match delete_workspace_slug(&session, &repo_path) {
+                                    Ok(slug) => slug,
+                                    Err(status) => {
+                                        model.status = status;
+                                        dirty = true;
+                                        continue;
+                                    }
                                 };
                                 if current_config.ui.confirm_delete_workspace {
                                     // Default (pre-selected) choice is "delete from

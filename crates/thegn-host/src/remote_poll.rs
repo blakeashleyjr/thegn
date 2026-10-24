@@ -602,7 +602,18 @@ fn poll_one(
     if !path.is_dir() {
         return FetchOutcome::NotRun;
     }
-    let loc = GitLoc::for_worktree(path);
+    let loc = match GitLoc::for_worktree_op(path, "background fetch") {
+        Ok(loc) => loc,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::git",
+                worktree,
+                %error,
+                "background fetch skipped: worktree location unreadable"
+            );
+            return FetchOutcome::NotRun;
+        }
+    };
     let Some(repo) = repo_key(worktree, &loc) else {
         return FetchOutcome::NotRun;
     };

@@ -52,6 +52,10 @@ pub struct ResolvedEnv {
     /// Bundle names that passed zone visibility and were folded, in fold order.
     /// Launch-time bundle effects must use this authorization result.
     pub authorized: Vec<String>,
+    /// State reads that failed while composing (a bundle binding, an identity
+    /// binding or an account pointer). Non-empty means the result may be missing
+    /// the identity the user bound; launches gate on it.
+    pub unreadable: Vec<String>,
 }
 
 impl ResolvedEnv {
@@ -93,14 +97,20 @@ fn scope_wt(worktree: &str) -> String {
 }
 
 /// The bundle bound at the global scope (`ui_state["bundle"].active`).
+// best-effort: used by the legacy chip/display path; composition uses the checked reader.
 fn global_binding(db: &Db) -> Option<String> {
     db.get_ui_state(&scope_global(), "active").ok().flatten()
+}
+
+fn global_binding_checked(db: &Db) -> anyhow::Result<Option<String>> {
+    db.get_ui_state(&scope_global(), "active")
 }
 
 /// The bundle bound at the workspace scope: `[workspace.<slug>].env_bundle`
 /// (config) wins over the `ui_state` pointer, matching `account.rs`.
 /// `Err(())` = the trusted overlay is refused (THE-515): the caller must not
 /// substitute the workspace pointer or the global binding for it.
+// best-effort: used by legacy display callers; launch composition preserves the ui_state error.
 fn workspace_binding(cfg: &Config, db: &Db, slug: Option<&str>) -> Result<Option<String>, ()> {
     let Some(slug) = slug else {
         return Ok(None);
@@ -115,11 +125,37 @@ fn workspace_binding(cfg: &Config, db: &Db, slug: Option<&str>) -> Result<Option
     Ok(db.get_ui_state(&scope_ws(slug), "active").ok().flatten())
 }
 
+/// Workspace state reads are nested under the overlay refusal: `Err(())`
+/// means the trusted overlay refused the scope, while the inner error is a
+/// failed `ui_state` read that must be surfaced to launch callers.
+fn workspace_binding_checked(
+    cfg: &Config,
+    db: &Db,
+    slug: Option<&str>,
+) -> Result<anyhow::Result<Option<String>>, ()> {
+    let Some(slug) = slug else {
+        return Ok(Ok(None));
+    };
+    let overlay = cfg.workspace_overlay_for_tab_slug(db, slug);
+    if overlay.is_refused() {
+        return Err(());
+    }
+    if let Some(name) = overlay.overlay().and_then(|w| w.env_bundle.clone()) {
+        return Ok(Ok(Some(name)));
+    }
+    Ok(db.get_ui_state(&scope_ws(slug), "active"))
+}
+
 /// The bundle bound at the worktree scope (strongest single binding).
+// best-effort: used by the legacy chip/display path; composition uses the checked reader.
 fn worktree_binding(db: &Db, worktree: &str) -> Option<String> {
     db.get_ui_state(&scope_wt(worktree), "active")
         .ok()
         .flatten()
+}
+
+fn worktree_binding_checked(db: &Db, worktree: &str) -> anyhow::Result<Option<String>> {
+    db.get_ui_state(&scope_wt(worktree), "active")
 }
 
 /// The single most-specific bound bundle name (worktree → workspace → global),
@@ -398,6 +434,39 @@ pub fn active_chain(cfg: &Config, db: &Db, worktree: &str, slug: Option<&str>) -
     order
 }
 
+fn active_chain_checked(
+    cfg: &Config,
+    db: &Db,
+    worktree: &str,
+    slug: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    let mut unreadable = Vec::new();
+    let workspace = workspace_binding_checked(cfg, db, slug);
+    let workspace_refused = workspace.is_err();
+    if !workspace_refused {
+        match global_binding_checked(db) {
+            Ok(Some(name)) => collect_chain(cfg, &name, &mut seen, &mut order),
+            Ok(None) => {}
+            Err(error) => unreadable.push(format!("read the global env-bundle binding: {error:#}")),
+        }
+        match workspace {
+            Ok(Ok(Some(name))) => collect_chain(cfg, &name, &mut seen, &mut order),
+            Ok(Ok(None)) | Err(()) => {}
+            Ok(Err(error)) => {
+                unreadable.push(format!("read the workspace env-bundle binding: {error:#}"))
+            }
+        }
+    }
+    match worktree_binding_checked(db, worktree) {
+        Ok(Some(name)) => collect_chain(cfg, &name, &mut seen, &mut order),
+        Ok(None) => {}
+        Err(error) => unreadable.push(format!("read the worktree env-bundle binding: {error:#}")),
+    }
+    (order, unreadable)
+}
+
 fn compose_inner(
     cfg: &Config,
     db: &Db,
@@ -406,7 +475,7 @@ fn compose_inner(
     choice: Option<&str>,
     allow_secrets: bool,
 ) -> ResolvedEnv {
-    let order = active_chain(cfg, db, worktree, slug);
+    let (order, mut unreadable) = active_chain_checked(cfg, db, worktree, slug);
 
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     let mut mounts: Vec<Mount> = Vec::new();
@@ -475,7 +544,10 @@ fn compose_inner(
     // scope (global → workspace → worktree), folded after the bundle chain so an
     // explicit identity switch wins over a bundle-referenced one. Each tool it
     // leaves unset still falls through to the bundle/profile-base identity below.
-    for id_name in crate::identity::bound_in_order(db, worktree, slug) {
+    let (identities, identity_failures) =
+        crate::identity::bound_in_order_checked(db, worktree, slug);
+    unreadable.extend(identity_failures);
+    for id_name in identities {
         fold_identity(
             cfg,
             db,
@@ -495,26 +567,32 @@ fn compose_inner(
             account::provider_for(cfg, choice).or_else(|| account::infer_provider(choice))
         && !overrides.contains_key(p.home_env)
     {
-        if let Some((var, dir)) = account::launch_env(cfg, db, worktree, slug, choice) {
-            fold_cred_dir(
+        match account::launch_env_checked(cfg, db, worktree, slug, choice) {
+            Ok(Some((var, dir))) => fold_cred_dir(
                 &var,
                 &dir.to_string_lossy(),
                 &mut overrides,
                 &mut mounts,
                 &mut ensure_dirs,
-            );
-        } else if let Some(dir) = account::effective_config_dir(p) {
-            // No thegn-managed account, but the agent still writes runtime
-            // state (session-env, todos, shell snapshots) into its inherited
-            // config dir. Under a read-only $HOME that fails EROFS, so carve it
-            // read-write path-preserving — parity with the managed path above.
-            fold_cred_dir(
-                p.home_env,
-                &dir,
-                &mut overrides,
-                &mut mounts,
-                &mut ensure_dirs,
-            );
+            ),
+            Ok(None) => {
+                if let Some(dir) = account::effective_config_dir(p) {
+                    // No thegn-managed account, but the agent still writes runtime
+                    // state (session-env, todos, shell snapshots) into its inherited
+                    // config dir. Under a read-only $HOME that fails EROFS, so carve it
+                    // read-write path-preserving — parity with the managed path above.
+                    fold_cred_dir(
+                        p.home_env,
+                        &dir,
+                        &mut overrides,
+                        &mut mounts,
+                        &mut ensure_dirs,
+                    );
+                }
+            }
+            Err(error) => {
+                unreadable.push(format!("read the {} account selection: {error:#}", p.id))
+            }
         }
     }
 
@@ -536,6 +614,7 @@ fn compose_inner(
         ensure_dirs,
         denied,
         authorized,
+        unreadable,
     }
 }
 
@@ -1206,6 +1285,98 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(r.env_pairs(), r.overrides);
+    }
+
+    #[test]
+    fn compose_records_an_unreadable_bundle_binding() {
+        let db = Db::open_memory().unwrap();
+        db.conn().execute_batch("DROP TABLE ui_state;").unwrap();
+
+        let resolved = compose(&Config::default(), &db, "/wt", None, None);
+
+        assert!(!resolved.unreadable.is_empty());
+        assert!(
+            resolved
+                .unreadable
+                .iter()
+                .any(|line| line.contains("env-bundle binding"))
+        );
+
+        let db = Db::open_memory().unwrap();
+        db.conn().execute_batch("DROP TABLE ui_state;").unwrap();
+        let resolved = compose(&Config::default(), &db, "/wt", Some("repo"), None);
+        assert!(
+            resolved
+                .unreadable
+                .iter()
+                .any(|line| line.contains("workspace env-bundle binding"))
+        );
+    }
+
+    #[test]
+    fn compose_records_an_unreadable_identity_binding() {
+        let db = Db::open_memory().unwrap();
+        db.conn().execute_batch("DROP TABLE ui_state;").unwrap();
+
+        let resolved = compose(&Config::default(), &db, "/wt", None, None);
+
+        assert!(
+            resolved
+                .unreadable
+                .iter()
+                .any(|line| line.contains("identity binding"))
+        );
+    }
+
+    #[test]
+    fn compose_never_folds_the_default_home_for_an_unreadable_account_pointer() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.agents.push(NamedCommand {
+            name: "claude".into(),
+            command: "claude".into(),
+            hints: vec![],
+            provider: None,
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
+        });
+        db.conn().execute_batch("DROP TABLE ui_state;").unwrap();
+
+        let resolved = compose(&cfg, &db, "/wt", None, Some("claude"));
+
+        assert!(
+            !resolved
+                .overrides
+                .iter()
+                .any(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        );
+        assert!(resolved.mounts.is_empty());
+        assert!(
+            resolved
+                .unreadable
+                .iter()
+                .any(|line| line.contains("claude account selection"))
+        );
+    }
+
+    #[test]
+    fn compose_with_readable_state_records_nothing_unreadable() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.bundle
+            .insert("g".into(), bundle_with_env(&[("THEGN_BUNDLE_TEST", "yes")]));
+        set_active(&db, Bind::Global, "/wt", None, "g").unwrap();
+
+        let resolved = compose(&cfg, &db, "/wt", None, None);
+
+        assert!(resolved.unreadable.is_empty());
+        assert_eq!(get(&resolved.overrides, "THEGN_BUNDLE_TEST"), Some("yes"));
     }
 
     #[test]

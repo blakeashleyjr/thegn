@@ -732,7 +732,7 @@ pub(crate) fn resolve_for(
     let wt = super::resolve_worktree(worktree)
         .to_string_lossy()
         .into_owned();
-    let loc = GitLoc::for_worktree(Path::new(&wt));
+    let loc = GitLoc::for_worktree_op(Path::new(&wt), "env resolve").map_err(anyhow::Error::msg)?;
     let repo_root = repo_root_for(&wt);
     let read =
         Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
@@ -839,7 +839,7 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree)
         .to_string_lossy()
         .into_owned();
-    let loc = GitLoc::for_worktree(Path::new(&wt));
+    let loc = GitLoc::for_worktree_op(Path::new(&wt), "env show").map_err(anyhow::Error::msg)?;
     let repo_root = repo_root_for(&wt);
     let read =
         Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
@@ -1184,5 +1184,44 @@ mod selection_tests {
             .expect("selected env resolves");
         assert_eq!(actual.name, "box");
         assert!(!actual.unresolved_selection);
+    }
+
+    #[test]
+    fn resolve_for_refuses_an_unrecognised_worktree_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open().unwrap();
+        db.put_worktree(
+            "repo/env",
+            &dir.path().to_string_lossy(),
+            &dir.path().to_string_lossy(),
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+
+        let result = resolve_for(
+            &Config::default(),
+            Some(dir.path().to_string_lossy().into_owned()),
+        );
+        assert!(
+            matches!(result, Err(error) if format!("{error:#}").contains("env resolve refused"))
+        );
+    }
+
+    #[test]
+    fn resolve_for_keeps_a_row_less_worktree_local() {
+        // Positive control: passes at 774069ac2 too. repo_root_for opens the DB.
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_for(
+            &Config::default(),
+            Some(dir.path().to_string_lossy().into_owned()),
+        );
+        assert!(result.is_ok());
+        let env = result.unwrap();
+        assert_eq!(env.name, "default");
+        assert!(env.placement.is_local());
     }
 }

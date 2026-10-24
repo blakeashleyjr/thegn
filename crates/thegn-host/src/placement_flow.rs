@@ -779,32 +779,68 @@ pub(crate) struct PlanOutput {
     pub candidates: Vec<PlanCandidate>,
 }
 
+/// The env selection a placement dry run plans for. A failed read is an error
+/// unless no non-local env, pinned host, or placement engine is configured
+/// (then the only possible environment is local and the default resolution is truthful).
+fn plan_selection(
+    read: anyhow::Result<Option<String>>,
+    cfg: &Config,
+) -> anyhow::Result<Option<String>> {
+    match read {
+        Ok(selected) => Ok(selected),
+        Err(_) if !cfg.placement.enabled
+            && !cfg
+                .env
+                .values()
+                .any(|env| env.placement != PlacementMode::Local || !env.host.trim().is_empty()) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.context(
+            "the worktree's environment selection could not be read; refusing to plan against the default environment",
+        )),
+    }
+}
+
 /// Pure dry-run for `thegn placement plan`. `None` ⇒ engine off / env not
-/// engine-placeable (pinned envs report a `pinned` plan).
-pub(crate) fn plan(cfg: &Config, worktree: &str) -> Option<PlanOutput> {
-    let Ok(db) = Db::open() else { return None };
+/// engine-placeable (pinned envs report a `pinned` plan); `Err` ⇒ selection
+/// or DB read failed.
+pub(crate) fn plan(cfg: &Config, worktree: &str) -> anyhow::Result<Option<PlanOutput>> {
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) => return plan_selection(Err(error), cfg).map(|_| None),
+    };
     let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
     let repo_root = thegn_core::repo::main_worktree(std::path::Path::new(worktree))
         .unwrap_or_else(|| std::path::PathBuf::from(worktree));
-    let environment = cfg.resolve_env(&repo_root, &loc, std::path::Path::new(worktree), None);
+    let selected = plan_selection(
+        db.effective_env_checked(worktree, &repo_root.to_string_lossy()),
+        cfg,
+    )?;
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        std::path::Path::new(worktree),
+        selected.as_deref(),
+    );
     let envc = cfg.env.get(&environment.name);
     if let Some(e) = envc.filter(|e| !e.host.trim().is_empty()) {
         let chosen = cfg
             .resolve_host_binding(&environment.name, e)
             .map(|b| b.id.to_string())
             .unwrap_or_default();
-        return Some(PlanOutput {
+        return Ok(Some(PlanOutput {
             decision: "pinned".into(),
             chosen,
             candidates: Vec::new(),
-        });
+        }));
     }
     if !engine_applicable(cfg, envc) {
-        return None;
+        return Ok(None);
     }
     let resolved = resolved_for(cfg, &db, worktree, envc);
     if !resolved.enabled {
-        return None;
+        return Ok(None);
     }
     let zone = zone_of(&db, worktree);
     let request = PlacementRequest {
@@ -837,7 +873,7 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> Option<PlanOutput> {
         PlacementDecision::Provision { template } => template.lane_key(),
         _ => String::new(),
     };
-    Some(PlanOutput {
+    Ok(Some(PlanOutput {
         decision: out.decision.tag().to_string(),
         chosen,
         candidates: out
@@ -848,7 +884,7 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> Option<PlanOutput> {
                 outcome: why.map(|w| w.as_str()).unwrap_or("eligible").to_string(),
             })
             .collect(),
-    })
+    }))
 }
 
 /// The paid-lane budget verdict for this worktree's zone.
@@ -1400,5 +1436,85 @@ mod tests {
             fresh_provision_failure(OnExhaustion::Queue, lane, "provider unavailable"),
             Ok(None)
         ));
+    }
+
+    #[test]
+    fn plan_honours_the_worktrees_selected_env() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt").to_string_lossy().into_owned();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_env(&wt, "pinned").unwrap();
+        let cfg = Config {
+            env: std::collections::BTreeMap::from([(
+                "pinned".to_string(),
+                EnvConfig {
+                    host: "h1".into(),
+                    ..EnvConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            plan(&cfg, &wt).unwrap().map(|plan| plan.decision),
+            Some("pinned".to_string())
+        );
+    }
+
+    #[test]
+    fn plan_selection_refuses_an_unreadable_selection_when_a_provider_env_is_configured() {
+        let cfg = Config {
+            env: std::collections::BTreeMap::from([(
+                "box".to_string(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    ..EnvConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let error = plan_selection(Err(anyhow::anyhow!("database is locked")), &cfg)
+            .expect_err("provider env makes the selection read authoritative");
+        let message = format!("{error:#}");
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(message.contains("database is locked"), "{message}");
+    }
+
+    #[test]
+    fn plan_selection_refuses_an_unreadable_selection_when_placement_is_enabled() {
+        let cfg = Config {
+            placement: thegn_core::config::PlacementConfig {
+                enabled: true,
+                ..thegn_core::config::PlacementConfig::default()
+            },
+            ..Config::default()
+        };
+
+        assert!(plan_selection(Err(anyhow::anyhow!("database is locked")), &cfg).is_err());
+    }
+
+    #[test]
+    fn plan_selection_allows_a_local_only_config() {
+        let cfg = Config::default();
+
+        assert_eq!(
+            plan_selection(Err(anyhow::anyhow!("database is locked")), &cfg).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn plan_selection_passes_a_read_through() {
+        let cfg = Config::default();
+
+        assert_eq!(
+            plan_selection(Ok(Some("x".into())), &cfg).unwrap(),
+            Some("x".into())
+        );
+        assert_eq!(plan_selection(Ok(None), &cfg).unwrap(), None);
     }
 }

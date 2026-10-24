@@ -1,5 +1,7 @@
 //! Resident-process ownership seam. All OS-specific lifecycle code stays here.
 //! Unix groups and Windows direct-child handles do not certify escaped trees.
+//! On Linux, termination also kills the live leader's tracked descendants,
+//! including setsid children; descendants re-parented before termination are not reached.
 
 #[cfg(unix)]
 mod unix;

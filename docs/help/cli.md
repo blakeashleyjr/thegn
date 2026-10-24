@@ -318,6 +318,14 @@ if it cannot read the host's placement tenants, and `thegn placement list`
 reports an error if it cannot read recorded state instead of showing an empty
 result.
 
+On the dev channel, when `[placement]` autoscale creates a host, the worktree
+is reserved there. If the host definition cannot be read or it has no free
+slot, placement stops once under `on_exhaustion` and names the host instead of
+creating more hosts. If an idle autoscale host cannot be removed because its
+token or ledger record is unavailable, or the destroy fails, thegn warns each
+time; while the UI runs it shows one status line and toast per host, naming the
+provider and saying the host keeps running and billing.
+
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
 in-degree, under a line budget (`--budget`, default `[semantic]

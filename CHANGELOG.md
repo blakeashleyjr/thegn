@@ -7,7 +7,48 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.41] — 2026-10-23 (maintenance batch 78)
+
 ## [0.1.0-alpha.40] — 2026-10-23 (maintenance batch 77)
+
+### Changed
+
+- Editing `[model_proxy]` takes effect on config reload while the UI runs:
+  disabling stops the supervised proxy, enabling starts it and other changes
+  restart it. Renaming a worktree with a merge-queue row is refused; remove the
+  row with `thegn merge rm` first.
+- Launch-menu and `thegn open --preset` warnings, and pane spawn failures, also
+  appear on the status line, in a toast and in the notification inbox.
+- (dev channel) Failed SSH sandbox teardowns and skipped or failed close
+  auto-checkpoints appear on the status line and in a toast.
+
+### Fixed
+
+- Launching several agents at once into a newly added repository no longer
+  fails with "database is locked"; a pane launch briefly retries a
+  transiently locked state database instead of refusing.
+  `thegn pr --worktree` resolves a symlinked or nested spelling to the
+  registered worktree's PR state.
+- (dev channel) Reopening a worktree adopts its pending machine0 VM instead of
+  creating a duplicate. Autoscale reserves a newly created host for the
+  worktree; a blocked or failed scale-down reports that the host keeps billing.
+
+### Security
+
+- Worktree writes and code runs refuse when the recorded location cannot be
+  read or is unrecognised, rather than acting on the host checkout. This covers
+  panel git actions, Tests and Jobs, `thegn land`, mutating `thegn pr` actions,
+  `thegn ci rerun`, `thegn ci trigger` and `thegn ci cancel`, worktree delete,
+  Sandbox container stop or restart, clipboard image paste and toolchain
+  install.
+- An unreadable environment selection no longer applies the default
+  environment's trust policy: trust-gated devcontainer steps and devshell
+  injection are skipped with a warning, and `thegn doctor` reports unknown.
+- The environment chip and loading splash show the unreadable state, and a
+  failed pane connection is not blamed on a guessed provider; an unreadable
+  account selection refuses a provider pane. (dev channel)
+- (dev channel) Reopening a hibernated worktree refuses to provision a fresh
+  sandbox when its hibernation record cannot be read while hibernation is on.
 
 ## [0.1.0-alpha.39] — 2026-10-23 (maintenance batch 76)
 
@@ -2159,7 +2200,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.40...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.41...HEAD
+[0.1.0-alpha.41]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.40...v0.1.0-alpha.41
 [0.1.0-alpha.40]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.39...v0.1.0-alpha.40
 [0.1.0-alpha.39]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.38...v0.1.0-alpha.39
 [0.1.0-alpha.38]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.37...v0.1.0-alpha.38
