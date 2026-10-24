@@ -504,17 +504,8 @@ pub(crate) fn control_stage(worktree: &std::path::Path, paths: &[String]) -> any
 pub(crate) fn control_commit(worktree: &std::path::Path, message: &str) -> anyhow::Result<String> {
     let loc = GitLoc::for_worktree_op(worktree, "git commit").map_err(anyhow::Error::msg)?;
     CliGit.commit(&loc, message, false, None)?;
-    // The new HEAD is the commit we just made (git_cmd scrubs GIT_* env; inside
-    // spawn_blocking, so the wait is off-loop).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "inside spawn_blocking — off-loop child wait is the sanctioned pattern"
-    )]
-    let out = thegn_core::util::git_cmd(worktree)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
-    anyhow::ensure!(out.status.success(), "rev-parse HEAD failed");
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    loc.git_out(&["rev-parse", "HEAD"])
+        .ok_or_else(|| anyhow::anyhow!("rev-parse HEAD failed after the commit"))
 }
 
 fn execute_at_with_db(
@@ -1745,6 +1736,37 @@ timeout_secs = 1
             matches!(result, Err(error) if format!("{error:#}").contains("git commit refused"))
         );
         assert_eq!(git_out(&dir, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn control_commit_reads_head_through_the_recorded_location() {
+        use thegn_core::store::WorkspaceStore;
+        let _state = crate::testenv::IsolatedState::new();
+        let host = tmp_repo("commit-head-host");
+        let remote = tmp_repo("commit-head-remote");
+        std::fs::write(host.join("host-only.txt"), "host history\n").unwrap();
+        git_out(&host, &["add", "host-only.txt"]);
+        git_out(&host, &["commit", "-m", "host-only"]);
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree(
+            "repo/x",
+            &host.to_string_lossy(),
+            &host.to_string_lossy(),
+            "main",
+            Some(&GitLoc::provider_db_string(
+                &["env".into()],
+                &remote.to_string_lossy(),
+            )),
+            None,
+        )
+        .unwrap();
+        drop(db);
+
+        std::fs::write(remote.join("new.txt"), "remote change\n").unwrap();
+        git_out(&remote, &["add", "new.txt"]);
+        let head = control_commit(&host, "msg").unwrap();
+        assert_eq!(head, git_out(&remote, &["rev-parse", "HEAD"]));
+        assert_ne!(head, git_out(&host, &["rev-parse", "HEAD"]));
     }
 
     #[test]

@@ -5059,7 +5059,19 @@ fn maybe_clean_merged_worktrees_with_state(
         // cache diff. Treating None/OPEN/unknown as "closed" (the old `!merged`
         // branch did) deletes the worktree's build artifacts on a transient error
         // or a still-open PR — unrecoverable. When unsure, do nothing.
-        let target_loc = thegn_core::remote::GitLoc::for_worktree(&path);
+        let target_loc =
+            match thegn_core::remote::GitLoc::for_worktree_op(&path, "merged-worktree clean") {
+                Ok(loc) => loc,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "thegn::hydrate",
+                        path = %path.display(),
+                        %error,
+                        "merged-worktree clean skipped: worktree location unreadable"
+                    );
+                    continue;
+                }
+            };
         let Ok(target_scope) = thegn_core::forge::checkout::checkout_scope(&target_loc) else {
             continue;
         };
