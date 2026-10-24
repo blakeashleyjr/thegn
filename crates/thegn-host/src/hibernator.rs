@@ -856,7 +856,7 @@ fn verify_bundle_shape_in(scratch_root: &Path, data: &[u8]) -> anyhow::Result<()
     let scratch_root = scratch_root.canonicalize()?;
     let scratch = tempfile::Builder::new()
         .prefix("tg-hib-verify-")
-        .tempdir_in(scratch_root)?;
+        .tempdir_in(&scratch_root)?;
     let mut tmp = tempfile::Builder::new()
         .suffix(".bundle")
         .tempfile_in(scratch.path())?;
@@ -864,7 +864,7 @@ fn verify_bundle_shape_in(scratch_root: &Path, data: &[u8]) -> anyhow::Result<()
 
     // off-loop: hibernator worker thread only.
     #[expect(clippy::disallowed_methods)]
-    let output = bundle_list_heads_command(scratch.path(), tmp.path()).output();
+    let output = bundle_list_heads_command(scratch.path(), tmp.path(), &scratch_root).output();
     match output {
         Ok(output) if output.status.success() && !output.stdout.is_empty() => Ok(()),
         Ok(output) => anyhow::bail!(
@@ -875,10 +875,11 @@ fn verify_bundle_shape_in(scratch_root: &Path, data: &[u8]) -> anyhow::Result<()
     }
 }
 
-fn bundle_list_heads_command(scratch: &Path, bundle: &Path) -> std::process::Command {
-    // The scratch dir is a private tempdir, so it always has a parent; fall
-    // back to the scratch dir itself rather than panicking.
-    let ceiling = scratch.parent().unwrap_or(scratch);
+fn bundle_list_heads_command(
+    scratch: &Path,
+    bundle: &Path,
+    ceiling: &Path,
+) -> std::process::Command {
     let mut cmd = thegn_core::util::git_cmd(scratch);
     cmd.env("GIT_CEILING_DIRECTORIES", ceiling)
         .args(["bundle", "list-heads"])
@@ -986,16 +987,15 @@ mod tests {
         assert_eq!(content, b"keep this content");
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture waits for its git child"
+    )]
     fn git_output(command: &mut std::process::Command) -> std::process::Output {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test fixture waits for its git child"
-        )]
-        let output = command
+        command
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
-            .unwrap();
-        output
+            .unwrap()
     }
 
     #[test]
@@ -1009,13 +1009,9 @@ mod tests {
 
         let repo = tempfile::tempdir().unwrap();
         assert!(
-            git_output(
-                thegn_core::util::git_cmd(repo.path())
-                    .args(["init", "-q"])
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            )
-            .status
-            .success()
+            git_output(thegn_core::util::git_cmd(repo.path()).args(["init", "-q"]))
+                .status
+                .success()
         );
         assert!(
             git_output(thegn_core::util::git_cmd(repo.path()).args([
@@ -1056,7 +1052,7 @@ mod tests {
         let root = root.path().canonicalize().unwrap();
         let scratch = root.join("s");
         let bundle = scratch.join("b.bundle");
-        let command = bundle_list_heads_command(&scratch, &bundle);
+        let command = bundle_list_heads_command(&scratch, &bundle, &root);
 
         assert!(command.get_envs().any(|(key, value)| {
             key == "GIT_CEILING_DIRECTORIES" && value == Some(root.as_os_str())
