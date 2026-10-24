@@ -288,6 +288,22 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
     None
 }
 
+/// The env selection a resident-bridge connect resolves: the worktree's own pin, else its workspace's default, keyed
+/// by the DB-recorded repo root (falling back to `fallback_repo_root` when none is recorded). `Err` = a read failed.
+pub(crate) fn bridge_env_selection(
+    db: &thegn_core::db::Db,
+    worktree: &str,
+    fallback_repo_root: &str,
+) -> anyhow::Result<Option<String>> {
+    use thegn_core::store::WorkspaceStore;
+
+    let root = db
+        .repo_root_for(worktree)?
+        .filter(|root| !root.is_empty())
+        .unwrap_or_else(|| fallback_repo_root.to_string());
+    db.effective_env_checked(worktree, &root)
+}
+
 /// The program of an ssh transport prefix: the last `/`- or `\`-separated
 /// component is exactly `ssh`, or `ssh.exe` in any ASCII case (Windows
 /// OpenSSH; Windows file names are case-insensitive).
@@ -1112,5 +1128,69 @@ mod tests {
         assert!(bridge::for_loc(&loc).is_none());
         assert!(!sup.is_connected(&loc));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn bridge_env_selection_uses_the_workspace_default() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/wt", "/x/app", "/wt/a", "tg/a", None, None)
+            .unwrap();
+        db.set_workspace_env("/x/app", "m0").unwrap();
+
+        assert_eq!(
+            bridge_env_selection(&db, "/wt/a", "/elsewhere").unwrap(),
+            Some("m0".to_string())
+        );
+    }
+
+    #[test]
+    fn bridge_env_selection_prefers_the_worktree_pin() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/wt", "/x/app", "/wt/a", "tg/a", None, None)
+            .unwrap();
+        db.set_workspace_env("/x/app", "m0").unwrap();
+        db.set_worktree_env("/wt/a", "sprites").unwrap();
+
+        assert_eq!(
+            bridge_env_selection(&db, "/wt/a", "/elsewhere").unwrap(),
+            Some("sprites".to_string())
+        );
+    }
+
+    #[test]
+    fn bridge_env_selection_uses_the_recorded_repo_root() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/wt", "/x/app", "/wt/a", "tg/a", None, None)
+            .unwrap();
+        db.set_workspace_env("/x/app", "m0").unwrap();
+
+        assert_eq!(
+            bridge_env_selection(&db, "/wt/a", "/elsewhere").unwrap(),
+            Some("m0".to_string())
+        );
+    }
+
+    #[test]
+    fn bridge_env_selection_is_none_without_a_selection() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/wt", "/x/app", "/wt/a", "tg/a", None, None)
+            .unwrap();
+
+        assert_eq!(
+            bridge_env_selection(&db, "/wt/a", "/elsewhere").unwrap(),
+            None
+        );
     }
 }

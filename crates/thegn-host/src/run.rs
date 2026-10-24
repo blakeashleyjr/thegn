@@ -2059,9 +2059,25 @@ fn connect_worktree_bridge(
             return;
         }
         let repo_root = thegn_core::repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
-        let env_name = thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.worktree_env(&wt.to_string_lossy()).ok().flatten());
+        let selection = thegn_core::db::Db::open().and_then(|db| {
+            crate::bridge_sup::bridge_env_selection(
+                &db,
+                &wt.to_string_lossy(),
+                &repo_root.to_string_lossy(),
+            )
+        });
+        let env_name = match selection {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::warn!(
+                    target: "thegn::bridge",
+                    worktree = %wt.display(),
+                    error = %format!("{error:#}"),
+                    "resident bridge connect skipped: the environment selection could not be read"
+                );
+                return;
+            }
+        };
         let env = cfg.resolve_env(&repo_root, &loc, &wt, env_name.as_deref());
         // For a managed provider, install and verify the resident bridge before
         // tunneling or connecting; a failed or unverified install skips both.
@@ -2069,11 +2085,7 @@ fn connect_worktree_bridge(
             let Some(bin) = crate::bridge_sup::bridge_binary_path() else {
                 return;
             };
-            let Some(bridge) = crate::agent::ensure_remote_bridge(
-                &cfg,
-                env_name.as_deref().unwrap_or_default(),
-                &bin,
-            ) else {
+            let Some(bridge) = crate::agent::ensure_remote_bridge(&cfg, &env.name, &bin) else {
                 return;
             };
             Some(bridge)
