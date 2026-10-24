@@ -734,10 +734,8 @@ pub(crate) fn resolve_for(
         .into_owned();
     let loc = GitLoc::for_worktree_op(Path::new(&wt), "env resolve").map_err(anyhow::Error::msg)?;
     let repo_root = repo_root_for(&wt);
-    let read = Db::open_read_only().and_then(|db| match db {
-        Some(db) => db.effective_env_checked(&wt, &repo_root.to_string_lossy()),
-        None => Ok(None),
-    });
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
     resolve_with_selection(cfg, &wt, &repo_root, &loc, read)
 }
 
@@ -843,10 +841,8 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
         .into_owned();
     let loc = GitLoc::for_worktree_op(Path::new(&wt), "env show").map_err(anyhow::Error::msg)?;
     let repo_root = repo_root_for(&wt);
-    let read = Db::open_read_only().and_then(|db| match db {
-        Some(db) => db.effective_env_checked(&wt, &repo_root.to_string_lossy()),
-        None => Ok(None),
-    });
+    let read =
+        Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
     let env = resolve_with_selection(cfg, &wt, &repo_root, &loc, read)?;
     outln!("worktree: {wt}");
     outln!("env:      {}", env.name);
@@ -1216,18 +1212,16 @@ mod selection_tests {
 
     #[test]
     fn resolve_for_keeps_a_row_less_worktree_local() {
-        let state = crate::testenv::IsolatedState::new();
+        // Positive control: passes at 774069ac2 too. repo_root_for opens the DB.
+        let _state = crate::testenv::IsolatedState::new();
         let dir = tempfile::tempdir().unwrap();
         let result = resolve_for(
             &Config::default(),
             Some(dir.path().to_string_lossy().into_owned()),
         );
         assert!(result.is_ok());
-        assert!(
-            !thegn_core::util::xdg_state_home()
-                .join("thegn/thegn.db")
-                .exists()
-        );
-        drop(state);
+        let env = result.unwrap();
+        assert_eq!(env.name, "default");
+        assert!(env.placement.is_local());
     }
 }
