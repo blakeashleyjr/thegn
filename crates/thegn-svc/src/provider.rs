@@ -1673,6 +1673,7 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
     let mut total_bytes = 0u64;
     let mut publishes: Vec<(String, Vec<u8>)> = Vec::new();
     let mut conflicts = Vec::new();
+    let mut ignore = LocalIgnore::new(local);
 
     while let Some((rel, parent, name)) = stack.pop() {
         let dir = match (parent, name) {
@@ -1736,7 +1737,13 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
                 format!("{rel}/{}", entry.name)
             };
             if entry.is_dir {
+                if ignore.is_ignored(&child, true)? {
+                    continue;
+                }
                 stack.push((child, dir.clone(), Some(entry.name)));
+                continue;
+            }
+            if ignore.is_ignored(&child, false)? {
                 continue;
             }
             file_count += 1;
@@ -1777,9 +1784,6 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
             let local_digest = local_data
                 .as_ref()
                 .map(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)));
-            if local_path_is_ignored(local, &child)? {
-                continue;
-            }
             match reconcile_action(baseline.get(&child), local_digest.as_ref(), &remote_digest) {
                 ReconcileAction::Skip => {}
                 ReconcileAction::Publish => publishes.push((child, data)),
@@ -1843,30 +1847,66 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
     Ok(())
 }
 
-/// Apply the local `.gitignore` files along a path's ancestry. This mirrors the
-/// upload's gitignore behavior for existing local files without walking ignored
-/// build trees during reconciliation.
-fn local_path_is_ignored(root: &Path, rel: &str) -> Result<bool> {
-    use ignore::gitignore::GitignoreBuilder;
+/// Local ignore rules for close-time reconciliation, mirroring the upload walk:
+/// each directory's `.ignore` and `.gitignore` apply below it, deeper
+/// directories win, and `.ignore` wins over `.gitignore` within one directory.
+/// Global excludes and `.git/info/exclude` are not consulted.
+struct LocalIgnore {
+    root: std::path::PathBuf,
+    dirs: HashMap<String, Vec<ignore::gitignore::Gitignore>>,
+}
 
-    let mut builder = GitignoreBuilder::new(root);
-    let mut parent = root.to_path_buf();
-    let candidate = root.join(rel);
-    let components: Vec<&str> = rel.split('/').collect();
-    for component in &components {
-        let ignore_file = parent.join(".gitignore");
-        if ignore_file.is_file()
-            && let Some(error) = builder.add(&ignore_file)
-        {
-            return Err(error).with_context(|| format!("read {}", ignore_file.display()));
+impl LocalIgnore {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            dirs: HashMap::new(),
         }
-        parent.push(component);
     }
-    let matcher = builder
-        .build()
-        .map_err(anyhow::Error::msg)
-        .context("parse local .gitignore rules")?;
-    Ok(matcher.matched(&candidate, false).is_ignore())
+
+    /// Matchers for one directory (`""` means the worktree root), loaded on
+    /// first use in `.ignore` then `.gitignore` order.
+    fn matchers(&mut self, dir: &str) -> Result<&[ignore::gitignore::Gitignore]> {
+        if !self.dirs.contains_key(dir) {
+            let directory = self.root.join(dir);
+            let mut matchers = Vec::new();
+            for name in [".ignore", ".gitignore"] {
+                let path = directory.join(name);
+                if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                    let (matcher, error) = ignore::gitignore::Gitignore::new(&path);
+                    if let Some(error) = error {
+                        return Err(anyhow::Error::msg(error.to_string()))
+                            .with_context(|| format!("read {}", path.display()));
+                    }
+                    matchers.push(matcher);
+                }
+            }
+            self.dirs.insert(dir.to_string(), matchers);
+        }
+        Ok(self.dirs.get(dir).expect("matcher entry inserted"))
+    }
+
+    /// Whether a slash-separated path beneath the worktree is excluded.
+    fn is_ignored(&mut self, rel: &str, is_dir: bool) -> Result<bool> {
+        let candidate = self.root.join(rel);
+        let components: Vec<&str> = rel.split('/').collect();
+        let mut dirs = Vec::with_capacity(components.len());
+        for end in (0..components.len()).rev() {
+            dirs.push(components[..end].join("/"));
+        }
+        for dir in dirs {
+            for matcher in self.matchers(&dir)? {
+                let matched = matcher.matched_path_or_any_parents(&candidate, is_dir);
+                if matched.is_ignore() {
+                    return Ok(true);
+                }
+                if matched.is_whitelist() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 impl SpritesProvider {
@@ -5927,6 +5967,87 @@ mod tests {
             std::fs::read(temp.path().join("out/x")).unwrap(),
             b"local build output",
             "ignored local output is excluded from upload conflicts and stays local"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_skips_an_ignored_sandbox_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/new.txt", b"x");
+        files.set("/w/keep.txt", b"k");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert!(!temp.path().join("out").exists());
+        assert_eq!(std::fs::read(temp.path().join("keep.txt")).unwrap(), b"k");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_honours_a_nested_gitignore() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("sub")).unwrap();
+        std::fs::create_dir(temp.path().join("sub/build")).unwrap();
+        std::fs::write(temp.path().join("sub/.gitignore"), "build/\n/gen\n").unwrap();
+        std::fs::write(temp.path().join("sub/build/x"), b"mine").unwrap();
+        std::fs::write(temp.path().join("sub/gen"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/sub/build/x", b"theirs");
+        files.set("/w/sub/gen", b"theirs");
+        files.set("/w/gen", b"top");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(temp.path().join("sub/build/x")).unwrap(),
+            b"mine"
+        );
+        assert_eq!(std::fs::read(temp.path().join("sub/gen")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(temp.path().join("gen")).unwrap(), b"top");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_honours_a_dot_ignore_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".ignore"), "out/\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/x"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"theirs");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(temp.path().join("out/x")).unwrap(), b"mine");
+    }
+
+    // Positive control: this negated path is not ignored and still conflicts.
+    #[tokio::test]
+    async fn sync_reconcile_still_conflicts_on_a_negated_path() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/*\n!out/keep\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/keep"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/keep", b"theirs");
+
+        let result =
+            download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new()).await;
+
+        let conflict = result.unwrap_err().downcast_ref::<SyncConflict>().cloned();
+        assert_eq!(
+            conflict.map(|error| error.paths),
+            Some(vec!["out/keep".to_string()])
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("out/keep")).unwrap(),
+            b"mine"
         );
     }
 }
