@@ -2668,19 +2668,18 @@ fn lifecycle_hooks_report(cfg: &Config) {
 fn model_proxy_report(cfg: &Config) {
     use thegn_core::seam::Kind;
     let mp = &cfg.model_proxy;
-    let tgproxy = crate::model_proxy_daemon::find_tgproxy();
     if !mp.enabled {
         outln!("Model proxy ([model_proxy])  disabled");
         outln!(
             "  tgproxy       {}",
-            crate::model_proxy_daemon::tgproxy_status_line(tgproxy.as_deref())
+            crate::model_proxy_daemon::tgproxy_report()
         );
         return;
     }
     outln!("Model proxy ([model_proxy])");
     outln!(
         "  tgproxy       {}",
-        crate::model_proxy_daemon::tgproxy_status_line(tgproxy.as_deref())
+        crate::model_proxy_daemon::tgproxy_report()
     );
     let loopback = mp.listen_is_loopback();
     outln!(
