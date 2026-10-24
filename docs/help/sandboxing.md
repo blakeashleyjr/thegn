@@ -603,16 +603,16 @@ checkout. This covers panel git actions, Tests and Jobs, `thegn land`, mutating
 worktree delete, Sandbox container stop or restart, clipboard image paste and
 toolchain install. With no state database, worktrees remain local as before.
 
-If an environment selection cannot be read, the tab shows `env?`, the loading
-splash shows `env: unknown`, and `thegn doctor` reports an unknown environment;
-a failed pane connection is not blamed on a guessed provider. Provisioning
-skips trust-gated devcontainer steps and launch skips devshell injection, with
-a warning. An unreadable account selection also refuses the native provider
-pane. On the dev channel, failed SSH sandbox teardown identifies the container
-that may still be running, and hibernation refuses a restore when its record
-cannot be read while hibernation is enabled. Teardown and close auto-checkpoint
-warnings appear on the status line and in a toast while the TUI runs; the CLI
-prints them to stderr.
+If an environment selection cannot be read and a non-local `[env.*]` is
+configured (dev channel), the tab shows `env?` and the loading splash shows
+`env: unknown`. `thegn doctor` reports an unknown environment; a failed pane
+connection is not blamed on a guessed provider. Provisioning skips trust-gated
+devcontainer steps and launch skips devshell injection, with a warning. On the
+dev channel, an unreadable account selection refuses a provider pane; failed
+SSH sandbox teardown identifies the container that may still be running, and
+hibernation refuses a restore when its record cannot be read while hibernation
+is enabled. Teardown and close auto-checkpoint warnings appear on the status
+line and in a toast while the TUI runs; the CLI prints them to stderr.
 
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and
