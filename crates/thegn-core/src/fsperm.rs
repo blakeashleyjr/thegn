@@ -1371,6 +1371,9 @@ pub fn open_rooted_dir(path: &Path) -> std::io::Result<RootedDir> {
 }
 
 impl RootedDir {
+    #[cfg(unix)]
+    const REMOVE_TREE_MAX_DEPTH: usize = 128;
+
     /// The path used to open this directory. The handle remains authoritative
     /// if the path is renamed or replaced.
     pub fn path(&self) -> &Path {
@@ -1673,6 +1676,92 @@ impl RootedDir {
             }
             std::fs::rename(from_path, to_path)
         }
+    }
+
+    /// Remove a child tree relative to this held directory handle, without
+    /// following symlinks. The handle remains authoritative if its path is
+    /// renamed or replaced while removal is in progress.
+    pub fn remove_child_tree(&self, name: &str) -> std::io::Result<bool> {
+        let name_path = single_component(name)?;
+        #[cfg(unix)]
+        {
+            self.remove_tree_entry(name_path.as_os_str(), 0)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name_path);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+            Ok(true)
+        }
+    }
+
+    #[cfg(unix)]
+    fn remove_tree_entry(&self, name: &std::ffi::OsStr, depth: usize) -> std::io::Result<bool> {
+        use nix::fcntl::{AtFlags, OFlag, openat};
+        use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
+        use nix::unistd::{UnlinkatFlags, geteuid, unlinkat};
+
+        let entry_path = Path::new(name);
+        if !matches!(
+            entry_path.components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        ) {
+            return Err(invalid_private_name());
+        }
+        if depth >= Self::REMOVE_TREE_MAX_DEPTH {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "directory tree too deep to remove",
+            ));
+        }
+        let stat = match fstatat(&self.fd, entry_path, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(nix::errno::Errno::ENOENT) => return Ok(false),
+            Err(error) => return Err(nix_io_error(error)),
+        };
+        if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR {
+            unlinkat(&self.fd, entry_path, UnlinkatFlags::NoRemoveDir).map_err(nix_io_error)?;
+            return Ok(true);
+        }
+
+        let fd = openat(
+            &self.fd,
+            entry_path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_directory_open_error)?;
+        let opened = fstat(&fd).map_err(nix_io_error)?;
+        if SFlag::from_bits_truncate(opened.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path component is not a directory",
+            ));
+        }
+        if opened.st_uid != geteuid().as_raw() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory is owned by another user",
+            ));
+        }
+        let child = RootedDir {
+            path: self.path.join(entry_path),
+            fd,
+        };
+        for entry in child.file_names()? {
+            child.remove_tree_entry(&entry, depth + 1)?;
+        }
+        unlinkat(&self.fd, entry_path, UnlinkatFlags::RemoveDir).map_err(nix_io_error)?;
+        Ok(true)
     }
 }
 
@@ -3222,6 +3311,106 @@ mod tests {
         }
         assert!(!rooted.same_dir_as(&root).unwrap());
         assert!(rooted.same_dir_as(&moved).unwrap());
+    }
+
+    #[test]
+    fn rooted_dir_remove_child_tree_removes_a_nested_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        std::fs::create_dir_all(stage.join("a/b")).unwrap();
+        std::fs::write(stage.join("a/b/file"), b"payload").unwrap();
+        std::fs::write(stage.join("ro"), b"read only").unwrap();
+        std::fs::set_permissions(stage.join("ro"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::create_dir(stage.join("empty")).unwrap();
+        let rooted = open_rooted_dir(temp.path()).unwrap();
+
+        assert!(rooted.remove_child_tree("stage").unwrap());
+        assert!(!stage.exists());
+        assert!(!rooted.remove_child_tree("stage").unwrap());
+
+        let deep = temp.path().join("deep");
+        let mut nested = deep.clone();
+        for _ in 0..=RootedDir::REMOVE_TREE_MAX_DEPTH {
+            nested.push("d");
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(matches!(
+            rooted.remove_child_tree("deep"),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn rooted_dir_remove_child_tree_stays_in_the_pinned_dir_after_a_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let moved = temp.path().join("moved");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(root.join("stage")).unwrap();
+        std::fs::write(root.join("stage/marker"), b"staged").unwrap();
+        std::fs::create_dir(outside.join("stage")).unwrap();
+        std::fs::write(outside.join("stage/keep"), b"safe").unwrap();
+        let rooted = open_rooted_dir(&root).unwrap();
+
+        std::fs::rename(&root, &moved).unwrap();
+        if let Err(error) = create_symlink(&outside, &root, true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create swapped root symlink fixture: {error}");
+        }
+        assert!(rooted.remove_child_tree("stage").unwrap());
+
+        assert!(!moved.join("stage").exists());
+        assert_eq!(std::fs::read(outside.join("stage/keep")).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn rooted_dir_remove_child_tree_never_follows_a_symlink_inside() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"safe").unwrap();
+        std::fs::create_dir(root.join("stage")).unwrap();
+        if let Err(error) = create_symlink(&outside, &root.join("stage/link"), true) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) {
+                return;
+            }
+            panic!("create child symlink fixture: {error}");
+        }
+        let rooted = open_rooted_dir(&root).unwrap();
+
+        assert!(rooted.remove_child_tree("stage").unwrap());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn rooted_dir_remove_child_tree_refuses_a_bad_name() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("stage")).unwrap();
+        let rooted = open_rooted_dir(temp.path()).unwrap();
+
+        for name in ["..", "a/b", ""] {
+            assert!(matches!(
+                rooted.remove_child_tree(name),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+            ));
+        }
+        assert!(matches!(
+            rooted.remove_tree_entry(std::ffi::OsStr::new("../stage"), 0),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(temp.path().join("stage").is_dir());
     }
 
     #[test]
