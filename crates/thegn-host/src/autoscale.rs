@@ -835,8 +835,10 @@ mod tests {
             scale_down_input(&row, Err(anyhow!("database is locked")), Ok(None), 9_000);
 
         assert_eq!(input.idle_secs, 0);
+        let reason = reason.expect("tenant read failure should have a reason");
         assert!(
-            matches!(reason, Some(reason) if reason.contains("tenant count") && reason.contains("database is locked"))
+            reason.contains("tenant count") && reason.contains("database is locked"),
+            "{reason}"
         );
         assert!(thegn_core::scheduler::decide_scaledown(&[input], 60, 0).is_empty());
     }
@@ -848,8 +850,10 @@ mod tests {
             scale_down_input(&row, Ok(0), Err(anyhow!("host row is corrupt")), 9_000);
 
         assert_eq!(input.idle_secs, 0);
+        let reason = reason.expect("last-use read failure should have a reason");
         assert!(
-            matches!(reason, Some(reason) if reason.contains("last use") && reason.contains("host row is corrupt"))
+            reason.contains("last use") && reason.contains("host row is corrupt"),
+            "{reason}"
         );
         assert!(thegn_core::scheduler::decide_scaledown(&[input], 60, 0).is_empty());
     }
@@ -866,7 +870,7 @@ mod tests {
 
     #[test]
     fn unreadable_host_still_counts_toward_min_hosts() {
-        let unreadable_row = managed_row("tg-auto-unreadable", 1_000);
+        let unreadable_row = managed_row("tg-auto-unreadable", 0);
         let idle_row = managed_row("tg-auto-idle", 1_000);
         let (unreadable, reason) = scale_down_input(
             &unreadable_row,
@@ -879,7 +883,10 @@ mod tests {
         assert!(reason.is_some());
         assert!(idle_reason.is_none());
         assert_eq!(idle.idle_secs, 10_000);
-        assert!(thegn_core::scheduler::decide_scaledown(&[unreadable, idle], 60, 1).is_empty());
+        assert_eq!(
+            thegn_core::scheduler::decide_scaledown(&[unreadable, idle], 60, 1),
+            vec![HostId::named("tg-auto-idle")]
+        );
     }
 
     #[test]
