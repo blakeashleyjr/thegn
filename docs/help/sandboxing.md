@@ -596,6 +596,24 @@ dev channel, provider SSH connect, warm-pool operations, hibernation,
 provisioning and host placement are refused or skipped with the reason. The
 close auto-checkpoint is also skipped with a warning on the dev channel.
 
+When the state database exists but the worktree's recorded location cannot be
+read or is unrecognised, writes and code runs refuse instead of using the host
+checkout. This covers panel git actions, Tests and Jobs, `thegn land`, mutating
+`thegn pr` actions, `thegn ci rerun`, `thegn ci trigger` and `thegn ci cancel`,
+worktree delete, Sandbox container stop or restart, clipboard image paste and
+toolchain install. With no state database, worktrees remain local as before.
+
+If an environment selection cannot be read, the tab shows `env?`, the loading
+splash shows `env: unknown`, and `thegn doctor` reports an unknown environment;
+a failed pane connection is not blamed on a guessed provider. Provisioning
+skips trust-gated devcontainer steps and launch skips devshell injection, with
+a warning. An unreadable account selection also refuses the native provider
+pane. On the dev channel, failed SSH sandbox teardown identifies the container
+that may still be running, and hibernation refuses a restore when its record
+cannot be read while hibernation is enabled. Teardown and close auto-checkpoint
+warnings appear on the status line and in a toast while the TUI runs; the CLI
+prints them to stderr.
+
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and
 quarantined spares under `Warm pool (provider spares needing review)`; it will
@@ -715,9 +733,9 @@ reservation is retired only after adoption is ready. The error says to retry
 later or destroy the sandbox to retire the reservation. A VM with that name
 and no pending create from this machine is refused. The Sprites list follows
 every page and refuses results over its page or row limit, or an ambiguous
-continuation, rather than treating a partial list as complete. Configured provider ids at
-`env.<name>.provider.id` must be lowercase for Sprites, Hetzner, DigitalOcean,
-Fly and machine0; validation refuses uppercase ids.
+continuation, rather than treating a partial list as complete. Configured
+provider ids at `env.<name>.provider.id` must be lowercase for Sprites,
+Hetzner, DigitalOcean, Fly and machine0; validation refuses uppercase ids.
 
 VPS and machine0 sandboxes pin their SSH host key on first contact with
 `accept-new` in a per-instance file under `~/.thegn/vps/known_hosts.d/` (or
