@@ -722,11 +722,33 @@ pub fn launch_env(
     slug: Option<&str>,
     choice: &str,
 ) -> Option<(String, PathBuf)> {
-    let p = provider_for(cfg, choice)?;
-    let name = active_name(cfg, db, worktree, slug, p.id)?;
-    let dir = account_dir(cfg, db, p.id, &name)?;
+    // best-effort: legacy display callers retain the lenient behavior; launches use launch_env_checked.
+    launch_env_checked(cfg, db, worktree, slug, choice)
+        .ok()
+        .flatten()
+}
+
+/// Resolve the active account home for a launch, preserving failures while
+/// reading the scoped account pointer so a caller cannot fall through to a
+/// different account's credentials.
+pub fn launch_env_checked(
+    cfg: &Config,
+    db: &Db,
+    worktree: &str,
+    slug: Option<&str>,
+    choice: &str,
+) -> anyhow::Result<Option<(String, PathBuf)>> {
+    let Some(p) = provider_for(cfg, choice) else {
+        return Ok(None);
+    };
+    let Some(name) = active_name_checked(cfg, db, worktree, slug, p.id)? else {
+        return Ok(None);
+    };
+    let Some(dir) = account_dir(cfg, db, p.id, &name) else {
+        return Ok(None);
+    };
     let _ = db.touch_account(p.id, &name, util::now()); // best-effort: cache write: last-used touch; git/forge stays the source of truth
-    Some((p.home_env.to_string(), dir))
+    Ok(Some((p.home_env.to_string(), dir)))
 }
 
 /// A short chip label for the resolved account (`"codex:work"`), or `None`.
@@ -1271,6 +1293,34 @@ mod tests {
         // A non-provider agent never injects.
         cfg.agents.push(agent("sh", "bash", None));
         assert!(launch_env(&cfg, &db, "/wt", None, "sh").is_none());
+    }
+
+    #[test]
+    fn launch_env_checked_propagates_an_unreadable_pointer() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.agents.push(agent("claude", "claude", None));
+        cfg.accounts.push(Account {
+            name: "work".into(),
+            provider: "claude".into(),
+            dir: Some("/creds/claude-work".into()),
+        });
+        db.conn().execute_batch("DROP TABLE ui_state;").unwrap();
+        assert!(matches!(
+            launch_env_checked(&cfg, &db, "/wt", None, "claude"),
+            Err(_)
+        ));
+
+        let db = Db::open_memory().unwrap();
+        set_active(&db, Bind::Global, "/wt", None, "claude", "work").unwrap();
+        let resolved = launch_env_checked(&cfg, &db, "/wt", None, "claude").unwrap();
+        assert_eq!(
+            resolved,
+            Some((
+                "CLAUDE_CONFIG_DIR".into(),
+                PathBuf::from("/creds/claude-work")
+            ))
+        );
     }
 
     #[test]

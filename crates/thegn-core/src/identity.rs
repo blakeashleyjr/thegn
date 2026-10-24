@@ -464,12 +464,15 @@ fn scope_wt(worktree: &str) -> String {
     format!("identity:wt:{worktree}")
 }
 
+// best-effort: used by the legacy identity chip; launch composition uses the checked reader.
 fn bound_global(db: &Db) -> Option<String> {
     db.get_ui_state(&scope_global(), "active").ok().flatten()
 }
+// best-effort: used by the legacy identity chip; launch composition uses the checked reader.
 fn bound_ws(db: &Db, slug: &str) -> Option<String> {
     db.get_ui_state(&scope_ws(slug), "active").ok().flatten()
 }
+// best-effort: used by the legacy identity chip; launch composition uses the checked reader.
 fn bound_wt(db: &Db, worktree: &str) -> Option<String> {
     db.get_ui_state(&scope_wt(worktree), "active")
         .ok()
@@ -488,17 +491,39 @@ pub fn active_name(db: &Db, worktree: &str, slug: Option<&str>) -> Option<String
 /// worktree). `bundle::compose` folds these in order so the worktree binding
 /// wins. Empty ⇒ none bound.
 pub fn bound_in_order(db: &Db, worktree: &str, slug: Option<&str>) -> Vec<String> {
+    // best-effort: legacy display callers keep the lenient view; launch composition uses the checked reader.
+    bound_in_order_checked(db, worktree, slug).0
+}
+
+/// Directly-bound identities and any failed scoped-pointer reads, both in
+/// low-to-high fold order. Launch composition gates when `unreadable` is not empty.
+pub fn bound_in_order_checked(
+    db: &Db,
+    worktree: &str,
+    slug: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut out = Vec::new();
-    if let Some(g) = bound_global(db) {
-        out.push(g);
+    let mut unreadable = Vec::new();
+    match db.get_ui_state(&scope_global(), "active") {
+        Ok(Some(g)) => out.push(g),
+        Ok(None) => {}
+        Err(error) => unreadable.push(format!("read the global identity binding: {error:#}")),
     }
-    if let Some(w) = slug.and_then(|s| bound_ws(db, s)) {
-        out.push(w);
+    if let Some(slug) = slug {
+        match db.get_ui_state(&scope_ws(slug), "active") {
+            Ok(Some(w)) => out.push(w),
+            Ok(None) => {}
+            Err(error) => {
+                unreadable.push(format!("read the workspace identity binding: {error:#}"))
+            }
+        }
     }
-    if let Some(t) = bound_wt(db, worktree) {
-        out.push(t);
+    match db.get_ui_state(&scope_wt(worktree), "active") {
+        Ok(Some(t)) => out.push(t),
+        Ok(None) => {}
+        Err(error) => unreadable.push(format!("read the worktree identity binding: {error:#}")),
     }
-    out
+    (out, unreadable)
 }
 
 /// Bind `name` as the active identity at the given scope.
@@ -720,6 +745,22 @@ mod tests {
 
         clear_active(&db, Bind::Worktree, "/wt", Some("repo")).unwrap();
         assert_eq!(active_name(&db, "/wt", Some("repo")).as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn bound_in_order_checked_reports_an_unreadable_binding() {
+        let db = crate::db::Db::open_memory().unwrap();
+        db.conn().execute_batch("DROP TABLE ui_state;").unwrap();
+        let (names, failures) = bound_in_order_checked(&db, "/wt", Some("repo"));
+        assert!(names.is_empty());
+        assert_eq!(failures.len(), 3);
+
+        let db = crate::db::Db::open_memory().unwrap();
+        set_active(&db, Bind::Global, "/wt", Some("repo"), "g").unwrap();
+        set_active(&db, Bind::Worktree, "/wt", Some("repo"), "w").unwrap();
+        let (names, failures) = bound_in_order_checked(&db, "/wt", Some("repo"));
+        assert_eq!(names, vec!["g".to_string(), "w".to_string()]);
+        assert!(failures.is_empty());
     }
 
     #[test]
