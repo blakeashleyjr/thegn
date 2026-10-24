@@ -1740,6 +1740,7 @@ timeout_secs = 1
 
     #[test]
     fn control_commit_reads_head_through_the_recorded_location() {
+        use thegn_core::store::WorkspaceStore;
         let _state = crate::testenv::IsolatedState::new();
         let host = tmp_repo("commit-head-host");
         let remote = tmp_repo("commit-head-remote");
