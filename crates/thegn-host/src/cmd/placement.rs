@@ -290,7 +290,7 @@ fn plan(cfg: &Config, worktree: Option<String>, json: bool) -> Result<()> {
     let wt = super::resolve_worktree(worktree)
         .to_string_lossy()
         .into_owned();
-    let out = crate::placement_flow::plan(cfg, &wt);
+    let out = crate::placement_flow::plan(cfg, &wt)?;
     if json {
         outln!("{}", serde_json::to_string_pretty(&out)?);
     } else {
