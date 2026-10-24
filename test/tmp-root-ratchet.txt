@@ -1,9 +1,9 @@
-# Files that root a repository, worktree, or wizard at the shared temp root.
+# Files that root a repository, worktree, wizard, or git command at the shared temp root.
 #
 # Test fixtures must use their own tempfile::tempdir() so repository metadata
 # cannot appear beside every other test's scratch files.
 #
-# SHRINK-ONLY. Enforced by tests_never_root_a_repository_at_the_temp_root in
+# SHRINK-ONLY. Enforced by the host and thegn-core scans in
 # crates/thegn-host/src/tmp_root_ratchet_tests.rs. The allowlist starts empty.
 
 # RATCHET-EMPTY
