@@ -881,12 +881,26 @@ pub(crate) fn upload_agent_accounts(
 /// ACTIVE account deployed by [`upload_agent_accounts`]. `$HOME` is expanded
 /// in-sprite (the sandbox login `$HOME` isn't known host-side, so we can't bake an
 /// absolute path). Empty when no account is active for any provider — the pane
-/// then uses the agent's default `~/.<agent>` home (backwards-compatible).
-pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktree: &str) -> String {
+/// then uses the agent's default `~/.<agent>` home (backwards-compatible). A
+/// database or selection read failure is returned so the provider pane can
+/// refuse instead of using that default home.
+pub(crate) fn account_pane_env_exports(
+    cfg: &thegn_core::config::Config,
+    worktree: &str,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let db = thegn_core::db::Db::open()
+        .context("open the state database to read the active coding-agent account")?;
+    account_exports_for(cfg, &db, worktree)
+}
+
+fn account_exports_for(
+    cfg: &thegn_core::config::Config,
+    db: &thegn_core::db::Db,
+    worktree: &str,
+) -> anyhow::Result<String> {
     use thegn_core::store::WorkspaceStore;
-    let Ok(db) = thegn_core::db::Db::open() else {
-        return String::new();
-    };
+
     let repo_root = db
         .repo_root_for(worktree)
         .ok()
@@ -895,17 +909,23 @@ pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktre
         .map(std::path::PathBuf::from)
         .or_else(|| thegn_core::repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| Path::new(worktree).to_path_buf());
-    let slug = crate::agent::repo_slug(&db, &repo_root);
+    let slug = crate::agent::repo_slug_checked(db, &repo_root)?;
     let mut out = String::new();
     for p in thegn_core::account::providers() {
         let Some(name) =
-            thegn_core::account::active_name(cfg, &db, worktree, slug.as_deref(), p.id)
+            thegn_core::account::active_name_checked(cfg, db, worktree, slug.as_deref(), p.id)?
         else {
             continue;
         };
         out.push_str(&account_export(p.home_env, p.id, &name));
     }
-    out
+    Ok(out)
+}
+
+/// Preserve the selection failure for the pane spawner to report through the
+/// running UI loop instead of logging a warning that may have no sink.
+pub(crate) fn account_exports_or_refuse(read: anyhow::Result<String>) -> Result<String, String> {
+    read.map_err(|error| format!("{error:#}"))
 }
 
 fn account_export(home_env: &str, provider_id: &str, name: &str) -> String {
@@ -1041,6 +1061,53 @@ mod tests {
         let first = account_export("CODEX_HOME", "codex", "work/a");
         let second = account_export("CODEX_HOME", "codex", "work-a");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn account_exports_for_exports_the_active_account() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        thegn_core::account::set_active(
+            &db,
+            thegn_core::account::Bind::Global,
+            "/wt",
+            None,
+            "claude",
+            "work",
+        )
+        .unwrap();
+
+        let out = account_exports_for(&thegn_core::config::Config::default(), &db, "/wt").unwrap();
+        assert!(out.contains("$HOME/.thegn/accounts/claude/work"));
+    }
+
+    #[test]
+    fn account_exports_for_is_empty_without_a_selection() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+
+        assert_eq!(
+            account_exports_for(&thegn_core::config::Config::default(), &db, "/wt").unwrap(),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn account_exports_or_refuse_refuses_an_unreadable_selection() {
+        assert_eq!(
+            account_exports_or_refuse(Err(anyhow::anyhow!("database is locked"))),
+            Err("database is locked".into())
+        );
+    }
+
+    #[test]
+    fn account_exports_or_refuse_passes_exports_through() {
+        assert_eq!(
+            account_exports_or_refuse(Ok("export X=1; ".into())),
+            Ok("export X=1; ".into())
+        );
+        assert_eq!(
+            account_exports_or_refuse(Ok(String::new())),
+            Ok(String::new())
+        );
     }
 
     #[test]

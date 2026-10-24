@@ -134,6 +134,12 @@ Verbs whose argument _is_ the object keep positionals instead:
 `wt rm <target>`, `wt new [name]`, `merge add [worktrees…]`,
 `open <repo>`.
 
+For `thegn pr` actions other than `thegn pr queue`, an explicit `--worktree`
+must be a registered remote worktree or a directory inside a local git
+worktree. A local path targets that worktree's root; anything else is refused
+before the forge is contacted. Omitting `--worktree` uses the default
+resolution above.
+
 ## A headless worktree, start to finish
 
 ```sh

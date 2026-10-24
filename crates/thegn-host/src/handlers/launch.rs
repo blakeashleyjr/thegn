@@ -16,6 +16,8 @@
 //! the sandbox-wrapped login shell. A preset's `env`/`cwd` overlay is applied
 //! last. A preset's panes deliberately do **not** claim the worktree's
 //! remembered agent (`suppress_agent_record`) — a preset only launches panes.
+//! Resolve warnings and pane spawn failures reach the status line, a toast and
+//! the inbox through `launch_notice` while the TUI runs.
 
 use termwiz::terminal::TerminalWaker;
 
@@ -31,6 +33,8 @@ use thegn_core::config_presets::{preset_pane_cwd, resolve_env};
 pub(crate) struct LaunchApply {
     /// Worktree group to launch into (routing key: the group's unique name).
     pub group: String,
+    /// The worktree path the launch targets (the notification key).
+    pub worktree: String,
     /// Human label for the status line ("dev" / "claude").
     pub label: String,
     /// One new tab holding an even split of every spec (`true`), or one new tab
@@ -98,6 +102,7 @@ fn resolve(cfg: &Config, group: String, worktree: &str, req: LaunchRequest) -> L
             }
             LaunchApply {
                 group,
+                worktree: worktree.to_string(),
                 label: choice,
                 split: false,
                 specs,
@@ -120,6 +125,7 @@ fn resolve(cfg: &Config, group: String, worktree: &str, req: LaunchRequest) -> L
             }
             LaunchApply {
                 group,
+                worktree: worktree.to_string(),
                 label: preset.name.clone(),
                 split,
                 specs,
@@ -182,6 +188,16 @@ fn compose_preset_command(
     Ok(spec)
 }
 
+/// Show resolve warnings while the TUI owns the screen: each goes to
+/// `msg::warn` (stderr/tracing, unchanged) and to `post` (status line, toast
+/// and inbox via `launch_notice`).
+fn surface_warnings(worktree: &str, warnings: &[String], post: impl Fn(&str, &str)) {
+    for warning in warnings {
+        thegn_core::msg::warn(warning);
+        post(worktree, warning);
+    }
+}
+
 /// The name of the first preset command that resolves to a configured agent
 /// (not a tool/shell/raw) — the remembered agent a template's preset claims
 /// when the template sets no explicit `agent`.
@@ -205,9 +221,7 @@ pub(crate) fn apply_launch(
     panes: &mut Panes,
     center: Rect,
 ) -> Option<u32> {
-    for w in &apply.warnings {
-        thegn_core::msg::warn(w);
-    }
+    surface_warnings(&apply.worktree, &apply.warnings, crate::launch_notice::post);
     let gi = session
         .worktrees
         .iter()
@@ -218,6 +232,7 @@ pub(crate) fn apply_launch(
     // Make the launched group the active one so the new tab is what the user
     // sees (relevant for an `open --preset` into a background workspace).
     session.active = gi;
+    let worktree = apply.worktree.clone();
 
     if apply.split && apply.specs.len() > 1 {
         let ti = session.worktrees[gi].add_tab();
@@ -262,7 +277,11 @@ pub(crate) fn apply_launch(
                     }
                     last = Some(id);
                 }
-                Err(e) => thegn_core::msg::warn(&format!("launch failed: {e}")),
+                Err(e) => surface_warnings(
+                    &worktree,
+                    &[format!("launch failed: {e}")],
+                    crate::launch_notice::post,
+                ),
             }
         }
         last
@@ -272,6 +291,97 @@ pub(crate) fn apply_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hydrate::RefreshKind;
+
+    type Setup = (
+        crate::testenv::IsolatedState,
+        std::sync::Arc<crate::notify::NotifyState>,
+        tokio::sync::mpsc::UnboundedReceiver<RefreshKind>,
+        Vec<Box<dyn std::any::Any>>,
+    );
+
+    fn setup() -> Setup {
+        let isolated = crate::testenv::IsolatedState::new();
+        let (waker, keepalive_a, keepalive_b) =
+            crate::platform::sound_process::test_support::test_waker();
+        let keepalive: Vec<Box<dyn std::any::Any>> =
+            vec![Box::new(keepalive_a), Box::new(keepalive_b)];
+        let state =
+            crate::notify::NotifyState::new(Config::default().notifications, String::new(), waker);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_toast_tx(tx);
+        (isolated, state, rx, keepalive)
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<RefreshKind>) -> Vec<RefreshKind> {
+        let mut messages = Vec::new();
+        for _ in 0..32 {
+            match rx.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(_) => break,
+            }
+        }
+        messages
+    }
+
+    fn post_inline(worktree: &str, text: &str) {
+        crate::launch_notice::post_with(worktree, text, |job| job());
+    }
+
+    #[test]
+    fn surface_warnings_reach_the_status_line() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (_isolated, _state, mut rx, _keepalive) = setup();
+        thegn_core::msg::set_tui_active(true);
+        surface_warnings(
+            "/wt/a",
+            &["codex: refusing to launch `codex`: disk I/O error".to_string()],
+            post_inline,
+        );
+        thegn_core::msg::set_tui_active(false);
+
+        let messages = drain(&mut rx);
+        assert!(messages.iter().any(|message| match message {
+            RefreshKind::PrActionStatus(text) => text.contains("refusing to launch"),
+            _ => false,
+        }));
+        assert!(messages.iter().any(|message| match message {
+            RefreshKind::Toast { message, .. } => message.contains("disk I/O error"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn surface_warnings_post_nothing_when_empty() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let (_isolated, _state, mut rx, _keepalive) = setup();
+        thegn_core::msg::set_tui_active(true);
+        surface_warnings("/wt/a", &[], post_inline);
+        thegn_core::msg::set_tui_active(false);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn surface_warnings_keep_every_warning() {
+        let posted = std::cell::RefCell::new(Vec::new());
+        let warnings = vec!["first".to_string(), "second".to_string()];
+        surface_warnings("/wt/a", &warnings, |worktree, text| {
+            posted
+                .borrow_mut()
+                .push((worktree.to_string(), text.to_string()));
+        });
+        assert_eq!(
+            posted.into_inner(),
+            vec![
+                ("/wt/a".to_string(), "first".to_string()),
+                ("/wt/a".to_string(), "second".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn split_mode_maps_to_split_flag() {

@@ -216,6 +216,45 @@ pub(crate) fn is_removed_root(registered: &std::collections::HashSet<String>, ke
         && !std::path::Path::new(key).exists()
 }
 
+/// The recheck, uniqueness scan and insert behind a slug claim. The caller
+/// holds the write lock (an IMMEDIATE transaction).
+fn claim_repo_slug(db: &Db, repo_path: &str, base: &str) -> Result<String> {
+    if let Some(slug) = db.repo_slug_lookup(repo_path)? {
+        return Ok(slug);
+    }
+    let taken: std::collections::HashSet<String> = {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT slug FROM repo_slugs WHERE repo_path != ?1")?;
+        let rows = stmt.query_map(params![repo_path], |r| r.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let mut cand = base.to_string();
+    let mut n = 1;
+    while taken.contains(&cand) {
+        n += 1;
+        cand = format!("{base}-{n}");
+    }
+    db.conn().execute(
+        "INSERT OR REPLACE INTO repo_slugs(repo_path, slug) VALUES(?1, ?2)",
+        params![repo_path, cand],
+    )?;
+    Ok(cand)
+}
+
+impl Db {
+    /// [`WorkspaceStore::slug_for_repo`] for the UI loop and startup: an
+    /// existing slug is read as usual, but a claim under another process's held
+    /// write lock fails at once instead of waiting out the busy timeout. Callers
+    /// fall back to the unsuffixed base and claim again on a later pass.
+    pub fn slug_for_repo_nowait(&self, repo_path: &str, base: &str) -> Result<String> {
+        if let Some(slug) = self.repo_slug_lookup(repo_path)? {
+            return Ok(slug);
+        }
+        self.transaction_immediate_nowait(|db| claim_repo_slug(db, repo_path, base))
+    }
+}
+
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -299,36 +338,25 @@ impl WorkspaceStore for Db {
     /// `-2`, `-3`, … on collision with a *different* repo, then persists it.
     /// Two repos with the same basename therefore get distinct tab namespaces.
     fn slug_for_repo(&self, repo_path: &str, base: &str) -> Result<String> {
-        // One transaction around the read-check-insert so two processes can't
-        // both pass the uniqueness scan and claim the same slug.
-        self.transaction(|db| {
-            if let Ok(s) = db.conn().query_row(
+        if let Some(slug) = self.repo_slug_lookup(repo_path)? {
+            return Ok(slug);
+        }
+
+        // Take the write lock before the recheck and uniqueness scan so two
+        // processes cannot both pass the scan and claim the same slug.
+        self.transaction_immediate(|db| claim_repo_slug(db, repo_path, base))
+    }
+
+    fn repo_slug_lookup(&self, repo_path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
                 "SELECT slug FROM repo_slugs WHERE repo_path=?1",
                 params![repo_path],
                 |r| r.get::<_, String>(0),
-            ) && !s.is_empty()
-            {
-                return Ok(s);
-            }
-            let taken: std::collections::HashSet<String> = {
-                let mut stmt = db
-                    .conn()
-                    .prepare("SELECT slug FROM repo_slugs WHERE repo_path != ?1")?;
-                let rows = stmt.query_map(params![repo_path], |r| r.get::<_, String>(0))?;
-                rows.filter_map(|r| r.ok()).collect()
-            };
-            let mut cand = base.to_string();
-            let mut n = 1;
-            while taken.contains(&cand) {
-                n += 1;
-                cand = format!("{base}-{n}");
-            }
-            db.conn().execute(
-                "INSERT OR REPLACE INTO repo_slugs(repo_path, slug) VALUES(?1, ?2)",
-                params![repo_path, cand],
-            )?;
-            Ok(cand)
-        })
+            )
+            .optional()?
+            .filter(|slug| !slug.is_empty()))
     }
 
     fn repo_slug_rows(&self) -> Result<Vec<(String, String)>> {
@@ -593,6 +621,14 @@ impl WorkspaceStore for Db {
                 "kept the merge-queue row of a removed worktree: claimed by an active drain"
             );
         }
+        // Audit events follow their queue row: a row kept above (claimed by a
+        // drain, or a retained cleanup hold) keeps its events; otherwise the
+        // path's events go with the worktree.
+        self.conn().execute(
+            "DELETE FROM merge_queue_events WHERE worktree=?1 \
+             AND NOT EXISTS (SELECT 1 FROM merge_queue WHERE worktree=?1)",
+            params![wt],
+        )?;
         Ok(())
     }
 
@@ -632,10 +668,28 @@ impl WorkspaceStore for Db {
         new_tab: &str,
         new_branch: &str,
     ) -> Result<()> {
-        self.conn().execute(
+        let base_conn = self.conn();
+        // Keep standalone rekeys atomic, while joining a caller's transaction
+        // when this method is used during transactional cleanup.
+        let tx = if base_conn.is_autocommit() {
+            Some(base_conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let conn = tx.as_deref().unwrap_or(base_conn);
+        conn.execute(
             "UPDATE worktrees SET worktree=?2, tab_name=?3, branch=?4 WHERE worktree=?1",
             params![old_path, new_path, new_tab, new_branch],
         )?;
+        // Audit events follow their queue row, so keep them while the row is keyed at the old path.
+        conn.execute(
+            "DELETE FROM merge_queue_events WHERE worktree=?1 \
+             AND NOT EXISTS (SELECT 1 FROM merge_queue WHERE worktree=?1)",
+            params![old_path],
+        )?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -3094,5 +3148,92 @@ mod tests {
         let db = Db::open_memory().unwrap();
 
         assert_eq!(db.effective_env_checked("/wt/a", "/repo").unwrap(), None);
+    }
+
+    #[test]
+    fn slug_for_repo_waits_for_a_held_writer_instead_of_busy() {
+        use crate::store::WorkspaceStore;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer = Db::open_at(&path).unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO repo_slugs(repo_path, slug) VALUES('/other','o');",
+            )
+            .unwrap();
+
+        let thread_path = path.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let db = Db::open_at(&thread_path).unwrap();
+            started_tx.send(()).unwrap();
+            let started = Instant::now();
+            let result = db.slug_for_repo("/fresh", "fresh");
+            result_tx.send((result, started.elapsed())).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        writer.conn().execute_batch("COMMIT;").unwrap();
+
+        let (result, elapsed) = result_rx.recv().unwrap();
+        assert_eq!(result.unwrap(), "fresh");
+        assert!(elapsed >= Duration::from_millis(150));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn slug_for_repo_nowait_fails_fast_under_a_held_writer() {
+        use crate::store::WorkspaceStore;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer = Db::open_at(&path).unwrap();
+        let db = Db::open_at(&path).unwrap();
+        db.slug_for_repo("/known", "known").unwrap();
+        writer.conn().execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let started = Instant::now();
+        let error = db.slug_for_repo_nowait("/fresh", "fresh").unwrap_err();
+        assert!(crate::db::is_transient_lock(&error));
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        assert_eq!(
+            db.slug_for_repo_nowait("/known", "known").unwrap(),
+            "known",
+            "an existing slug is a plain read"
+        );
+        let timeout_ms: i64 = db
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout_ms, 5000, "the busy timeout is restored");
+
+        writer.conn().execute_batch("COMMIT;").unwrap();
+        assert_eq!(db.slug_for_repo_nowait("/fresh", "fresh").unwrap(), "fresh");
+    }
+
+    #[test]
+    fn slug_for_repo_joins_an_open_transaction() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        let slug = db.transaction(|db| db.slug_for_repo("/r", "r")).unwrap();
+
+        assert_eq!(slug, "r");
+        assert_eq!(db.repo_slug_lookup("/r").unwrap().as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn repo_slug_lookup_never_writes() {
+        use crate::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.repo_slug_lookup("/unknown").unwrap(), None);
+        assert!(db.repo_slug_rows().unwrap().is_empty());
     }
 }

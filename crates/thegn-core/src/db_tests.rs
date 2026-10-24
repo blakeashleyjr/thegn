@@ -6168,3 +6168,135 @@ fn bound_enqueue_validates_identity_absorbs_legacy_and_rebind_validates_rows() {
     );
     assert!(mismatch.is_err());
 }
+
+#[test]
+fn retry_transient_retries_busy_then_succeeds() {
+    let mut calls: usize = 0;
+    let result = retry_transient_with(
+        &[1, 2, 3],
+        |_| {},
+        || {
+            calls += 1;
+            if calls < 3 {
+                Err(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )))
+            } else {
+                Ok(7)
+            }
+        },
+    );
+
+    assert_eq!(result.unwrap(), 7);
+    assert_eq!(calls, 3);
+}
+
+#[test]
+fn retry_transient_does_not_retry_a_non_lock_error() {
+    let mut calls: usize = 0;
+    let result: Result<()> = retry_transient_with(
+        &[1, 2, 3],
+        |_| {},
+        || {
+            calls += 1;
+            Err(anyhow::anyhow!("disk I/O error"))
+        },
+    );
+
+    assert!(result.unwrap_err().to_string().contains("disk I/O error"));
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn retry_transient_gives_up_after_its_budget() {
+    let delays = [1, 2, 3];
+    let mut calls: usize = 0;
+    let result: Result<()> = retry_transient_with(
+        &delays,
+        |_| {},
+        || {
+            calls += 1;
+            Err(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )))
+        },
+    );
+    let Err(error) = result else {
+        panic!("persistent busy must exhaust the retry budget");
+    };
+
+    assert_eq!(calls, delays.len() + 1);
+    assert!(format!("{error:#}").contains("still locked after 3 retries"));
+    assert!(is_transient_lock(&error));
+}
+
+#[test]
+fn retry_transient_returns_final_non_lock_error_without_locked_context() {
+    let mut calls: usize = 0;
+    let result: Result<()> = retry_transient_with(
+        &[1],
+        |_| {},
+        || {
+            calls += 1;
+            if calls == 1 {
+                Err(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )))
+            } else {
+                Err(anyhow::anyhow!("disk I/O error"))
+            }
+        },
+    );
+    let Err(error) = result else {
+        panic!("the final non-lock failure must be returned");
+    };
+
+    assert_eq!(calls, 2);
+    assert!(format!("{error:#}").contains("disk I/O error"));
+    assert!(!format!("{error:#}").contains("still locked"));
+}
+
+#[test]
+fn retry_transient_does_not_retry_after_a_busy_timeout_wait() {
+    let mut calls: usize = 0;
+    let result: Result<()> = retry_transient_with(
+        &[1, 2],
+        |_| {},
+        || {
+            calls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(210));
+            Err(anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )))
+        },
+    );
+    let Err(error) = result else {
+        panic!("a slow busy attempt must be returned without another wait");
+    };
+
+    assert_eq!(calls, 1);
+    assert!(format!("{error:#}").contains("still locked after 0 retries"));
+}
+
+#[test]
+fn is_transient_lock_classifies_busy_and_locked() {
+    let sqlite_error = |code| {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    };
+    let busy = sqlite_error(rusqlite::ffi::SQLITE_BUSY);
+    let locked = sqlite_error(rusqlite::ffi::SQLITE_LOCKED);
+    let io = sqlite_error(rusqlite::ffi::SQLITE_IOERR);
+
+    assert!(is_transient_lock(&busy));
+    assert!(is_transient_lock(&locked));
+    assert!(!is_transient_lock(&io));
+    assert!(!is_transient_lock(&anyhow::anyhow!("disk I/O error")));
+    assert!(is_transient_lock(&busy.context("wrapped read")));
+}

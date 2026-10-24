@@ -298,19 +298,46 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
     // not cwd-scoped.  In a linked worktree `root` is the common checkout's
     // root, while `--show-toplevel` is the worktree the user is diagnosing.
     let worktree = current_worktree_root().unwrap_or_else(|| root.clone());
-    let db = doctor_db().ready();
+    let doctor_db = doctor_db();
+    if !matches!(&doctor_db, DoctorDb::Ready(_) | DoctorDb::Absent) {
+        let reason = doctor_db.describe();
+        return serde_json::json!({
+            "mode": cfg.sandbox.devcontainer.as_str(),
+            "repo": root.display().to_string(),
+            "candidates": [],
+            "selected": null,
+            "error": reason.clone(),
+            "status": { "variant": "", "state": "unknown", "reason": reason }
+        });
+    }
+    // An absent database means no selection has ever been stored. Unavailable
+    // and mismatched databases were returned above instead of using defaults.
+    let db = doctor_db.ready();
     let approvals = db
         .as_ref()
         .map(|db| crate::handlers::repo_trust::approvals_for(db, &root.to_string_lossy()))
         .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
-    let environment = crate::handlers::repo_trust::effective_environment_for_worktree(
+    let environment = match crate::handlers::repo_trust::effective_environment_for_worktree(
         cfg,
         db.as_ref(),
         &root,
         &worktree,
         None,
         &approvals,
-    );
+    ) {
+        Ok(environment) => environment,
+        Err(error) => {
+            let reason = format!("{error:#}");
+            return serde_json::json!({
+                "mode": cfg.sandbox.devcontainer.as_str(),
+                "repo": root.display().to_string(),
+                "candidates": [],
+                "selected": null,
+                "error": reason.clone(),
+                "status": { "variant": "", "state": "unknown", "reason": reason }
+            });
+        }
+    };
     let sandbox = environment.sandbox.clone();
     if sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
         return serde_json::json!({

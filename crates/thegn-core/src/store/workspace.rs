@@ -53,6 +53,9 @@ pub trait WorkspaceStore {
     /// Two repos with the same basename therefore get distinct tab namespaces.
     fn slug_for_repo(&self, repo_path: &str, base: &str) -> Result<String>;
 
+    /// Look up a repo slug with a SELECT only; this never claims a slug.
+    fn repo_slug_lookup(&self, repo_path: &str) -> Result<Option<String>>;
+
     /// Drop a repo's stable sidebar slug so a removed workspace can't reclaim a
     /// stale slug if it is reopened later.
     fn del_repo_slug(&self, repo_path: &str) -> Result<()>;
