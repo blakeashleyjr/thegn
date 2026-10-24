@@ -848,23 +848,41 @@ fn verify_published(
 /// the header without needing a repository (a prerequisite check would need
 /// the SANDBOX's remote tips, which the host may not have).
 // off-loop: hibernator worker thread only.
-#[expect(clippy::disallowed_methods)]
 fn verify_bundle_shape(data: &[u8]) -> anyhow::Result<()> {
-    let mut tmp = tempfile::Builder::new()
+    verify_bundle_shape_in(&std::env::temp_dir(), data)
+}
+
+fn verify_bundle_shape_in(scratch_root: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let scratch_root = scratch_root.canonicalize()?;
+    let scratch = tempfile::Builder::new()
         .prefix("tg-hib-verify-")
+        .tempdir_in(scratch_root)?;
+    let mut tmp = tempfile::Builder::new()
         .suffix(".bundle")
-        .tempfile()?;
+        .tempfile_in(scratch.path())?;
     tmp.write_all(data)?;
-    let ok = thegn_core::util::git_cmd(&std::env::temp_dir())
-        .args(["bundle", "list-heads"])
-        .arg(tmp.path())
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false);
-    if !ok {
-        anyhow::bail!("captured bundle failed list-heads verification");
+
+    // off-loop: hibernator worker thread only.
+    #[expect(clippy::disallowed_methods)]
+    let output = bundle_list_heads_command(scratch.path(), tmp.path()).output();
+    match output {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => Ok(()),
+        Ok(output) => anyhow::bail!(
+            "captured bundle failed list-heads verification: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => anyhow::bail!("captured bundle failed list-heads verification: {error}"),
     }
-    Ok(())
+}
+
+fn bundle_list_heads_command(scratch: &Path, bundle: &Path) -> std::process::Command {
+    let ceiling = scratch
+        .parent()
+        .expect("private bundle scratch directory has a parent");
+    thegn_core::util::git_cmd(scratch)
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
+        .args(["bundle", "list-heads"])
+        .arg(bundle)
 }
 
 #[cfg(test)]
@@ -965,6 +983,94 @@ mod tests {
         std::fs::remove_file(link).unwrap();
         assert!(result.is_err());
         assert_eq!(content, b"keep this content");
+    }
+
+    fn git_output(command: &mut std::process::Command) -> std::process::Output {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test fixture waits for its git child"
+        )]
+        let output = command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        output
+    }
+
+    #[test]
+    fn verify_bundle_shape_in_ignores_a_broken_repository_above_its_scratch_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".git"),
+            format!("gitdir: {}\n", root.path().join("missing-gitdir").display()),
+        )
+        .unwrap();
+
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            git_output(
+                thegn_core::util::git_cmd(repo.path())
+                    .args(["init", "-q"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            )
+            .status
+            .success()
+        );
+        assert!(
+            git_output(thegn_core::util::git_cmd(repo.path()).args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ]))
+            .status
+            .success()
+        );
+        let bundle = repo.path().join("b.bundle");
+        assert!(
+            git_output(
+                thegn_core::util::git_cmd(repo.path())
+                    .args(["bundle", "create"])
+                    .arg(&bundle)
+                    .arg("--all")
+            )
+            .status
+            .success()
+        );
+        let bytes = std::fs::read(bundle).unwrap();
+
+        verify_bundle_shape_in(root.path(), &bytes).unwrap();
+    }
+
+    #[test]
+    fn verify_bundle_shape_command_sets_a_ceiling_above_its_scratch_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let scratch = root.join("s");
+        let bundle = scratch.join("b.bundle");
+        let command = bundle_list_heads_command(&scratch, &bundle);
+
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "GIT_CEILING_DIRECTORIES" && value == Some(root.as_os_str())
+        }));
+        let args: Vec<_> = command.get_args().collect();
+        let git_cwd = args.iter().position(|arg| *arg == "-C").unwrap();
+        assert_eq!(args.get(git_cwd + 1), Some(&scratch.as_os_str()));
+    }
+
+    #[test]
+    fn verify_bundle_shape_in_rejects_garbage() {
+        let root = tempfile::tempdir().unwrap();
+
+        assert!(verify_bundle_shape_in(root.path(), b"not a bundle").is_err());
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     }
 
     #[derive(Clone, Copy)]
