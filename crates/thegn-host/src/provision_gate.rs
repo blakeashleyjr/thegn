@@ -299,7 +299,11 @@ pub(crate) fn guard_unprovisioned_attach(
     if !has_provider_location || choice == "clean-shell" {
         return Ok(());
     }
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let loc = thegn_core::remote::GitLoc::for_worktree_op(
+        std::path::Path::new(worktree),
+        "provider attach",
+    )
+    .map_err(anyhow::Error::msg)?;
     let repo_root = thegn_core::db::Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -1235,6 +1239,23 @@ mod tests {
         assert_eq!(
             attach_selection(Ok(Some("picked".into()))).unwrap(),
             Some("picked".into())
+        );
+    }
+
+    #[test]
+    fn guard_unprovisioned_attach_refuses_an_unreadable_location() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+            .unwrap();
+        drop(db);
+
+        let result =
+            guard_unprovisioned_attach(&thegn_core::config::Config::default(), &wt, "shell", true);
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("provider attach refused"))
         );
     }
 }

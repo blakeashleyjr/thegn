@@ -2964,3 +2964,50 @@ fn repo_slug_checked_reads_an_existing_slug_without_writing() {
         vec![("/x/app".into(), "app".into())]
     );
 }
+
+#[test]
+fn provision_worktree_refuses_an_unreadable_location_when_a_provider_env_is_configured() {
+    use thegn_core::config::{Config, EnvConfig, PlacementMode};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        env: [(
+            "cloud".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Config::default()
+    };
+
+    let result = provision_worktree(&cfg, &wt, |_| {});
+    assert!(matches!(result, Err(error) if format!("{error:#}").contains("provisioning refused")));
+}
+
+#[test]
+fn provision_worktree_keeps_a_local_worktree_local_without_provider_envs() {
+    use thegn_core::config::Config;
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+
+    assert!(matches!(
+        provision_worktree(&Config::default(), &wt, |_| {}),
+        Ok(false)
+    ));
+}
