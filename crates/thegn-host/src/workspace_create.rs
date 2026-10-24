@@ -706,15 +706,36 @@ fn clone_workspace_repo_with_deadline(
     {
         match pin.same_dir_as(pin.path()) {
             Ok(true) => remove_partial_clone_dest(&staging, false),
-            Ok(false) => tracing::debug!(
-                path = %staging.display(),
-                "workspace clone parent was replaced; leaving staging for startup sweep"
-            ),
-            Err(error) => tracing::debug!(
-                path = %staging.display(),
-                %error,
-                "could not verify workspace clone parent; leaving staging for startup sweep"
-            ),
+            Ok(false) => {
+                if let Some(staging_name) = staging.file_name().and_then(|name| name.to_str()) {
+                    remove_staging_through_pin(pin, staging_name);
+                    tracing::debug!(
+                        path = %staging.display(),
+                        "workspace clone parent was replaced; staging removed through held parent"
+                    );
+                } else {
+                    tracing::warn!(
+                        path = %staging.display(),
+                        "could not name workspace clone staging for removal through held parent"
+                    );
+                }
+            }
+            Err(error) => {
+                if let Some(staging_name) = staging.file_name().and_then(|name| name.to_str()) {
+                    remove_staging_through_pin(pin, staging_name);
+                    tracing::warn!(
+                        path = %staging.display(),
+                        %error,
+                        "could not verify workspace clone parent; staging removed through held parent"
+                    );
+                } else {
+                    tracing::warn!(
+                        path = %staging.display(),
+                        %error,
+                        "could not verify workspace clone parent or name staging for removal"
+                    );
+                }
+            }
         }
     }
     result
@@ -807,18 +828,38 @@ fn promote_staged_clone(
     if result.is_err() {
         match pin.same_dir_as(pin.path()) {
             Ok(true) => remove_partial_clone_dest(&staging, false),
-            Ok(false) => tracing::debug!(
-                path = %staging.display(),
-                "workspace clone parent was replaced; leaving staging for startup sweep"
-            ),
-            Err(error) => tracing::debug!(
-                path = %staging.display(),
-                %error,
-                "could not verify workspace clone parent; leaving staging for startup sweep"
-            ),
+            Ok(false) => {
+                remove_staging_through_pin(pin, staging_name);
+                tracing::debug!(
+                    path = %staging.display(),
+                    "workspace clone parent was replaced; staging removed through held parent"
+                );
+            }
+            Err(error) => {
+                remove_staging_through_pin(pin, staging_name);
+                tracing::warn!(
+                    path = %staging.display(),
+                    %error,
+                    "could not verify workspace clone parent; staging removed through held parent"
+                );
+            }
         }
     }
     result
+}
+
+/// Remove staging through the pinned parent: a path-based removal could miss
+/// the orphan or hit the wrong tree, and the startup sweep scans the configured
+/// path rather than this held directory.
+fn remove_staging_through_pin(pin: &thegn_core::fsperm::RootedDir, staging_name: &str) {
+    if let Err(error) = pin.remove_child_tree(staging_name) {
+        tracing::warn!(
+            target: "thegn::workspace",
+            %error,
+            staging = staging_name,
+            "could not remove workspace clone staging from the original parent"
+        );
+    }
 }
 
 /// Reclaim exact-name staging directories from dead clone processes, but only
@@ -2455,6 +2496,8 @@ Receiving objects: 100% (10/10)\rdone.\n";
         std::fs::create_dir(&elsewhere).unwrap();
         std::fs::create_dir(parent.join(".x.clone-1-1")).unwrap();
         std::fs::write(parent.join(".x.clone-1-1/marker"), b"staged").unwrap();
+        std::fs::create_dir(elsewhere.join(".x.clone-1-1")).unwrap();
+        std::fs::write(elsewhere.join(".x.clone-1-1/marker"), b"other").unwrap();
         let pin = thegn_core::fsperm::open_rooted_dir(&parent).unwrap();
 
         std::fs::rename(&parent, &moved).unwrap();
@@ -2474,9 +2517,10 @@ Receiving objects: 100% (10/10)\rdone.\n";
             Err(error) if error.to_string().contains("replaced while cloning")
         ));
         assert!(!elsewhere.join("x").exists());
+        assert!(!moved.join(".x.clone-1-1").exists());
         assert_eq!(
-            std::fs::read(moved.join(".x.clone-1-1/marker")).unwrap(),
-            b"staged"
+            std::fs::read(elsewhere.join(".x.clone-1-1/marker")).unwrap(),
+            b"other"
         );
     }
 
