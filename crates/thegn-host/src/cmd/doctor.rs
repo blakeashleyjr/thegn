@@ -4938,7 +4938,13 @@ fn tool_version_state(tool: &ManagedTool, res: &Resolution) -> String {
         Resolution::Managed { .. } if tool.bin_path().exists() => {
             format!("pinned {}, installed differs", tool.version)
         }
-        Resolution::Managed { .. } => format!("pinned {}, not installed", tool.version),
+        Resolution::Managed { .. } => {
+            if crate::managed_tool::managed_install_unavailable(tool).is_some() {
+                format!("pinned {}, managed install unavailable", tool.version)
+            } else {
+                format!("pinned {}, not installed", tool.version)
+            }
+        }
         _ => format!("external (managed pin {} bypassed)", tool.version),
     }
 }
@@ -4959,6 +4965,9 @@ fn managed_tools_report(cfg: &Config) {
             tool_version_state(&tool, &res)
         );
         outln!("             {}", res.path());
+        if let Some(reason) = crate::managed_tool::managed_install_unavailable(&tool) {
+            outln!("             note: {reason}");
+        }
         // BugStalker is Linux-x86-64-only; flag the gate so a "not installed"
         // row on an unsupported host isn't read as merely "run setup".
         if tool.name == "bugstalker"
@@ -5013,6 +5022,9 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
             };
             report["provenance"] = serde_json::json!(provenance);
             report["provenance_reason"] = serde_json::json!(provenance_reason);
+            let managed_install_note = crate::managed_tool::managed_install_unavailable(&tool);
+            report["managed_install_available"] = serde_json::json!(managed_install_note.is_none());
+            report["managed_install_note"] = serde_json::json!(managed_install_note);
             if is_bugstalker {
                 report["platform_supported"] =
                     serde_json::json!(thegn_core::debug::platform_supported());
@@ -5818,6 +5830,50 @@ agent = "unsafe"
                 .expect("provenance_reason key");
             assert!(reason.is_null() || reason.is_string());
         }
+    }
+
+    #[test]
+    fn managed_tools_json_marks_the_difft_managed_install_unavailable() {
+        let tools = managed_tools_json(&Config::default());
+        let rows = tools.as_array().expect("managed tools array");
+        let difft = rows
+            .iter()
+            .find(|tool| tool["name"] == "difft")
+            .expect("difft row");
+        assert!(
+            !difft["managed_install_available"]
+                .as_bool()
+                .expect("availability bool")
+        );
+        assert!(
+            difft["managed_install_note"]
+                .as_str()
+                .expect("difft unavailable note")
+                .contains("SHA-256")
+        );
+
+        let bugstalker = rows
+            .iter()
+            .find(|tool| tool["name"] == "bugstalker")
+            .expect("bugstalker row");
+        assert!(
+            bugstalker["managed_install_available"]
+                .as_bool()
+                .expect("availability bool")
+        );
+        assert!(bugstalker["managed_install_note"].is_null());
+    }
+
+    #[test]
+    fn managed_tool_version_state_says_unavailable_for_an_unpinned_release_tool() {
+        let state = tool_version_state(
+            &thegn_core::difft::difft_tool(),
+            &Resolution::Managed {
+                path: "/nonexistent/difft".into(),
+                current: false,
+            },
+        );
+        assert!(state.contains("managed install unavailable"), "{state}");
     }
 
     #[test]
