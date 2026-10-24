@@ -1418,7 +1418,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     let result = match command {
         Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
-        Command::Issue { action } => cmd::issue::run(&cfg, action),
+        Command::Issue { action } => cmd::issue::run(&cfg, action, &config_path),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
         Command::Dispatch { action } => cmd::dispatch::run(&cfg, action),
         Command::Supervise { action } => cmd::supervise::run(&cfg, action),

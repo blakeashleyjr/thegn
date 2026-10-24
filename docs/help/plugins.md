@@ -178,6 +178,10 @@ The standalone `thegn doctor` does not start resident plugins, but it lists
 the native-trust state of each enabled plugin. Use `thegn plugin list` and
 `thegn plugin check` to inspect and validate plugin declarations.
 
+Plugin issue providers are served only by the running UI; the standalone
+`thegn issue list --status …` queries only your configured `[issues]` accounts
+and names any plugin issue providers it skipped on stderr.
+
 ## Capabilities and host calls
 
 The manifest's capabilities and the plugin's `scopes` gate what the host does for

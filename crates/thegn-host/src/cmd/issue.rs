@@ -62,7 +62,11 @@ pub enum Action {
     },
 }
 
-pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
+pub fn run(
+    cfg: &thegn_core::config::Config,
+    action: Action,
+    config_path: &std::path::Path,
+) -> Result<()> {
     match action {
         Action::List {
             target,
@@ -77,6 +81,7 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
                 list_tracker_issues(
                     cfg,
                     std::env::current_dir().ok().as_deref(),
+                    config_path.parent().unwrap_or(std::path::Path::new("")),
                     status,
                     limit.unwrap_or(0),
                     json,
@@ -146,13 +151,19 @@ fn list_issues(worktree: Option<String>, state: String, json: bool) -> Result<()
 fn list_tracker_issues(
     cfg: &thegn_core::config::Config,
     dir: Option<&std::path::Path>,
+    plugin_dir: &std::path::Path,
     status: Option<String>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
     let router = tracker_router(cfg, dir);
+    let (plugins, _problems) = thegn_svc::plugin::discover(cfg, plugin_dir);
+    let skipped = plugin_issue_providers(&plugins);
     if !router.is_configured() {
-        msg::die("no issue tracker configured (set [issues] providers/accounts)");
+        msg::die(&no_tracker_message(&skipped));
+    }
+    if let Some(note) = skipped_plugin_note(&skipped) {
+        msg::warn(&note);
     }
     let statuses = status
         .as_deref()
@@ -205,6 +216,54 @@ fn tracker_router(
 ) -> thegn_svc::issue::IssueRouter {
     let issues_cfg = crate::repo_issues::for_dir(cfg, dir);
     thegn_svc::issue::IssueRouter::from_config(&issues_cfg)
+}
+
+fn plugin_issue_providers(plugins: &[thegn_svc::plugin::LoadedPlugin]) -> Vec<String> {
+    plugins
+        .iter()
+        .filter(|plugin| plugin.spec.enabled)
+        .flat_map(|plugin| {
+            plugin
+                .spec
+                .manifest
+                .contributions
+                .iter()
+                .filter(|contribution| {
+                    contribution.extension_point
+                        == thegn_core::plugin_api::ExtensionPoint::IssueProvider
+                })
+                .map(|contribution| {
+                    format!(
+                        "{} ({})",
+                        plugin.spec.manifest.id.as_str(),
+                        contribution.label
+                    )
+                })
+        })
+        .collect()
+}
+
+fn skipped_plugin_note(skipped: &[String]) -> Option<String> {
+    if skipped.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "skipped plugin issue provider(s) {}: plugin issue providers are served only by the running thegn UI; `thegn issue list` queries your [issues] accounts",
+            skipped.join(", ")
+        ))
+    }
+}
+
+fn no_tracker_message(skipped: &[String]) -> String {
+    let message = "no issue tracker configured (set [issues] providers/accounts)";
+    if skipped.is_empty() {
+        message.to_owned()
+    } else {
+        format!(
+            "{message}; plugin issue provider(s) {} are only available in the running thegn UI",
+            skipped.join(", ")
+        )
+    }
 }
 
 /// Parse a comma-separated tracker status list (unknown names dropped).
@@ -365,6 +424,52 @@ mod issue_gitloc_tests {
 mod repo_scope_tests {
     use super::*;
     use crate::repo_issues::test_support::{overlay_repo, two_account_config};
+    use thegn_core::plugin_api::{
+        API_VERSION, CadenceHint, Contribution, ContributionId, ExtensionPoint, PluginId,
+        PluginManifest, PluginMode, PluginSpec,
+    };
+
+    fn plugin(
+        id: &str,
+        contributions: Vec<(ExtensionPoint, &str)>,
+        enabled: bool,
+    ) -> thegn_svc::plugin::LoadedPlugin {
+        thegn_svc::plugin::LoadedPlugin {
+            spec: PluginSpec {
+                manifest: PluginManifest {
+                    id: PluginId::new(id),
+                    name: id.into(),
+                    version: "1.0.0".into(),
+                    api: API_VERSION,
+                    capabilities: Vec::new(),
+                    contributions: contributions
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (extension_point, label))| Contribution {
+                            id: ContributionId::new(format!("{id}.contribution{index}")),
+                            extension_point,
+                            label: label.into(),
+                            surface: None,
+                            cadence: CadenceHint::OnDemand,
+                            metadata: Default::default(),
+                            caps: serde_json::Value::Null,
+                            chord: None,
+                        })
+                        .collect(),
+                },
+                command: vec!["true".into()],
+                cwd: String::new(),
+                env: Default::default(),
+                timeout_secs: 5,
+                scopes: vec![thegn_core::control::Scope::Exec],
+                mode: PluginMode::Resident,
+                enabled,
+                trusted_native: false,
+            },
+            dir: None,
+            trusted_native_ignored: false,
+        }
+    }
 
     #[test]
     fn issue_list_router_honours_repo_overlay_inside_and_global_outside() {
@@ -381,5 +486,74 @@ mod repo_scope_tests {
                 .len(),
             global
         );
+    }
+
+    #[test]
+    fn plugin_issue_providers_lists_enabled_issue_provider_contributions() {
+        let plugins = [
+            plugin("demo", vec![(ExtensionPoint::IssueProvider, "Demo")], true),
+            plugin(
+                "multi",
+                vec![
+                    (ExtensionPoint::IssueProvider, "First"),
+                    (ExtensionPoint::IssueProvider, "Second"),
+                ],
+                true,
+            ),
+        ];
+
+        assert_eq!(
+            plugin_issue_providers(&plugins),
+            vec!["demo (Demo)", "multi (First)", "multi (Second)"]
+        );
+    }
+
+    #[test]
+    fn plugin_issue_providers_ignores_disabled_plugins_and_other_extension_points() {
+        let plugins = [
+            plugin(
+                "disabled",
+                vec![(ExtensionPoint::IssueProvider, "Hidden")],
+                false,
+            ),
+            plugin(
+                "other",
+                vec![
+                    (ExtensionPoint::PaletteAction, "Palette"),
+                    (ExtensionPoint::StatusBarSegment, "Status"),
+                ],
+                true,
+            ),
+        ];
+
+        assert!(plugin_issue_providers(&plugins).is_empty());
+    }
+
+    #[test]
+    fn skipped_plugin_note_names_every_skipped_provider() {
+        let skipped = vec!["demo (Demo)".to_owned(), "multi (First)".to_owned()];
+
+        assert_eq!(
+            skipped_plugin_note(&skipped).as_deref(),
+            Some(
+                "skipped plugin issue provider(s) demo (Demo), multi (First): plugin issue providers are served only by the running thegn UI; `thegn issue list` queries your [issues] accounts"
+            )
+        );
+    }
+
+    #[test]
+    fn skipped_plugin_note_is_none_without_plugin_providers() {
+        assert_eq!(skipped_plugin_note(&[]), None);
+    }
+
+    #[test]
+    fn no_tracker_message_names_skipped_plugin_providers() {
+        let old = "no issue tracker configured (set [issues] providers/accounts)";
+        assert_eq!(no_tracker_message(&[]), old);
+
+        let message = no_tracker_message(&["demo (Demo)".to_owned(), "other (Other)".to_owned()]);
+        assert!(message.contains(old));
+        assert!(message.contains("demo (Demo)"));
+        assert!(message.contains("other (Other)"));
     }
 }
