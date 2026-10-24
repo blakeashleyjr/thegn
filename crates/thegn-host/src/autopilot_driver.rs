@@ -344,7 +344,13 @@ fn drive_claim(
         return;
     }
 
-    let loc = GitLoc::for_worktree(&worktree);
+    let loc = match GitLoc::for_worktree_op(&worktree, "autopilot push") {
+        Ok(loc) => loc,
+        Err(reason) => {
+            mark_worker_failed(db, run_id, dispatch_id, &reason);
+            return;
+        }
+    };
     let current = crate::git_handle::get()
         .current_branch(&loc)
         .unwrap_or_default();
@@ -687,7 +693,7 @@ fn sealed_autopilot_sandbox(
     sandbox.network_block.clear();
     sandbox.vpn = thegn_core::config::VpnConfig::default();
 
-    let loc = GitLoc::for_worktree(worktree);
+    let loc = GitLoc::for_worktree_op(worktree, "autopilot worker")?;
     let name = format!(
         "autopilot-{}",
         thegn_core::util::slugify(&worktree.to_string_lossy())
@@ -995,16 +1001,39 @@ mod tests {
     use super::{
         autopilot_backend_is_isolated, autopilot_issue_router, autopilot_pickup_hold, issue_prompt,
         needs_human_overwrites, pr_opened_reason, record_pr_open, record_worker_result,
-        tracker_config_for_account, tracker_in_progress_note, worker_failure, worker_run_stop,
-        worker_start_reason,
+        sealed_autopilot_sandbox, tracker_config_for_account, tracker_in_progress_note,
+        worker_failure, worker_run_stop, worker_start_reason,
     };
     use std::path::{Path, PathBuf};
 
     use thegn_core::db::Db;
     use thegn_core::issue::{AgentDispatchStatus as Status, IssueFilter, NewDispatch};
     use thegn_core::sandbox::Backend;
-    use thegn_core::store::{AutopilotStore, NotificationStore};
+    use thegn_core::store::{AutopilotStore, NotificationStore, WorkspaceStore};
     use thegn_svc::issue::{IssueBackend, IssueCaps, IssueError};
+
+    #[test]
+    fn sealed_autopilot_sandbox_refuses_an_unrecognised_worktree_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open().unwrap();
+        db.put_worktree(
+            "repo/worker",
+            &dir.path().to_string_lossy(),
+            &dir.path().to_string_lossy(),
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+
+        let result = sealed_autopilot_sandbox(
+            &thegn_core::config::Config::default(),
+            dir.path(),
+            dir.path(),
+        );
+        assert!(matches!(result, Err(message) if message.contains("autopilot worker refused")));
+    }
 
     #[test]
     fn autopilot_pickup_holds_on_unsupported_platform() {

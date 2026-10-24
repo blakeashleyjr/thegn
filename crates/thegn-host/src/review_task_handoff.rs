@@ -71,7 +71,10 @@ pub(crate) fn handle(cfg: &Config, context: &HandleContext) -> String {
         return format!("review handoff refused: {refusal}");
     }
     let queue = cfg.repo_pr_queue(&root);
-    let loc = GitLoc::for_worktree(Path::new(&task.worktree_path));
+    let loc = match GitLoc::for_worktree_op(Path::new(&task.worktree_path), "review handoff") {
+        Ok(loc) => loc,
+        Err(error) => return error,
+    };
     let forges = crate::forge_handle::get();
     let forge = forges.for_loc(&loc);
     handle_loaded(&db, cfg, &queue, forge, &loc, context, task)
@@ -465,6 +468,7 @@ fn finish_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::store::WorkspaceStore;
 
     #[test]
     fn not_started_review_agent_is_parked_not_judged() {
@@ -748,6 +752,30 @@ mod tests {
                 .unwrap()
                 .next_forge_action_at_ms
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn handle_refuses_an_unrecognised_worktree_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let task = task(&db);
+        db.put_worktree(
+            "acme/feature",
+            "/tmp",
+            "/tmp/review-task",
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+
+        let message = handle(&Config::default(), &context(&task));
+        assert!(message.contains("review handoff refused"));
+        assert!(message.contains("unrecognised worktree location"));
+        assert_eq!(
+            db.get_review_task(task.id).unwrap().unwrap().status,
+            AgentDispatchStatus::Queued
         );
     }
 }

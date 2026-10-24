@@ -205,9 +205,11 @@ pub(crate) fn initialize(
     if let Some(location) = loc.filter(|location| location.is_remote()) {
         authority_check(location, &metadata.blob)?;
     }
-    let location = loc
-        .cloned()
-        .unwrap_or_else(|| GitLoc::for_worktree(worktree));
+    let location = match loc {
+        Some(location) => location.clone(),
+        None => GitLoc::for_worktree_op(worktree, "submodule init")
+            .map_err(|error| format!("submodules not initialized: {error}"))?,
+    };
     crate::git_handle::get()
         .init_submodules(&location, false)
         .map(|_| true)
