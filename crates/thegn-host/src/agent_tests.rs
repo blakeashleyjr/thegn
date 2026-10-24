@@ -2894,6 +2894,55 @@ fn launch_state_gate_lets_a_shell_launch_with_a_warning() {
 }
 
 #[test]
+fn bundle_read_gate_refuses_a_configured_agent() {
+    let cfg = cfg_with(&[("codex", "codex")], &[]);
+    let unreadable = vec!["read the global env-bundle binding: disk I/O error".to_string()];
+    let mut notified = false;
+    let result = bundle_read_gate_with(&cfg, "/wt/a", "codex", &unreadable, |_, _| {
+        notified = true;
+    });
+    let Err(error) = result else {
+        panic!("configured agent must be refused when state reads fail");
+    };
+    let detail = format!("{error:#}");
+    assert!(detail.contains("refusing to launch `codex`"), "{detail}");
+    assert!(
+        detail.contains("env-bundle or coding-agent account selection"),
+        "{detail}"
+    );
+    assert!(detail.contains("disk I/O error"), "{detail}");
+    assert!(!notified);
+}
+
+#[test]
+fn bundle_read_gate_lets_a_shell_launch_with_a_notice() {
+    let cfg = cfg_with(&[], &[]);
+    let unreadable = vec!["read the global env-bundle binding: disk I/O error".to_string()];
+    let mut notices = Vec::new();
+    assert!(
+        bundle_read_gate_with(&cfg, "/wt/a", "shell", &unreadable, |_, text| {
+            notices.push(text.to_string());
+        })
+        .is_ok()
+    );
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("the shell launches without it"));
+}
+
+#[test]
+fn bundle_read_gate_passes_when_nothing_is_unreadable() {
+    let cfg = cfg_with(&[], &[]);
+    let mut notified = false;
+    assert!(
+        bundle_read_gate_with(&cfg, "/wt/a", "shell", &[], |_, _| {
+            notified = true;
+        })
+        .is_ok()
+    );
+    assert!(!notified);
+}
+
+#[test]
 fn repo_slug_checked_is_none_without_a_directory_name() {
     let db = Db::open_memory().unwrap();
     assert_eq!(repo_slug_checked(&db, Path::new("/")).unwrap(), None);
