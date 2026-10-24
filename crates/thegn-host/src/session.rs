@@ -729,6 +729,44 @@ impl Session {
         root.is_absolute().then_some(root)
     }
 
+    /// The `{slug}/` prefix of this session's own groups is the DB slug they
+    /// were registered under. This is the loop-safe source for a workspace's
+    /// slug: no DB and no git.
+    pub(crate) fn workspace_slug_hint(&self) -> Option<String> {
+        if self.id.is_empty() {
+            return None;
+        }
+
+        if let Some(slug) = self
+            .worktrees
+            .iter()
+            .filter(|group| group.kind == GroupKind::Home && group.path == self.id)
+            .find_map(|group| {
+                crate::sidebar::split_tab(&group.name)
+                    .map(|(slug, _)| slug)
+                    .filter(|slug| !slug.is_empty())
+            })
+        {
+            return Some(slug);
+        }
+
+        let mut branch_slugs = self
+            .worktrees
+            .iter()
+            .filter(|group| group.kind == GroupKind::Branch)
+            .map(|group| {
+                crate::sidebar::split_tab(&group.name)
+                    .map(|(slug, _)| slug)
+                    .filter(|slug| !slug.is_empty())
+            });
+        let first = branch_slugs.next()??;
+        if branch_slugs.all(|slug| slug.as_deref() == Some(first.as_str())) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
     pub fn active_group_mut(&mut self) -> Option<&mut WorktreeGroup> {
         if self.active >= self.worktrees.len() {
             self.worktrees.last_mut()
@@ -2395,5 +2433,57 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn workspace_slug_hint_prefers_the_home_group() {
+        let session = Session {
+            id: "/r/app".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app-2/feat", GroupKind::Branch, "/r/app-feat"),
+                WorktreeGroup::new("app-2/home", GroupKind::Home, "/r/app"),
+            ],
+            active: 0,
+        };
+
+        assert_eq!(session.workspace_slug_hint(), Some("app-2".to_string()));
+    }
+
+    #[test]
+    fn workspace_slug_hint_ignores_terminals_and_disagreeing_branches() {
+        let disagreeing = Session {
+            id: "/r/app".into(),
+            worktrees: vec![
+                WorktreeGroup::new("ssh/box", GroupKind::Terminal, "/remote"),
+                WorktreeGroup::new("a/x", GroupKind::Branch, "/r/a"),
+                WorktreeGroup::new("b/y", GroupKind::Branch, "/r/b"),
+            ],
+            active: 0,
+        };
+        assert_eq!(disagreeing.workspace_slug_hint(), None);
+
+        let agreeing = Session {
+            id: "/r/app".into(),
+            worktrees: vec![
+                WorktreeGroup::new("ssh/box", GroupKind::Terminal, "/remote"),
+                WorktreeGroup::new("a/x", GroupKind::Branch, "/r/a"),
+            ],
+            active: 0,
+        };
+        assert_eq!(agreeing.workspace_slug_hint(), Some("a".to_string()));
+
+        let empty = Session {
+            id: "/r/app".into(),
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        assert_eq!(empty.workspace_slug_hint(), None);
+
+        let empty_id = Session {
+            id: String::new(),
+            worktrees: vec![WorktreeGroup::new("a/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        assert_eq!(empty_id.workspace_slug_hint(), None);
     }
 }
