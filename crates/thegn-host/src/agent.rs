@@ -2954,8 +2954,15 @@ pub fn provision_provider_env_named(
             }
             StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
             StepKind::AgentConfigs(agents) => {
-                crate::agent_configs::upload_agent_accounts(&provider, &id, &sprite_home, cfg);
-                crate::agent_configs::upload_agent_configs(&provider, &id, &sprite_home, agents)
+                let account_failures =
+                    crate::agent_configs::upload_agent_accounts(&provider, &id, &sprite_home, cfg);
+                let configs = crate::agent_configs::upload_agent_configs(
+                    &provider,
+                    &id,
+                    &sprite_home,
+                    agents,
+                );
+                crate::agent_configs::agent_configs_step_result(configs, &account_failures)
             }
             StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
             StepKind::LocalParity {

@@ -658,6 +658,29 @@ fn account_file_vanished(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
 }
 
+fn account_failure_line(provider_id: &str, identity: &str, reason: &str) -> String {
+    format!("{provider_id}/{identity}: {reason}")
+}
+
+/// The Sync agent logins step result: the config upload's own result, plus a failure naming every account home that
+/// did not reach the sandbox (the step is best-effort, so the caller marks it Failed and continues).
+pub(crate) fn agent_configs_step_result(
+    configs: anyhow::Result<()>,
+    account_failures: &[String],
+) -> anyhow::Result<()> {
+    if account_failures.is_empty() {
+        return configs;
+    }
+    let accounts = format!(
+        "account homes not published: {}",
+        account_failures.join("; ")
+    );
+    match configs {
+        Ok(()) => Err(anyhow::anyhow!("{accounts}")),
+        Err(error) => Err(anyhow::anyhow!("{error:#}; {accounts}")),
+    }
+}
+
 /// Deploy each declared coding-agent ACCOUNT's credential home into the sandbox
 /// under a stable per-account path (`$HOME/.thegn/accounts/<provider>/<slug>/`),
 /// so a provider pane can point the agent's home env var (`CLAUDE_CONFIG_DIR` /
@@ -675,12 +698,18 @@ pub(crate) fn upload_agent_accounts(
     id: &str,
     sprite_home: &str,
     cfg: &thegn_core::config::Config,
-) {
-    let Ok(db) = thegn_core::db::Db::open() else {
-        return;
+) -> Vec<String> {
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            return vec![format!(
+                "coding-agent accounts were not uploaded: the state database could not be opened: {error:#}"
+            )];
+        }
     };
     let base = sprite_home.trim_end_matches('/');
     let mut uploads: Vec<AccountUpload> = Vec::new();
+    let mut failures = Vec::new();
     for p in thegn_core::account::providers() {
         for acct in thegn_core::account::list(cfg, &db, p.id) {
             // Only ship accounts that are actually logged in (auth marker present)
@@ -694,6 +723,7 @@ pub(crate) fn upload_agent_accounts(
             let mut nonce = [0_u8; 8];
             if let Err(error) = getrandom::fill(&mut nonce) {
                 tracing::warn!(target: "thegn::startup", provider = p.id, account = %identity, reason = %error, "account home not published; previous generation kept");
+                failures.push(account_failure_line(p.id, &identity, &error.to_string()));
                 continue;
             }
             let nonce = nonce
@@ -735,11 +765,12 @@ pub(crate) fn upload_agent_accounts(
         }
     }
     if uploads.is_empty() {
-        return;
+        return failures;
     }
     let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
     let mut written_by_upload = vec![0; uploads.len()];
     let result = block_on_provider(|| async {
+        let mut publish_failures = Vec::new();
         for (upload_index, upload) in uploads.iter().enumerate() {
             let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
             let mut failure = upload.read_failure.clone();
@@ -813,10 +844,12 @@ pub(crate) fn upload_agent_accounts(
             let reason = failure.unwrap_or_else(|| "account upload failed".to_string());
             let Some(cleanup_timeout) = account_cleanup_timeout(deadline) else {
                 tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+                publish_failures.push(account_failure_line(&upload.provider_id, identity, &reason));
                 continue;
             };
             if written == 0 {
                 tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+                publish_failures.push(account_failure_line(&upload.provider_id, identity, &reason));
                 continue;
             }
             let discard_argv = vec![
@@ -838,42 +871,52 @@ pub(crate) fn upload_agent_accounts(
                 Err(_) => format!("{reason}; stage cleanup timed out"),
             };
             tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+            publish_failures.push(account_failure_line(&upload.provider_id, identity, &reason));
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<Vec<String>, anyhow::Error>(publish_failures)
     });
-    if let Err(error) = result {
-        for (upload_index, upload) in uploads.iter().enumerate() {
-            if written_by_upload[upload_index] == 0 {
-                continue;
-            }
-            let Some(cleanup_timeout) = account_cleanup_timeout(deadline) else {
-                tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %upload.dest_root.rsplit('/').next().unwrap_or("unknown"), reason = %error, "account home publish failed or outcome unknown");
-                continue;
-            };
-            let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
-            let discard_argv = vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                account_discard_script(&upload.stage_root),
-            ];
-            let reason = match block_on_provider(|| async {
-                match tokio::time::timeout(
-                    cleanup_timeout,
-                    provider.run_exec(id, &discard_argv, None, &[]),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!("stage cleanup timed out")),
+    match result {
+        Ok(publish_failures) => {
+            failures.extend(publish_failures);
+        }
+        Err(error) => {
+            for (upload_index, upload) in uploads.iter().enumerate() {
+                if written_by_upload[upload_index] == 0 {
+                    continue;
                 }
-            }) {
-                Ok((0, _)) => error.to_string(),
-                Ok((code, output)) => format!("{error}; stage cleanup exited {code}: {output}"),
-                Err(cleanup_error) => format!("{error}; stage cleanup failed: {cleanup_error}"),
-            };
-            tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+                let identity = upload.dest_root.rsplit('/').next().unwrap_or("unknown");
+                let Some(cleanup_timeout) = account_cleanup_timeout(deadline) else {
+                    let reason = error.to_string();
+                    tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+                    failures.push(account_failure_line(&upload.provider_id, identity, &reason));
+                    continue;
+                };
+                let discard_argv = vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    account_discard_script(&upload.stage_root),
+                ];
+                let reason = match block_on_provider(|| async {
+                    match tokio::time::timeout(
+                        cleanup_timeout,
+                        provider.run_exec(id, &discard_argv, None, &[]),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("stage cleanup timed out")),
+                    }
+                }) {
+                    Ok((0, _)) => error.to_string(),
+                    Ok((code, output)) => format!("{error}; stage cleanup exited {code}: {output}"),
+                    Err(cleanup_error) => format!("{error}; stage cleanup failed: {cleanup_error}"),
+                };
+                tracing::warn!(target: "thegn::startup", provider = %upload.provider_id, account = %identity, reason = %reason, "account home publish failed or outcome unknown");
+                failures.push(account_failure_line(&upload.provider_id, identity, &reason));
+            }
         }
     }
+    failures
 }
 
 /// The `export <HOME_ENV>="$HOME/.thegn/accounts/<provider>/<slug>"; …` prefix to
@@ -1390,6 +1433,46 @@ mod tests {
         assert!(!account_upload_ready(2, 1, false, true));
         assert!(!account_upload_ready(2, 2, true, true));
         assert!(!account_upload_ready(2, 2, false, false));
+    }
+
+    #[test]
+    fn agent_configs_step_passes_configs_result_through_without_account_failures() {
+        assert!(agent_configs_step_result(Ok(()), &[]).is_ok());
+        let error = agent_configs_step_result(Err(anyhow::anyhow!("x")), &[]).unwrap_err();
+        assert_eq!(error.to_string(), "x");
+    }
+
+    #[test]
+    fn agent_configs_step_fails_naming_each_unpublished_account() {
+        let failures = [
+            "claude/acct1: publish exited 1: boom".to_string(),
+            "codex/work: write auth.json timed out".to_string(),
+        ];
+        let error = agent_configs_step_result(Ok(()), &failures).unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.contains("account homes not published"));
+        assert!(detail.contains("claude/acct1"));
+        assert!(detail.contains("publish exited 1: boom"));
+        assert!(detail.contains("codex/work"));
+    }
+
+    #[test]
+    fn agent_configs_step_keeps_the_configs_error_and_the_account_failures() {
+        let failures = ["claude/acct1: publish failed: x".to_string()];
+        let error =
+            agent_configs_step_result(Err(anyhow::anyhow!("upload .claude failed")), &failures)
+                .unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.contains("upload .claude failed"));
+        assert!(detail.contains("claude/acct1: publish failed: x"));
+    }
+
+    #[test]
+    fn account_failure_line_names_provider_and_account() {
+        assert_eq!(
+            account_failure_line("claude", "acct1", "publish failed: x"),
+            "claude/acct1: publish failed: x"
+        );
     }
 
     #[test]
