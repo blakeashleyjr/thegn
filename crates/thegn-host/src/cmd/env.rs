@@ -732,10 +732,12 @@ pub(crate) fn resolve_for(
     let wt = super::resolve_worktree(worktree)
         .to_string_lossy()
         .into_owned();
-    let loc = GitLoc::for_worktree(Path::new(&wt));
+    let loc = GitLoc::for_worktree_op(Path::new(&wt), "env resolve").map_err(anyhow::Error::msg)?;
     let repo_root = repo_root_for(&wt);
-    let read =
-        Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
+    let read = Db::open_read_only().and_then(|db| match db {
+        Some(db) => db.effective_env_checked(&wt, &repo_root.to_string_lossy()),
+        None => Ok(None),
+    });
     resolve_with_selection(cfg, &wt, &repo_root, &loc, read)
 }
 
@@ -839,10 +841,12 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree)
         .to_string_lossy()
         .into_owned();
-    let loc = GitLoc::for_worktree(Path::new(&wt));
+    let loc = GitLoc::for_worktree_op(Path::new(&wt), "env show").map_err(anyhow::Error::msg)?;
     let repo_root = repo_root_for(&wt);
-    let read =
-        Db::open().and_then(|db| db.effective_env_checked(&wt, &repo_root.to_string_lossy()));
+    let read = Db::open_read_only().and_then(|db| match db {
+        Some(db) => db.effective_env_checked(&wt, &repo_root.to_string_lossy()),
+        None => Ok(None),
+    });
     let env = resolve_with_selection(cfg, &wt, &repo_root, &loc, read)?;
     outln!("worktree: {wt}");
     outln!("env:      {}", env.name);
@@ -1184,5 +1188,46 @@ mod selection_tests {
             .expect("selected env resolves");
         assert_eq!(actual.name, "box");
         assert!(!actual.unresolved_selection);
+    }
+
+    #[test]
+    fn resolve_for_refuses_an_unrecognised_worktree_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open().unwrap();
+        db.put_worktree(
+            "repo/env",
+            &dir.path().to_string_lossy(),
+            &dir.path().to_string_lossy(),
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+
+        let result = resolve_for(
+            &Config::default(),
+            Some(dir.path().to_string_lossy().into_owned()),
+        );
+        assert!(
+            matches!(result, Err(error) if format!("{error:#}").contains("env resolve refused"))
+        );
+    }
+
+    #[test]
+    fn resolve_for_keeps_a_row_less_worktree_local() {
+        let state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_for(
+            &Config::default(),
+            Some(dir.path().to_string_lossy().into_owned()),
+        );
+        assert!(result.is_ok());
+        assert!(
+            !thegn_core::util::xdg_state_home()
+                .join("thegn/thegn.db")
+                .exists()
+        );
+        drop(state);
     }
 }

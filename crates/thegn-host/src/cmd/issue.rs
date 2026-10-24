@@ -280,7 +280,8 @@ fn create_issue(
     body: Option<String>,
     labels: Option<String>,
 ) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree_op(&resolve_worktree(worktree), "issue create")
+        .map_err(anyhow::Error::msg)?;
     let opts = CreateIssueOpts {
         title,
         body,
@@ -296,12 +297,68 @@ fn create_issue(
 }
 
 fn comment_issue(worktree: Option<String>, number: u64, body: String) -> Result<()> {
-    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let loc = GitLoc::for_worktree_op(&resolve_worktree(worktree), "issue comment")
+        .map_err(anyhow::Error::msg)?;
     match forges().for_loc(&loc).issue_comment(&loc, number, &body) {
         Ok(()) => outln!("Comment added to issue #{number}"),
         Err(e) => msg::die(&format!("comment failed: {e}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod issue_gitloc_tests {
+    use super::*;
+    use thegn_core::store::WorkspaceStore;
+
+    #[test]
+    fn create_issue_refuses_an_unrecognised_worktree_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree(
+            "repo/issue-create",
+            &dir.path().to_string_lossy(),
+            &dir.path().to_string_lossy(),
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+
+        let result = create_issue(
+            Some(dir.path().to_string_lossy().into_owned()),
+            "t".into(),
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(error)
+            if format!("{error:#}").contains("issue create refused")));
+    }
+
+    #[test]
+    fn comment_issue_refuses_an_unrecognised_worktree_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree(
+            "repo/issue-comment",
+            &dir.path().to_string_lossy(),
+            &dir.path().to_string_lossy(),
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+
+        let result = comment_issue(
+            Some(dir.path().to_string_lossy().into_owned()),
+            1,
+            "b".into(),
+        );
+        assert!(matches!(result, Err(error)
+            if format!("{error:#}").contains("issue comment refused")));
+    }
 }
 
 #[cfg(test)]

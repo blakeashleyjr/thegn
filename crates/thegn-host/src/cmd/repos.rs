@@ -91,10 +91,14 @@ fn repo_root_arg(path: Option<String>) -> PathBuf {
 /// remote row and otherwise use the first remote row registered for the repo.
 /// The target-side bytes are resolved by the provider below; this helper never
 /// treats the placeholder as the source of truth.
-fn trust_target(start: &std::path::Path, root: &std::path::Path, db: &Db) -> (PathBuf, GitLoc) {
-    let direct = GitLoc::for_worktree(start);
+fn trust_target(
+    start: &std::path::Path,
+    root: &std::path::Path,
+    db: &Db,
+) -> anyhow::Result<(PathBuf, GitLoc)> {
+    let direct = GitLoc::for_worktree_op(start, "repo trust").map_err(anyhow::Error::msg)?;
     if direct.is_remote() {
-        return (start.to_path_buf(), direct);
+        return Ok((start.to_path_buf(), direct));
     }
     if let Ok(rows) = db.worktrees()
         && let Some(row) = rows.into_iter().find(|row| {
@@ -103,10 +107,10 @@ fn trust_target(start: &std::path::Path, root: &std::path::Path, db: &Db) -> (Pa
         })
     {
         let worktree = PathBuf::from(row.worktree);
-        let loc = GitLoc::for_worktree(&worktree);
-        return (worktree, loc);
+        let loc = GitLoc::for_worktree_op(&worktree, "repo trust").map_err(anyhow::Error::msg)?;
+        return Ok((worktree, loc));
     }
-    (root.to_path_buf(), direct)
+    Ok((root.to_path_buf(), direct))
 }
 
 /// Resolve all pending repo-overlay requests exposed by `repo trust`. The
@@ -155,7 +159,7 @@ pub fn trust(
         .map(PathBuf::from)
         .unwrap_or(root);
     let root_s = root.to_string_lossy().to_string();
-    let (target, target_loc) = trust_target(&start, &root, &db);
+    let (target, target_loc) = trust_target(&start, &root, &db)?;
 
     if let Some(id) = revoke {
         let row = db
@@ -320,5 +324,37 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root); // best-effort: test cleanup
         let _ = std::fs::remove_dir_all(state_home); // best-effort: test cleanup
+    }
+
+    #[test]
+    fn trust_target_refuses_an_unrecognised_worktree_location() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        db.put_worktree(
+            "repo/trust",
+            &dir.path().to_string_lossy(),
+            &dir.path().to_string_lossy(),
+            "feature",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+
+        let result = trust_target(dir.path(), dir.path(), &db);
+        assert!(
+            matches!(result, Err(error) if format!("{error:#}").contains("repo trust refused"))
+        );
+    }
+
+    #[test]
+    fn trust_target_keeps_a_row_less_start_local() {
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = trust_target(dir.path(), dir.path(), &db).unwrap();
+        assert_eq!(result.0, dir.path());
+        assert!(matches!(result.1, GitLoc::Local(_)));
     }
 }
