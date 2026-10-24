@@ -5065,7 +5065,7 @@ fn maybe_clean_merged_worktrees_with_state(
                 Err(error) => {
                     tracing::debug!(
                         target: "thegn::hydrate",
-                        path = %path,
+                        path = %path.display(),
                         %error,
                         "merged-worktree clean skipped: worktree location unreadable"
                     );
