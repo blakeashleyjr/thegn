@@ -4472,6 +4472,7 @@ pub fn launch_spec_full(
             bundle::compose_at_launch(cfg, db, worktree, slug.as_deref(), Some(choice))
         })
         .unwrap_or_default();
+    bundle_read_gate(cfg, worktree, choice, &resolved.unreadable)?;
     // Credential/HOME dirs the child writes into must exist before launch.
     for dir in &resolved.ensure_dirs {
         if let Err(error) = std::fs::create_dir_all(dir) {
@@ -4891,6 +4892,44 @@ fn is_configured_entry(cfg: &Config, choice: &str) -> bool {
         .iter()
         .chain(cfg.tools.iter())
         .any(|entry| entry.name == choice)
+}
+
+/// Gate a launch whose env-bundle or account selection could not be read
+/// (THE-509h): a configured agent is refused, a shell launches with a visible
+/// warning (see `launch_state_gate`).
+fn bundle_read_gate(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    unreadable: &[String],
+) -> anyhow::Result<()> {
+    bundle_read_gate_with(
+        cfg,
+        worktree,
+        choice,
+        unreadable,
+        crate::launch_notice::post,
+    )
+}
+
+fn bundle_read_gate_with(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    unreadable: &[String],
+    notify: impl FnOnce(&str, &str),
+) -> anyhow::Result<()> {
+    if unreadable.is_empty() {
+        return Ok(());
+    }
+    launch_state_gate_with_notice(
+        cfg,
+        worktree,
+        choice,
+        "this worktree's env-bundle or coding-agent account selection could not be read",
+        &anyhow::anyhow!("{}", unreadable.join("; ")),
+        notify,
+    )
 }
 
 pub(crate) fn launch_state_gate(
