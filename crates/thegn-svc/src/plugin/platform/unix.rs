@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -8,6 +10,102 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant;
+
+#[cfg(target_os = "linux")]
+const MAX_TRACKED_DESCENDANTS: usize = 4096;
+
+#[cfg(target_os = "linux")]
+fn proc_stat_ppid_start(stat: &str) -> Option<(libc::pid_t, u64)> {
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let ppid = fields.get(1)?.parse().ok()?;
+    let start_time = fields.get(19)?.parse().ok()?;
+    Some((ppid, start_time))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descendants(root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut children = BTreeMap::<libc::pid_t, Vec<(libc::pid_t, u64)>>::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some((ppid, start_time)) = proc_stat_ppid_start(&stat) {
+            children.entry(ppid).or_default().push((pid, start_time));
+        }
+    }
+
+    let mut descendants = Vec::new();
+    let mut pending = VecDeque::from([root]);
+    let mut visited = std::collections::BTreeSet::from([root]);
+    let mut capped = false;
+    while let Some(parent) = pending.pop_front() {
+        let Some(rows) = children.get(&parent) else {
+            continue;
+        };
+        for &(pid, start_time) in rows {
+            if !visited.insert(pid) {
+                continue;
+            }
+            if descendants.len() == MAX_TRACKED_DESCENDANTS {
+                capped = true;
+                break;
+            }
+            descendants.push((pid, start_time));
+            pending.push_back(pid);
+        }
+        if capped {
+            break;
+        }
+    }
+    if capped {
+        tracing::warn!(
+            target: "thegn::plugin",
+            limit = MAX_TRACKED_DESCENDANTS,
+            "plugin descendant snapshot reached its process limit"
+        );
+    }
+    descendants
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_descendants(_root: libc::pid_t) -> Vec<(libc::pid_t, u64)> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn kill_tracked(pids: &[(libc::pid_t, u64)]) {
+    for &(pid, start_time) in pids {
+        let stat_path = format!("/proc/{pid}/stat");
+        let Ok(stat) = std::fs::read_to_string(stat_path) else {
+            continue;
+        };
+        if proc_stat_ppid_start(&stat).is_some_and(|(_, current_start)| current_start == start_time)
+            && unsafe { libc::kill(pid, libc::SIGKILL) } < 0
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                tracing::debug!(target: "thegn::plugin", pid, %error, "tracked plugin descendant kill failed");
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_tracked(_pids: &[(libc::pid_t, u64)]) {}
 
 pub(crate) fn platform_is_executable_file(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -316,6 +414,19 @@ impl Leader {
             .child
             .as_ref()
             .ok_or_else(|| io::Error::other("leader already reaped"))?;
+        let leader_pid = child.id() as libc::pid_t;
+        let tracked = {
+            #[cfg(test)]
+            if self.signal_override.is_some() {
+                Vec::new()
+            } else {
+                linux_descendants(leader_pid)
+            }
+            #[cfg(not(test))]
+            {
+                linux_descendants(leader_pid)
+            }
+        };
         let group = -(child.id() as libc::pid_t);
         let group_result = self.signal_group(group);
         // Group success does not prove the leader still belonged to that
@@ -326,6 +437,7 @@ impl Leader {
             .as_mut()
             .expect("unreaped child ownership")
             .kill();
+        kill_tracked(&tracked);
         match (group_result, leader_result) {
             (Ok(()), leader) => leader,
             (Err(group), leader) if group.raw_os_error() == Some(libc::ESRCH) => leader,
@@ -621,5 +733,184 @@ mod tests {
             );
             assert!(runtime.block_on(process.settle_pipes(Instant::now())));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_stat_parses_ppid_and_start_time() {
+        let mut fields = vec!["0".to_string(); 20];
+        fields[0] = "S".to_string();
+        fields[1] = "123".to_string();
+        fields[19] = "98765".to_string();
+        let stat = format!("42 (a) b (c) {}", fields.join(" "));
+
+        assert_eq!(proc_stat_ppid_start(&stat), Some((123, 98765)));
+        assert_eq!(proc_stat_ppid_start("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendants_walks_a_tree_and_skips_the_root() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let child_pid = child.id() as libc::pid_t;
+        let descendants = linux_descendants(std::process::id() as libc::pid_t);
+        let child_result = child.kill();
+        let child_status = child.wait().unwrap();
+
+        assert!(
+            child_result.is_ok(),
+            "fixture child should still be killable"
+        );
+        assert!(!child_status.success());
+        assert!(
+            descendants.iter().any(|(pid, _)| *pid == child_pid),
+            "snapshot did not include direct child {child_pid}"
+        );
+        assert!(
+            descendants
+                .iter()
+                .all(|(pid, _)| *pid != std::process::id() as libc::pid_t),
+            "snapshot included its root"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_linux_terminate_kills_a_setsid_grandchild() {
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_file = pid_dir.path().join("grandchild.pid");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                r#"setsid sh -c 'echo $$ > "$1"; exec sleep 300' _ "$1" & wait"#,
+                "_",
+                pid_file.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut process = Prepared::new().unwrap().spawn(command).unwrap();
+        let leader_pid = process.leader.child.as_ref().unwrap().id() as libc::pid_t;
+        drop(entered);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let grandchild_pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+            {
+                break pid;
+            }
+            if std::time::Instant::now() >= deadline {
+                process.leader.terminate().unwrap();
+                runtime.block_on(async {
+                    process.leader.wait_ready().await.unwrap();
+                });
+                process.leader.reap().unwrap();
+                panic!("setsid grandchild did not publish its pid");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stat_path = format!("/proc/{grandchild_pid}/stat");
+        let start_time = loop {
+            if let Ok(stat) = std::fs::read_to_string(&stat_path)
+                && let Some((_, start_time)) = proc_stat_ppid_start(&stat)
+            {
+                break start_time;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setsid grandchild {grandchild_pid} vanished before its stat was read"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let grandchild_group = unsafe { libc::getpgid(grandchild_pid) };
+        let leader_group = unsafe { libc::getpgid(leader_pid) };
+        process.leader.terminate().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut grandchild_stopped = false;
+        while std::time::Instant::now() < deadline {
+            match std::fs::read_to_string(&stat_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    grandchild_stopped = true;
+                    break;
+                }
+                Ok(stat)
+                    if stat
+                        .rsplit_once(')')
+                        .and_then(|(_, fields)| fields.split_whitespace().next())
+                        == Some("Z") =>
+                {
+                    grandchild_stopped = true;
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        if !grandchild_stopped {
+            kill_tracked(&[(grandchild_pid, start_time)]);
+        }
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), process.leader.wait_ready())
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        process.leader.reap().unwrap();
+
+        assert_ne!(
+            grandchild_group, leader_group,
+            "fixture did not escape its group"
+        );
+        assert!(
+            grandchild_stopped,
+            "setsid grandchild {grandchild_pid} survived resident termination"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_linux_terminate_spares_an_unrelated_process() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "read -r fixture"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut plugin = Prepared::new().unwrap().spawn(command).unwrap();
+        drop(entered);
+
+        let mut unrelated = Command::new("sleep");
+        unrelated.arg("30").process_group(0);
+        let mut unrelated = unrelated.spawn().unwrap();
+        plugin.leader.terminate().unwrap();
+        let unrelated_alive = unsafe { libc::kill(unrelated.id() as libc::pid_t, 0) } == 0;
+
+        unrelated.kill().unwrap();
+        let unrelated_status = unrelated.wait().unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), plugin.leader.wait_ready())
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        plugin.leader.reap().unwrap();
+
+        assert!(
+            unrelated_alive,
+            "unrelated process was signaled by plugin teardown"
+        );
+        assert!(!unrelated_status.success());
     }
 }
