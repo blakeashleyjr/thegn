@@ -22,8 +22,9 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Fixed
 
-- Repository slug assignment avoids a deferred-transaction lock failure when
-  launches race; startup also retries transient state reads briefly.
+- Launching several agents at once into a newly added repository no longer
+  fails with "database is locked"; a pane launch briefly retries a
+  transiently locked state database instead of refusing.
   `thegn pr --worktree` resolves a symlinked or nested spelling to the
   registered worktree's PR state.
 - (dev channel) Reopening a worktree adopts its pending machine0 VM instead of
@@ -41,9 +42,9 @@ All notable changes to **thegn** are documented here. The format follows
 - An unreadable environment selection no longer applies the default
   environment's trust policy: trust-gated devcontainer steps and devshell
   injection are skipped with a warning, and `thegn doctor` reports unknown.
-  (dev channel) The environment chip and loading splash show the unreadable
-  state, a failed pane connection is not blamed on a guessed provider, and an
-  unreadable account selection refuses the native provider pane.
+- The environment chip and loading splash show the unreadable state, and a
+  failed pane connection is not blamed on a guessed provider; an unreadable
+  account selection refuses a provider pane. (dev channel)
 - (dev channel) Reopening a hibernated worktree refuses to provision a fresh
   sandbox when its hibernation record cannot be read while hibernation is on.
 
