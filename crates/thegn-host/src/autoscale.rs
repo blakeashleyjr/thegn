@@ -245,6 +245,54 @@ fn cool_lane(db: &Db, template: &ManagedTemplate, reason: &str, cfg: &Config) {
     });
 }
 
+/// One host as scale-down sees it, from its two state reads. A failed read
+/// keeps the host this tick: it still counts toward `min_hosts` but is never
+/// idle past the threshold.
+fn scale_down_input(
+    row: &HostCapacityRow,
+    tenants: anyhow::Result<u32>,
+    last_used: anyhow::Result<Option<i64>>,
+    now: i64,
+) -> (thegn_core::scheduler::ScaleDownHost, Option<String>) {
+    let (tenants, tenant_error) = match tenants {
+        Ok(tenants) => (tenants, None),
+        Err(error) => (
+            0,
+            Some(format!("its tenant count could not be read ({error:#})")),
+        ),
+    };
+    let (last_used, last_use_error) = match last_used {
+        Ok(last_used) => (last_used, None),
+        Err(error) => (
+            None,
+            Some(format!("its last use could not be read ({error:#})")),
+        ),
+    };
+    let reason = match (tenant_error, last_use_error) {
+        (Some(tenant_error), Some(last_use_error)) => {
+            Some(format!("{tenant_error}; {last_use_error}"))
+        }
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
+    };
+    let idle_secs = if reason.is_some() {
+        0
+    } else {
+        let anchor = last_used.unwrap_or(0).max(row.created_at.unwrap_or(0));
+        now.saturating_sub(anchor).max(0) as u64
+    };
+    (
+        thegn_core::scheduler::ScaleDownHost {
+            host: row.host.clone(),
+            ownership: row.ownership,
+            tenants,
+            engine_created: true,
+            idle_secs,
+        },
+        reason,
+    )
+}
+
 /// Maintainer-tick pass: scale down drained engine hosts (pure decision via
 /// [`thegn_core::scheduler::decide_scaledown`]) and reap crash orphans
 /// (created instances that never got registered). Blocking; call off-loop.
@@ -261,24 +309,21 @@ pub(crate) fn scaledown_tick(cfg: &Config) {
         if row.ownership != HostOwnership::Managed || row.template.is_empty() {
             continue;
         }
-        let tenants = db
-            .reserved_totals(&row.host)
-            .map(|t| t.tenants)
-            .unwrap_or(0);
-        // Idle since the later of create / last host use.
-        let last_used = db
-            .host_get(&row.host)
-            .ok()
-            .flatten()
-            .and_then(|h| h.last_used);
-        let anchor = last_used.unwrap_or(0).max(row.created_at.unwrap_or(0));
-        inputs.push(thegn_core::scheduler::ScaleDownHost {
-            host: row.host.clone(),
-            ownership: row.ownership,
-            tenants,
-            engine_created: true,
-            idle_secs: now.saturating_sub(anchor).max(0) as u64,
-        });
+        let (input, read_failure) = scale_down_input(
+            row,
+            db.reserved_totals(&row.host).map(|totals| totals.tenants),
+            db.host_get(&row.host)
+                .map(|host| host.and_then(|host| host.last_used)),
+            now,
+        );
+        if let Some(reason) = read_failure {
+            let name = row.host.config_name().unwrap_or("?");
+            thegn_core::msg::warn(&format!(
+                "placement: engine host {name} ({}) kept this scale-down tick: {reason}; nothing destroyed",
+                row.provider
+            ));
+        }
+        inputs.push(input);
     }
     let victims =
         thegn_core::scheduler::decide_scaledown(&inputs, a.scale_down_idle_secs, a.min_hosts);
@@ -765,6 +810,82 @@ mod tests {
             db_host_def(&db, "tg-auto-cx32-0000000000000001")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    fn managed_row(name: &str, created_at: i64) -> HostCapacityRow {
+        HostCapacityRow {
+            host: HostId::named(name),
+            ownership: HostOwnership::Managed,
+            spec: None,
+            overcommit_cpu_pct: 0,
+            overcommit_mem_pct: 0,
+            provider: "hetzner".into(),
+            template: "cx22".into(),
+            created_at: Some(created_at),
+            measured: None,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn scale_down_input_keeps_a_host_whose_tenants_cannot_be_read() {
+        let row = managed_row("tg-auto-unreadable-tenants", 1_000);
+        let (input, reason) =
+            scale_down_input(&row, Err(anyhow!("database is locked")), Ok(None), 9_000);
+
+        assert_eq!(input.idle_secs, 0);
+        let reason = reason.expect("tenant read failure should have a reason");
+        assert!(
+            reason.contains("tenant count") && reason.contains("database is locked"),
+            "{reason}"
+        );
+        assert!(thegn_core::scheduler::decide_scaledown(&[input], 60, 0).is_empty());
+    }
+
+    #[test]
+    fn scale_down_input_keeps_a_host_whose_last_use_cannot_be_read() {
+        let row = managed_row("tg-auto-unreadable-last-use", 1_000);
+        let (input, reason) =
+            scale_down_input(&row, Ok(0), Err(anyhow!("host row is corrupt")), 9_000);
+
+        assert_eq!(input.idle_secs, 0);
+        let reason = reason.expect("last-use read failure should have a reason");
+        assert!(
+            reason.contains("last use") && reason.contains("host row is corrupt"),
+            "{reason}"
+        );
+        assert!(thegn_core::scheduler::decide_scaledown(&[input], 60, 0).is_empty());
+    }
+
+    #[test]
+    fn scale_down_input_measures_idle_from_the_later_of_create_and_last_use() {
+        let row = managed_row("tg-auto-readable", 1_000);
+        let (input, reason) = scale_down_input(&row, Ok(2), Ok(Some(5_000)), 9_000);
+
+        assert_eq!(input.idle_secs, 4_000);
+        assert_eq!(input.tenants, 2);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn unreadable_host_still_counts_toward_min_hosts() {
+        let unreadable_row = managed_row("tg-auto-unreadable", 0);
+        let idle_row = managed_row("tg-auto-idle", 1_000);
+        let (unreadable, reason) = scale_down_input(
+            &unreadable_row,
+            Err(anyhow!("database is locked")),
+            Ok(None),
+            11_000,
+        );
+        let (idle, idle_reason) = scale_down_input(&idle_row, Ok(0), Ok(None), 11_000);
+
+        assert!(reason.is_some());
+        assert!(idle_reason.is_none());
+        assert_eq!(idle.idle_secs, 10_000);
+        assert_eq!(
+            thegn_core::scheduler::decide_scaledown(&[unreadable, idle], 60, 1),
+            vec![HostId::named("tg-auto-idle")]
         );
     }
 
