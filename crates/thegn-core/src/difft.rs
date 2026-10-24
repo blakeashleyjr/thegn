@@ -1,12 +1,11 @@
 //! difftastic (`difft`) — the structural differ thegn renders read-only diff
 //! surfaces through when `[git] structural_diff` selects it.
 //!
-//! Like the BugStalker debugger, `difft` is a [`crate::managed_tool::ManagedTool`]:
-//! resolved **override → PATH (`difft`) → managed GitHub-release download**, so a
-//! user who already has difftastic installed pays nothing, and everyone else can
-//! have thegn acquire a pinned build. This module carries only the *pure* spec
-//! (which asset per platform, the pinned tag); the download + the ANSI→cells
-//! rendering live in the host / [`crate::ansi_cells`].
+//! `difft` is a [`crate::managed_tool::ManagedTool`], resolved from a configured
+//! override and then `PATH` (`difft`). Managed GitHub-release downloads stay
+//! disabled until reviewed SHA-256 pins ship. This module carries only the
+//! *pure* spec (which asset per platform, the pinned tag); the download + the
+//! ANSI→cells rendering live in the host / [`crate::ansi_cells`].
 //!
 //! GitHub-release (not `cargo install`) is deliberate: it dodges the managed-tool
 //! `Source::Cargo` spec drift and gives every platform a prebuilt binary.
@@ -21,8 +20,8 @@ pub const DIFFT_PIN: &str = "0.63.0";
 /// GitHub `owner/repo` difftastic releases come from.
 pub const DIFFT_REPO: &str = "Wilfred/difftastic";
 
-/// The difftastic managed-tool spec: GitHub-release download of the platform
-/// tarball/zip, `difft` on PATH as the tier-2 fallback, pinned at [`DIFFT_PIN`].
+/// The difftastic managed-tool spec: platform release assets, `difft` on PATH
+/// as the fallback, and the pin [`DIFFT_PIN`]. Downloads require reviewed pins.
 pub fn difft_tool() -> ManagedTool {
     ManagedTool::github(
         "difft",
