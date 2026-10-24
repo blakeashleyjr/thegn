@@ -9,6 +9,44 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.40] — 2026-10-23 (maintenance batch 77)
 
+### Changed
+
+- Editing `[model_proxy]` takes effect on config reload while the UI runs:
+  disabling stops the supervised proxy, enabling starts it and other changes
+  restart it. Renaming a worktree with a merge-queue row is refused; remove the
+  row with `thegn merge rm` first.
+- Launch-menu and `thegn open --preset` warnings, and pane spawn failures, also
+  appear on the status line, in a toast and in the notification inbox.
+- (dev channel) Failed SSH sandbox teardowns and skipped or failed close
+  auto-checkpoints appear on the status line and in a toast.
+
+### Fixed
+
+- Repository slug assignment avoids a deferred-transaction lock failure when
+  launches race; startup also retries transient state reads briefly.
+  `thegn pr --worktree` resolves a symlinked or nested spelling to the
+  registered worktree's PR state.
+- (dev channel) Reopening a worktree adopts its pending machine0 VM instead of
+  creating a duplicate. Autoscale reserves a newly created host for the
+  worktree; a blocked or failed scale-down reports that the host keeps billing.
+
+### Security
+
+- Worktree writes and code runs refuse when the recorded location cannot be
+  read or is unrecognised, rather than acting on the host checkout. This covers
+  panel git actions, Tests and Jobs, `thegn land`, mutating `thegn pr` actions,
+  `thegn ci rerun`, `thegn ci trigger` and `thegn ci cancel`, worktree delete,
+  Sandbox container stop or restart, clipboard image paste and toolchain
+  install.
+- An unreadable environment selection no longer applies the default
+  environment's trust policy: trust-gated devcontainer steps and devshell
+  injection are skipped with a warning, and `thegn doctor` reports unknown.
+  (dev channel) The environment chip and loading splash show the unreadable
+  state, a failed pane connection is not blamed on a guessed provider, and an
+  unreadable account selection refuses the native provider pane.
+- (dev channel) Reopening a hibernated worktree refuses to provision a fresh
+  sandbox when its hibernation record cannot be read while hibernation is on.
+
 ## [0.1.0-alpha.39] — 2026-10-23 (maintenance batch 76)
 
 ### Changed
