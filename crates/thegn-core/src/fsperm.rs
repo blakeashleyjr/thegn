@@ -1704,6 +1704,15 @@ impl RootedDir {
         }
     }
 
+    /// List entry names through the held directory handle.
+    #[cfg(unix)]
+    fn file_names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
+        use std::os::fd::AsRawFd;
+        std::fs::read_dir(format!("/dev/fd/{}", self.fd.as_raw_fd()))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect()
+    }
+
     #[cfg(unix)]
     fn remove_tree_entry(&self, name: &std::ffi::OsStr, depth: usize) -> std::io::Result<bool> {
         use nix::fcntl::{AtFlags, OFlag, openat};
