@@ -4949,6 +4949,14 @@ fn tool_version_state(tool: &ManagedTool, res: &Resolution) -> String {
     }
 }
 
+fn managed_install_note_for_resolution(tool: &ManagedTool, res: &Resolution) -> Option<String> {
+    if matches!(res, Resolution::Managed { .. }) {
+        crate::managed_tool::managed_install_unavailable(tool)
+    } else {
+        None
+    }
+}
+
 /// Report each known managed tool: the tier that resolves it (override / PATH /
 /// managed), its path, and the pinned-vs-installed state — so a user can see
 /// whether a tool is overridden, found on PATH, or managed, and if the managed
@@ -4965,7 +4973,7 @@ fn managed_tools_report(cfg: &Config) {
             tool_version_state(&tool, &res)
         );
         outln!("             {}", res.path());
-        if let Some(reason) = crate::managed_tool::managed_install_unavailable(&tool) {
+        if let Some(reason) = managed_install_note_for_resolution(&tool, &res) {
             outln!("             note: {reason}");
         }
         // BugStalker is Linux-x86-64-only; flag the gate so a "not installed"
@@ -5834,6 +5842,12 @@ agent = "unsafe"
 
     #[test]
     fn managed_tools_json_marks_the_difft_managed_install_unavailable() {
+        if thegn_core::managed_tool::Os::current().is_none()
+            || thegn_core::managed_tool::Arch::current().is_none()
+        {
+            return;
+        }
+
         let tools = managed_tools_json(&Config::default());
         let rows = tools.as_array().expect("managed tools array");
         let difft = rows
@@ -5862,6 +5876,27 @@ agent = "unsafe"
                 .expect("availability bool")
         );
         assert!(bugstalker["managed_install_note"].is_null());
+    }
+
+    #[test]
+    fn managed_tool_note_is_omitted_when_difft_resolves_externally() {
+        let difft = thegn_core::difft::difft_tool();
+        let resolutions = [
+            Resolution::OnPath {
+                path: "/usr/bin/difft".into(),
+            },
+            Resolution::Override {
+                path: "/opt/difft".into(),
+                args: Vec::new(),
+            },
+        ];
+
+        for resolution in &resolutions {
+            assert!(
+                managed_install_note_for_resolution(&difft, resolution).is_none(),
+                "external resolution should not show managed download advice: {resolution:?}"
+            );
+        }
     }
 
     #[test]
