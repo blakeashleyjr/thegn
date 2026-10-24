@@ -755,7 +755,11 @@ comparing each file with what the upload sent: a file the sandbox did not
 change never overwrites a local edit. A file changed in both places (or deleted
 locally and changed in the sandbox) stops the sync with a list of files; nothing
 is written locally and the sandbox is kept. Make each listed file match one
-copy and close again. Files deleted in the sandbox are not deleted locally.
+copy and close again. Files and directories your `.gitignore` or `.ignore` files
+exclude are not compared or copied back (the upload skips them too), so build
+output never blocks the sync; a file excluded only by a global or
+`.git/info/exclude` rule is still compared. Files deleted in the sandbox are not
+deleted locally.
 
 ## Inspecting
 
