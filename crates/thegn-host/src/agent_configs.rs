@@ -363,7 +363,15 @@ pub(crate) fn resync_agent_auth(
     use thegn_core::store::WorkspaceStore;
     // Agent kinds: mirror `run_provisioning` — an explicit `[sandbox.home]
     // agents` list wins, else the `[[agents]]` picker, else host detection.
-    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
+    let loc =
+        match thegn_core::remote::GitLoc::for_worktree_op(Path::new(worktree), "agent auth resync")
+        {
+            Ok(loc) => loc,
+            Err(error) => {
+                thegn_core::msg::warn(&format!("{error}; agent auth was not re-synced into {id}"));
+                return;
+            }
+        };
     let repo_root = thegn_core::db::Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())

@@ -191,7 +191,25 @@ fn resolve_binding(
     worktree: &str,
     intent: crate::placement_flow::PlaceIntent,
 ) -> Result<Option<(String, HostBinding)>, HostFailure> {
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let loc = match thegn_core::remote::GitLoc::for_worktree_op(
+        std::path::Path::new(worktree),
+        "host placement",
+    ) {
+        Ok(loc) => loc,
+        Err(_)
+            if !cfg.placement.enabled
+                && !cfg.env.values().any(|env| !env.host.trim().is_empty()) =>
+        {
+            thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(worktree))
+        }
+        Err(error) => {
+            return Err(HostFailure {
+                step: HostStep::Connect,
+                error,
+                retryable: true,
+            });
+        }
+    };
     let repo_root = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -1801,5 +1819,59 @@ mod tests {
             ..Config::default()
         };
         assert!(binding_selection(Err(anyhow::anyhow!("locked")), &cfg).is_err());
+    }
+
+    #[test]
+    fn resolve_binding_refuses_an_unreadable_location_when_a_host_may_apply() {
+        use thegn_core::store::WorkspaceStore;
+
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        let db = Db::open().unwrap();
+        db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+            .unwrap();
+        drop(db);
+        let cfg = Config {
+            env: [(
+                "remote".into(),
+                thegn_core::config::EnvConfig {
+                    host: "builder".into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Config::default()
+        };
+
+        match resolve_binding(&cfg, &wt, crate::placement_flow::PlaceIntent::Query) {
+            Err(failure) => {
+                assert_eq!(failure.step, HostStep::Connect);
+                assert!(failure.error.contains("host placement refused"));
+            }
+            Ok(_) => panic!("unreadable worktree location must refuse host placement"),
+        }
+    }
+
+    #[test]
+    fn resolve_binding_keeps_local_only_config_on_an_unreadable_location() {
+        use thegn_core::store::WorkspaceStore;
+
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().to_string_lossy().into_owned();
+        let db = Db::open().unwrap();
+        db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+            .unwrap();
+        drop(db);
+
+        assert!(matches!(
+            resolve_binding(
+                &Config::default(),
+                &wt,
+                crate::placement_flow::PlaceIntent::Query
+            ),
+            Ok(None)
+        ));
     }
 }

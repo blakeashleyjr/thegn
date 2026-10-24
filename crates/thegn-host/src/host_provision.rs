@@ -66,7 +66,16 @@ pub(crate) fn provision_worktree_on_host(
 ) -> Option<String> {
     // 1. Ensure the worktree's sandbox container exists (idempotent; the
     //    Ready-host spec injection pins its image + warm volumes).
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let loc = match thegn_core::remote::GitLoc::for_worktree_op(
+        std::path::Path::new(worktree),
+        "host worktree pipeline",
+    ) {
+        Ok(loc) => loc,
+        Err(error) => {
+            thegn_core::msg::warn(&format!("host worktree pipeline: {error}"));
+            return None;
+        }
+    };
     let repo_root = thegn_core::db::Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())

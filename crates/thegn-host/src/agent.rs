@@ -2057,7 +2057,13 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
 /// to a bare one; the focused materialize provisions it). Off-loop (network);
 /// `false` for non-provider envs, a tokenless/unbuilt provider, or a list error.
 pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "provision check") {
+        Ok(loc) => loc,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, %error, "provision check skipped");
+            return false;
+        }
+    };
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -2189,7 +2195,14 @@ pub fn clear_force_host(worktree: &str) {
 /// would re-halt immediately on the stale cooldown). No-op for non-provider
 /// envs; the token check in `env_halt_reason` still gates a tokenless retry.
 pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "native exec cooldown clear") {
+        Ok(loc) => loc,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, %error, "native exec cooldown clear skipped");
+            clear_configured_provider_cooldowns(cfg);
+            return;
+        }
+    };
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -2254,7 +2267,18 @@ pub fn provision_worktree(
     // keeps it out of *other* worktrees' views.
     let _wt_log =
         thegn_core::log_trace::enter_wt(thegn_core::log_trace::wt_slug(Path::new(worktree)));
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "provisioning") {
+        Ok(loc) => loc,
+        Err(_)
+            if !cfg
+                .env
+                .values()
+                .any(|env| env.placement == thegn_core::config::PlacementMode::Provider) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -2545,6 +2569,8 @@ pub fn provision_provider_env_named(
     if !provider.caps().files {
         return Ok((false, None)); // can't provision without the fs API
     }
+    let loc = GitLoc::for_worktree_op(Path::new(worktree), "provider provisioning")
+        .map_err(anyhow::Error::msg)?;
     // Serialize concurrent provisions of the same sandbox (eager vs focused
     // materialize): the loser blocks here (off-loop by contract), then the
     // marker short-circuit below makes its run a no-op. The marker alone only
@@ -2617,7 +2643,6 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let loc = GitLoc::for_worktree(Path::new(worktree));
     let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
     let allow = &resolved.sandbox.network_allow;
     let block = &resolved.sandbox.network_block;
@@ -3615,6 +3640,8 @@ fn auto_provision_sandbox(
     {
         return Ok(None);
     }
+    let loc = GitLoc::for_worktree_op(Path::new(worktree), "sandbox auto-provision")
+        .map_err(anyhow::Error::msg)?;
     // Bake the RESOLVED name so `ensure_exists`→`create` names the new sandbox
     // correctly (the raw `pc.id` is a template + embeds a path-hash).
     //
@@ -3663,12 +3690,7 @@ fn auto_provision_sandbox(
                 .map(PathBuf::from)
                 .or_else(|| repo::main_worktree(Path::new(worktree)))
                 .unwrap_or_else(|| PathBuf::from(worktree));
-            let resolved = cfg.resolve_env(
-                &repo_root,
-                &GitLoc::for_worktree(Path::new(worktree)),
-                Path::new(worktree),
-                Some(env_name),
-            );
+            let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
             let allow = &resolved.sandbox.network_allow;
             let block = &resolved.sandbox.network_block;
             if crate::egress_admit::egress_admission(true, provider.caps().egress, allow, block)

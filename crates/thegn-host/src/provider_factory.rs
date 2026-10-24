@@ -483,7 +483,21 @@ fn resolve_provider_env(
 ) -> anyhow::Result<Option<(thegn_core::env::Environment, Option<String>)>> {
     use std::path::{Path, PathBuf};
     use thegn_core::store::{PoolStore, WorkspaceStore};
-    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
+    let loc = match thegn_core::remote::GitLoc::for_worktree_op(
+        Path::new(worktree),
+        "provider sandbox resolution",
+    ) {
+        Ok(loc) => loc,
+        Err(_)
+            if !cfg
+                .env
+                .get(env_name)
+                .is_some_and(|e| e.placement == thegn_core::config::PlacementMode::Provider) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
     let db = thegn_core::db::Db::open();
     let repo_root = match db.as_ref().ok() {
         Some(db) => match db.repo_root_for(worktree) {
