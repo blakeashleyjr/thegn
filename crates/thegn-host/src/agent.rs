@@ -651,10 +651,12 @@ pub fn prepare_sandbox_env(
     {
         match block_on_provider(|| async {
             provider
-                .upload_dir(&id, std::path::Path::new(worktree), &workdir)
+                .upload_dir_with_baseline(&id, std::path::Path::new(worktree), &workdir)
                 .await
         }) {
-            Ok(()) => register_provider_sync(worktree, &env_name),
+            Ok(baseline) => {
+                register_provider_sync(worktree, &env_name, Some(std::sync::Arc::new(baseline)))
+            }
             Err(e) => {
                 warnings.push(format!("provider sync upload failed: {e}"));
                 thegn_core::msg::warn(&format!("provider sync upload failed for {worktree}: {e}"));
@@ -2057,7 +2059,13 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> P
 /// to a bare one; the focused materialize provisions it). Off-loop (network);
 /// `false` for non-provider envs, a tokenless/unbuilt provider, or a list error.
 pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "provision check") {
+        Ok(loc) => loc,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, %error, "provision check skipped");
+            return false;
+        }
+    };
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -2189,7 +2197,14 @@ pub fn clear_force_host(worktree: &str) {
 /// would re-halt immediately on the stale cooldown). No-op for non-provider
 /// envs; the token check in `env_halt_reason` still gates a tokenless retry.
 pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "native exec cooldown clear") {
+        Ok(loc) => loc,
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, %error, "native exec cooldown clear skipped");
+            clear_configured_provider_cooldowns(cfg);
+            return;
+        }
+    };
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -2254,7 +2269,18 @@ pub fn provision_worktree(
     // keeps it out of *other* worktrees' views.
     let _wt_log =
         thegn_core::log_trace::enter_wt(thegn_core::log_trace::wt_slug(Path::new(worktree)));
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "provisioning") {
+        Ok(loc) => loc,
+        Err(_)
+            if !cfg
+                .env
+                .values()
+                .any(|env| env.placement == thegn_core::config::PlacementMode::Provider) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -2545,6 +2571,8 @@ pub fn provision_provider_env_named(
     if !provider.caps().files {
         return Ok((false, None)); // can't provision without the fs API
     }
+    let loc = GitLoc::for_worktree_op(Path::new(worktree), "provider provisioning")
+        .map_err(anyhow::Error::msg)?;
     // Serialize concurrent provisions of the same sandbox (eager vs focused
     // materialize): the loser blocks here (off-loop by contract), then the
     // marker short-circuit below makes its run a no-op. The marker alone only
@@ -2617,7 +2645,6 @@ pub fn provision_provider_env_named(
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
-    let loc = GitLoc::for_worktree(Path::new(worktree));
     let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
     let allow = &resolved.sandbox.network_allow;
     let block = &resolved.sandbox.network_block;
@@ -2954,8 +2981,15 @@ pub fn provision_provider_env_named(
             }
             StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
             StepKind::AgentConfigs(agents) => {
-                crate::agent_configs::upload_agent_accounts(&provider, &id, &sprite_home, cfg);
-                crate::agent_configs::upload_agent_configs(&provider, &id, &sprite_home, agents)
+                let account_failures =
+                    crate::agent_configs::upload_agent_accounts(&provider, &id, &sprite_home, cfg);
+                let configs = crate::agent_configs::upload_agent_configs(
+                    &provider,
+                    &id,
+                    &sprite_home,
+                    agents,
+                );
+                crate::agent_configs::agent_configs_step_result(configs, &account_failures)
             }
             StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
             StepKind::LocalParity {
@@ -3615,6 +3649,8 @@ fn auto_provision_sandbox(
     {
         return Ok(None);
     }
+    let loc = GitLoc::for_worktree_op(Path::new(worktree), "sandbox auto-provision")
+        .map_err(anyhow::Error::msg)?;
     // Bake the RESOLVED name so `ensure_exists`→`create` names the new sandbox
     // correctly (the raw `pc.id` is a template + embeds a path-hash).
     //
@@ -3663,12 +3699,7 @@ fn auto_provision_sandbox(
                 .map(PathBuf::from)
                 .or_else(|| repo::main_worktree(Path::new(worktree)))
                 .unwrap_or_else(|| PathBuf::from(worktree));
-            let resolved = cfg.resolve_env(
-                &repo_root,
-                &GitLoc::for_worktree(Path::new(worktree)),
-                Path::new(worktree),
-                Some(env_name),
-            );
+            let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
             let allow = &resolved.sandbox.network_allow;
             let block = &resolved.sandbox.network_block;
             if crate::egress_admit::egress_admission(true, provider.caps().egress, allow, block)
@@ -3830,6 +3861,8 @@ where
 struct ProviderSyncRecord {
     env_name: String,
     in_flight: bool,
+    /// What the upload sent; `None` = no baseline, the close sync overlays as before.
+    baseline: Option<std::sync::Arc<thegn_svc::provider::SyncBaseline>>,
 }
 
 fn provider_sync_registry()
@@ -3840,13 +3873,18 @@ fn provider_sync_registry()
     REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn register_provider_sync(worktree: &str, env_name: &str) {
+fn register_provider_sync(
+    worktree: &str,
+    env_name: &str,
+    baseline: Option<std::sync::Arc<thegn_svc::provider::SyncBaseline>>,
+) {
     if let Ok(mut r) = provider_sync_registry().lock() {
         r.insert(
             worktree.to_string(),
             ProviderSyncRecord {
                 env_name: env_name.to_string(),
                 in_flight: false,
+                baseline,
             },
         );
     }
@@ -3862,7 +3900,7 @@ pub(crate) fn forget_provider_sync(worktree: &str) {
 /// provider `data = "sync"` env. A failed pull is surfaced and retained in the
 /// in-process registry so a later close can retry it.
 pub(crate) fn deprovision_sync(path: &str) -> Result<(), String> {
-    let env_name = {
+    let (env_name, baseline) = {
         let mut registry = provider_sync_registry()
             .lock()
             .map_err(|_| "provider sync registry unavailable".to_string())?;
@@ -3873,14 +3911,19 @@ pub(crate) fn deprovision_sync(path: &str) -> Result<(), String> {
             return Err("provider sync is already in progress".into());
         }
         record.in_flight = true;
-        record.env_name.clone()
+        (record.env_name.clone(), record.baseline.clone())
     };
     let cfg = crate::config_startup::cleanup_config();
     let result = if let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) {
         let p = path.to_string();
         block_on_provider(|| async {
             provider
-                .download_dir(&id, &workdir, std::path::Path::new(&p))
+                .download_dir_reconciled(
+                    &id,
+                    &workdir,
+                    std::path::Path::new(&p),
+                    baseline.as_deref(),
+                )
                 .await
         })
         .map_err(|error| format!("{error:#}"))
@@ -4096,10 +4139,17 @@ pub fn compose_spec(
                 .into());
             }
         },
-        (Some(spec), _) => sandbox::enter_argv(spec, &cmd).map_err(|error| {
-            let hint = error.remediation_hint();
-            anyhow::Error::new(error).context(hint)
-        })?,
+        (Some(spec), _) => {
+            let entered = sandbox::enter_argv_guarded(spec, &cmd).map_err(|error| {
+                let hint = error.remediation_hint();
+                anyhow::Error::new(error).context(hint)
+            })?;
+            if let Some(warning) = entered.omitted_secrets_warning() {
+                thegn_core::msg::warn(&warning);
+                warnings.push(warning);
+            }
+            entered.into_spawned()
+        }
         (None, None) => {
             // Host fallback: a login shell so PATH/env expand — still CAPPED. There
             // is no sandbox spec here (no container runtime, or one turned off), but
@@ -4472,6 +4522,7 @@ pub fn launch_spec_full(
             bundle::compose_at_launch(cfg, db, worktree, slug.as_deref(), Some(choice))
         })
         .unwrap_or_default();
+    bundle_read_gate(cfg, worktree, choice, &resolved.unreadable)?;
     // Credential/HOME dirs the child writes into must exist before launch.
     for dir in &resolved.ensure_dirs {
         if let Err(error) = std::fs::create_dir_all(dir) {
@@ -4891,6 +4942,44 @@ fn is_configured_entry(cfg: &Config, choice: &str) -> bool {
         .iter()
         .chain(cfg.tools.iter())
         .any(|entry| entry.name == choice)
+}
+
+/// Gate a launch whose env-bundle or account selection could not be read
+/// (THE-509h): a configured agent is refused, a shell launches with a visible
+/// warning (see `launch_state_gate`).
+fn bundle_read_gate(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    unreadable: &[String],
+) -> anyhow::Result<()> {
+    bundle_read_gate_with(
+        cfg,
+        worktree,
+        choice,
+        unreadable,
+        crate::launch_notice::post,
+    )
+}
+
+fn bundle_read_gate_with(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    unreadable: &[String],
+    notify: impl FnOnce(&str, &str),
+) -> anyhow::Result<()> {
+    if unreadable.is_empty() {
+        return Ok(());
+    }
+    launch_state_gate_with_notice(
+        cfg,
+        worktree,
+        choice,
+        "this worktree's env-bundle or coding-agent account selection could not be read",
+        &anyhow::anyhow!("{}", unreadable.join("; ")),
+        notify,
+    )
 }
 
 pub(crate) fn launch_state_gate(

@@ -218,18 +218,10 @@ pub fn branch_tab(slug: &str, branch: &str) -> String {
     format!("{slug}/{branch}")
 }
 
-/// [`repo_slug`] for authority-bearing callers (registration, routing). The
-/// infallible variant falls back to the unsuffixed basename slug when the DB
-/// is unavailable, which re-aliases same-basename repositories (`repo` vs
-/// `repo-2`). This variant refuses instead, so nothing is registered or routed
-/// under a fabricated identity.
-pub fn repo_slug_checked(root: &Path) -> anyhow::Result<String> {
-    let db = crate::db::Db::open()?;
-    db.slug_for_repo(&root.to_string_lossy(), &slug_base(&repo_name(root)))
-}
-
-/// [`repo_slug_with`] that refuses instead of falling back (see
-/// [`repo_slug_checked`]). Path-derived name, no Git, like [`repo_slug_with`].
+/// [`repo_slug_with`] that refuses instead of falling back to the unsuffixed
+/// basename (which would re-alias same-basename repositories). Nothing is
+/// registered or routed under a fabricated identity. Path-derived name, no
+/// Git, like [`repo_slug_with`].
 pub fn repo_slug_with_checked(db: &crate::db::Db, root: &Path) -> anyhow::Result<String> {
     db.slug_for_repo(
         &root.to_string_lossy(),

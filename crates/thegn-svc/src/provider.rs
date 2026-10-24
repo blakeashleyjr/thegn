@@ -1356,6 +1356,62 @@ pub(crate) const DOWNLOAD_MAX_FILES: usize = 10_000;
 pub(crate) const DOWNLOAD_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const DOWNLOAD_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
+/// SHA-256 of each file exactly as the sync upload sent it, keyed by its
+/// `/`-separated path relative to the synced root.
+pub type SyncBaseline = std::collections::BTreeMap<String, [u8; 32]>;
+
+/// A close-time sync found files changed on both sides of the upload baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflict {
+    pub paths: Vec<String>,
+}
+
+impl std::fmt::Display for SyncConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first_ten = self
+            .paths
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = self.paths.len().saturating_sub(10);
+        let suffix = if more > 0 {
+            format!(", and {more} more")
+        } else {
+            String::new()
+        };
+        write!(
+            formatter,
+            "provider sync refused: {} file(s) changed both locally and in the sandbox since the upload: {first_ten}{suffix}; nothing was written locally and the sandbox copy is kept; make each file match one copy (or restore it) and close again",
+            self.paths.len()
+        )
+    }
+}
+
+impl std::error::Error for SyncConflict {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileAction {
+    Skip,
+    Publish,
+    Conflict,
+}
+
+fn reconcile_action(
+    base: Option<&[u8; 32]>,
+    local: Option<&[u8; 32]>,
+    remote: &[u8; 32],
+) -> ReconcileAction {
+    if base == Some(remote) || local == Some(remote) {
+        ReconcileAction::Skip
+    } else if (base.is_some() && local == base) || (base.is_none() && local.is_none()) {
+        ReconcileAction::Publish
+    } else {
+        ReconcileAction::Conflict
+    }
+}
+
 fn valid_remote_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -1448,14 +1504,7 @@ pub trait ProviderFiles: Send + Sync {
         local: &'a Path,
         remote: &'a str,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            for (abs, rel) in collect_files(local)? {
-                let data =
-                    std::fs::read(&abs).with_context(|| format!("read {}", abs.display()))?;
-                self.write(id, &join_remote(remote, &rel), &data).await?;
-            }
-            Ok(())
-        })
+        Box::pin(async move { upload_tree(self, id, local, remote).await.map(|_| ()) })
     }
 
     /// Recursively download the sandbox `remote` dir into `local`.
@@ -1573,6 +1622,290 @@ pub trait ProviderFiles: Send + Sync {
             }
             Ok(())
         })
+    }
+}
+
+/// Upload the selected local files and retain the exact bytes' digests only
+/// after each corresponding provider write succeeds.
+pub(crate) async fn upload_tree<F: ProviderFiles + ?Sized>(
+    files: &F,
+    id: &str,
+    local: &Path,
+    remote: &str,
+) -> Result<SyncBaseline> {
+    use sha2::{Digest, Sha256};
+
+    let mut baseline = SyncBaseline::new();
+    for (abs, rel) in collect_files(local)? {
+        let data = std::fs::read(&abs).with_context(|| format!("read {}", abs.display()))?;
+        files.write(id, &join_remote(remote, &rel), &data).await?;
+        baseline.insert(rel, Sha256::digest(&data).into());
+    }
+    Ok(baseline)
+}
+
+/// Reconcile a provider tree against the upload baseline without changing the
+/// local tree until every remote file has been read and classified. The staged
+/// publish set is bounded by `DOWNLOAD_MAX_TOTAL_BYTES`.
+pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
+    files: &F,
+    id: &str,
+    remote: &str,
+    local: &Path,
+    baseline: &SyncBaseline,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let root: Arc<thegn_core::fsperm::RootedDir> =
+        Arc::new(thegn_core::fsperm::open_rooted_dir(local).with_context(|| {
+            format!(
+                "download destination is not a real directory: {}",
+                local.display()
+            )
+        })?);
+    let mut stack: Vec<(
+        String,
+        Option<Arc<thegn_core::fsperm::RootedDir>>,
+        Option<String>,
+    )> = vec![(String::new(), Some(root.clone()), None)];
+    let mut seen = std::collections::HashSet::new();
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    let mut publishes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut ignore = LocalIgnore::new(local);
+
+    while let Some((rel, parent, name)) = stack.pop() {
+        let dir = match (parent, name) {
+            (Some(parent), Some(name)) => parent
+                .open_child_dir(&name)
+                .with_context(|| {
+                    format!(
+                        "open existing comparison directory {}",
+                        local.join(&rel).display()
+                    )
+                })?
+                .map(Arc::new),
+            (parent, None) => parent,
+            (None, Some(_)) => None,
+        };
+        let depth = if rel.is_empty() {
+            0
+        } else {
+            rel.split('/').count()
+        };
+        anyhow::ensure!(
+            depth <= DOWNLOAD_MAX_DEPTH,
+            "provider listing exceeded maximum directory depth"
+        );
+        let listing = files.list_dir(id, &join_remote(remote, &rel)).await?;
+        let mut siblings = std::collections::HashSet::new();
+        for entry in &listing {
+            if entry.name == ".git" {
+                continue;
+            }
+            anyhow::ensure!(
+                valid_remote_component(&entry.name),
+                "provider returned an unsafe path component"
+            );
+            anyhow::ensure!(
+                siblings.insert(entry.name.clone()),
+                "provider returned a duplicate directory entry"
+            );
+            let child = if rel.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{rel}/{}", entry.name)
+            };
+            anyhow::ensure!(
+                seen.insert(child.clone()),
+                "provider returned a repeated path"
+            );
+            let child_depth = depth + 1;
+            anyhow::ensure!(
+                child_depth <= DOWNLOAD_MAX_DEPTH,
+                "provider listing exceeded maximum directory depth"
+            );
+        }
+        for entry in listing {
+            if entry.name == ".git" {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{rel}/{}", entry.name)
+            };
+            if entry.is_dir {
+                if ignore.is_ignored(&child, true)? {
+                    continue;
+                }
+                stack.push((child, dir.clone(), Some(entry.name)));
+                continue;
+            }
+            if ignore.is_ignored(&child, false)? {
+                continue;
+            }
+            file_count += 1;
+            anyhow::ensure!(
+                file_count <= DOWNLOAD_MAX_FILES,
+                "provider listing exceeded maximum file count"
+            );
+            let data = files.read(id, &join_remote(remote, &child)).await?;
+            let actual_size = data.len() as u64;
+            anyhow::ensure!(
+                actual_size <= DOWNLOAD_MAX_FILE_BYTES,
+                "provider file exceeded per-file size limit"
+            );
+            total_bytes = total_bytes
+                .checked_add(actual_size)
+                .context("provider transfer byte count overflow")?;
+            anyhow::ensure!(
+                total_bytes <= DOWNLOAD_MAX_TOTAL_BYTES,
+                "provider transfer exceeded total byte limit"
+            );
+            if actual_size != entry.size {
+                tracing::warn!(target: "thegn::provider", path = %child,
+                    listed_size = entry.size, actual_size, "provider file changed between listing and read; entry skipped");
+                continue;
+            }
+            let remote_digest: [u8; 32] = Sha256::digest(&data).into();
+            let local_data = match &dir {
+                Some(dir) => dir
+                    .read_regular(&entry.name, DOWNLOAD_MAX_FILE_BYTES)
+                    .with_context(|| {
+                        format!(
+                            "read local comparison file {}",
+                            local.join(&child).display()
+                        )
+                    })?,
+                None => None,
+            };
+            let local_digest = local_data
+                .as_ref()
+                .map(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)));
+            match reconcile_action(baseline.get(&child), local_digest.as_ref(), &remote_digest) {
+                ReconcileAction::Skip => {}
+                ReconcileAction::Publish => publishes.push((child, data)),
+                ReconcileAction::Conflict => conflicts.push(child),
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        conflicts.sort();
+        return Err(SyncConflict { paths: conflicts }.into());
+    }
+
+    publishes.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut ancestry = vec![(String::new(), root)];
+    for (child, data) in publishes {
+        let (parent_rel, name) = child.rsplit_once('/').unwrap_or(("", child.as_str()));
+        let components: Vec<&str> = parent_rel
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        let mut shared: usize = 0;
+        while shared < components.len()
+            && shared < ancestry.len().saturating_sub(1)
+            && ancestry[shared + 1].0.rsplit('/').next() == Some(components[shared])
+        {
+            shared += 1;
+        }
+        ancestry.truncate(shared + 1);
+        for component in components.iter().skip(shared) {
+            let current_rel = ancestry.last().expect("root directory retained").0.clone();
+            let next_rel = if current_rel.is_empty() {
+                (*component).to_string()
+            } else {
+                format!("{current_rel}/{component}")
+            };
+            let parent = ancestry
+                .last()
+                .expect("parent directory retained")
+                .1
+                .clone();
+            let opened = parent.ensure_child_dir(component).with_context(|| {
+                format!(
+                    "open download destination directory {}",
+                    local.join(&next_rel).display()
+                )
+            })?;
+            ancestry.push((next_rel, Arc::new(opened)));
+        }
+        ancestry
+            .last()
+            .expect("publish directory retained")
+            .1
+            .publish_file(name, &data)
+            .with_context(|| {
+                format!(
+                    "publish download destination {}",
+                    local.join(&child).display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Local ignore rules for close-time reconciliation, mirroring the upload walk:
+/// each directory's `.ignore` and `.gitignore` apply below it, deeper
+/// directories win, and `.ignore` wins over `.gitignore` within one directory.
+/// Global excludes and `.git/info/exclude` are not consulted.
+struct LocalIgnore {
+    root: std::path::PathBuf,
+    dirs: HashMap<String, Vec<ignore::gitignore::Gitignore>>,
+}
+
+impl LocalIgnore {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            dirs: HashMap::new(),
+        }
+    }
+
+    /// Matchers for one directory (`""` means the worktree root), loaded on
+    /// first use in `.ignore` then `.gitignore` order.
+    fn matchers(&mut self, dir: &str) -> Result<&[ignore::gitignore::Gitignore]> {
+        if !self.dirs.contains_key(dir) {
+            let directory = self.root.join(dir);
+            let mut matchers = Vec::new();
+            for name in [".ignore", ".gitignore"] {
+                let path = directory.join(name);
+                if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                    let (matcher, error) = ignore::gitignore::Gitignore::new(&path);
+                    if let Some(error) = error {
+                        return Err(anyhow::Error::msg(error.to_string()))
+                            .with_context(|| format!("read {}", path.display()));
+                    }
+                    matchers.push(matcher);
+                }
+            }
+            self.dirs.insert(dir.to_string(), matchers);
+        }
+        Ok(self.dirs.get(dir).expect("matcher entry inserted"))
+    }
+
+    /// Whether a slash-separated path beneath the worktree is excluded.
+    fn is_ignored(&mut self, rel: &str, is_dir: bool) -> Result<bool> {
+        let candidate = self.root.join(rel);
+        let components: Vec<&str> = rel.split('/').collect();
+        let mut dirs = Vec::with_capacity(components.len());
+        for end in (0..components.len()).rev() {
+            dirs.push(components[..end].join("/"));
+        }
+        for dir in dirs {
+            for matcher in self.matchers(&dir)? {
+                let matched = matcher.matched_path_or_any_parents(&candidate, is_dir);
+                if matched.is_ignore() {
+                    return Ok(true);
+                }
+                if matched.is_whitelist() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -3026,12 +3359,45 @@ impl Provider {
             .await
     }
 
+    /// Push a local directory and return the file-content baseline for close
+    /// time reconciliation.
+    pub async fn upload_dir_with_baseline(
+        &self,
+        id: &str,
+        local: &Path,
+        remote: &str,
+    ) -> Result<SyncBaseline> {
+        upload_tree(
+            self.files_ops().ok_or_else(|| self.no_files())?,
+            id,
+            local,
+            remote,
+        )
+        .await
+    }
+
     /// Pull the sandbox fs back into a local directory.
     pub async fn download_dir(&self, id: &str, remote: &str, local: &Path) -> Result<()> {
         self.files_ops()
             .ok_or_else(|| self.no_files())?
             .download_dir(id, remote, local)
             .await
+    }
+
+    /// Reconcile a close-time download against the upload baseline when one is
+    /// available; legacy records retain the original overlay behaviour.
+    pub async fn download_dir_reconciled(
+        &self,
+        id: &str,
+        remote: &str,
+        local: &Path,
+        baseline: Option<&SyncBaseline>,
+    ) -> Result<()> {
+        let files = self.files_ops().ok_or_else(|| self.no_files())?;
+        match baseline {
+            Some(baseline) => download_reconciled(files, id, remote, local, baseline).await,
+            None => files.download_dir(id, remote, local).await,
+        }
     }
 
     /// Open a native PTY exec session (the `exec_api` capability), so an
@@ -5391,6 +5757,297 @@ mod tests {
         assert!(
             high_water <= baseline + 16,
             "open handle high-water {high_water} exceeded baseline {baseline} by more than 16"
+        );
+    }
+
+    struct TreeFiles {
+        files: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl TreeFiles {
+        fn new() -> Self {
+            Self {
+                files: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            }
+        }
+
+        fn set(&self, path: &str, bytes: &[u8]) {
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(path.to_string(), bytes.to_vec());
+        }
+    }
+
+    impl ProviderFiles for TreeFiles {
+        fn read<'a>(&'a self, _id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            let result = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing file"));
+            Box::pin(async move { result })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _id: &'a str,
+            path: &'a str,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, Result<()>> {
+            self.set(path, data);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list_dir<'a>(
+            &'a self,
+            _id: &'a str,
+            path: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            let files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut children = std::collections::BTreeMap::<String, FileEntry>::new();
+            for (remote_path, bytes) in files.iter() {
+                let Some(remainder) = remote_path.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let (name, is_dir, size) = match remainder.split_once('/') {
+                    Some((name, _)) => (name, true, 0),
+                    None => (remainder, false, bytes.len() as u64),
+                };
+                children
+                    .entry(name.to_string())
+                    .or_insert_with(|| FileEntry {
+                        name: name.to_string(),
+                        is_dir,
+                        size,
+                    });
+            }
+            let entries: Vec<FileEntry> = children.into_values().collect();
+            Box::pin(async move { Ok(entries) })
+        }
+
+        fn delete<'a>(&'a self, _id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(path);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn sync_reconcile_action_table() {
+        let b = [1; 32];
+        let l = [2; 32];
+        let r = [3; 32];
+        let cases = [
+            (Some(&b), Some(&b), &b, ReconcileAction::Skip),
+            (Some(&b), Some(&l), &b, ReconcileAction::Skip),
+            (Some(&b), None, &b, ReconcileAction::Skip),
+            (Some(&b), Some(&b), &r, ReconcileAction::Publish),
+            (None, None, &r, ReconcileAction::Publish),
+            (Some(&b), Some(&r), &r, ReconcileAction::Skip),
+            (None, Some(&r), &r, ReconcileAction::Skip),
+            (Some(&b), Some(&l), &r, ReconcileAction::Conflict),
+            (Some(&b), None, &r, ReconcileAction::Conflict),
+            (None, Some(&l), &r, ReconcileAction::Conflict),
+        ];
+        for (base, local, remote, expected) in cases {
+            assert_eq!(reconcile_action(base, local, remote), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_upload_records_a_baseline_for_every_uploaded_file() {
+        use sha2::{Digest, Sha256};
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("d")).unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
+        std::fs::write(temp.path().join("d/b.txt"), b"two").unwrap();
+        let files = TreeFiles::new();
+        let baseline = upload_tree(&files, "id", temp.path(), "/w").await.unwrap();
+        let expected = std::collections::BTreeMap::from([
+            ("a.txt".to_string(), Sha256::digest(b"one").into()),
+            ("d/b.txt".to_string(), Sha256::digest(b"two").into()),
+        ]);
+        assert_eq!(baseline, expected);
+        let uploaded = files.files.lock().unwrap();
+        assert_eq!(
+            uploaded.get("/w/a.txt").map(Vec::as_slice),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            uploaded.get("/w/d/b.txt").map(Vec::as_slice),
+            Some(&b"two"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_keeps_a_local_edit_when_the_sandbox_copy_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
+        let files = TreeFiles::new();
+        let baseline = upload_tree(&files, "id", temp.path(), "/w").await.unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"mine").unwrap();
+        download_reconciled(&files, "id", "/w", temp.path(), &baseline)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(temp.path().join("a.txt")).unwrap(), b"mine");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_fast_forwards_an_untouched_local_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
+        let files = TreeFiles::new();
+        let baseline = upload_tree(&files, "id", temp.path(), "/w").await.unwrap();
+        files.set("/w/a.txt", b"theirs");
+        download_reconciled(&files, "id", "/w", temp.path(), &baseline)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(temp.path().join("a.txt")).unwrap(), b"theirs");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_publishes_a_new_sandbox_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = TreeFiles::new();
+        let baseline = upload_tree(&files, "id", temp.path(), "/w").await.unwrap();
+        files.set("/w/n/new.txt", b"x");
+        download_reconciled(&files, "id", "/w", temp.path(), &baseline)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(temp.path().join("n/new.txt")).unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_refuses_a_both_sides_edit_before_writing_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("d")).unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
+        std::fs::write(temp.path().join("d/b.txt"), b"two").unwrap();
+        let files = TreeFiles::new();
+        let baseline = upload_tree(&files, "id", temp.path(), "/w").await.unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"mine").unwrap();
+        files.set("/w/a.txt", b"theirs");
+        files.set("/w/d/b.txt", b"fast");
+        files.set("/w/z/new.txt", b"x");
+        let result = download_reconciled(&files, "id", "/w", temp.path(), &baseline).await;
+        let conflict = result.unwrap_err().downcast_ref::<SyncConflict>().cloned();
+        assert_eq!(
+            conflict.map(|error| error.paths),
+            Some(vec!["a.txt".to_string()])
+        );
+        assert_eq!(std::fs::read(temp.path().join("a.txt")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(temp.path().join("d/b.txt")).unwrap(), b"two");
+        assert!(!temp.path().join("z").exists());
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_keeps_ignored_local_build_output() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/x"), b"local build output").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"sandbox build output");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(temp.path().join("out/x")).unwrap(),
+            b"local build output",
+            "ignored local output is excluded from upload conflicts and stays local"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_skips_an_ignored_sandbox_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/new.txt", b"x");
+        files.set("/w/keep.txt", b"k");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert!(!temp.path().join("out").exists());
+        assert_eq!(std::fs::read(temp.path().join("keep.txt")).unwrap(), b"k");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_honours_a_nested_gitignore() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("sub")).unwrap();
+        std::fs::create_dir(temp.path().join("sub/build")).unwrap();
+        std::fs::write(temp.path().join("sub/.gitignore"), "build/\n/gen\n").unwrap();
+        std::fs::write(temp.path().join("sub/build/x"), b"mine").unwrap();
+        std::fs::write(temp.path().join("sub/gen"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/sub/build/x", b"theirs");
+        files.set("/w/sub/gen", b"theirs");
+        files.set("/w/gen", b"top");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(temp.path().join("sub/build/x")).unwrap(),
+            b"mine"
+        );
+        assert_eq!(std::fs::read(temp.path().join("sub/gen")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(temp.path().join("gen")).unwrap(), b"top");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_honours_a_dot_ignore_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".ignore"), "out/\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/x"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"theirs");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(temp.path().join("out/x")).unwrap(), b"mine");
+    }
+
+    // Positive control: this negated path is not ignored and still conflicts.
+    #[tokio::test]
+    async fn sync_reconcile_still_conflicts_on_a_negated_path() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "out/*\n!out/keep\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/keep"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/keep", b"theirs");
+
+        let result =
+            download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new()).await;
+
+        let conflict = result.unwrap_err().downcast_ref::<SyncConflict>().cloned();
+        assert_eq!(
+            conflict.map(|error| error.paths),
+            Some(vec!["out/keep".to_string()])
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("out/keep")).unwrap(),
+            b"mine"
         );
     }
 }

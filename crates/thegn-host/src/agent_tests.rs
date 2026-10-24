@@ -2894,6 +2894,55 @@ fn launch_state_gate_lets_a_shell_launch_with_a_warning() {
 }
 
 #[test]
+fn bundle_read_gate_refuses_a_configured_agent() {
+    let cfg = cfg_with(&[("codex", "codex")], &[]);
+    let unreadable = vec!["read the global env-bundle binding: disk I/O error".to_string()];
+    let mut notified = false;
+    let result = bundle_read_gate_with(&cfg, "/wt/a", "codex", &unreadable, |_, _| {
+        notified = true;
+    });
+    let Err(error) = result else {
+        panic!("configured agent must be refused when state reads fail");
+    };
+    let detail = format!("{error:#}");
+    assert!(detail.contains("refusing to launch `codex`"), "{detail}");
+    assert!(
+        detail.contains("env-bundle or coding-agent account selection"),
+        "{detail}"
+    );
+    assert!(detail.contains("disk I/O error"), "{detail}");
+    assert!(!notified);
+}
+
+#[test]
+fn bundle_read_gate_lets_a_shell_launch_with_a_notice() {
+    let cfg = cfg_with(&[], &[]);
+    let unreadable = vec!["read the global env-bundle binding: disk I/O error".to_string()];
+    let mut notices = Vec::new();
+    assert!(
+        bundle_read_gate_with(&cfg, "/wt/a", "shell", &unreadable, |_, text| {
+            notices.push(text.to_string());
+        })
+        .is_ok()
+    );
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("the shell launches without it"));
+}
+
+#[test]
+fn bundle_read_gate_passes_when_nothing_is_unreadable() {
+    let cfg = cfg_with(&[], &[]);
+    let mut notified = false;
+    assert!(
+        bundle_read_gate_with(&cfg, "/wt/a", "shell", &[], |_, _| {
+            notified = true;
+        })
+        .is_ok()
+    );
+    assert!(!notified);
+}
+
+#[test]
 fn repo_slug_checked_is_none_without_a_directory_name() {
     let db = Db::open_memory().unwrap();
     assert_eq!(repo_slug_checked(&db, Path::new("/")).unwrap(), None);
@@ -2963,4 +3012,51 @@ fn repo_slug_checked_reads_an_existing_slug_without_writing() {
         db.repo_slug_rows().unwrap(),
         vec![("/x/app".into(), "app".into())]
     );
+}
+
+#[test]
+fn provision_worktree_refuses_an_unreadable_location_when_a_provider_env_is_configured() {
+    use thegn_core::config::{Config, EnvConfig, PlacementMode};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        env: [(
+            "cloud".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Config::default()
+    };
+
+    let result = provision_worktree(&cfg, &wt, |_| {});
+    assert!(matches!(result, Err(error) if format!("{error:#}").contains("provisioning refused")));
+}
+
+#[test]
+fn provision_worktree_keeps_a_local_worktree_local_without_provider_envs() {
+    use thegn_core::config::Config;
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+
+    assert!(matches!(
+        provision_worktree(&Config::default(), &wt, |_| {}),
+        Ok(false)
+    ));
 }

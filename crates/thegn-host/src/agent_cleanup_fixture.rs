@@ -32,6 +32,7 @@ impl RegistryCustody {
                 ProviderSyncRecord {
                     env_name: sync,
                     in_flight: false,
+                    baseline: None,
                 },
             );
         }
