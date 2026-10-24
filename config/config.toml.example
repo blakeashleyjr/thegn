@@ -824,7 +824,7 @@ structural_diff = "off"  # how the READ-ONLY diff surfaces (the Alt+/ full-scree
                          # DiffView and `thegn diff --structural`) render:
                          #   off    internal unified view (the default)
                          #   auto   structural (difftastic) WHEN difft resolves
-                         #          through the managed-tool tiers, else internal
+                         #          via [managed_tools.difft] path or PATH, else internal
                          #   difft  always structural; falls back to internal with
                          #          a one-line notice on any tool failure
                          # Structural output is NEVER fed to `git apply`: every
@@ -833,9 +833,10 @@ structural_diff = "off"  # how the READ-ONLY diff surfaces (the Alt+/ full-scree
                          # diff = "git diff", which normally makes the native modal
                          # unreachable; setting this key routes the native
                          # (structural) modal AHEAD of that tool — an explicit
-                         # opt-in wins over the seeded default. Resolve/acquire
-                         # difft via [managed_tools.difft] or PATH; see
-                         # `thegn doctor`. Also `THEGN_GIT_STRUCTURAL_DIFF`.
+                         # opt-in wins over the seeded default. Resolve difft via
+                         # [managed_tools.difft] path or PATH; managed downloads
+                         # are disabled until reviewed pins ship. See `thegn doctor`.
+                         # Also `THEGN_GIT_STRUCTURAL_DIFF`.
 auto_fetch_colocated = false  # also run background auto_fetch in repos colocated
                               # with jujutsu (a `.jj/` beside `.git/`). Off by
                               # default: jj's docs warn a background `git fetch`
