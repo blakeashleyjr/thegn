@@ -1481,6 +1481,38 @@ fn trusted_digest(tool: &str, version: &str, asset: &str) -> Option<&'static str
         .map(|(_, _, _, digest)| *digest)
 }
 
+/// Explain why a managed GitHub-release install cannot be performed on this
+/// platform. Installer-sourced tools are unaffected by release pins.
+pub(crate) fn managed_install_unavailable(tool: &ManagedTool) -> Option<String> {
+    if !matches!(&tool.source, Source::GithubRelease { .. }) {
+        return None;
+    }
+    let Some(os) = Os::current() else {
+        return Some(format!(
+            "managed download unavailable: unsupported platform; put {} on PATH or set [managed_tools.{}] path",
+            tool.name, tool.name
+        ));
+    };
+    let Some(arch) = Arch::current() else {
+        return Some(format!(
+            "managed download unavailable: unsupported platform; put {} on PATH or set [managed_tools.{}] path",
+            tool.name, tool.name
+        ));
+    };
+    let Some(asset) = tool.asset_for(os, arch) else {
+        return Some(format!(
+            "managed download unavailable: no release asset for this platform; put {} on PATH or set [managed_tools.{}] path",
+            tool.name, tool.name
+        ));
+    };
+    trusted_digest(&tool.name, &tool.version, asset).is_none().then(|| {
+        format!(
+            "managed download disabled: no reviewed SHA-256 pin ships for {} {} ({}); put {} on PATH or set [managed_tools.{}] path",
+            tool.name, tool.version, asset, tool.name, tool.name
+        )
+    })
+}
+
 /// Stream an asset into an owner-only temporary file, enforcing response and
 /// body deadlines, a hard byte cap, and the shipped digest before returning it.
 fn download_to(url: &str, dir: &Path, expected_digest: &str) -> Result<NamedTempFile> {
@@ -1838,6 +1870,45 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("no trusted SHA-256 pin"));
         assert!(!tool.bin_path().exists());
+    }
+
+    #[test]
+    fn managed_install_unavailable_names_the_missing_pin_for_a_release_tool() {
+        let Some(os) = Os::current() else {
+            return;
+        };
+        let Some(arch) = Arch::current() else {
+            return;
+        };
+        let difft = thegn_core::difft::difft_tool();
+        let note = managed_install_unavailable(&difft).expect("difft has no reviewed release pin");
+        assert!(note.contains("no reviewed SHA-256 pin"), "{note}");
+        assert!(note.contains("difft"), "{note}");
+
+        let other_os = match os {
+            Os::Linux => Os::Macos,
+            Os::Macos | Os::Windows => Os::Linux,
+        };
+        let no_asset = ManagedTool::github(
+            "unreviewed-tool",
+            "example/unreachable",
+            "0.1.0",
+            vec![thegn_core::managed_tool::AssetRule {
+                os: other_os,
+                arch,
+                asset: "unreviewed-tool.tar.gz".to_string(),
+            }],
+        );
+        let note = managed_install_unavailable(&no_asset).expect("current platform has no asset");
+        assert!(
+            note.contains("no release asset for this platform"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn managed_install_unavailable_is_none_for_installer_sourced_tools() {
+        assert!(managed_install_unavailable(&thegn_core::debug::bs_tool()).is_none());
     }
 
     #[test]
