@@ -726,12 +726,16 @@ impl PluginsHost {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let id = plugin.spec.manifest.id.as_str().to_string();
             let run = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
-                Ok(env) => thegn_svc::plugin::spawn_ndjson(
-                    &plugin.spec.command,
-                    &env,
-                    plugin.effective_cwd().as_deref(),
-                    plugin.spec.run_timeout(),
-                ),
+                Ok(env) => {
+                    let cancel = || late.drops(&id);
+                    thegn_svc::plugin::spawn_ndjson_cancellable(
+                        &plugin.spec.command,
+                        &env,
+                        plugin.effective_cwd().as_deref(),
+                        plugin.spec.run_timeout(),
+                        &cancel,
+                    )
+                }
                 Err(problem) => {
                     drop(ticket);
                     if let Err(error) = tx.send(PluginMsg::Refused(vec![problem])) {
@@ -1024,7 +1028,14 @@ fn start_poll_worker(
     let worker_late = late.clone();
     match thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        let run = thegn_svc::plugin::spawn_ndjson(&command, &env, cwd.as_deref(), timeout);
+        let cancel = || worker_late.drops(&plugin);
+        let run = thegn_svc::plugin::spawn_ndjson_cancellable(
+            &command,
+            &env,
+            cwd.as_deref(),
+            timeout,
+            &cancel,
+        );
         drop(ticket);
         if worker_late.drops(&plugin) {
             tracing::debug!(target: "thegn::plugin", plugin = %plugin, "one-shot result dropped: plugin disabled or host stopped while it ran");
