@@ -134,8 +134,8 @@ pub(crate) fn kick(tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::Refre
 /// workspace's MAIN checkout.
 ///
 /// The workspace roots are the fix for a whole class of "it never shows a size":
-/// a workspace's home group is session-only — `workspace_create` and
-/// `Session::switch_to_workspace` write `workspaces`/`repos` rows but never a
+/// a workspace's home group is session-only — the workspace create/switch flow
+/// writes `workspaces`/`repos` rows but never a
 /// `worktrees` row — so a scan that walked `db.worktrees()` alone left the
 /// sidebar workspace row (which does carry `worktree_path = repo_path`) and the
 /// bottom-bar `disk` chip on a home tab permanently blank.

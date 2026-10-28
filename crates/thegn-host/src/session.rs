@@ -988,11 +988,11 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub fn switch_to_workspace(&mut self, repo_path: &str, db: &thegn_core::db::Db) -> Result<()> {
         let now = crate::run::now_secs();
         self.persist(db, &self.id, now)?;
-        // Workspace create/remove callers have no loaded config in scope, so
-        // this synchronous wrapper keeps the default-config fallback. The UI
+        // Test-only synchronous wrapper with the default-config fallback. The UI
         // loop's prepare job threads the loaded config through
         // `prepare_workspace_switch` (THE-73).
         self.switch_to_workspace_deferred(repo_path, db, &thegn_core::config::Config::default())?;
@@ -1007,14 +1007,15 @@ impl Session {
     /// tests. It swaps the in-memory session without full-layout writes; the
     /// loop uses `prepare_workspace_switch` on the FIFO DB writer and applies
     /// its result after the outgoing layout persist.
-    /// The plain [`Self::switch_to_workspace`] above keeps synchronous persists
-    /// for workspace create/remove callers.
+    /// The plain [`Self::switch_to_workspace`] above (tests only) keeps
+    /// synchronous persists.
     /// `cfg` is the loaded config, threaded through to
     /// [`Self::resurrect_with_cfg`] so a worktree with a non-local placement
     /// (ssh/k8s/provider, including one inherited from the repo's ambient env)
     /// is recognized as remote and survives the switch even though its tree
     /// isn't on this host. The default-config shim could not see those envs and
     /// dropped them on exactly this path (THE-73).
+    #[cfg(test)]
     pub fn switch_to_workspace_deferred(
         &mut self,
         repo_path: &str,
