@@ -47,6 +47,9 @@ pub enum PluginError {
     Exit { code: Option<i32>, stderr: String },
     /// It ran past its timeout and its process group was killed.
     Timeout(u64),
+    /// The run was stopped because its plugin was disabled or the plugin host
+    /// stopped; its process group was killed.
+    Cancelled,
     /// Its output was not the newline-delimited JSON we asked for.
     Protocol(String),
 }
@@ -60,6 +63,9 @@ impl std::fmt::Display for PluginError {
                 None => write!(f, "plugin was killed: {}", stderr.trim()),
             },
             PluginError::Timeout(s) => write!(f, "plugin timed out after {s}s"),
+            PluginError::Cancelled => {
+                write!(f, "plugin run cancelled (plugin disabled or host stopped)")
+            }
             PluginError::Protocol(e) => write!(f, "plugin protocol error: {e}"),
         }
     }
@@ -448,7 +454,20 @@ pub fn spawn_ndjson(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<PluginRun, PluginError> {
-    let out = spawn_ndjson_stream(
+    spawn_ndjson_cancellable(argv, env, cwd, timeout, &|| false)
+}
+
+/// Run `argv`, stopping early when `cancel` returns true (polled every wait
+/// tick): the process group is killed, the leader reaped within the reader
+/// grace, and the result is [`PluginError::Cancelled`].
+pub fn spawn_ndjson_cancellable(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    cancel: &dyn Fn() -> bool,
+) -> Result<PluginRun, PluginError> {
+    let out = spawn_ndjson_stream_inner(
         argv,
         env,
         cwd,
@@ -457,6 +476,7 @@ pub fn spawn_ndjson(
             run: PluginRun::default(),
             retained_bytes: 0,
         },
+        cancel,
     )?;
     let mut run = out.sink.run;
     run.stderr = out.stderr;
@@ -475,6 +495,17 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     cwd: Option<&Path>,
     timeout: Duration,
     sink: S,
+) -> Result<StreamRun<S>, PluginError> {
+    spawn_ndjson_stream_inner(argv, env, cwd, timeout, sink, &|| false)
+}
+
+fn spawn_ndjson_stream_inner<S: NdjsonSink>(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    sink: S,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<StreamRun<S>, PluginError> {
     let Some((program, args)) = argv.split_first() else {
         return Err(PluginError::Spawn("empty command".into()));
@@ -630,15 +661,55 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     // Observe the leader without reaping it, so its pid still pins the process
     // group when descendants are terminated.
     let mut timed_out = false;
+    let mut cancelled = false;
     let mut kill_requested = false;
     #[cfg(unix)]
-    let status = 'run: loop {
-        match leader_exited_nowait(pid) {
-            Ok(true) => {
-                // A successful one-shot run also kills helpers left in its process group,
-                // matching gh_run; backgrounded helpers do not outlive the plugin run.
+    let status = {
+        let reap_after_kill = |mut child: std::process::Child| {
+            let reap_deadline = Instant::now() + READER_GRACE;
+            loop {
+                match leader_exited_nowait(pid) {
+                    Ok(true) => return child.wait().ok(),
+                    Ok(false) => {}
+                    Err(_) => {
+                        hand_off_unreaped_child(child);
+                        return None;
+                    }
+                }
+                if Instant::now() >= reap_deadline {
+                    hand_off_unreaped_child(child);
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        'run: loop {
+            match leader_exited_nowait(pid) {
+                Ok(true) => {
+                    // A successful one-shot run also kills helpers left in its process group,
+                    // matching gh_run; backgrounded helpers do not outlive the plugin run.
+                    kill_requested = true;
+                    #[cfg(unix)]
+                    reader_deadline_ms.store(
+                        started
+                            .elapsed()
+                            .saturating_add(READER_GRACE)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                        Ordering::Release,
+                    );
+                    kill_group(pid);
+                    break child.wait().ok();
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    hand_off_unreaped_child(child);
+                    break None;
+                }
+            }
+            if cancel() {
+                cancelled = true;
                 kill_requested = true;
-                #[cfg(unix)]
                 reader_deadline_ms.store(
                     started
                         .elapsed()
@@ -648,36 +719,16 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                     Ordering::Release,
                 );
                 kill_group(pid);
-                break child.wait().ok();
+                break 'run reap_after_kill(child);
             }
-            Ok(false) => {}
-            Err(_) => {
-                hand_off_unreaped_child(child);
-                break None;
+            if Instant::now() >= deadline {
+                timed_out = true;
+                kill_requested = true;
+                kill_group(pid);
+                break 'run reap_after_kill(child);
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            kill_requested = true;
-            kill_group(pid);
-            let reap_deadline = Instant::now() + READER_GRACE;
-            loop {
-                match leader_exited_nowait(pid) {
-                    Ok(true) => break 'run child.wait().ok(),
-                    Ok(false) => {}
-                    Err(_) => {
-                        hand_off_unreaped_child(child);
-                        break 'run None;
-                    }
-                }
-                if Instant::now() >= reap_deadline {
-                    hand_off_unreaped_child(child);
-                    break 'run None;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
     };
     #[cfg(not(unix))]
     let status = loop {
@@ -688,6 +739,13 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                 hand_off_unreaped_child(child);
                 break None;
             }
+        }
+        if cancel() {
+            cancelled = true;
+            kill_requested = true;
+            kill_group(pid);
+            hand_off_unreaped_child(child);
+            break None;
         }
         if Instant::now() >= deadline {
             timed_out = true;
@@ -715,7 +773,13 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             }
             ((sink, truncated, poll_calls), stderr, drained, abandoned)
         }
-        Ok(Err(error)) => return Err(PluginError::Protocol(error)),
+        Ok(Err(error)) => {
+            return if cancelled {
+                Err(PluginError::Cancelled)
+            } else {
+                Err(PluginError::Protocol(error))
+            };
+        }
         Err(error) => {
             let outcome = RunOutcome {
                 killed: kill_requested,
@@ -727,7 +791,9 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
             };
             tracing::debug!(target: "thegn::plugin", program, ?outcome, "plugin pipe reader exceeded drain deadline");
             return match error {
+                mpsc::RecvTimeoutError::Timeout if cancelled => Err(PluginError::Cancelled),
                 mpsc::RecvTimeoutError::Timeout => Err(timeout_error(timeout.as_secs(), outcome)),
+                mpsc::RecvTimeoutError::Disconnected if cancelled => Err(PluginError::Cancelled),
                 mpsc::RecvTimeoutError::Disconnected => {
                     Err(PluginError::Protocol("plugin pipe reader failed".into()))
                 }
@@ -735,7 +801,9 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
         }
     };
     #[cfg(not(unix))]
-    let drain_deadline = if status.is_some() && !timed_out {
+    let drain_deadline = if cancelled {
+        Instant::now() + READER_GRACE
+    } else if status.is_some() && !timed_out {
         Instant::now() + READER_GRACE
     } else {
         deadline + READER_GRACE
@@ -758,8 +826,12 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                 };
                 tracing::debug!(target: "thegn::plugin", program, ?outcome, "Windows plugin stdout reader abandoned");
                 return match error {
+                    mpsc::RecvTimeoutError::Timeout if cancelled => Err(PluginError::Cancelled),
                     mpsc::RecvTimeoutError::Timeout => {
                         Err(timeout_error(timeout.as_secs(), outcome))
+                    }
+                    mpsc::RecvTimeoutError::Disconnected if cancelled => {
+                        Err(PluginError::Cancelled)
                     }
                     mpsc::RecvTimeoutError::Disconnected => {
                         Err(PluginError::Protocol("plugin output reader failed".into()))
@@ -780,8 +852,12 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
                 };
                 tracing::debug!(target: "thegn::plugin", program, ?outcome, "Windows plugin stderr reader abandoned");
                 return match error {
+                    mpsc::RecvTimeoutError::Timeout if cancelled => Err(PluginError::Cancelled),
                     mpsc::RecvTimeoutError::Timeout => {
                         Err(timeout_error(timeout.as_secs(), outcome))
+                    }
+                    mpsc::RecvTimeoutError::Disconnected if cancelled => {
+                        Err(PluginError::Cancelled)
                     }
                     mpsc::RecvTimeoutError::Disconnected => {
                         Err(PluginError::Protocol("plugin stderr reader failed".into()))
@@ -803,6 +879,9 @@ pub fn spawn_ndjson_stream<S: NdjsonSink>(
     };
     tracing::debug!(target: "thegn::plugin", program, ?outcome, "plugin run process-tree outcome");
 
+    if cancelled {
+        return Err(PluginError::Cancelled);
+    }
     match (timed_out, status) {
         (true, _) | (false, None) => Err(timeout_error(timeout.as_secs(), outcome)),
         (false, Some(s)) if !s.success() => Err(PluginError::Exit {
@@ -1293,7 +1372,7 @@ pub(crate) fn kill_group(pid: u32) {
 mod process_tree_deadline_tests {
     use super::{
         LIVE_PIPE_READERS, PluginError, READER_GRACE, READER_RECEIVE_MARGIN, poll_wait_ms,
-        spawn_ndjson,
+        spawn_ndjson, spawn_ndjson_cancellable,
     };
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
@@ -1433,6 +1512,46 @@ mod process_tree_deadline_tests {
         }
         assert!(started.elapsed() < Duration::from_secs(4));
         assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn cancelled_run_kills_the_group_before_its_timeout() {
+        // `sh` and its sleeping child share the runner's process group. When
+        // cancellation is observed, killing that group closes both plugin
+        // pipes; the runner reaps `sh` and its pipe reader exits within grace.
+        let started = Instant::now();
+        let result = spawn_ndjson_cancellable(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(30),
+            &|| started.elapsed() >= Duration::from_millis(200),
+        );
+        assert!(matches!(result, Err(PluginError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_readers_exit_within_margin();
+    }
+
+    #[test]
+    fn uncancelled_run_with_a_cancel_predicate_completes_normally() {
+        let run = spawn_ndjson_cancellable(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"log\",\"params\":{}}'".into(),
+            ],
+            &BTreeMap::new(),
+            None,
+            Duration::from_secs(10),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(run.messages.len(), 1);
+    }
+
+    #[test]
+    fn cancelled_error_says_the_run_was_stopped() {
+        assert!(PluginError::Cancelled.to_string().contains("cancelled"));
     }
 
     #[test]
