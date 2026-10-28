@@ -95,7 +95,7 @@ primary action.
 - **WHEN** a GitHub-release tool has no shipped reviewed SHA-256 pin for the
   selected asset
 - **THEN** the host refuses the download before any network access and the tool
-  resolves only through an override or PATH
+  resolves through an override, PATH, or an already-installed managed copy
 
 #### Scenario: Fetch stays off the event loop
 

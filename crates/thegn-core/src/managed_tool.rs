@@ -6,8 +6,9 @@
 //! **user override → project PATH → managed location**, per platform, with an
 //! update policy and graceful fallback. The host refuses a GitHub-release
 //! download unless a reviewed SHA-256 pin for that tool, version, and asset
-//! ships with thegn; today difft resolves only through an override or PATH.
-//! Each tool is one [`ManagedTool`] value.
+//! ships with thegn; today difft has no shipped pin for new managed downloads,
+//! but can resolve through an override, PATH, or an already-installed managed
+//! copy. Each tool is one [`ManagedTool`] value.
 //!
 //! This module is **pure**: it decides *which* tier satisfies a tool, *which*
 //! release asset matches the platform, *where* the managed copy lives, and
