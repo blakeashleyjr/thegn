@@ -56,6 +56,24 @@ pub(crate) enum StopProbe {
     NotRunning,
     Ours,
     Foreign(String),
+    /// Something answers at the endpoint but did not pass the health check; the reason is the error text.
+    Unverified(String),
+}
+
+/// Whether a failed control request proves nothing is listening: some cause in the chain is an io::Error of kind
+/// NotFound (no socket / directory) or ConnectionRefused (a stale socket). Timeouts, HTTP and protocol errors,
+/// permission failures and everything else came from something present.
+pub(crate) fn proves_no_listener(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+            })
+    })
 }
 
 fn classify_scope_reply(reply: Result<Value>, expected: &[String]) -> ScopeCheck {
@@ -137,6 +155,7 @@ struct CandidateScan {
     found: Option<ControlClient>,
     foreign: Vec<(String, String)>,
     unassessed: Vec<String>,
+    unverified: Vec<(String, String)>,
 }
 
 async fn scan_candidates(
@@ -157,6 +176,7 @@ async fn scan_candidates(
         found: None,
         foreign: Vec::new(),
         unassessed: Vec::new(),
+        unverified: Vec::new(),
     };
     let mut candidates = unique.into_iter();
     while let Some(candidate) = candidates.next() {
@@ -168,6 +188,7 @@ async fn scan_candidates(
             }
             Ok(StopProbe::Foreign(scope)) => scan.foreign.push((label, scope)),
             Ok(StopProbe::NotRunning) => {}
+            Ok(StopProbe::Unverified(reason)) => scan.unverified.push((label, reason)),
             Err(_) => {
                 scan.unassessed.push(label);
                 scan.unassessed
@@ -189,6 +210,7 @@ async fn scan_startup_candidates(
         found: None,
         foreign: Vec::new(),
         unassessed: Vec::new(),
+        unverified: Vec::new(),
     };
     let mut candidates = candidates;
     if let Some(local) = local {
@@ -204,11 +226,13 @@ async fn scan_startup_candidates(
             }
             StopProbe::Foreign(scope) => scan.foreign.push((label, scope)),
             StopProbe::NotRunning => {}
+            StopProbe::Unverified(reason) => scan.unverified.push((label, reason)),
         }
     }
 
     let mut registry_scan = scan_candidates(candidates, deadline, probe).await;
     scan.foreign.append(&mut registry_scan.foreign);
+    scan.unverified.append(&mut registry_scan.unverified);
     scan.found = registry_scan.found;
     scan.unassessed = registry_scan.unassessed;
     scan
@@ -262,6 +286,11 @@ fn startup_refusal(scan: &CandidateScan, sock_label: &str) -> Option<anyhow::Err
             CONNECT_DAEMON_TOTAL_DEADLINE.as_secs()
         ));
     }
+    if let Some((label, reason)) = scan.unverified.first() {
+        return Some(anyhow!(
+            "pane daemon endpoint {label} is present but did not answer its health check ({reason}); not starting another daemon (stop the process holding it, then retry)"
+        ));
+    }
     scan.foreign
         .iter()
         .find(|(label, _)| label == sock_label)
@@ -273,8 +302,12 @@ pub(crate) fn socket_label(client: &ControlClient) -> String {
 }
 
 pub(crate) async fn probe_stop_target(client: &ControlClient, scopes: &[String]) -> StopProbe {
-    if client.health().await.is_err() {
-        return StopProbe::NotRunning;
+    if let Err(error) = client.health().await {
+        return if proves_no_listener(&error) {
+            StopProbe::NotRunning
+        } else {
+            StopProbe::Unverified(format!("{error:#}"))
+        };
     }
     match check_daemon_scope(client, scopes).await {
         ScopeCheck::Match | ScopeCheck::Unknown => StopProbe::Ours,
@@ -314,6 +347,7 @@ async fn wait_for_spawned_daemon(
             Ok(StopProbe::Ours) => return SpawnWait::Up,
             Ok(StopProbe::Foreign(actual)) => return SpawnWait::Foreign(actual),
             Ok(StopProbe::NotRunning) => {}
+            Ok(StopProbe::Unverified(_)) => {}
             Err(_) => return SpawnWait::TimedOut,
         }
     }
@@ -406,6 +440,14 @@ fn report_startup_scan(scan: &CandidateScan) {
             target: "thegn::daemon",
             candidates = ?scan.unassessed,
             "pane daemon candidates not checked within the startup deadline"
+        );
+    }
+    for (label, reason) in &scan.unverified {
+        tracing::warn!(
+            target: "thegn::daemon",
+            endpoint = %label,
+            %reason,
+            "pane daemon endpoint is present but failed its health check"
         );
     }
 }
@@ -1672,6 +1714,7 @@ mod tests {
             found: None,
             foreign: Vec::new(),
             unassessed: vec!["/slow.sock".into()],
+            unverified: Vec::new(),
         };
         assert!(
             startup_refusal(&unassessed, "/configured.sock")
@@ -1684,6 +1727,7 @@ mod tests {
             found: None,
             foreign: vec![("/configured.sock".into(), "other-scope".into())],
             unassessed: Vec::new(),
+            unverified: Vec::new(),
         };
         assert!(
             startup_refusal(&configured_foreign, "/configured.sock")
@@ -1696,8 +1740,95 @@ mod tests {
             found: None,
             foreign: vec![("/other.sock".into(), "other-scope".into())],
             unassessed: Vec::new(),
+            unverified: Vec::new(),
         };
         assert!(startup_refusal(&other_foreign, "/configured.sock").is_none());
+    }
+
+    #[test]
+    fn listener_absence_needs_a_missing_or_refused_socket() {
+        use anyhow::Context;
+
+        let missing = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("connect control endpoint /x");
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("connect control endpoint /x");
+        let timeout =
+            anyhow::Error::new(thegn_svc::control::client::ControlBoundError::RequestTimeout);
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let protocol =
+            anyhow::Error::new(thegn_svc::control::client::ControlProtocolError::InvalidJson);
+
+        assert!(proves_no_listener(&missing));
+        assert!(proves_no_listener(&refused));
+        assert!(!proves_no_listener(&timeout));
+        assert!(!proves_no_listener(&denied));
+        assert!(!proves_no_listener(&protocol));
+    }
+
+    #[tokio::test]
+    async fn probe_stop_target_reports_a_listener_that_hangs_up_as_unverified() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("d.sock");
+        let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
+        let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
+            .await
+            .unwrap()
+        {
+            thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
+            thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+        };
+        let accept_task = tokio::spawn(async move {
+            let mut listener = listener;
+            while let Ok(stream) = listener.accept_stream().await {
+                drop(stream);
+            }
+        });
+        let client = ControlClient::new(ControlAddr::Unix(socket)).with_limits(
+            thegn_svc::control::client::ControlLimits {
+                request_timeout: Duration::from_secs(2),
+                long_request_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        );
+        let probe = probe_stop_target(&client, &["scope".into()]).await;
+        assert!(matches!(probe, StopProbe::Unverified(_)));
+        accept_task.abort();
+        assert!(accept_task.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_stop_target_reports_a_missing_socket_as_not_running() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let client = ControlClient::new(ControlAddr::Unix(dir.path().join("missing.sock")));
+        assert!(matches!(
+            probe_stop_target(&client, &["scope".into()]).await,
+            StopProbe::NotRunning
+        ));
+    }
+
+    #[tokio::test]
+    async fn candidate_scan_refuses_to_start_beside_an_unverified_endpoint() {
+        let scan = scan_candidates(
+            vec![ControlAddr::Unix("/a.sock".into())],
+            Duration::from_secs(1),
+            |_| Box::pin(async { StopProbe::Unverified("reply was cut short".into()) }),
+        )
+        .await;
+        assert_eq!(
+            scan.unverified,
+            vec![("/a.sock".into(), "reply was cut short".into())]
+        );
+        let refusal = startup_refusal(&scan, "/configured.sock").unwrap();
+        assert!(refusal.to_string().contains("/a.sock"));
+        assert!(refusal.to_string().contains("not starting another daemon"));
     }
 
     #[tokio::test]
