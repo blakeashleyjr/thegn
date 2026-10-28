@@ -89,9 +89,9 @@ admitted with.
   limit is reached or its previous run is still going; missed ticks are
   skipped and never replayed. A palette action reports `... is already running` or
   `... not started: too many plugin runs in flight (4 max)` in the status
-  line. A run still in progress when its plugin is disabled, plugins are
-  reloaded, or thegn quits is stopped: its process group is killed and its
-  output discarded.
+  line. A run still in progress when its plugin is disabled or plugins are
+  reloaded is stopped: its process group is killed and its output discarded.
+  When thegn quits, in-flight runs are stopped best-effort before exit.
 - `mode = "resident"`: one long-lived process for the session; thegn sends
   `activate`, then `render` per cadence, and `deactivate` on shutdown.
 
