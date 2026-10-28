@@ -491,7 +491,10 @@ pub(crate) fn provision_reserved(
 /// atomic), check out the worktree's branch in the spare's workdir, mirror local
 /// state, and REBIND the persisted remote location so chrome git/fs reads and CLI
 /// panes route into the spare. Returns the claimed sandbox name, or `None` when no
-/// spare is ready or the env can't hand one over (caller provisions fresh).
+/// spare is ready or the env can't hand one over (caller provisions fresh). A
+/// spare ledger that cannot be read is reported visibly (status line and toast
+/// in the TUI) and returns `None`, so the caller provisions fresh; it is never
+/// silently treated as an empty pool.
 pub fn claim_spare(
     cfg: &thegn_core::config::Config,
     worktree: &str,
@@ -508,8 +511,21 @@ pub fn claim_spare(
     // auto-created can be destroyed once the spare takes over below.
     let derived = crate::agent::provider_sandbox_name(cfg, worktree, env_name);
     let repo = repo_root.to_string_lossy().into_owned();
-    let db = thegn_core::db::Db::open().ok()?;
-    let (name, checkpoint) = db.begin_pool_spare_claim(&repo, env_name).ok()??;
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            crate::close_teardown::warn_visible(&spare_ledger_unreadable_warning(
+                env_name, worktree, &error,
+            ));
+            return None;
+        }
+    };
+    let (name, checkpoint) = claim_ledger_pick(
+        db.begin_pool_spare_claim(&repo, env_name),
+        env_name,
+        worktree,
+        crate::close_teardown::warn_visible,
+    )?;
     let _spare_lease = {
         let mut retries = 0;
         loop {
@@ -833,6 +849,31 @@ fn rollback_spare_failure(
     match destroy_spare(cfg, env_name, name) {
         Ok(()) => error,
         Err(rollback) => error.context(format!("rollback also failed: {rollback:#}")),
+    }
+}
+
+fn spare_ledger_unreadable_warning(
+    env_name: &str,
+    worktree: &str,
+    error: &anyhow::Error,
+) -> String {
+    format!(
+        "warm pool: the spare ledger for env '{env_name}' could not be read while opening {worktree} ({error:#}); provisioning a fresh sandbox instead of claiming a ready spare"
+    )
+}
+
+fn claim_ledger_pick(
+    read: anyhow::Result<Option<(String, Option<String>)>>,
+    env_name: &str,
+    worktree: &str,
+    warn: impl FnOnce(&str),
+) -> Option<(String, Option<String>)> {
+    match read {
+        Ok(picked) => picked,
+        Err(error) => {
+            warn(&spare_ledger_unreadable_warning(env_name, worktree, &error));
+            None
+        }
     }
 }
 
@@ -1221,6 +1262,57 @@ mod tests {
             claim_selection("/wt", Ok(Some("picked".into()))),
             Some(Some("picked".into()))
         );
+    }
+
+    #[test]
+    fn claim_ledger_pick_warns_and_falls_back_on_a_read_error() {
+        let mut warned: Vec<String> = Vec::new();
+        let picked = claim_ledger_pick(
+            Err(anyhow::anyhow!("database is locked")),
+            "sprites",
+            "/wt/a",
+            |text| warned.push(text.to_string()),
+        );
+
+        assert!(picked.is_none());
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("sprites"));
+        assert!(warned[0].contains("/wt/a"));
+        assert!(warned[0].contains("database is locked"));
+        assert!(warned[0].contains("provisioning a fresh sandbox"));
+    }
+
+    #[test]
+    fn claim_ledger_pick_passes_a_ready_spare_and_an_empty_pool_through_silently() {
+        let mut warned: Vec<String> = Vec::new();
+        let ready = claim_ledger_pick(
+            Ok(Some(("spare-1".into(), Some("cp".into())))),
+            "sprites",
+            "/wt/a",
+            |text| warned.push(text.to_string()),
+        );
+        assert_eq!(ready, Some(("spare-1".into(), Some("cp".into()))));
+        assert!(warned.is_empty());
+
+        let empty = claim_ledger_pick(Ok(None), "sprites", "/wt/a", |text| {
+            warned.push(text.to_string())
+        });
+        assert_eq!(empty, None);
+        assert!(warned.is_empty());
+    }
+
+    #[test]
+    fn spare_ledger_unreadable_warning_names_the_env_worktree_and_cause() {
+        use anyhow::Context as _;
+
+        let error = anyhow::anyhow!("no such table: pool_spares")
+            .context("warm pool: cannot read ready spares for /r / sprites");
+        let warning = spare_ledger_unreadable_warning("sprites", "/wt/a", &error);
+
+        assert!(warning.contains("sprites"));
+        assert!(warning.contains("/wt/a"));
+        assert!(warning.contains("warm pool: cannot read ready spares"));
+        assert!(warning.contains("no such table: pool_spares"));
     }
 
     #[test]
