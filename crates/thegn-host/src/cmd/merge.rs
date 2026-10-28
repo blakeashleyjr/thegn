@@ -13,7 +13,7 @@ use thegn_core::attention::MqStatus;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::outln;
-use thegn_core::store::{MergeRetryOutcome, WorktreeAuxStore};
+use thegn_core::store::{MergeQueueEvent, MergeRetryOutcome, WorktreeAuxStore};
 
 use thegn_core::merge_lifecycle::LifecycleEvent;
 
@@ -83,6 +83,17 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
+    /// Show the merge-queue audit trail for a worktree (operator retry/remove/clear), newest first.
+    History {
+        #[command(flatten)]
+        target: super::target::WorktreeFlag,
+        /// How many events to show (1-200; the queue keeps at most 200 per worktree).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit one JSON array instead of the human lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Classify conflicts and print a reconcile draft that must be completed.
     ///
     /// Splits hunks into concurrent additions (the base had nothing) and
@@ -125,7 +136,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     {
         if matches!(
             action,
-            Action::List { .. } | Action::Rm { .. } | Action::Clear | Action::Conflicts { .. }
+            Action::List { .. }
+                | Action::Rm { .. }
+                | Action::Clear
+                | Action::Conflicts { .. }
+                | Action::History { .. }
         ) {
             thegn_core::msg::warn(&format!("{}: {refusal}", root.display()));
             if !cfg.merge_queue.enabled {
@@ -162,6 +177,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Drain { all, json } => drain(cfg, all, json),
         Action::Land { target } => land(cfg, target.get()),
         Action::Retry { target } => retry(target.get()),
+        Action::History {
+            target,
+            limit,
+            json,
+        } => history(target.worktree, limit, json),
         Action::Conflicts {
             issue,
             summary,
@@ -361,6 +381,127 @@ fn retry_message(
             "{wt} is being worked by a drain; retry it after the drain finishes"
         )),
     }
+}
+
+#[derive(serde::Serialize)]
+struct HistoryEventJson<'a> {
+    worktree: &'a str,
+    operation: &'a str,
+    outcome: &'a str,
+    old_status: &'a str,
+    new_status: Option<&'a str>,
+    row_updated_at: i64,
+    candidate_oid: Option<&'a str>,
+    result_oid: Option<&'a str>,
+    actor: &'a str,
+    at_ms: i64,
+}
+
+fn history_json(events: &[MergeQueueEvent]) -> Vec<HistoryEventJson<'_>> {
+    events
+        .iter()
+        .map(|event| HistoryEventJson {
+            worktree: &event.worktree,
+            operation: &event.operation,
+            outcome: &event.outcome,
+            old_status: &event.old_status,
+            new_status: event.new_status.as_deref(),
+            row_updated_at: event.row_updated_at,
+            candidate_oid: event.candidate_oid.as_deref(),
+            result_oid: event.result_oid.as_deref(),
+            actor: &event.actor,
+            at_ms: event.at_ms,
+        })
+        .collect()
+}
+
+fn history_line(event: &MergeQueueEvent) -> String {
+    let when = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(event.at_ms)
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| event.at_ms.to_string());
+    let new_status = event
+        .new_status
+        .as_deref()
+        .map(crate::merge_sweep::safe_display)
+        .unwrap_or_else(|| "-".to_owned());
+    let mut oids = String::new();
+    if let Some(candidate) = &event.candidate_oid {
+        oids.push_str(&format!(
+            "  candidate {}",
+            crate::merge_sweep::safe_display(candidate)
+                .chars()
+                .take(12)
+                .collect::<String>()
+        ));
+    }
+    if let Some(result) = &event.result_oid {
+        oids.push_str(&format!(
+            "  result {}",
+            crate::merge_sweep::safe_display(result)
+                .chars()
+                .take(12)
+                .collect::<String>()
+        ));
+    }
+    format!(
+        "{}  {} {}  {} -> {}  by {}{}",
+        crate::merge_sweep::safe_display(&when),
+        crate::merge_sweep::safe_display(&event.operation),
+        crate::merge_sweep::safe_display(&event.outcome),
+        crate::merge_sweep::safe_display(&event.old_status),
+        new_status,
+        crate::merge_sweep::safe_display(&event.actor),
+        oids
+    )
+}
+
+fn history_limit(limit: usize) -> Result<usize> {
+    let max = thegn_core::store::MERGE_QUEUE_EVENTS_PER_WORKTREE;
+    if (1..=max).contains(&limit) {
+        Ok(limit)
+    } else {
+        anyhow::bail!("--limit must be between 1 and {max}")
+    }
+}
+
+fn history_empty_message(worktree: &str) -> String {
+    format!(
+        "No merge-queue history for {}.",
+        crate::merge_sweep::safe_display(worktree)
+    )
+}
+
+fn history(worktree: Option<String>, limit: usize, json: bool) -> Result<()> {
+    let limit = history_limit(limit)?;
+    let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
+    let wt_s = wt.to_string_lossy().to_string();
+    let db = match Db::open() {
+        Ok(db) => db,
+        Err(error) if json => {
+            super::emit_json(&queue_error_json(&error))?;
+            return Err(error.context("merge queue unreadable"));
+        }
+        Err(error) => return Err(queue_error_context(error)),
+    };
+    let events = match db.merge_queue_events(&wt_s, limit) {
+        Ok(events) => events,
+        Err(error) if json => {
+            super::emit_json(&queue_error_json(&error))?;
+            return Err(error.context("merge queue unreadable"));
+        }
+        Err(error) => return Err(queue_error_context(error)),
+    };
+    if json {
+        return super::emit_json(&history_json(&events));
+    }
+    if events.is_empty() {
+        outln!("{}", history_empty_message(&wt_s));
+        return Ok(());
+    }
+    for event in &events {
+        outln!("  {}", history_line(event));
+    }
+    Ok(())
 }
 
 /// The repo root (main checkout) reachable from the cwd.
@@ -1840,5 +1981,94 @@ mod claim_conflict_tests {
     #[test]
     fn rm_names_the_drain() {
         assert!(rm_claimed_message("/r/a").contains("being worked by a drain"));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn event(actor: &str) -> MergeQueueEvent {
+        MergeQueueEvent {
+            worktree: "/repo/wt".to_owned(),
+            operation: "retry".to_owned(),
+            outcome: "rearmed".to_owned(),
+            old_status: "gate_failed".to_owned(),
+            new_status: Some("queued".to_owned()),
+            row_updated_at: 5,
+            candidate_oid: Some("a".repeat(40)),
+            result_oid: None,
+            actor: actor.to_owned(),
+            at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn history_line_names_operation_statuses_actor_and_short_oids() {
+        let line = history_line(&event("thegn pid 42"));
+        assert!(line.contains("2023-11-14 22:13:20 UTC"));
+        assert!(line.contains("retry rearmed"));
+        assert!(line.contains("gate_failed -> queued"));
+        assert!(line.contains("by thegn pid 42"));
+        assert!(line.contains("candidate aaaaaaaaaaaa"));
+        assert!(!line.contains(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn history_line_neutralises_control_characters() {
+        let line = history_line(&event("evil\u{1b}]52;c;x\u{7}"));
+        assert!(!line.contains('\u{1b}'));
+        assert!(!line.contains('\u{7}'));
+    }
+
+    #[test]
+    fn history_json_keeps_every_event_field() {
+        let value = serde_json::to_value(history_json(&[event("a")])).unwrap();
+        assert_eq!(value[0]["worktree"], "/repo/wt");
+        assert_eq!(value[0]["operation"], "retry");
+        assert_eq!(value[0]["outcome"], "rearmed");
+        assert_eq!(value[0]["old_status"], "gate_failed");
+        assert_eq!(value[0]["new_status"], "queued");
+        assert_eq!(value[0]["row_updated_at"], 5);
+        assert_eq!(value[0]["candidate_oid"], "a".repeat(40));
+        assert!(value[0]["result_oid"].is_null());
+        assert_eq!(value[0]["actor"], "a");
+        assert_eq!(value[0]["at_ms"], 1_700_000_000_000_i64);
+    }
+
+    #[test]
+    fn history_json_is_empty_when_there_are_no_events() {
+        let value = serde_json::to_value(history_json(&[])).unwrap();
+        assert_eq!(value, serde_json::json!([]));
+    }
+
+    #[test]
+    fn history_empty_message_sanitises_the_worktree_path() {
+        let message = history_empty_message("/repo/wt\u{1b}]52;c;x\u{7}");
+        assert_eq!(message, "No merge-queue history for /repo/wt�]52;c;x�.");
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{7}'));
+    }
+
+    #[test]
+    fn history_limit_outside_one_to_cap_is_refused() {
+        let low_error = history_limit(0).unwrap_err().to_string();
+        let high_error = history_limit(201).unwrap_err().to_string();
+        assert!(low_error.contains("200"));
+        assert!(high_error.contains("200"));
+        assert_eq!(history_limit(1).unwrap(), 1);
+        assert_eq!(history_limit(200).unwrap(), 200);
+    }
+
+    #[test]
+    fn history_reads_a_recorded_remove_event() {
+        let db = Db::open_memory().unwrap();
+        db.enqueue_merge("/repo/wt", "feature", "main").unwrap();
+        db.remove_merge_entry("/repo/wt").unwrap();
+        let events = db.merge_queue_events("/repo/wt", 20).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "remove");
+        assert_eq!(events[0].outcome, "deleted");
+        assert!(history_line(&events[0]).contains("remove deleted"));
     }
 }
