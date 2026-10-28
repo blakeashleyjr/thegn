@@ -1859,23 +1859,27 @@ struct LocalIgnore {
     global: ignore::gitignore::Gitignore,
 }
 
+fn handle_ignore_error(path: &Path, error: ignore::Error) -> Result<()> {
+    if error.is_io() {
+        return Err(anyhow::Error::msg(error.to_string()))
+            .with_context(|| format!("read {}", path.display()));
+    }
+    tracing::warn!(
+        target: "thegn::provider",
+        path = %path.display(),
+        error = %error,
+        "ignore file contains invalid rules; applying parsed rules"
+    );
+    Ok(())
+}
+
 impl LocalIgnore {
     fn new(root: &Path) -> Result<Self> {
         let (global, error) = ignore::gitignore::GitignoreBuilder::new(root).build_global();
         if let Some(error) = error {
             let path =
                 ignore::gitignore::gitconfig_excludes_path().unwrap_or_else(|| root.to_path_buf());
-            if error.is_partial() {
-                tracing::warn!(
-                    target: "thegn::provider",
-                    path = %path.display(),
-                    error = %error,
-                    "global git excludes file contains invalid rules; applying parsed rules"
-                );
-            } else {
-                return Err(anyhow::Error::msg(error.to_string()))
-                    .with_context(|| format!("read {}", path.display()));
-            }
+            handle_ignore_error(&path, error)?;
         }
         Self::with_global(root, global)
     }
@@ -1887,17 +1891,7 @@ impl LocalIgnore {
         let exclude = if std::fs::metadata(&exclude_path).is_ok_and(|metadata| metadata.is_file()) {
             let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
             if let Some(error) = builder.add(&exclude_path) {
-                if error.is_partial() {
-                    tracing::warn!(
-                        target: "thegn::provider",
-                        path = %exclude_path.display(),
-                        error = %error,
-                        "git info/exclude contains invalid rules; applying parsed rules"
-                    );
-                } else {
-                    return Err(anyhow::Error::msg(error.to_string()))
-                        .with_context(|| format!("read {}", exclude_path.display()));
-                }
+                handle_ignore_error(&exclude_path, error)?;
             }
             Some(
                 builder
@@ -1927,17 +1921,7 @@ impl LocalIgnore {
                 if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
                     let (matcher, error) = ignore::gitignore::Gitignore::new(&path);
                     if let Some(error) = error {
-                        if error.is_partial() {
-                            tracing::warn!(
-                                target: "thegn::provider",
-                                path = %path.display(),
-                                error = %error,
-                                "ignore file contains invalid rules; applying parsed rules"
-                            );
-                        } else {
-                            return Err(anyhow::Error::msg(error.to_string()))
-                                .with_context(|| format!("read {}", path.display()));
-                        }
+                        handle_ignore_error(&path, error)?;
                     }
                     matchers.push(matcher);
                 }
@@ -6147,6 +6131,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read(temp.path().join("out/x")).unwrap(), b"mine");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_applies_info_exclude_rules_after_one_invalid_line() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git/info")).unwrap();
+        std::fs::write(temp.path().join(".git/info/exclude"), "a/**b[\nout/\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/x"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"theirs");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(temp.path().join("out/x")).unwrap(),
+            b"mine",
+            "a single invalid exclude line must not discard the valid out/ rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_applies_gitignore_rules_after_one_invalid_line() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "a/**b[\nout/\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/x"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"theirs");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(temp.path().join("out/x")).unwrap(),
+            b"mine",
+            "a single invalid ignore line must not discard the valid out/ rule"
+        );
     }
 
     #[tokio::test]
