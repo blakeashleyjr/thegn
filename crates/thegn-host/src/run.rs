@@ -15414,6 +15414,12 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                 }
+                crate::forward::ForwardEvent::Refused { worktree, reason } => {
+                    if last_forward_target.as_deref() == Some(worktree.as_str()) {
+                        model.status = format!("Port forwarding paused: {reason}");
+                        dirty = true;
+                    }
+                }
                 crate::forward::ForwardEvent::Vanished {
                     worktree,
                     container_port,
