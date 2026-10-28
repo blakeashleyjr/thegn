@@ -27,6 +27,6 @@ pub use env::{PLUGIN_STATE_DIR_ENV, ensure_plugin_state_dir, resolve_env, resolv
 pub use loader::{
     LoadedPlugin, SpecProblem, check_spec, check_specs, discover, host_contract, negotiate,
 };
-pub use proc::{PluginError, PluginRun, spawn_ndjson};
+pub use proc::{PluginError, PluginRun, spawn_ndjson, spawn_ndjson_cancellable};
 pub use provider::{BridgeError, PluginIssueBackend, ProviderBridge};
 pub use session::{ResidentSession, ResidentSupervisor, SessionEvent, SessionWriter};
