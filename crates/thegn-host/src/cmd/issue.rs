@@ -157,8 +157,7 @@ fn list_tracker_issues(
     json: bool,
 ) -> Result<()> {
     let router = tracker_router(cfg, dir);
-    let (plugins, _problems) = thegn_svc::plugin::discover(cfg, plugin_dir);
-    let skipped = plugin_issue_providers(&plugins);
+    let skipped = skipped_plugin_issue_providers(cfg, plugin_dir);
     if !router.is_configured() {
         msg::die(&no_tracker_message(&skipped));
     }
@@ -243,6 +242,28 @@ fn plugin_issue_providers(plugins: &[thegn_svc::plugin::LoadedPlugin]) -> Vec<St
         .collect()
 }
 
+/// Enabled plugin issue providers (`"<id> (<label>)"`) a standalone CLI router cannot use: they are served only by
+/// the running UI. `config_dir` is the directory of the config file in effect (`--config` or the default).
+pub(crate) fn skipped_plugin_issue_providers(
+    cfg: &thegn_core::config::Config,
+    config_dir: &std::path::Path,
+) -> Vec<String> {
+    let (plugins, _problems) = thegn_svc::plugin::discover(cfg, config_dir);
+    plugin_issue_providers(&plugins)
+}
+
+/// Suffix for a failed issue fetch: names the plugin issue providers the CLI skipped, or "" when there are none.
+pub(crate) fn plugin_fetch_hint(skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; plugin issue provider(s) {} are only available in the running thegn UI",
+            skipped.join(", ")
+        )
+    }
+}
+
 fn skipped_plugin_note(skipped: &[String]) -> Option<String> {
     if skipped.is_empty() {
         None
@@ -254,7 +275,7 @@ fn skipped_plugin_note(skipped: &[String]) -> Option<String> {
     }
 }
 
-fn no_tracker_message(skipped: &[String]) -> String {
+pub(crate) fn no_tracker_message(skipped: &[String]) -> String {
     let message = "no issue tracker configured (set [issues] providers/accounts)";
     if skipped.is_empty() {
         message.to_owned()
@@ -555,5 +576,22 @@ mod repo_scope_tests {
         assert!(message.contains(old));
         assert!(message.contains("demo (Demo)"));
         assert!(message.contains("other (Other)"));
+    }
+
+    #[test]
+    fn plugin_fetch_hint_names_every_skipped_provider() {
+        let hint = plugin_fetch_hint(&["demo (Demo)".into(), "multi (First)".into()]);
+
+        assert!(hint.contains("demo (Demo)"), "{hint}");
+        assert!(hint.contains("multi (First)"), "{hint}");
+        assert!(
+            hint.contains("only available in the running thegn UI"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn plugin_fetch_hint_is_empty_without_plugin_providers() {
+        assert_eq!(plugin_fetch_hint(&[]), "");
     }
 }
