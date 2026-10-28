@@ -1673,7 +1673,7 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
     let mut total_bytes = 0u64;
     let mut publishes: Vec<(String, Vec<u8>)> = Vec::new();
     let mut conflicts = Vec::new();
-    let mut ignore = LocalIgnore::new(local);
+    let mut ignore = LocalIgnore::new(local)?;
 
     while let Some((rel, parent, name)) = stack.pop() {
         let dir = match (parent, name) {
@@ -1850,18 +1850,70 @@ pub(crate) async fn download_reconciled<F: ProviderFiles + ?Sized>(
 /// Local ignore rules for close-time reconciliation, mirroring the upload walk:
 /// each directory's `.ignore` and `.gitignore` apply below it, deeper
 /// directories win, and `.ignore` wins over `.gitignore` within one directory.
-/// Global excludes and `.git/info/exclude` are not consulted.
+/// Per-directory rules take precedence over `.git/info/exclude`, which takes
+/// precedence over the global excludes file.
 struct LocalIgnore {
     root: std::path::PathBuf,
     dirs: HashMap<String, Vec<ignore::gitignore::Gitignore>>,
+    exclude: Option<ignore::gitignore::Gitignore>,
+    global: ignore::gitignore::Gitignore,
 }
 
 impl LocalIgnore {
-    fn new(root: &Path) -> Self {
-        Self {
+    fn new(root: &Path) -> Result<Self> {
+        let (global, error) = ignore::gitignore::GitignoreBuilder::new(root).build_global();
+        if let Some(error) = error {
+            let path =
+                ignore::gitignore::gitconfig_excludes_path().unwrap_or_else(|| root.to_path_buf());
+            if error.is_partial() {
+                tracing::warn!(
+                    target: "thegn::provider",
+                    path = %path.display(),
+                    error = %error,
+                    "global git excludes file contains invalid rules; applying parsed rules"
+                );
+            } else {
+                return Err(anyhow::Error::msg(error.to_string()))
+                    .with_context(|| format!("read {}", path.display()));
+            }
+        }
+        Self::with_global(root, global)
+    }
+
+    fn with_global(root: &Path, global: ignore::gitignore::Gitignore) -> Result<Self> {
+        let exclude_path = thegn_core::util::git_common_dir(root)
+            .join("info")
+            .join("exclude");
+        let exclude = if std::fs::metadata(&exclude_path).is_ok_and(|metadata| metadata.is_file()) {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+            if let Some(error) = builder.add(&exclude_path) {
+                if error.is_partial() {
+                    tracing::warn!(
+                        target: "thegn::provider",
+                        path = %exclude_path.display(),
+                        error = %error,
+                        "git info/exclude contains invalid rules; applying parsed rules"
+                    );
+                } else {
+                    return Err(anyhow::Error::msg(error.to_string()))
+                        .with_context(|| format!("read {}", exclude_path.display()));
+                }
+            }
+            Some(
+                builder
+                    .build()
+                    .map_err(|error| anyhow::Error::msg(error.to_string()))
+                    .with_context(|| format!("read {}", exclude_path.display()))?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
             root: root.to_path_buf(),
             dirs: HashMap::new(),
-        }
+            exclude,
+            global,
+        })
     }
 
     /// Matchers for one directory (`""` means the worktree root), loaded on
@@ -1875,8 +1927,17 @@ impl LocalIgnore {
                 if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
                     let (matcher, error) = ignore::gitignore::Gitignore::new(&path);
                     if let Some(error) = error {
-                        return Err(anyhow::Error::msg(error.to_string()))
-                            .with_context(|| format!("read {}", path.display()));
+                        if error.is_partial() {
+                            tracing::warn!(
+                                target: "thegn::provider",
+                                path = %path.display(),
+                                error = %error,
+                                "ignore file contains invalid rules; applying parsed rules"
+                            );
+                        } else {
+                            return Err(anyhow::Error::msg(error.to_string()))
+                                .with_context(|| format!("read {}", path.display()));
+                        }
                     }
                     matchers.push(matcher);
                 }
@@ -1903,6 +1964,15 @@ impl LocalIgnore {
                 if matched.is_whitelist() {
                     return Ok(false);
                 }
+            }
+        }
+        for matcher in self.exclude.iter().chain(std::iter::once(&self.global)) {
+            let matched = matcher.matched_path_or_any_parents(&candidate, is_dir);
+            if matched.is_ignore() {
+                return Ok(true);
+            }
+            if matched.is_whitelist() {
+                return Ok(false);
             }
         }
         Ok(false)
@@ -5867,6 +5937,7 @@ mod tests {
     async fn sync_reconcile_upload_records_a_baseline_for_every_uploaded_file() {
         use sha2::{Digest, Sha256};
 
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("d")).unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
@@ -5891,6 +5962,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_keeps_a_local_edit_when_the_sandbox_copy_is_unchanged() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
         let files = TreeFiles::new();
@@ -5904,6 +5976,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_fast_forwards_an_untouched_local_file() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
         let files = TreeFiles::new();
@@ -5917,6 +5990,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_publishes_a_new_sandbox_file() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         let files = TreeFiles::new();
         let baseline = upload_tree(&files, "id", temp.path(), "/w").await.unwrap();
@@ -5929,6 +6003,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_refuses_a_both_sides_edit_before_writing_anything() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("d")).unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
@@ -5952,6 +6027,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_keeps_ignored_local_build_output() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
         std::fs::create_dir(temp.path().join("out")).unwrap();
@@ -5972,6 +6048,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_skips_an_ignored_sandbox_directory() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
         let files = TreeFiles::new();
@@ -5988,6 +6065,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_honours_a_nested_gitignore() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("sub")).unwrap();
         std::fs::create_dir(temp.path().join("sub/build")).unwrap();
@@ -6013,6 +6091,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_honours_a_dot_ignore_file() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".ignore"), "out/\n").unwrap();
         std::fs::create_dir(temp.path().join("out")).unwrap();
@@ -6030,6 +6109,7 @@ mod tests {
     // Positive control: this negated path is not ignored and still conflicts.
     #[tokio::test]
     async fn sync_reconcile_still_conflicts_on_a_negated_path() {
+        let _state = crate::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".gitignore"), "out/*\n!out/keep\n").unwrap();
         std::fs::create_dir(temp.path().join("out")).unwrap();
@@ -6049,5 +6129,80 @@ mod tests {
             std::fs::read(temp.path().join("out/keep")).unwrap(),
             b"mine"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_skips_output_excluded_by_info_exclude() {
+        let _state = crate::testenv::IsolatedState::new();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git/info")).unwrap();
+        std::fs::write(temp.path().join(".git/info/exclude"), "out/\n").unwrap();
+        std::fs::create_dir(temp.path().join("out")).unwrap();
+        std::fs::write(temp.path().join("out/x"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"theirs");
+
+        download_reconciled(&files, "id", "/w", temp.path(), &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(temp.path().join("out/x")).unwrap(), b"mine");
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_skips_output_excluded_in_a_linked_worktree() {
+        let _state = crate::testenv::IsolatedState::new();
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let worktree = temp.path().join("wt");
+        let gitdir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(main.join(".git/info")).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(main.join(".git/info/exclude"), "out/\n").unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::create_dir(worktree.join("out")).unwrap();
+        std::fs::write(worktree.join("out/x"), b"mine").unwrap();
+        let files = TreeFiles::new();
+        files.set("/w/out/x", b"theirs");
+
+        download_reconciled(&files, "id", "/w", &worktree, &SyncBaseline::new())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(worktree.join("out/x")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn local_ignore_honours_a_global_excludes_matcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let excludes = tempfile::tempdir().unwrap();
+        let excludes_file = excludes.path().join("ignore");
+        std::fs::write(&excludes_file, "target/\n").unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(temp.path());
+        assert!(builder.add(&excludes_file).is_none());
+        let matcher = builder.build().unwrap();
+        let mut ignore = LocalIgnore::with_global(temp.path(), matcher).unwrap();
+
+        assert!(ignore.is_ignored("target/debug/x", false).unwrap());
+        assert!(!ignore.is_ignored("src/x", false).unwrap());
+    }
+
+    #[test]
+    fn local_ignore_gitignore_negation_beats_info_exclude() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git/info")).unwrap();
+        std::fs::write(temp.path().join(".git/info/exclude"), "out/*\n").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "!out/keep\n").unwrap();
+        let mut ignore =
+            LocalIgnore::with_global(temp.path(), ignore::gitignore::Gitignore::empty()).unwrap();
+
+        assert!(!ignore.is_ignored("out/keep", false).unwrap());
+        assert!(ignore.is_ignored("out/other", false).unwrap());
     }
 }
