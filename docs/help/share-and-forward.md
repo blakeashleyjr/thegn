@@ -82,9 +82,10 @@ refused unless `[forward] allow_external_bind = true`. The **system → forward*
 active forwards: `↵` copies the preview URL, `o` opens it, `n` starts
 watching a port, and `x` removes a forward.
 
-Forwards go through the one container runtime (podman, docker, or rootful podman) that holds the
-worktree's container; if more than one runtime has a container of that name, forwarding is paused
-for that worktree and the status line says why.
+Forwards go through the one container runtime (podman, docker, or rootful
+podman) that holds the worktree's container. If more than one runtime has a
+container of that name, forwarding is paused for that worktree and the status
+line says why.
 
 Reverse tunnels have a per-run connection cap (`forward.reverse_max_connections`,
 default 256) and a process-wide host cap
