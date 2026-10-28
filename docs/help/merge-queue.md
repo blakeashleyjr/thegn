@@ -105,6 +105,10 @@ verifies the new commits. Otherwise they refuse with the reason; use
   renamed. While a drain holds the row the refusal names the drain; otherwise
   run `thegn merge rm` first. If the queue cannot be read, the rename is refused
   too.
+- `thegn merge history` (`--worktree`, `--limit 1-200`, `--json`) lists the
+  recorded retry, remove and clear outcomes for a worktree, newest first: who
+  acted, the status before and after, and the candidate and result commits. Up
+  to 200 are kept per worktree; a removed worktree's history is dropped with it.
 
 ## Land strategy, signing, drivers
 
