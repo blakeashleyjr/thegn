@@ -11,8 +11,9 @@
 //! slirp4netns/pasta — the host cannot dial its IP directly; only ports published
 //! with `-p` at create time are reachable. To forward a port that appears *after*
 //! the container starts (a dev server the user launches), we instead enter the
-//! container's netns with `podman exec` and bridge stdio to its loopback. This
-//! one mechanism works for rootless + rootful podman and docker alike.
+//! container's netns through the one runtime that holds it and bridge stdio to
+//! its loopback. This one mechanism works for rootless + rootful podman and
+//! docker alike.
 //!
 //! Pure argv builders are unit-tested here; the subprocess execution is the I/O
 //! seam exercised by `test/smoke.sh`.
@@ -26,9 +27,8 @@ use crate::vpn::{OciRuntime, exec_in};
 #[cfg(test)]
 mod tests;
 
-/// OCI runtimes to try when reaching a worktree's sandbox container. We don't
-/// record which one created it, so try the likely ones; a wrong runtime fails
-/// to find the container and is skipped.
+/// OCI runtimes to probe when reaching a worktree's sandbox container. Every
+/// likely runtime is asked because same-named containers make a guess unsafe.
 fn likely_runtimes() -> Vec<OciRuntime> {
     vec![
         OciRuntime::podman(),
@@ -49,28 +49,132 @@ pub fn ss_probe_cmd() -> Vec<String> {
     ]
 }
 
-/// Probe the listening TCP ports inside `container`, trying each likely runtime.
-/// Returns `(runtime_prefix, ports)` for the first runtime that reaches the
-/// container — the prefix so the caller can build the `exec`-bridge argv (see
-/// [`exec_bridge_argv`]) without a second blocking probe. `Err` when no runtime
-/// can reach it (so the caller keeps its last-known set rather than tearing
-/// forwards down on a transient failure / stopped sandbox).
-pub fn probe_container_ports(container: &str) -> Result<(Vec<String>, BTreeSet<u16>)> {
-    let cmd = ss_probe_cmd();
-    let mut last_err = None;
-    for rt in likely_runtimes() {
-        match exec_in(&rt, container, &cmd) {
-            Ok((true, out)) => return Ok((rt.prefix, parse_ss_listening(&out))),
-            Ok((false, _)) => {
-                last_err = Some(anyhow!(
-                    "'{}' could not reach {container}",
-                    rt.prefix.join(" ")
-                ));
-            }
-            Err(e) => last_err = Some(e),
+/// One runtime's answer to the listening-port probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reach {
+    Reached(BTreeSet<u16>),
+    Absent,
+    Unknown(String),
+}
+
+/// `exec_in`'s result as a [`Reach`]: success means reached; a non-zero exit or
+/// a missing runtime binary means absent; other errors remain unknown.
+fn classify_probe(result: Result<(bool, String)>) -> Reach {
+    match result {
+        Ok((true, output)) => Reach::Reached(parse_ss_listening(&output)),
+        Ok((false, _)) => Reach::Absent,
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+            }) =>
+        {
+            Reach::Absent
         }
+        Err(error) => Reach::Unknown(format!("{error:#}")),
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("no OCI runtime could reach {container}")))
+}
+
+/// Two or more runtimes hold the container name, so forwarding into either
+/// could reach the wrong container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousRuntime {
+    pub container: String,
+    pub runtimes: Vec<String>,
+}
+
+impl std::fmt::Display for AmbiguousRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} exists in more than one container runtime ({}); port forwarding is paused for this worktree until only one holds it",
+            self.container,
+            self.runtimes.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousRuntime {}
+
+/// Pure runtime selection: only one reachable runtime with no unknown probes
+/// is safe to use.
+fn pick_runtime(
+    container: &str,
+    outcomes: Vec<(OciRuntime, Reach)>,
+) -> Result<(Vec<String>, BTreeSet<u16>)> {
+    let reached: Vec<_> = outcomes
+        .iter()
+        .filter_map(|(runtime, result)| match result {
+            Reach::Reached(ports) => Some((runtime, ports)),
+            Reach::Absent | Reach::Unknown(_) => None,
+        })
+        .collect();
+    let unknown: Vec<_> = outcomes
+        .iter()
+        .filter_map(|(runtime, result)| match result {
+            Reach::Unknown(reason) => Some((runtime, reason)),
+            Reach::Reached(_) | Reach::Absent => None,
+        })
+        .collect();
+
+    if reached.len() > 1 {
+        return Err(anyhow::Error::new(AmbiguousRuntime {
+            container: container.to_string(),
+            runtimes: reached
+                .iter()
+                .map(|(runtime, _)| runtime.prefix.join(" "))
+                .collect(),
+        }));
+    }
+    if let Some((unknown_runtime, reason)) = unknown.first()
+        && !reached.is_empty()
+    {
+        return Err(anyhow!(
+            "cannot rule out a same-named container in '{}': {reason}",
+            unknown_runtime.prefix.join(" ")
+        ));
+    }
+    if let Some((runtime, ports)) = reached.first() {
+        return Ok((runtime.prefix.clone(), (*ports).clone()));
+    }
+
+    let mut message = format!("no OCI runtime could reach {container}");
+    for (runtime, reason) in unknown {
+        message.push_str(&format!(
+            "; '{}' probe failed: {reason}",
+            runtime.prefix.join(" ")
+        ));
+    }
+    Err(anyhow!(message))
+}
+
+/// Probe every likely runtime once and pick the one that holds `container`.
+pub fn resolve_container_runtime(container: &str) -> Result<(Vec<String>, BTreeSet<u16>)> {
+    let command = ss_probe_cmd();
+    let outcomes = likely_runtimes()
+        .into_iter()
+        .map(|runtime| {
+            let reach = classify_probe(exec_in(&runtime, container, &command));
+            (runtime, reach)
+        })
+        .collect();
+    pick_runtime(container, outcomes)
+}
+
+/// Probe ports through the already-resolved runtime prefix only.
+pub fn probe_ports_in(prefix: &[String], container: &str) -> Result<BTreeSet<u16>> {
+    let runtime = OciRuntime {
+        prefix: prefix.to_vec(),
+    };
+    match exec_in(&runtime, container, &ss_probe_cmd()) {
+        Ok((true, output)) => Ok(parse_ss_listening(&output)),
+        Ok((false, _)) => Err(anyhow!(
+            "'{}' could not reach {container}",
+            prefix.join(" ")
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 /// The full argv for one bridged connection: enter `container`'s netns and pipe
