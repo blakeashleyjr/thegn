@@ -15,7 +15,7 @@ fn pick_ready_spare(
     tx: &rusqlite::Transaction<'_>,
     repo: &str,
     env: &str,
-) -> Option<(String, Option<String>)> {
+) -> Result<Option<(String, Option<String>)>> {
     let res = tx.query_row(
         "SELECT sandbox_name, checkpoint_id FROM pool_spares
          WHERE repo_path=?1 AND env_name=?2 AND state='ready'
@@ -24,12 +24,11 @@ fn pick_ready_spare(
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
     );
     match res {
-        Ok(row) => Some(row),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(error) => {
-            tracing::warn!(target: "thegn::db", error = %error, "pick_spare read failed; treating as a miss");
-            None
-        }
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(anyhow::Error::from(error).context(format!(
+            "warm pool: cannot read ready spares for {repo} / {env}"
+        ))),
     }
 }
 
@@ -144,7 +143,7 @@ impl PoolStore for Db {
         worktree: &str,
     ) -> Result<Option<(String, Option<String>)>> {
         let tx = self.conn().unchecked_transaction()?;
-        let picked = pick_ready_spare(&tx, repo, env);
+        let picked = pick_ready_spare(&tx, repo, env)?;
         if let Some((ref name, _)) = picked {
             let begun = tx.execute(
                 "UPDATE pool_spares SET state='claiming', updated_at=?2
@@ -181,7 +180,7 @@ impl PoolStore for Db {
         env: &str,
     ) -> Result<Option<(String, Option<String>)>> {
         let tx = self.conn().unchecked_transaction()?;
-        let picked = pick_ready_spare(&tx, repo, env);
+        let picked = pick_ready_spare(&tx, repo, env)?;
         if let Some((name, _)) = &picked {
             let changed = tx.execute(
                 "UPDATE pool_spares SET state='claiming', updated_at=?2
@@ -525,20 +524,19 @@ mod tests {
     }
 
     #[test]
-    fn ready_spare_pick_query_errors_are_misses() {
+    fn ready_spare_pick_query_errors_are_errors() {
         let db = Db::open_memory().unwrap();
         db.conn().execute("DROP TABLE pool_spares", []).unwrap();
 
-        assert!(
-            db.begin_pool_spare_claim("/repo", "sprites")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            db.claim_pool_spare("/repo", "sprites", "/wt/x")
-                .unwrap()
-                .is_none()
-        );
+        let begin_error = db
+            .begin_pool_spare_claim("/repo", "sprites")
+            .expect_err("a failed ready-spare read must remain an error");
+        assert!(format!("{begin_error:#}").contains("warm pool: cannot read ready spares"));
+
+        let claim_error = db
+            .claim_pool_spare("/repo", "sprites", "/wt/x")
+            .expect_err("a failed ready-spare read must remain an error");
+        assert!(format!("{claim_error:#}").contains("warm pool: cannot read ready spares"));
     }
 
     #[test]

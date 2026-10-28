@@ -245,9 +245,9 @@ fn cool_lane(db: &Db, template: &ManagedTemplate, reason: &str, cfg: &Config) {
     });
 }
 
-/// One host as scale-down sees it, from its two state reads. A failed read
-/// keeps the host this tick: it still counts toward `min_hosts` but is never
-/// idle past the threshold.
+/// One host as scale-down sees it, from its two state reads. A failed read or
+/// unknown age keeps the host this tick: it still counts toward `min_hosts`
+/// but is never idle past the threshold.
 fn scale_down_input(
     row: &HostCapacityRow,
     tenants: anyhow::Result<u32>,
@@ -268,13 +268,19 @@ fn scale_down_input(
             Some(format!("its last use could not be read ({error:#})")),
         ),
     };
-    let reason = match (tenant_error, last_use_error) {
-        (Some(tenant_error), Some(last_use_error)) => {
-            Some(format!("{tenant_error}; {last_use_error}"))
-        }
-        (Some(error), None) | (None, Some(error)) => Some(error),
-        (None, None) => None,
-    };
+    let mut reasons = Vec::with_capacity(3);
+    if let Some(error) = tenant_error {
+        reasons.push(error);
+    }
+    if let Some(error) = last_use_error {
+        reasons.push(error);
+    }
+    if reasons.is_empty() && last_used.is_none() && row.created_at.is_none() {
+        reasons.push(
+            "it has no recorded creation time or last use, so its idle time is unknown".into(),
+        );
+    }
+    let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
     let idle_secs = if reason.is_some() {
         0
     } else {
@@ -856,6 +862,35 @@ mod tests {
             "{reason}"
         );
         assert!(thegn_core::scheduler::decide_scaledown(&[input], 60, 0).is_empty());
+    }
+
+    #[test]
+    fn scale_down_input_keeps_a_host_with_no_creation_time_or_last_use() {
+        let row = HostCapacityRow {
+            created_at: None,
+            ..managed_row("tg-auto-unknown-age", 0)
+        };
+        let (input, reason) = scale_down_input(&row, Ok(0), Ok(None), 9_000);
+
+        assert_eq!(input.idle_secs, 0);
+        let reason = reason.expect("unknown age should have a reason");
+        assert!(
+            reason.contains("no recorded creation time or last use"),
+            "{reason}"
+        );
+        assert!(thegn_core::scheduler::decide_scaledown(&[input], 60, 0).is_empty());
+    }
+
+    #[test]
+    fn scale_down_input_measures_a_host_without_a_creation_time_from_its_last_use() {
+        let row = HostCapacityRow {
+            created_at: None,
+            ..managed_row("tg-auto-no-create-record", 0)
+        };
+        let (input, reason) = scale_down_input(&row, Ok(0), Ok(Some(5_000)), 9_000);
+
+        assert_eq!(input.idle_secs, 4_000);
+        assert!(reason.is_none());
     }
 
     #[test]

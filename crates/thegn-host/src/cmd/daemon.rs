@@ -18,6 +18,7 @@ struct Classified {
     ours: Vec<PathBuf>,
     unknown: Vec<PathBuf>,
     foreign: Vec<(PathBuf, String)>,
+    unverified: Vec<(PathBuf, String)>,
 }
 
 #[derive(Subcommand, Clone)]
@@ -109,6 +110,9 @@ where
             Ok(crate::daemon::client::StopProbe::Foreign(scope)) => {
                 classified.foreign.push((target, scope));
             }
+            Ok(crate::daemon::client::StopProbe::Unverified(reason)) => {
+                classified.unverified.push((target, reason));
+            }
             Err(_) => {
                 classified.unknown.push(target);
                 classified.unknown.extend(targets);
@@ -134,7 +138,7 @@ fn stop_verdict(ours_total: usize, failures: &[String], unknown: &[String]) -> R
     }
     if !unknown.is_empty() {
         details.push(format!(
-            "{} not checked before the deadline ({})",
+            "{} not confirmed ({})",
             unknown.len(),
             unknown.join(", ")
         ));
@@ -217,6 +221,12 @@ fn stop(cfg: &Config) -> Result<()> {
         })
         .await;
         let ours = classified.ours;
+        for (path, reason) in classified.unverified {
+            let client = ControlClient::new(ControlAddr::Unix(path.clone()));
+            let label = crate::daemon::client::socket_label(&client);
+            outln!("unverified {}: {}", label, reason);
+            unknown.push(label);
+        }
         for (path, scope) in classified.foreign {
             let client = ControlClient::new(ControlAddr::Unix(path));
             outln!(
@@ -262,10 +272,8 @@ fn stop(cfg: &Config) -> Result<()> {
             waiting,
             stop_deadline.saturating_duration_since(tokio::time::Instant::now()),
             |path| async move {
-                ControlClient::new(ControlAddr::Unix(path))
-                    .health()
-                    .await
-                    .is_ok()
+                let health = ControlClient::new(ControlAddr::Unix(path)).health().await;
+                still_live(&health)
             },
         )
         .await;
@@ -292,6 +300,13 @@ fn stop(cfg: &Config) -> Result<()> {
     })
 }
 
+fn still_live(health: &anyhow::Result<()>) -> bool {
+    match health {
+        Ok(()) => true,
+        Err(error) => !crate::daemon::client::proves_no_listener(error),
+    }
+}
+
 async fn probe_before_deadline<F: Future>(
     deadline: tokio::time::Instant,
     future: F,
@@ -302,13 +317,71 @@ async fn probe_before_deadline<F: Future>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Classified, classify_targets, probe_before_deadline, stop_targets, stop_verdict,
-        wait_until_stopped,
+        Classified, classify_targets, probe_before_deadline, still_live, stop_targets,
+        stop_verdict, wait_until_stopped,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use thegn_core::config::{Config, DaemonConfig};
+
+    #[test]
+    fn stop_reports_an_unverified_listener_as_unknown_and_fails() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+        let _state = crate::testenv::IsolatedState::new();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
+        let listener = rt.block_on(async {
+            match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
+                .await
+                .unwrap()
+            {
+                thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
+                thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+            }
+        });
+        let accept_task = rt.spawn(async move {
+            let mut listener = listener;
+            while let Ok(stream) = listener.accept_stream().await {
+                drop(stream);
+            }
+        });
+        let config = Config {
+            daemon: DaemonConfig {
+                socket: socket.display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // stop() builds its own runtime, so run it on a plain thread outside this one.
+        let result = std::thread::spawn(move || super::stop(&config))
+            .join()
+            .unwrap();
+
+        rt.block_on(async {
+            accept_task.abort();
+            assert!(accept_task.await.is_err());
+        });
+        let error = result.expect_err("an unverified listener must fail daemon stop");
+        assert!(
+            error.to_string().contains(&socket.display().to_string()),
+            "the failure must name the unverified socket: {error}"
+        );
+        assert!(
+            error.to_string().contains("not confirmed"),
+            "unverified listeners must be included in the unknown stop verdict: {error}"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn classify_targets_reports_a_probe_that_outlasts_the_deadline_as_unknown() {
@@ -335,6 +408,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn classify_targets_keeps_an_unverified_listener_out_of_not_running() {
+        let classified = classify_targets(
+            vec![PathBuf::from("a")],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            |_path| async { crate::daemon::client::StopProbe::Unverified("500".into()) },
+        )
+        .await;
+        assert_eq!(
+            classified.unverified,
+            vec![(PathBuf::from("a"), "500".to_string())]
+        );
+        assert!(classified.ours.is_empty());
+        assert!(classified.unknown.is_empty());
+        let verdict = stop_verdict(0, &[], &["a".into()]);
+        assert!(verdict.is_err());
+        assert!(verdict.unwrap_err().to_string().contains("a"));
+    }
+
+    #[test]
+    fn a_health_error_that_does_not_prove_absence_keeps_the_target_live() {
+        let healthy: anyhow::Result<()> = Ok(());
+        let timeout = Err(anyhow::Error::new(
+            thegn_svc::control::client::ControlBoundError::RequestTimeout,
+        ));
+        let refused = Err(anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+
+        assert!(still_live(&healthy));
+        assert!(still_live(&timeout));
+        assert!(!still_live(&refused));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn classify_targets_keeps_ours_and_foreign_before_the_deadline() {
         let ours = PathBuf::from("ours");
         let foreign = PathBuf::from("foreign");
@@ -356,6 +463,7 @@ mod tests {
                 ours: vec![ours],
                 unknown: Vec::new(),
                 foreign: vec![(foreign, "other".into())],
+                unverified: vec![],
             }
         );
     }

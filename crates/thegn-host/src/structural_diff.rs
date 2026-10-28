@@ -4,7 +4,8 @@
 //! This is a **read-only** surface: difft is invoked as git's external diff with
 //! the sanitizers deliberately OFF (structural output never feeds `git apply` —
 //! every *stageable* diff keeps `SANITIZED_DIFF`/`--no-ext-diff` elsewhere). The
-//! tool is resolved through the managed-tool tiers (override → PATH → managed),
+//! tool is resolved through an override → PATH → an already-installed managed
+//! copy (managed downloads are disabled until reviewed SHA-256 pins ship),
 //! bounded by a wall-clock timeout plus difft's own byte/graph limits, and every
 //! failure falls back to the internal viewer — never blocking, never erroring.
 //!
@@ -27,9 +28,11 @@ const MAX_STRUCTURAL_STDERR_TAIL: usize = 16 * 1024;
 const READER_GRACE: Duration = Duration::from_millis(500);
 const READ_CHUNK: usize = 8 * 1024;
 
-/// Resolve difft through the three managed-tool tiers, returning a *usable*
-/// binary path — `None` when nothing resolves (or the managed copy is not yet
-/// installed), so the caller degrades to the internal viewer.
+/// Resolve difft through an override → PATH → an already-installed managed
+/// copy, returning a *usable* binary path — `None` when nothing resolves (or
+/// the managed copy is not yet installed), so the caller degrades to the
+/// internal viewer. Managed downloads are disabled until reviewed SHA-256 pins
+/// ship.
 pub fn resolve_difft(cfg: &Config) -> Option<String> {
     let tool = thegn_core::difft::difft_tool();
     let over = cfg.managed_tools.get(&tool.name);

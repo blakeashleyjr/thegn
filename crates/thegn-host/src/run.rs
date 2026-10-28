@@ -49,7 +49,6 @@ use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
 use crate::panes::{Panes, prewarm_requests, relayout, relayout_strip};
 use crate::recorder::Recorder;
 use crate::wizard;
-use crate::workspace_create::complete_workspace_create;
 use thegn_core::store::{
     CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
 };
@@ -2069,8 +2068,9 @@ pub(crate) fn forget_worktree_group(
 
 /// Connect a resident bridge for `worktree` if it's a remote/provider env and not
 /// already connected. Resolves the env off the event loop (DB + git/`resolve_env`)
-/// then spawns the agent; a non-remote loc, a miss, or a spawn failure silently
-/// leaves the per-op git path in place.
+/// then spawns the agent. A non-remote loc or an already-connected bridge returns
+/// early; an unreadable env selection logs a `thegn::bridge` warning. A missing
+/// bridge binary or failed install/spawn leaves the per-op git path in place.
 fn connect_worktree_bridge(
     sup: &crate::bridge_sup::BridgeSupervisor,
     rsup: &crate::revtunnel::ReverseTunnelSupervisor,
@@ -8727,6 +8727,7 @@ async fn event_loop<T: Terminal>(
                         // Confirm skipped: take the SAFE arm (keep
                         // files) — an unprompted action must never
                         // delete worktree dirs from disk.
+                        let was_active = session.id == repo_path;
                         model.status = crate::handlers::workspace_remove::remove_workspace(
                             &mut session,
                             &mut panes,
@@ -8746,6 +8747,25 @@ async fn event_loop<T: Terminal>(
                         crate::handlers::workspace_remove::forget_workspace_in_model(
                             &mut model, &slug, &repo_path,
                         );
+                        if let Some(target) =
+                            crate::handlers::workspace_remove::landing_after_removal(
+                                was_active,
+                                &session,
+                                &model.sidebar_workspaces,
+                                &repo_path,
+                            )
+                            && switch_workspace_from_region!(
+                                &target,
+                                None::<&str>,
+                                crate::workspace_switch_prep::AfterSwitch {
+                                    reveal_active: true,
+                                    focus_active_row: true,
+                                    ..Default::default()
+                                }
+                            )
+                        {
+                            kick_model_hydration!();
+                        }
                         sb.marked.clear();
                         refresh_tab_model(&mut model, &session, &mut sb);
                         sb.focus_active_row(&mut model);
@@ -10402,6 +10422,70 @@ async fn event_loop<T: Terminal>(
         }
         while let Ok(result) = switch_result_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
+            let result = match result {
+                crate::workspace_switch_prep::SwitchResult::Created { request, result } => {
+                    let current = pending_switch.current(request.seq);
+                    match crate::workspace_switch_prep::route_created(
+                        request,
+                        result,
+                        current,
+                        &session.id,
+                    ) {
+                        crate::workspace_switch_prep::CreatedRoute::Apply(cold) => cold,
+                        route => {
+                            let seq = match &route {
+                                crate::workspace_switch_prep::CreatedRoute::Drop { seq }
+                                | crate::workspace_switch_prep::CreatedRoute::AlreadyOpen {
+                                    seq,
+                                    ..
+                                }
+                                | crate::workspace_switch_prep::CreatedRoute::InitGit {
+                                    seq, ..
+                                }
+                                | crate::workspace_switch_prep::CreatedRoute::Failed {
+                                    seq, ..
+                                } => *seq,
+                                crate::workspace_switch_prep::CreatedRoute::Apply(_) => {
+                                    unreachable!()
+                                }
+                            };
+                            pending_switch.clear_spinner_if_matches(seq, &mut model.status);
+                            match route {
+                                crate::workspace_switch_prep::CreatedRoute::AlreadyOpen {
+                                    status,
+                                    ..
+                                }
+                                | crate::workspace_switch_prep::CreatedRoute::Failed {
+                                    status,
+                                    ..
+                                } => {
+                                    model.status = status;
+                                }
+                                crate::workspace_switch_prep::CreatedRoute::InitGit {
+                                    path,
+                                    ..
+                                } => {
+                                    active_menu = Some(menu::init_git_menu(path));
+                                }
+                                crate::workspace_switch_prep::CreatedRoute::Drop { .. } => {}
+                                crate::workspace_switch_prep::CreatedRoute::Apply(_) => {
+                                    unreachable!()
+                                }
+                            }
+                            if deferred_preset
+                                .as_ref()
+                                .is_some_and(|(pending_seq, _)| *pending_seq == seq)
+                            {
+                                deferred_preset = None;
+                            }
+                            pending_switch.clear(seq);
+                            dirty = true;
+                            continue;
+                        }
+                    }
+                }
+                other => other,
+            };
             if let crate::workspace_switch_prep::SwitchResult::Cold { request, result } = &result {
                 let decision = crate::workspace_switch_prep::cold_result_decision(
                     request.seq,
@@ -10437,7 +10521,11 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                     Ok(prepared) => {
-                        model.status.clear();
+                        if let Some(status) = &request.after.landed_status {
+                            model.status.clone_from(status);
+                        } else {
+                            model.status.clear();
+                        }
                         if std::env::var_os("THEGN_WS_CLEAR").is_some() {
                             clear_on_next_frame = true;
                         }
@@ -11174,23 +11262,15 @@ async fn event_loop<T: Terminal>(
         }
         while let Ok(ev) = workspace_clone_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            if crate::workspace_create::apply_clone_event(
+            crate::workspace_create::apply_clone_event(
                 ev,
                 &mut workspace_picker,
-                &mut session,
-                &mut panes,
-                &mut workspace_pool,
-                &mut active_menu,
-                &mut focus,
+                &mut pending_switch,
+                &switch_result_tx,
+                &waker,
                 &mut model,
-                &mut sb,
-                &mut drawer_runtime,
                 &current_config,
-                chrome.center,
-            ) {
-                need_relayout = true;
-                kick_model_hydration!();
-            }
+            );
             dirty = true;
         }
         // Named task (Tasks section) run outcomes.
@@ -14196,12 +14276,29 @@ async fn event_loop<T: Terminal>(
         }
         let plugin_backlog = !plugin_rx.is_empty();
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
-        dirty |= crate::worktree_lifecycle::apply_completions(
+        let applied = crate::worktree_lifecycle::apply_completions(
             &mut session,
             &mut panes,
             &mut model,
             &mut sb,
         );
+        dirty |= applied.changed;
+        if let Some(target) = applied.land_on
+            && switch_workspace_from_region!(
+                &target,
+                None::<&str>,
+                crate::workspace_switch_prep::AfterSwitch {
+                    reveal_active: true,
+                    focus_active_row: true,
+                    ..Default::default()
+                }
+            )
+        {
+            refresh_tab_model(&mut model, &session, &mut sb);
+            sb.focus_active_row(&mut model);
+            kick_model_hydration!();
+            need_relayout = true;
+        }
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             let kind = match kind {
@@ -15412,6 +15509,12 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                             }
                         }
+                    }
+                }
+                crate::forward::ForwardEvent::Refused { worktree, reason } => {
+                    if last_forward_target.as_deref() == Some(worktree.as_str()) {
+                        model.status = format!("Port forwarding paused: {reason}");
+                        dirty = true;
                     }
                 }
                 crate::forward::ForwardEvent::Vanished {
@@ -19266,25 +19369,17 @@ async fn event_loop<T: Terminal>(
                     .as_mut()
                     .map(|p| p.handle_key(&k.key, k.modifiers))
                 {
-                    if crate::workspace_create::handle_picker_outcome(
+                    crate::workspace_create::handle_picker_outcome(
                         outcome,
                         &mut workspace_picker,
                         &workspace_clone_tx,
                         &waker,
-                        &mut session,
-                        &mut panes,
-                        &mut workspace_pool,
+                        &mut pending_switch,
+                        &switch_result_tx,
                         &mut active_menu,
-                        &mut focus,
                         &mut model,
-                        &mut sb,
-                        &mut drawer_runtime,
                         &current_config,
-                        chrome.center,
-                    ) {
-                        need_relayout = true;
-                        kick_model_hydration!();
-                    }
+                    );
                     dirty = true;
                     continue;
                 }
@@ -20040,22 +20135,14 @@ async fn event_loop<T: Terminal>(
                                         .map(|s| s.success())
                                         .unwrap_or(false);
                                 if initialized {
-                                    if complete_workspace_create(
+                                    crate::workspace_switch_prep::request_workspace_create(
                                         &path,
-                                        &mut session,
-                                        &mut panes,
-                                        &mut workspace_pool,
-                                        &mut active_menu,
-                                        &mut focus,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut drawer_runtime,
+                                        &mut pending_switch,
+                                        &switch_result_tx,
+                                        &waker,
                                         &current_config,
-                                        chrome.center,
-                                    ) {
-                                        need_relayout = true;
-                                        kick_model_hydration!();
-                                    }
+                                        &mut model.status,
+                                    );
                                 } else {
                                     model.status =
                                         format!("failed to initialize git repository at {}", path);
@@ -20069,22 +20156,14 @@ async fn event_loop<T: Terminal>(
                             if let menu::MenuChoice::ConfirmCreateProject { path } = choice {
                                 match crate::workspace_create::init_new_project(Path::new(&path)) {
                                     Ok(()) => {
-                                        if complete_workspace_create(
+                                        crate::workspace_switch_prep::request_workspace_create(
                                             &path,
-                                            &mut session,
-                                            &mut panes,
-                                            &mut workspace_pool,
-                                            &mut active_menu,
-                                            &mut focus,
-                                            &mut model,
-                                            &mut sb,
-                                            &mut drawer_runtime,
+                                            &mut pending_switch,
+                                            &switch_result_tx,
+                                            &waker,
                                             &current_config,
-                                            chrome.center,
-                                        ) {
-                                            need_relayout = true;
-                                            kick_model_hydration!();
-                                        }
+                                            &mut model.status,
+                                        );
                                     }
                                     Err(e) => {
                                         model.status = format!("create project failed: {e}");
@@ -20097,6 +20176,7 @@ async fn event_loop<T: Terminal>(
                                 && let Some((repo_path, slug, display)) =
                                     pending_delete_workspace.take()
                             {
+                                let was_active = session.id == repo_path;
                                 model.status = crate::handlers::workspace_remove::remove_workspace(
                                     &mut session,
                                     &mut panes,
@@ -20119,6 +20199,25 @@ async fn event_loop<T: Terminal>(
                                     crate::handlers::workspace_remove::forget_workspace_in_model(
                                         &mut model, &slug, &repo_path,
                                     );
+                                }
+                                if let Some(target) =
+                                    crate::handlers::workspace_remove::landing_after_removal(
+                                        was_active,
+                                        &session,
+                                        &model.sidebar_workspaces,
+                                        &repo_path,
+                                    )
+                                    && switch_workspace_from_region!(
+                                        &target,
+                                        None::<&str>,
+                                        crate::workspace_switch_prep::AfterSwitch {
+                                            reveal_active: true,
+                                            focus_active_row: true,
+                                            ..Default::default()
+                                        }
+                                    )
+                                {
+                                    kick_model_hydration!();
                                 }
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);

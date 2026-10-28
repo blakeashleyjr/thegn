@@ -240,18 +240,22 @@ pub fn tgproxy_report() -> String {
     )
 }
 
+/// The non-executable `tgproxy` beside the running thegn that discovery skipped, for `doctor --json`.
+pub fn skipped_tgproxy() -> Option<PathBuf> {
+    skipped_tgproxy_sibling(
+        thegn_core::util::self_exe_path()
+            .as_deref()
+            .and_then(std::path::Path::parent),
+    )
+}
+
+/// Formats a path already checked by the resolver, or the source-build-only guidance when absent.
 pub fn tgproxy_status_line(found: Option<&std::path::Path>) -> String {
     found.map_or_else(
         || {
             "not installed (source-build-only in this alpha: cargo install --path crates/thegn-proxy, then put tgproxy beside thegn or on PATH)".to_string()
         },
-        |path| {
-            if executable_regular_file(path) {
-                path.display().to_string()
-            } else {
-                format!("{} (present but not executable)", path.display())
-            }
-        },
+        |path| path.display().to_string(),
     )
 }
 
@@ -1273,6 +1277,37 @@ mod tests {
         assert!(report.contains("not installed"));
         assert!(report.contains("skipped non-executable"));
         assert!(report.contains(&sibling.display().to_string()));
+    }
+
+    #[test]
+    fn skipped_tgproxy_sibling_names_only_a_non_executable_sibling() {
+        if !crate::platform::sound_process::test_support::UNIX {
+            return;
+        }
+
+        assert_eq!(skipped_tgproxy_sibling(None), None);
+
+        let non_executable_dir = tempfile::tempdir().unwrap();
+        let non_executable = make_tgproxy(non_executable_dir.path(), 0o644);
+        assert_eq!(
+            skipped_tgproxy_sibling(Some(non_executable_dir.path())),
+            Some(non_executable)
+        );
+
+        let executable_dir = tempfile::tempdir().unwrap();
+        make_tgproxy(executable_dir.path(), 0o755);
+        assert_eq!(skipped_tgproxy_sibling(Some(executable_dir.path())), None);
+
+        let directory_dir = tempfile::tempdir().unwrap();
+        let sibling_directory = directory_dir.path().join("tgproxy");
+        std::fs::create_dir(&sibling_directory).unwrap();
+        assert_eq!(
+            skipped_tgproxy_sibling(Some(directory_dir.path())),
+            Some(sibling_directory)
+        );
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        assert_eq!(skipped_tgproxy_sibling(Some(empty_dir.path())), None);
     }
 
     #[test]

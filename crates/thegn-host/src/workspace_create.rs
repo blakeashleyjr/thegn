@@ -1,7 +1,7 @@
 //! The Alt+W "new workspace" flow's non-loop halves: input classification
-//! (path / URL / new-project), clone-by-URL, and the create+switch completion
-//! shared by the typed prompt, the fuzzy picker, and the clone-finished drain
-//! arm. Extracted from `run.rs` (god-file ratchet).
+//! (path / URL / new-project), clone-by-URL, and the picker/clone request
+//! routing. Workspace creation resolves on a blocking worker and seeds/prepares
+//! through the DB-writer switch flow. Extracted from `run.rs` (god-file ratchet).
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,13 +11,7 @@ use std::time::{Duration, Instant};
 use thegn_core::store::WorkspaceStore;
 
 use crate::chrome::FrameModel;
-use crate::compositor::Rect;
 use crate::menu::{self, MenuOverlay};
-use crate::panes::Panes;
-use crate::run::{
-    DrawerRuntime, ResidentWorkspace, SidebarState, WorkspacePool, persist_session_layout,
-    refresh_tab_model, remap_cold_workspace_ids,
-};
 
 const MAX_PROGRESS_SEGMENT: usize = 512;
 const CLONE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -476,7 +470,10 @@ fn workspace_repo_display(input: &str) -> String {
 }
 
 pub(crate) enum WorkspaceResolution {
-    Repo(std::path::PathBuf),
+    Repo {
+        root: std::path::PathBuf,
+        name: String,
+    },
     NotARepo(std::path::PathBuf),
 }
 
@@ -1324,10 +1321,10 @@ fn run_clone_job(job: CloneJob) {
     wake_clone_loop_best_effort(&waker);
 }
 
-pub(crate) fn create_workspace_from_input_with_config(
+/// Resolve and classify a workspace input on a blocking worker; this does not
+/// access the state database.
+pub(crate) fn resolve_workspace_input(
     input: &str,
-    session: &mut crate::session::Session,
-    db: &thegn_core::db::Db,
     cfg: &thegn_core::config::Config,
 ) -> Result<WorkspaceResolution> {
     let input = input.trim();
@@ -1365,7 +1362,6 @@ pub(crate) fn create_workspace_from_input_with_config(
         thegn_core::repo::main_worktree(&canonical).unwrap_or(canonical)
     };
 
-    let root_s = root.to_string_lossy().into_owned();
     let name = parse_workspace_url(input)
         .map(|parsed| parsed.label)
         .unwrap_or_else(|_| {
@@ -1373,88 +1369,40 @@ pub(crate) fn create_workspace_from_input_with_config(
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "workspace".into())
         });
-    let kind = if thegn_core::repo::main_worktree(&root).is_some() {
-        "repo"
-    } else {
+    if thegn_core::repo::main_worktree(&root).is_none() {
         return Ok(WorkspaceResolution::NotARepo(root));
-    };
-    db.put_workspace(&root_s, &name, kind)?;
-    db.touch_repo(&root_s, &name)?;
-    session.switch_to_workspace(&root_s, db)?;
-    Ok(WorkspaceResolution::Repo(root))
+    }
+    Ok(WorkspaceResolution::Repo { root, name })
 }
 
-/// Create + switch to a workspace for a LOCAL `input` (a path, or the dest of
-/// a finished URL clone): park the outgoing workspace in the pool, resolve
-/// and persist the new one, and sync chrome state. Never clones — URL inputs
-/// go through the off-loop clone first (see `WorkspaceCloneOutcome`).
-/// Returns whether a relayout is needed.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn complete_workspace_create(
-    input: &str,
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    workspace_pool: &mut WorkspacePool,
-    active_menu: &mut Option<MenuOverlay>,
-    focus: &mut crate::focus::FocusState,
-    model: &mut FrameModel,
-    sb: &mut SidebarState,
-    drawer_runtime: &mut DrawerRuntime,
+pub(crate) fn seed_workspace_create(
+    db: &thegn_core::db::Db,
+    root: &std::path::Path,
+    name: &str,
     cfg: &thegn_core::config::Config,
-    center: Rect,
-) -> bool {
-    persist_session_layout(session, panes);
-    let prev_id = session.id.clone();
-    let snapshot = ResidentWorkspace {
-        worktrees: session.worktrees.clone(),
-        active: session.active,
-    };
-    match thegn_core::db::Db::open()
-        .context("open thegn db")
-        .and_then(|db| create_workspace_from_input_with_config(input, session, &db, cfg))
-    {
-        Ok(WorkspaceResolution::Repo(path)) => {
-            workspace_pool.stash(prev_id, snapshot, panes);
-            remap_cold_workspace_ids(session, panes);
-            focus.zone = crate::focus::Zone::Center;
-            refresh_tab_model(model, session, sb);
-            model.status = format!("project created: {}", path.display());
-            if let Some(dir) = crate::run::active_cwd(session) {
-                drawer_runtime.reconcile(cfg, &dir, panes, center);
-            }
-            true
-        }
-        Ok(WorkspaceResolution::NotARepo(path)) => {
-            *active_menu = Some(menu::init_git_menu(path.to_string_lossy().into_owned()));
-            false
-        }
-        Err(e) => {
-            model.status = format!("project create failed: {e}");
-            false
-        }
-    }
+) -> Result<crate::workspace_switch_prep::CreateOutcome> {
+    let root_s = root.to_string_lossy().into_owned();
+    db.put_workspace(&root_s, name, "repo")?;
+    db.touch_repo(&root_s, name)?;
+    let prepared = crate::session::Session::prepare_workspace_switch(&root_s, db, cfg)?;
+    Ok(crate::workspace_switch_prep::CreateOutcome::Repo {
+        root: root_s,
+        prepared,
+    })
 }
 
 /// Apply one `CloneEvent` from the off-loop clone to the picker: stream a
-/// progress line into its cloning panel, or on `Done` complete+switch (closing
-/// the picker) / park it in a visible error. Ignores results for a clone the
-/// user has since cancelled or moved past. Returns whether the loop should
-/// relayout + re-hydrate (a workspace was created).
-#[allow(clippy::too_many_arguments)]
+/// progress line, queue the created workspace switch, or park a visible error.
+/// Ignores results for a clone the user has since cancelled or moved past.
 pub(crate) fn apply_clone_event(
     ev: CloneEvent,
     picker: &mut Option<crate::workspace_picker::WorkspacePicker>,
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    workspace_pool: &mut WorkspacePool,
-    active_menu: &mut Option<MenuOverlay>,
-    focus: &mut crate::focus::FocusState,
+    pending_switch: &mut crate::workspace_switch_prep::PendingSwitch,
+    switch_tx: &tokio::sync::mpsc::UnboundedSender<crate::workspace_switch_prep::SwitchResult>,
+    waker: &termwiz::terminal::TerminalWaker,
     model: &mut FrameModel,
-    sb: &mut SidebarState,
-    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
-    center: Rect,
-) -> bool {
+) {
     match ev {
         CloneEvent::Progress {
             generation,
@@ -1467,7 +1415,6 @@ pub(crate) fn apply_clone_event(
             {
                 p.set_clone_progress(line);
             }
-            false
         }
         CloneEvent::Done(o) => {
             // Only honor a result the picker is still awaiting — a cancel (or a
@@ -1479,25 +1426,20 @@ pub(crate) fn apply_clone_event(
                         .as_ref()
                         .is_some_and(|p| p.cloning_url() == Some(o.url.as_str()));
             if !awaited {
-                return false;
+                return;
             }
             match o.result {
                 Ok(()) => {
                     *picker = None;
                     let dest = o.dest.to_string_lossy().into_owned();
-                    complete_workspace_create(
+                    crate::workspace_switch_prep::request_workspace_create(
                         &dest,
-                        session,
-                        panes,
-                        workspace_pool,
-                        active_menu,
-                        focus,
-                        model,
-                        sb,
-                        drawer_runtime,
+                        pending_switch,
+                        switch_tx,
+                        waker,
                         cfg,
-                        center,
-                    )
+                        &mut model.status,
+                    );
                 }
                 Err(e) => {
                     if let Some(p) = picker.as_mut() {
@@ -1506,7 +1448,6 @@ pub(crate) fn apply_clone_event(
                             thegn_core::ci_log::redact(&e.to_string())
                         ));
                     }
-                    false
                 }
             }
         }
@@ -1514,76 +1455,39 @@ pub(crate) fn apply_clone_event(
 }
 
 /// Map a [`crate::workspace_picker::PickerOutcome`] onto the shared workspace
-/// flows: cancel, open a browsed repo, or classify+dispatch a manual input
-/// (off-loop clone / local create+switch / new-project confirm / inline error).
-/// Owns the picker's lifecycle so it stays on screen through a clone or a bad
-/// input instead of vanishing. Returns whether the loop should relayout +
-/// re-hydrate (a workspace was created).
+/// flows: cancel, queue a workspace open/create, clone, or offer new-project
+/// creation. Owns the picker's lifecycle through a clone or invalid input.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_picker_outcome(
     outcome: crate::workspace_picker::PickerOutcome,
     picker: &mut Option<crate::workspace_picker::WorkspacePicker>,
     clone_tx: &tokio::sync::mpsc::UnboundedSender<CloneEvent>,
     waker: &termwiz::terminal::TerminalWaker,
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    workspace_pool: &mut WorkspacePool,
+    pending_switch: &mut crate::workspace_switch_prep::PendingSwitch,
+    switch_tx: &tokio::sync::mpsc::UnboundedSender<crate::workspace_switch_prep::SwitchResult>,
     active_menu: &mut Option<MenuOverlay>,
-    focus: &mut crate::focus::FocusState,
     model: &mut FrameModel,
-    sb: &mut SidebarState,
-    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
-    center: Rect,
-) -> bool {
+) {
     use crate::workspace_picker::PickerOutcome;
-    let create = |input: &str,
-                  picker: &mut Option<crate::workspace_picker::WorkspacePicker>,
-                  session: &mut crate::session::Session,
-                  panes: &mut Panes,
-                  workspace_pool: &mut WorkspacePool,
-                  active_menu: &mut Option<MenuOverlay>,
-                  focus: &mut crate::focus::FocusState,
-                  model: &mut FrameModel,
-                  sb: &mut SidebarState,
-                  drawer_runtime: &mut DrawerRuntime| {
-        *picker = None;
-        complete_workspace_create(
-            input,
-            session,
-            panes,
-            workspace_pool,
-            active_menu,
-            focus,
-            model,
-            sb,
-            drawer_runtime,
-            cfg,
-            center,
-        )
-    };
     match outcome {
-        PickerOutcome::Pending => false,
+        PickerOutcome::Pending => {}
         PickerOutcome::Cancel => {
             next_clone_generation();
             *picker = None;
             model.status = "project creation cancelled".into();
-            false
         }
         PickerOutcome::OpenRepo(path) => {
             next_clone_generation();
-            create(
+            *picker = None;
+            crate::workspace_switch_prep::request_workspace_create(
                 &path,
-                picker,
-                session,
-                panes,
-                workspace_pool,
-                active_menu,
-                focus,
-                model,
-                sb,
-                drawer_runtime,
-            )
+                pending_switch,
+                switch_tx,
+                waker,
+                cfg,
+                &mut model.status,
+            );
         }
         PickerOutcome::Manual(input) => match plan_new_workspace_input(&input, cfg) {
             SubmitPlan::Clone { url, dest } => {
@@ -1602,22 +1506,18 @@ pub(crate) fn handle_picker_outcome(
                     clone_tx.clone(),
                     waker.clone(),
                 );
-                false
             }
             SubmitPlan::Local(input) => {
                 next_clone_generation();
-                create(
+                *picker = None;
+                crate::workspace_switch_prep::request_workspace_create(
                     &input,
-                    picker,
-                    session,
-                    panes,
-                    workspace_pool,
-                    active_menu,
-                    focus,
-                    model,
-                    sb,
-                    drawer_runtime,
-                )
+                    pending_switch,
+                    switch_tx,
+                    waker,
+                    cfg,
+                    &mut model.status,
+                );
             }
             SubmitPlan::CreateNew { leaf } => {
                 next_clone_generation();
@@ -1625,7 +1525,6 @@ pub(crate) fn handle_picker_outcome(
                 *active_menu = Some(menu::create_project_menu(
                     leaf.to_string_lossy().into_owned(),
                 ));
-                false
             }
             SubmitPlan::Invalid(msg) => {
                 next_clone_generation();
@@ -1633,7 +1532,6 @@ pub(crate) fn handle_picker_outcome(
                 if let Some(p) = picker.as_mut() {
                     p.set_error(msg);
                 }
-                false
             }
         },
     }
@@ -1664,6 +1562,80 @@ Receiving objects: 100% (10/10)\rdone.\n";
                 "Receiving objects: 100% (10/10)",
                 "done.",
             ]
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_input_classifies_without_touching_the_state_db() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let scratch = tempfile::tempdir().unwrap();
+        let proj = scratch.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let initialized = fixture_git(&proj, &["init"]);
+        assert!(initialized.status.success());
+        let plain = scratch.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let resolved = resolve_workspace_input(
+            proj.to_str().unwrap(),
+            &thegn_core::config::Config::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolved,
+            WorkspaceResolution::Repo { root, name }
+                if root == std::fs::canonicalize(&proj).unwrap() && name == "proj"
+        ));
+        let resolved = resolve_workspace_input(
+            plain.to_str().unwrap(),
+            &thegn_core::config::Config::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            resolved,
+            WorkspaceResolution::NotARepo(path)
+                if path == std::fs::canonicalize(&plain).unwrap()
+        ));
+        let missing = scratch.path().join("missing");
+        let error = resolve_workspace_input(
+            missing.to_str().unwrap(),
+            &thegn_core::config::Config::default(),
+        );
+        let error = match error {
+            Ok(_) => panic!("missing input should fail resolution"),
+            Err(error) => error,
+        };
+        assert!(format!("{error}").contains("path does not exist"));
+        assert!(!state.state_home().join("thegn/thegn.db").exists());
+    }
+
+    #[test]
+    fn seed_workspace_create_registers_the_repo_and_prepares_its_home_group() {
+        let scratch = tempfile::tempdir().unwrap();
+        let db = thegn_core::db::Db::open_at(&scratch.path().join("db.sqlite")).unwrap();
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let initialized = fixture_git(&repo, &["init"]);
+        assert!(initialized.status.success());
+
+        let outcome =
+            seed_workspace_create(&db, &repo, "label", &thegn_core::config::Config::default())
+                .unwrap();
+        let crate::workspace_switch_prep::CreateOutcome::Repo { root, prepared } = outcome else {
+            panic!("initialized git repository should be prepared as a repo")
+        };
+        assert_eq!(root, repo.to_string_lossy().into_owned());
+        assert_eq!(prepared.worktrees[0].kind, crate::session::GroupKind::Home);
+        let slug = db.repo_slug_lookup(&root).unwrap().unwrap();
+        assert_eq!(
+            prepared.worktrees[0].name,
+            thegn_core::repo::home_tab(&slug)
+        );
+        assert!(
+            db.workspaces()
+                .unwrap()
+                .iter()
+                .any(|row| row.repo_path == root)
         );
     }
 
