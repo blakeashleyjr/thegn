@@ -2776,15 +2776,19 @@ fn model_proxy_json(cfg: &Config) -> serde_json::Value {
     use thegn_core::seam::Kind;
     let mp = &cfg.model_proxy;
     let tgproxy = crate::model_proxy_daemon::find_tgproxy().map(|path| path.display().to_string());
+    let tgproxy_skipped =
+        crate::model_proxy_daemon::skipped_tgproxy().map(|path| path.display().to_string());
     if !mp.enabled {
         return serde_json::json!({
             "enabled": false,
             "tgproxy": tgproxy,
+            "tgproxy_skipped": tgproxy_skipped,
         });
     }
     serde_json::json!({
         "enabled": true,
         "tgproxy": tgproxy,
+        "tgproxy_skipped": tgproxy_skipped,
         "listen": mp.listen,
         "loopback": mp.listen_is_loopback(),
         "reachable": crate::model_proxy_daemon::probe_up(mp),
@@ -5285,6 +5289,15 @@ mod tests {
             .get("cpu_soft_reason")
             .expect("cpu_soft_reason key is present");
         assert!(reason.is_null() || reason.is_string(), "{reason}");
+    }
+
+    #[test]
+    fn model_proxy_json_carries_the_tgproxy_skipped_key() {
+        let value = model_proxy_json(&Config::default());
+        let skipped = value
+            .get("tgproxy_skipped")
+            .expect("tgproxy_skipped key is present");
+        assert!(skipped.is_null() || skipped.is_string(), "{skipped}");
     }
 
     #[test]
