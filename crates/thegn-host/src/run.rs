@@ -8726,6 +8726,7 @@ async fn event_loop<T: Terminal>(
                         // Confirm skipped: take the SAFE arm (keep
                         // files) — an unprompted action must never
                         // delete worktree dirs from disk.
+                        let was_active = session.id == repo_path;
                         model.status = crate::handlers::workspace_remove::remove_workspace(
                             &mut session,
                             &mut panes,
@@ -8745,6 +8746,25 @@ async fn event_loop<T: Terminal>(
                         crate::handlers::workspace_remove::forget_workspace_in_model(
                             &mut model, &slug, &repo_path,
                         );
+                        if let Some(target) =
+                            crate::handlers::workspace_remove::landing_after_removal(
+                                was_active,
+                                &session,
+                                &model.sidebar_workspaces,
+                                &repo_path,
+                            )
+                            && switch_workspace_from_region!(
+                                &target,
+                                None::<&str>,
+                                crate::workspace_switch_prep::AfterSwitch {
+                                    reveal_active: true,
+                                    focus_active_row: true,
+                                    ..Default::default()
+                                }
+                            )
+                        {
+                            kick_model_hydration!();
+                        }
                         sb.marked.clear();
                         refresh_tab_model(&mut model, &session, &mut sb);
                         sb.focus_active_row(&mut model);
@@ -14255,12 +14275,29 @@ async fn event_loop<T: Terminal>(
         }
         let plugin_backlog = !plugin_rx.is_empty();
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
-        dirty |= crate::worktree_lifecycle::apply_completions(
+        let applied = crate::worktree_lifecycle::apply_completions(
             &mut session,
             &mut panes,
             &mut model,
             &mut sb,
         );
+        dirty |= applied.changed;
+        if let Some(target) = applied.land_on
+            && switch_workspace_from_region!(
+                &target,
+                None::<&str>,
+                crate::workspace_switch_prep::AfterSwitch {
+                    reveal_active: true,
+                    focus_active_row: true,
+                    ..Default::default()
+                }
+            )
+        {
+            refresh_tab_model(&mut model, &session, &mut sb);
+            sb.focus_active_row(&mut model);
+            kick_model_hydration!();
+            need_relayout = true;
+        }
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             let kind = match kind {
@@ -20132,6 +20169,7 @@ async fn event_loop<T: Terminal>(
                                 && let Some((repo_path, slug, display)) =
                                     pending_delete_workspace.take()
                             {
+                                let was_active = session.id == repo_path;
                                 model.status = crate::handlers::workspace_remove::remove_workspace(
                                     &mut session,
                                     &mut panes,
@@ -20154,6 +20192,25 @@ async fn event_loop<T: Terminal>(
                                     crate::handlers::workspace_remove::forget_workspace_in_model(
                                         &mut model, &slug, &repo_path,
                                     );
+                                }
+                                if let Some(target) =
+                                    crate::handlers::workspace_remove::landing_after_removal(
+                                        was_active,
+                                        &session,
+                                        &model.sidebar_workspaces,
+                                        &repo_path,
+                                    )
+                                    && switch_workspace_from_region!(
+                                        &target,
+                                        None::<&str>,
+                                        crate::workspace_switch_prep::AfterSwitch {
+                                            reveal_active: true,
+                                            focus_active_row: true,
+                                            ..Default::default()
+                                        }
+                                    )
+                                {
+                                    kick_model_hydration!();
                                 }
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
