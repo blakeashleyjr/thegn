@@ -1726,7 +1726,7 @@ pub fn provider_proxy_target(
     String,
     String,
 )> {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = provider_pane_loc(worktree, "provider proxy target")?;
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -1772,11 +1772,14 @@ pub fn provider_proxy_target(
 
 /// Builds the `sprite-proxy` refusal message after [`provider_proxy_target`]
 /// returned `None`. This is a second, best-effort read of the selection, not a
-/// diagnosis of the refusal's own cause: a state-database or environment-
-/// selection read failure is named as such (the refusal itself only reaches
-/// tracing, which has no sink in a ProxyCommand child); otherwise the generic
-/// reasons stand.
+/// diagnosis of the refusal's own cause: a state-database, location, or
+/// environment-selection read failure is named as such (the refusal
+/// itself only reaches tracing, which has no sink in a ProxyCommand child);
+/// otherwise the generic reasons stand.
 pub(crate) fn provider_proxy_refusal(worktree: &str) -> String {
+    if let Err(error) = GitLoc::for_worktree_op(Path::new(worktree), "provider proxy target") {
+        return format!("sprite-proxy: {error}");
+    }
     let read = Db::open().and_then(|db| {
         let repo_root: PathBuf = db
             .repo_root_for(worktree)?
@@ -1934,7 +1937,9 @@ pub(crate) fn native_agent_exec_for_pane(
 /// that agent command (run via the same `cd workdir; <cmd>` wrapper).
 fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> PaneNativeExec {
     use thegn_core::config::ProviderExecMode;
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let Some(loc) = provider_pane_loc(worktree, "native exec") else {
+        return PaneNativeExec::Unavailable;
+    };
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -2351,6 +2356,30 @@ fn provision_selection(
         Err(error) => Err(error).context(
             "provisioning refused: the environment selection could not be read (the default environment is never used instead)",
         ),
+    }
+}
+
+/// Whether any remote placement may apply to a worktree under `cfg`: a non-local or host-pinned `[env.<name>]`, the
+/// placement engine, or a `[sandbox.remote]` host. The union of the batch-78 gates in `provision_worktree`,
+/// `host_flow::resolve_binding` and `placement_flow::plan_selection`. When none applies, a worktree can only be local,
+/// so a failed location read is resolved as local and a plain local shell is never refused (THE-1474).
+pub(crate) fn remote_placement_configured(cfg: &Config) -> bool {
+    cfg.placement.enabled
+        || cfg.sandbox.remote.is_remote()
+        || cfg.env.values().any(|env| {
+            env.placement != thegn_core::config::PlacementMode::Local || !env.host.trim().is_empty()
+        })
+}
+
+/// The worktree's location for a provider pane or connect path. `None` (logged) when it cannot be read: the caller
+/// treats the worktree as having no provider target, and the pane launch then refuses visibly in `launch_spec_full`.
+pub(crate) fn provider_pane_loc(worktree: &str, what: &str) -> Option<GitLoc> {
+    match GitLoc::for_worktree_op(Path::new(worktree), what) {
+        Ok(loc) => Some(loc),
+        Err(error) => {
+            tracing::warn!(target: "thegn::provider", worktree, %error, "{what}: location unreadable");
+            None
+        }
     }
 }
 
@@ -4322,7 +4351,11 @@ pub fn launch_spec_full(
     daemon_persistent: bool,
     extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = match GitLoc::for_worktree_op(Path::new(worktree), "pane launch") {
+        Ok(loc) => loc,
+        Err(_) if !remote_placement_configured(cfg) => GitLoc::Local(PathBuf::from(worktree)),
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
 
     // Resolved once: the host env fold near the end needs the entry's env KEYS
     // (see there). The headless allow-list (`[[agents]].permissions`, or the

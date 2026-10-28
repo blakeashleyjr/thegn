@@ -3060,3 +3060,249 @@ fn provision_worktree_keeps_a_local_worktree_local_without_provider_envs() {
         Ok(false)
     ));
 }
+
+#[test]
+fn remote_placement_configured_matches_the_remote_placement_gates() {
+    use thegn_core::config::{Config, EnvConfig, PlacementMode, RemoteConfig, SandboxConfig};
+
+    assert!(!remote_placement_configured(&Config::default()));
+    assert!(!remote_placement_configured(&Config {
+        env: [("local".into(), EnvConfig::default())].into(),
+        ..Config::default()
+    }));
+    for placement in [PlacementMode::Provider, PlacementMode::Ssh] {
+        assert!(remote_placement_configured(&Config {
+            env: [(
+                "remote".into(),
+                EnvConfig {
+                    placement,
+                    ..Default::default()
+                }
+            )]
+            .into(),
+            ..Config::default()
+        }));
+    }
+    assert!(remote_placement_configured(&Config {
+        env: [(
+            "pinned".into(),
+            EnvConfig {
+                host: "h1".into(),
+                ..Default::default()
+            }
+        )]
+        .into(),
+        ..Config::default()
+    }));
+    assert!(remote_placement_configured(&Config {
+        placement: thegn_core::config::PlacementConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Config::default()
+    }));
+    assert!(remote_placement_configured(&Config {
+        sandbox: SandboxConfig {
+            remote: RemoteConfig {
+                host: "box".into(),
+                ..Default::default()
+            },
+            ..SandboxConfig::default()
+        },
+        ..Config::default()
+    }));
+}
+
+#[test]
+fn provider_pane_loc_is_none_for_an_unrecognised_location() {
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+
+    assert!(provider_pane_loc(&wt, "native exec").is_none());
+}
+
+#[test]
+fn provider_pane_loc_resolves_a_recorded_provider_location() {
+    use thegn_core::remote::GitLoc;
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let location = GitLoc::provider_db_string(&["env".into()], "/workspace");
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some(&location), None)
+        .unwrap();
+    drop(db);
+
+    assert!(matches!(
+        provider_pane_loc(&wt, "native exec"),
+        Some(GitLoc::Provider { .. })
+    ));
+}
+
+#[test]
+fn provider_pane_loc_is_local_without_a_state_db() {
+    let state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+
+    assert!(matches!(
+        provider_pane_loc(&wt, "native exec"),
+        Some(GitLoc::Local(_))
+    ));
+    assert!(!state.state_home().join("thegn/thegn.db").exists());
+}
+
+#[test]
+fn provider_proxy_refusal_names_an_unreadable_location() {
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+
+    let refusal = provider_proxy_refusal(&wt);
+    assert!(
+        refusal.contains("provider proxy target refused"),
+        "{refusal}"
+    );
+    assert!(
+        refusal.contains("unrecognised worktree location"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn launch_spec_full_refuses_a_shell_on_an_unrecognised_location_when_a_provider_env_is_configured()
+{
+    use thegn_core::config::{Config, EnvConfig, PlacementMode, SandboxBackend, SandboxConfig};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        env: [(
+            "cloud".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                ..Default::default()
+            },
+        )]
+        .into(),
+        sandbox: SandboxConfig {
+            backend: SandboxBackend::None,
+            inject_devshell: false,
+            ..SandboxConfig::default()
+        },
+        ..Config::default()
+    };
+
+    let result = launch_spec_full(
+        &cfg,
+        &wt,
+        None,
+        "shell",
+        true,
+        LaunchExtras {
+            suppress_agent_record: true,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(result, Err(error) if {
+        let message = format!("{error:#}");
+        message.contains("pane launch refused") && message.contains("unrecognised worktree location")
+    }));
+}
+
+#[test]
+fn launch_spec_full_refuses_on_an_unopenable_state_db_when_a_host_is_pinned() {
+    use thegn_core::config::{Config, EnvConfig, SandboxBackend, SandboxConfig};
+
+    let state = crate::testenv::IsolatedState::new();
+    std::fs::create_dir_all(state.state_home().join("thegn/thegn.db")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let cfg = Config {
+        env: [(
+            "pinned".into(),
+            EnvConfig {
+                host: "h1".into(),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        sandbox: SandboxConfig {
+            backend: SandboxBackend::None,
+            inject_devshell: false,
+            ..SandboxConfig::default()
+        },
+        ..Config::default()
+    };
+
+    let result = launch_spec_full(
+        &cfg,
+        &wt,
+        None,
+        "shell",
+        true,
+        LaunchExtras {
+            suppress_agent_record: true,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(result, Err(error) if format!("{error:#}").contains("pane launch refused")));
+}
+
+#[test]
+fn launch_spec_full_keeps_a_local_only_config_local_on_an_unrecognised_location() {
+    use thegn_core::config::{Config, SandboxBackend, SandboxConfig};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        sandbox: SandboxConfig {
+            backend: SandboxBackend::None,
+            inject_devshell: false,
+            ..SandboxConfig::default()
+        },
+        ..cfg_with(&[("worker", "claude")], &[])
+    };
+
+    assert!(
+        launch_spec_full(
+            &cfg,
+            &wt,
+            None,
+            "worker",
+            true,
+            LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )
+        .is_ok()
+    );
+}
