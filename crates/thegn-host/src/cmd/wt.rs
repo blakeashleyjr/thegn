@@ -148,6 +148,10 @@ pub enum Action {
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
+    run_with_config(cfg, action, &thegn_core::config::Config::path())
+}
+
+pub fn run_with_config(cfg: &Config, action: Action, config_path: &std::path::Path) -> Result<()> {
     match action {
         Action::List(a) => super::list::run(cfg, a.json),
         Action::New {
@@ -162,7 +166,17 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             folder,
         } => match program {
             Some(p) => new_batched(cfg, name, &p, repos, base, env, folder, json),
-            None => new(cfg, name, repo, base, env, from_issue, folder, json),
+            None => new(
+                cfg,
+                name,
+                repo,
+                base,
+                env,
+                from_issue,
+                folder,
+                json,
+                config_path.parent().unwrap_or(std::path::Path::new("")),
+            ),
         },
         Action::Folder {
             worktree,
@@ -195,6 +209,7 @@ fn new(
     from_issue: Option<String>,
     folder: Option<String>,
     json: bool,
+    config_dir: &std::path::Path,
 ) -> Result<()> {
     let folder = folder.as_deref().map(validate_folder_name).transpose()?;
     let start = super::resolve_worktree(repo);
@@ -211,7 +226,7 @@ fn new(
     // any positional `name`.
     let issue_id = from_issue.filter(|s| !s.trim().is_empty());
     let issue_branch = match &issue_id {
-        Some(id) => Some(resolve_issue_branch(cfg, &root, id)?),
+        Some(id) => Some(resolve_issue_branch(cfg, &root, id, config_dir)?),
         None => None,
     };
 
@@ -1000,23 +1015,59 @@ fn new_batched(
 /// from the configured tracker, derive the seed branch ([`thegn_core::issue::issue_branch_seed`]),
 /// then de-duplicate against the repo's existing branches — exactly the `D` key
 /// / `worktrees.create` derivation, so the doors cannot drift.
-fn resolve_issue_branch(cfg: &Config, root: &std::path::Path, issue_id: &str) -> Result<String> {
+fn resolve_issue_branch(
+    cfg: &Config,
+    root: &std::path::Path,
+    issue_id: &str,
+    config_dir: &std::path::Path,
+) -> Result<String> {
+    resolve_issue_branch_lazy(cfg, root, issue_id, || {
+        crate::cmd::issue::skipped_plugin_issue_providers(cfg, config_dir)
+    })
+}
+
+#[cfg(test)]
+fn resolve_issue_branch_with(
+    cfg: &Config,
+    root: &std::path::Path,
+    issue_id: &str,
+    skipped: &[String],
+) -> Result<String> {
+    resolve_issue_branch_lazy(cfg, root, issue_id, || skipped.to_vec())
+}
+
+fn resolve_issue_branch_lazy(
+    cfg: &Config,
+    root: &std::path::Path,
+    issue_id: &str,
+    skipped: impl Fn() -> Vec<String>,
+) -> Result<String> {
     // Repo-resolved so the repo overlay's restrictions/pins (account filter,
     // team id) apply; the overlay can only narrow, never add accounts.
     let router = thegn_svc::issue::IssueRouter::from_config(&cfg.repo_issues(Some(root)));
     if !router.is_configured() {
-        anyhow::bail!("no issue tracker configured (set [issues] providers/accounts)");
+        anyhow::bail!("{}", crate::cmd::issue::no_tracker_message(&skipped()));
     }
     let rt = tokio::runtime::Runtime::new()?;
-    let detail = rt
-        .block_on(router.get_issue(issue_id))
-        .map_err(|e| anyhow::anyhow!("fetch issue {issue_id}: {e}"))?;
+    let detail = rt.block_on(router.get_issue(issue_id)).map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            fetch_issue_error_message(issue_id, &e.to_string(), &skipped())
+        )
+    })?;
     let seed = thegn_core::issue::issue_branch_seed(
         detail.issue.branch_hint.as_deref(),
         &detail.issue.number,
     );
     let taken = worktree::BranchSet::load(root);
     Ok(worktree::dedupe(&seed, &taken))
+}
+
+fn fetch_issue_error_message(issue_id: &str, error: &str, skipped: &[String]) -> String {
+    format!(
+        "fetch issue {issue_id}: {error}{}",
+        crate::cmd::issue::plugin_fetch_hint(skipped)
+    )
 }
 
 fn unreadable_note(unreadable_roots: &[String]) -> String {
@@ -1341,6 +1392,67 @@ mod rm_tests {
         assert!(msg.contains("live branches: a, b"), "{msg}");
         assert!(msg.contains("could not read repositories: /gone"), "{msg}");
         assert!(no_match_message("t", &[], &[]).contains("none"));
+    }
+}
+
+#[cfg(test)]
+mod from_issue_tests {
+    use super::{fetch_issue_error_message, resolve_issue_branch_with};
+    use thegn_core::config::Config;
+
+    #[test]
+    fn from_issue_without_tracker_names_skipped_plugin_providers() {
+        let root = tempfile::tempdir().unwrap();
+        let error = resolve_issue_branch_with(
+            &Config::default(),
+            root.path(),
+            "THE-1",
+            &["demo (Demo)".to_owned()],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no issue tracker configured"), "{error}");
+        assert!(error.contains("demo (Demo)"), "{error}");
+        assert!(
+            error.contains("only available in the running thegn UI"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn from_issue_without_tracker_or_plugins_keeps_the_old_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let error = resolve_issue_branch_with(&Config::default(), root.path(), "THE-1", &[])
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "no issue tracker configured (set [issues] providers/accounts)"
+        );
+    }
+
+    #[test]
+    fn from_issue_fetch_failure_keeps_old_text_without_plugin_providers() {
+        assert_eq!(
+            fetch_issue_error_message("THE-1", "offline", &[]),
+            "fetch issue THE-1: offline"
+        );
+    }
+
+    #[test]
+    fn from_issue_fetch_failure_names_skipped_plugin_providers() {
+        let error = fetch_issue_error_message(
+            "THE-1",
+            "offline",
+            &["demo (Demo)".to_owned(), "multi (First)".to_owned()],
+        );
+
+        assert_eq!(
+            error,
+            "fetch issue THE-1: offline; plugin issue provider(s) demo (Demo), multi (First) are only available in the running thegn UI"
+        );
     }
 }
 

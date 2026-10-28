@@ -297,6 +297,12 @@ impl WorkspacePool {
         // project. Callers that know which worktree the user left step back onto
         // it first; this is the floor for the ones that don't.
         rw.active = rw.landing_index();
+        // An emptied session after removing its active workspace has nothing
+        // to park. Keeping it under "" would consume a pool slot and could
+        // evict a real parked workspace.
+        if repo.is_empty() && rw.worktrees.is_empty() {
+            return;
+        }
         if self.limit == Some(0) {
             for id in rw.pane_ids() {
                 panes.detach_pane(id);
@@ -481,5 +487,48 @@ mod tests {
             &mut p,
         );
         assert!(pool.detach_exited_terminal_pane(40).is_none());
+    }
+
+    #[test]
+    fn stash_never_parks_an_empty_unnamed_session() {
+        let mut pool = WorkspacePool::default();
+        let mut p = panes();
+
+        pool.stash(
+            String::new(),
+            ResidentWorkspace {
+                worktrees: Vec::new(),
+                active: 0,
+            },
+            &mut p,
+        );
+
+        assert!(!pool.contains(""));
+    }
+
+    #[test]
+    fn stash_of_an_empty_unnamed_session_never_evicts_a_parked_workspace() {
+        let mut pool = WorkspacePool::default();
+        pool.set_limit(1);
+        let mut p = panes();
+
+        pool.stash(
+            "repo".into(),
+            ResidentWorkspace {
+                worktrees: vec![group("home", GroupKind::Home, 40)],
+                active: 0,
+            },
+            &mut p,
+        );
+        pool.stash(
+            String::new(),
+            ResidentWorkspace {
+                worktrees: Vec::new(),
+                active: 0,
+            },
+            &mut p,
+        );
+
+        assert!(pool.contains("repo"));
     }
 }

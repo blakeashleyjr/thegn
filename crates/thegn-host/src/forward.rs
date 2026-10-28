@@ -6,9 +6,9 @@
 //! mpsc channel, pulsing the `TerminalWaker` exactly like the config/LSP/share
 //! producers. The event loop drains the channel and, for each appeared port,
 //! binds a free host port and spawns a userspace TCP proxy that bridges
-//! `localhost:<host_port>` into the container's network namespace via
-//! `podman exec` — so a dev server started *after* the sandbox came up is
-//! previewable at `http://localhost:<host_port>` without a create-time `-p`.
+//! `localhost:<host_port>` into the container's network namespace through the
+//! one runtime that holds it — so a dev server started *after* the sandbox came
+//! up is previewable at `http://localhost:<host_port>` without a create-time `-p`.
 //!
 //! Detection (a subprocess `ss`) runs on the detector thread; the proxy's
 //! per-connection `exec` children run inside tokio tasks. The loop itself only
@@ -41,6 +41,8 @@ pub enum ForwardEvent {
         worktree: String,
         container_port: u16,
     },
+    /// The detector will not forward this worktree's ports; `reason` names why.
+    Refused { worktree: String, reason: String },
 }
 
 /// A render-facing snapshot of one active forward (mirrored into `FrameModel`).
@@ -306,11 +308,16 @@ pub fn spawn_detector(
         // it gets re-forwarded, which a stale snapshot would suppress.
         let mut tracked: Option<String> = None;
         let mut last: BTreeSet<u16> = BTreeSet::new();
+        let mut runtime: Option<Vec<String>> = None;
+        let mut reported: Option<String> = None;
         let mut probe_failures: u32 = 0;
         loop {
             let wt = target.lock().unwrap().clone();
             if wt != tracked {
                 last.clear();
+                runtime = None;
+                reported = None;
+                probe_failures = 0;
                 tracked = wt.clone();
             }
             let mut sleep = idle_backoff;
@@ -329,14 +336,37 @@ pub fn spawn_detector(
                 // ports register as `appeared` and re-forward. (With `last`
                 // held forever, a same-port restart never re-established
                 // its forwards until a worktree switch away and back.)
-                match thegn_svc::forward::probe_container_ports(&container) {
-                    Err(_) => {
+                let probe = match runtime.as_deref() {
+                    Some(prefix) => thegn_svc::forward::probe_ports_in(prefix, &container)
+                        .map(|ports| (prefix.to_vec(), ports)),
+                    None => thegn_svc::forward::resolve_container_runtime(&container),
+                };
+                match probe {
+                    Err(error) => {
+                        runtime = None;
+                        if let Some(refusal) =
+                            error.downcast_ref::<thegn_svc::forward::AmbiguousRuntime>()
+                        {
+                            let reason = refusal.to_string();
+                            if should_report(&mut reported, &reason)
+                                && tx
+                                    .send(ForwardEvent::Refused {
+                                        worktree: wt.clone(),
+                                        reason,
+                                    })
+                                    .is_ok()
+                            {
+                                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                            }
+                        }
                         probe_failures += 1;
                         if probe_failures >= 3 && !last.is_empty() {
                             last.clear();
                         }
                     }
-                    Ok((runtime, now)) => {
+                    Ok((rt, now)) => {
+                        runtime = Some(rt.clone());
+                        reported = None;
                         probe_failures = 0;
                         sleep = poll;
                         let (appeared, disappeared) = diff_listening(&last, &now);
@@ -347,7 +377,7 @@ pub fn spawn_detector(
                                 .send(ForwardEvent::Detected {
                                     worktree: wt.clone(),
                                     container_port: p,
-                                    runtime: runtime.clone(),
+                                    runtime: rt.clone(),
                                 })
                                 .is_ok()
                             {
@@ -384,9 +414,29 @@ pub fn spawn_detector(
     .ok(); // best-effort: spawn failure is now logged above
 }
 
+fn should_report(last: &mut Option<String>, reason: &str) -> bool {
+    if last.as_deref() == Some(reason) {
+        return false;
+    }
+    *last = Some(reason.to_string());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_is_reported_once_per_reason() {
+        let mut reported = None;
+
+        assert!(should_report(&mut reported, "ambiguous podman/docker"));
+        assert!(!should_report(&mut reported, "ambiguous podman/docker"));
+        assert!(should_report(
+            &mut reported,
+            "ambiguous docker/rootful podman"
+        ));
+    }
 
     #[test]
     fn start_refuses_a_non_loopback_bind_without_opt_in() {

@@ -28,6 +28,16 @@ fn close_selection(
     }
 }
 
+/// The location a background close tears down; an unreadable location produces a warning because path-only cleanup
+/// can leave a remote sandbox running.
+fn close_location(path: &str, resolved: Result<GitLoc, String>) -> Result<GitLoc, String> {
+    resolved.map_err(|error| {
+        format!(
+            "Worktree location could not be read while closing {path}; path-only cleanup may leave its SSH sandbox container running ({error})"
+        )
+    })
+}
+
 /// Deliver warnings from off-loop teardown work to stderr or the active TUI.
 fn warn_visible_with(text: &str, tui_active: bool, show: impl FnOnce(&str)) {
     thegn_core::msg::warn(text);
@@ -90,7 +100,16 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
         return;
     };
     let worktree = std::path::Path::new(path);
-    let loc = GitLoc::for_worktree(worktree);
+    let loc = match close_location(path, GitLoc::for_worktree_op(worktree, "close teardown")) {
+        Ok(loc) => loc,
+        Err(warning) => {
+            tracing::warn!(target: "thegn::lifecycle", worktree = path, %warning,
+                "worktree location unreadable during close; tearing down by path only");
+            warn_visible(&warning);
+            thegn_core::sandbox::teardown_by_path(path);
+            return;
+        }
+    };
     let repo_root =
         thegn_core::repo::main_worktree(worktree).unwrap_or_else(|| worktree.to_path_buf());
     let read = thegn_core::db::Db::open().and_then(|db| {
@@ -114,7 +133,9 @@ pub(crate) fn background_close(cfg: Option<&thegn_core::config::Config>, path: &
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, close_selection, placed_teardown_warning, route, warn_visible_with};
+    use super::{
+        Route, close_location, close_selection, placed_teardown_warning, route, warn_visible_with,
+    };
     use thegn_core::placement::{Placement, ProviderPlacement, SshPlacement, TransportKind};
 
     #[test]
@@ -158,6 +179,28 @@ mod tests {
             Ok(Some("box".into()))
         );
         assert_eq!(close_selection("/wt", Ok(None)), Ok(None));
+    }
+
+    #[test]
+    fn close_location_refuses_an_unreadable_location() {
+        let Err(warning) = close_location(
+            "/wt",
+            Err("close teardown refused: cannot read where /wt lives (unrecognised worktree location)".into()),
+        ) else {
+            panic!("unreadable location must report the possible remote residual");
+        };
+        assert!(warning.contains("SSH sandbox container running"));
+        assert!(warning.contains("unrecognised worktree location"));
+    }
+
+    #[test]
+    fn close_location_passes_a_location_through() {
+        use thegn_core::remote::GitLoc;
+
+        assert!(matches!(
+            close_location("/wt", Ok(GitLoc::Local("/wt".into()))),
+            Ok(GitLoc::Local(_))
+        ));
     }
 
     #[test]

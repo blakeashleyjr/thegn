@@ -89,8 +89,10 @@ admitted with.
   limit is reached or its previous run is still going; missed ticks are
   skipped and never replayed. A palette action reports `... is already running` or
   `... not started: too many plugin runs in flight (4 max)` in the status
-  line. A run still in progress when its plugin is disabled, plugins are
-  reloaded, or thegn quits finishes, but its output is discarded.
+  line. A run still in progress when its plugin is disabled or plugins are
+  reloaded is stopped: its process group is killed and its output discarded.
+  A run in flight when thegn quits is killed with thegn on a best-effort
+  basis.
 - `mode = "resident"`: one long-lived process for the session; thegn sends
   `activate`, then `render` per cadence, and `deactivate` on shutdown.
 
@@ -179,8 +181,10 @@ the native-trust state of each enabled plugin. Use `thegn plugin list` and
 `thegn plugin check` to inspect and validate plugin declarations.
 
 Plugin issue providers are served only by the running UI; the standalone
-`thegn issue list --status …` queries only your configured `[issues]` accounts
-and names any plugin issue providers it skipped on stderr.
+`thegn issue list --status …` uses only your configured `[issues]` accounts
+and names skipped plugin issue providers on stderr. `thegn wt new --from-issue`
+also uses only those accounts and names skipped providers when it cannot resolve
+the issue because no tracker is configured or the fetch fails.
 
 ## Capabilities and host calls
 
@@ -229,13 +233,19 @@ If the plugin host, restart worker, or a scheduled run cannot start, the status
 line reports the failure. A restart that cannot be scheduled counts as a failed
 restart, so the plugin is disabled after the usual attempts. A scheduled run
 start failure is reported once until a run starts successfully.
+A failed one-shot run (non-zero exit, timeout, start or protocol failure) is
+reported on the status line: every time for a palette action, once per distinct
+failure for a scheduled run until a run succeeds. The plugin's stderr is never
+shown there; use `thegn plugin check` or debug logging.
 Each resident process has its own session generation. After a reload or restart
 replaces a process, late events from that old process are ignored, so its exit
 cannot stop the new process or schedule another restart.
 Resident-plugin stderr is drained and, when debug logging is enabled, written
 to the debug log at most 20 lines per second; a line is capped at 512 bytes,
 and excess lines are suppressed. thegn keeps the last 8 KiB and line counts
-internally; no command shows them yet.
+internally; no command shows them yet. On Linux, stopping or timing out a
+resident plugin also kills descendant processes it started in a new session,
+such as with `setsid`, while they remain its descendants.
 Plugin processes are _not sandboxed_ — treat a plugin like any program you
 choose to run. For a non-empty list, `thegn plugin list` ends with a note that
 capabilities are not containment (its `--json` rows carry `"containment": "none"`),

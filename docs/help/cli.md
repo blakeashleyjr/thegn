@@ -316,7 +316,10 @@ nothing was removed.
 On the dev channel, `thegn host rm <name>` refuses without removing anything
 if it cannot read the host's placement tenants, and `thegn placement list`
 reports an error if it cannot read recorded state instead of showing an empty
-result.
+result. On the dev channel, `thegn placement plan` uses the worktree's pinned
+environment or its workspace default; if that selection or the state database
+cannot be read, it exits with the cause when a non-local environment, pinned
+host or placement engine is configured.
 
 On the dev channel, when `[placement]` autoscale creates a host, the worktree
 is reserved there. If the host definition cannot be read or it has no free
@@ -325,6 +328,9 @@ creating more hosts. If an idle autoscale host cannot be removed because its
 token or ledger record is unavailable, or the destroy fails, thegn warns each
 time; while the UI runs it shows one status line and toast per host, naming the
 provider and saying the host keeps running and billing.
+On the dev channel, scale-down also keeps and warns by name about an engine
+host whose tenant count or last use cannot be read, or whose creation time and
+use are both unrecorded; it never treats that missing age as idle.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller

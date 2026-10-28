@@ -233,6 +233,11 @@ than resolving it from the pane environment. Loader variables such as `LD_*`
 and `DYLD_*` are withheld from the outer launcher. Under `bwrap` they are set
 again inside the sandbox; a `systemd-run` launch without `bwrap` drops them.
 
+If the systemd backend cannot create a pane's protected environment file, the
+pane still starts without those host-sourced secrets. The launch warning names
+each omitted secret key, never its value; secrets are not put on the command
+line.
+
 For local rootless Podman, the first thegn command is the `version` liveness
 probe, before container creation or the events client. The `podman events`
 client runs in its own process group, which thegn kills at shutdown and on
@@ -576,6 +581,9 @@ while it is queued, followed by the result, and raising the target stops at
 eight spares for the workspace's environment.
 If the spare ledger cannot be read, reconciliation warns and makes no pool
 changes rather than treating the pool as empty.
+When a worktree opens and its spare ledger cannot be read, a warning appears on
+the status line and in a toast, and the worktree is provisioned fresh instead
+of claiming a spare.
 If the current warm-pool target cannot be read, reconciliation makes no pool
 changes rather than falling back to the configured size. The warm-pool keys
 report `warm pool: cannot read the current target: ...` and save nothing.
@@ -613,6 +621,17 @@ SSH sandbox teardown identifies the container that may still be running, and
 hibernation refuses a restore when its record cannot be read while hibernation
 is enabled. Teardown and close auto-checkpoint warnings appear on the status
 line and in a toast while the TUI runs; the CLI prints them to stderr.
+
+An unreadable recorded worktree location makes the control API's commit, review handoff,
+autopilot push or worker sandbox, `thegn issue create` and `thegn issue comment`, PR creation,
+worktree-resolving `thegn env` commands, `thegn repo trust` and submodule init refuse. Background
+fetch and merged-worktree cleanup skip it. On the dev channel, hibernation refuses and its
+bridge-key drop warns and skips; provider provisioning and attach, provider and host worktree
+pipelines, and host placement refuse too. A plain local worktree is unaffected unless a provider
+or host placement is configured. Also on the dev channel, failed agent-login uploads mark “Sync
+agent logins” Failed with one line per account but do not stop provisioning. The resident bridge
+uses the pinned environment or workspace default; if that selection is unreadable, it skips
+connecting and logs a warning.
 
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and
@@ -774,11 +793,10 @@ comparing each file with what the upload sent: a file the sandbox did not
 change never overwrites a local edit. A file changed in both places (or deleted
 locally and changed in the sandbox) stops the sync with a list of files; nothing
 is written locally and the sandbox is kept. Make each listed file match one
-copy and close again. Files and directories your `.gitignore` or `.ignore` files
-exclude are not compared or copied back (the upload skips them too), so build
-output never blocks the sync; a file excluded only by a global or
-`.git/info/exclude` rule is still compared. Files deleted in the sandbox are not
-deleted locally.
+copy and close again. Files and directories excluded by `.gitignore`, `.ignore`,
+`.git/info/exclude` or your global git excludes file are not compared or copied
+back (the upload skips them too), so build output never blocks the sync. Files
+deleted in the sandbox are not deleted locally.
 
 ## Inspecting
 

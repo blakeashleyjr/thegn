@@ -54,6 +54,9 @@ const STEM: &str = "tg-hib";
 /// Age before a crashed-`capturing` row is discarded / a `destroying` row is
 /// re-driven by the healing sweep.
 const HEAL_AFTER_SECS: u64 = 10 * 60;
+/// Prints the attached login-session count, or a sentinel when the image has no `who`.
+const ATTACHED_SESSIONS_SCRIPT: &str =
+    "if command -v who >/dev/null 2>&1; then who | wc -l; else echo TG-WHO-UNAVAILABLE; fi";
 
 /// Per-worktree failure backoff (in-memory: a restart retries, which is fine —
 /// the failure will just repeat its warning if it persists).
@@ -388,15 +391,21 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
 
     // Sandbox-side pane guard: an attached interactive shell (an ssh pts
     // session on a VPS) means someone may be mid-something — skip quietly.
+    // An unknown count fails the cycle, so the caller keeps the sandbox,
+    // warns and backs off instead of treating uncertainty as an empty sandbox.
     // (`who` misses exotic attach paths; VPS panes are ssh and do show up.)
     let who = exec_capture(
         &provider,
         &name,
-        "who 2>/dev/null | wc -l",
+        ATTACHED_SESSIONS_SCRIPT,
         Duration::from_secs(30),
     )?;
-    if who.trim().lines().last().unwrap_or("0").trim() != "0" {
-        return Ok(());
+    match attached_sessions(&who) {
+        Ok(0) => {}
+        Ok(_) => return Ok(()),
+        Err(why) => {
+            anyhow::bail!("cannot tell whether a shell is attached ({why}); hibernation skipped")
+        }
     }
 
     let db = thegn_core::db::Db::open()?;
@@ -439,6 +448,22 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
     db.put_hibernation(&row)?;
     finish_destroy(cfg, &row);
     Ok(())
+}
+
+/// Attached interactive sessions from [`ATTACHED_SESSIONS_SCRIPT`]'s output:
+/// the last non-empty line must be a decimal count. `Err` names why the count
+/// is unknown (no `who` in the sandbox, no output, or an unrecognised line).
+fn attached_sessions(output: &str) -> Result<u64, String> {
+    let Some(line) = output.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+        return Err("the attached-session check printed nothing".into());
+    };
+
+    if line == "TG-WHO-UNAVAILABLE" {
+        return Err("`who` is not available in the sandbox".into());
+    }
+
+    line.parse::<u64>()
+        .map_err(|_| format!("unrecognised attached-session count {line:?}"))
 }
 
 /// The snapshot a re-provision must overlay, from an already-performed record
@@ -1358,5 +1383,41 @@ mod tests {
             hibernated_state("/wt", Ok(Some(row("hibernated", "x")))),
             Some(true)
         );
+    }
+
+    #[test]
+    fn attached_sessions_reads_a_count() {
+        assert_eq!(attached_sessions("0\n").unwrap(), 0);
+        assert_eq!(attached_sessions("2\n").unwrap(), 2);
+    }
+
+    #[test]
+    fn attached_sessions_skips_profile_noise_before_the_count() {
+        assert_eq!(attached_sessions("Welcome to box\n\n 0 \n").unwrap(), 0);
+    }
+
+    #[test]
+    fn attached_sessions_is_unknown_without_who() {
+        assert!(
+            attached_sessions("TG-WHO-UNAVAILABLE\n")
+                .unwrap_err()
+                .contains("who")
+        );
+    }
+
+    #[test]
+    fn attached_sessions_is_unknown_for_empty_or_garbled_output() {
+        assert!(attached_sessions("").unwrap_err().contains("nothing"));
+        assert!(
+            attached_sessions("zero\n")
+                .unwrap_err()
+                .contains("unrecognised")
+        );
+    }
+
+    #[test]
+    fn attached_sessions_script_checks_for_who() {
+        assert!(ATTACHED_SESSIONS_SCRIPT.contains("command -v who"));
+        assert!(ATTACHED_SESSIONS_SCRIPT.contains("TG-WHO-UNAVAILABLE"));
     }
 }

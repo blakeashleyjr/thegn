@@ -192,9 +192,11 @@ pub(crate) enum PluginMsg {
         session: SessionGen,
         event: SessionEvent,
     },
-    /// One completed `spawn_ndjson` run of a one-shot plugin.
+    /// One completed `spawn_ndjson` run of a one-shot plugin. `invoked` is
+    /// true when the user started it from the palette rather than a schedule.
     OneShot {
         plugin: String,
+        invoked: bool,
         run: Result<PluginRun, PluginError>,
     },
     /// A backoff-scheduled restart finished; `writer` is `None` when the
@@ -726,12 +728,16 @@ impl PluginsHost {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let id = plugin.spec.manifest.id.as_str().to_string();
             let run = match thegn_svc::plugin::resolve_launch_env(&plugin, &state_anchor) {
-                Ok(env) => thegn_svc::plugin::spawn_ndjson(
-                    &plugin.spec.command,
-                    &env,
-                    plugin.effective_cwd().as_deref(),
-                    plugin.spec.run_timeout(),
-                ),
+                Ok(env) => {
+                    let cancel = || late.drops(&id);
+                    thegn_svc::plugin::spawn_ndjson_cancellable(
+                        &plugin.spec.command,
+                        &env,
+                        plugin.effective_cwd().as_deref(),
+                        plugin.spec.run_timeout(),
+                        &cancel,
+                    )
+                }
                 Err(problem) => {
                     drop(ticket);
                     if let Err(error) = tx.send(PluginMsg::Refused(vec![problem])) {
@@ -749,7 +755,11 @@ impl PluginsHost {
                 return;
             }
             // best-effort: the loop may be shutting down.
-            let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
+            let _ = tx.send(PluginMsg::OneShot {
+                plugin: id,
+                invoked: true,
+                run,
+            });
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
         match spawn {
@@ -1024,14 +1034,25 @@ fn start_poll_worker(
     let worker_late = late.clone();
     match thegn_core::thread_name::try_spawn_named("thegn-plug-poll", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        let run = thegn_svc::plugin::spawn_ndjson(&command, &env, cwd.as_deref(), timeout);
+        let cancel = || worker_late.drops(&plugin);
+        let run = thegn_svc::plugin::spawn_ndjson_cancellable(
+            &command,
+            &env,
+            cwd.as_deref(),
+            timeout,
+            &cancel,
+        );
         drop(ticket);
         if worker_late.drops(&plugin) {
             tracing::debug!(target: "thegn::plugin", plugin = %plugin, "one-shot result dropped: plugin disabled or host stopped while it ran");
             return;
         }
         // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = worker_tx.send(PluginMsg::OneShot { plugin, run });
+        let _ = worker_tx.send(PluginMsg::OneShot {
+            plugin,
+            invoked: false,
+            run,
+        });
         if let Some(waker) = &worker_waker {
             let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
         }
@@ -2914,7 +2935,7 @@ mod tests {
         );
         let fast_completed = matches!(
             recv_within(&mut rx, Duration::from_secs(10)),
-            Some(PluginMsg::OneShot { plugin, run: Ok(_) }) if plugin == "b-fast"
+            Some(PluginMsg::OneShot { plugin, run: Ok(_), .. }) if plugin == "b-fast"
         );
         let fast_marker_exists = marker.exists();
         let slow_not_completed_before_release =
@@ -2922,7 +2943,7 @@ mod tests {
         std::fs::write(&release, "go").unwrap();
         let slow_completed = matches!(
             recv_within(&mut rx, Duration::from_secs(10)),
-            Some(PluginMsg::OneShot { plugin, run: Ok(_) }) if plugin == "a-slow"
+            Some(PluginMsg::OneShot { plugin, run: Ok(_), .. }) if plugin == "a-slow"
         );
         setup.join().unwrap();
 
@@ -2986,7 +3007,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
         assert!(matches!(
             recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
-            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
+            PluginMsg::OneShot { plugin, run: Ok(_), .. } if plugin == "hello"
         ));
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "s3cr3t");
         assert!(rx.try_recv().is_err());
@@ -3036,7 +3057,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
         assert!(matches!(
             recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
-            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
+            PluginMsg::OneShot { plugin, run: Ok(_), .. } if plugin == "hello"
         ));
         assert_eq!(
             std::fs::read_to_string(marker).unwrap(),
@@ -3128,7 +3149,7 @@ mod tests {
         ));
         assert!(matches!(
             recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
-            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "survivor"
+            PluginMsg::OneShot { plugin, run: Ok(_), .. } if plugin == "survivor"
         ));
         assert!(!refused_marker.exists());
         assert!(other_marker.exists());

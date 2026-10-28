@@ -190,8 +190,8 @@ pub(crate) fn pane_shell_argv(
 /// isolation floor after resolution, including host fallbacks. This is the
 /// single spec builder shared by every terminal spawn, all of which run
 /// OFF-THREAD (the lazy materialize in `handlers::materialize` and the run-loop
-/// prewarm worker, both on `spawn_blocking`): `sandbox_wrap_shell` below opens
-/// SQLite and shells out to git, so this must not be called on the event loop.
+/// prewarm worker, both on `spawn_blocking`): `sandbox_wrap_shell` below shells
+/// out to git, so this must not be called on the event loop.
 pub(crate) fn terminal_launch_spec(
     cfg: &thegn_core::config::Config,
     connection: &str,
@@ -205,7 +205,7 @@ pub(crate) fn terminal_launch_spec(
     // ensure/create/pull happens while building the wrap — the sandbox command
     // self-provisions at exec (bwrap runs immediately, `podman run` pulls on
     // first use) — but resolution itself is NOT free: `sandbox_wrap_shell`
-    // opens SQLite, runs a git subprocess, and probes backends, which is why
+    // runs a git subprocess and probes backends, which is why
     // every caller of this builder runs off-thread.
     let backend = sandbox_backend.trim();
     if connection.is_empty() && !backend.is_empty() && backend != "host" && backend != "none" {
@@ -393,9 +393,8 @@ struct WrappedShell {
 /// caller labels and admits that host fallback against the isolation floor.
 /// Invalid volume input is an error and becomes a visible refusal at the caller.
 /// No provisioning happens here, but this is NOT loop-safe:
-/// `GitLoc::for_worktree` opens + reads SQLite (up to
-/// the 5s busy-timeout under a writer), `resolve_placed` shells out to
-/// `git rev-parse`, and backend availability probing can run
+/// `resolve_placed` shells out to `git rev-parse`, and backend availability
+/// probing can run
 /// `sudo -n podman version` — run it off-thread (`handlers::materialize` /
 /// the prewarm worker do).
 fn sandbox_wrap_shell(
@@ -430,7 +429,7 @@ fn sandbox_wrap_shell(
     let mut sb = cfg.sandbox.clone();
     sb.enabled = true;
     sb.backend = be;
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&home));
+    let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(&home));
     let name = thegn_core::sandbox::container_name(&home);
     let Some(mut spec) = thegn_core::sandbox::resolve_placed(
         &sb,

@@ -150,7 +150,8 @@ nix flake ship only `thegn`: build the proxy from a source checkout with
 `cargo install --path crates/thegn-proxy` and put it beside `thegn` or on
 `PATH`. `thegn doctor` reports where it found `tgproxy`, or `not installed`.
 A non-executable `tgproxy` beside `thegn` is skipped in favour of `PATH`, and
-doctor names the skipped sibling.
+doctor names the skipped sibling. `thegn doctor --json` reports it as
+`model_proxy.tgproxy_skipped` (null when none is skipped).
 
 When the opt-in model proxy is enabled (`[model_proxy] enabled = true`), the
 **System ▸ Usage** section and the `Alt-u` overlay grow a **model-proxy spend**
