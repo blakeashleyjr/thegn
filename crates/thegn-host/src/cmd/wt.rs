@@ -226,10 +226,7 @@ fn new(
     // any positional `name`.
     let issue_id = from_issue.filter(|s| !s.trim().is_empty());
     let issue_branch = match &issue_id {
-        Some(id) => {
-            let skipped = crate::cmd::issue::skipped_plugin_issue_providers(cfg, config_dir);
-            Some(resolve_issue_branch_with(cfg, &root, id, &skipped)?)
-        }
+        Some(id) => Some(resolve_issue_branch(cfg, &root, id, config_dir)?),
         None => None,
     };
 
@@ -1018,23 +1015,43 @@ fn new_batched(
 /// from the configured tracker, derive the seed branch ([`thegn_core::issue::issue_branch_seed`]),
 /// then de-duplicate against the repo's existing branches — exactly the `D` key
 /// / `worktrees.create` derivation, so the doors cannot drift.
+fn resolve_issue_branch(
+    cfg: &Config,
+    root: &std::path::Path,
+    issue_id: &str,
+    config_dir: &std::path::Path,
+) -> Result<String> {
+    resolve_issue_branch_lazy(cfg, root, issue_id, || {
+        crate::cmd::issue::skipped_plugin_issue_providers(cfg, config_dir)
+    })
+}
+
 fn resolve_issue_branch_with(
     cfg: &Config,
     root: &std::path::Path,
     issue_id: &str,
     skipped: &[String],
 ) -> Result<String> {
+    resolve_issue_branch_lazy(cfg, root, issue_id, || skipped.to_vec())
+}
+
+fn resolve_issue_branch_lazy(
+    cfg: &Config,
+    root: &std::path::Path,
+    issue_id: &str,
+    skipped: impl Fn() -> Vec<String>,
+) -> Result<String> {
     // Repo-resolved so the repo overlay's restrictions/pins (account filter,
     // team id) apply; the overlay can only narrow, never add accounts.
     let router = thegn_svc::issue::IssueRouter::from_config(&cfg.repo_issues(Some(root)));
     if !router.is_configured() {
-        anyhow::bail!("{}", crate::cmd::issue::no_tracker_message(skipped));
+        anyhow::bail!("{}", crate::cmd::issue::no_tracker_message(&skipped()));
     }
     let rt = tokio::runtime::Runtime::new()?;
     let detail = rt.block_on(router.get_issue(issue_id)).map_err(|e| {
         anyhow::anyhow!(
-            "fetch issue {issue_id}: {e}{}",
-            crate::cmd::issue::plugin_fetch_hint(skipped)
+            "{}",
+            fetch_issue_error_message(issue_id, &e.to_string(), &skipped())
         )
     })?;
     let seed = thegn_core::issue::issue_branch_seed(
@@ -1043,6 +1060,13 @@ fn resolve_issue_branch_with(
     );
     let taken = worktree::BranchSet::load(root);
     Ok(worktree::dedupe(&seed, &taken))
+}
+
+fn fetch_issue_error_message(issue_id: &str, error: &str, skipped: &[String]) -> String {
+    format!(
+        "fetch issue {issue_id}: {error}{}",
+        crate::cmd::issue::plugin_fetch_hint(skipped)
+    )
 }
 
 fn unreadable_note(unreadable_roots: &[String]) -> String {
@@ -1372,7 +1396,7 @@ mod rm_tests {
 
 #[cfg(test)]
 mod from_issue_tests {
-    use super::resolve_issue_branch_with;
+    use super::{fetch_issue_error_message, resolve_issue_branch_with};
     use thegn_core::config::Config;
 
     #[test]
@@ -1405,6 +1429,28 @@ mod from_issue_tests {
         assert_eq!(
             error,
             "no issue tracker configured (set [issues] providers/accounts)"
+        );
+    }
+
+    #[test]
+    fn from_issue_fetch_failure_keeps_old_text_without_plugin_providers() {
+        assert_eq!(
+            fetch_issue_error_message("THE-1", "offline", &[]),
+            "fetch issue THE-1: offline"
+        );
+    }
+
+    #[test]
+    fn from_issue_fetch_failure_names_skipped_plugin_providers() {
+        let error = fetch_issue_error_message(
+            "THE-1",
+            "offline",
+            &["demo (Demo)".to_owned(), "multi (First)".to_owned()],
+        );
+
+        assert_eq!(
+            error,
+            "fetch issue THE-1: offline; plugin issue provider(s) demo (Demo), multi (First) are only available in the running thegn UI"
         );
     }
 }
