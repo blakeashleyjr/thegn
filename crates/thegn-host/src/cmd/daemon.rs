@@ -138,7 +138,7 @@ fn stop_verdict(ours_total: usize, failures: &[String], unknown: &[String]) -> R
     }
     if !unknown.is_empty() {
         details.push(format!(
-            "{} not confirmed stopped ({})",
+            "{} not confirmed ({})",
             unknown.len(),
             unknown.join(", ")
         ));
@@ -326,27 +326,34 @@ mod tests {
     use std::time::Duration;
     use thegn_core::config::{Config, DaemonConfig};
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stop_reports_an_unverified_listener_as_unknown_and_fails() {
+    #[test]
+    fn stop_reports_an_unverified_listener_as_unknown_and_fails() {
         if !crate::platform::sound_process::test_support::UNIX {
             return;
         }
         let _state = crate::testenv::IsolatedState::new();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("daemon.sock");
         let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
-        let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
-            .await
-            .unwrap()
-        {
-            thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
-            thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
-        };
-        let accept_task = tokio::spawn(async move {
-            let mut listener = listener;
-            while let Ok(stream) = listener.accept_stream().await {
-                drop(stream);
-            }
+        let accept_task = rt.block_on(async {
+            let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
+                .await
+                .unwrap()
+            {
+                thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
+                thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+            };
+            tokio::spawn(async move {
+                let mut listener = listener;
+                while let Ok(stream) = listener.accept_stream().await {
+                    drop(stream);
+                }
+            })
         });
         let config = Config {
             daemon: DaemonConfig {
@@ -356,17 +363,21 @@ mod tests {
             ..Default::default()
         };
 
-        let result = super::stop(&config);
+        let result = rt
+            .block_on(tokio::task::spawn_blocking(move || super::stop(&config)))
+            .unwrap();
 
-        accept_task.abort();
-        assert!(accept_task.await.is_err());
+        rt.block_on(async {
+            accept_task.abort();
+            assert!(accept_task.await.is_err());
+        });
         let error = result.expect_err("an unverified listener must fail daemon stop");
         assert!(
             error.to_string().contains(&socket.display().to_string()),
             "the failure must name the unverified socket: {error}"
         );
         assert!(
-            error.to_string().contains("not confirmed stopped"),
+            error.to_string().contains("not confirmed"),
             "unverified listeners must be included in the unknown stop verdict: {error}"
         );
     }
