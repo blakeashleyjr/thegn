@@ -1564,7 +1564,7 @@ mod process_tree_deadline_tests {
             &[
                 "sh".into(),
                 "-c".into(),
-                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"log\",\"params\":{}}'".into(),
+                "printf '%s\\n' '{\"method\":\"log\",\"params\":{}}'".into(),
             ],
             &BTreeMap::new(),
             None,
