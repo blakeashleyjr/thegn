@@ -9,6 +9,10 @@ fn ports(values: &[u16]) -> BTreeSet<u16> {
     values.iter().copied().collect()
 }
 
+fn names(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
 #[test]
 fn pick_runtime_uses_the_only_runtime_that_reached() {
     let result = pick_runtime(
@@ -21,7 +25,7 @@ fn pick_runtime_uses_the_only_runtime_that_reached() {
     )
     .unwrap();
 
-    assert_eq!(result, (vec!["podman".to_string()], ports(&[3000])));
+    assert_eq!(result, (names(&["podman"]), ports(&[3000])));
 }
 
 #[test]
@@ -40,10 +44,7 @@ fn pick_runtime_refuses_a_name_reached_in_two_runtimes() {
     let refusal = error
         .downcast_ref::<AmbiguousRuntime>()
         .expect("ambiguous reach must retain its typed refusal");
-    assert_eq!(
-        refusal.runtimes,
-        vec!["podman".to_string(), "docker".to_string()]
-    );
+    assert_eq!(refusal.runtimes, names(&["podman", "docker"]));
     let message = error.to_string();
     assert!(message.contains("thegn-app"));
     assert!(message.contains("podman"));
