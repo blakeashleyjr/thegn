@@ -2872,6 +2872,8 @@ mod tests {
                 )),
             },
         );
+        assert!(model.status.contains("plugin p"));
+        assert!(model.status.contains('\u{fffd}'));
         assert!(!model.status.contains('\u{1b}'));
     }
 
