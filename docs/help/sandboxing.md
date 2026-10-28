@@ -619,19 +619,16 @@ hibernation refuses a restore when its record cannot be read while hibernation
 is enabled. Teardown and close auto-checkpoint warnings appear on the status
 line and in a toast while the TUI runs; the CLI prints them to stderr.
 
-An unreadable recorded worktree location also makes the control API's commit,
-review handoff, autopilot push or worker sandbox, `thegn issue create` and
-`thegn issue comment`, PR creation, worktree-resolving `thegn env` commands,
-`thegn repo trust` and submodule init refuse. Background fetch and
-merged-worktree cleanup skip that worktree; hibernation refuses, and its
-bridge-key drop warns and skips. On the dev channel, provider provisioning and
-attach, provider and host worktree pipelines, and host placement also refuse
-when the location cannot be read. A plain local worktree is unaffected unless
-a provider or host placement is configured. If agent login files cannot be
-uploaded to a provider sandbox, the loading screen marks “Sync agent logins”
-Failed with a line for each account and continues provisioning. The resident
-bridge uses the worktree's pinned environment or workspace default; if that
-selection cannot be read, it skips connecting and logs a warning.
+An unreadable recorded worktree location makes the control API's commit, review handoff,
+autopilot push or worker sandbox, `thegn issue create` and `thegn issue comment`, PR creation,
+worktree-resolving `thegn env` commands, `thegn repo trust` and submodule init refuse. Background
+fetch and merged-worktree cleanup skip it. On the dev channel, hibernation refuses and its
+bridge-key drop warns and skips; provider provisioning and attach, provider and host worktree
+pipelines, and host placement refuse too. A plain local worktree is unaffected unless a provider
+or host placement is configured. Also on the dev channel, failed agent-login uploads mark “Sync
+agent logins” Failed with one line per account but do not stop provisioning. The resident bridge
+uses the pinned environment or workspace default; if that selection is unreadable, it skips
+connecting and logs a warning.
 
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and

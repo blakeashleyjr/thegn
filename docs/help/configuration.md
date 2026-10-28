@@ -441,8 +441,8 @@ appear on the status line, in a toast and in the notification inbox.
 If a worktree's env-bundle binding or pinned coding-agent account cannot be
 read, a configured agent launch is refused and a plain shell starts with a
 warning; thegn does not use the agent's default account instead. A split
-preset adds its tab only after at least one pane starts; failed panes are
-reported here.
+preset adds its tab only after at least one pane starts; failed panes appear on
+the status line, in a toast and in the notification inbox, as above.
 
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,
