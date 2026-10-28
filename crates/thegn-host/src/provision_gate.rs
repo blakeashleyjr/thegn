@@ -1303,8 +1303,6 @@ mod tests {
 
     #[test]
     fn spare_ledger_unreadable_warning_names_the_env_worktree_and_cause() {
-        use anyhow::Context as _;
-
         let error = anyhow::anyhow!("no such table: pool_spares")
             .context("warm pool: cannot read ready spares for /r / sprites");
         let warning = spare_ledger_unreadable_warning("sprites", "/wt/a", &error);
