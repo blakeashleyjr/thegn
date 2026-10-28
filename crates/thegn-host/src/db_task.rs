@@ -392,7 +392,9 @@ fn enqueue_latest(writer: &Writer, key: String, job: impl FnOnce(&Db) + Send + '
 
 /// Wait until every earlier channel message has been handled, or `timeout`
 /// elapses. A retained job whose DB open still fails remains pending even when
-/// this barrier acks. Used on workspace switches before resurrecting rows.
+/// this barrier acks. Test-only: production switches order their writes on the
+/// writer itself (workspace_switch_prep).
+#[cfg(test)]
 pub(crate) fn flush(timeout: Duration) -> bool {
     let (ack_tx, ack_rx) = sync_channel(0);
     if writer().tx.send(Msg::Flush(ack_tx)).is_err() {

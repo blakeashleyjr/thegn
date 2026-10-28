@@ -454,11 +454,7 @@ fn hibernate_one(cfg: &Config, worktree: &str, env_name: &str) -> anyhow::Result
 /// the last non-empty line must be a decimal count. `Err` names why the count
 /// is unknown (no `who` in the sandbox, no output, or an unrecognised line).
 fn attached_sessions(output: &str) -> Result<u64, String> {
-    let Some(line) = output
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-    else {
+    let Some(line) = output.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
         return Err("the attached-session check printed nothing".into());
     };
 
