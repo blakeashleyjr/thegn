@@ -1431,7 +1431,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
         Command::Share { action } => cmd::share::run(&cfg, action),
         Command::Forward { action } => cmd::forward::run(action),
-        Command::Wt { action } => cmd::wt::run(&cfg, action),
+        Command::Wt { action } => cmd::wt::run_with_config(&cfg, action, &config_path),
         Command::Repo { action } => cmd::repos::run(&cfg, action),
         // Dispatched before run_subcommand (it may fall through to the TUI);
         // unreachable here, kept for match exhaustiveness.
