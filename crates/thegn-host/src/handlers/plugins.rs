@@ -71,6 +71,9 @@ pub(crate) struct PluginEntry {
     /// Live `provider.call` correlation for resident plugins with provider
     /// contributions (`ExtensionPoint::IssueProvider`); `None` otherwise.
     pub bridge: Option<std::sync::Arc<thegn_svc::plugin::ProviderBridge>>,
+    /// Status text of the last reported one-shot failure; cleared by a
+    /// successful run so a recurring scheduled failure is reported once.
+    last_one_shot_failure: Option<String>,
 }
 
 /// Loop-side plugin state: entries by plugin id (BTreeMap ⇒ stable statusbar
@@ -278,6 +281,7 @@ fn build_entry(st: LoadedState) -> PluginEntry {
         restarts: 0,
         disabled: false,
         bridge,
+        last_one_shot_failure: None,
     }
 }
 
@@ -633,8 +637,15 @@ fn drain_with_responder(
                     }
                 }
             }
-            PluginMsg::OneShot { plugin, run } => match run {
+            PluginMsg::OneShot {
+                plugin,
+                invoked,
+                run,
+            } => match run {
                 Ok(run) => {
+                    if let Some(entry) = state.plugins.get_mut(&plugin) {
+                        entry.last_one_shot_failure = None;
+                    }
                     for line in &run.junk {
                         tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
                     }
@@ -647,6 +658,17 @@ fn drain_with_responder(
                 }
                 Err(e) => {
                     tracing::warn!(target: "thegn::plugin", plugin = %plugin, error = %e, "one-shot run failed");
+                    let text = one_shot_failure_status(&plugin, &e);
+                    let should_report = state.plugins.get(&plugin).is_some_and(|entry| {
+                        invoked || entry.last_one_shot_failure.as_deref() != Some(text.as_str())
+                    });
+                    if should_report {
+                        model.status = text.clone();
+                        damage.merge(PluginDamage::Structural);
+                    }
+                    if let Some(entry) = state.plugins.get_mut(&plugin) {
+                        entry.last_one_shot_failure = Some(text);
+                    }
                 }
             },
             PluginMsg::Respawned {
@@ -728,6 +750,25 @@ fn drain_with_responder(
         ));
     }
     damage
+}
+
+/// Status-line text for a failed one-shot run. A non-zero exit shows only its
+/// code: the plugin's stderr can echo resolved secret env values. Text is
+/// terminal-safe and bounded.
+fn one_shot_failure_status(plugin: &str, error: &thegn_svc::plugin::PluginError) -> String {
+    let status = match error {
+        thegn_svc::plugin::PluginError::Exit {
+            code: Some(code), ..
+        } => format!("plugin {plugin}: one-shot run exited {code}"),
+        thegn_svc::plugin::PluginError::Exit { code: None, .. } => {
+            format!("plugin {plugin}: one-shot run was killed")
+        }
+        other => format!("plugin {plugin}: {other}"),
+    };
+    thegn_core::msg::terminal_safe(&status)
+        .chars()
+        .take(200)
+        .collect()
 }
 
 fn answer_rejected(
@@ -2333,6 +2374,7 @@ mod tests {
         rx.bind_host(102);
         old.send(PluginMsg::OneShot {
             plugin: "p".into(),
+            invoked: false,
             run: Ok(thegn_svc::plugin::PluginRun {
                 messages: vec![msg(
                     "update",
@@ -2727,6 +2769,7 @@ mod tests {
         let (tx, mut rx) = crate::plugins::plugin_channel();
         tx.send(PluginMsg::OneShot {
             plugin: "p".into(),
+            invoked: false,
             run: Ok(run),
         })
         .unwrap();
@@ -2744,6 +2787,92 @@ mod tests {
         drain(&mut rx, &mut state, &mut model, None);
         assert!(rx.is_empty());
         assert_eq!(statusbar_views(&state)[0].1.text_content(), "after-shot");
+    }
+
+    fn failed(invoked: bool, code: i32, stderr: &str) -> PluginMsg {
+        PluginMsg::OneShot {
+            plugin: "p".into(),
+            invoked,
+            run: Err(thegn_svc::plugin::PluginError::Exit {
+                code: Some(code),
+                stderr: stderr.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn scheduled_one_shot_failure_reaches_the_status_line_once() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+
+        drain_one(&mut state, &mut model, failed(false, 2, ""));
+        assert!(model.status.contains("plugin p"));
+        assert!(model.status.contains("exited 2"));
+
+        model.status = "other".into();
+        drain_one(&mut state, &mut model, failed(false, 2, ""));
+        assert_eq!(model.status, "other");
+    }
+
+    #[test]
+    fn invoked_one_shot_failure_is_reported_every_time() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+
+        drain_one(&mut state, &mut model, failed(true, 2, ""));
+        model.status = "other".into();
+        drain_one(&mut state, &mut model, failed(true, 2, ""));
+        assert!(model.status.contains("plugin p"));
+        assert!(model.status.contains("exited 2"));
+    }
+
+    #[test]
+    fn one_shot_success_clears_the_remembered_failure() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+
+        drain_one(&mut state, &mut model, failed(false, 2, ""));
+        model.status = "other".into();
+        drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::OneShot {
+                plugin: "p".into(),
+                invoked: false,
+                run: Ok(thegn_svc::plugin::PluginRun::default()),
+            },
+        );
+        drain_one(&mut state, &mut model, failed(false, 2, ""));
+        assert!(model.status.contains("plugin p"));
+        assert!(model.status.contains("exited 2"));
+    }
+
+    #[test]
+    fn one_shot_exit_status_never_shows_plugin_stderr() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+
+        drain_one(&mut state, &mut model, failed(true, 1, "TOKEN=sekrit"));
+        assert!(model.status.contains("exited 1"));
+        assert!(!model.status.contains("sekrit"));
+    }
+
+    #[test]
+    fn one_shot_failure_text_is_terminal_safe() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::OneShot {
+                plugin: "p".into(),
+                invoked: true,
+                run: Err(thegn_svc::plugin::PluginError::Spawn(
+                    "bad\u{1b}[2Jname".into(),
+                )),
+            },
+        );
+        assert!(!model.status.contains('\u{1b}'));
     }
 
     #[test]
@@ -2863,6 +2992,7 @@ mod tests {
                 &mut model,
                 PluginMsg::OneShot {
                     plugin: "p".into(),
+                    invoked: false,
                     run: Ok(run)
                 }
             ),
