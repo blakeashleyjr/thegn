@@ -8,6 +8,7 @@ type ConnectRegistry = (Vec<WorktreeRegistryRow>, Vec<String>);
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AfterSwitch {
     pub(crate) focus_center: bool,
+    pub(crate) landed_status: Option<String>,
     pub(crate) set_region_last_w: bool,
     pub(crate) reveal_active: bool,
     pub(crate) focus_active_row: bool,
@@ -98,6 +99,10 @@ pub(crate) enum SwitchResult {
         request: SwitchRequest,
         result: anyhow::Result<PreparedWorkspaceSwitch>,
     },
+    Created {
+        request: SwitchRequest,
+        result: anyhow::Result<CreateOutcome>,
+    },
     Adopted {
         seq: u64,
         session_id: String,
@@ -112,6 +117,136 @@ pub(crate) enum SwitchResult {
         group_paths: Vec<String>,
         result: anyhow::Result<ConnectRegistry>,
     },
+}
+
+#[derive(Debug)]
+pub(crate) enum CreateOutcome {
+    Repo {
+        root: String,
+        prepared: PreparedWorkspaceSwitch,
+    },
+    NotARepo(std::path::PathBuf),
+}
+
+pub(crate) fn workspace_create_spec(input: &str) -> SwitchRequestSpec {
+    SwitchRequestSpec {
+        target: input.trim().to_string(),
+        group: None,
+        after: AfterSwitch {
+            focus_center: true,
+            ..AfterSwitch::default()
+        },
+    }
+}
+
+pub(crate) fn request_workspace_create(
+    input: &str,
+    pending: &mut PendingSwitch,
+    tx: &tokio::sync::mpsc::UnboundedSender<SwitchResult>,
+    waker: &termwiz::terminal::TerminalWaker,
+    cfg: &thegn_core::config::Config,
+    status: &mut String,
+) {
+    let request = pending.begin(workspace_create_spec(input));
+    let name = std::path::Path::new(&request.target)
+        .file_name()
+        .map(|part| part.to_string_lossy().into_owned())
+        .unwrap_or_else(|| request.target.clone());
+    *status = format!("{} Opening {}…", crate::loading::plan::spinner_now(), name);
+    pending.set_spinner(request.seq, status.clone());
+
+    let job_request = request.clone();
+    let input = request.target.clone();
+    let tx = tx.clone();
+    let wake = waker.clone();
+    let resolve_cfg = cfg.clone();
+    let cfg = cfg.clone();
+    tokio::spawn(async move {
+        let resolved = match tokio::task::spawn_blocking(move || {
+            crate::workspace_create::resolve_workspace_input(&input, &resolve_cfg)
+        })
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => Err(anyhow::anyhow!("workspace resolver failed: {error}")),
+        };
+        match resolved {
+            Ok(crate::workspace_create::WorkspaceResolution::Repo { root, name }) => {
+                crate::db_task::persist_critical(move |db| {
+                    let result =
+                        crate::workspace_create::seed_workspace_create(db, &root, &name, &cfg);
+                    send_created(&tx, &wake, job_request, result);
+                });
+            }
+            Ok(crate::workspace_create::WorkspaceResolution::NotARepo(path)) => {
+                send_created(&tx, &wake, job_request, Ok(CreateOutcome::NotARepo(path)));
+            }
+            Err(error) => send_created(&tx, &wake, job_request, Err(error)),
+        }
+    });
+}
+
+fn send_created(
+    tx: &tokio::sync::mpsc::UnboundedSender<SwitchResult>,
+    wake: &termwiz::terminal::TerminalWaker,
+    request: SwitchRequest,
+    result: anyhow::Result<CreateOutcome>,
+) {
+    if let Err(error) = tx.send(SwitchResult::Created { request, result }) {
+        tracing::debug!(target: "thegn::workspace_switch", %error, "workspace create result receiver is gone");
+    }
+    if let Err(error) = wake.wake() {
+        tracing::debug!(target: "thegn::workspace_switch", %error, "workspace create result wake failed");
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CreatedRoute {
+    Drop { seq: u64 },
+    Apply(SwitchResult),
+    AlreadyOpen { seq: u64, status: String },
+    InitGit { seq: u64, path: String },
+    Failed { seq: u64, status: String },
+}
+
+pub(crate) fn route_created(
+    request: SwitchRequest,
+    result: anyhow::Result<CreateOutcome>,
+    current: bool,
+    current_session: &str,
+) -> CreatedRoute {
+    if !current {
+        return CreatedRoute::Drop { seq: request.seq };
+    }
+    match result {
+        Err(error) => CreatedRoute::Failed {
+            seq: request.seq,
+            status: format!("project create failed: {error:#}"),
+        },
+        Ok(CreateOutcome::NotARepo(path)) => CreatedRoute::InitGit {
+            seq: request.seq,
+            path: path.to_string_lossy().into_owned(),
+        },
+        Ok(CreateOutcome::Repo { root, .. }) if root == current_session => {
+            CreatedRoute::AlreadyOpen {
+                seq: request.seq,
+                status: format!("project already open: {root}"),
+            }
+        }
+        Ok(CreateOutcome::Repo { root, prepared }) => {
+            let mut request = request;
+            request.target = root.clone();
+            request.after = AfterSwitch {
+                focus_center: true,
+                landed_status: Some(format!("project created: {root}")),
+                ..request.after
+            };
+            CreatedRoute::Apply(SwitchResult::Cold {
+                request,
+                result: Ok(prepared),
+            })
+        }
+    }
 }
 
 pub(crate) fn request_workspace_switch(
@@ -438,9 +573,143 @@ mod tests {
     }
 
     #[test]
+    fn workspace_create_spec_targets_the_trimmed_input_and_focuses_center() {
+        let spec = workspace_create_spec(" /r/new ");
+        assert_eq!(spec.target, "/r/new");
+        assert!(spec.group.is_none());
+        assert!(spec.after.focus_center);
+        assert!(spec.after.landed_status.is_none());
+    }
+
+    #[test]
+    fn created_repo_routes_to_a_cold_apply_with_the_resolved_root() {
+        let mut pending = PendingSwitch::default();
+        let request = pending.begin(workspace_create_spec("~/typed"));
+        let prepared = PreparedWorkspaceSwitch {
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "new/home",
+                crate::session::GroupKind::Home,
+                "/r/new",
+            )],
+            active: 0,
+        };
+        let route = route_created(
+            request.clone(),
+            Ok(CreateOutcome::Repo {
+                root: "/r/new".into(),
+                prepared,
+            }),
+            pending.current(request.seq),
+            "/r/old",
+        );
+        let CreatedRoute::Apply(SwitchResult::Cold {
+            request: cold,
+            result: Ok(prepared),
+        }) = route
+        else {
+            panic!("created repo should route through the existing cold apply")
+        };
+        assert_eq!(cold.seq, request.seq);
+        assert_eq!(cold.target, "/r/new");
+        assert!(cold.after.focus_center);
+        assert_eq!(
+            cold.after.landed_status.as_deref(),
+            Some("project created: /r/new")
+        );
+        assert_eq!(prepared.worktrees.len(), 1);
+        assert_eq!(
+            cold_result_decision(cold.seq, pending.seq(), "/r/old", &cold.target, true),
+            ColdResultDecision::Apply
+        );
+    }
+
+    #[test]
+    fn created_repo_for_the_current_workspace_reports_already_open() {
+        let mut pending = PendingSwitch::default();
+        let request = pending.begin(workspace_create_spec("/r/new"));
+        let prepared = PreparedWorkspaceSwitch {
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        assert!(matches!(
+            route_created(
+                request.clone(),
+                Ok(CreateOutcome::Repo {
+                    root: "/r/new".into(),
+                    prepared,
+                }),
+                pending.current(request.seq),
+                "/r/new",
+            ),
+            CreatedRoute::AlreadyOpen { seq, status }
+                if seq == request.seq && status == "project already open: /r/new"
+        ));
+    }
+
+    #[test]
+    fn created_not_a_repo_offers_git_init() {
+        let mut pending = PendingSwitch::default();
+        let request = pending.begin(workspace_create_spec("/r/plain"));
+        assert!(matches!(
+            route_created(
+                request.clone(),
+                Ok(CreateOutcome::NotARepo("/r/plain".into())),
+                pending.current(request.seq),
+                "/r/old",
+            ),
+            CreatedRoute::InitGit { seq, path }
+                if seq == request.seq && path == "/r/plain"
+        ));
+    }
+
+    #[test]
+    fn created_error_is_reported_visibly() {
+        let mut pending = PendingSwitch::default();
+        let request = pending.begin(workspace_create_spec("/nope"));
+        assert!(matches!(
+            route_created(
+                request,
+                Err(anyhow::anyhow!("path does not exist: /nope")),
+                true,
+                "/r/old",
+            ),
+            CreatedRoute::Failed { status, .. }
+                if status.starts_with("project create failed: path does not exist")
+        ));
+    }
+
+    #[test]
+    fn superseded_create_result_is_dropped() {
+        let mut pending = PendingSwitch::default();
+        let first = pending.begin(workspace_create_spec("/one"));
+        pending.begin(SwitchRequestSpec {
+            target: "/two".into(),
+            group: None,
+            after: AfterSwitch::default(),
+        });
+        let prepared = PreparedWorkspaceSwitch {
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        assert!(matches!(
+            route_created(
+                first.clone(),
+                Ok(CreateOutcome::Repo {
+                    root: "/one".into(),
+                    prepared,
+                }),
+                pending.current(first.seq),
+                "/old",
+            ),
+            CreatedRoute::Drop { seq } if seq == first.seq
+        ));
+    }
+
+    #[test]
     fn after_switch_effects_apply_bookmarks_and_flags_to_the_landed_session() {
         let after = AfterSwitch {
             focus_center: true,
+            landed_status: None,
             set_region_last_w: true,
             reveal_active: true,
             focus_active_row: true,
