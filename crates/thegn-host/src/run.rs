@@ -49,7 +49,6 @@ use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
 use crate::panes::{Panes, prewarm_requests, relayout, relayout_strip};
 use crate::recorder::Recorder;
 use crate::wizard;
-use crate::workspace_create::complete_workspace_create;
 use thegn_core::store::{
     CacheStore, NotificationStore, PoolStore, WorkspaceStore, WorktreeAuxStore,
 };
@@ -10402,6 +10401,70 @@ async fn event_loop<T: Terminal>(
         }
         while let Ok(result) = switch_result_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
+            let result = match result {
+                crate::workspace_switch_prep::SwitchResult::Created { request, result } => {
+                    let current = pending_switch.current(request.seq);
+                    match crate::workspace_switch_prep::route_created(
+                        request,
+                        result,
+                        current,
+                        &session.id,
+                    ) {
+                        crate::workspace_switch_prep::CreatedRoute::Apply(cold) => cold,
+                        route => {
+                            let seq = match &route {
+                                crate::workspace_switch_prep::CreatedRoute::Drop { seq }
+                                | crate::workspace_switch_prep::CreatedRoute::AlreadyOpen {
+                                    seq,
+                                    ..
+                                }
+                                | crate::workspace_switch_prep::CreatedRoute::InitGit {
+                                    seq, ..
+                                }
+                                | crate::workspace_switch_prep::CreatedRoute::Failed {
+                                    seq, ..
+                                } => *seq,
+                                crate::workspace_switch_prep::CreatedRoute::Apply(_) => {
+                                    unreachable!()
+                                }
+                            };
+                            pending_switch.clear_spinner_if_matches(seq, &mut model.status);
+                            match route {
+                                crate::workspace_switch_prep::CreatedRoute::AlreadyOpen {
+                                    status,
+                                    ..
+                                }
+                                | crate::workspace_switch_prep::CreatedRoute::Failed {
+                                    status,
+                                    ..
+                                } => {
+                                    model.status = status;
+                                }
+                                crate::workspace_switch_prep::CreatedRoute::InitGit {
+                                    path,
+                                    ..
+                                } => {
+                                    active_menu = Some(menu::init_git_menu(path));
+                                }
+                                crate::workspace_switch_prep::CreatedRoute::Drop { .. } => {}
+                                crate::workspace_switch_prep::CreatedRoute::Apply(_) => {
+                                    unreachable!()
+                                }
+                            }
+                            if deferred_preset
+                                .as_ref()
+                                .is_some_and(|(pending_seq, _)| *pending_seq == seq)
+                            {
+                                deferred_preset = None;
+                            }
+                            pending_switch.clear(seq);
+                            dirty = true;
+                            continue;
+                        }
+                    }
+                }
+                other => other,
+            };
             if let crate::workspace_switch_prep::SwitchResult::Cold { request, result } = &result {
                 let decision = crate::workspace_switch_prep::cold_result_decision(
                     request.seq,
@@ -10437,7 +10500,11 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                     Ok(prepared) => {
-                        model.status.clear();
+                        if let Some(status) = &request.after.landed_status {
+                            model.status.clone_from(status);
+                        } else {
+                            model.status.clear();
+                        }
                         if std::env::var_os("THEGN_WS_CLEAR").is_some() {
                             clear_on_next_frame = true;
                         }
@@ -11174,23 +11241,15 @@ async fn event_loop<T: Terminal>(
         }
         while let Ok(ev) = workspace_clone_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            if crate::workspace_create::apply_clone_event(
+            crate::workspace_create::apply_clone_event(
                 ev,
                 &mut workspace_picker,
-                &mut session,
-                &mut panes,
-                &mut workspace_pool,
-                &mut active_menu,
-                &mut focus,
+                &mut pending_switch,
+                &switch_result_tx,
+                &waker,
                 &mut model,
-                &mut sb,
-                &mut drawer_runtime,
                 &current_config,
-                chrome.center,
-            ) {
-                need_relayout = true;
-                kick_model_hydration!();
-            }
+            );
             dirty = true;
         }
         // Named task (Tasks section) run outcomes.
@@ -19266,25 +19325,17 @@ async fn event_loop<T: Terminal>(
                     .as_mut()
                     .map(|p| p.handle_key(&k.key, k.modifiers))
                 {
-                    if crate::workspace_create::handle_picker_outcome(
+                    crate::workspace_create::handle_picker_outcome(
                         outcome,
                         &mut workspace_picker,
                         &workspace_clone_tx,
                         &waker,
-                        &mut session,
-                        &mut panes,
-                        &mut workspace_pool,
+                        &mut pending_switch,
+                        &switch_result_tx,
                         &mut active_menu,
-                        &mut focus,
                         &mut model,
-                        &mut sb,
-                        &mut drawer_runtime,
                         &current_config,
-                        chrome.center,
-                    ) {
-                        need_relayout = true;
-                        kick_model_hydration!();
-                    }
+                    );
                     dirty = true;
                     continue;
                 }
@@ -20040,22 +20091,14 @@ async fn event_loop<T: Terminal>(
                                         .map(|s| s.success())
                                         .unwrap_or(false);
                                 if initialized {
-                                    if complete_workspace_create(
+                                    crate::workspace_switch_prep::request_workspace_create(
                                         &path,
-                                        &mut session,
-                                        &mut panes,
-                                        &mut workspace_pool,
-                                        &mut active_menu,
-                                        &mut focus,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut drawer_runtime,
+                                        &mut pending_switch,
+                                        &switch_result_tx,
+                                        &waker,
                                         &current_config,
-                                        chrome.center,
-                                    ) {
-                                        need_relayout = true;
-                                        kick_model_hydration!();
-                                    }
+                                        &mut model.status,
+                                    );
                                 } else {
                                     model.status =
                                         format!("failed to initialize git repository at {}", path);
@@ -20069,22 +20112,14 @@ async fn event_loop<T: Terminal>(
                             if let menu::MenuChoice::ConfirmCreateProject { path } = choice {
                                 match crate::workspace_create::init_new_project(Path::new(&path)) {
                                     Ok(()) => {
-                                        if complete_workspace_create(
+                                        crate::workspace_switch_prep::request_workspace_create(
                                             &path,
-                                            &mut session,
-                                            &mut panes,
-                                            &mut workspace_pool,
-                                            &mut active_menu,
-                                            &mut focus,
-                                            &mut model,
-                                            &mut sb,
-                                            &mut drawer_runtime,
+                                            &mut pending_switch,
+                                            &switch_result_tx,
+                                            &waker,
                                             &current_config,
-                                            chrome.center,
-                                        ) {
-                                            need_relayout = true;
-                                            kick_model_hydration!();
-                                        }
+                                            &mut model.status,
+                                        );
                                     }
                                     Err(e) => {
                                         model.status = format!("create project failed: {e}");
