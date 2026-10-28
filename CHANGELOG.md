@@ -9,6 +9,52 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.41] — 2026-10-23 (maintenance batch 78)
 
+### Changed
+
+- Managed difftastic downloads are disabled until reviewed SHA-256 pins ship;
+  `auto` structural diffs use `[managed_tools.difft] path` or `difft` on
+  `PATH`, and `thegn doctor` shows which resolved.
+- `thegn issue list` names plugin issue providers it skipped; those providers
+  are served only by the running UI.
+- A non-executable `tgproxy` beside `thegn` is skipped for `PATH`, and
+  `thegn doctor` names the skipped file.
+- (dev channel) With `data = "sync"`, closing a worktree compares files with
+  the upload baseline: unchanged sandbox files do not overwrite local edits,
+  conflicting edits stop the sync and keep the sandbox, and `.gitignore` or
+  `.ignore` exclusions are skipped.
+- (dev channel) The resident bridge connects using the worktree's pinned
+  environment or workspace default. Failed agent-login uploads to a sandbox
+  mark “Sync agent logins” Failed with a line per account, while provisioning
+  continues. `thegn placement plan` uses the selected environment.
+
+### Fixed
+
+- A split preset reports failed panes and adds its tab only after a pane
+  starts.
+- If a systemd pane's protected environment file cannot be created, it starts
+  without the host-sourced secrets and warns with their keys, never values.
+- Deleting a project while the state database is busy reports that promptly
+  instead of freezing the UI; workspace focus changes no longer wait on the
+  database.
+- (dev channel) Autoscale keeps an engine host when its tenant count or last
+  use cannot be read, and warns with the host name.
+
+### Security
+
+- More worktree operations refuse when the recorded location cannot be read:
+  control API commit, review handoff, autopilot push and worker sandbox,
+  `thegn issue create` and `thegn issue comment`, PR creation, `thegn env`
+  resolution, `thegn repo trust` and submodule init. Background fetch and
+  merged-worktree cleanup skip that worktree; hibernation refuses. (dev
+  channel) Provider provisioning, provider and host worktree pipelines, host
+  placement and provider attach refuse too; a plain local worktree is
+  unaffected unless a provider or host placement is configured.
+- An unreadable env-bundle or coding-agent account selection refuses a
+  configured agent launch; a shell starts with a warning instead of using the
+  default account.
+- On Linux, stopping a resident plugin also kills descendant processes it
+  started in a new session, such as with `setsid`.
+
 ## [0.1.0-alpha.40] — 2026-10-23 (maintenance batch 77)
 
 ### Changed

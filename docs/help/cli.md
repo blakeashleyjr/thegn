@@ -316,7 +316,10 @@ nothing was removed.
 On the dev channel, `thegn host rm <name>` refuses without removing anything
 if it cannot read the host's placement tenants, and `thegn placement list`
 reports an error if it cannot read recorded state instead of showing an empty
-result.
+result. On the dev channel, `thegn placement plan` uses the worktree's pinned
+environment or its workspace default; if that selection or the state database
+cannot be read, it exits with the cause when a non-local environment, pinned
+host or placement engine is configured.
 
 On the dev channel, when `[placement]` autoscale creates a host, the worktree
 is reserved there. If the host definition cannot be read or it has no free

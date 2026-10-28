@@ -235,7 +235,9 @@ cannot stop the new process or schedule another restart.
 Resident-plugin stderr is drained and, when debug logging is enabled, written
 to the debug log at most 20 lines per second; a line is capped at 512 bytes,
 and excess lines are suppressed. thegn keeps the last 8 KiB and line counts
-internally; no command shows them yet.
+internally; no command shows them yet. On Linux, stopping or timing out a
+resident plugin also kills descendant processes it started in a new session,
+such as with `setsid`, while they remain its descendants.
 Plugin processes are _not sandboxed_ — treat a plugin like any program you
 choose to run. For a non-empty list, `thegn plugin list` ends with a note that
 capabilities are not containment (its `--json` rows carry `"containment": "none"`),
