@@ -95,8 +95,9 @@ pub(crate) fn spawn_delete_workspace_dirs(
 /// false it *also* deletes the workspace's worktree directories from disk (the
 /// home checkout at `repo_path` is always preserved, off the loop); when true
 /// the files stay on disk and the workspace re-appears if reopened. If the
-/// removed workspace is the active one, the session switches to the next
-/// available workspace (or empties when none remain).
+/// removed workspace is active, the session is emptied as removal completes;
+/// the caller queues a landing on the next available workspace through the
+/// loop's switch path.
 ///
 /// The destructive disk-removal is dispatched to a background thread (see
 /// [`spawn_delete_workspace_dirs`]) so the compositor never blocks on git/ssh/fs.
@@ -160,10 +161,9 @@ pub(crate) fn remove_workspace(
         );
     });
 
-    // Removing the active workspace leaves the session pointing at nothing;
-    // land on the next available workspace, else empty out.
+    // The caller queues the next workspace through the normal switch path.
     if was_active {
-        land_after_workspace_removed(session, None);
+        land_after_workspace_removed(session);
     }
 
     let mut status = workspace_removed_status(display, keep_files, live_dirs.len());
@@ -176,25 +176,34 @@ pub(crate) fn remove_workspace(
     status
 }
 
-/// After removing the *active* workspace, land on the first remaining workspace,
-/// or empty the session (no dangling context) when none remain. Split out so it
-/// can be unit-tested with an injected DB (the parent opens the process DB).
-pub(crate) fn land_after_workspace_removed(
-    session: &mut crate::session::Session,
-    db: Option<&thegn_core::db::Db>,
-) {
-    let mut switched = false;
-    if let Some(db) = db
-        && let Ok(workspaces) = db.workspaces()
-        && let Some(next) = workspaces.first()
-    {
-        switched = session.switch_to_workspace(&next.repo_path, db).is_ok();
+/// After removing the *active* workspace, empty the session. The caller lands
+/// on the next workspace via [`landing_after_removal`] and the loop's switch
+/// path (warm from the resident pool, otherwise cold on the DB writer), never
+/// through a synchronous switch here.
+pub(crate) fn land_after_workspace_removed(session: &mut crate::session::Session) {
+    session.id.clear();
+    session.worktrees.clear();
+    session.active = 0;
+}
+
+/// Pick the first remaining workspace for the caller's normal switch path.
+/// `workspaces` is `model.sidebar_workspaces` after
+/// [`forget_workspace_in_model`] has removed the deleted workspace, in display
+/// order.
+pub(crate) fn landing_after_removal(
+    was_active: bool,
+    session: &crate::session::Session,
+    workspaces: &[(String, String, String, String)],
+    removed_repo: &str,
+) -> Option<String> {
+    if !was_active || !session.id.is_empty() {
+        return None;
     }
-    if !switched {
-        session.id.clear();
-        session.worktrees.clear();
-        session.active = 0;
-    }
+    workspaces
+        .iter()
+        .map(|(_, _, _, repo_path)| repo_path)
+        .find(|repo_path| !repo_path.is_empty() && repo_path.as_str() != removed_repo)
+        .cloned()
 }
 
 /// The status line after a workspace removal. Non-destructive (`keep_files`)
@@ -748,12 +757,6 @@ mod tests {
     fn delete_last_workspace_empties_session() {
         // Removing the active (and only) workspace must fall back to an empty
         // home rather than leave the session pointing at a pruned workspace.
-        let db_path = std::env::temp_dir().join(format!(
-            "tg-host-last-ws-{}-{}.sqlite",
-            std::process::id(),
-            now_secs()
-        ));
-        let db = thegn_core::db::Db::open_at(&db_path).unwrap();
         let mut session = Session {
             id: "/tmp/repo-lib".into(),
             worktrees: vec![WorktreeGroup::new(
@@ -763,11 +766,77 @@ mod tests {
             )],
             active: 0,
         };
-        land_after_workspace_removed(&mut session, Some(&db));
+        land_after_workspace_removed(&mut session);
         assert!(session.id.is_empty(), "session id cleared");
         assert!(session.worktrees.is_empty(), "no groups remain");
         assert_eq!(session.active, 0);
-        let _ = std::fs::remove_file(&db_path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn landing_after_removal_names_the_first_remaining_workspace() {
+        let session = Session {
+            id: String::new(),
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        let workspaces = vec![
+            ("app".into(), "app".into(), "repo".into(), "/r/app".into()),
+            ("lib".into(), "lib".into(), "repo".into(), "/r/lib".into()),
+        ];
+
+        assert_eq!(
+            landing_after_removal(true, &session, &workspaces, "/r/gone"),
+            Some("/r/app".into())
+        );
+    }
+
+    #[test]
+    fn landing_after_removal_skips_blank_paths_and_the_removed_repo() {
+        let session = Session {
+            id: String::new(),
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        let workspaces = vec![
+            ("live".into(), "Live".into(), "repo".into(), String::new()),
+            (
+                "gone".into(),
+                "gone".into(),
+                "repo".into(),
+                "/r/gone".into(),
+            ),
+            ("lib".into(), "lib".into(), "repo".into(), "/r/lib".into()),
+        ];
+
+        assert_eq!(
+            landing_after_removal(true, &session, &workspaces, "/r/gone"),
+            Some("/r/lib".into())
+        );
+    }
+
+    #[test]
+    fn landing_after_removal_is_none_unless_the_active_workspace_was_emptied() {
+        let emptied = Session {
+            id: String::new(),
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        let current = Session {
+            id: "/r/gone".into(),
+            worktrees: Vec::new(),
+            active: 0,
+        };
+        let workspaces = vec![("lib".into(), "lib".into(), "repo".into(), "/r/lib".into())];
+
+        assert_eq!(
+            landing_after_removal(false, &emptied, &workspaces, "/r/gone"),
+            None
+        );
+        assert_eq!(
+            landing_after_removal(true, &current, &workspaces, "/r/gone"),
+            None
+        );
+        assert_eq!(landing_after_removal(true, &emptied, &[], "/r/gone"), None);
     }
 
     #[test]

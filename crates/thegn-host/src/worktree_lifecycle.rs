@@ -71,6 +71,14 @@ pub fn take_completions() -> Vec<LifecycleCompletion> {
     std::mem::take(&mut *completions().lock().expect("lifecycle mutex poisoned"))
 }
 
+/// What one drain of worker completions changed, and the workspace to land on
+/// when it removed the active one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AppliedCompletions {
+    pub changed: bool,
+    pub land_on: Option<String>,
+}
+
 /// Apply worker outcomes on the compositor loop. No hook, git, or filesystem
 /// work occurs here; this only reconciles in-memory session, pane, model, and
 /// focus state after a worker has proven that its requested removal completed.
@@ -79,21 +87,22 @@ pub fn apply_completions(
     panes: &mut crate::panes::Panes,
     model: &mut crate::chrome::FrameModel,
     sb: &mut crate::run::SidebarState,
-) -> bool {
-    apply_completions_from(take_completions(), session, panes, model, sb)
+) -> AppliedCompletions {
+    apply_completion_batch(take_completions(), session, panes, model, sb)
 }
 
 /// Apply a supplied batch of worker outcomes on the compositor loop. Keeping
-/// the batch-taking wrapper above separate makes this seam testable without
-/// racing the process-global completion queue.
-fn apply_completions_from(
+/// this batch-taking core separate makes the seam testable without racing the
+/// process-global completion queue.
+fn apply_completion_batch(
     completions: Vec<LifecycleCompletion>,
     session: &mut crate::session::Session,
     panes: &mut crate::panes::Panes,
     model: &mut crate::chrome::FrameModel,
     sb: &mut crate::run::SidebarState,
-) -> bool {
+) -> AppliedCompletions {
     let mut changed = false;
+    let mut emptied_active: Option<String> = None;
     let mut workspace_failures: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
     // One landing for the whole batch, planned while the rows still show every
@@ -200,9 +209,8 @@ fn apply_completions_from(
                         session, panes, &slug,
                     );
                     if session.id == repo_path {
-                        crate::handlers::workspace_remove::land_after_workspace_removed(
-                            session, None,
-                        );
+                        crate::handlers::workspace_remove::land_after_workspace_removed(session);
+                        emptied_active = Some(repo_path.clone());
                     }
                     crate::handlers::workspace_remove::forget_workspace_in_model(
                         model, &slug, &repo_path,
@@ -225,11 +233,30 @@ fn apply_completions_from(
             }
         }
     }
+    let land_on = emptied_active.and_then(|repo| {
+        crate::handlers::workspace_remove::landing_after_removal(
+            true,
+            session,
+            &model.sidebar_workspaces,
+            &repo,
+        )
+    });
     if changed {
         crate::run::refresh_tab_model(model, session, sb);
         landing.place_cursor(model, sb);
     }
-    changed
+    AppliedCompletions { changed, land_on }
+}
+
+#[cfg(test)]
+fn apply_completions_from(
+    completions: Vec<LifecycleCompletion>,
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    model: &mut crate::chrome::FrameModel,
+    sb: &mut crate::run::SidebarState,
+) -> bool {
+    apply_completion_batch(completions, session, panes, model, sb).changed
 }
 
 fn complete(completion: LifecycleCompletion, waker: Option<termwiz::terminal::TerminalWaker>) {
@@ -2632,6 +2659,96 @@ mod tests {
         ));
         assert!(session.worktrees.is_empty());
         assert!(model.sidebar_workspaces.is_empty());
+    }
+
+    #[test]
+    fn removing_the_active_workspace_lands_on_the_next_remaining_one() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut session = completion_test_session();
+        let mut model = crate::chrome::FrameModel {
+            sidebar_workspaces: vec![
+                ("repo".into(), "repo".into(), "repo".into(), "repo".into()),
+                ("lib".into(), "lib".into(), "repo".into(), "/r/lib".into()),
+            ],
+            ..Default::default()
+        };
+        let mut sb = crate::run::SidebarState::default();
+
+        let applied = apply_completion_batch(
+            vec![LifecycleCompletion::WorkspaceDeleteFinished {
+                repo_path: "repo".into(),
+                slug: "repo".into(),
+                failed_paths: Vec::new(),
+            }],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        );
+
+        assert!(applied.changed);
+        assert_eq!(applied.land_on.as_deref(), Some("/r/lib"));
+        assert!(session.id.is_empty());
+    }
+
+    #[test]
+    fn removing_another_workspace_queues_no_landing() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut session = completion_test_session();
+        let mut model = crate::chrome::FrameModel {
+            sidebar_workspaces: vec![
+                ("repo".into(), "repo".into(), "repo".into(), "repo".into()),
+                ("lib".into(), "lib".into(), "repo".into(), "/r/lib".into()),
+            ],
+            ..Default::default()
+        };
+        let mut sb = crate::run::SidebarState::default();
+
+        let applied = apply_completion_batch(
+            vec![LifecycleCompletion::WorkspaceDeleteFinished {
+                repo_path: "/r/lib".into(),
+                slug: "lib".into(),
+                failed_paths: Vec::new(),
+            }],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        );
+
+        assert!(applied.changed);
+        assert_eq!(applied.land_on, None);
+        assert_eq!(session.id, "repo");
+    }
+
+    #[test]
+    fn removing_the_last_workspace_queues_no_landing() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut session = completion_test_session();
+        let mut model = crate::chrome::FrameModel {
+            sidebar_workspaces: vec![("repo".into(), "repo".into(), "repo".into(), "repo".into())],
+            ..Default::default()
+        };
+        let mut sb = crate::run::SidebarState::default();
+
+        let applied = apply_completion_batch(
+            vec![LifecycleCompletion::WorkspaceDeleteFinished {
+                repo_path: "repo".into(),
+                slug: "repo".into(),
+                failed_paths: Vec::new(),
+            }],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        );
+
+        assert!(applied.changed);
+        assert_eq!(applied.land_on, None);
+        assert!(session.id.is_empty());
     }
 
     #[test]
