@@ -181,8 +181,10 @@ the native-trust state of each enabled plugin. Use `thegn plugin list` and
 `thegn plugin check` to inspect and validate plugin declarations.
 
 Plugin issue providers are served only by the running UI; the standalone
-`thegn issue list --status …` queries only your configured `[issues]` accounts
-and names any plugin issue providers it skipped on stderr.
+`thegn issue list --status …` uses only your configured `[issues]` accounts
+and names skipped plugin issue providers on stderr. `thegn wt new --from-issue`
+also uses only those accounts and names skipped providers when it cannot resolve
+the issue because no tracker is configured or the fetch fails.
 
 ## Capabilities and host calls
 
