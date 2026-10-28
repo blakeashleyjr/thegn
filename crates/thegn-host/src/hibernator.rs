@@ -457,8 +457,7 @@ fn attached_sessions(output: &str) -> Result<u64, String> {
     let Some(line) = output
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .last()
+        .rfind(|line| !line.is_empty())
     else {
         return Err("the attached-session check printed nothing".into());
     };
