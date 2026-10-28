@@ -340,20 +340,20 @@ mod tests {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("daemon.sock");
         let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
-        let accept_task = rt.block_on(async {
-            let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
+        let listener = rt.block_on(async {
+            match thegn_svc::ipc::IpcListener::bind_exclusive(&endpoint)
                 .await
                 .unwrap()
             {
                 thegn_svc::ipc::BindOutcome::Bound(listener) => listener,
                 thegn_svc::ipc::BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
-            };
-            tokio::spawn(async move {
-                let mut listener = listener;
-                while let Ok(stream) = listener.accept_stream().await {
-                    drop(stream);
-                }
-            })
+            }
+        });
+        let accept_task = rt.spawn(async move {
+            let mut listener = listener;
+            while let Ok(stream) = listener.accept_stream().await {
+                drop(stream);
+            }
         });
         let config = Config {
             daemon: DaemonConfig {
