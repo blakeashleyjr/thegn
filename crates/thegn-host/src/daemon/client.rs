@@ -1747,8 +1747,6 @@ mod tests {
 
     #[test]
     fn listener_absence_needs_a_missing_or_refused_socket() {
-        use anyhow::Context;
-
         let missing = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
             .context("connect control endpoint /x");
         let refused =
