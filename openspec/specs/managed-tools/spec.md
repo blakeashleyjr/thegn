@@ -82,10 +82,20 @@ recheck.
 ### Requirement: Core decides, host fetches
 
 The download/install side effects SHALL live in `thegn-host`, driven by the
-core spec: npm-sourced tools install via an `npm` subprocess and GitHub-release
-tools download the selected asset and mark it executable. The fetch MUST NOT run
-on the event loop (it runs on the CLI path or `spawn_blocking`) and MUST surface
-failures rather than silently degrading the primary action.
+core spec: npm-sourced tools install via an `npm` subprocess, and GitHub-release
+tools download the selected asset only when a reviewed SHA-256 pin for that
+tool, version, and asset ships with thegn, verify it, and mark it executable.
+Without a pin, the GitHub-release download MUST be refused before any network
+access. The fetch MUST NOT run on the event loop (it runs on the CLI path or
+`spawn_blocking`) and MUST surface failures rather than silently degrading the
+primary action.
+
+#### Scenario: Unpinned GitHub-release asset is refused
+
+- **WHEN** a GitHub-release tool has no shipped reviewed SHA-256 pin for the
+  selected asset
+- **THEN** the host refuses the download before any network access and the tool
+  resolves only through an override or PATH
 
 #### Scenario: Fetch stays off the event loop
 
@@ -98,13 +108,23 @@ failures rather than silently degrading the primary action.
 `thegn doctor` SHALL report each managed tool: which resolution tier applies,
 the resolved path, and the pinned-versus-installed version state, so a user can
 see whether a tool is overridden, found on PATH, or managed — and whether the
-managed copy is current.
+managed copy is current. Doctor SHALL report an unavailable managed install
+(unsupported platform, no release asset, or no reviewed pin) with its reason and
+how to provide the tool, in both text and JSON through
+`managed_install_available` and `managed_install_note`.
 
 #### Scenario: doctor lists a managed tool's resolution
 
 - **WHEN** `thegn doctor` runs with a managed tool configured
 - **THEN** its output names the tool, the tier that resolves it, its path, and
   whether the managed copy matches the pinned version
+
+#### Scenario: doctor reports an unavailable managed install
+
+- **WHEN** a managed install is unavailable because the platform is unsupported,
+  no release asset exists, or no reviewed pin ships
+- **THEN** text and JSON doctor output report the reason and how to provide the
+  tool, with `managed_install_available` and `managed_install_note` in JSON
 
 ### Requirement: Managed tools support a Cargo source
 
