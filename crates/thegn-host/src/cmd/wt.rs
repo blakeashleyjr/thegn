@@ -1026,6 +1026,7 @@ fn resolve_issue_branch(
     })
 }
 
+#[cfg(test)]
 fn resolve_issue_branch_with(
     cfg: &Config,
     root: &std::path::Path,
