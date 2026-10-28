@@ -38,6 +38,8 @@ All notable changes to **thegn** are documented here. The format follows
   database.
 - (dev channel) Autoscale keeps an engine host when its tenant count or last
   use cannot be read, and warns with the host name.
+- (dev channel) A stray `.git` entry in the temporary directory no longer
+  disrupts hibernation bundle checks.
 
 ### Security
 
@@ -45,10 +47,11 @@ All notable changes to **thegn** are documented here. The format follows
   control API commit, review handoff, autopilot push and worker sandbox,
   `thegn issue create` and `thegn issue comment`, PR creation, `thegn env`
   resolution, `thegn repo trust` and submodule init. Background fetch and
-  merged-worktree cleanup skip that worktree; hibernation refuses. (dev
-  channel) Provider provisioning, provider and host worktree pipelines, host
-  placement and provider attach refuse too; a plain local worktree is
-  unaffected unless a provider or host placement is configured.
+  merged-worktree cleanup skip that worktree. (dev channel) Hibernation
+  refuses and its bridge-key drop warns and skips; provider provisioning,
+  provider and host worktree pipelines, host placement and provider attach
+  refuse too. A plain local worktree is unaffected unless a provider or host
+  placement is configured.
 - An unreadable env-bundle or coding-agent account selection refuses a
   configured agent launch; a shell starts with a warning instead of using the
   default account.
