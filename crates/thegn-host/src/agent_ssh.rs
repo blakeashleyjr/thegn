@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use thegn_core::config::{Config, ManagedKeyScope};
 use thegn_core::db::Db;
-use thegn_core::remote::GitLoc;
 use thegn_core::repo;
 use thegn_core::store::WorkspaceStore;
 
@@ -154,7 +153,7 @@ pub fn sprite_sshd_start_script() -> String {
 /// proxy: `(private key path, ssh user, in-sandbox workdir)`. `None` otherwise.
 pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, String, String)> {
     use thegn_core::config::ProviderConnect;
-    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let loc = crate::agent::provider_pane_loc(worktree, "sprite ssh connect")?;
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())

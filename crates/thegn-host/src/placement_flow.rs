@@ -810,7 +810,16 @@ pub(crate) fn plan(cfg: &Config, worktree: &str) -> anyhow::Result<Option<PlanOu
         Ok(db) => db,
         Err(error) => return plan_selection(Err(error), cfg).map(|_| None),
     };
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let loc = match thegn_core::remote::GitLoc::for_worktree_op(
+        std::path::Path::new(worktree),
+        "placement plan",
+    ) {
+        Ok(loc) => loc,
+        Err(_) if !crate::agent::remote_placement_configured(cfg) => {
+            thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(worktree))
+        }
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
     let repo_root = thegn_core::repo::main_worktree(std::path::Path::new(worktree))
         .unwrap_or_else(|| std::path::PathBuf::from(worktree));
     let selected = plan_selection(
@@ -1516,5 +1525,49 @@ mod tests {
             Some("x".into())
         );
         assert_eq!(plan_selection(Ok(None), &cfg).unwrap(), None);
+    }
+
+    #[test]
+    fn plan_refuses_an_unrecognised_location_when_a_host_is_pinned() {
+        use thegn_core::store::WorkspaceStore;
+
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt").to_string_lossy().into_owned();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", Some("garbage"), None)
+            .unwrap();
+        db.set_worktree_env(&wt, "pinned").unwrap();
+        drop(db);
+        let cfg = Config {
+            env: std::collections::BTreeMap::from([(
+                "pinned".to_string(),
+                EnvConfig {
+                    host: "h1".into(),
+                    ..EnvConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let Err(error) = plan(&cfg, &wt) else {
+            panic!("placement plan must refuse an unreadable configured location");
+        };
+        assert!(format!("{error:#}").contains("placement plan refused"));
+    }
+
+    #[test]
+    fn plan_keeps_a_local_only_config_on_an_unrecognised_location() {
+        use thegn_core::store::WorkspaceStore;
+
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt").to_string_lossy().into_owned();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", Some("garbage"), None)
+            .unwrap();
+        drop(db);
+
+        assert!(plan(&Config::default(), &wt).unwrap().is_none());
     }
 }
