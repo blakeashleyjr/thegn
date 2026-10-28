@@ -464,6 +464,13 @@ fn history_limit(limit: usize) -> Result<usize> {
     }
 }
 
+fn history_empty_message(worktree: &str) -> String {
+    format!(
+        "No merge-queue history for {}.",
+        crate::merge_sweep::safe_display(worktree)
+    )
+}
+
 fn history(worktree: Option<String>, limit: usize, json: bool) -> Result<()> {
     let limit = history_limit(limit)?;
     let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
@@ -488,10 +495,7 @@ fn history(worktree: Option<String>, limit: usize, json: bool) -> Result<()> {
         return super::emit_json(&history_json(&events));
     }
     if events.is_empty() {
-        outln!(
-            "No merge-queue history for {}.",
-            crate::merge_sweep::safe_display(&wt_s)
-        );
+        outln!("{}", history_empty_message(&wt_s));
         return Ok(());
     }
     for event in &events {
@@ -1983,7 +1987,6 @@ mod claim_conflict_tests {
 #[cfg(test)]
 mod history_tests {
     use super::*;
-    use thegn_core::store::WorktreeAuxStore;
 
     fn event(actor: &str) -> MergeQueueEvent {
         MergeQueueEvent {
@@ -2037,6 +2040,14 @@ mod history_tests {
     fn history_json_is_empty_when_there_are_no_events() {
         let value = serde_json::to_value(history_json(&[])).unwrap();
         assert_eq!(value, serde_json::json!([]));
+    }
+
+    #[test]
+    fn history_empty_message_sanitises_the_worktree_path() {
+        let message = history_empty_message("/repo/wt\u{1b}]52;c;x\u{7}");
+        assert_eq!(message, "No merge-queue history for /repo/wt�]52;c;x�.");
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{7}'));
     }
 
     #[test]
