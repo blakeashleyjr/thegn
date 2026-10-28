@@ -2069,8 +2069,9 @@ pub(crate) fn forget_worktree_group(
 
 /// Connect a resident bridge for `worktree` if it's a remote/provider env and not
 /// already connected. Resolves the env off the event loop (DB + git/`resolve_env`)
-/// then spawns the agent; a non-remote loc, a miss, or a spawn failure silently
-/// leaves the per-op git path in place.
+/// then spawns the agent. A non-remote loc or an already-connected bridge returns
+/// early; an unreadable env selection logs a `thegn::bridge` warning. A missing
+/// bridge binary or failed install/spawn leaves the per-op git path in place.
 fn connect_worktree_bridge(
     sup: &crate::bridge_sup::BridgeSupervisor,
     rsup: &crate::revtunnel::ReverseTunnelSupervisor,

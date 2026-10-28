@@ -2549,11 +2549,11 @@ pub fn provision_provider_env_named(
         return Ok((false, None));
     };
     let pc = &env.provider;
-    let Some(id) = name_override
-        .map(str::to_string)
-        .or_else(|| provider_sandbox_name(cfg, worktree, env_name))
-        .filter(|s| !s.is_empty())
-    else {
+    let id = match name_override {
+        Some(name) => Some(name.to_string()),
+        None => crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name)?,
+    };
+    let Some(id) = id.filter(|s| !s.is_empty()) else {
         return Ok((false, None));
     };
     // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
@@ -2690,7 +2690,7 @@ pub fn provision_provider_env_named(
     // provision-time snapshot goes stale and the in-sandbox agent 401s.
     if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
         crate::provider_workdir::mark_provisioned(&id);
-        crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, env_name);
+        crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, &loc, env_name);
         crate::remote_enqueue_auth::reconcile_provider_credential(
             cfg,
             &provider,
@@ -3625,8 +3625,11 @@ fn auto_provision_sandbox(
     if !pc.auto_provision {
         return Ok(None);
     }
-    // Per-worktree id from the single source of truth (resolved placement).
-    let Some(name) = provider_sandbox_name(cfg, worktree, env_name).filter(|s| !s.is_empty())
+    // A failed location or provider-binding read is an error the caller's
+    // failover surfaces (halt, or degrade with a notice), never a silent no-op.
+    let Some(name) =
+        crate::provider_factory::provider_sandbox_name_checked(cfg, worktree, env_name)?
+            .filter(|s| !s.is_empty())
     else {
         return Ok(None);
     };

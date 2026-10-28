@@ -351,27 +351,20 @@ fn sync_agent_auth_critical(
 /// snapshot goes stale and the in-sandbox agent 401s ("Invalid authentication
 /// credentials") despite reporting "logged in". Runs on every provider bring-up
 /// (even the cached path where full provisioning short-circuits on its marker) —
-/// cheap (~5 tiny files) + best-effort. Resolves the sandbox `$HOME` and the
-/// agent kinds itself so the caller stays a one-liner.
+/// cheap (~5 tiny files) + best-effort. `loc` is the location the caller already
+/// read checked. Resolves the sandbox `$HOME` and the agent kinds itself so the
+/// caller stays a one-liner.
 pub(crate) fn resync_agent_auth(
     provider: &thegn_svc::provider::Provider,
     id: &str,
     cfg: &thegn_core::config::Config,
     worktree: &str,
+    loc: &thegn_core::remote::GitLoc,
     env_name: &str,
 ) {
     use thegn_core::store::WorkspaceStore;
     // Agent kinds: mirror `run_provisioning` — an explicit `[sandbox.home]
     // agents` list wins, else the `[[agents]]` picker, else host detection.
-    let loc =
-        match thegn_core::remote::GitLoc::for_worktree_op(Path::new(worktree), "agent auth resync")
-        {
-            Ok(loc) => loc,
-            Err(error) => {
-                thegn_core::msg::warn(&format!("{error}; agent auth was not re-synced into {id}"));
-                return;
-            }
-        };
     let repo_root = thegn_core::db::Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())

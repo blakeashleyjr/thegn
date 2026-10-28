@@ -1164,18 +1164,20 @@ mod tests {
     }
 
     #[test]
-    fn bridge_env_selection_uses_the_recorded_repo_root() {
+    fn bridge_env_selection_falls_back_to_the_given_repo_root() {
         use thegn_core::store::WorkspaceStore;
 
         let db = thegn_core::db::Db::open_memory().unwrap();
         db.put_workspace("/x/app", "app", "repo").unwrap();
-        db.put_worktree("app/wt", "/x/app", "/wt/a", "tg/a", None, None)
-            .unwrap();
         db.set_workspace_env("/x/app", "m0").unwrap();
 
         assert_eq!(
-            bridge_env_selection(&db, "/wt/a", "/elsewhere").unwrap(),
+            bridge_env_selection(&db, "/wt/unrecorded", "/x/app").unwrap(),
             Some("m0".to_string())
+        );
+        assert_eq!(
+            bridge_env_selection(&db, "/wt/unrecorded", "/elsewhere").unwrap(),
+            None
         );
     }
 

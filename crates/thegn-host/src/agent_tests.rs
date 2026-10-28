@@ -3043,6 +3043,75 @@ fn provision_worktree_refuses_an_unreadable_location_when_a_provider_env_is_conf
 }
 
 #[test]
+fn auto_provision_sandbox_refuses_an_unreadable_provider_location() {
+    use thegn_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        env: [(
+            "cloud".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    auto_provision: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Config::default()
+    };
+
+    let result = auto_provision_sandbox(&cfg, "cloud", &wt);
+    assert!(
+        matches!(&result, Err(error) if format!("{error:#}").contains("provider sandbox resolution refused")),
+        "{:?}",
+        result.as_ref().err()
+    );
+}
+
+#[test]
+fn provision_provider_env_named_refuses_an_unreadable_provider_location() {
+    use thegn_core::config::{Config, EnvConfig, EnvProviderConfig, PlacementMode};
+    use thegn_core::store::WorkspaceStore;
+
+    let _state = crate::testenv::IsolatedState::new();
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().into_owned();
+    let db = Db::open().unwrap();
+    db.put_worktree("app/wt", &wt, &wt, "main", Some("garbage"), None)
+        .unwrap();
+    drop(db);
+    let cfg = Config {
+        env: [(
+            "cloud".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig::default(),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Config::default()
+    };
+
+    let result =
+        provision_provider_env_named(&cfg, &wt, "cloud", None, &mut |_: &[ProvisionStepView]| {});
+    assert!(matches!(
+        &result,
+        Err(error) if format!("{error:#}").contains("provider sandbox resolution refused")
+    ));
+}
+
+#[test]
 fn provision_worktree_keeps_a_local_worktree_local_without_provider_envs() {
     use thegn_core::config::Config;
     use thegn_core::store::WorkspaceStore;
