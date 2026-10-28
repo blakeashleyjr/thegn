@@ -1,11 +1,13 @@
 //! Managed external tools — a reusable "acquire and pin a binary" resolver.
 //!
-//! thegn owns a handful of external tools (today the `pi` coding agent under
-//! `~/.thegn/pi`; soon a debug adapter and user-declared MCP servers). Rather
-//! than hand-roll the install per tool, this module captures the pattern Zed's
-//! extensions use: resolve a tool by **user override → project PATH →
-//! download-and-pin**, per platform, with an update policy and graceful
-//! fallback. Each tool is one [`ManagedTool`] value.
+//! thegn owns a handful of external tools: bugstalker from crates.io and difft
+//! from GitHub releases. Rather than hand-roll the install per tool, this
+//! module captures the pattern Zed's extensions use: resolve a tool by
+//! **user override → project PATH → managed location**, per platform, with an
+//! update policy and graceful fallback. The host refuses a GitHub-release
+//! download unless a reviewed SHA-256 pin for that tool, version, and asset
+//! ships with thegn; today difft resolves only through an override or PATH.
+//! Each tool is one [`ManagedTool`] value.
 //!
 //! This module is **pure**: it decides *which* tier satisfies a tool, *which*
 //! release asset matches the platform, *where* the managed copy lives, and
@@ -144,8 +146,9 @@ pub enum Resolution {
     Override { path: String, args: Vec<String> },
     /// Tier 2: found on the project PATH.
     OnPath { path: String },
-    /// Tier 3: the managed download-and-pin location (`current` = marker matches
-    /// the pinned version and the binary exists).
+    /// Tier 3: the managed location (`current` = marker matches the pinned
+    /// version and the binary exists). A GitHub-release tool is installed there
+    /// only when a reviewed SHA-256 pin ships.
     Managed { path: String, current: bool },
 }
 

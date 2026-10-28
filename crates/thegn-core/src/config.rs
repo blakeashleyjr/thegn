@@ -422,8 +422,9 @@ config_enum! {
     /// full-screen DiffView and `thegn diff --structural`) render:
     ///
     /// - `off`   — thegn's internal unified view (the default; unchanged).
-    /// - `auto`  — structural (difftastic) *when the tool resolves* through the
-    ///             managed-tool tiers, else the internal view.
+    /// - `auto`  — structural (difftastic) when `difft` resolves through a
+    ///             `[managed_tools.difft]` path override or PATH; managed
+    ///             downloads are disabled until reviewed SHA-256 pins ship.
     /// - `difft` — always structural; falls back to the internal view (with a
     ///             one-line notice) on any tool failure.
     ///
@@ -5497,8 +5498,9 @@ pub struct Config {
     pub zone: std::collections::BTreeMap<String, crate::zone::ZoneConfig>,
     /// Per-tool binary overrides (`[managed_tools.<name>]`) for the managed-tool
     /// resolver: an explicit `path` (highest-priority tier) + optional `args`,
-    /// consulted before PATH lookup and the managed download. See
-    /// [`crate::managed_tool`].
+    /// consulted before PATH lookup and the managed tier (a GitHub-release tool
+    /// installs there only when a reviewed SHA-256 pin ships; see `thegn doctor`).
+    /// See [`crate::managed_tool`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub managed_tools: std::collections::BTreeMap<String, crate::managed_tool::ToolOverride>,
     /// User-declared MCP servers (`[mcp_servers.<name>]`) the agent consumes,
