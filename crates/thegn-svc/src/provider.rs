@@ -5937,7 +5937,7 @@ mod tests {
     async fn sync_reconcile_upload_records_a_baseline_for_every_uploaded_file() {
         use sha2::{Digest, Sha256};
 
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("d")).unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
@@ -5962,7 +5962,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_keeps_a_local_edit_when_the_sandbox_copy_is_unchanged() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
         let files = TreeFiles::new();
@@ -5976,7 +5976,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_fast_forwards_an_untouched_local_file() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
         let files = TreeFiles::new();
@@ -5990,7 +5990,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_publishes_a_new_sandbox_file() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         let files = TreeFiles::new();
         let baseline = upload_tree(&files, "id", temp.path(), "/w").await.unwrap();
@@ -6003,7 +6003,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_refuses_a_both_sides_edit_before_writing_anything() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("d")).unwrap();
         std::fs::write(temp.path().join("a.txt"), b"one").unwrap();
@@ -6027,7 +6027,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_keeps_ignored_local_build_output() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
         std::fs::create_dir(temp.path().join("out")).unwrap();
@@ -6048,7 +6048,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_skips_an_ignored_sandbox_directory() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".gitignore"), "out/\n").unwrap();
         let files = TreeFiles::new();
@@ -6065,7 +6065,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_honours_a_nested_gitignore() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("sub")).unwrap();
         std::fs::create_dir(temp.path().join("sub/build")).unwrap();
@@ -6091,7 +6091,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_honours_a_dot_ignore_file() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".ignore"), "out/\n").unwrap();
         std::fs::create_dir(temp.path().join("out")).unwrap();
@@ -6109,7 +6109,7 @@ mod tests {
     // Positive control: this negated path is not ignored and still conflicts.
     #[tokio::test]
     async fn sync_reconcile_still_conflicts_on_a_negated_path() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".gitignore"), "out/*\n!out/keep\n").unwrap();
         std::fs::create_dir(temp.path().join("out")).unwrap();
@@ -6133,7 +6133,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_skips_output_excluded_by_info_exclude() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".git/info")).unwrap();
         std::fs::write(temp.path().join(".git/info/exclude"), "out/\n").unwrap();
@@ -6151,7 +6151,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_skips_output_excluded_in_a_linked_worktree() {
-        let _state = crate::testenv::IsolatedState::new();
+        let _state = thegn_core::testenv::IsolatedState::new();
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         let worktree = temp.path().join("wt");
