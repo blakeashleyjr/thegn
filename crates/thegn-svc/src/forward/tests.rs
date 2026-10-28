@@ -1,5 +1,5 @@
 use super::*;
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 
 fn runtime(prefix: &[&str]) -> OciRuntime {
     OciRuntime::new(prefix.iter().map(|part| (*part).to_string()).collect())
