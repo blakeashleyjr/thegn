@@ -28,13 +28,17 @@ for each to stop answering, and exits non-zero naming any that are still
 running. A listener or the registry it cannot check before the stop deadline
 is reported as unknown and makes the command exit non-zero naming it. It prints
 "no thegn pane daemon is running" only when every listener was checked and none
-is running.
+is running. A listener whose health check fails without proving the socket is
+gone is reported as unverified, makes `thegn daemon stop` exit non-zero naming
+it, and is not reported as stopped.
 
 When starting a pane daemon, thegn checks a configured socket first, then
 checks registered daemon endpoints, skipping any duplicate address. Registered
 endpoints share a 5-second check budget; if an endpoint is still unchecked when
 that budget expires, thegn does not start another daemon and names the
-unchecked endpoints, suggesting a retry or `thegn daemon stop`.
+unchecked endpoints, suggesting a retry or `thegn daemon stop`. A listener
+whose health check fails without proving the socket is gone is reported as
+unverified and prevents thegn from starting another daemon beside it.
 
 After starting a pane daemon, thegn waits up to 3 seconds for it to answer and
 reports an error if it does not. A daemon that cannot acquire its control-socket
