@@ -576,6 +576,9 @@ while it is queued, followed by the result, and raising the target stops at
 eight spares for the workspace's environment.
 If the spare ledger cannot be read, reconciliation warns and makes no pool
 changes rather than treating the pool as empty.
+When a worktree opens and its spare ledger cannot be read, a warning appears on
+the status line and in a toast, and the worktree is provisioned fresh instead
+of claiming a spare.
 If the current warm-pool target cannot be read, reconciliation makes no pool
 changes rather than falling back to the configured size. The warm-pool keys
 report `warm pool: cannot read the current target: ...` and save nothing.
