@@ -192,9 +192,11 @@ pub(crate) enum PluginMsg {
         session: SessionGen,
         event: SessionEvent,
     },
-    /// One completed `spawn_ndjson` run of a one-shot plugin.
+    /// One completed `spawn_ndjson` run of a one-shot plugin. `invoked` is
+    /// true when the user started it from the palette rather than a schedule.
     OneShot {
         plugin: String,
+        invoked: bool,
         run: Result<PluginRun, PluginError>,
     },
     /// A backoff-scheduled restart finished; `writer` is `None` when the
@@ -753,7 +755,11 @@ impl PluginsHost {
                 return;
             }
             // best-effort: the loop may be shutting down.
-            let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
+            let _ = tx.send(PluginMsg::OneShot {
+                plugin: id,
+                invoked: true,
+                run,
+            });
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
         match spawn {
@@ -1042,7 +1048,11 @@ fn start_poll_worker(
             return;
         }
         // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-        let _ = worker_tx.send(PluginMsg::OneShot { plugin, run });
+        let _ = worker_tx.send(PluginMsg::OneShot {
+            plugin,
+            invoked: false,
+            run,
+        });
         if let Some(waker) = &worker_waker {
             let _ = waker.wake(); // best-effort: an input nudge must never fail the calling path
         }
@@ -2925,7 +2935,7 @@ mod tests {
         );
         let fast_completed = matches!(
             recv_within(&mut rx, Duration::from_secs(10)),
-            Some(PluginMsg::OneShot { plugin, run: Ok(_) }) if plugin == "b-fast"
+            Some(PluginMsg::OneShot { plugin, run: Ok(_), .. }) if plugin == "b-fast"
         );
         let fast_marker_exists = marker.exists();
         let slow_not_completed_before_release =
@@ -2933,7 +2943,7 @@ mod tests {
         std::fs::write(&release, "go").unwrap();
         let slow_completed = matches!(
             recv_within(&mut rx, Duration::from_secs(10)),
-            Some(PluginMsg::OneShot { plugin, run: Ok(_) }) if plugin == "a-slow"
+            Some(PluginMsg::OneShot { plugin, run: Ok(_), .. }) if plugin == "a-slow"
         );
         setup.join().unwrap();
 
@@ -2997,7 +3007,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
         assert!(matches!(
             recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
-            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
+            PluginMsg::OneShot { plugin, run: Ok(_), .. } if plugin == "hello"
         ));
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "s3cr3t");
         assert!(rx.try_recv().is_err());
@@ -3047,7 +3057,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), PluginMsg::Loaded(_)));
         assert!(matches!(
             recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
-            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "hello"
+            PluginMsg::OneShot { plugin, run: Ok(_), .. } if plugin == "hello"
         ));
         assert_eq!(
             std::fs::read_to_string(marker).unwrap(),
@@ -3139,7 +3149,7 @@ mod tests {
         ));
         assert!(matches!(
             recv_within(&mut rx, Duration::from_secs(10)).unwrap(),
-            PluginMsg::OneShot { plugin, run: Ok(_) } if plugin == "survivor"
+            PluginMsg::OneShot { plugin, run: Ok(_), .. } if plugin == "survivor"
         ));
         assert!(!refused_marker.exists());
         assert!(other_marker.exists());
