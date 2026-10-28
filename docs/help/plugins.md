@@ -229,6 +229,10 @@ If the plugin host, restart worker, or a scheduled run cannot start, the status
 line reports the failure. A restart that cannot be scheduled counts as a failed
 restart, so the plugin is disabled after the usual attempts. A scheduled run
 start failure is reported once until a run starts successfully.
+A failed one-shot run (non-zero exit, timeout, start or protocol failure) is
+reported on the status line: every time for a palette action, once per distinct
+failure for a scheduled run until a run succeeds. The plugin's stderr is never
+shown there; use `thegn plugin check` or debug logging.
 Each resident process has its own session generation. After a reload or restart
 replaces a process, late events from that old process are ignored, so its exit
 cannot stop the new process or schedule another restart.
