@@ -363,8 +363,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = rt
-            .block_on(tokio::task::spawn_blocking(move || super::stop(&config)))
+        // stop() builds its own runtime, so run it on a plain thread outside this one.
+        let result = std::thread::spawn(move || super::stop(&config))
+            .join()
             .unwrap();
 
         rt.block_on(async {
