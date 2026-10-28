@@ -312,6 +312,8 @@ pub const CATALOG: &[Slot] = &[
     slot("map", "worktree", SourceKind::Worktree),
     slot("merge add", "worktrees", SourceKind::Worktree),
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
+    slot("merge history", "worktree", SourceKind::Worktree),
+    slot("merge history", "limit", SourceKind::Structural),
     slot("merge land", "worktree", SourceKind::Worktree),
     slot("merge land", "worktree_pos", SourceKind::Worktree),
     slot("merge retry", "worktree", SourceKind::Worktree),
@@ -875,5 +877,17 @@ mod tests {
             assert_eq!(lookup(s.command_path, s.arg_id), Some(s));
         }
         assert_eq!(lookup("no-such-verb", "nope"), None);
+    }
+
+    #[test]
+    fn merge_history_value_slots_have_their_completion_sources() {
+        assert_eq!(
+            lookup("merge history", "worktree").map(|slot| slot.source),
+            Some(SourceKind::Worktree)
+        );
+        assert_eq!(
+            lookup("merge history", "limit").map(|slot| slot.source),
+            Some(SourceKind::Structural)
+        );
     }
 }
