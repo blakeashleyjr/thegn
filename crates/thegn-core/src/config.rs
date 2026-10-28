@@ -423,8 +423,9 @@ config_enum! {
     ///
     /// - `off`   — thegn's internal unified view (the default; unchanged).
     /// - `auto`  — structural (difftastic) when `difft` resolves through a
-    ///             `[managed_tools.difft]` path override or PATH; managed
-    ///             downloads are disabled until reviewed SHA-256 pins ship.
+    ///             `[managed_tools.difft]` path override, PATH, or an already-
+    ///             installed managed copy; new managed downloads are disabled
+    ///             until reviewed SHA-256 pins ship.
     /// - `difft` — always structural; falls back to the internal view (with a
     ///             one-line notice) on any tool failure.
     ///
