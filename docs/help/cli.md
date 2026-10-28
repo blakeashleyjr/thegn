@@ -325,6 +325,9 @@ creating more hosts. If an idle autoscale host cannot be removed because its
 token or ledger record is unavailable, or the destroy fails, thegn warns each
 time; while the UI runs it shows one status line and toast per host, naming the
 provider and saying the host keeps running and billing.
+On the dev channel, scale-down also keeps and warns by name about an engine
+host whose tenant count or last use cannot be read, or whose creation time and
+use are both unrecorded; it never treats that missing age as idle.
 
 `thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
 entities (functions, types, …) grouped by file, ranked by caller
