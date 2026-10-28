@@ -14235,6 +14235,7 @@ async fn event_loop<T: Terminal>(
             )
         {
             refresh_tab_model(&mut model, &session, &mut sb);
+            sb.focus_active_row(&mut model);
             kick_model_hydration!();
             need_relayout = true;
         }
