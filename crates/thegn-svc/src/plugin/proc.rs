@@ -801,9 +801,7 @@ fn spawn_ndjson_stream_inner<S: NdjsonSink>(
         }
     };
     #[cfg(not(unix))]
-    let drain_deadline = if cancelled {
-        Instant::now() + READER_GRACE
-    } else if status.is_some() && !timed_out {
+    let drain_deadline = if cancelled || (status.is_some() && !timed_out) {
         Instant::now() + READER_GRACE
     } else {
         deadline + READER_GRACE
@@ -1516,12 +1514,21 @@ mod process_tree_deadline_tests {
 
     #[test]
     fn cancelled_run_kills_the_group_before_its_timeout() {
-        // `sh` and its sleeping child share the runner's process group. When
-        // cancellation is observed, killing that group closes both plugin
-        // pipes; the runner reaps `sh` and its pipe reader exits within grace.
+        // The shell and background sleeper share the runner's process group.
+        // Its pid file proves the descendant started before cancellation; the
+        // ESRCH check proves the group kill removed it, even if pipes close
+        // early for another reason.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("child.pid");
         let started = Instant::now();
         let result = spawn_ndjson_cancellable(
-            &["sh".into(), "-c".into(), "sleep 30".into()],
+            &[
+                "sh".into(),
+                "-c".into(),
+                "sleep 30 & echo $! > \"$1\"; wait".into(),
+                "sh".into(),
+                pid_path.to_string_lossy().into_owned(),
+            ],
             &BTreeMap::new(),
             None,
             Duration::from_secs(30),
@@ -1529,6 +1536,25 @@ mod process_tree_deadline_tests {
         );
         assert!(matches!(result, Err(PluginError::Cancelled)));
         assert!(started.elapsed() < Duration::from_secs(4));
+        let child_pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("background child wrote its pid")
+            .trim()
+            .parse()
+            .expect("background child pid is numeric");
+        let gone_by = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 only checks whether this pid still exists.
+            if unsafe { libc::kill(child_pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < gone_by,
+                "cancelled process group left child {child_pid} alive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_readers_exit_within_margin();
     }
 
