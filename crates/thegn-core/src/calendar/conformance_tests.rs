@@ -96,11 +96,11 @@ fn conformance_matrix_carries_recurrence_instance_rows() {
             ) if ics.contains("RECURRENCE-ID:") && json.contains("\"recurrence_id\"")
         )
     });
-    assert!(
-        admitted_override.is_some(),
-        "missing admitted recurrence-instance fixture; recurrence rows: {recurrence_fixture_names:?}"
-    );
-    let admitted_override = admitted_override.expect("asserted admitted override exists");
+    let Some(admitted_override) = admitted_override else {
+        panic!(
+            "missing admitted recurrence-instance fixture; recurrence rows: {recurrence_fixture_names:?}"
+        );
+    };
     let (json, _) = admitted_override
         .json
         .expect("admitted override has a JSON representation");
