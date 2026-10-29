@@ -317,16 +317,12 @@ pub(crate) const ORPHAN_SWEEP_LIMIT: usize = 64;
 
 pub(crate) fn sweep_orphan_ingest_refs(
     target: &GitLoc,
-    live: &[(GitLoc, String)],
+    live_rows: impl FnOnce() -> Result<Vec<(GitLoc, String)>>,
 ) -> Result<SweepReport> {
     if target.is_remote() {
         anyhow::bail!("cannot sweep merge-queue ingest refs in a remote target store");
     }
 
-    let live_keys: HashSet<String> = live
-        .iter()
-        .map(|(loc, branch)| row_key(loc, branch))
-        .collect();
     let outcome = target.git_run(
         &[
             "for-each-ref",
@@ -343,6 +339,10 @@ pub(crate) fn sweep_orphan_ingest_refs(
         other => anyhow::bail!("git for-each-ref failed: {other}"),
     };
 
+    let live_keys: HashSet<String> = live_rows()?
+        .iter()
+        .map(|(loc, branch)| row_key(loc, branch))
+        .collect();
     let mut report = SweepReport {
         limit_reached: refs.len() > ORPHAN_SWEEP_LIMIT,
         ..SweepReport::default()
@@ -1337,7 +1337,8 @@ mod tests {
         git(&fixture.target, &["update-ref", &orphan_ref, &target_oid]);
         git(&fixture.target, &["update-ref", legacy_ref, &target_oid]);
 
-        let report = sweep_orphan_ingest_refs(&target, &[(live_loc, "feat".to_string())]).unwrap();
+        let report =
+            sweep_orphan_ingest_refs(&target, || Ok(vec![(live_loc, "feat".to_string())])).unwrap();
 
         assert_eq!(report.deleted, 2);
         assert_eq!(report.failed, 0);
@@ -1348,7 +1349,9 @@ mod tests {
     #[test]
     fn sweep_with_no_refs_is_a_noop() {
         let fixture = stores("source");
-        let report = sweep_orphan_ingest_refs(&GitLoc::Local(fixture.target.clone()), &[]).unwrap();
+        let report =
+            sweep_orphan_ingest_refs(&GitLoc::Local(fixture.target.clone()), || Ok(Vec::new()))
+                .unwrap();
 
         assert_eq!(report, SweepReport::default());
         assert!(list_refs(&fixture.target).is_empty());
@@ -1366,11 +1369,31 @@ mod tests {
             git(&fixture.target, &["update-ref", &name, &target_oid]);
         }
 
-        let report = sweep_orphan_ingest_refs(&target, &[]).unwrap();
+        let report = sweep_orphan_ingest_refs(&target, || Ok(Vec::new())).unwrap();
 
         assert!(report.limit_reached);
         assert_eq!(report.deleted, ORPHAN_SWEEP_LIMIT);
         assert_eq!(report.failed, 0);
         assert_eq!(list_refs(&fixture.target).len(), 2);
+    }
+
+    #[test]
+    fn sweep_does_not_include_refs_created_after_listing() {
+        let fixture = stores("source");
+        let target = GitLoc::Local(fixture.target.clone());
+        let later_ref = "refs/thegn/mq/created-during-snapshot";
+        let target_oid =
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+
+        // Model another drain writing a ref after this pass has taken its ref
+        // listing but before it reads the queue snapshot.
+        let report = sweep_orphan_ingest_refs(&target, || {
+            git(&fixture.target, &["update-ref", later_ref, &target_oid]);
+            Ok(Vec::new())
+        })
+        .unwrap();
+
+        assert_eq!(report.deleted, 0);
+        assert_eq!(list_refs(&fixture.target), vec![later_ref.to_string()]);
     }
 }
