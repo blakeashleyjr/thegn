@@ -231,6 +231,41 @@ fn claimed_row_is_released_after_the_drain() {
 }
 
 #[test]
+fn drain_transitions_are_recorded_in_the_audit_trail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_at(&db_path).unwrap();
+    let worktree = root.join("worktree").to_string_lossy().into_owned();
+    let item = registered_row(&db, &root, &worktree, "feature");
+
+    drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        &root,
+        &db,
+        vec![item.clone()],
+        |_| {},
+        ready_actions(
+            |_, _, _| Ok(AttemptOutcome::Ready { tip: "tip".into() }),
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
+    );
+
+    let events = db.merge_queue_events(&item.worktree, 20).unwrap();
+    assert!(events.iter().any(|event| {
+        event.old_status == "queued" && event.new_status.as_deref() == Some("folding")
+    }));
+    assert!(events.iter().any(|event| {
+        event.old_status == "folding" && event.new_status.as_deref() == Some("ready")
+    }));
+    assert!(events.iter().all(|event| event.operation == "drive"));
+    assert_eq!(events[0].new_status.as_deref(), Some("ready"));
+}
+
+#[test]
 fn budget_is_consumed_through_the_claim() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("queue.sqlite");
