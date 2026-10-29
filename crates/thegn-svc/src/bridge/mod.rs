@@ -2005,6 +2005,16 @@ fn do_exec(p: &ExecParams, cancel: &Arc<AtomicBool>) -> Result<ExecResult> {
     // Diagnostics cross the bridge into host logs and status lines: scrub
     // secret-shaped text (THE-312). stdout is data and is never rewritten.
     result.stderr = thegn_core::ci_log::redact(&result.stderr);
+    // Redaction can expand short lines into markers. Keep the wire budget tied
+    // to the capture ceiling, and report the loss so the client fails closed.
+    if result.stderr.len() > MAX_CAPTURE_BYTES {
+        let mut end = MAX_CAPTURE_BYTES;
+        while !result.stderr.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.stderr.truncate(end);
+        result.stderr_truncated = true;
+    }
     Ok(result)
 }
 
@@ -2188,6 +2198,7 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
+    const TOKEN: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaa";
     const SECRET_OUTPUT_SCRIPT: &str = "printf '%s\\n' 'fatal: GITHUB_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaa' 'remote: https://user:hunter2pass@example.com/x.git' >&2; printf '%s\\n' 'ghp_aaaaaaaaaaaaaaaaaaaaaaaa'";
 
     #[test]
@@ -3686,7 +3697,6 @@ mod tests {
 
     #[test]
     fn do_exec_redacts_secret_shaped_stderr() {
-        let token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaa";
         let result = do_exec(
             &ExecParams {
                 argv: vec!["sh".into(), "-c".into(), SECRET_OUTPUT_SCRIPT.into()],
@@ -3697,10 +3707,34 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!result.stderr.contains(token));
+        assert!(!result.stderr.contains(TOKEN));
         assert!(!result.stderr.contains("hunter2pass"));
         assert!(result.stderr.contains(thegn_core::ci_log::REDACTION_MARKER));
-        assert_eq!(result.stdout, format!("{token}\n"));
+        assert_eq!(result.stdout, format!("{TOKEN}\n"));
+    }
+
+    #[test]
+    fn do_exec_caps_redaction_expansion_and_marks_stderr_truncated() {
+        let result = do_exec(
+            &ExecParams {
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf '%s\\n' '-----BEGIN PRIVATE KEY-----' >&2; yes '' | head -c 90000 >&2"
+                        .into(),
+                ],
+                cwd: None,
+                env: vec![],
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert!(
+            result.stderr.len() <= MAX_CAPTURE_BYTES,
+            "redacted stderr must remain within the capture and frame budget"
+        );
+        assert!(result.stderr_truncated, "expanded stderr was clipped");
     }
 
     #[test]
@@ -3732,10 +3766,10 @@ mod tests {
             .exec(&["sh", "-c", SECRET_OUTPUT_SCRIPT], None, &[])
             .unwrap();
 
-        assert!(!result.stderr.contains("ghp_aaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!result.stderr.contains(TOKEN));
         assert!(!result.stderr.contains("hunter2pass"));
         assert!(result.stderr.contains(thegn_core::ci_log::REDACTION_MARKER));
-        assert_eq!(result.stdout, "ghp_aaaaaaaaaaaaaaaaaaaaaaaa\n");
+        assert_eq!(result.stdout, format!("{TOKEN}\n"));
     }
 
     #[test]
