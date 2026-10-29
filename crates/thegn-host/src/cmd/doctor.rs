@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use thegn_core::capabilities::{Capabilities, IsolationClass};
-use thegn_core::config::{Config, FileAccess, SandboxProfile};
+use thegn_core::config::{Config, EnvProviderKind, FileAccess, SandboxProfile};
 use thegn_core::db::Db;
 use thegn_core::hooks::HookEvent;
 use thegn_core::managed_tool::{ManagedTool, Resolution};
@@ -3293,8 +3293,8 @@ fn provider_cache_report(cfg: &Config) {
             p.provider.trim(),
             env_devshell(cfg, e),
         );
-        if thegn_core::config::EnvProviderKind::of(p.provider.trim()).live_unverified() {
-            outln!("               experimental: lifecycle not verified on a live account");
+        if let Some(note) = provider_cache_lifecycle_note(p.provider.trim()) {
+            outln!("{note}");
         }
         if p.host_cache {
             match &bridge {
@@ -3311,17 +3311,24 @@ fn provider_cache_report(cfg: &Config) {
     }
 }
 
+fn provider_cache_lifecycle_note(provider: &str) -> Option<&'static str> {
+    EnvProviderKind::of(provider)
+        .live_unverified()
+        .then_some("               experimental: lifecycle not verified on a live account")
+}
+
 fn provider_cache_json(cfg: &Config) -> serde_json::Value {
     let bridge_present = crate::bridge_sup::bridge_binary_path().is_some();
     let mut map = serde_json::Map::new();
     for name in provider_env_names(cfg) {
         let e = &cfg.env[name];
         let p = &e.provider;
+        let kind = EnvProviderKind::of(p.provider.trim());
         map.insert(
             name.clone(),
             serde_json::json!({
                 "provider": p.provider.trim(),
-                "live_verified": !thegn_core::config::EnvProviderKind::of(p.provider.trim()).live_unverified(),
+                "live_verified": !kind.live_unverified(),
                 "devshell": env_devshell(cfg, e),
                 "binary_cache_url": p.binary_cache_url.trim(),
                 "host_cache": p.host_cache,
@@ -6067,6 +6074,11 @@ args = ["--verbose"]
         let bridge = s["bridge_present"].as_bool().unwrap();
         assert_eq!(s["host_cache_effective"], bridge);
         assert_eq!(v["vps"]["live_verified"], false);
+        assert_eq!(
+            provider_cache_lifecycle_note("hetzner"),
+            Some("               experimental: lifecycle not verified on a live account")
+        );
+        assert_eq!(provider_cache_lifecycle_note("sprites"), None);
         // env_devshell falls back to the global default when no override is set.
         let plain = EnvConfig {
             provider: EnvProviderConfig {
