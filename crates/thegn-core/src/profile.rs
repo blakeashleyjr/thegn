@@ -513,7 +513,14 @@ fn ssh_key_verdict(is_file: bool, owned: bool, mode: Option<u32>) -> Result<(), 
 }
 
 /// Return credential-shaped environment names selected by the THE-444 option
-/// B denylist. This is the decided denylist, not a full firewall.
+/// B denylist. It mirrors the autonomous-agent `credential_shaped` families
+/// minus socket names; this is the decided denylist, not a full firewall.
+/// - `_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_ACCESS_KEY`
+/// - `_KEY`, `_AUTH`, `_CREDENTIAL`, `_CREDENTIALS`, `_PASSPHRASE`
+/// - Exact names: `GPG_AGENT_INFO`, `GOOGLE_APPLICATION_CREDENTIALS`,
+///   `AWS_ACCESS_KEY_ID`, `AWS_SESSION_TOKEN`, `AWS_SECRET_ACCESS_KEY`,
+///   `AZURE_CLIENT_SECRET`, `NPM_TOKEN`, `NODE_AUTH_TOKEN`,
+///   `CARGO_REGISTRY_TOKEN`, `DOCKER_AUTH_CONFIG`
 pub fn scrubbed_credential_vars<I: IntoIterator<Item = String>>(
     names: I,
     profile_has_ssh_key: bool,
@@ -535,10 +542,22 @@ pub fn scrubbed_credential_vars<I: IntoIterator<Item = String>>(
                             | "NPM_TOKEN"
                             | "NODE_AUTH_TOKEN"
                             | "CARGO_REGISTRY_TOKEN"
+                            | "DOCKER_AUTH_CONFIG"
                     )
-                    || ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_ACCESS_KEY"]
-                        .iter()
-                        .any(|suffix| upper.ends_with(suffix))
+                    || [
+                        "_API_KEY",
+                        "_TOKEN",
+                        "_SECRET",
+                        "_PASSWORD",
+                        "_ACCESS_KEY",
+                        "_KEY",
+                        "_AUTH",
+                        "_CREDENTIAL",
+                        "_CREDENTIALS",
+                        "_PASSPHRASE",
+                    ]
+                    .iter()
+                    .any(|suffix| upper.ends_with(suffix))
                     || (upper.starts_with("CARGO_REGISTRIES_") && upper.ends_with("_TOKEN")))
         })
         .collect()
@@ -1392,6 +1411,113 @@ mod tests {
         let names = vec!["SSH_AUTH_SOCK".to_owned()];
         assert_eq!(scrubbed_credential_vars(names.clone(), false), names);
         assert!(scrubbed_credential_vars(names, true).is_empty());
+    }
+
+    #[test]
+    fn credential_scrub_covers_every_denylist_family() {
+        let cases = [
+            ("exact GPG_AGENT_INFO", "GPG_AGENT_INFO"),
+            (
+                "exact GOOGLE_APPLICATION_CREDENTIALS",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+            ),
+            ("exact AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+            ("exact AWS_SESSION_TOKEN", "AWS_SESSION_TOKEN"),
+            ("exact AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+            ("exact AZURE_CLIENT_SECRET", "AZURE_CLIENT_SECRET"),
+            ("exact NPM_TOKEN", "NPM_TOKEN"),
+            ("exact NODE_AUTH_TOKEN", "NODE_AUTH_TOKEN"),
+            ("exact CARGO_REGISTRY_TOKEN", "CARGO_REGISTRY_TOKEN"),
+            ("exact DOCKER_AUTH_CONFIG", "DOCKER_AUTH_CONFIG"),
+            ("_API_KEY", "ANTHROPIC_API_KEY"),
+            ("_TOKEN", "GH_TOKEN"),
+            ("_SECRET", "AZURE_SECRET"),
+            ("_PASSWORD", "DB_PASSWORD"),
+            ("_ACCESS_KEY", "AWS_ACCESS_KEY"),
+            ("_KEY", "AWS_SECRET_KEY"),
+            ("_KEY", "SSH_PRIVATE_KEY"),
+            ("_KEY", "STRIPE_KEY"),
+            ("_KEY, lowercase input", "openai_key"),
+            ("_AUTH", "NPM_CONFIG__AUTH"),
+            ("_CREDENTIAL", "GIT_CREDENTIAL"),
+            ("_CREDENTIALS", "GCP_CREDENTIALS"),
+            ("_PASSPHRASE", "GPG_PASSPHRASE"),
+            (
+                "CARGO_REGISTRIES_*_TOKEN",
+                "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+            ),
+        ];
+
+        for (family, name) in cases {
+            assert_eq!(
+                scrubbed_credential_vars([name.to_owned()], false),
+                vec![name.to_owned()],
+                "denylist family {family} must scrub {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_scrub_never_touches_infrastructure_or_locators() {
+        for name in crate::util::HOST_ENV_ALLOW_EXACT {
+            assert!(
+                scrubbed_credential_vars([(*name).to_owned()], false).is_empty(),
+                "host infrastructure name {name} must remain available"
+            );
+        }
+
+        for name in [
+            "LC_ALL",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "NIX_PATH",
+            "THEGN_PROFILE",
+            "THEGN_CONTROL_TOKEN",
+            "SSH_AGENT_PID",
+            "KUBECONFIG",
+        ] {
+            assert!(
+                scrubbed_credential_vars([name.to_owned()], false).is_empty(),
+                "infrastructure or locator name {name} must remain available"
+            );
+        }
+
+        assert!(scrubbed_credential_vars(["SSH_AUTH_SOCK".to_owned()], true).is_empty());
+    }
+
+    #[test]
+    fn two_profiles_credential_env_never_share_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let personal = dir.path().join("personal");
+
+        for (name, value) in credential_env(&work, None) {
+            if let Some(value) = value {
+                let value_path = std::path::Path::new(&value);
+                assert!(
+                    value_path.starts_with(&work),
+                    "work profile {name} points outside its root: {value}"
+                );
+                assert!(
+                    !value_path.starts_with(&personal),
+                    "work profile {name} points into personal root: {value}"
+                );
+            }
+        }
+
+        for (name, value) in credential_env(&personal, None) {
+            if let Some(value) = value {
+                let value_path = std::path::Path::new(&value);
+                assert!(
+                    value_path.starts_with(&personal),
+                    "personal profile {name} points outside its root: {value}"
+                );
+                assert!(
+                    !value_path.starts_with(&work),
+                    "personal profile {name} points into work root: {value}"
+                );
+            }
+        }
     }
 
     #[test]
