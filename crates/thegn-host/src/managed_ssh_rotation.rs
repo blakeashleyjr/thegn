@@ -497,7 +497,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
 
     for record in &tracked {
         ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
-        thegn_core::managed_ssh::record_authorized_with_proxy_worktree(
+        thegn_core::managed_ssh::record_rotation_completed(
             &record.provider,
             &record.account,
             &record.instance,
@@ -677,7 +677,7 @@ fn recover_pending(
         for &index in &pending {
             let record = &records[index];
             ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
-            thegn_core::managed_ssh::record_authorized_with_proxy_worktree(
+            thegn_core::managed_ssh::record_rotation_completed(
                 &record.provider,
                 &record.account,
                 &record.instance,
