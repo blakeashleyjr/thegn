@@ -761,8 +761,19 @@ impl LspInner {
         released
     }
 
-    pub(crate) fn set_require_containment(&self, require: bool) {
-        self.require_containment.store(require, Ordering::Release);
+    pub(crate) fn set_require_containment(&self, epoch: u64, require: bool) {
+        let mut state = match self.clients.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.config_epoch != epoch {
+            return;
+        }
+        if self.require_containment.swap(require, Ordering::AcqRel) != require {
+            state
+                .map
+                .retain(|_, slot| !matches!(slot, ClientSlot::Failed { .. }));
+        }
     }
 
     fn containment_gate(
@@ -3547,7 +3558,8 @@ mod tests {
         use thegn_core::sandbox_cpucap::BackgroundWrap;
 
         let (inner, _rx) = enabled_inner();
-        inner.set_require_containment(true);
+        assert_eq!(inner.reconfigure(1, true, &[]), 0);
+        inner.set_require_containment(1, true);
         assert!(matches!(
             inner.containment_gate(BackgroundWrap::ScopeUnusable),
             Err(LspError::Spawn(_))
@@ -3560,18 +3572,19 @@ mod tests {
         use thegn_core::sandbox_cpucap::BackgroundWrap;
 
         let (inner, _rx) = enabled_inner();
+        assert_eq!(inner.reconfigure(1, true, &[]), 0);
         assert!(
             inner
                 .containment_gate(BackgroundWrap::ScopeUnusable)
                 .is_ok()
         );
-        inner.set_require_containment(true);
+        inner.set_require_containment(1, true);
         assert!(
             inner
                 .containment_gate(BackgroundWrap::ScopeUnusable)
                 .is_err()
         );
-        inner.set_require_containment(false);
+        inner.set_require_containment(1, false);
         assert!(
             inner
                 .containment_gate(BackgroundWrap::ScopeUnusable)
@@ -3592,6 +3605,59 @@ mod tests {
                 .containment_gate(BackgroundWrap::ScopeUnusable)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stale_require_containment_epoch_is_ignored() {
+        use thegn_core::sandbox_cpucap::BackgroundWrap;
+
+        let (inner, _rx) = enabled_inner();
+        assert_eq!(inner.reconfigure(2, true, &[]), 0);
+        inner.set_require_containment(1, true);
+
+        assert!(
+            inner
+                .containment_gate(BackgroundWrap::ScopeUnusable)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn changing_require_containment_clears_cached_start_failure() {
+        use thegn_core::sandbox_cpucap::BackgroundWrap;
+
+        let (inner, _rx) = enabled_inner();
+        assert_eq!(inner.reconfigure(1, true, &[]), 0);
+        inner.set_require_containment(1, true);
+        let root = Path::new("/containment-backoff");
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        assert!(matches!(
+            inner.client_with(root, "rust", |_, _, _, _| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                inner.containment_gate(BackgroundWrap::ScopeUnusable)?;
+                panic!("uncontained server must not reach startup")
+            }),
+            Err(LspError::Spawn(message)) if message.contains("require_containment")
+        ));
+        assert!(matches!(
+            inner.client_with(root, "rust", |_, _, _, _| {
+                panic!("cached failure must be in backoff before the policy changes")
+            }),
+            Err(LspError::Protocol(message)) if message == "LSP start backoff active"
+        ));
+
+        inner.set_require_containment(1, false);
+        assert!(matches!(
+            inner.client_with(root, "rust", |_, _, _, _| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                inner
+                    .containment_gate(BackgroundWrap::ScopeUnusable)
+                    .unwrap();
+                Err(LspError::Spawn("server launch failed".into()))
+            }),
+            Err(LspError::Spawn(message)) if message == "server launch failed"
+        ));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
