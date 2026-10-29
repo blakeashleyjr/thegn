@@ -1356,6 +1356,8 @@ fn serve_up_turns_off_the_serve_when_the_dns_lookup_fails() {
     });
 
     assert!(result.is_err());
+    let error = result.err().unwrap();
+    assert!(format!("{error:#}").contains("turned off"));
     assert!(calls.iter().any(|(_, argv)| argv == &plan.down_argv));
     assert!(calls.iter().all(|(target, _)| target == &recorded.id));
 }
