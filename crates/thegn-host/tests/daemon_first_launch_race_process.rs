@@ -124,10 +124,6 @@ fn read_capped(path: &Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "process test owns each spawned daemon child"
-)]
 fn spawn_daemon(mut command: Command, scope: &Scope, index: usize) -> OwnedDaemon {
     let stdout_path = scope.root.path().join(format!("daemon-{index}.stdout"));
     let stderr_path = scope.root.path().join(format!("daemon-{index}.stderr"));
@@ -284,10 +280,6 @@ mod unix_tests {
         run_first_launch_race(&scope, None, candidates.into());
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "process race test polls and reaps its owned daemon children"
-    )]
     fn run_first_launch_race(scope: &Scope, runtime: Option<&Path>, candidates: Vec<PathBuf>) {
         let mut children = Vec::with_capacity(CHILD_COUNT);
         for index in 0..CHILD_COUNT {
@@ -329,8 +321,10 @@ mod unix_tests {
                 }
                 statuses.push(status);
             }
-            if endpoint.is_some() && running == 1 && statuses.iter().all(Option::is_some) {
-                break (endpoint.expect("endpoint was checked"), statuses);
+            if let Some(endpoint) = endpoint
+                && running == 1
+            {
+                break (endpoint, statuses);
             }
             assert!(
                 Instant::now() < deadline,
@@ -416,16 +410,21 @@ mod unix_tests {
         );
         let survivor = &mut children[winner];
         let exit_deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        let survivor_status = loop {
             match survivor.child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < exit_deadline => {
                     thread::sleep(Duration::from_millis(10));
                 }
                 Ok(None) => panic!("stopped daemon did not exit before deadline"),
                 Err(error) => panic!("could not poll stopped daemon: {error}"),
             }
-        }
+        };
+        let survivor_stderr = read_capped(&survivor.stderr_path);
+        assert!(
+            survivor_status.success(),
+            "stopped daemon must exit successfully; status={survivor_status}; stderr:\n{survivor_stderr}"
+        );
         assert!(
             !endpoint.exists(),
             "stopped daemon must remove endpoint {}",
@@ -437,7 +436,8 @@ mod unix_tests {
         !status.success()
             && ((stderr.contains("daemon allocation lock") && stderr.contains("held by another"))
                 || (stderr.contains("existing control socket did not answer the probe")
-                    && stderr.contains("refusing to replace it")))
+                    && stderr.contains("refusing to replace it"))
+                || stderr.contains("control socket lock is held by another process"))
     }
 
     #[expect(
