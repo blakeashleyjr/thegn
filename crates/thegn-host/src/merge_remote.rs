@@ -19,6 +19,7 @@
 use crate::platform::bundle_custody::{BundleTemp, kill_bundle_producer, spawn_bundle_producer};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
@@ -303,6 +304,82 @@ fn enumerate_stale_refs(target: &GitLoc, prefix: &str) -> Result<Vec<String>> {
         thegn_core::git_run::GitOutcome::EmptyOk => Ok(Vec::new()),
         other => anyhow::bail!("git for-each-ref failed: {other}"),
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SweepReport {
+    pub(crate) deleted: usize,
+    pub(crate) failed: usize,
+    pub(crate) limit_reached: bool,
+}
+
+pub(crate) const ORPHAN_SWEEP_LIMIT: usize = 64;
+
+pub(crate) fn sweep_orphan_ingest_refs(
+    target: &GitLoc,
+    live: &[(GitLoc, String)],
+) -> Result<SweepReport> {
+    if target.is_remote() {
+        anyhow::bail!("cannot sweep merge-queue ingest refs in a remote target store");
+    }
+
+    let live_keys: HashSet<String> = live
+        .iter()
+        .map(|(loc, branch)| row_key(loc, branch))
+        .collect();
+    let outcome = target.git_run(
+        &[
+            "for-each-ref",
+            "--count=65",
+            "--format=%(refname)",
+            "refs/thegn/mq/",
+        ],
+        &thegn_core::git_run::GitPolicy::read(crate::integrate::DRIVER_SUBPROCESS_TIMEOUT),
+        &AtomicBool::new(false),
+    );
+    let refs = match outcome {
+        thegn_core::git_run::GitOutcome::Ok(stdout) => parse_ref_listing(&stdout)?,
+        thegn_core::git_run::GitOutcome::EmptyOk => Vec::new(),
+        other => anyhow::bail!("git for-each-ref failed: {other}"),
+    };
+
+    let mut report = SweepReport {
+        limit_reached: refs.len() > ORPHAN_SWEEP_LIMIT,
+        ..SweepReport::default()
+    };
+    for name in refs.into_iter().take(ORPHAN_SWEEP_LIMIT) {
+        let Some(rest) = name.strip_prefix("refs/thegn/mq/") else {
+            continue;
+        };
+        let mut parts = rest.split('/');
+        let generation_layout = match (parts.next(), parts.next(), parts.next()) {
+            (Some(key), Some(generation), None) => {
+                is_lower_hex_16(key) && is_lower_hex_16(generation)
+            }
+            _ => false,
+        };
+        if generation_layout
+            && let Some(key) = rest.split('/').next()
+            && live_keys.contains(key)
+        {
+            continue;
+        }
+        match ref_update(target, &["update-ref", "-d", &name]) {
+            Ok(()) => report.deleted += 1,
+            Err(error) => {
+                report.failed += 1;
+                tracing::warn!(target: "thegn::merge", ref_name = %name, %error, "failed to sweep merge-queue ingest ref");
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn is_lower_hex_16(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Result of comparing the live source host branch to the ingested OID.
@@ -1238,5 +1315,62 @@ mod tests {
             verify_source_unchanged(&GitLoc::Local(fixture.source.clone()), "feat", &fixture.oid),
             SourceCheck::Moved { actual }
         );
+    }
+
+    #[test]
+    fn sweep_deletes_orphaned_and_legacy_refs_and_keeps_live_rows() {
+        let fixture = stores("source");
+        let target = GitLoc::Local(fixture.target.clone());
+        let live_loc = GitLoc::Local(fixture.source.clone());
+        let live_ref = format!(
+            "refs/thegn/mq/{}/0000000000000001",
+            row_key(&live_loc, "feat")
+        );
+        let orphan_ref = format!(
+            "refs/thegn/mq/{}/0000000000000002",
+            row_key(&GitLoc::Local(PathBuf::from("/gone")), "gone")
+        );
+        let legacy_ref = "refs/thegn/mq/old-branch";
+        let target_oid =
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+        git(&fixture.target, &["update-ref", &live_ref, &target_oid]);
+        git(&fixture.target, &["update-ref", &orphan_ref, &target_oid]);
+        git(&fixture.target, &["update-ref", legacy_ref, &target_oid]);
+
+        let report = sweep_orphan_ingest_refs(&target, &[(live_loc, "feat".to_string())]).unwrap();
+
+        assert_eq!(report.deleted, 2);
+        assert_eq!(report.failed, 0);
+        assert!(!report.limit_reached);
+        assert_eq!(list_refs(&fixture.target), vec![live_ref]);
+    }
+
+    #[test]
+    fn sweep_with_no_refs_is_a_noop() {
+        let fixture = stores("source");
+        let report = sweep_orphan_ingest_refs(&GitLoc::Local(fixture.target.clone()), &[]).unwrap();
+
+        assert_eq!(report, SweepReport::default());
+        assert!(list_refs(&fixture.target).is_empty());
+    }
+
+    #[test]
+    fn sweep_reports_the_limit() {
+        let fixture = stores("source");
+        let target = GitLoc::Local(fixture.target.clone());
+        let target_oid =
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+        let row = row_key(&GitLoc::Local(PathBuf::from("/gone")), "gone");
+        for generation in 0..(ORPHAN_SWEEP_LIMIT + 2) {
+            let name = format!("refs/thegn/mq/{row}/{generation:016x}");
+            git(&fixture.target, &["update-ref", &name, &target_oid]);
+        }
+
+        let report = sweep_orphan_ingest_refs(&target, &[]).unwrap();
+
+        assert!(report.limit_reached);
+        assert_eq!(report.deleted, ORPHAN_SWEEP_LIMIT);
+        assert_eq!(report.failed, 0);
+        assert_eq!(list_refs(&fixture.target).len(), 2);
     }
 }

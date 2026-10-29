@@ -349,6 +349,47 @@ pub(crate) fn drive_queue(
     items: Vec<QueueItem>,
     progress: impl FnMut(&DriveStep),
 ) -> DriveOutcome {
+    match db.list_merge_queue() {
+        Ok(rows) => {
+            let live = rows
+                .iter()
+                .map(|row| {
+                    (
+                        thegn_core::remote::GitLoc::from_db(
+                            &row.worktree,
+                            (!row.location.is_empty()).then_some(row.location.as_str()),
+                        ),
+                        row.branch.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            match crate::merge_remote::sweep_orphan_ingest_refs(
+                &thegn_core::remote::GitLoc::Local(repo_root.to_path_buf()),
+                &live,
+            ) {
+                Ok(report) if report.deleted > 0 || report.failed > 0 || report.limit_reached => {
+                    tracing::warn!(
+                        target: "thegn::merge",
+                        deleted = report.deleted,
+                        failed = report.failed,
+                        limit_reached = report.limit_reached,
+                        "swept orphaned merge-queue ingest refs"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    target: "thegn::merge",
+                    %error,
+                    "merge-queue ingest ref sweep skipped"
+                ),
+            }
+        }
+        Err(error) => tracing::warn!(
+            target: "thegn::merge",
+            %error,
+            "merge-queue ingest ref sweep skipped: queue unreadable"
+        ),
+    }
     let worktree_branches: HashMap<String, String> = items
         .iter()
         .map(|item| (item.worktree.clone(), item.branch.clone()))
