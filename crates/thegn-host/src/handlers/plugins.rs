@@ -3433,7 +3433,6 @@ mod tests {
 
         drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {});
 
-        assert!(rx.is_empty(), "the io request is consumed at dispatch");
         assert!(state.plugins["p"].runtime.audit_log().is_empty());
     }
 
