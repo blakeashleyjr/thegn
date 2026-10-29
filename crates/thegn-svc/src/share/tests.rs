@@ -2367,3 +2367,238 @@ fn stop_now_after_reap_never_signals() {
     assert_eq!(report.leaked_readers, 0);
     assert_eq!(handle.stop_now(), StopOutcome::AlreadyExited);
 }
+
+#[derive(Clone, Default)]
+struct SecretCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl SecretCapture {
+    fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn records(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Default)]
+struct SecretFields(Vec<String>);
+
+impl tracing::field::Visit for SecretFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push(format!("{}={value:?}", field.name()));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push(format!("{}={value}", field.name()));
+    }
+}
+
+impl tracing::Subscriber for SecretCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut fields = SecretFields::default();
+        attrs.record(&mut fields);
+        let metadata = attrs.metadata();
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!(
+                "{} {} {}",
+                metadata.target(),
+                metadata.level(),
+                fields.0.join(" ")
+            ));
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = SecretFields::default();
+        event.record(&mut fields);
+        let metadata = event.metadata();
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!(
+                "{} {} {}",
+                metadata.target(),
+                metadata.level(),
+                fields.0.join(" ")
+            ));
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::TRACE)
+    }
+}
+
+static SHARE_SECRET_CAPTURE: std::sync::OnceLock<SecretCapture> = std::sync::OnceLock::new();
+static SHARE_SECRET_GLOBAL_CAPTURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SHARE_SECRET_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn share_secret_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    SHARE_SECRET_TEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[allow(
+    clippy::disallowed_macros,
+    reason = "Report when a global subscriber prevents thread capture"
+)]
+fn install_share_secret_capture() -> (SecretCapture, Option<tracing::subscriber::DefaultGuard>) {
+    let capture = SHARE_SECRET_CAPTURE
+        .get_or_init(SecretCapture::default)
+        .clone();
+    let global_capture_installed =
+        *SHARE_SECRET_GLOBAL_CAPTURE.get_or_init(|| match tracing::subscriber::set_global_default(
+            capture.clone(),
+        ) {
+            Ok(()) => true,
+            Err(_) => false,
+        });
+    let fallback = if global_capture_installed {
+        None
+    } else {
+        eprintln!(
+            "share-secret capture fallback only covers this test thread; reader-thread events are not covered"
+        );
+        Some(tracing::subscriber::set_default(capture.clone()))
+    };
+    (capture, fallback)
+}
+
+fn share_secret_plan(canary: &str, script: &std::path::Path) -> SharePlan {
+    SharePlan {
+        program: "/bin/sh".into(),
+        args: vec![
+            script.to_string_lossy().into_owned(),
+            "{statedir}/frpc.toml".into(),
+        ],
+        env: vec![("BORE_SECRET".into(), SecretString::from(canary))],
+        files: vec![SharePlanFile {
+            dest: "frpc.toml".into(),
+            contents: SecretString::from(format!("token = \"{canary}\"\n")),
+        }],
+        url_rule: UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    }
+}
+
+#[test]
+fn share_secret_capture_sees_events() {
+    let _serial = share_secret_test_lock();
+    let (capture, _fallback) = install_share_secret_capture();
+    capture.clear();
+    let canary = "tg-b80-share-canary-positive";
+    let plan = SharePlan {
+        program: "fake-share-client".into(),
+        args: Vec::new(),
+        env: vec![("BORE_SECRET".into(), SecretString::from(canary))],
+        files: Vec::new(),
+        url_rule: UrlRule::Fixed("http://fake.example".into()),
+    };
+
+    tracing::warn!(target: "thegn::share_secret_test", plan = ?plan, "share plan built");
+
+    let records = capture.records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.contains("share plan built")),
+        "capture missed the positive-control event; records: {records:?}"
+    );
+    assert!(
+        records.iter().all(|record| !record.contains(canary)),
+        "SharePlan Debug exposed its secret; records: {records:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn share_secrets_never_reach_tracing_errors_or_files_on_a_clean_start_and_stop() {
+    let _serial = share_secret_test_lock();
+    let (capture, _fallback) = install_share_secret_capture();
+    capture.clear();
+    let canary = "tg-b80-share-canary-clean";
+    let script_dir = tempfile::tempdir().expect("private fake-client directory");
+    let state = tempfile::tempdir().expect("private share state directory");
+    let script = script_dir.path().join("fake-client");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ntest -f \"$1\" || exit 3\nprintf 'listening at fake.example:4123\\n'\nexec sleep 30\n",
+    )
+    .expect("write fake client");
+    let plan = share_secret_plan(canary, &script);
+
+    let running = start(&plan, state.path(), Duration::from_secs(5)).expect("start fake client");
+    assert!(state.path().join("frpc.toml").exists());
+    let report = running.stop_verified();
+
+    assert!(!state.path().join("frpc.toml").exists());
+    assert!(
+        !format!("{report:?}").contains(canary),
+        "teardown report contained the secret: {report:?}"
+    );
+    let records = capture.records();
+    assert!(
+        records.iter().all(|record| !record.contains(canary)),
+        "tracing contained the secret; records: {records:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn share_secret_echoed_by_a_failing_client_never_reaches_the_start_error_or_tracing() {
+    let _serial = share_secret_test_lock();
+    let (capture, _fallback) = install_share_secret_capture();
+    capture.clear();
+    let canary = "tg-b80-share-canary-fail";
+    let script_dir = tempfile::tempdir().expect("private fake-client directory");
+    let state = tempfile::tempdir().expect("private share state directory");
+    let script = script_dir.path().join("fake-client");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'auth failed for %s\\n' \"$BORE_SECRET\"\nprintf 'auth failed for %s\\n' \"$BORE_SECRET\" >&2\nexit 1\n",
+    )
+    .expect("write fake client");
+    let plan = share_secret_plan(canary, &script);
+
+    let error = start(&plan, state.path(), Duration::from_secs(5)).expect_err("client must fail");
+
+    assert!(
+        !format!("{error:#}").contains(canary),
+        "start error display chain contained the secret: {error:#}"
+    );
+    assert!(
+        !format!("{error:?}").contains(canary),
+        "start error debug chain contained the secret: {error:?}"
+    );
+    assert!(!state.path().join("frpc.toml").exists());
+    let records = capture.records();
+    assert!(
+        records.iter().all(|record| !record.contains(canary)),
+        "tracing contained the secret; records: {records:?}"
+    );
+}
