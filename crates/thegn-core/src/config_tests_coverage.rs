@@ -537,6 +537,7 @@ fn section_defaults_match_documented_values() {
     assert!(l.enabled);
     assert!(l.hover);
     assert!(l.servers.is_empty());
+    assert!(!l.require_containment);
 
     let p = PaletteConfig::default();
     assert_eq!(p.content_max_results, 500);
@@ -1749,6 +1750,7 @@ fn lsp_servers_and_actions_and_custom_actions_parse() {
 [lsp]
 enabled = false
 hover = false
+require_containment = true
 [[lsp.servers]]
 lang = "rust"
 command = "rust-analyzer"
@@ -1776,6 +1778,7 @@ run = "echo hi"
     .unwrap();
     assert!(!cfg.lsp.enabled);
     assert!(!cfg.lsp.hover);
+    assert!(cfg.lsp.require_containment);
     // A legacy override-only entry deserializes identically (new fields default).
     assert_eq!(cfg.lsp.servers[0].lang, "rust");
     assert_eq!(cfg.lsp.servers[0].args, vec!["--stdio"]);
