@@ -330,6 +330,8 @@ fn credential_free_spec_at(
             .collect::<Vec<_>>();
         strip_credential_mounts(&mut spec.mounts, home, &identity_dests);
     }
+    let worktree = spec.worktree.clone();
+    pin_git_control_read_only(&mut spec.mounts, &worktree);
     spec
 }
 
@@ -350,6 +352,117 @@ fn strip_credential_mounts(
                 .iter()
                 .any(|credential_dir| dest.starts_with(credential_dir))
     });
+}
+
+fn pin_git_control_read_only(
+    mounts: &mut Vec<thegn_core::sandbox::Mount>,
+    worktree: &std::path::Path,
+) {
+    let Some(common_index) = mounts.iter().position(|mount| {
+        !mount.ro
+            && mounts
+                .iter()
+                .any(|config| config.ro && config.host == format!("{}/config", mount.host))
+    }) else {
+        return;
+    };
+    let common = mounts[common_index].host.clone();
+    let hooks = format!("{common}/hooks");
+    if !std::path::Path::new(&hooks).is_dir()
+        && let Err(error) = std::fs::create_dir(&hooks)
+    {
+        mounts[common_index].ro = true;
+        tracing::warn!(
+            target: "thegn::sandbox",
+            path = %hooks,
+            %error,
+            "git hooks dir could not be pinned; git dir mounted read-only for this agent"
+        );
+        return;
+    }
+    if !std::path::Path::new(&hooks).is_dir() {
+        mounts[common_index].ro = true;
+        tracing::warn!(
+            target: "thegn::sandbox",
+            path = %hooks,
+            "git hooks dir could not be pinned; git dir mounted read-only for this agent"
+        );
+        return;
+    }
+    if let Some(existing) = mounts.iter_mut().find(|mount| mount.dest == hooks) {
+        existing.ro = true;
+    } else {
+        mounts.push(thegn_core::sandbox::Mount {
+            host: hooks.clone(),
+            dest: hooks,
+            ro: true,
+            cache: false,
+        });
+    }
+
+    let Some(worktree_git_dir) = thegn_core::git_memo::git_dir(worktree) else {
+        tracing::debug!(
+            target: "thegn::sandbox",
+            worktree = %worktree.display(),
+            "per-worktree git dir is unavailable; config.worktree was not pinned"
+        );
+        return;
+    };
+    let canonical_common = match std::fs::canonicalize(&common) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::sandbox",
+                path = %common,
+                %error,
+                "git common dir could not be canonicalized; config.worktree was not pinned"
+            );
+            return;
+        }
+    };
+    let canonical_worktree_git_dir = match std::fs::canonicalize(&worktree_git_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(
+                target: "thegn::sandbox",
+                path = %worktree_git_dir.display(),
+                %error,
+                "per-worktree git dir could not be canonicalized; config.worktree was not pinned"
+            );
+            return;
+        }
+    };
+    let Ok(relative_git_dir) = canonical_worktree_git_dir.strip_prefix(&canonical_common) else {
+        tracing::debug!(
+            target: "thegn::sandbox",
+            worktree_git_dir = %canonical_worktree_git_dir.display(),
+            common = %canonical_common.display(),
+            "per-worktree git dir is outside the git common dir; config.worktree was not pinned"
+        );
+        return;
+    };
+    let spelled_git_dir = if relative_git_dir.as_os_str().is_empty() {
+        std::path::PathBuf::from(&common)
+    } else {
+        std::path::Path::new(&common).join(relative_git_dir)
+    };
+    let config_worktree = spelled_git_dir.join("config.worktree");
+    if config_worktree.exists() {
+        let config_worktree = config_worktree.to_string_lossy().into_owned();
+        if let Some(existing) = mounts
+            .iter_mut()
+            .find(|mount| mount.dest == config_worktree)
+        {
+            existing.ro = true;
+        } else {
+            mounts.push(thegn_core::sandbox::Mount {
+                host: config_worktree.clone(),
+                dest: config_worktree,
+                ro: true,
+                cache: false,
+            });
+        }
+    }
 }
 
 /// Provision a resolved dispatch target before a queue can claim its work.
@@ -2265,6 +2378,246 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(remaining, expected);
+    }
+
+    struct GitControlFixture {
+        _root: tempfile::TempDir,
+        worktree: std::path::PathBuf,
+        common: std::path::PathBuf,
+        config_worktree: std::path::PathBuf,
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture runs and reaps git and bwrap children"
+    )]
+    fn run_git_control_command(command: &mut std::process::Command) -> std::process::Output {
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.output().expect("run test fixture command")
+    }
+
+    fn git_control_fixture() -> GitControlFixture {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut init = thegn_core::util::git_cmd(&repo);
+        init.args(["init", "-q"]);
+        assert!(run_git_control_command(&mut init).status.success());
+        std::fs::write(repo.join("seed"), "seed\n").unwrap();
+        let mut add = thegn_core::util::git_cmd(&repo);
+        add.args(["add", "seed"]);
+        assert!(run_git_control_command(&mut add).status.success());
+        let mut commit = thegn_core::util::git_cmd(&repo);
+        commit.args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "-qm",
+            "seed",
+        ]);
+        assert!(run_git_control_command(&mut commit).status.success());
+        let worktree = root.path().join("wt");
+        let mut add_worktree = thegn_core::util::git_cmd(&repo);
+        add_worktree.args(["worktree", "add", "-q"]);
+        add_worktree.arg(&worktree).args(["-b", "feat"]);
+        assert!(run_git_control_command(&mut add_worktree).status.success());
+        let common = std::fs::canonicalize(repo.join(".git")).unwrap();
+        let config_worktree = common.join("worktrees/wt/config.worktree");
+        std::fs::write(&config_worktree, "[core]\n\thooksPath = /tmp/agent-hook\n").unwrap();
+        GitControlFixture {
+            _root: root,
+            worktree,
+            common,
+            config_worktree,
+        }
+    }
+
+    fn git_control_mounts(fixture: &GitControlFixture) -> Vec<thegn_core::sandbox::Mount> {
+        let common = fixture.common.to_string_lossy().into_owned();
+        vec![
+            thegn_core::sandbox::Mount {
+                host: fixture.worktree.to_string_lossy().into_owned(),
+                dest: fixture.worktree.to_string_lossy().into_owned(),
+                ro: false,
+                cache: false,
+            },
+            thegn_core::sandbox::Mount {
+                host: common.clone(),
+                dest: common.clone(),
+                ro: false,
+                cache: false,
+            },
+            thegn_core::sandbox::Mount {
+                host: format!("{common}/config"),
+                dest: format!("{common}/config"),
+                ro: true,
+                cache: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn git_control_pins_hooks_and_worktree_config_read_only() {
+        let fixture = git_control_fixture();
+        let common = fixture.common.to_string_lossy().into_owned();
+        let hooks = format!("{common}/hooks");
+        let config_worktree = fixture.config_worktree.to_string_lossy().into_owned();
+        let mut spec = sandbox_spec();
+        spec.worktree = fixture.worktree.clone();
+        spec.mounts = git_control_mounts(&fixture);
+
+        let spec = credential_free_spec_at(spec, None);
+        let common_index = spec
+            .mounts
+            .iter()
+            .position(|mount| mount.dest == common)
+            .unwrap();
+        assert!(
+            !spec.mounts[common_index].ro,
+            "common git dir stays writable for commits"
+        );
+        for dest in [&hooks, &config_worktree] {
+            let index = spec
+                .mounts
+                .iter()
+                .position(|mount| &mount.dest == dest)
+                .unwrap();
+            assert!(spec.mounts[index].ro, "{dest} must be mounted read-only");
+            assert!(
+                index > common_index,
+                "{dest} override must follow its writable parent"
+            );
+        }
+    }
+
+    #[test]
+    fn git_control_pin_creates_a_missing_hooks_dir() {
+        let fixture = git_control_fixture();
+        let hooks = fixture.common.join("hooks");
+        std::fs::remove_dir_all(&hooks).unwrap();
+        let mut mounts = git_control_mounts(&fixture);
+
+        pin_git_control_read_only(&mut mounts, &fixture.worktree);
+
+        assert!(hooks.is_dir());
+        let hooks = hooks.to_string_lossy().into_owned();
+        let hook_mount = mounts.iter().find(|mount| mount.dest == hooks).unwrap();
+        assert!(hook_mount.ro);
+    }
+
+    #[test]
+    fn git_control_pin_leaves_specs_without_a_git_common_mount_alone() {
+        let mut spec = sandbox_spec();
+        spec.mounts.push(thegn_core::sandbox::Mount {
+            host: "/worktree".into(),
+            dest: "/worktree".into(),
+            ro: false,
+            cache: false,
+        });
+        let before = spec.mounts.clone();
+
+        let spec = credential_free_spec_at(spec, None);
+
+        assert_eq!(spec.mounts, before);
+    }
+
+    #[test]
+    fn autonomous_agent_bwrap_sandbox_cannot_write_a_git_hook() {
+        let _state = crate::testenv::IsolatedState::new();
+        let fixture = git_control_fixture();
+        let Some(path) = std::env::var_os("PATH") else {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "bwrap on PATH",
+                false
+            ));
+            return;
+        };
+        let Some(bwrap) = std::env::split_paths(&path)
+            .map(|dir| dir.join("bwrap"))
+            .find(|candidate| candidate.is_file())
+        else {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "bwrap on PATH",
+                false
+            ));
+            return;
+        };
+        let mut probe = std::process::Command::new(&bwrap);
+        probe
+            .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+            .current_dir(&fixture.worktree);
+        if !run_git_control_command(&mut probe).status.success() {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "bwrap with user namespaces",
+                false
+            ));
+            return;
+        }
+
+        let config = thegn_core::config::SandboxConfig {
+            enabled: true,
+            backend: thegn_core::config::SandboxBackend::Bwrap,
+            backend_chain: vec!["bwrap".into()],
+            profile: thegn_core::config::SandboxProfile::Hardened,
+            ..Default::default()
+        };
+        let location = thegn_core::remote::GitLoc::from_db(
+            fixture.worktree.to_str().expect("worktree path is UTF-8"),
+            None,
+        );
+        let Some(spec) = thegn_core::sandbox::resolve_placed_exact(
+            &config,
+            &location,
+            "agent-git-hooks-readonly-test",
+            thegn_core::config::SandboxProfile::Hardened,
+            thegn_core::placement::Placement::Local,
+        ) else {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "hardened bwrap spec resolution",
+                false
+            ));
+            return;
+        };
+        if spec.backend != thegn_core::sandbox::Backend::Bwrap {
+            assert!(!thegn_core::testenv::require_or_skip(
+                "hardened bwrap backend",
+                false
+            ));
+            return;
+        }
+        let spec = credential_free_spec_at(spec, None);
+        let hook = fixture.common.join("hooks/post-checkout");
+        let writable = fixture.common.join("thegn-canary-rw");
+        let script = format!(
+            "printf x > {}; printf ok > {}",
+            thegn_core::util::sh_quote(&hook.to_string_lossy()),
+            thegn_core::util::sh_quote(&writable.to_string_lossy())
+        );
+        let argv = thegn_core::sandbox::enter_argv(
+            &spec,
+            &format!("sh -c {}", thegn_core::util::sh_quote(&script)),
+        )
+        .expect("bwrap enter argv");
+        let mut child = std::process::Command::new(&argv[0]);
+        child.args(&argv[1..]).current_dir(&fixture.worktree);
+        let output = run_git_control_command(&mut child);
+        assert!(
+            output.status.success(),
+            "sandbox canary command failed: {output:?}"
+        );
+        assert!(
+            !hook.exists(),
+            "agent created a host-executed post-checkout hook"
+        );
+        assert!(
+            writable.is_file(),
+            "positive control: common git dir remains writable"
+        );
+        std::fs::remove_file(writable).unwrap();
     }
 
     #[test]
