@@ -27,7 +27,7 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Fixed
 
-- Deleting the active project switches to the next remaining project; deleting
+- Deleting the active project switches to the first remaining project; deleting
   the last leaves an empty view.
 - Disabling or reloading a plugin stops its in-flight one-shot run, and failed
   one-shot runs are reported on the status line.
@@ -39,8 +39,8 @@ All notable changes to **thegn** are documented here. The format follows
   ledger warns before provisioning fresh; autoscale keeps a host whose age and
   use are both unknown; and idle hibernation keeps a sandbox when it cannot
   tell whether a shell is attached.
-- (dev channel) Closing a tab whose worktree location cannot be read falls back
-  to path-only teardown and warns that a remote sandbox may remain.
+- Closing a tab whose worktree location cannot be read falls back to path-only
+  teardown and warns that a remote sandbox may remain.
 
 ### Security
 
