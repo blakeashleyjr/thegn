@@ -230,8 +230,8 @@ A cancellation-only update with no new start time is applied too: with a
 When a calendar carries two versions of the same event, the higher `SEQUENCE`
 wins, so an older cancellation cannot remove a newer confirmed event.
 
-When an upgrade changes how cached events are keyed, existing rows become
-masters and every calendar account fetches a full provider snapshot once.
+When an upgrade changes how cached events are keyed, cached events stay visible
+and every calendar account downloads a full snapshot once.
 
 An event marked free (`TRANSP:TRANSPARENT` in iCalendar, `"busy": "free"` from
 a command plugin) is shown dimmed in the agenda. It is still listed and its
@@ -359,7 +359,7 @@ An event needs only four fields:
 
 Everything else is optional: `description`, `location`, `url`, `calendar`,
 `color` (a theme hue name like `"teal"`, never an RGB value), `status`,
-`busy` (`"busy"` or `"free"`, default `"busy"`), `organizer`, `reminders`, and
+`busy` (`"busy"` or `"free"`, default `"busy"`), `organizer`, `reminders`,
 `recurrence` (whose `rules` are plain `RRULE` strings), and `recurrence_id`
 (the `RECURRENCE-ID` time this component overrides, in the same shape as
 `start`). Unknown fields are ignored, so a plugin written against a newer thegn
