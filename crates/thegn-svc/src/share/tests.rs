@@ -2469,13 +2469,8 @@ fn install_share_secret_capture() -> (SecretCapture, Option<tracing::subscriber:
     let capture = SHARE_SECRET_CAPTURE
         .get_or_init(SecretCapture::default)
         .clone();
-    let global_capture_installed =
-        *SHARE_SECRET_GLOBAL_CAPTURE.get_or_init(|| match tracing::subscriber::set_global_default(
-            capture.clone(),
-        ) {
-            Ok(()) => true,
-            Err(_) => false,
-        });
+    let global_capture_installed = *SHARE_SECRET_GLOBAL_CAPTURE
+        .get_or_init(|| tracing::subscriber::set_global_default(capture.clone()).is_ok());
     let fallback = if global_capture_installed {
         None
     } else {
