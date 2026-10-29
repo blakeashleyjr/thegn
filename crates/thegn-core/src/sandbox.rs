@@ -638,6 +638,8 @@ pub enum RefusalClass {
     ControlSocketReachable,
     /// A sealed profile requested a control this backend cannot enforce.
     StrictUnsupported,
+    /// A container with this lossy name belongs to another worktree or its owner could not be read.
+    ContainerOwner,
 }
 
 impl RefusalClass {
@@ -657,6 +659,7 @@ impl RefusalClass {
             Self::MountDrift => "mount-drift",
             Self::ControlSocketReachable => "control-socket-reachable",
             Self::StrictUnsupported => "strict-unsupported",
+            Self::ContainerOwner => "container-owner",
         }
     }
 
@@ -702,6 +705,9 @@ impl RefusalClass {
             }
             Self::StrictUnsupported => {
                 "use a backend that enforces every sealed control (bwrap or an OCI runtime), or choose a non-sealed profile"
+            }
+            Self::ContainerOwner => {
+                "another worktree's sandbox container has this container's name (worktree paths that differ only in punctuation or case share one): close that worktree's sandbox first, or rename one worktree directory"
             }
         }
     }
@@ -2522,6 +2528,77 @@ pub(crate) fn remove_container(spec: &SandboxSpec) {
     let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnerVerdict {
+    Ours,
+    Legacy,
+    Foreign(String),
+    Unknown,
+}
+
+pub(crate) fn owner_label_probe_argv(spec: &SandboxSpec) -> Vec<String> {
+    let mut argv = oci_prefix(spec);
+    argv.extend([
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        format!(
+            "{{index .Config.Labels \"{}\"}}",
+            crate::sandbox_manage::WORKTREE_LABEL_KEY
+        ),
+        spec.name.clone(),
+    ]);
+    argv
+}
+
+pub(crate) fn owner_verdict(probe: Option<(bool, String)>, expected: &str) -> OwnerVerdict {
+    let Some((true, stdout)) = probe else {
+        return OwnerVerdict::Unknown;
+    };
+    let value = stdout.trim();
+    if value.is_empty() || value == "<no value>" {
+        OwnerVerdict::Legacy
+    } else if value == expected {
+        OwnerVerdict::Ours
+    } else {
+        OwnerVerdict::Foreign(value.to_owned())
+    }
+}
+
+fn container_owner(spec: &SandboxSpec) -> OwnerVerdict {
+    if spec.backend == Backend::Apple {
+        return OwnerVerdict::Legacy;
+    }
+    let argv = owner_label_probe_argv(spec);
+    let probe = if spec.placement.is_local() {
+        output_with_timeout(&argv, PROBE_TIMEOUT)
+    } else {
+        output_control_owned(spec, &argv, PROBE_TIMEOUT)
+    };
+    owner_verdict(
+        probe,
+        &crate::sandbox_manage::worktree_label_value(spec.worktree.as_os_str().as_encoded_bytes()),
+    )
+}
+
+pub(crate) fn foreign_owner_refusal(
+    spec: &SandboxSpec,
+    verdict: &OwnerVerdict,
+) -> Option<EnterError> {
+    let message = match verdict {
+        OwnerVerdict::Foreign(_) => format!(
+            "sandbox container '{}' belongs to another worktree (a different path with the same container name); it was left running and this launch was refused",
+            spec.name
+        ),
+        OwnerVerdict::Unknown => format!(
+            "sandbox container '{}' exists but its owning worktree could not be read; it was left running and this launch was refused",
+            spec.name
+        ),
+        OwnerVerdict::Ours | OwnerVerdict::Legacy => return None,
+    };
+    Some(refusal(spec, RefusalClass::ContainerOwner, None, message))
+}
+
 /// Return `(running, reusable)` after checking the policy label, mounts, and
 /// the runtime image id against the current local image id. Docker reports
 /// both ids as `sha256:<64 hex>`; Podman reports both as bare 64-hex ids.
@@ -2767,6 +2844,9 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
     if running {
         if mounts_ok {
             return Ok(()); // already running with the correct mounts
+        }
+        if let Some(error) = foreign_owner_refusal(spec, &container_owner(spec)) {
+            return Err(anyhow::Error::new(error));
         }
         // Stale policy or mounts — force-remove and fall through to recreate.
         msg::warn(&format!(
