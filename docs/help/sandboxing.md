@@ -495,7 +495,10 @@ passthrough drop credential-shaped variables plus `GH_CONFIG_DIR`, `GNUPGHOME`,
 variables (the resolver's `THEGN_SANDBOX` marker is retained). Autonomous
 sandbox specs also lose SSH identity mounts and mounts at
 or below `~/.ssh`, `~/.gnupg` and `~/.config/gh`; Git credential helpers are
-reset. `XDG_RUNTIME_DIR` and `GIT_CONFIG_GLOBAL` are kept for launcher plumbing
+reset. Autonomous agents (queue agents and autopilot) see the repository's
+`.git/hooks` and the worktree's `config.worktree` read-only, so they cannot plant
+a hook that host-side git later runs; interactive panes are unchanged.
+`XDG_RUNTIME_DIR` and `GIT_CONFIG_GLOBAL` are kept for launcher plumbing
 and commit identity. A broad `[sandbox] mounts` entry that exposes the whole
 home still exposes these directories; they are not masked inside a broad home
 mount. With `agent_sandbox` on, a queue agent whose sandbox cannot be
