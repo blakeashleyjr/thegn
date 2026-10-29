@@ -2543,7 +2543,7 @@ pub(crate) fn owner_label_probe_argv(spec: &SandboxSpec) -> Vec<String> {
         "inspect".into(),
         "--format".into(),
         format!(
-            "{{index .Config.Labels \"{}\"}}",
+            "{{{{index .Config.Labels \"{}\"}}}}",
             crate::sandbox_manage::WORKTREE_LABEL_KEY
         ),
         spec.name.clone(),
@@ -2845,6 +2845,8 @@ fn ensure_noncompose(spec: &SandboxSpec) -> anyhow::Result<()> {
         if mounts_ok {
             return Ok(()); // already running with the correct mounts
         }
+        // The container can exit or be removed between container_status and this label probe.
+        // Keep that race fail-closed: an unreadable owner is not safe to remove by name.
         if let Some(error) = foreign_owner_refusal(spec, &container_owner(spec)) {
             return Err(anyhow::Error::new(error));
         }

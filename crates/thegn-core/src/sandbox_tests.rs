@@ -838,14 +838,18 @@ fn owner_verdict_classifies_worktree_labels() {
 fn owner_label_probe_reads_only_the_worktree_label() {
     let spec = spec(Backend::Docker);
     let argv = owner_label_probe_argv(&spec);
-    assert!(argv.starts_with(&oci_prefix(&spec)));
-    assert!(argv.ends_with(&[
+    let mut expected = oci_prefix(&spec);
+    expected.extend([
         "container".into(),
         "inspect".into(),
         "--format".into(),
         "{{index .Config.Labels \"thegn.worktree\"}}".into(),
-        spec.name,
-    ]));
+        spec.name.clone(),
+    ]);
+    assert_eq!(
+        argv, expected,
+        "the runtime must receive a Go template action"
+    );
 }
 
 #[test]
