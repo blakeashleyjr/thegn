@@ -109,13 +109,14 @@ the declared `exec` scope in the same central authorization lattice.
 
 ### Requirement: Unimplemented plugin I/O fails explicitly
 
-The `io` host verb SHALL check and audit its requested capability, then return
-an `unsupported` RPC error until the host has a bounded implementation that
-performs the requested operation. A grant MUST NOT produce a success-shaped
+The `io` host verb SHALL be advertised as `reserved` in the host verb support
+matrix and SHALL be refused with an `unsupported` RPC error naming it as
+reserved before dispatch, until the host has a bounded implementation that
+performs the requested operation. A request MUST NOT produce a success-shaped
 response for work that did not occur.
 
-#### Scenario: A granted I/O request has no implementation
+#### Scenario: An I/O request has no implementation
 
-- **WHEN** a plugin requests a granted network or command operation
-- **THEN** it receives an `unsupported` RPC error and the capability decision
-  remains in the audit log
+- **WHEN** a plugin sends an `io` request (network or command)
+- **THEN** it receives an `unsupported` RPC error that names the verb as
+  reserved and the request performs no operation
