@@ -3799,8 +3799,8 @@ open_on_detect = false # auto-open the browser (via `browser` above) when a new 
 # #   [sandbox] failover). Override per-env to prompt or auto-degrade instead:
 # # failover = "ask"           # "halt" | "ask" (prompt: retry / run-on-host) | "auto"
 #
-# ── Example: a cheap commodity VPS (Hetzner Cloud) ─────────────────────────
-# The budget alternative to a managed sandbox provider: thegn provisions a
+# ── Example: Hetzner Cloud (experimental; live lifecycle unverified) ────────
+# Experimental: lifecycle not verified on a live account; provisioning uses the
 # VPS via the vendor API, reaches it over plain ssh (a `thegn vps-ssh`
 # self-bridge — no vendor CLI), and runs the same provisioning pipeline on it.
 # THE COST MODEL DIFFERS FROM SPRITES: a VPS has no suspend/checkpoint — a

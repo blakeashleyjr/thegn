@@ -3293,6 +3293,9 @@ fn provider_cache_report(cfg: &Config) {
             p.provider.trim(),
             env_devshell(cfg, e),
         );
+        if thegn_core::config::EnvProviderKind::of(p.provider.trim()).live_unverified() {
+            outln!("               experimental: lifecycle not verified on a live account");
+        }
         if p.host_cache {
             match &bridge {
                 Some(pth) => outln!("               host_cache: on (bridge {})", pth.display()),
@@ -3318,6 +3321,7 @@ fn provider_cache_json(cfg: &Config) -> serde_json::Value {
             name.clone(),
             serde_json::json!({
                 "provider": p.provider.trim(),
+                "live_verified": !thegn_core::config::EnvProviderKind::of(p.provider.trim()).live_unverified(),
                 "devshell": env_devshell(cfg, e),
                 "binary_cache_url": p.binary_cache_url.trim(),
                 "host_cache": p.host_cache,
@@ -6043,14 +6047,26 @@ args = ["--verbose"]
                 ..Default::default()
             },
         );
+        cfg.env.insert(
+            "vps".into(),
+            EnvConfig {
+                provider: EnvProviderConfig {
+                    provider: "hetzner".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
 
         let v = provider_cache_json(&cfg);
         let s = &v["sprites"];
         assert_eq!(s["provider"], "sprites");
         assert_eq!(s["devshell"], "sprite-full");
         assert_eq!(s["host_cache"], true);
+        assert_eq!(s["live_verified"], true);
         let bridge = s["bridge_present"].as_bool().unwrap();
         assert_eq!(s["host_cache_effective"], bridge);
+        assert_eq!(v["vps"]["live_verified"], false);
         // env_devshell falls back to the global default when no override is set.
         let plain = EnvConfig {
             provider: EnvProviderConfig {

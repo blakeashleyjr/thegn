@@ -723,6 +723,9 @@ On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
 machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
 is set. Destroy those instances yourself or set the value to `0`.
 
+The Hetzner provider is experimental: its lifecycle has not been verified on a
+live account, and `thegn doctor` says so.
+
 On the dev channel, an unreadable or malformed VPS or Fly ledger record is
 refused rather than treated as absent. Destroy, retarget, address lookup,
 `vps-ssh` and managed-key selection refuse it; a refused destroy keeps SSH
