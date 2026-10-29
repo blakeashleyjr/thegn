@@ -368,24 +368,23 @@ fn pin_git_control_read_only(
     };
     let common = mounts[common_index].host.clone();
     let hooks = format!("{common}/hooks");
-    if !std::path::Path::new(&hooks).is_dir()
-        && let Err(error) = std::fs::create_dir(&hooks)
-    {
+    let hooks_metadata = match std::fs::symlink_metadata(&hooks) {
+        Ok(metadata) if metadata.file_type().is_dir() => Some(metadata),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(&hooks) {
+                Ok(()) => std::fs::symlink_metadata(&hooks).ok(),
+                Err(_) => None,
+            }
+        }
+        Err(_) => None,
+    };
+    if !hooks_metadata.is_some_and(|metadata| metadata.file_type().is_dir()) {
         mounts[common_index].ro = true;
         tracing::warn!(
             target: "thegn::sandbox",
             path = %hooks,
-            %error,
-            "git hooks dir could not be pinned; git dir mounted read-only for this agent"
-        );
-        return;
-    }
-    if !std::path::Path::new(&hooks).is_dir() {
-        mounts[common_index].ro = true;
-        tracing::warn!(
-            target: "thegn::sandbox",
-            path = %hooks,
-            "git hooks dir could not be pinned; git dir mounted read-only for this agent"
+            "git hooks dir is not a real directory; git dir mounted read-only for this agent"
         );
         return;
     }
@@ -447,21 +446,43 @@ fn pin_git_control_read_only(
         std::path::Path::new(&common).join(relative_git_dir)
     };
     let config_worktree = spelled_git_dir.join("config.worktree");
-    if config_worktree.exists() {
-        let config_worktree = config_worktree.to_string_lossy().into_owned();
-        if let Some(existing) = mounts
-            .iter_mut()
-            .find(|mount| mount.dest == config_worktree)
-        {
-            existing.ro = true;
-        } else {
-            mounts.push(thegn_core::sandbox::Mount {
-                host: config_worktree.clone(),
-                dest: config_worktree,
-                ro: true,
-                cache: false,
-            });
+    let config_metadata = match std::fs::symlink_metadata(&config_worktree) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&config_worktree)
+            {
+                Ok(_) => std::fs::symlink_metadata(&config_worktree).ok(),
+                Err(_) => None,
+            }
         }
+        Err(_) => None,
+    };
+    if !config_metadata.is_some_and(|metadata| metadata.file_type().is_file()) {
+        mounts[common_index].ro = true;
+        tracing::warn!(
+            target: "thegn::sandbox",
+            path = %config_worktree.display(),
+            "worktree config is not a real file; git dir mounted read-only for this agent"
+        );
+        return;
+    }
+    let config_worktree = config_worktree.to_string_lossy().into_owned();
+    if let Some(existing) = mounts
+        .iter_mut()
+        .find(|mount| mount.dest == config_worktree)
+    {
+        existing.ro = true;
+    } else {
+        mounts.push(thegn_core::sandbox::Mount {
+            host: config_worktree.clone(),
+            dest: config_worktree,
+            ro: true,
+            cache: false,
+        });
     }
 }
 
@@ -2507,6 +2528,76 @@ mod tests {
         let hooks = hooks.to_string_lossy().into_owned();
         let hook_mount = mounts.iter().find(|mount| mount.dest == hooks).unwrap();
         assert!(hook_mount.ro);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_control_pin_fails_closed_for_symlinked_hooks_dir() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = git_control_fixture();
+        let hooks = fixture.common.join("hooks");
+        std::fs::remove_dir_all(&hooks).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        symlink(target.path(), &hooks).unwrap();
+        let mut mounts = git_control_mounts(&fixture);
+
+        pin_git_control_read_only(&mut mounts, &fixture.worktree);
+
+        let common = fixture.common.to_string_lossy();
+        let common_mount = mounts.iter().find(|mount| mount.dest == common).unwrap();
+        assert!(
+            common_mount.ro,
+            "a symlinked hooks entry must make the common git dir read-only"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_control_pin_fails_closed_for_symlinked_worktree_config() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = git_control_fixture();
+        std::fs::remove_file(&fixture.config_worktree).unwrap();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        symlink(target.path(), &fixture.config_worktree).unwrap();
+        let mut mounts = git_control_mounts(&fixture);
+
+        pin_git_control_read_only(&mut mounts, &fixture.worktree);
+
+        let common = fixture.common.to_string_lossy();
+        let common_mount = mounts.iter().find(|mount| mount.dest == common).unwrap();
+        assert!(
+            common_mount.ro,
+            "a symlinked config.worktree must make the common git dir read-only"
+        );
+    }
+
+    #[test]
+    fn git_control_pin_creates_and_pins_a_missing_worktree_config() {
+        let fixture = git_control_fixture();
+        std::fs::remove_file(&fixture.config_worktree).unwrap();
+        let mut mounts = git_control_mounts(&fixture);
+
+        pin_git_control_read_only(&mut mounts, &fixture.worktree);
+
+        assert!(fixture.config_worktree.is_file());
+        assert!(std::fs::read(&fixture.config_worktree).unwrap().is_empty());
+        let config_worktree = fixture.config_worktree.to_string_lossy();
+        let config_mount = mounts
+            .iter()
+            .find(|mount| mount.dest == config_worktree)
+            .unwrap();
+        assert!(
+            config_mount.ro,
+            "new config.worktree must be pinned read-only"
+        );
+        let common = fixture.common.to_string_lossy();
+        let common_mount = mounts.iter().find(|mount| mount.dest == common).unwrap();
+        assert!(
+            !common_mount.ro,
+            "creating config.worktree keeps git writable"
+        );
     }
 
     #[test]
