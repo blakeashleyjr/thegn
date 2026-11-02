@@ -407,7 +407,7 @@ mod tests {
     }
 
     fn ok_response(headers: &str, body: &str) -> String {
-        format!("HTTP/1.1 200 OK\r\n{headers}\r\nConnection: close\r\n\r\n{body}")
+        format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n{body}")
     }
 
     fn signed_headers(url: &reqwest::Url) -> Option<String> {
