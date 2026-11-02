@@ -190,6 +190,27 @@ pub const FIXTURES: &[Fixture] = &[
         )),
         json: None,
     },
+    Fixture {
+        name: "override_recurrence_id",
+        ics: Some((
+            "UID:matrix-override\r\nRECURRENCE-ID:20260815T090000Z\r\nDTSTART:20260815T100000Z\r\nDTEND:20260815T110000Z\r\nSUMMARY:Moved occurrence",
+            Verdict::Admit,
+        )),
+        json: Some((
+            r#"{"uid":"matrix-override","title":"Moved occurrence","start":{"kind":"instant","at":"2026-08-15T10:00:00Z"},"end":{"kind":"instant","at":"2026-08-15T11:00:00Z"},"recurrence_id":{"kind":"instant","at":"2026-08-15T09:00:00Z"}}"#,
+            Verdict::Admit,
+        )),
+    },
+    Fixture {
+        name: "malformed_recurrence_id",
+        ics: Some((
+            "UID:matrix-bad-recurrence-id\r\nRECURRENCE-ID:not-a-time\r\nDTSTART:20260815T100000Z\r\nDTEND:20260815T110000Z\r\nSUMMARY:Bad recurrence id",
+            Verdict::Reject,
+        )),
+        // JSON cannot carry an unparsable time without failing deserialization,
+        // which the host cache consumer expects to succeed before validation.
+        json: None,
+    },
 ];
 
 /// Wrap VEVENT properties in a minimal complete calendar document.
