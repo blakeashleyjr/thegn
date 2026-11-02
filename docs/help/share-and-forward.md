@@ -48,6 +48,8 @@ running sidecar has no runtime record, share start refuses and stop cannot
 verify teardown; restarting the worktree sandbox lets thegn record the runtime.
 Stopping a share in thegn while it is still starting cancels the start, so
 the tunnel does not come up after the stop request.
+A Tailscale share reports its URL only after `tailscale serve status` in the
+sidecar shows it; if it does not, the serve is turned off and the share fails.
 A share client started by thegn runs in its own process group. Stopping it sends
 TERM to the group, then KILL after a short grace period if processes remain; the
 row stays `stopping…` until the group has exited.

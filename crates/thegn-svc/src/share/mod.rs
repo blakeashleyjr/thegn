@@ -1025,8 +1025,9 @@ fn plan_iroh(spec: &ShareSpec, i: &IrohShareConfig) -> SharePlan {
 // ── sidecar-serve seam (tailscale; smoke-tested) ─────────────────────────────
 
 /// Bring a tailscale serve/funnel up inside the worktree's VPN `sidecar` and
-/// return the resulting public URL (derived from the node's MagicDNS name).
-/// Errors with guidance if no sidecar with tailscale is reachable.
+/// return its public URL after verifying it against `tailscale serve status`.
+/// A failed verification turns the serve off. Errors with guidance if no
+/// sidecar with tailscale is reachable.
 pub fn serve_up(sidecar: &str, serve: &ServePlan) -> Result<PublicEndpoint> {
     let recorded = crate::vpn::recorded_sidecar(sidecar)?;
     serve_up_with(&recorded, serve, |runtime, target, argv| {
@@ -1041,24 +1042,57 @@ fn serve_up_with(
 ) -> Result<PublicEndpoint> {
     let guidance = "share: tailscale ingress needs an active VPN sidecar with tailscale (set [sandbox.vpn] provider = \"tailscale\" on this worktree)";
     match exec(&recorded.runtime, &recorded.id, &serve.up_argv) {
-        Ok((true, _)) => {
-            let dns = serve_dns_name(&recorded.runtime, &recorded.id, &mut exec)
-                .with_context(|| guidance)?;
-            let suffix = if serve.port == 443 {
-                String::new()
-            } else {
-                format!(":{}", serve.port)
-            };
-            let url = format!("{}://{dns}{suffix}", serve.scheme);
-            PublicEndpoint::parse_url(&url)
-                .ok_or_else(|| anyhow::anyhow!("share: invalid tailscale public URL"))
-        }
+        Ok((true, _)) => match serve_up_verify(recorded, serve, &mut exec) {
+            Ok(endpoint) => Ok(endpoint),
+            Err(error) => match serve_down_with(
+                std::slice::from_ref(&recorded.runtime),
+                serve,
+                |rt, argv| exec(rt, &recorded.id, argv),
+            ) {
+                Ok(()) => Err(error).context("share: tailscale serve was turned off"),
+                Err(teardown) => Err(anyhow::anyhow!(
+                    "{error:#}; teardown unverified; the share may still be reachable: {teardown:#}"
+                )),
+            },
+        },
         Ok((false, output)) => bail!(
             "{guidance}: tailscale serve command failed: {}",
             output.trim()
         ),
         Err(error) => Err(error).with_context(|| guidance),
     }
+}
+
+fn serve_up_verify(
+    recorded: &crate::vpn::RecordedSidecar,
+    serve: &ServePlan,
+    exec: &mut impl FnMut(&OciRuntime, &str, &[String]) -> Result<(bool, String)>,
+) -> Result<PublicEndpoint> {
+    let dns = serve_dns_name(&recorded.runtime, &recorded.id, exec)
+        .context("share: could not verify tailscale serve URL")?;
+    let suffix = if serve.port == 443 {
+        String::new()
+    } else {
+        format!(":{}", serve.port)
+    };
+    let url = format!("{}://{dns}{suffix}", serve.scheme);
+    let endpoint = PublicEndpoint::parse_url(&url)
+        .ok_or_else(|| anyhow::anyhow!("share: invalid tailscale public URL"))?;
+    let status_argv = vec![
+        "tailscale".to_string(),
+        "serve".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ];
+    let (ok, out) = exec(&recorded.runtime, &recorded.id, &status_argv)?;
+    if !ok {
+        bail!("share: could not read tailscale serve status");
+    }
+    let funnel = serve.up_argv.get(1).map(String::as_str) == Some("funnel");
+    if !serve_status_shows_url(&out, &dns, serve.port, funnel)? {
+        bail!("share: tailscale serve status does not show {url}");
+    }
+    Ok(endpoint)
 }
 
 /// Tear a tailscale serve/funnel down and verify it is absent in status JSON.
@@ -1135,6 +1169,34 @@ fn serve_status_has_port(json: &str, port: u16) -> Result<bool> {
         bail!("share: unexpected tailscale serve status shape")
     }
     Ok(false)
+}
+
+/// Return whether status reports the exact public host and port for this serve.
+fn serve_status_shows_url(json: &str, dns: &str, port: u16, funnel: bool) -> Result<bool> {
+    use serde_json::Value;
+
+    let status: Value =
+        serde_json::from_str(json).context("share: parse tailscale serve status")?;
+    if !status.is_object() {
+        bail!("share: unexpected tailscale serve status shape")
+    }
+    let key = format!("{dns}:{port}");
+    let shows_url = status
+        .get("Web")
+        .and_then(Value::as_object)
+        .is_some_and(|entries| entries.contains_key(&key));
+    if !shows_url {
+        return Ok(false);
+    }
+    if funnel {
+        return Ok(status
+            .get("AllowFunnel")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(&key))
+            .and_then(Value::as_bool)
+            == Some(true));
+    }
+    Ok(true)
 }
 
 /// Read the node's MagicDNS name from `tailscale status --json` in the sidecar.
