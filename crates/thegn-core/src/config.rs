@@ -5101,6 +5101,13 @@ pub struct LspConfig {
     /// given, `command = ""` disables). A non-built-in key registers an arbitrary
     /// server and MUST declare `extensions`. See [`crate::lsp_registry`].
     pub servers: Vec<LspServerConfig>,
+    /// Refuse to start a language server that cannot join the shared thegn
+    /// resource slice (the `[sandbox.limits]` aggregate cap): with `true`, a
+    /// server whose systemd scope cannot be created is not started and the
+    /// request fails naming this key. `false` (default) starts it outside the
+    /// slice with one warning per run. A host without cgroup delegation uses
+    /// the `nice` fallback, which counts as joined.
+    pub require_containment: bool,
 }
 
 impl Default for LspConfig {
@@ -5109,6 +5116,7 @@ impl Default for LspConfig {
             enabled: true,
             hover: true,
             servers: Vec::new(),
+            require_containment: false,
         }
     }
 }
