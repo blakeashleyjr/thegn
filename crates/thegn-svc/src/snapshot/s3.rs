@@ -8,6 +8,7 @@
 //!
 //! Object layout mirrors the fs backend under the configured key prefix:
 //! `<prefix>/<repo>/<worktree>/<env>/<id>/{manifest.json,bundle,patch,tar}`.
+//! Manifests are bound to their object key and reads are capped.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -26,8 +27,35 @@ use super::SnapshotStore;
 const SIGN_TTL: Duration = Duration::from_secs(600);
 const SSE_HEADER: &str = "x-amz-server-side-encryption";
 const SSE_AES256: &str = "AES256";
+/// Maximum size of one snapshot object, matching the filesystem backend's per-file limit.
+const MAX_SNAPSHOT_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 /// One artifact transfer's HTTP budget.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn require_success(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("{what}: unexpected HTTP status {status}");
+    }
+    Ok(response)
+}
+
+fn manifest_id_from_key<'a>(root: &str, object: &'a str) -> Option<&'a str> {
+    let id = object.strip_prefix(root)?.strip_suffix("/manifest.json")?;
+    (!id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\'))
+        .then_some(id)
+}
+
+fn decode_manifest(id: &str, data: &[u8]) -> Result<SnapshotManifest> {
+    let manifest: SnapshotManifest = serde_json::from_slice(data)
+        .with_context(|| format!("snapshot manifest {id} is not valid JSON"))?;
+    anyhow::ensure!(
+        manifest.id == id,
+        "snapshot manifest id {:?} does not match its key id {id:?}",
+        manifest.id
+    );
+    Ok(manifest)
+}
 
 /// Parse and admit a custom endpoint. Plain HTTP is reserved for local S3
 /// emulators; all other endpoints must protect snapshot contents in transit.
@@ -121,6 +149,7 @@ impl S3SnapshotStore {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .https_only(!loopback)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("snapshot store http client")?;
         Ok(S3SnapshotStore {
@@ -168,31 +197,54 @@ impl S3SnapshotStore {
     fn put_bytes(&self, object: &str, data: &[u8]) -> Result<()> {
         let request = self.put_request(object, data)?;
         self.rt.block_on(async {
-            self.http
+            let response = self
+                .http
                 .execute(request)
                 .await
-                .with_context(|| format!("PUT {object}"))?
-                .error_for_status()
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("PUT {object}"))?;
+            require_success(response, &format!("PUT {object}"))?;
             Ok(())
         })
     }
 
     fn get_bytes(&self, object: &str) -> Result<Vec<u8>> {
+        self.get_bytes_capped(object, MAX_SNAPSHOT_OBJECT_BYTES)
+    }
+
+    fn get_bytes_capped(&self, object: &str, cap: u64) -> Result<Vec<u8>> {
         let url = self
             .bucket
             .get_object(Some(&self.creds), object)
             .sign(SIGN_TTL);
         self.rt.block_on(async {
-            let resp = self
+            let response = self
                 .http
                 .get(url)
                 .send()
                 .await
-                .with_context(|| format!("GET {object}"))?
-                .error_for_status()
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("GET {object}"))?;
-            Ok(resp.bytes().await?.to_vec())
+            let mut response = require_success(response, &format!("GET {object}"))?;
+            if response.content_length().is_some_and(|len| len > cap) {
+                anyhow::bail!("GET {object}: object exceeds the {cap}-byte snapshot limit");
+            }
+            let mut body = Vec::new();
+            let mut total = 0_u64;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .with_context(|| format!("GET {object}"))?
+            {
+                let chunk_len = u64::try_from(chunk.len())?;
+                if chunk_len > cap - total {
+                    anyhow::bail!("GET {object}: object exceeds the {cap}-byte snapshot limit");
+                }
+                total += chunk_len;
+                body.extend_from_slice(&chunk);
+            }
+            Ok(body)
         })
     }
 
@@ -202,13 +254,14 @@ impl S3SnapshotStore {
             .delete_object(Some(&self.creds), object)
             .sign(SIGN_TTL);
         self.rt.block_on(async {
-            self.http
+            let response = self
+                .http
                 .delete(url)
                 .send()
                 .await
-                .with_context(|| format!("DELETE {object}"))?
-                .error_for_status()
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("DELETE {object}"))?;
+            require_success(response, &format!("DELETE {object}"))?;
             Ok(())
         })
     }
@@ -230,10 +283,13 @@ impl S3SnapshotStore {
                     .get(url)
                     .send()
                     .await
-                    .with_context(|| format!("LIST {prefix}"))?
-                    .error_for_status()
+                    .map_err(reqwest::Error::without_url)
                     .with_context(|| format!("LIST {prefix}"))?;
-                anyhow::Ok(resp.text().await?)
+                let resp = require_success(resp, &format!("LIST {prefix}"))?;
+                resp.text()
+                    .await
+                    .map_err(reqwest::Error::without_url)
+                    .with_context(|| format!("LIST {prefix}"))
             })?;
             let parsed = ListObjectsV2::parse_response(&text)
                 .with_context(|| format!("LIST {prefix}: bad response"))?;
@@ -261,22 +317,27 @@ impl SnapshotStore for S3SnapshotStore {
     }
 
     fn get_manifest(&self, key: &SnapshotKey, id: &str) -> Result<SnapshotManifest> {
-        let data = self.get_bytes(&self.object_key(key, id, "manifest.json"))?;
-        Ok(serde_json::from_slice(&data)?)
+        let root = self.key_root(key);
+        let object = self.object_key(key, id, "manifest.json");
+        if manifest_id_from_key(&root, &object).is_none() {
+            anyhow::bail!("invalid snapshot id {id:?}");
+        }
+        decode_manifest(id, &self.get_bytes(&object)?)
     }
 
     fn list(&self, key: &SnapshotKey) -> Result<Vec<SnapshotManifest>> {
         // Only manifest objects make a snapshot real (same torn-write contract
         // as the fs backend).
         let mut out = Vec::new();
-        for k in self.list_keys(&self.key_root(key))? {
+        let root = self.key_root(key);
+        for k in self.list_keys(&root)? {
             if !k.ends_with("/manifest.json") {
                 continue;
             }
+            let id = manifest_id_from_key(&root, &k)
+                .ok_or_else(|| anyhow::anyhow!("unexpected snapshot manifest object {k}"))?;
             let data = self.get_bytes(&k)?;
-            if let Ok(m) = serde_json::from_slice::<SnapshotManifest>(&data) {
-                out.push(m);
-            }
+            out.push(decode_manifest(id, &data)?);
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
@@ -294,6 +355,9 @@ impl SnapshotStore for S3SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::thread::JoinHandle;
 
     fn cfg(endpoint: &str) -> SnapshotStoreConfig {
         SnapshotStoreConfig {
@@ -321,6 +385,29 @@ mod tests {
             worktree_slug: "wt".into(),
             env: "hetzner".into(),
         }
+    }
+
+    fn response_server(response: String) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (address, handle)
+    }
+
+    fn ok_response(headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 200 OK\r\n{headers}\r\nConnection: close\r\n\r\n{body}")
     }
 
     fn signed_headers(url: &reqwest::Url) -> Option<String> {
@@ -478,5 +565,103 @@ mod tests {
             "repo/wt/hetzner/id/patch"
         );
         assert_eq!(s.key_root(&key()), "repo/wt/hetzner/");
+    }
+
+    #[test]
+    fn manifest_key_binding_accepts_only_a_direct_child_id() {
+        let root = "thegn/repo/wt/hetzner/";
+        assert_eq!(
+            manifest_id_from_key(root, "thegn/repo/wt/hetzner/id1/manifest.json"),
+            Some("id1")
+        );
+        for object in [
+            "thegn/repo/wt/hetzner/a/b/manifest.json",
+            "thegn/repo/wt/hetzner//manifest.json",
+            "thegn/repo/wt/hetzner/../manifest.json",
+            "other/id1/manifest.json",
+            "thegn/repo/wt/hetzner/id1/bundle",
+        ] {
+            assert_eq!(manifest_id_from_key(root, object), None, "{object}");
+        }
+    }
+
+    #[test]
+    fn decode_manifest_refuses_a_mismatched_id() {
+        let manifest = SnapshotManifest::new(Some("abcd1234"), "main", 10, Vec::new());
+        let data = serde_json::to_vec(&manifest).unwrap();
+        let error = decode_manifest("different-id", &data).unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(decode_manifest(&manifest.id, &data).unwrap(), manifest);
+    }
+
+    #[test]
+    fn decode_manifest_refuses_malformed_json() {
+        let error = decode_manifest("id1", b"not json").unwrap_err();
+        assert!(error.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn get_refuses_a_declared_length_over_the_cap() {
+        let (address, server) =
+            response_server(ok_response("Content-Length: 16\r\n", "0123456789abcdef"));
+        let s = S3SnapshotStore::new(&cfg(&format!("http://{address}")), &resolver).unwrap();
+        let error = s.get_bytes_capped("thegn/x/bundle", 8).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the 8-byte snapshot limit")
+        );
+    }
+
+    #[test]
+    fn get_refuses_a_streamed_body_over_the_cap() {
+        let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n";
+        let (address, server) = response_server(response.into());
+        let s = S3SnapshotStore::new(&cfg(&format!("http://{address}")), &resolver).unwrap();
+        let error = s.get_bytes_capped("thegn/x/bundle", 8).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the 8-byte snapshot limit")
+        );
+    }
+
+    #[test]
+    fn get_does_not_follow_a_redirect() {
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other_address = other.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{other_address}/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (address, server) = response_server(response);
+        let s = S3SnapshotStore::new(&cfg(&format!("http://{address}")), &resolver).unwrap();
+        let error = s.get_bytes("thegn/x/bundle").unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("unexpected HTTP status 307"));
+        other.set_nonblocking(true).unwrap();
+        let error = other.accept().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn transport_errors_do_not_echo_the_presigned_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let s = S3SnapshotStore::new(&cfg(&format!("http://{address}")), &resolver).unwrap();
+        let error = s.get_bytes("thegn/x/bundle").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(!message.contains("X-Amz-Signature"));
+        assert!(!message.contains("X-Amz-Credential"));
+    }
+
+    #[test]
+    fn get_within_the_cap_returns_the_body() {
+        let (address, server) = response_server(ok_response("Content-Length: 4\r\n", "data"));
+        let s = S3SnapshotStore::new(&cfg(&format!("http://{address}")), &resolver).unwrap();
+        assert_eq!(s.get_bytes_capped("thegn/x/bundle", 8).unwrap(), b"data");
+        server.join().unwrap();
     }
 }
