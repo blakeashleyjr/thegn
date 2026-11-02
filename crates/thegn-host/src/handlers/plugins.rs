@@ -157,14 +157,26 @@ pub(crate) fn host_call_check(spec: &PluginSpec, cap: &str) -> Result<(), RpcErr
 }
 
 /// Enforce the canonical verb support/mode row and declared API before dispatch.
-/// A one-shot process can print any valid wire verb, but resident-only
-/// request/reply verbs must not become accidentally supported merely because
-/// decoding succeeds; each verb's `since` version must also fit the manifest.
+/// Reserved verbs are refused with a typed unsupported error before dispatch
+/// and before any capability audit. A one-shot process can print any valid
+/// wire verb, but resident-only request/reply verbs must not become
+/// accidentally supported merely because decoding succeeds; each verb's
+/// `since` version must also fit the manifest.
 fn host_verb_check(spec: &PluginSpec, verb: HostVerb) -> Result<(), RpcError> {
     let row = HOST_VERB_SUPPORT
         .iter()
         .find(|row| row.verb == verb)
         .expect("HostVerb::ALL and HOST_VERB_SUPPORT are pinned to the same set");
+    if row.state == SupportState::Reserved {
+        return Err(RpcError::new(
+            RpcErrorCode::Unsupported,
+            format!(
+                "{} is reserved by this host and not implemented ({})",
+                verb.method_name(),
+                row.owner
+            ),
+        ));
+    }
     if row.state != SupportState::Wired || !row.modes.contains(&spec.mode) {
         return Err(RpcError::new(
             RpcErrorCode::Unsupported,
@@ -3381,6 +3393,47 @@ mod tests {
 
         plugin.manifest.api = ApiVersion::new(0, 2, 0);
         assert!(host_verb_check(&plugin, HostVerb::StateGet).is_ok());
+    }
+
+    #[test]
+    fn reserved_io_verb_is_refused_with_a_reserved_reason() {
+        let resident = seg_spec("p");
+        let mut one_shot = resident.clone();
+        one_shot.mode = PluginMode::OneShot;
+
+        for spec in [&resident, &one_shot] {
+            let refusal = host_verb_check(spec, HostVerb::Io)
+                .expect_err("reserved io must be refused before dispatch");
+            assert_eq!(refusal.code, RpcErrorCode::Unsupported);
+            assert!(refusal.message.contains("io"));
+            assert!(refusal.message.contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn io_request_is_refused_at_dispatch_without_an_audit_entry() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        let mut model = FrameModel::default();
+        let (tx, mut rx) = crate::plugins::plugin_channel();
+        tx.send(PluginMsg::Event {
+            session: 1,
+            plugin: "p".into(),
+            event: SessionEvent::Message(RpcMessage {
+                id: Some(31),
+                method: "io".into(),
+                params: serde_json::json!({
+                    "scheme": "network",
+                    "target": "https://example.com",
+                    "payload": null
+                }),
+            }),
+        })
+        .unwrap();
+        drop(tx);
+
+        drain_with_responder(&mut rx, &mut state, &mut model, None, &mut |_, _| {});
+
+        assert!(state.plugins["p"].runtime.audit_log().is_empty());
     }
 
     #[test]

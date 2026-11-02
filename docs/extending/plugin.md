@@ -66,8 +66,10 @@ the plugin.
 The host verb matrix is also embedded as `x-thegn-host-verb-support`, and the
 exact currently dispatchable catalog ids are in
 `x-thegn-host-call-capabilities`. The runtime implements `register`, `update`,
-`invalidate`, `io`, `notify`, `emit`,
-and `state.set` for both modes. `subscribe`, `state.get`, `host.value`, and
+`invalidate`, `notify`, `emit`, and `state.set` for both modes. `io` is
+reserved: it is in the wire vocabulary but this host does not implement it, so
+an `io` request gets an `unsupported` error naming it as reserved. `subscribe`,
+`state.get`, `host.value`, and
 `host.call` require a resident reply/event channel. `host.call` can reach only
 non-streaming, non-admin capabilities explicitly listed for the plugin surface
 and backed by the generic control route spine; event streams use the resident
