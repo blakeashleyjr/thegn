@@ -97,6 +97,9 @@ impl FsSnapshotStore {
         Ok(())
     }
 
+    /// Publish one snapshot object create-only: an existing destination is
+    /// refused and never replaced. Filesystems without hard-link support fail
+    /// closed.
     fn write_atomic(&self, dir: &Path, name: &str, data: &[u8]) -> Result<()> {
         check_component(name)?;
         check_size(data.len() as u64)?;
@@ -109,21 +112,30 @@ impl FsSnapshotStore {
                     dst.display()
                 );
             }
-            Ok(_) => {}
+            Ok(_) => anyhow::bail!(
+                "snapshot object {} already exists; refusing to overwrite a published snapshot",
+                dst.display()
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).with_context(|| format!("stat {}", dst.display())),
         }
 
         let (tmp, mut file) = create_staging_file(dir, name)?;
-        let result = file
-            .write_all(data)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| fs::rename(&tmp, &dst))
-            .and_then(|()| sync_directory(dir));
-        if let Err(error) = result {
+        let result = (|| -> Result<()> {
+            file.write_all(data)?;
+            file.sync_all()?;
             drop(file);
-            let publish_error =
-                anyhow::Error::new(error).context(format!("publish {}", dst.display()));
+            match fs::hard_link(&tmp, &dst) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
+                    "snapshot object {} already exists; refusing to overwrite a published snapshot",
+                    dst.display()
+                ),
+                Err(error) => Err(error.into()),
+            }
+        })();
+        if let Err(error) = result {
+            let publish_error = error.context(format!("publish {}", dst.display()));
             return match fs::remove_file(&tmp) {
                 Ok(()) => Err(publish_error),
                 Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
@@ -135,6 +147,20 @@ impl FsSnapshotStore {
                 ))),
             };
         }
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "publish {}: remove staging file {}",
+                        dst.display(),
+                        tmp.display()
+                    )
+                });
+            }
+        }
+        sync_directory(dir).with_context(|| format!("publish {}", dst.display()))?;
         Ok(())
     }
 
@@ -386,6 +412,92 @@ mod tests {
         assert_eq!(s.get_manifest(&k, &m.id).unwrap(), m);
         let all = s.list(&k).unwrap();
         assert_eq!(all, vec![m]);
+    }
+
+    #[test]
+    fn republishing_a_manifest_is_refused_and_keeps_the_published_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let k = key();
+        let m = manifest(10);
+        s.put_manifest(&k, &m).unwrap();
+        let other = SnapshotManifest {
+            branch: "other".into(),
+            ..m.clone()
+        };
+
+        let error = s.put_manifest(&k, &other).unwrap_err();
+
+        assert!(format!("{error:#}").contains("already exists"));
+        assert_eq!(s.get_manifest(&k, &m.id).unwrap(), m);
+    }
+
+    #[test]
+    fn republishing_an_artifact_is_refused_and_keeps_the_published_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let k = key();
+        s.put(&k, "gen-1", "bundle", b"data").unwrap();
+
+        let error = s.put(&k, "gen-1", "bundle", b"evil").unwrap_err();
+
+        assert!(format!("{error:#}").contains("already exists"));
+        assert_eq!(s.get(&k, "gen-1", "bundle").unwrap(), b"data");
+    }
+
+    #[test]
+    fn concurrent_publishers_of_one_object_have_exactly_one_winner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let k = key();
+
+        // All scoped threads race from an initially absent destination;
+        // hard_link lets one publisher win and refuses every later link.
+        let outcomes = std::thread::scope(|scope| {
+            (0..8)
+                .map(|n| {
+                    let s = &s;
+                    let k = &k;
+                    scope.spawn(move || {
+                        let bytes = format!("writer-{n}");
+                        (bytes.clone(), s.put(k, "gen-1", "bundle", bytes.as_bytes()))
+                    })
+                })
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let winners: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|(bytes, result)| result.is_ok().then_some(bytes.as_str()))
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(s.get(&k, "gen-1", "bundle").unwrap(), winners[0].as_bytes());
+
+        let dir = s.snap_dir(&k, "gen-1").unwrap();
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["bundle"]);
+    }
+
+    #[test]
+    fn artifact_publish_leaves_no_staging_files() {
+        // Positive control: this also passes against the pre-change publisher.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let k = key();
+        s.put(&k, "gen-1", "bundle", b"data").unwrap();
+
+        let dir = s.snap_dir(&k, "gen-1").unwrap();
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["bundle"]);
     }
 
     #[test]
