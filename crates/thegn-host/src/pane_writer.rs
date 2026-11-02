@@ -73,13 +73,6 @@ pub(crate) enum WriterLog {
 }
 
 impl WriterLog {
-    fn thread_name(&self) -> String {
-        match self {
-            WriterLog::Pane { pane } => format!("pty-writer-pane-{pane}"),
-            WriterLog::DaemonSession { session } => format!("pty-writer-{session}"),
-        }
-    }
-
     fn warn_write_failed(&self, e: &std::io::Error) {
         match self {
             WriterLog::Pane { pane } => {
@@ -142,23 +135,23 @@ impl StdinTx {
 /// Spawn the dedicated writer thread for one PTY: loops `recv` →
 /// `write_all` + `flush`; exits when the sender drops (pane/actor teardown) or
 /// the write errors (child's side of the PTY died after exit/kill), after
-/// which sends return [`StdinSendError::Closed`].
+/// which sends return [`StdinSendError::Closed`]. The keystroke-path writer
+/// declares `Interactive` explicitly, its existing scheduling class.
 pub(crate) fn spawn_stdin_writer(mut writer: Box<dyn Write + Send>, log: WriterLog) -> StdinTx {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_CHANNEL_CAP);
     let thread_log = log.clone();
     // best-effort: if the thread can't spawn, the receiver drops and stdin
     // degrades to Closed-drop at the send sites.
     // best-effort: stdout write: EPIPE on a closed |head pipe is normal
-    let _ = std::thread::Builder::new()
-        .name(log.thread_name())
-        .spawn(move || {
-            while let Ok(bytes) = rx.recv() {
-                if let Err(e) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
-                    thread_log.warn_write_failed(&e);
-                    return; // child gone/broken — remaining input has nowhere to go
-                }
+    let _ = thegn_core::thread_name::try_spawn_named("thegn-pty-write", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
+        while let Ok(bytes) = rx.recv() {
+            if let Err(e) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                thread_log.warn_write_failed(&e);
+                return; // child gone/broken — remaining input has nowhere to go
             }
-        });
+        }
+    });
     StdinTx {
         tx,
         congested: false,
