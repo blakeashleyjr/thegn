@@ -1155,17 +1155,32 @@ fn serve_up_uses_only_the_recorded_runtime_and_id() {
         calls.push((runtime.clone(), target.to_string(), argv.to_vec()));
         if argv == plan.up_argv.as_slice() {
             Ok((true, String::new()))
-        } else {
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "status", "--json"])
+        {
             Ok((
                 true,
                 r#"{"Self":{"DNSName":"node.example.ts.net."}}"#.into(),
             ))
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "serve", "status", "--json"])
+        {
+            Ok((
+                true,
+                r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"node.example.ts.net:443":{}}}"#.into(),
+            ))
+        } else {
+            panic!("unexpected tailscale argv: {argv:?}")
         }
     })
     .unwrap();
 
     assert_eq!(endpoint.as_url(), Some("https://node.example.ts.net"));
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 3);
     assert!(calls.iter().all(|(runtime, target, _)| {
         runtime == &OciRuntime::docker() && target == &recorded.id && target != "c-tgvpn"
     }));
@@ -1209,6 +1224,200 @@ fn serve_status_parser_cases() {
         );
     }
     assert!(serve_status_has_port("{broken", 443).is_err());
+}
+
+#[test]
+fn serve_up_refuses_and_turns_off_a_serve_missing_from_status() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let recorded = crate::vpn::RecordedSidecar {
+        runtime: OciRuntime::docker(),
+        id: "a".repeat(64),
+    };
+    let mut calls = Vec::new();
+    let mut serve_status_reads = 0;
+    let result = serve_up_with(&recorded, &plan, |_, target, argv| {
+        calls.push((target.to_string(), argv.to_vec()));
+        if argv == plan.up_argv.as_slice() {
+            Ok((true, String::new()))
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "status", "--json"])
+        {
+            Ok((
+                true,
+                r#"{"Self":{"DNSName":"node.example.ts.net."}}"#.into(),
+            ))
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "serve", "status", "--json"])
+        {
+            serve_status_reads += 1;
+            if serve_status_reads == 1 {
+                Ok((
+                    true,
+                    r#"{"TCP":{"8443":{"HTTPS":true}},"Web":{"other.ts.net:443":{}}}"#.into(),
+                ))
+            } else {
+                Ok((true, "{}".into()))
+            }
+        } else if argv == plan.down_argv.as_slice() {
+            Ok((true, String::new()))
+        } else {
+            panic!("unexpected tailscale argv: {argv:?}")
+        }
+    });
+
+    assert!(result.is_err());
+    let error = result.err().unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("does not show"));
+    assert!(message.contains("turned off"));
+    assert!(calls.iter().any(|(_, argv)| argv == &plan.down_argv));
+    assert!(calls.iter().all(|(target, _)| target == &recorded.id));
+}
+
+#[test]
+fn serve_up_reports_an_unverified_teardown() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let recorded = crate::vpn::RecordedSidecar {
+        runtime: OciRuntime::docker(),
+        id: "b".repeat(64),
+    };
+    let mut calls = Vec::new();
+    let result = serve_up_with(&recorded, &plan, |_, target, argv| {
+        calls.push((target.to_string(), argv.to_vec()));
+        if argv == plan.up_argv.as_slice() {
+            Ok((true, String::new()))
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "status", "--json"])
+        {
+            Ok((
+                true,
+                r#"{"Self":{"DNSName":"node.example.ts.net."}}"#.into(),
+            ))
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "serve", "status", "--json"])
+        {
+            Ok((
+                true,
+                r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"x.ts.net:443":{}}}"#.into(),
+            ))
+        } else if argv == plan.down_argv.as_slice() {
+            Ok((true, String::new()))
+        } else {
+            panic!("unexpected tailscale argv: {argv:?}")
+        }
+    });
+
+    assert!(result.is_err());
+    let error = result.err().unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("teardown unverified"));
+    assert!(message.contains("share may still be reachable"));
+    assert!(calls.iter().any(|(_, argv)| argv == &plan.down_argv));
+    assert!(calls.iter().all(|(target, _)| target == &recorded.id));
+}
+
+#[test]
+fn serve_up_turns_off_the_serve_when_the_dns_lookup_fails() {
+    let plan = serve_plan(thegn_core::config::TailscaleShareConfig::default(), 3000);
+    let recorded = crate::vpn::RecordedSidecar {
+        runtime: OciRuntime::docker(),
+        id: "c".repeat(64),
+    };
+    let mut calls = Vec::new();
+    let result = serve_up_with(&recorded, &plan, |_, target, argv| {
+        calls.push((target.to_string(), argv.to_vec()));
+        if argv == plan.up_argv.as_slice() {
+            Ok((true, String::new()))
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "status", "--json"])
+        {
+            Ok((false, String::new()))
+        } else if argv == plan.down_argv.as_slice() {
+            Ok((true, String::new()))
+        } else if argv
+            .iter()
+            .map(String::as_str)
+            .eq(["tailscale", "serve", "status", "--json"])
+        {
+            Ok((true, "{}".into()))
+        } else {
+            panic!("unexpected tailscale argv: {argv:?}")
+        }
+    });
+
+    assert!(result.is_err());
+    let error = result.err().unwrap();
+    assert!(format!("{error:#}").contains("turned off"));
+    assert!(calls.iter().any(|(_, argv)| argv == &plan.down_argv));
+    assert!(calls.iter().all(|(target, _)| target == &recorded.id));
+}
+
+#[test]
+fn serve_status_shows_url_cases() {
+    for (json, dns, port, funnel, expected) in [
+        (
+            r#"{"Web":{"node.ts.net:443":{}}}"#,
+            "node.ts.net",
+            443,
+            false,
+            Some(true),
+        ),
+        (
+            r#"{"Web":{"other.ts.net:443":{}}}"#,
+            "node.ts.net",
+            443,
+            false,
+            Some(false),
+        ),
+        (
+            r#"{"Web":{"node.ts.net:8443":{}}}"#,
+            "node.ts.net",
+            443,
+            false,
+            Some(false),
+        ),
+        (
+            r#"{"TCP":{"443":{"HTTPS":true}}}"#,
+            "node.ts.net",
+            443,
+            false,
+            Some(false),
+        ),
+        (
+            r#"{"Web":{"node.ts.net:443":{}}}"#,
+            "node.ts.net",
+            443,
+            true,
+            Some(false),
+        ),
+        (
+            r#"{"Web":{"node.ts.net:443":{}},"AllowFunnel":{"node.ts.net:443":true}}"#,
+            "node.ts.net",
+            443,
+            true,
+            Some(true),
+        ),
+        ("{broken", "node.ts.net", 443, false, None),
+    ] {
+        match expected {
+            Some(expected) => assert_eq!(
+                serve_status_shows_url(json, dns, port, funnel).unwrap(),
+                expected,
+                "{json}"
+            ),
+            None => assert!(serve_status_shows_url(json, dns, port, funnel).is_err()),
+        }
+    }
 }
 
 // ── iroh / dumbpipe ──────────────────────────────────────────────────────────
