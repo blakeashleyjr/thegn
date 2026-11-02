@@ -261,17 +261,19 @@ fn a_response_with_too_many_elements_is_refused() {
 
 #[test]
 fn too_many_retained_multistatus_children_are_refused() {
-    let build = |child_count: usize| {
+    let build = |child_count: usize, grandchildren_per_child: usize| {
+        let child = format!("<x:a>{}</x:a>", "<x:v/>".repeat(grandchildren_per_child));
         format!(
             "<d:multistatus xmlns:d=\"DAV:\" xmlns:x=\"urn:vendor\">{}</d:multistatus>",
-            "<x:v/>".repeat(child_count)
+            child.repeat(child_count)
         )
     };
     assert!(matches!(
-        collect(&build(MAX_EVENT_CHILDREN + 1)),
+        collect(&build(MAX_EVENT_CHILDREN + 1, 0)),
         Err(CalendarError::Parse(_))
     ));
-    assert!(collect(&build(100)).is_ok());
+    assert!(collect(&build(400, 100)).is_err());
+    assert!(collect(&build(2, 100)).is_ok());
 }
 
 #[test]
