@@ -5402,6 +5402,72 @@ fn control_socket_oci_control_dir_outside_every_mount_is_clear() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn control_socket_oci_refuses_a_control_dir_symlinked_into_a_mount() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let mount = temp.path().join("mnt");
+    let mounted_control = mount.join("ctl");
+    let runtime = temp.path().join("rt");
+    let control_dir = runtime.join("thegn");
+    std::fs::create_dir_all(&mounted_control).unwrap();
+    std::fs::create_dir(&runtime).unwrap();
+    symlink(&mounted_control, &control_dir).unwrap();
+
+    for backend in [Backend::Podman, Backend::Docker] {
+        let mut sandbox = spec(backend);
+        sandbox.mounts.push(Mount {
+            host: mount.display().to_string(),
+            dest: mount.display().to_string(),
+            ro: true,
+            cache: false,
+        });
+        assert!(matches!(
+            launchable_with(&sandbox, std::slice::from_ref(&control_dir)),
+            Err(EnterError::Refused(refusal))
+                if refusal.class == RefusalClass::ControlSocketReachable
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn control_socket_bwrap_masks_a_control_dir_seen_through_a_symlinked_mount_host() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let real = temp.path().join("real");
+    let control_dir = real.join("run/thegn");
+    let mount_host = temp.path().join("hostlink");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    symlink(&real, &mount_host).unwrap();
+
+    let mut sandbox = spec(Backend::Bwrap);
+    sandbox.mounts.push(Mount {
+        host: mount_host.display().to_string(),
+        dest: "/data".into(),
+        ro: true,
+        cache: false,
+    });
+    let argv = backend_enter_argv_with_env(
+        &sandbox,
+        "true",
+        SandboxArgvEnv {
+            resolver_dir: None,
+            runtime_dir: None,
+            control_dirs: vec![control_dir],
+            protected_dirs: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| { pair[0] == "--tmpfs" && pair[1] == "/data/run/thegn" })
+    );
+}
+
 // Compile/wiring check only: in this test process the resolved list may be empty,
 // so this does not prove that each configured control dir is added to the guard.
 #[test]
