@@ -462,6 +462,11 @@ mod tests {
             Some(ComposeExecFailure::ServiceNotFound),
             "producer output should retain the service-not-found classification: {stderr}"
         );
+        assert_eq!(
+            classify_compose_exec_failure("no such service: api"),
+            Some(ComposeExecFailure::ServiceNotFound),
+            "the alternate service-not-found producer output should have a typed classification"
+        );
         for stderr in [
             "service \"api\" is not running",
             "no container found for service api",
