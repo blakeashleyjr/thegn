@@ -35,8 +35,8 @@ fn wait_for_capacity_release(counter: &AtomicUsize) {
 #[test]
 fn failed_pipe_worker_creation_hands_owned_child_to_bounded_reaper() {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    fn fail_second(name: &str, task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
-        if name.ends_with("stderr") {
+    fn fail_second(name: &'static str, task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        if name == "thegn-probe-err" {
             return Err(std::io::Error::other("injected thread creation refusal"));
         }
         spawn_worker(name, task)

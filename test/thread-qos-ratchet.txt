@@ -35,9 +35,6 @@
 # - loading/ticker.rs (`thegn-splash-tick`) — drives an animation the user is
 #   actively watching; `Background` would visibly stutter it, and `Utility`
 #   would make it fight the very hydration burst the splash exists to cover.
-# - pane_writer.rs (per-PTY stdin writers) — on the keystroke path (recv →
-#   write_all + flush), the input counterpart of frame_writer; only
-#   `Interactive` is honest, which is already the default.
 #
 # Also not an entry (the file declares a class on its supervisor thread, so the
 # file-level scan passes it): metrics.rs's `thegn-metrics-collect` thread is
@@ -47,4 +44,3 @@
 db_task.rs
 frame_writer.rs
 loading/ticker.rs
-pane_writer.rs
