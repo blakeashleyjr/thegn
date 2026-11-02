@@ -1101,6 +1101,33 @@ async fn caldav_token_recovery_is_one_bounded_retry_with_shared_deadline() {
 }
 
 #[tokio::test]
+async fn caldav_delta_without_sync_token_falls_back_to_one_full_fetch() {
+    let delta = multistatus(1, 0).replace("<d:sync-token>tok-next</d:sync-token>", "");
+    let snapshot = multistatus(1, 0).replace("tok-next", "new-token");
+    let (address, requests, server) = serve_caldav_delta_then_snapshot(delta, snapshot).await;
+    let backend = caldav::CalDavBackend::new(&caldav_acct(address), adm());
+    let page = backend
+        .list_events(
+            window().0,
+            window().1,
+            &caldav::scope_token(&[], "UTC", "old-token"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(
+        page.sync_token(),
+        caldav::scope_token(&[], "UTC", "new-token")
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].1.contains("old-token"));
+    assert!(!requests[1].1.contains("old-token"));
+    drop(requests);
+    server.abort();
+}
+
+#[tokio::test]
 async fn oversized_chunked_and_encoded_calendar_bodies_are_rejected_before_parse() {
     use axum::Router;
     use axum::body::Body;
@@ -3683,22 +3710,21 @@ async fn a_full_caldav_snapshot_that_returns_a_token_is_still_a_snapshot() {
 }
 
 #[tokio::test]
-async fn a_caldav_delta_without_a_next_token_stays_a_delta() {
-    let body = multistatus(1, 2).replace("<d:sync-token>tok-next</d:sync-token>", "");
-    let (address, _hits, server) = serve_fixed(
-        axum::http::StatusCode::MULTI_STATUS,
-        "application/xml",
-        body,
-    )
-    .await;
+async fn a_caldav_delta_without_a_next_token_falls_back_to_snapshot() {
+    let delta = multistatus(1, 0).replace("<d:sync-token>tok-next</d:sync-token>", "");
+    let snapshot = multistatus(1, 0);
+    let (address, requests, server) = serve_caldav_delta_then_snapshot(delta, snapshot).await;
     let (from, to) = window();
     let page = caldav::CalDavBackend::new(&caldav_acct(address), adm())
         .list_events(from, to, &caldav::scope_token(&[], "UTC", "tok-prev"))
         .await
         .unwrap();
-    assert_eq!(page.mode(), PageMode::Delta);
-    assert!(page.sync_token().is_empty());
-    assert_eq!(page.deleted().len(), 2);
+    assert_eq!(page.mode(), PageMode::Snapshot);
+    assert_eq!(
+        page.sync_token(),
+        caldav::scope_token(&[], "UTC", "tok-next")
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
     server.abort();
 }
 

@@ -261,6 +261,8 @@ pub struct EventPage {
     event_hrefs: Vec<String>,
     /// Resource hrefs parallel to legacy UID tombstones.
     deleted_hrefs: Vec<String>,
+    /// Provider ETag per event, parallel to `events` when supplied (CalDAV); empty otherwise.
+    event_etags: Vec<Option<String>>,
     /// Opaque provider cursor to resume from next time (an ETag, a CalDAV
     /// sync-token). Empty means "no cursor": the next fetch is a full one.
     /// Independent of `mode`.
@@ -392,6 +394,19 @@ impl EventPage {
         self
     }
 
+    pub(crate) fn with_event_etags(
+        mut self,
+        etags: Vec<Option<String>>,
+    ) -> Result<Self, CalendarError> {
+        if !etags.is_empty() && etags.len() != self.events.len() {
+            return Err(CalendarError::Parse(
+                "resource etags do not match page rows".into(),
+            ));
+        }
+        self.event_etags = etags;
+        Ok(self)
+    }
+
     /// Nothing changed since `sync_token`: keep the cache, keep the cursor.
     pub fn unchanged(sync_token: impl Into<String>) -> Self {
         EventPage {
@@ -470,6 +485,7 @@ impl EventPage {
             deleted,
             event_hrefs,
             deleted_hrefs,
+            event_etags: Vec::new(),
             sync_token,
             diagnostics: PageDiagnostics::default(),
             lease: meter.into_lease(),
@@ -533,6 +549,10 @@ impl EventPage {
 
     pub fn event_hrefs(&self) -> &[String] {
         &self.event_hrefs
+    }
+
+    pub fn event_etags(&self) -> &[Option<String>] {
+        &self.event_etags
     }
 
     pub fn deleted_hrefs(&self) -> &[String] {

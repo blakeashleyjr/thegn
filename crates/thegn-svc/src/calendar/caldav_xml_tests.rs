@@ -204,3 +204,96 @@ fn google_status_first_crlf_shape_parses() {
     let body = "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:response><D:href>/a</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:getetag>&quot;63831&quot;</D:getetag><calendar-data xmlns=\"urn:ietf:params:xml:ns:caldav\">BEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT</calendar-data></D:prop></D:propstat></D:response></D:multistatus>";
     assert_eq!(collect(body).unwrap().0.len(), 1);
 }
+
+#[test]
+fn getetag_is_kept_from_a_successful_propstat_only() {
+    let google = "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:response><D:href>/a</D:href><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><D:getetag>&quot;63831&quot;</D:getetag><calendar-data xmlns=\"urn:ietf:params:xml:ns:caldav\">BEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT</calendar-data></D:prop></D:propstat></D:response></D:multistatus>";
+    let mut etags = Vec::new();
+    walk_multistatus(google, |resource| {
+        etags.push(resource.etag);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(etags, [Some("\"63831\"".to_string())]);
+
+    let sabre = "<d:multistatus xmlns:d=\"DAV:\" xmlns:cal=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/x.ics</d:href><d:propstat><d:prop><cal:calendar-data>ICS</cal:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><d:getetag/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response><d:response><d:href>/gone.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response><d:sync-token>t</d:sync-token></d:multistatus>";
+    let mut resources = Vec::new();
+    walk_multistatus(sabre, |resource| {
+        resources.push((resource.deleted, resource.etag));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(resources, [(false, None), (true, None)]);
+}
+
+#[test]
+fn nested_or_oversized_getetag_is_refused() {
+    let prefix = "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:x=\"urn:x\"><d:response><d:href>/a</d:href><d:propstat><d:prop>";
+    let suffix = "<c:calendar-data>ICS</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+    let nested = format!("{prefix}<d:getetag><x:y/></d:getetag>{suffix}");
+    assert!(matches!(collect(&nested), Err(CalendarError::Parse(_))));
+    let oversized = format!(
+        "{prefix}<d:getetag>{}</d:getetag>{suffix}",
+        "x".repeat(crate::http::MAX_REQUEST_BYTES + 1)
+    );
+    assert!(matches!(
+        collect(&oversized),
+        Err(CalendarError::BodyLimit(
+            "calendar resource etag exceeds limit"
+        ))
+    ));
+}
+
+#[test]
+fn a_response_with_too_many_elements_is_refused() {
+    let build = |vendor_count: usize| {
+        format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:x=\"urn:vendor\"><d:response><d:href>/a</d:href><d:propstat><d:prop><c:calendar-data>ICS</c:calendar-data>{}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
+            "<x:v/>".repeat(vendor_count)
+        )
+    };
+    assert!(matches!(
+        collect(&build(MAX_EVENT_CHILDREN)),
+        Err(CalendarError::Parse(_))
+    ));
+    assert!(collect(&build(100)).is_ok());
+}
+
+#[test]
+fn too_many_retained_multistatus_children_are_refused() {
+    let build = |child_count: usize| {
+        format!(
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:x=\"urn:vendor\">{}</d:multistatus>",
+            "<x:v/>".repeat(child_count)
+        )
+    };
+    assert!(matches!(
+        collect(&build(MAX_EVENT_CHILDREN + 1)),
+        Err(CalendarError::Parse(_))
+    ));
+    assert!(collect(&build(100)).is_ok());
+}
+
+#[test]
+fn arbitrary_hrefs_unrelated_to_uids_are_kept_verbatim() {
+    let body = "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/a&amp;b%20c.ics</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VEVENT\nUID:x/y@z\nEND:VEVENT</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/cal/été.ics</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VEVENT\nUID:other\nEND:VEVENT</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+    let mut rows = Vec::new();
+    walk_multistatus(body, |resource| {
+        rows.push((resource.href, resource.ics_raw.to_string()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (
+                "/cal/a&b%20c.ics".to_string(),
+                "BEGIN:VEVENT\nUID:x/y@z\nEND:VEVENT".to_string()
+            ),
+            (
+                "/cal/été.ics".to_string(),
+                "BEGIN:VEVENT\nUID:other\nEND:VEVENT".to_string()
+            ),
+        ]
+    );
+}
