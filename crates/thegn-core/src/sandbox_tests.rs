@@ -795,8 +795,6 @@ fn refusal_remediation_hint_names_class_path_and_fix() {
 
 #[test]
 fn refusal_context_leads_with_the_remediation_hint() {
-    use anyhow::Context as _;
-
     let mut spec = spec(Backend::Docker);
     spec.volumes = vec![("/tmp/state".into(), "/mnt/state".into())];
     let error =

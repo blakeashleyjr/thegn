@@ -446,7 +446,10 @@ where
             spec.mounts.truncate(mount_count_before_cache_policy);
             return SandboxCacheDecision {
                 active: false,
-                reason: format!("compiler cache not applied: {}", error.remediation_hint()),
+                reason: format!(
+                    "compiler cache not applied: {} ({error})",
+                    error.remediation_hint()
+                ),
             };
         }
     };
@@ -925,7 +928,8 @@ mod tests {
         }
         let mut cfg = Config::default();
         cfg.sandbox.compiler_cache = SandboxCompilerCache::Auto;
-        let spec = SandboxSpec {
+        cfg.disk.sccache_dir = format!("/tmp/thegn-sccache-volume-refusal-{}", std::process::id());
+        let mut spec = SandboxSpec {
             volumes: vec![("/tmp/state".into(), "/mnt/state".into())],
             ..policy_bwrap_spec()
         };
@@ -939,6 +943,7 @@ mod tests {
 
         assert!(!decision.active);
         assert!(decision.reason.contains("[volume-name]"));
+        assert!(decision.reason.contains("sandbox volume refused (pair 0;"));
     }
 
     #[test]
