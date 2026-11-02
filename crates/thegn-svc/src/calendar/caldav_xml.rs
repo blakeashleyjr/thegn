@@ -622,7 +622,8 @@ fn process_response<'a>(
                         "calendar resource etag exceeds limit",
                     ));
                 }
-                let decoded = decode_text(property.inner.trim())?.trim();
+                let decoded = decode_text(property.inner.trim())?;
+                let decoded = decoded.trim();
                 if (200..300).contains(&code) && !decoded.is_empty() {
                     etag = Some(decoded.to_string());
                 }
