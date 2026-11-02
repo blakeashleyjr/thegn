@@ -5,6 +5,9 @@ fn stamp_version(path: &Path, version: i64) {
     conn.pragma_update(None, "user_version", version).unwrap();
 }
 
+// The creator stamps the version before unlocking, then reacquires shared.
+// If this thread wins exclusive in that gap, release it so the scoped creator
+// can finish; only a Joined outcome proves both shared leases coexist.
 #[test]
 fn bootstrap_loser_waits_then_joins_the_created_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -22,15 +25,25 @@ fn bootstrap_loser_waits_then_joins_the_created_schema() {
             holder.lock_shared().unwrap();
         });
 
-        assert_eq!(
-            wait_for_bootstrap_lease(&file, &conn, &path, SCHEMA_BOOTSTRAP_WAIT).unwrap(),
-            BootstrapLease::Joined(SCHEMA_VERSION)
-        );
-        let third = open_schema_lock(&path).unwrap();
-        assert!(
-            matches!(third.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-            "the joined lease must remain shared while the creator holds its shared lease"
-        );
+        let outcome = wait_for_bootstrap_lease(&file, &conn, &path, SCHEMA_BOOTSTRAP_WAIT).unwrap();
+        match outcome {
+            BootstrapLease::Joined(version) => {
+                assert_eq!(version, SCHEMA_VERSION, "wait outcome: Joined({version})");
+                let third = open_schema_lock(&path).unwrap();
+                assert!(
+                    matches!(third.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                    "wait outcome: Joined({version}); the joined lease must remain shared while the creator holds its shared lease"
+                );
+            }
+            BootstrapLease::Exclusive => {
+                let version = query_user_version(&conn);
+                file.unlock().unwrap();
+                assert_eq!(
+                    version, SCHEMA_VERSION,
+                    "wait outcome: Exclusive; the creator stamped the completed schema before releasing its exclusive lease"
+                );
+            }
+        }
     });
 }
 

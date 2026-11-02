@@ -696,7 +696,10 @@ fn try_exclusive_lock(file: &std::fs::File, database: &Path) -> Result<()> {
     }
 }
 
+/// How long a process that lost the bootstrap race waits for the creating process.
+/// The same 5 s bound as the connection's SQLite busy_timeout.
 const SCHEMA_BOOTSTRAP_WAIT: std::time::Duration = std::time::Duration::from_millis(5000);
+/// Delay between attempts to acquire the bootstrap lease.
 const SCHEMA_BOOTSTRAP_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 fn old_schema_lease_refusal(database: &Path) -> String {
