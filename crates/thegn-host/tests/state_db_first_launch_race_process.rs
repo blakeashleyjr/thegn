@@ -79,10 +79,6 @@ fn read_capped(path: &Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "process test captures and owns each spawned CLI child"
-)]
 fn spawn_disk(scope: &Scope, index: usize) -> OwnedChild {
     let stdout_path = scope.root.path().join(format!("child-{index}.stdout"));
     let stderr_path = scope.root.path().join(format!("child-{index}.stderr"));
@@ -116,13 +112,13 @@ fn wait_for_child(child: &mut OwnedChild) -> ExitStatus {
                 if let Err(error) = child.child.kill() {
                     panic!(
                         "CLI child exceeded {CHILD_DEADLINE:?}; kill failed: {error}; {}",
-                        child_report(child, None)
+                        child_report(child)
                     );
                 }
                 let _status = child.child.wait().expect("reap timed-out CLI child");
                 panic!(
                     "CLI child exceeded {CHILD_DEADLINE:?}; {}",
-                    child_report(child, None)
+                    child_report(child)
                 );
             }
             Err(error) => {
@@ -133,18 +129,15 @@ fn wait_for_child(child: &mut OwnedChild) -> ExitStatus {
                     .child
                     .wait()
                     .expect("reap CLI child after poll failure");
-                panic!(
-                    "could not poll CLI child: {error}; {}",
-                    child_report(child, None)
-                );
+                panic!("could not poll CLI child: {error}; {}", child_report(child));
             }
         }
     }
 }
 
-fn child_report(child: &OwnedChild, status: Option<&ExitStatus>) -> String {
+fn child_report(child: &OwnedChild) -> String {
     format!(
-        "status={status:?}\nstdout:\n{}\nstderr:\n{}",
+        "stdout:\n{}\nstderr:\n{}",
         read_capped(&child.stdout_path),
         read_capped(&child.stderr_path)
     )
