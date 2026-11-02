@@ -423,6 +423,25 @@ pub struct WaitOutcome {
     pub exit_code: Option<i32>,
 }
 
+/// One account whose `issues.list` result is missing or incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueListGap {
+    pub account: String,
+    pub provider: String,
+    /// `partial` (some rows returned) or `failed` (none).
+    pub kind: String,
+    pub reason: String,
+}
+
+/// The `issues.list` answer: rows plus every account that was not read completely.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueListing {
+    pub issues: Vec<thegn_core::issue::Issue>,
+    /// True only when every configured account answered completely.
+    pub complete: bool,
+    pub incomplete: Vec<IssueListGap>,
+}
+
 /// Where a `split` places the new pane relative to the target session. Mirrors
 /// the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does
 /// not depend on `thegn-host`.
@@ -1176,12 +1195,12 @@ pub trait ControlApi: Send + Sync + 'static {
     // provider seam the panel uses); the dispatch verbs and `worktree_create`
     // are local DB / git, like the merge verbs.
 
-    /// List tracker issues matching `filter` (`issues.list`).
+    /// List tracker issues matching `filter` (`issues.list`); `complete` is false when any account was partial or failed.
     fn issues_list<'a>(
         &'a self,
         _filter: &'a thegn_core::issue::IssueFilter,
         _repo: Option<&'a str>,
-    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+    ) -> BoxFuture<'a, ControlResult<IssueListing>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
