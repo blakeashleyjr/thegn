@@ -522,10 +522,16 @@ static CI_DETAIL_IN_FLIGHT: std::sync::Mutex<std::collections::BTreeSet<CiDetail
 struct CiDetailClaim(CiDetailKey);
 
 fn claim_ci_detail(key: CiDetailKey) -> Option<CiDetailClaim> {
-    let mut in_flight = CI_DETAIL_IN_FLIGHT
+    let inserted = CI_DETAIL_IN_FLIGHT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    in_flight.insert(key.clone()).then_some(CiDetailClaim(key))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone());
+    // Build the claim only after a successful insert; its Drop takes this same lock.
+    if inserted {
+        Some(CiDetailClaim(key))
+    } else {
+        None
+    }
 }
 
 impl Drop for CiDetailClaim {
@@ -563,7 +569,11 @@ pub(crate) fn spawn_ci_detail(
         run.id.clone(),
         generation.as_ref().map(|(_, g)| *g),
     )) else {
-        tracing::debug!(target: "thegn::ci", run = %run.id, "CI run detail fetch already in flight; coalesced");
+        tracing::debug!(
+            target: "thegn::ci",
+            run = %run.id,
+            "CI run detail fetch already in flight; coalesced"
+        );
         return;
     };
     tokio::task::spawn_blocking(move || {
@@ -2901,6 +2911,7 @@ mod tests {
 
         let first = claim_ci_detail(key.clone());
         assert!(first.is_some());
+        assert!(claim_ci_detail(key.clone()).is_none());
         assert!(claim_ci_detail(key.clone()).is_none());
 
         drop(first);
