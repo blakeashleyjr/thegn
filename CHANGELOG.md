@@ -43,7 +43,7 @@ All notable changes to **thegn** are documented here. The format follows
 - (dev channel) Provisioning refuses to overwrite a managed SSH key record
   whose rotation is unfinished and points at `thegn secret ssh rotate`. A
   second provisioning of the same host-placed container while one runs is
-  skipped with a warning.
+  skipped; the next open checks again.
 
 ### Security
 

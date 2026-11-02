@@ -127,7 +127,8 @@ container and checks it again afterward. If the source was swapped, thegn
 removes the container and refuses the launch.
 If a container with this worktree's container name belongs to another worktree
 (paths differing only in punctuation or case can share a name), or its owner
-cannot be read, the launch is refused and the other container stays running.
+cannot be read, the launch is refused with the `container-owner` class and the
+other container stays running.
 Close that worktree's sandbox first or rename one worktree directory. An older
 container without an owner label follows the existing reuse and recreate checks.
 
@@ -652,7 +653,8 @@ remote placement is configured, the launch stops in the halt modal with the
 read error instead of using the default environment. Without a remote
 placement, a local shell is not refused for that read error. For host
 placement, if another provisioning run for the same container is active, this
-open skips provisioning with a warning; the next open checks again.
+open skips provisioning; when `THEGN_LOG` is set, the warning is written to
+`thegn.log`. The next open checks again.
 
 On any channel, closing a tab whose location cannot be read tears down by path
 only and warns on the status line that a remote sandbox may remain. Idle
