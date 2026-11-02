@@ -173,6 +173,8 @@ struct ClientState {
 
 pub struct LspInner {
     enabled: AtomicBool,
+    /// `[lsp] require_containment`; applies to the next server start.
+    require_containment: AtomicBool,
     /// The resolved server registry (built-ins + user `[[lsp.servers]]`). It is
     /// swappable on config reload; readers clone the Arc and release the lock
     /// before resolving or doing any other work.
@@ -189,6 +191,7 @@ impl LspSupervisor {
         LspSupervisor {
             inner: Arc::new(LspInner {
                 enabled: AtomicBool::new(cfg.lsp.enabled),
+                require_containment: AtomicBool::new(cfg.lsp.require_containment),
                 registry: RwLock::new(Arc::new(Registry::build(&cfg.lsp.servers))),
                 diag_tx,
                 admission: RootAdmission::new(),
@@ -346,6 +349,7 @@ impl LspInner {
                     );
                 }
             }
+            self.containment_gate(wrap)?;
             let client = LspClient::start_argv_with_identity(
                 &argv,
                 &spec.language_id,
@@ -756,6 +760,48 @@ impl LspInner {
         teardown_off_loop(teardown);
         released
     }
+
+    pub(crate) fn set_require_containment(&self, epoch: u64, require: bool) {
+        let mut state = match self.clients.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.config_epoch != epoch {
+            return;
+        }
+        if self.require_containment.swap(require, Ordering::AcqRel) != require {
+            state
+                .map
+                .retain(|_, slot| !matches!(slot, ClientSlot::Failed { .. }));
+        }
+    }
+
+    fn containment_gate(
+        &self,
+        wrap: thegn_core::sandbox_cpucap::BackgroundWrap,
+    ) -> Result<(), LspError> {
+        containment_refusal(self.require_containment.load(Ordering::Acquire), wrap)
+            .map_or(Ok(()), Err)
+    }
+}
+
+/// `[lsp] require_containment`: the refusal for a server whose background
+/// wrap did not join the thegn slice, or `None` when it may start.
+fn containment_refusal(
+    require: bool,
+    wrap: thegn_core::sandbox_cpucap::BackgroundWrap,
+) -> Option<LspError> {
+    use thegn_core::sandbox_cpucap::BackgroundWrap;
+    let reason = match wrap {
+        BackgroundWrap::Wrapped | BackgroundWrap::AlreadyCapped => return None,
+        BackgroundWrap::ScopeUnusable => "the systemd scope for the thegn slice is unavailable",
+        BackgroundWrap::NoPolicy => "no resource policy is published",
+    };
+    require.then(|| {
+        LspError::Spawn(format!(
+            "[lsp] require_containment is set and {reason}; not starting the language server"
+        ))
+    })
 }
 
 fn changed_registry_keys(old: &Registry, new: &Registry) -> HashSet<String> {
@@ -3475,6 +3521,143 @@ mod tests {
             })
             .unwrap();
         assert!(Arc::ptr_eq(&original, &current));
+    }
+
+    #[test]
+    fn containment_refusal_follows_policy_and_wrap_outcome() {
+        use thegn_core::sandbox_cpucap::BackgroundWrap;
+
+        let cases = [
+            (false, BackgroundWrap::Wrapped, false),
+            (false, BackgroundWrap::AlreadyCapped, false),
+            (false, BackgroundWrap::NoPolicy, false),
+            (false, BackgroundWrap::ScopeUnusable, false),
+            (true, BackgroundWrap::Wrapped, false),
+            (true, BackgroundWrap::AlreadyCapped, false),
+            (true, BackgroundWrap::NoPolicy, true),
+            (true, BackgroundWrap::ScopeUnusable, true),
+        ];
+
+        for (require, wrap, refuses) in cases {
+            let result = containment_refusal(require, wrap);
+            assert_eq!(
+                result.is_some(),
+                refuses,
+                "require={require}, wrap={wrap:?}"
+            );
+            if refuses {
+                assert!(
+                    matches!(result, Some(LspError::Spawn(message)) if message.contains("require_containment"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn require_containment_gate_refuses_an_unwrapped_start() {
+        use thegn_core::sandbox_cpucap::BackgroundWrap;
+
+        let (inner, _rx) = enabled_inner();
+        assert_eq!(inner.reconfigure(1, true, &[]), 0);
+        inner.set_require_containment(1, true);
+        assert!(matches!(
+            inner.containment_gate(BackgroundWrap::ScopeUnusable),
+            Err(LspError::Spawn(_))
+        ));
+        assert!(inner.containment_gate(BackgroundWrap::Wrapped).is_ok());
+    }
+
+    #[test]
+    fn require_containment_flag_follows_set_require_containment() {
+        use thegn_core::sandbox_cpucap::BackgroundWrap;
+
+        let (inner, _rx) = enabled_inner();
+        assert_eq!(inner.reconfigure(1, true, &[]), 0);
+        assert!(
+            inner
+                .containment_gate(BackgroundWrap::ScopeUnusable)
+                .is_ok()
+        );
+        inner.set_require_containment(1, true);
+        assert!(
+            inner
+                .containment_gate(BackgroundWrap::ScopeUnusable)
+                .is_err()
+        );
+        inner.set_require_containment(1, false);
+        assert!(
+            inner
+                .containment_gate(BackgroundWrap::ScopeUnusable)
+                .is_ok()
+        );
+
+        let cfg = Config {
+            lsp: thegn_core::config::LspConfig {
+                require_containment: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let supervisor = LspSupervisor::from_config(&cfg);
+        assert!(
+            supervisor
+                .handle()
+                .containment_gate(BackgroundWrap::ScopeUnusable)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_require_containment_epoch_is_ignored() {
+        use thegn_core::sandbox_cpucap::BackgroundWrap;
+
+        let (inner, _rx) = enabled_inner();
+        assert_eq!(inner.reconfigure(2, true, &[]), 0);
+        inner.set_require_containment(1, true);
+
+        assert!(
+            inner
+                .containment_gate(BackgroundWrap::ScopeUnusable)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn changing_require_containment_clears_cached_start_failure() {
+        use thegn_core::sandbox_cpucap::BackgroundWrap;
+
+        let (inner, _rx) = enabled_inner();
+        assert_eq!(inner.reconfigure(1, true, &[]), 0);
+        inner.set_require_containment(1, true);
+        let root = Path::new("/containment-backoff");
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        assert!(matches!(
+            inner.client_with(root, "rust", |_, _, _, _| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                inner.containment_gate(BackgroundWrap::ScopeUnusable)?;
+                panic!("uncontained server must not reach startup")
+            }),
+            Err(LspError::Spawn(message)) if message.contains("require_containment")
+        ));
+        assert!(matches!(
+            inner.client_with(root, "rust", |_, _, _, _| {
+                panic!("cached failure must be in backoff before the policy changes")
+            }),
+            Err(LspError::Protocol(message)) if message == "LSP start backoff active"
+        ));
+
+        inner.set_require_containment(1, false);
+        assert!(matches!(
+            inner.client_with(root, "rust", |_, _, _, _| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                inner
+                    .containment_gate(BackgroundWrap::ScopeUnusable)
+                    .unwrap();
+                Err(LspError::Spawn("server launch failed".into()))
+            }),
+            Err(LspError::Spawn(message)) if message == "server launch failed"
+        ));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

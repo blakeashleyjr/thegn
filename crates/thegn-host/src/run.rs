@@ -14103,9 +14103,11 @@ async fn event_loop<T: Terminal>(
                     lsp_config_epoch += 1;
                     let epoch = lsp_config_epoch;
                     let (enabled, servers) = (new_cfg.lsp.enabled, new_cfg.lsp.servers.clone());
+                    let require_containment = new_cfg.lsp.require_containment;
                     let lsp = lsp_supervisor.handle();
                     tokio::task::spawn_blocking(move || {
                         let released = lsp.reconfigure(epoch, enabled, &servers);
+                        lsp.set_require_containment(epoch, require_containment);
                         if released > 0 {
                             tracing::debug!(
                                 target: "thegn::lsp",
