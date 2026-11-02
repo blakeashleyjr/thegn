@@ -962,15 +962,16 @@ mod tests {
                 } else {
                     vec![format!("p{}-a", page - 1), format!("p{}-b", page - 1)]
                 };
-                db.apply_calendar_page(
-                    "acct",
-                    &CalendarPageWrite::Delta {
-                        rows: &rows,
-                        tombstones: CalendarTombstones::Uids(&previous_uids),
-                    },
-                    &cursor(&format!("t{page}")),
-                )
-                .unwrap();
+                let _applied = db
+                    .apply_calendar_page(
+                        "acct",
+                        &CalendarPageWrite::Delta {
+                            rows: &rows,
+                            tombstones: CalendarTombstones::Uids(&previous_uids),
+                        },
+                        &cursor(&format!("t{page}")),
+                    )
+                    .unwrap();
             }
             writer_done.store(true, Ordering::Release);
         });
