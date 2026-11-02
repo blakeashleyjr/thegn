@@ -2814,6 +2814,8 @@ fn bounded_reader_counts_each_oversized_line_once() {
     let tracker = super::EndpointTracker::default();
     let mut input = vec![b'x'; super::MAX_PROVIDER_LINE + 10];
     input.extend_from_slice(b"\n");
+    input.extend(std::iter::repeat_n(b'z', super::MAX_PROVIDER_LINE));
+    input.extend_from_slice(b"\n");
     input.resize(input.len() + 2 * super::MAX_PROVIDER_LINE, b'y');
     input.extend_from_slice(b"\nok\n");
 
@@ -2839,6 +2841,10 @@ fn bounded_reader_counts_each_oversized_line_once() {
             .dropped_lines
             .load(std::sync::atomic::Ordering::Relaxed),
         0
+    );
+    assert_eq!(
+        rx.recv().expect("line at the provider limit"),
+        "z".repeat(super::MAX_PROVIDER_LINE)
     );
     assert_eq!(rx.recv().expect("following bounded line"), "ok");
 }
