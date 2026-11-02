@@ -962,7 +962,7 @@ mod tests {
                 } else {
                     vec![format!("p{}-a", page - 1), format!("p{}-b", page - 1)]
                 };
-                let _applied = db
+                let applied = db
                     .apply_calendar_page(
                         "acct",
                         &CalendarPageWrite::Delta {
@@ -972,6 +972,12 @@ mod tests {
                         &cursor(&format!("t{page}")),
                     )
                     .unwrap();
+                assert_eq!(
+                    applied,
+                    CalendarPageApplied::Applied {
+                        events_changed: true
+                    }
+                );
             }
             writer_done.store(true, Ordering::Release);
         });
@@ -983,12 +989,14 @@ mod tests {
             let mut observations = 0;
             let mut violations = Vec::new();
             let mut saw_done = false;
+            let mut last_token = String::new();
             loop {
                 db.conn().execute_batch("BEGIN").unwrap();
                 let observed_events = events(&db, "acct");
                 let observed_token = token(&db, "acct");
                 db.conn().execute_batch("COMMIT").unwrap();
                 observations += 1;
+                last_token.clone_from(&observed_token);
 
                 let valid = if observed_token == "old-token" {
                     observed_events == vec![r#"{"uid":"prior"}"#.to_owned()]
@@ -1020,15 +1028,19 @@ mod tests {
                     saw_done = true;
                 }
             }
-            (observations, violations)
+            (observations, violations, last_token)
         });
 
         writer.join().unwrap();
-        let (observations, violations) = reader.join().unwrap();
+        let (observations, violations, last_token) = reader.join().unwrap();
         assert!(observations > 0, "reader made no observations");
         assert!(
             violations.is_empty(),
             "inconsistent page snapshots: {violations:?}"
+        );
+        assert_eq!(
+            last_token, "t40",
+            "reader's final snapshot must include page 40"
         );
     }
 
