@@ -1095,6 +1095,11 @@ done
             receiver.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
+        assert!(bridge.resolve(RpcResponse::ok(1_000_000, serde_json::json!("original"))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Ok(resp)) if resp.result == Some(serde_json::json!("original"))
+        ));
     }
 
     #[test]
