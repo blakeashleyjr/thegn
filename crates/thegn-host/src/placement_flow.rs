@@ -961,7 +961,18 @@ fn try_spillover(
 /// (or parks it budget-dead) — called from the provision error path.
 pub(crate) fn note_spillover_failure(cfg: &Config, worktree: &str, error: &str) {
     let Ok(db) = Db::open() else { return };
-    let env = db.effective_env(worktree, "").unwrap_or_default();
+    let env = match db.effective_env_checked(worktree, "") {
+        Ok(env) => env.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::placement",
+                worktree,
+                error = %format!("{error:#}"),
+                "spillover cooldown not recorded: the environment selection could not be read"
+            );
+            return;
+        }
+    };
     if !cfg.placement.spillover_envs.contains(&env) {
         return;
     }
