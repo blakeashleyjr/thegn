@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -1316,6 +1317,84 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             self.assertIn("not bound to this workflow run", result.stdout)
             self.assertIn("untrusted runner", result.stderr)
+
+    def test_publishers_screen_metadata_before_the_key_exists(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        expected = {
+            "publish-homebrew": (
+                "Screen Homebrew metadata bytes",
+                ("$PUBLISH_ROOT/metadata/thegn-$TAG-homebrew.rb",),
+                "Materialize Homebrew deploy key",
+            ),
+            "publish-aur": (
+                "Screen AUR metadata bytes",
+                (
+                    "$RUNNER_TEMP/aur-metadata/PKGBUILD",
+                    "$RUNNER_TEMP/aur-metadata/.SRCINFO",
+                ),
+                "Materialize AUR deploy key",
+            ),
+        }
+        for job_name, (screen_name, paths, key_name) in expected.items():
+            steps = jobs[job_name]["steps"]
+            names = [step.get("name", "") for step in steps]
+            screen_index = names.index(screen_name)
+            key_index = names.index(key_name)
+            screen_step = steps[screen_index]
+            with self.subTest(job=job_name):
+                self.assertLess(screen_index, key_index)
+                self.assertEqual("steps.publication.outputs.ready == 'true'", screen_step["if"])
+                self.assertEqual("${{ inputs.tag }}", screen_step["env"]["TAG"])
+                command = screen_step["run"].replace("\\\n", " ").split(
+                    "python3 packaging/screen_metadata.py ", maxsplit=1
+                )[1]
+                invocation = command.splitlines()[0].partition("; then")[0]
+                arguments = shlex.split(invocation)
+                self.assertEqual(list(paths), arguments)
+
+    def test_publishers_compare_committed_blobs_before_push(self) -> None:
+        jobs = read_workflow("release.yml")["jobs"]
+        expectations = {
+            "publish-homebrew": ("HEAD:Formula/thegn.rb",),
+            "publish-aur": ("HEAD:PKGBUILD", "HEAD:.SRCINFO"),
+        }
+        for job_name, blobs in expectations.items():
+            step_name = (
+                "Publish Homebrew formula"
+                if job_name == "publish-homebrew"
+                else "Publish generated AUR metadata"
+            )
+            step = next(
+                item for item in jobs[job_name]["steps"] if item.get("name") == step_name
+            )
+            script = step["run"]
+            push_position = script.index("push --force-with-lease")
+            with self.subTest(job=job_name):
+                self.assertIn("cmp -s -", script)
+                for blob in blobs:
+                    self.assertLess(script.index(f"cat-file blob {blob}"), push_position)
+
+    def test_key_bearing_jobs_never_interpret_metadata(self) -> None:
+        # Positive control: this policy already passes at aec345be8e; the new screen/blob tests fail there.
+        workflow = read_workflow("release.yml")
+        interpreter_patterns = (
+            re.compile(
+                r"\b(makepkg|source|eval|bash|sh|ruby|brew)\b[^\n]*(PKGBUILD|SRCINFO|homebrew\.rb|Formula/)"
+            ),
+            re.compile(r"(^|[;&|]\s*)\.\s+[^\n]*PKGBUILD"),
+        )
+        for job_name, job in workflow["jobs"].items():
+            serialized_job = yaml.safe_dump(job)
+            if "HOMEBREW_TAP_DEPLOY_KEY" not in serialized_job and "AUR_DEPLOY_KEY" not in serialized_job:
+                continue
+            for step in job.get("steps", []):
+                script = step.get("run", "")
+                if not isinstance(script, str):
+                    continue
+                for line in script.splitlines():
+                    for pattern in interpreter_patterns:
+                        with self.subTest(job=job_name, step=step.get("name"), line=line):
+                            self.assertIsNone(pattern.search(line), f"metadata interpreter: {line}")
 
 
 if __name__ == "__main__":
