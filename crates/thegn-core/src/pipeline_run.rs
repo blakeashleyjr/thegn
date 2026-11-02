@@ -746,7 +746,12 @@ mod tests {
             ("\u{200d}".as_bytes(), false, ArtifactContent::Valid),
         ];
         for (bytes, over_limit, expected) in cases {
-            assert_eq!(classify_artifact_bytes(bytes, over_limit), expected);
+            assert_eq!(
+                classify_artifact_bytes(bytes, over_limit),
+                expected,
+                "input {:?} over_limit={over_limit}",
+                String::from_utf8_lossy(&bytes[..bytes.len().min(32)])
+            );
         }
     }
 
