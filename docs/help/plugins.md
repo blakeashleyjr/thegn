@@ -166,7 +166,9 @@ A plugin can _be_ a provider: an `IssueProvider` contribution makes the
 plugin an issue-tracker backend — the host bridges the issue seam's
 operations to it as `provider.call` requests, and its issues join the
 panel beside your configured accounts (the contribution's label is the
-account name). Its contribution `caps` object may declare `comments` and
+account name). A plugin declares at most one `IssueProvider` contribution;
+`thegn plugin check` reports any further one as rejected. Its contribution
+`caps` object may declare `comments` and
 `labels`; omitted or `null` caps are all false, and a false-cap optional call
 is rejected locally without a `provider.call` round trip. The host uses the
 existing issue JSON shapes and maps an RPC `unsupported` reply to the same
