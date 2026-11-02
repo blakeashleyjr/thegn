@@ -652,6 +652,7 @@ impl<'a> StateRouter<'a> {
                     "name": tool_name(t.cap),
                     "description": t.description,
                     "inputSchema": input_schema(t.args),
+                    "annotations": tool_annotations(t.cap),
                 })
             })
             .collect()
@@ -728,6 +729,26 @@ fn input_schema(args: &[ArgSpec]) -> Value {
         "required": required,
         "additionalProperties": false,
     })
+}
+
+/// Write-class MCP tools whose effect is additive or reversible (open/fork a
+/// session, open an editor, assign a folder): advertised with
+/// `destructiveHint: false`. Every other non-read tool is advertised
+/// destructive (fail closed), so a new write tool is destructive until it is
+/// deliberately listed here.
+const NON_DESTRUCTIVE_WRITE_CAPS: &[&str] = &[
+    "folders.assign",
+    "editor.open",
+    "sessions.open",
+    "sessions.fork",
+];
+
+/// MCP `annotations` for a state tool, derived from the catalog scope. Hints
+/// only: `--scopes` is the enforcement.
+fn tool_annotations(cap: &str) -> Value {
+    let read_only = lookup(cap).is_some_and(|c| scope_of(c) == Scope::Read);
+    let destructive = !read_only && !NON_DESTRUCTIVE_WRITE_CAPS.contains(&cap);
+    json!({ "readOnlyHint": read_only, "destructiveHint": destructive })
 }
 
 /// Validate `value` against a tool's declared arguments: `Value::Null` is
@@ -1203,5 +1224,55 @@ mod tests {
         let args = json!({"session": "s1"});
         assert_eq!(redact_for_audit("sessions.kill", &args), args);
         assert_eq!(redact_for_audit("sessions.list", &args), args);
+    }
+
+    #[test]
+    fn tool_entries_annotate_read_write_and_destructive_classes() {
+        let r = StateRouter::new(all_caps(), |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        for entry in &entries {
+            let name = entry["name"].as_str().unwrap();
+            let cap = MCP_STATE_CAPS
+                .iter()
+                .find(|cap| tool_name(cap) == name)
+                .unwrap();
+            let read_only = scope_of(lookup(cap).unwrap()) == Scope::Read;
+            assert_eq!(entry["annotations"]["readOnlyHint"], json!(read_only));
+        }
+
+        for (name, read_only, destructive) in [
+            ("sessions_list", true, false),
+            ("automations_test", true, false),
+            ("sessions_kill", false, true),
+            ("sessions_input", false, true),
+            ("tools_run", false, true),
+            ("folders_assign", false, false),
+            ("editor_open", false, false),
+            ("sessions_open", false, false),
+            ("sessions_fork", false, false),
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(name))
+                .unwrap();
+            assert_eq!(entry["annotations"]["readOnlyHint"], json!(read_only));
+            assert_eq!(entry["annotations"]["destructiveHint"], json!(destructive));
+        }
+    }
+
+    #[test]
+    fn non_destructive_write_caps_are_real_non_read_mcp_caps() {
+        for cap in NON_DESTRUCTIVE_WRITE_CAPS {
+            assert!(MCP_STATE_CAPS.contains(cap), "{cap}");
+            assert_ne!(scope_of(lookup(cap).unwrap()), Scope::Read, "{cap}");
+        }
+    }
+
+    #[test]
+    fn unknown_capability_annotations_fail_closed() {
+        assert_eq!(
+            tool_annotations("nope.nope"),
+            json!({ "readOnlyHint": false, "destructiveHint": true })
+        );
     }
 }
