@@ -14103,9 +14103,11 @@ async fn event_loop<T: Terminal>(
                     lsp_config_epoch += 1;
                     let epoch = lsp_config_epoch;
                     let (enabled, servers) = (new_cfg.lsp.enabled, new_cfg.lsp.servers.clone());
+                    let require_containment = new_cfg.lsp.require_containment;
                     let lsp = lsp_supervisor.handle();
                     tokio::task::spawn_blocking(move || {
                         let released = lsp.reconfigure(epoch, enabled, &servers);
+                        lsp.set_require_containment(epoch, require_containment);
                         if released > 0 {
                             tracing::debug!(
                                 target: "thegn::lsp",
@@ -21327,20 +21329,29 @@ async fn event_loop<T: Terminal>(
                                     supervisor.toggle_strip();
                                     chrome = recompute_chrome!();
                                     need_relayout = true;
-                                } else if let Some(id) = key.strip_prefix("media-playlist:") {
-                                    // Activate the chosen playlist off-thread.
-                                    if current_config.media.enabled {
-                                        let cfg = media_effective_cfg(
-                                            &current_config.media,
-                                            &media_player_override,
-                                        );
-                                        crate::media_ctl::spawn_media_playlist(
-                                            cfg,
-                                            id.to_string(),
-                                            &media_generation,
-                                            media_tx.clone(),
-                                            waker.clone(),
-                                        );
+                                } else if let Some(rest) = key.strip_prefix("media-playlist:") {
+                                    match crate::media_ctl::parse_playlist_key(rest) {
+                                        Some(lease) => {
+                                            // Activate the chosen playlist off-thread.
+                                            if current_config.media.enabled {
+                                                let cfg = media_effective_cfg(
+                                                    &current_config.media,
+                                                    &media_player_override,
+                                                );
+                                                crate::media_ctl::spawn_media_playlist(
+                                                    cfg,
+                                                    lease,
+                                                    &media_generation,
+                                                    media_tx.clone(),
+                                                    waker.clone(),
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            model.status =
+                                                "Media: that playlist selection is not valid"
+                                                    .into();
+                                        }
                                     }
                                 } else if let Some(p) = key.strip_prefix("media-player:") {
                                     // Switch which player we control + restart the watcher.

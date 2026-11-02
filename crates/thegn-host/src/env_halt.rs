@@ -24,7 +24,8 @@ use crate::agent::{SandboxHalt, force_host_requested, native_exec_healthy};
 /// is `auto` (or the worktree was pinned to the host), or when there's no cheap
 /// evidence of failure yet — in which case a later bring-up failure is caught in
 /// `prepare_sandbox_env` / the native relay, which flip the health flag so the
-/// next spawn halts here.
+/// next spawn halts here. An unreadable selection also halts when remote placement
+/// is configured, rather than resolving to the default environment.
 pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
     use thegn_core::config::ProviderExecMode;
     let loc = GitLoc::for_worktree(Path::new(worktree));
@@ -80,9 +81,29 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
             dormant: None,
         });
     }
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let selected_env = match Db::open()
+        .and_then(|db| db.effective_env_checked(worktree, &repo_root.to_string_lossy()))
+    {
+        Ok(selection) => selection,
+        Err(error) => {
+            if let Some(halt) = unreadable_selection_halt(cfg, &error) {
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    worktree,
+                    error = %format!("{error:#}"),
+                    "HALT: environment selection unreadable"
+                );
+                return Some(halt);
+            }
+            tracing::debug!(
+                target: "thegn::sandbox",
+                worktree,
+                error = %format!("{error:#}"),
+                "environment selection unreadable; continuing with local resolution"
+            );
+            None
+        }
+    };
     let environment = cfg.resolve_env(
         &repo_root,
         &loc,
@@ -178,6 +199,21 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
     None
 }
 
+/// An unreadable environment selection where a remote placement could apply: halt instead of resolving the default
+/// environment (THE-419). `None` when no remote placement is configured: the worktree can only be local, and a plain
+/// local shell is never refused (THE-1474).
+fn unreadable_selection_halt(cfg: &Config, error: &anyhow::Error) -> Option<SandboxHalt> {
+    crate::agent::remote_placement_configured(cfg).then(|| SandboxHalt {
+        env_name: "unknown".into(),
+        placement: "unknown".into(),
+        reason: format!(
+            "the environment selection could not be read ({error:#}); the default environment is never used instead"
+        ),
+        ask: false,
+        dormant: None,
+    })
+}
+
 fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
     if channel_clamped {
         format!(
@@ -190,7 +226,48 @@ fn unresolved_env_reason(name: &str, channel_clamped: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unresolved_env_reason;
+    use super::{unreadable_selection_halt, unresolved_env_reason};
+    use thegn_core::config::{Config, EnvConfig, PlacementMode};
+
+    #[test]
+    fn unreadable_selection_halts_only_where_a_remote_placement_is_configured() {
+        let error = anyhow::anyhow!("database is locked");
+        assert!(unreadable_selection_halt(&Config::default(), &error).is_none());
+
+        let cfg = Config {
+            env: [(
+                "remote".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Config::default()
+        };
+        assert!(unreadable_selection_halt(&cfg, &error).is_some());
+    }
+
+    #[test]
+    fn unreadable_selection_halt_names_the_read_error() {
+        let cfg = Config {
+            env: [(
+                "remote".into(),
+                EnvConfig {
+                    placement: PlacementMode::Provider,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Config::default()
+        };
+        let halt = unreadable_selection_halt(&cfg, &anyhow::anyhow!("database is locked"))
+            .expect("remote placement halts on an unreadable selection");
+
+        assert!(halt.reason.contains("database is locked"));
+        assert!(halt.reason.contains("never used instead"));
+        assert!(!halt.ask);
+    }
 
     #[test]
     fn unresolved_reason_names_the_stable_channel_when_clamped() {

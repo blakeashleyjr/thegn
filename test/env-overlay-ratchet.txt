@@ -190,6 +190,7 @@ limits.test_nice
 limits.test_timeout_secs
 lsp.enabled
 lsp.hover
+lsp.require_containment
 mcp_proxy.cooldown_secs
 mcp_proxy.enabled
 mcp_proxy.failure_threshold

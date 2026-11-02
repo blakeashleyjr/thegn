@@ -19,6 +19,7 @@ name: ci
 # check-cross check-features check-msrv test doc-check openspec-validate
 # coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build — and
 # `just ci-local` adds e2e. Stages NOT in the routine gate:
+#  - security-e2e (GitHub-hosted only; required mode fails on missing prerequisites).
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
 #    the Tier-1 dns/db tests (no container runtime needed) DO run here.
 #  - macos: the aarch64-darwin build + unit tests. Opt-in per run (`extras:
@@ -256,6 +257,26 @@ jobs:
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
+  security-e2e:
+    # Required mode makes missing bubblewrap or user-namespace support fail the job.
+    # THE-558 / THE-153 require native-security tests to avoid persistent privileged runners.
+    runs-on: ubuntu-latest # GitHub-hosted only; never use the self-hosted CI_RUNS_ON toggle.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install bubblewrap and enable unprivileged user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just security-e2e
   nix-build:
     runs-on: ${{ fromJSON((github.event_name == 'workflow_dispatch' && github.repository == 'blakeashleyjr/thegn' && vars.CI_RUNS_ON) || '["ubuntu-latest"]') }} # yamllint disable-line rule:line-length
     # Routinely builds `.#thegn-nobridge` (the shipped stable binary). The full

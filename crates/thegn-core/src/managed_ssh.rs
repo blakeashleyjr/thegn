@@ -5,12 +5,31 @@
 //! public-key body never enter the ledger. Provider destroy removes the record
 //! only after remote deletion succeeds, so a failed teardown remains visible to
 //! rotation/audit rather than silently losing revocation state.
+//! Provisioning never replaces a row with pending rotation recovery.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+#[derive(Debug)]
+pub struct RotationRecoveryPending {
+    pub provider: String,
+    pub instance: String,
+}
+
+impl std::fmt::Display for RotationRecoveryPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "managed SSH custody for {}/{} has an unfinished key rotation; run `thegn secret ssh rotate` to finish it before provisioning again (nothing was changed)",
+            self.provider, self.instance
+        )
+    }
+}
+
+impl std::error::Error for RotationRecoveryPending {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizedKeyRecord {
@@ -262,6 +281,36 @@ pub fn record_authorized_with_proxy_worktree(
     Ok(())
 }
 
+pub fn record_rotation_completed(
+    provider: &str,
+    account: &str,
+    instance: &str,
+    key_path: &Path,
+    public_key: &str,
+    proxy_worktree: Option<&str>,
+) -> Result<()> {
+    let fingerprint = record_rotation_completed_at(
+        &dir(),
+        provider,
+        account,
+        instance,
+        key_path,
+        public_key,
+        proxy_worktree,
+    )?;
+    tracing::info!(
+        target: "thegn::secret::audit",
+        consumer = "managed-ssh:rotate",
+        provider,
+        account,
+        instance,
+        key_fingerprint = %fingerprint,
+        outcome = "rotated",
+        "managed SSH key rotation recorded",
+    );
+    Ok(())
+}
+
 fn record_authorized_with_proxy_worktree_at(
     dir: &Path,
     provider: &str,
@@ -271,19 +320,66 @@ fn record_authorized_with_proxy_worktree_at(
     public_key: &str,
     proxy_worktree: Option<&str>,
 ) -> Result<String> {
-    let fingerprint = try_key_fingerprint(public_key)?;
-    let record = AuthorizedKeyRecord {
+    let record = authorized_record(
+        provider,
+        account,
+        instance,
+        key_path,
+        public_key,
+        proxy_worktree,
+    )?;
+    if let Some(existing) = read_at(dir, provider, account, instance)?
+        && existing.rotation_recovery.is_some()
+    {
+        return Err(RotationRecoveryPending {
+            provider: provider.to_string(),
+            instance: instance.to_string(),
+        }
+        .into());
+    }
+    record_authorized_at(dir, &record)?;
+    Ok(record.key_fingerprint)
+}
+
+pub fn record_rotation_completed_at(
+    dir: &Path,
+    provider: &str,
+    account: &str,
+    instance: &str,
+    key_path: &Path,
+    public_key: &str,
+    proxy_worktree: Option<&str>,
+) -> Result<String> {
+    let record = authorized_record(
+        provider,
+        account,
+        instance,
+        key_path,
+        public_key,
+        proxy_worktree,
+    )?;
+    record_authorized_at(dir, &record)?;
+    Ok(record.key_fingerprint)
+}
+
+fn authorized_record(
+    provider: &str,
+    account: &str,
+    instance: &str,
+    key_path: &Path,
+    public_key: &str,
+    proxy_worktree: Option<&str>,
+) -> Result<AuthorizedKeyRecord> {
+    Ok(AuthorizedKeyRecord {
         provider: provider.to_string(),
         account: account.to_string(),
         instance: instance.to_string(),
         key_path: key_path.to_path_buf(),
-        key_fingerprint: fingerprint,
+        key_fingerprint: try_key_fingerprint(public_key)?,
         authorized_at: crate::util::now(),
         proxy_worktree: proxy_worktree.map(str::to_string),
         rotation_recovery: None,
-    };
-    record_authorized_at(dir, &record)?;
-    Ok(record.key_fingerprint)
+    })
 }
 
 pub fn record_authorized_at(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
@@ -573,6 +669,193 @@ mod tests {
 
         assert_eq!(fingerprint, expected);
         assert_eq!(published.key_fingerprint, fingerprint);
+    }
+
+    fn recovering_record(key_fingerprint: &str) -> AuthorizedKeyRecord {
+        AuthorizedKeyRecord {
+            provider: "fly".into(),
+            account: "account".into(),
+            instance: "instance".into(),
+            key_path: PathBuf::from("/state/old-key"),
+            key_fingerprint: key_fingerprint.into(),
+            authorized_at: 1,
+            proxy_worktree: None,
+            rotation_recovery: Some(RotationRecovery {
+                key_path: PathBuf::from("/state/next-key"),
+                key_fingerprint: "SHA256:7wNHZPUVQSnbsSe5yU7EEx0GGDS9qo9UK41TH7Cam/g".into(),
+                backup_key_path: Some(PathBuf::from("/state/backup-key")),
+                authorized: true,
+                verified: false,
+                retiring_started: false,
+                retiring_completed: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn provision_publish_refuses_a_row_with_pending_rotation_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let old_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
+        let old_fingerprint = try_key_fingerprint(old_key).unwrap();
+        let original = recovering_record(&old_fingerprint);
+        record_authorized_at(temp.path(), &original).unwrap();
+        let record_file = record_path(
+            temp.path(),
+            &original.provider,
+            &original.account,
+            &original.instance,
+        );
+        let original_bytes = std::fs::read(&record_file).unwrap();
+
+        let result = record_authorized_with_proxy_worktree_at(
+            temp.path(),
+            &original.provider,
+            &original.account,
+            &original.instance,
+            Path::new("/state/new-key"),
+            key,
+            None,
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<RotationRecoveryPending>().is_some());
+        assert!(format!("{error:#}").contains("fly/instance"));
+        assert!(format!("{error:#}").contains("thegn secret ssh rotate"));
+        assert_eq!(std::fs::read(&record_file).unwrap(), original_bytes);
+        assert_eq!(
+            read_at(
+                temp.path(),
+                &original.provider,
+                &original.account,
+                &original.instance,
+            )
+            .unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn rotation_completion_publish_replaces_a_recovering_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
+        let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let original = recovering_record(try_key_fingerprint(old_key).unwrap().as_str());
+        record_authorized_at(temp.path(), &original).unwrap();
+
+        let fingerprint = record_rotation_completed_at(
+            temp.path(),
+            &original.provider,
+            &original.account,
+            &original.instance,
+            Path::new("/state/new-key"),
+            new_key,
+            None,
+        )
+        .unwrap();
+        let published = read_at(
+            temp.path(),
+            &original.provider,
+            &original.account,
+            &original.instance,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            fingerprint,
+            "SHA256:7wNHZPUVQSnbsSe5yU7EEx0GGDS9qo9UK41TH7Cam/g"
+        );
+        assert_eq!(published.key_fingerprint, fingerprint);
+        assert_eq!(published.key_path, PathBuf::from("/state/new-key"));
+        assert_eq!(published.rotation_recovery, None);
+    }
+
+    #[test]
+    fn global_rotation_completion_retires_only_the_matching_recovery_record() {
+        let _state = crate::testenv::IsolatedState::new();
+        let old_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
+        let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let old_fingerprint = try_key_fingerprint(old_key).unwrap();
+        let original = recovering_record(&old_fingerprint);
+        record_authorized_at(&dir(), &original).unwrap();
+
+        let unrelated = AuthorizedKeyRecord {
+            instance: "another-instance".into(),
+            ..original.clone()
+        };
+        record_authorized_at(&dir(), &unrelated).unwrap();
+
+        record_rotation_completed(
+            &original.provider,
+            &original.account,
+            &original.instance,
+            Path::new("/state/completed-key"),
+            new_key,
+            None,
+        )
+        .unwrap();
+
+        let completed = read(&original.provider, &original.account, &original.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed.key_fingerprint,
+            try_key_fingerprint(new_key).unwrap()
+        );
+        assert_eq!(completed.key_path, PathBuf::from("/state/completed-key"));
+        assert_eq!(completed.rotation_recovery, None);
+        assert_eq!(
+            read(&unrelated.provider, &unrelated.account, &unrelated.instance).unwrap(),
+            Some(unrelated),
+            "rotation completion must preserve recovery for a different instance tuple"
+        );
+    }
+
+    #[test]
+    fn provision_publish_replaces_a_row_without_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
+        let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let original = AuthorizedKeyRecord {
+            provider: "fly".into(),
+            account: "account".into(),
+            instance: "instance".into(),
+            key_path: PathBuf::from("/state/old-key"),
+            key_fingerprint: try_key_fingerprint(old_key).unwrap(),
+            authorized_at: 1,
+            proxy_worktree: None,
+            rotation_recovery: None,
+        };
+        record_authorized_at(temp.path(), &original).unwrap();
+
+        let fingerprint = record_authorized_with_proxy_worktree_at(
+            temp.path(),
+            &original.provider,
+            &original.account,
+            &original.instance,
+            Path::new("/state/new-key"),
+            new_key,
+            None,
+        )
+        .unwrap();
+        let published = read_at(
+            temp.path(),
+            &original.provider,
+            &original.account,
+            &original.instance,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(published.key_fingerprint, original.key_fingerprint);
+        assert_eq!(published.key_fingerprint, fingerprint);
+        assert_eq!(published.key_path, PathBuf::from("/state/new-key"));
+        assert_eq!(published.rotation_recovery, None);
     }
 
     #[test]

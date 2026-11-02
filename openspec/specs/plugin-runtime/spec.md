@@ -54,8 +54,8 @@ Runtime registration SHALL match a contribution's negotiated ID, extension
 point, declaration, and granted surface capability. Unmatched or changed
 registrations SHALL fail without changing host contribution or surface state.
 An identical repeated registration SHALL succeed idempotently without another
-audit entry or state change. The currently unimplemented `io` verb SHALL return
-the typed `unsupported` RPC error after its capability decision is audited.
+audit entry or state change. The reserved `io` verb SHALL be refused with the
+typed `unsupported` RPC error before dispatch.
 
 #### Scenario: A statusbar segment renders
 

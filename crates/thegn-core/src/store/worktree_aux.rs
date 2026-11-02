@@ -33,13 +33,15 @@ pub enum MergeRetryOutcome {
 /// Rows kept per worktree in `merge_queue_events`; older rows are pruned in the writing transaction.
 pub const MERGE_QUEUE_EVENTS_PER_WORKTREE: usize = 200;
 
-/// One operator or lifecycle transition on a merge-queue row. `operation` is "retry" or
-/// "remove" (`thegn merge clear` removes row by row and is recorded as "remove"); `outcome`
-/// is "rearmed", "not_retryable", "claimed" or "deleted"; `new_status` is "queued" for a
-/// re-arm and None otherwise; `row_updated_at` is the row's `updated_at` before the
-/// transition (its version). Operator removals use the process actor (`thegn pid N`);
-/// automatic cleanup uses a distinct actor such as `thegn close` (or `thegn sweep`), so
-/// lifecycle work is distinguishable from `merge rm` / `clear`.
+/// One operator, drain, or lifecycle transition on a merge-queue row. `operation` is "retry",
+/// "remove" (`thegn merge clear` removes row by row and is recorded as "remove"), or "drive"
+/// (a status transition written by the merge-queue drain under its claim). Drive events have
+/// outcome "transition", `new_status` is the status written, and `result_oid` is the result OID
+/// written by that transition. Retry outcomes include "rearmed", "not_retryable" and "claimed";
+/// remove outcomes include "deleted". `row_updated_at` is the row's `updated_at` before the
+/// transition (its version). Operator actions and drive transitions use the process actor
+/// (`thegn pid N`); automatic cleanup uses a distinct actor such as `thegn close` (or
+/// `thegn sweep`), so lifecycle work is distinguishable from `merge rm` / `clear`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeQueueEvent {
     pub worktree: String,

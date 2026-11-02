@@ -1311,7 +1311,7 @@ wait "$FRP_PID" 2>/dev/null || true
 
 # iroh: scrape the dumbpipe ticket into a copyable connect command.
 printf '[share]\nprovider = "iroh"\n' >"$TMP/share-iroh.toml"
-PATH="$SHBIN:$PATH" "$SZ" --config "$TMP/share-iroh.toml" share start 3000 --worktree "$WT" \
+PATH="$SHBIN:$PATH" "$SZ" --config "$TMP/share-iroh.toml" share start 3001 --worktree "$WT" \
   >"$TMP/iroh.out" 2>&1 &
 IROH_PID=$!
 for _ in $(seq 1 60); do
@@ -1348,7 +1348,7 @@ peer   = "iroh"
 server_addr = "frps.example.com"
 subdomain_host = "share.example.com"
 EOF
-PATH="$SHBIN:$PATH" "$SZ" --config "$TMP/share-reach.toml" share start 3000 --reach peer \
+PATH="$SHBIN:$PATH" "$SZ" --config "$TMP/share-reach.toml" share start 3002 --reach peer \
   --worktree "$WT" >"$TMP/reach.out" 2>&1 &
 REACH_PID=$!
 for _ in $(seq 1 60); do
