@@ -29,6 +29,30 @@ def variable_runner_expressions() -> list[str]:
 
 
 class CiRunnerPolicyTests(unittest.TestCase):
+    def test_security_e2e_job_runs_required_on_github_hosted_runners(self) -> None:
+        job = read_workflow()["jobs"]["security-e2e"]
+        self.assertEqual("ubuntu-latest", job["runs-on"])
+        self.assertEqual({"contents": "read"}, job["permissions"])
+        steps = job["steps"]
+        self.assertTrue(
+            any("just security-e2e" in step.get("run", "") for step in steps),
+            "security-e2e must run just security-e2e in required mode",
+        )
+        self.assertTrue(
+            any("bubblewrap" in step.get("run", "") for step in steps),
+            "security-e2e must provision bubblewrap",
+        )
+        self.assertFalse(
+            any("|| true" in step.get("run", "") for step in steps),
+            "security-e2e provisioning must fail closed",
+        )
+
+    def test_security_e2e_job_never_uses_the_self_hosted_toggle(self) -> None:
+        runner = read_workflow()["jobs"]["security-e2e"]["runs-on"]
+        for forbidden in ("CI_RUNS_ON", "self-hosted", "ageless"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, runner)
+
     def test_every_variable_runner_uses_the_trusted_event_gate(self) -> None:
         variable_runners = variable_runner_expressions()
         self.assertEqual(
