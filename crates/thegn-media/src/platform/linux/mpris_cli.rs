@@ -10,7 +10,7 @@ use tokio::process::Command;
 
 use crate::helper::{self, Limits};
 use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist};
-use crate::{MediaBackend, MediaCaps, MediaError};
+use crate::{MediaBackend, MediaCaps, MediaError, MediaSnapshot};
 
 /// Field separator for the `metadata --format` template. `markup_escape` turns
 /// C0 control bytes other than TAB/LF/CR into character references, so metadata
@@ -100,6 +100,15 @@ impl MediaBackend for MprisCli {
         })
     }
 
+    fn snapshot_with_caps(&self) -> BoxFuture<'_, Result<Option<MediaSnapshot>, MediaError>> {
+        Box::pin(async move {
+            Ok(self.snapshot().await?.map(|state| MediaSnapshot {
+                caps: snapshot_caps(&state),
+                state,
+            }))
+        })
+    }
+
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async move { self.run(&["play-pause"]).await.map(|_| ()) })
     }
@@ -177,6 +186,7 @@ impl MediaBackend for MprisCli {
     }
 
     fn caps(&self) -> MediaCaps {
+        // Pre-snapshot upper bound; each snapshot narrows this to reported fields.
         MediaCaps {
             shuffle: true,
             loop_mode: true,
@@ -190,6 +200,25 @@ impl MediaBackend for MprisCli {
             chapters: false,
             fullscreen: false,
         }
+    }
+}
+
+/// playerctl exposes no MPRIS `Can*` properties, so offer controls only when
+/// the player reported the property they change.
+fn snapshot_caps(state: &MediaState) -> MediaCaps {
+    let volume = state.volume.is_some();
+    MediaCaps {
+        shuffle: state.shuffle.is_some(),
+        loop_mode: state.loop_mode.is_some(),
+        volume,
+        playlists: false,
+        signals: false,
+        seek: state.can_seek,
+        art: true,
+        queue: false,
+        abs_volume: volume,
+        chapters: false,
+        fullscreen: false,
     }
 }
 
@@ -258,7 +287,9 @@ fn parse_line(line: &str) -> Result<MediaState, MediaError> {
         can_go_previous: true,
         art_url: (!art.is_empty()).then(|| art.to_string()),
         kind: MediaKind::from_hints(&player, None, (!url.is_empty()).then_some(url)),
-        can_seek: true, // playerctl can always position-seek
+        // Only tracks with a reported length offer seeking; streams and tracks
+        // with unknown length do not.
+        can_seek: length.is_some(),
         track_id: (!trackid.is_empty()).then(|| trackid.to_string()),
         player,
     })
@@ -349,6 +380,76 @@ mod tests {
         assert_eq!(s.shuffle, Some(true));
         assert_eq!(s.loop_mode, Some(LoopMode::Playlist));
         assert_eq!(s.volume, Some(80));
+    }
+
+    #[test]
+    fn snapshot_caps_follow_the_fields_the_player_reported() {
+        let line = "spotify\u{1f}Playing\u{1f}Get Lucky\u{1f}Daft Punk\u{1f}Random Access Memories\u{1f}248000000\u{1f}1000000\u{1f}true\u{1f}Playlist\u{1f}0.80\u{1f}art\u{1f}url\u{1f}track-id";
+        let state = parse_line(line).unwrap();
+        let caps = snapshot_caps(&state);
+        assert!(caps.shuffle);
+        assert!(caps.loop_mode);
+        assert!(caps.volume);
+        assert!(caps.abs_volume);
+        assert!(caps.seek);
+        assert!(caps.art);
+        assert!(!caps.playlists);
+        assert!(!caps.queue);
+        assert!(!caps.chapters);
+        assert!(!caps.fullscreen);
+        assert!(!caps.signals);
+    }
+
+    #[test]
+    fn unreported_fields_disable_their_controls() {
+        let line = escaped_record([
+            "mpv",
+            "Paused",
+            "Some Song",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]);
+        let state = parse_line(&line).unwrap();
+        assert!(!state.can_seek);
+        let caps = snapshot_caps(&state);
+        assert!(!caps.shuffle);
+        assert!(!caps.loop_mode);
+        assert!(!caps.volume);
+        assert!(!caps.abs_volume);
+        assert!(!caps.seek);
+    }
+
+    #[test]
+    fn a_track_without_length_is_not_seekable() {
+        let mut fields = [
+            "spotify",
+            "Playing",
+            "Get Lucky",
+            "Daft Punk",
+            "Random Access Memories",
+            "",
+            "1000000",
+            "true",
+            "Playlist",
+            "0.80",
+            "art",
+            "url",
+            "track-id",
+        ];
+        let without_length = escaped_record(fields);
+        assert!(!parse_line(&without_length).unwrap().can_seek);
+
+        fields[5] = "248000000";
+        let with_length = escaped_record(fields);
+        assert!(parse_line(&with_length).unwrap().can_seek);
     }
 
     fn escaped_record(fields: [&str; FIELDS]) -> String {
