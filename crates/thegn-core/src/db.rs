@@ -220,7 +220,8 @@ mod db_open_memo;
 /// v94: merge_queue.enqueue_common_dir + enqueue_admin_dir, repository and worktree identity captured at enqueue (THE-230).
 /// v95: durable usage-alert claims and legacy inbox compaction (THE-1386).
 /// v96: merge_queue_events, the audit trail of operator retry/remove/clear transitions (THE-229).
-pub const SCHEMA_VERSION: i64 = 96;
+/// v97: merge_queue_events.target_base_oid, the target base a drain landing replaced (THE-395).
+pub const SCHEMA_VERSION: i64 = 97;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1715,6 +1716,7 @@ impl Db {
                     crate::db_migrate::verify_v94_schema(&conn)?;
                     crate::db_migrate::verify_v95_schema(&conn)?;
                     crate::db_migrate::verify_v96_schema(&conn)?;
+                    crate::db_migrate::verify_v97_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2395,6 +2397,7 @@ impl Db {
         crate::db_migrate::migrate_v94(&conn)?;
         crate::db_migrate::migrate_v95(&conn, ver < 95)?;
         crate::db_migrate::migrate_v96(&conn)?;
+        crate::db_migrate::migrate_v97(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2429,6 +2432,7 @@ impl Db {
             crate::db_migrate::verify_v94_schema(&conn)?;
             crate::db_migrate::verify_v95_schema(&conn)?;
             crate::db_migrate::verify_v96_schema(&conn)?;
+            crate::db_migrate::verify_v97_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

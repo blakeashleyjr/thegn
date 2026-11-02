@@ -266,6 +266,56 @@ fn drain_transitions_are_recorded_in_the_audit_trail() {
 }
 
 #[test]
+fn landed_drain_records_the_target_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_at(&db_path).unwrap();
+    let worktree = root.join("worktree").to_string_lossy().into_owned();
+    let item = registered_row(&db, &root, &worktree, "feature");
+    let commit = "1234567890123456789012345678901234567890";
+    let target_base_oid = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let config = MergeQueueConfig {
+        on_landed: thegn_core::config::OnLanded::Off,
+        ..registered_config()
+    };
+
+    drive_queue_with(
+        &config,
+        &Config::default(),
+        &root,
+        &db,
+        vec![item.clone()],
+        |_| {},
+        ready_actions(
+            move |_, _, _| {
+                Ok(AttemptOutcome::Landed {
+                    commit: commit.into(),
+                    old_oid: target_base_oid.into(),
+                    resyncs: Vec::new(),
+                })
+            },
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
+    );
+
+    let events = db.merge_queue_events(&item.worktree, 20).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].old_status, "folding");
+    assert_eq!(events[0].new_status.as_deref(), Some("landed"));
+    assert_eq!(events[0].result_oid.as_deref(), Some(commit));
+    assert_eq!(events[0].target_base_oid.as_deref(), Some(target_base_oid));
+    assert!(
+        events
+            .iter()
+            .skip(1)
+            .all(|event| event.target_base_oid.is_none())
+    );
+}
+
+#[test]
 fn budget_is_consumed_through_the_claim() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("queue.sqlite");
