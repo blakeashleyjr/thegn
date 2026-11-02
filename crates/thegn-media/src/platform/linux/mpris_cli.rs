@@ -402,8 +402,22 @@ mod tests {
 
     #[test]
     fn unreported_fields_disable_their_controls() {
-        let line = "mpv\u{1f}Paused\u{1f}Some Song\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}";
-        let state = parse_line(line).unwrap();
+        let line = escaped_record([
+            "mpv",
+            "Paused",
+            "Some Song",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]);
+        let state = parse_line(&line).unwrap();
         assert!(!state.can_seek);
         let caps = snapshot_caps(&state);
         assert!(!caps.shuffle);
@@ -415,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_track_without_length_is_not_seekable() {
-        let fields = [
+        let mut fields = [
             "spotify",
             "Playing",
             "Get Lucky",
@@ -433,21 +447,8 @@ mod tests {
         let without_length = escaped_record(fields);
         assert!(!parse_line(&without_length).unwrap().can_seek);
 
-        let with_length = escaped_record([
-            "spotify",
-            "Playing",
-            "Get Lucky",
-            "Daft Punk",
-            "Random Access Memories",
-            "248000000",
-            "1000000",
-            "true",
-            "Playlist",
-            "0.80",
-            "art",
-            "url",
-            "track-id",
-        ]);
+        fields[5] = "248000000";
+        let with_length = escaped_record(fields);
         assert!(parse_line(&with_length).unwrap().can_seek);
     }
 
