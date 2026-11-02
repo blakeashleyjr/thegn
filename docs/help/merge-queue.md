@@ -276,6 +276,9 @@ target:
   the queue. The host re-reads the registered repo, branch, and remote location
   and uses that location to ingest the tip; it never treats the remote absolute
   path as a host-local path.
+  Each drain removes up to 64 leftover ingest refs under `refs/thegn/mq/` that
+  no queued entry uses. If the queue or ref list cannot be read, it removes
+  none.
 - **`push`** folds and gates in the provider clone, advances its local target,
   and pushes that target to `origin`. It needs no inbound host control endpoint,
   but origin—not the host queue—is the convergence authority.

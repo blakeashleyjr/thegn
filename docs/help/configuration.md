@@ -115,6 +115,8 @@ The file is watched: edits apply live, no restart.
   applied. Set `[lsp] require_containment = true` to refuse such a server
   instead (the request reports why; the next start after a config reload uses
   the new setting).
+  `thegn doctor` shows whether containment is required or best-effort; JSON
+  includes `require_containment`.
 - `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
   persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
   and reuses the existing trusted PR-queue agent policy.
