@@ -32,6 +32,8 @@ use crate::http::{
 };
 use thegn_core::calendar::AdmissionMeter;
 
+const MISSING_DELTA_SYNC_TOKEN: &str = "CalDAV sync-collection response has no sync-token";
+
 #[path = "caldav_xml.rs"]
 mod xml;
 
@@ -235,6 +237,7 @@ fn page_from_multistatus(
     let mut events = Vec::new();
     let mut deleted = Vec::new();
     let mut event_hrefs = Vec::new();
+    let mut event_etags = Vec::new();
     let mut deleted_hrefs = Vec::new();
     let mut diagnostics = PageDiagnostics::default();
     let mut saw_series_tombstone = false;
@@ -270,6 +273,7 @@ fn page_from_multistatus(
             0
         };
         meter.reserve_transient(copy)?;
+        let etag = r.etag.clone();
         let ics = match xml::decode_text(r.ics_raw) {
             Ok(ics) => ics,
             Err(error) => {
@@ -289,10 +293,17 @@ fn page_from_multistatus(
             &mut report,
         );
         let href = r.href.clone();
-        event_hrefs.extend(std::iter::repeat_n(r.href, events.len() - before));
+        let event_count = events.len() - before;
+        event_hrefs.extend(std::iter::repeat_n(r.href, event_count));
         drop(ics);
         meter.release_transient(copy);
         parsed.map_err(CalendarError::from)?;
+        if let Some(etag) = etag.as_ref() {
+            for _ in 0..event_count {
+                meter.charge_retained(etag.len())?;
+            }
+        }
+        event_etags.extend(std::iter::repeat_n(etag, event_count));
         if report.is_document_failure() {
             return Err(CalendarError::Parse(
                 "calendar resource is incomplete or structurally malformed".into(),
@@ -311,6 +322,9 @@ fn page_from_multistatus(
         }
         Ok(())
     })?;
+    if mode == PageMode::Delta && token.is_empty() {
+        return Err(CalendarError::Parse(MISSING_DELTA_SYNC_TOKEN.into()));
+    }
     let token = scope_token(calendar_ids, zone, &token);
     let mode = if mode == PageMode::Snapshot {
         super::ics::snapshot_mode(events.is_empty(), saw_series_tombstone)
@@ -326,6 +340,7 @@ fn page_from_multistatus(
         deleted_hrefs,
         token,
     )
+    .and_then(|page| page.with_event_etags(event_etags))
     .map(|page| page.with_diagnostics(diagnostics))
 }
 
@@ -564,6 +579,18 @@ impl CalDavBackend {
                     tracing::debug!(
                         target: "thegn::calendar",
                         "caldav delta exceeds the admission budget — falling back to a full fetch"
+                    );
+                    let mut meter = self.admission.meter();
+                    meter.reserve_transient(MAX_BODY_BYTES)?;
+                    self.fetch_full(window, deadline, meter).await
+                }
+                Err(CalendarError::Parse(message))
+                    if incremental && message == MISSING_DELTA_SYNC_TOKEN =>
+                {
+                    drop(text);
+                    tracing::debug!(
+                        target: "thegn::calendar",
+                        "caldav delta carried no sync-token — falling back to a full fetch"
                     );
                     let mut meter = self.admission.meter();
                     meter.reserve_transient(MAX_BODY_BYTES)?;
@@ -845,11 +872,37 @@ END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:
     }
 
     #[test]
+    fn a_delta_without_a_sync_token_is_refused() {
+        let xml = "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/e.ics</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:e\nDTSTART:20300101T100000Z\nEND:VEVENT\nEND:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+        assert!(matches!(
+            page_from_multistatus(xml, "UTC", &[], PageMode::Delta, test_meter()),
+            Err(CalendarError::Parse(message)) if message == MISSING_DELTA_SYNC_TOKEN
+        ));
+        assert!(page_from_multistatus(xml, "UTC", &[], PageMode::Snapshot, test_meter()).is_ok());
+    }
+
+    #[test]
+    fn page_carries_each_resources_etag_for_every_component() {
+        let xml = "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/random-server-key.ics</d:href><d:propstat><d:prop><d:getetag>&quot;e1&quot;</d:getetag><c:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:meeting-a@example\nDTSTART:20300101T100000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:meeting-b@example\nDTSTART:20300102T100000Z\nEND:VEVENT\nEND:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:sync-token>t</d:sync-token></d:multistatus>";
+        let page =
+            page_from_multistatus(xml, "UTC", &[], PageMode::Snapshot, test_meter()).unwrap();
+        assert_eq!(
+            page.event_etags(),
+            [Some("\"e1\"".to_string()), Some("\"e1\"".to_string())]
+        );
+        assert!(matches!(
+            page.with_event_etags(vec![Some("\"e1\"".to_string())]),
+            Err(CalendarError::Parse(message))
+                if message == "resource etags do not match page rows"
+        ));
+    }
+
+    #[test]
     fn cancel_only_resource_in_a_delta_deletes_its_href() {
         let data =
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSTATUS:CANCELLED\nEND:VEVENT\nEND:VCALENDAR";
         let xml = format!(
-            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}<d:sync-token>t</d:sync-token></d:multistatus>",
             resource("/cal/x.ics", data)
         );
         let page = page_from_multistatus(&xml, "UTC", &[], PageMode::Delta, test_meter()).unwrap();
@@ -909,7 +962,7 @@ END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:
     fn cancel_resource_with_surviving_events_is_not_deleted() {
         let data = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSEQUENCE:3\nDTSTART:20300101T100000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:x\nSTATUS:CANCELLED\nSEQUENCE:2\nEND:VEVENT\nEND:VCALENDAR";
         let xml = format!(
-            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>",
+            "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}<d:sync-token>t</d:sync-token></d:multistatus>",
             resource("/cal/x.ics", data)
         );
         let page = page_from_multistatus(&xml, "UTC", &[], PageMode::Delta, test_meter()).unwrap();
