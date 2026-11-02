@@ -10,6 +10,30 @@ pub(crate) struct InstallKey {
     pub(crate) public: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstallKeyStatus {
+    Missing,
+    Present { name: String },
+    Invalid(String),
+}
+
+impl InstallKeyStatus {
+    pub(crate) fn state(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Present { .. } => "present",
+            Self::Invalid(_) => "invalid",
+        }
+    }
+
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::Present { name } => Some(name),
+            Self::Missing | Self::Invalid(_) => None,
+        }
+    }
+}
+
 pub(crate) fn ensure_install_key() -> anyhow::Result<InstallKey> {
     let config = thegn_core::config::Config::path();
     let dir = config
@@ -17,6 +41,59 @@ pub(crate) fn ensure_install_key() -> anyhow::Result<InstallKey> {
         .map(|parent| parent.join("nix-signing"))
         .context("config path has no parent for Nix signing key")?;
     load_or_create_in(&dir, generate_key, convert_secret_to_public)
+}
+
+pub(crate) fn install_key_status() -> InstallKeyStatus {
+    let config = thegn_core::config::Config::path();
+    let Some(parent) = config.parent() else {
+        return InstallKeyStatus::Invalid(
+            "config path has no parent for Nix signing key".to_string(),
+        );
+    };
+    install_key_status_in(&parent.join("nix-signing"))
+}
+
+fn install_key_status_in(dir: &Path) -> InstallKeyStatus {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return InstallKeyStatus::Missing;
+        }
+        Err(error) => {
+            return InstallKeyStatus::Invalid(format!("cannot inspect {}: {error}", dir.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return InstallKeyStatus::Invalid("signing directory is not a real directory".to_string());
+    }
+
+    let secret = dir.join("secret-key");
+    let public = dir.join("public-key");
+    match (
+        std::fs::symlink_metadata(&secret).is_ok(),
+        std::fs::symlink_metadata(&public).is_ok(),
+    ) {
+        (false, false) => InstallKeyStatus::Missing,
+        (true, true) => match load_pair(&secret, &public) {
+            Ok(key) => match install_key_name(&key) {
+                Some(name) => InstallKeyStatus::Present { name },
+                None => InstallKeyStatus::Invalid("public key has no thegn key name".to_string()),
+            },
+            Err(error) => InstallKeyStatus::Invalid(format!("{error:#}")),
+        },
+        (true, false) => match load_secret(&secret) {
+            Ok(line) => match key_name(&line) {
+                Some(name) => InstallKeyStatus::Present {
+                    name: name.to_string(),
+                },
+                None => InstallKeyStatus::Invalid("secret key has no thegn key name".to_string()),
+            },
+            Err(error) => InstallKeyStatus::Invalid(format!("{error:#}")),
+        },
+        (false, true) => InstallKeyStatus::Invalid(
+            "public key without its secret (an interrupted key generation; the next host-cache provision replaces it)".to_string(),
+        ),
+    }
 }
 
 fn load_or_create_in(
@@ -307,8 +384,8 @@ fn key_name_suffix(name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallKey, install_key_name, load_or_create_in, parse_public_key, sign_argv, trust_script,
-        trusted_key_conf_line,
+        InstallKey, InstallKeyStatus, install_key_name, install_key_status_in, load_or_create_in,
+        parse_public_key, sign_argv, trust_script, trusted_key_conf_line,
     };
     use std::path::Path;
 
@@ -337,6 +414,82 @@ mod tests {
             .unwrap();
         thegn_core::fsperm::write_owner_only_new(&dir.join("public-key"), PUBLIC.as_bytes())
             .unwrap();
+    }
+
+    #[test]
+    fn install_key_status_never_creates_the_signing_directory() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let dir = state.root().join("keys");
+        assert_eq!(install_key_status_in(&dir), InstallKeyStatus::Missing);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn install_key_status_names_an_existing_pair() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let dir = state.root().join("keys");
+        write_pair(&dir);
+        assert_eq!(
+            install_key_status_in(&dir),
+            InstallKeyStatus::Present {
+                name: "thegn-0123456789abcdef-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn install_key_status_names_a_secret_without_its_public_key_and_writes_nothing() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let dir = state.root().join("keys");
+        private_dir(&dir);
+        thegn_core::fsperm::write_owner_only_new(&dir.join("secret-key"), SECRET.as_bytes())
+            .unwrap();
+        assert_eq!(
+            install_key_status_in(&dir),
+            InstallKeyStatus::Present {
+                name: "thegn-0123456789abcdef-1".to_string()
+            }
+        );
+        assert!(!dir.join("public-key").exists());
+    }
+
+    #[test]
+    fn install_key_status_reports_broken_keys_as_invalid() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let dir = state.root().join("keys");
+        private_dir(&dir);
+        thegn_core::fsperm::write_owner_only_new(&dir.join("public-key"), PUBLIC.as_bytes())
+            .unwrap();
+        match install_key_status_in(&dir) {
+            InstallKeyStatus::Invalid(reason) => assert!(!reason.contains("cHVibGlj")),
+            status => panic!("expected invalid signing key, got {status:?}"),
+        }
+
+        std::fs::remove_file(dir.join("public-key")).unwrap();
+        write_pair(&dir);
+        let secret = dir.join("secret-key");
+        if cfg!(unix) {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "make the secret fixture group-readable"
+            )]
+            fn chmod_group_readable(path: &Path) {
+                let status = std::process::Command::new("chmod")
+                    .arg("0640")
+                    .arg(path)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            chmod_group_readable(&secret);
+            match install_key_status_in(&dir) {
+                InstallKeyStatus::Invalid(reason) => {
+                    assert!(reason.contains("group- or other-readable"));
+                    assert!(!reason.contains("c2VjcmV0"));
+                }
+                status => panic!("expected invalid signing key, got {status:?}"),
+            }
+        }
     }
 
     #[test]
