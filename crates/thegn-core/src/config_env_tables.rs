@@ -454,6 +454,13 @@ impl EnvProviderKind {
     pub fn lifetime_reaped(self) -> bool {
         matches!(self, Self::Fly) || self.is_vps()
     }
+
+    /// Whether this provider's lifecycle (provision, teardown, orphan reaping,
+    /// and warm pool) has not been verified against a live account. `thegn doctor`
+    /// displays this state by owner decision THE-142.
+    pub fn live_unverified(self) -> bool {
+        matches!(self, Self::Hetzner)
+    }
 }
 
 /// Whether `name` names a commodity-VPS provider kind. See
@@ -975,6 +982,33 @@ mod tests {
                 | EnvProviderKind::Sprites
                 | EnvProviderKind::Machine0 => {
                     assert!(!kind.lifetime_reaped(), "{kind:?} has no lifetime reaper");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_unverified_marks_only_hetzner() {
+        for kind in [
+            EnvProviderKind::Custom,
+            EnvProviderKind::Daytona,
+            EnvProviderKind::Sprites,
+            EnvProviderKind::Hetzner,
+            EnvProviderKind::DigitalOcean,
+            EnvProviderKind::Fly,
+            EnvProviderKind::Machine0,
+        ] {
+            match kind {
+                EnvProviderKind::Hetzner => {
+                    assert!(kind.live_unverified(), "{kind:?} is live-unverified");
+                }
+                EnvProviderKind::Custom
+                | EnvProviderKind::Daytona
+                | EnvProviderKind::Sprites
+                | EnvProviderKind::DigitalOcean
+                | EnvProviderKind::Fly
+                | EnvProviderKind::Machine0 => {
+                    assert!(!kind.live_unverified(), "{kind:?} is not live-unverified");
                 }
             }
         }
