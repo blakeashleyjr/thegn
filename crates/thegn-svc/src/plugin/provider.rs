@@ -9,9 +9,11 @@
 //! resolved through [`ProviderBridge::resolve`] (the host's drain routes
 //! `SessionEvent::Response` here), waking the waiting call. Every call
 //! carries the plugin's own timeout so a stuck plugin degrades to a seam
-//! error, never a hang.
+//! error, never a hang. Request ids use a checked increment, and calls never
+//! replace pending waiters; exhaustion or collision refuses the call.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -149,7 +151,14 @@ impl ProviderBridge {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, BridgeError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let Ok(id) = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        else {
+            return Err(BridgeError::Transport(
+                "provider request ids are exhausted".into(),
+            ));
+        };
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -162,7 +171,16 @@ impl ProviderBridge {
             if pending.calls.len() >= MAX_QUEUED_FRAMES {
                 return Err(BridgeError::Transport(SessionFailure::Full.to_string()));
             }
-            pending.calls.insert(id, tx);
+            match pending.calls.entry(id) {
+                Entry::Occupied(_) => {
+                    return Err(BridgeError::Transport(format!(
+                        "provider request id {id} is still pending"
+                    )));
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(tx);
+                }
+            }
         }
         let _pending_guard = PendingGuard { bridge: self, id };
         let msg = RpcMessage {
@@ -1039,5 +1057,65 @@ done
             receiver.blocking_recv().unwrap().unwrap().result,
             Some(serde_json::json!("current"))
         );
+    }
+
+    #[test]
+    fn colliding_request_id_never_replaces_a_pending_waiter() {
+        let bridge = ProviderBridge::new(
+            SessionWriter(super::super::session::admission::Shared::new()),
+            Duration::from_millis(200),
+        );
+        let (sender, mut receiver) = oneshot::channel();
+        bridge
+            .pending
+            .lock()
+            .unwrap()
+            .calls
+            .insert(1_000_000, sender);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = rt.block_on(bridge.call("issues", "get_issue", serde_json::Value::Null));
+
+        assert!(matches!(
+            result,
+            Err(BridgeError::Transport(message)) if message.contains("still pending")
+        ));
+        assert!(
+            bridge
+                .pending
+                .lock()
+                .unwrap()
+                .calls
+                .contains_key(&1_000_000)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn exhausted_request_ids_refuse_without_wrapping() {
+        let bridge = ProviderBridge::new(
+            SessionWriter(super::super::session::admission::Shared::new()),
+            Duration::from_millis(200),
+        );
+        bridge.next_id.store(u64::MAX, Ordering::Relaxed);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = rt.block_on(bridge.call("issues", "get_issue", serde_json::Value::Null));
+
+        assert!(matches!(
+            result,
+            Err(BridgeError::Transport(message)) if message.contains("exhausted")
+        ));
+        assert_eq!(bridge.next_id.load(Ordering::Relaxed), u64::MAX);
+        assert!(bridge.pending.lock().unwrap().calls.is_empty());
     }
 }
