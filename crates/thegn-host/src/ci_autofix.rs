@@ -475,6 +475,32 @@ fn consider_candidate_with_forge(
         }
     };
     tracing::debug!(target: "thegn::ci_autofix", pr = item.number, attempt = guard.attempt(), "CI autofix agent admitted under PR lease");
+    if let Err(moved) = admitted_head_still_checked_out(&loc, &entry.head_sha) {
+        match guard.finish_not_started(db, &moved) {
+            crate::pr_agent_lease::NotStartedRelease::Refunded => {
+                notify(format!(
+                    "CI autofix for PR #{} held: {}",
+                    item.number,
+                    crate::pr_agent_lease::not_started_detail(&moved, false)
+                ));
+            }
+            crate::pr_agent_lease::NotStartedRelease::RefundFailed(error) => {
+                let detail = crate::pr_agent_lease::not_started_detail(&moved, true);
+                tracing::warn!(target: "thegn::ci_autofix", pr = item.number, %error, "{detail}");
+                notify(format!(
+                    "CI autofix for PR #{} held: {detail} ({error})",
+                    item.number
+                ));
+            }
+            crate::pr_agent_lease::NotStartedRelease::LeaseLost => {
+                notify(format!(
+                    "CI autofix for PR #{} stopped: its PR-agent lease could not be confirmed; the next refresh re-evaluates the row",
+                    item.number
+                ));
+            }
+        }
+        return;
+    }
     let verdict = crate::agent_run::run_outcome_cancellable(
         &crate::agent_run::AgentTaskRun {
             kind: thegn_core::agent_task::TaskKind::PrCiFailure,
@@ -628,6 +654,21 @@ fn head_is_current(
         && !forge.id().is_empty()
 }
 
+/// Re-read the checkout's HEAD after the PR-agent lease is admitted and
+/// immediately before the agent spawns. Authorship, isolation and prompt
+/// gates run between the first head check and admission; a commit or
+/// checkout in that window must not run the fixer on an unattested HEAD.
+fn admitted_head_still_checked_out(
+    loc: &thegn_core::remote::GitLoc,
+    admitted: &str,
+) -> Result<(), String> {
+    match loc.git_out(&["rev-parse", "HEAD"]) {
+        Some(head) if head == admitted => Ok(()),
+        Some(_) => Err("the worktree HEAD moved after the agent was admitted".to_owned()),
+        None => Err("the worktree HEAD could not be read after the agent was admitted".to_owned()),
+    }
+}
+
 /// The PR-queue detail recorded when a CI autofix run ends. A not-started run is held earlier
 /// through `finish_not_started` and never reaches this function.
 fn autofix_finish_detail(verdict: &crate::agent_run::AgentRunVerdict) -> String {
@@ -688,6 +729,42 @@ mod tests {
     use super::*;
     use crate::pr_authorship::tests::Fixture;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn admitted_head_check_accepts_the_admitted_head_and_refuses_a_moved_or_unreadable_one() {
+        let fixture = Fixture::new();
+        let head = fixture.loc.git_out(&["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(admitted_head_still_checked_out(&fixture.loc, &head), Ok(()));
+        let moved = admitted_head_still_checked_out(&fixture.loc, &"0".repeat(40));
+        assert!(matches!(moved, Err(reason) if reason.contains("moved")));
+
+        let empty = tempfile::tempdir().unwrap();
+        let path = empty.path().to_str().unwrap();
+        let unreadable = thegn_core::remote::GitLoc::from_db(path, None);
+        let result = admitted_head_still_checked_out(&unreadable, &head);
+        assert!(matches!(result, Err(reason) if reason.contains("could not be read")));
+    }
+
+    #[test]
+    fn admitted_head_is_rechecked_after_admission_and_before_the_agent_spawns() {
+        let production = include_str!("ci_autofix.rs");
+        let production = production
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap();
+        let admission = production
+            .find("PrAgentGuard::admit(db, &request)")
+            .unwrap();
+        let recheck = production
+            .find("admitted_head_still_checked_out(&loc, &entry.head_sha)")
+            .unwrap();
+        let spawn = production
+            .find("let verdict = crate::agent_run::run_outcome_cancellable(")
+            .unwrap();
+
+        assert!(admission < recheck && recheck < spawn);
+    }
 
     struct Handoff {
         db: thegn_core::db::Db,
