@@ -456,13 +456,12 @@ mod tests {
         );
         assert_eq!(compose_exec_failure("permission denied"), None);
 
-        for stderr in ["no service found: api"] {
-            assert_eq!(
-                classify_compose_exec_failure(stderr),
-                Some(ComposeExecFailure::ServiceNotFound),
-                "producer output should retain the service-not-found classification: {stderr}"
-            );
-        }
+        let stderr = "no service found: api";
+        assert_eq!(
+            classify_compose_exec_failure(stderr),
+            Some(ComposeExecFailure::ServiceNotFound),
+            "producer output should retain the service-not-found classification: {stderr}"
+        );
         for stderr in [
             "service \"api\" is not running",
             "no container found for service api",
