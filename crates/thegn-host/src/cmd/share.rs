@@ -2,9 +2,10 @@
 //!
 //! The non-interactive surface over [`thegn_svc::share`]. `start` runs in the
 //! foreground (like `bore local`/`ngrok` themselves): it spawns the tunnel
-//! client, prints the URL, records the share in the DB so the panel/restore can
-//! see it, and blocks until interrupted. `list` reads the persisted shares;
-//! `stop` verifies provider teardown before removing its record.
+//! client, records a pending row before exposure, prints the URL, and blocks
+//! until interrupted. It refuses to start over a port with an existing record.
+//! `list` reads the persisted shares; `stop` verifies provider teardown before
+//! removing its record.
 //!
 //! The in-process host supervisor (live respawn on restart, badge, panel) builds
 //! on the same `[share]` config + `thegn_svc::share` seam this CLI uses.
@@ -93,8 +94,38 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
 
     match launch {
         ShareLaunch::Process(plan) => {
-            let statedir = share::share_state_dir(&wt_path, &kind, port, generation)?;
-            let running = share::start(&plan, &statedir, spec.ready_timeout)?;
+            let interrupt = crate::platform::InterruptGuard::install();
+            begin_share(&db, &wt, port, generation, &kind)?;
+            if interrupt.fired() {
+                abandon_pending(&db, &wt, port, generation)?;
+                return Ok(());
+            }
+            let statedir = match share::share_state_dir(&wt_path, &kind, port, generation) {
+                Ok(statedir) => statedir,
+                Err(error) => {
+                    let error = error.context("share: could not prepare the provider");
+                    return Err(abandon_pending_with_error(
+                        &db, &wt, port, generation, error,
+                    ));
+                }
+            };
+            if interrupt.fired() {
+                abandon_pending(&db, &wt, port, generation)?;
+                return Ok(());
+            }
+            let running = match share::start(&plan, &statedir, spec.ready_timeout) {
+                Ok(running) => running,
+                Err(error) => {
+                    let error = error.context("share: could not start the provider");
+                    return Err(abandon_pending_with_error(
+                        &db, &wt, port, generation, error,
+                    ));
+                }
+            };
+            if interrupt.fired() {
+                cleanup_interrupted_share(&db, &wt, port, generation, || running.stop())?;
+                return Ok(());
+            }
             let endpoint = display_endpoint(&running.public_url, &kind);
             let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&endpoint);
             outln!("share: 127.0.0.1:{port} → {}", display_endpoint);
@@ -102,17 +133,28 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             let url = running.public_url.canonical();
             if let Err(error) = db.upsert_share(&wt, port, generation, &kind, Some(&url), "up") {
                 running.stop();
-                return Err(error)
-                    .context("share: could not record the started provider; child stopped");
+                let error = error.context(
+                    "share: could not record the started provider; child teardown requested",
+                );
+                return Err(abandon_pending_with_error(
+                    &db, &wt, port, generation, error,
+                ));
             }
             // Block until the client exits (Ctrl-C tears down the group).
             // CLI path: `thegn share` runs the tunnel in the foreground by design.
+            while !running.has_exited() {
+                if interrupt.fired() {
+                    cleanup_interrupted_share(&db, &wt, port, generation, || running.stop())?;
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             running.wait();
             if !db
                 .delete_share_generation(&wt, port, generation)
-                .context("share: could not remove the stopped provider record")?
+                .context("share: could not remove the provider record after teardown")?
             {
-                bail!("share: stopped provider record changed before removal");
+                bail!("share: provider record changed before removal after teardown");
             }
         }
         ShareLaunch::SidecarServe(serve) => {
@@ -125,7 +167,46 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                     Some(&thegn_core::profile::name()),
                 ),
             );
-            let url = share::serve_up(&sidecar, &serve)?;
+            begin_share_after_preflight(
+                &db,
+                &wt,
+                port,
+                generation,
+                &kind,
+                thegn_svc::vpn::recorded_sidecar(&sidecar).map(|_| ()),
+            )?;
+            let url = match share::serve_up(&sidecar, &serve) {
+                Ok(url) => url,
+                Err(error) => match share::serve_down(&sidecar, &serve) {
+                    Ok(()) => {
+                        let error = error.context("share: serve start failed; teardown verified");
+                        return Err(abandon_pending_with_error(
+                            &db, &wt, port, generation, error,
+                        ));
+                    }
+                    Err(teardown_error) => {
+                        if let Err(record_error) = thegn_svc::vpn::recorded_sidecar(&sidecar) {
+                            let error = error.context(format!(
+                                "share: serve start failed before exposure ({record_error:#}); teardown could not be verified ({teardown_error:#})"
+                            ));
+                            return Err(abandon_pending_with_error(
+                                &db, &wt, port, generation, error,
+                            ));
+                        }
+                        let failed_record =
+                            db.upsert_share(&wt, port, generation, &kind, None, "failed");
+                        let mut message = format!(
+                            "share: serve start failed ({error:#}); teardown could not be verified ({teardown_error:#}); the share may still be reachable; run `thegn share stop {port}` to retry the teardown"
+                        );
+                        if let Err(record_error) = failed_record {
+                            message.push_str(&format!(
+                                "; could not persist failed state: {record_error:#}"
+                            ));
+                        }
+                        return Err(anyhow::anyhow!(message));
+                    }
+                },
+            };
             let url = url.canonical();
             let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&url);
             outln!("share: 127.0.0.1:{port} → {display_endpoint}");
@@ -134,15 +215,106 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             );
             if let Err(error) = db.upsert_share(&wt, port, generation, &kind, Some(&url), "up") {
                 return match share::serve_down(&sidecar, &serve) {
-                    Ok(()) => Err(error).context("share: could not record the started provider; teardown verified"),
-                    Err(teardown_error) => Err(error).context(format!(
-                        "share: could not record the started provider; teardown failed ({teardown_error}); share is still public; run `thegn share stop {port}`"
-                    )),
+                    Ok(()) => {
+                        let error = error.context(
+                            "share: could not record the started provider; teardown verified",
+                        );
+                        Err(abandon_pending_with_error(
+                            &db, &wt, port, generation, error,
+                        ))
+                    }
+                    Err(teardown_error) => {
+                        let failed_record =
+                            db.upsert_share(&wt, port, generation, &kind, None, "failed");
+                        let mut message = format!(
+                            "share: could not record the started provider ({error:#}); teardown could not be verified ({teardown_error:#}); the share may still be reachable; run `thegn share stop {port}` to retry the teardown"
+                        );
+                        if let Err(record_error) = failed_record {
+                            message.push_str(&format!(
+                                "; could not persist failed state: {record_error:#}"
+                            ));
+                        }
+                        Err(anyhow::anyhow!(message))
+                    }
                 };
             }
         }
     }
     Ok(())
+}
+
+fn begin_share(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+    kind: &str,
+) -> Result<()> {
+    let rows = store.list_shares().context("share: read the state DB")?;
+    if let Some(row) = rows
+        .iter()
+        .find(|row| row.worktree == wt && row.local_port == port)
+    {
+        bail!(
+            "share: port {port} already has a recorded {} share ({}); stop it with `thegn share stop {port}` (or `thegn share stop {port} --forget` for a stale record) before starting another",
+            row.provider,
+            row.state
+        );
+    }
+    store
+        .upsert_share(wt, port, generation, kind, None, "starting")
+        .context("share: could not record the pending share; nothing was started")
+}
+
+fn begin_share_after_preflight(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+    kind: &str,
+    preflight: Result<()>,
+) -> Result<()> {
+    preflight.context("share: provider precondition failed; nothing was started")?;
+    begin_share(store, wt, port, generation, kind)
+}
+
+fn cleanup_interrupted_share(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+    stop: impl FnOnce(),
+) -> Result<()> {
+    stop();
+    abandon_pending(store, wt, port, generation)
+}
+
+fn abandon_pending(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+) -> Result<()> {
+    if !store
+        .delete_share_generation(wt, port, generation)
+        .context("share: could not remove the pending share record")?
+    {
+        bail!("share: pending share record changed before removal");
+    }
+    Ok(())
+}
+
+fn abandon_pending_with_error(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match abandon_pending(store, wt, port, generation) {
+        Ok(()) => error,
+        Err(abandon_error) => anyhow::anyhow!("{error:#}; {abandon_error:#}"),
+    }
 }
 
 fn display_endpoint(endpoint: &thegn_svc::share::PublicEndpoint, provider: &str) -> String {
@@ -250,7 +422,7 @@ fn stop_with_store(
         &thegn_core::sandbox::container_name_with_profile(wt, Some(&thegn_core::profile::name())),
     );
     finish_stop(store, &row, || share::serve_down(&sidecar, &serve))?;
-    outln!("share: stopped and verified port {port}");
+    outln!("share: verified teardown for port {port}");
     Ok(())
 }
 
@@ -280,6 +452,9 @@ fn stop_plan(
     let Some(configured) = plan_port else {
         return StopPlan::RefuseProcess;
     };
+    if row.public_url.is_none() && matches!(row.state.as_str(), "starting" | "failed") {
+        return StopPlan::TeardownTailscale;
+    }
     if recorded_port != Some(configured) {
         return StopPlan::RefusePortMismatch {
             recorded: recorded_port,
@@ -345,6 +520,178 @@ mod tests {
 
     fn isolated_db(state: &IsolatedState) -> Db {
         Db::open_at(&state.root().join("share-stop.sqlite")).expect("open isolated DB")
+    }
+
+    #[test]
+    fn begin_share_records_a_starting_row_before_exposure() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+
+        begin_share(&db, "/worktree/demo", 3000, 7, "tailscale").expect("persist pending share");
+
+        let rows = db.list_shares().expect("read shares");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "starting");
+        assert_eq!(rows[0].public_url, None);
+        assert_eq!(rows[0].generation, 7);
+    }
+
+    #[test]
+    fn begin_share_refuses_a_port_that_already_has_a_record() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+        stored_row(&db, "tailscale", Some("https://demo.ts.net"));
+
+        let result = begin_share(&db, "/worktree/demo", 3000, 9, "tailscale");
+
+        let error = result.expect_err("existing record must block replacement");
+        assert!(format!("{error:#}").contains("already has a recorded"));
+        let rows = db.list_shares().expect("read retained share");
+        assert_eq!(rows.len(), 1);
+        let row = rows.into_iter().next().expect("retained share row");
+        assert_eq!(row.generation, 41);
+        assert_eq!(row.state, "up");
+        assert_eq!(row.public_url.as_deref(), Some("https://demo.ts.net"));
+    }
+
+    #[test]
+    fn sidecar_preflight_refusal_leaves_no_share_row() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+
+        let result = begin_share_after_preflight(
+            &db,
+            "/worktree/demo",
+            3000,
+            9,
+            "tailscale",
+            Err(anyhow::anyhow!("vpn: no recorded runtime for sidecar")),
+        );
+
+        assert!(
+            result.is_err(),
+            "missing runtime record refuses before exposure"
+        );
+        assert!(
+            db.list_shares()
+                .expect("read shares after refusal")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn interrupted_process_cleanup_stops_and_removes_its_generation() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+        begin_share(&db, "/worktree/demo", 3000, 7, "frp").expect("persist pending share");
+        db.upsert_share(
+            "/worktree/demo",
+            3000,
+            7,
+            "frp",
+            Some("https://share.example"),
+            "up",
+        )
+        .expect("mark share exposed");
+        let stopped = std::cell::Cell::new(false);
+
+        cleanup_interrupted_share(&db, "/worktree/demo", 3000, 7, || stopped.set(true))
+            .expect("stop process share and delete its row");
+
+        assert!(stopped.get(), "interrupted cleanup must stop the child");
+        assert!(
+            db.list_shares()
+                .expect("read shares after cleanup")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn begin_share_allows_another_port_or_worktree() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+        stored_row(&db, "tailscale", Some("https://demo.ts.net"));
+
+        begin_share(&db, "/worktree/demo", 3001, 9, "tailscale")
+            .expect("different port is independent");
+        begin_share(&db, "/worktree/other", 3000, 10, "tailscale")
+            .expect("different worktree is independent");
+
+        let rows = db.list_shares().expect("read shares");
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| {
+            row.worktree == "/worktree/demo" && row.local_port == 3001 && row.state == "starting"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.worktree == "/worktree/other" && row.local_port == 3000 && row.state == "starting"
+        }));
+    }
+
+    #[test]
+    fn abandon_pending_removes_only_this_generation() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+        begin_share(&db, "/worktree/demo", 3000, 7, "tailscale").expect("persist pending share");
+
+        abandon_pending(&db, "/worktree/demo", 3000, 7).expect("remove matching generation");
+        assert!(db.list_shares().expect("read after removal").is_empty());
+
+        begin_share(&db, "/worktree/demo", 3000, 8, "tailscale")
+            .expect("persist second pending share");
+        let result = abandon_pending(&db, "/worktree/demo", 3000, 7);
+        assert!(result.is_err(), "wrong generation must be visible");
+        let rows = db.list_shares().expect("read retained generation");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].generation, 8);
+        assert_eq!(rows[0].state, "starting");
+    }
+
+    #[test]
+    fn stop_plan_tears_down_a_urlless_pending_tailscale_row() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+        db.upsert_share("/worktree/demo", 3000, 41, "tailscale", None, "starting")
+            .expect("insert starting row");
+        let row = db
+            .list_shares()
+            .expect("read starting row")
+            .into_iter()
+            .next()
+            .expect("starting share row");
+        assert_eq!(
+            stop_plan(&row, false, Some(443), None),
+            StopPlan::TeardownTailscale
+        );
+
+        db.upsert_share("/worktree/demo", 3000, 41, "tailscale", None, "failed")
+            .expect("mark row failed");
+        let row = db
+            .list_shares()
+            .expect("read failed row")
+            .into_iter()
+            .next()
+            .expect("failed share row");
+        assert_eq!(
+            stop_plan(&row, false, Some(443), None),
+            StopPlan::TeardownTailscale
+        );
+
+        let up_row = ShareRow {
+            worktree: "/worktree/demo".to_string(),
+            local_port: 3000,
+            provider: "tailscale".to_string(),
+            public_url: None,
+            state: "up".to_string(),
+            created_at: 0,
+            generation: 41,
+        };
+        assert_eq!(
+            stop_plan(&up_row, false, Some(443), None),
+            StopPlan::RefusePortMismatch {
+                recorded: None,
+                configured: 443,
+            }
+        );
     }
 
     #[test]
