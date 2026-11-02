@@ -5425,8 +5425,13 @@ mod tests {
         let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
         assert_eq!(plan.len(), 1);
         assert!(
-            !matches!(&plan[0].verdict, pipeline_reap::ReapVerdict::CloseDone),
-            "binary handoff must not be reaped done"
+            matches!(
+                &plan[0].verdict,
+                pipeline_reap::ReapVerdict::NeedsDecision { why }
+                    if why.contains("is not this row's non-empty canonical handoff")
+            ),
+            "binary handoff should be refused by the artifact check: {:?}",
+            plan[0].verdict
         );
     }
 
