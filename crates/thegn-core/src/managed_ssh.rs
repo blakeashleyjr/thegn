@@ -6,6 +6,8 @@
 //! only after remote deletion succeeds, so a failed teardown remains visible to
 //! rotation/audit rather than silently losing revocation state.
 //! Provisioning never replaces a row with pending rotation recovery.
+//! Every mutation runs under one process-shared ledger lock; rotation writes
+//! are compare-and-swap against the row they read.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +32,24 @@ impl std::fmt::Display for RotationRecoveryPending {
 }
 
 impl std::error::Error for RotationRecoveryPending {}
+
+#[derive(Debug)]
+pub struct CustodyChanged {
+    pub provider: String,
+    pub instance: String,
+}
+
+impl std::fmt::Display for CustodyChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "managed SSH custody row {}/{} changed since this rotation read it; no further remote change was made",
+            self.provider, self.instance
+        )
+    }
+}
+
+impl std::error::Error for CustodyChanged {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizedKeyRecord {
@@ -282,28 +302,17 @@ pub fn record_authorized_with_proxy_worktree(
 }
 
 pub fn record_rotation_completed(
-    provider: &str,
-    account: &str,
-    instance: &str,
+    expected: &AuthorizedKeyRecord,
     key_path: &Path,
     public_key: &str,
-    proxy_worktree: Option<&str>,
 ) -> Result<()> {
-    let fingerprint = record_rotation_completed_at(
-        &dir(),
-        provider,
-        account,
-        instance,
-        key_path,
-        public_key,
-        proxy_worktree,
-    )?;
+    let fingerprint = record_rotation_completed_at(&dir(), expected, key_path, public_key)?;
     tracing::info!(
         target: "thegn::secret::audit",
         consumer = "managed-ssh:rotate",
-        provider,
-        account,
-        instance,
+        provider = %expected.provider,
+        account = %expected.account,
+        instance = %expected.instance,
         key_fingerprint = %fingerprint,
         outcome = "rotated",
         "managed SSH key rotation recorded",
@@ -328,6 +337,7 @@ fn record_authorized_with_proxy_worktree_at(
         public_key,
         proxy_worktree,
     )?;
+    let _ledger = lock_ledger(dir)?;
     if let Some(existing) = read_at(dir, provider, account, instance)?
         && existing.rotation_recovery.is_some()
     {
@@ -337,28 +347,25 @@ fn record_authorized_with_proxy_worktree_at(
         }
         .into());
     }
-    record_authorized_at(dir, &record)?;
+    publish_locked(dir, &record)?;
     Ok(record.key_fingerprint)
 }
 
 pub fn record_rotation_completed_at(
     dir: &Path,
-    provider: &str,
-    account: &str,
-    instance: &str,
+    expected: &AuthorizedKeyRecord,
     key_path: &Path,
     public_key: &str,
-    proxy_worktree: Option<&str>,
 ) -> Result<String> {
     let record = authorized_record(
-        provider,
-        account,
-        instance,
+        &expected.provider,
+        &expected.account,
+        &expected.instance,
         key_path,
         public_key,
-        proxy_worktree,
+        expected.proxy_worktree.as_deref(),
     )?;
-    record_authorized_at(dir, &record)?;
+    publish_if_unchanged_at(dir, expected, &record)?;
     Ok(record.key_fingerprint)
 }
 
@@ -383,9 +390,45 @@ fn authorized_record(
 }
 
 pub fn record_authorized_at(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
+    let _ledger = lock_ledger(dir)?;
+    publish_locked(dir, record)
+}
+
+/// Acquire the process-shared custody ledger lock. Hold it only around local
+/// file operations, never across remote calls; never acquire it twice in one
+/// call chain because a second flock descriptor deadlocks.
+fn lock_ledger(dir: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     crate::fsperm::restrict_dir_to_owner(dir)
         .with_context(|| format!("restrict {}", dir.display()))?;
+    let path = dir.join(".custody.lock");
+    let file = loop {
+        match crate::fsperm::open_regular_file_nofollow(&path) {
+            Ok(file) => break file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match crate::fsperm::create_owner_only_exclusive(&path) {
+                    Ok(file) => break file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("open managed SSH custody ledger lock {}", path.display())
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("open managed SSH custody ledger lock {}", path.display())
+                });
+            }
+        }
+    };
+    file.lock()
+        .with_context(|| format!("lock managed SSH custody ledger {}", path.display()))?;
+    Ok(file)
+}
+
+fn publish_locked(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
     let path = record_path(dir, &record.provider, &record.account, &record.instance);
     let legacy = legacy_record_path(dir, &record.provider, &record.account, &record.instance);
     for candidate in [&path, &legacy] {
@@ -409,6 +452,34 @@ pub fn record_authorized_at(dir: &Path, record: &AuthorizedKeyRecord) -> Result<
     Ok(())
 }
 
+pub fn publish_if_unchanged_at(
+    dir: &Path,
+    expected: &AuthorizedKeyRecord,
+    next: &AuthorizedKeyRecord,
+) -> Result<()> {
+    anyhow::ensure!(
+        next.provider == expected.provider
+            && next.account == expected.account
+            && next.instance == expected.instance,
+        "custody compare-and-swap cannot change the row identity"
+    );
+    let _ledger = lock_ledger(dir)?;
+    let actual = read_at(
+        dir,
+        &expected.provider,
+        &expected.account,
+        &expected.instance,
+    )?;
+    if actual.as_ref() != Some(expected) {
+        return Err(CustodyChanged {
+            provider: expected.provider.clone(),
+            instance: expected.instance.clone(),
+        }
+        .into());
+    }
+    publish_locked(dir, next)
+}
+
 fn remove_if_exists(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -418,8 +489,7 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 }
 
 pub fn record_revoked(provider: &str, account: &str, instance: &str) -> Result<()> {
-    let existing = read(provider, account, instance)?;
-    remove_record_path(&dir(), provider, account, instance)?;
+    let existing = revoke_at(&dir(), provider, account, instance)?;
     tracing::info!(
         target: "thegn::secret::audit",
         consumer = "managed-ssh:destroy",
@@ -437,11 +507,27 @@ pub fn record_revoked(provider: &str, account: &str, instance: &str) -> Result<(
 }
 
 pub fn record_revoked_at(dir: &Path, provider: &str, account: &str, instance: &str) -> Result<()> {
+    revoke_at(dir, provider, account, instance).map(|_| ())
+}
+
+fn revoke_at(
+    dir: &Path,
+    provider: &str,
+    account: &str,
+    instance: &str,
+) -> Result<Option<AuthorizedKeyRecord>> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", dir.display())),
+    }
+    let _ledger = lock_ledger(dir)?;
     // Parse before delete. An unreadable or corrupt row may be the only local
     // evidence of a remotely authorized key and must never be collapsed into
     // "missing" by a mutation path.
-    read_at(dir, provider, account, instance)?;
-    remove_record_path(dir, provider, account, instance)
+    let existing = read_at(dir, provider, account, instance)?;
+    remove_record_path(dir, provider, account, instance)?;
+    Ok(existing)
 }
 
 fn remove_record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> Result<()> {
@@ -507,7 +593,7 @@ pub fn record_rotation_recovery(
 ) -> Result<AuthorizedKeyRecord> {
     let mut updated = record.clone();
     updated.rotation_recovery = recovery;
-    record_authorized_at(&dir(), &updated)?;
+    publish_if_unchanged_at(&dir(), record, &updated)?;
     Ok(updated)
 }
 
@@ -747,12 +833,9 @@ mod tests {
 
         let fingerprint = record_rotation_completed_at(
             temp.path(),
-            &original.provider,
-            &original.account,
-            &original.instance,
+            &original,
             Path::new("/state/new-key"),
             new_key,
-            None,
         )
         .unwrap();
         let published = read_at(
@@ -789,15 +872,7 @@ mod tests {
         };
         record_authorized_at(&dir(), &unrelated).unwrap();
 
-        record_rotation_completed(
-            &original.provider,
-            &original.account,
-            &original.instance,
-            Path::new("/state/completed-key"),
-            new_key,
-            None,
-        )
-        .unwrap();
+        record_rotation_completed(&original, Path::new("/state/completed-key"), new_key).unwrap();
 
         let completed = read(&original.provider, &original.account, &original.instance)
             .unwrap()
@@ -1362,5 +1437,310 @@ mod tests {
         ] {
             assert!(vendor_key_name(key).is_err(), "accepted key: {key:?}");
         }
+    }
+
+    #[test]
+    fn publish_waits_for_a_held_ledger_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let row = record();
+        let held = lock_ledger(&dir).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(record_authorized_at(&dir, &row)).unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            read_at(&dir, "fly", "env:FLY_WORK", "tg-project-feature").unwrap(),
+            None
+        );
+        drop(held);
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(
+            read_at(&dir, "fly", "env:FLY_WORK", "tg-project-feature")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn revoke_waits_for_a_held_ledger_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let row = record();
+        record_authorized_at(&dir, &row).unwrap();
+        let held = lock_ledger(&dir).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(record_revoked_at(
+                    &dir,
+                    "fly",
+                    "env:FLY_WORK",
+                    "tg-project-feature",
+                ))
+                .unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            read_at(&dir, "fly", "env:FLY_WORK", "tg-project-feature").unwrap(),
+            Some(row)
+        );
+        drop(held);
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            read_at(&dir, "fly", "env:FLY_WORK", "tg-project-feature").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_and_publish_refuses_a_changed_row_and_keeps_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = record();
+        let changed = AuthorizedKeyRecord {
+            key_fingerprint: "SHA256:changed".into(),
+            ..original.clone()
+        };
+        let next = AuthorizedKeyRecord {
+            key_fingerprint: "SHA256:next".into(),
+            ..original.clone()
+        };
+        record_authorized_at(temp.path(), &original).unwrap();
+        record_authorized_at(temp.path(), &changed).unwrap();
+
+        let result = publish_if_unchanged_at(temp.path(), &original, &next);
+
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<CustodyChanged>()
+                .is_some()
+        );
+        assert_eq!(
+            read_at(
+                temp.path(),
+                &original.provider,
+                &original.account,
+                &original.instance
+            )
+            .unwrap(),
+            Some(changed)
+        );
+    }
+
+    #[test]
+    fn compare_and_publish_refuses_a_changed_identity_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = record();
+        let changed_identity = AuthorizedKeyRecord {
+            instance: "another-instance".into(),
+            ..original.clone()
+        };
+        record_authorized_at(temp.path(), &original).unwrap();
+
+        let result = publish_if_unchanged_at(temp.path(), &original, &changed_identity);
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot change the row identity")
+        );
+        assert_eq!(
+            read_at(
+                temp.path(),
+                &original.provider,
+                &original.account,
+                &original.instance
+            )
+            .unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn concurrent_compare_and_publish_from_one_snapshot_has_exactly_one_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let original = record();
+        record_authorized_at(dir, &original).unwrap();
+        // Every scoped writer starts from the same stored snapshot. The shared
+        // barrier releases all eight before any writer can publish; every
+        // handle is collected before joining so the race is concurrent.
+        let barrier = std::sync::Barrier::new(8);
+        let outcomes = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|writer| {
+                    let barrier = &barrier;
+                    let original = &original;
+                    scope.spawn(move || {
+                        let next = AuthorizedKeyRecord {
+                            key_fingerprint: format!("SHA256:writer-{writer}"),
+                            ..original.clone()
+                        };
+                        barrier.wait();
+                        let result = publish_if_unchanged_at(dir, original, &next);
+                        (next, result)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let mut winners = Vec::new();
+        let mut changed = 0;
+        for (next, result) in outcomes {
+            match result {
+                Ok(()) => winners.push(next),
+                Err(error) => {
+                    assert!(error.downcast_ref::<CustodyChanged>().is_some());
+                    changed += 1;
+                }
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        assert_eq!(changed, 7);
+        assert_eq!(
+            read_at(
+                dir,
+                &original.provider,
+                &original.account,
+                &original.instance
+            )
+            .unwrap(),
+            Some(winners[0].clone())
+        );
+    }
+
+    #[test]
+    fn provision_publish_cannot_replace_a_recovery_row_written_while_it_waited() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let recovering = recovering_record("SHA256:old");
+        let initial = AuthorizedKeyRecord {
+            rotation_recovery: None,
+            ..recovering.clone()
+        };
+        record_authorized_at(&dir, &initial).unwrap();
+        let held = lock_ledger(&dir).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(record_authorized_with_proxy_worktree_at(
+                    &worker_dir,
+                    "fly",
+                    "account",
+                    "instance",
+                    Path::new("/k"),
+                    key,
+                    None,
+                ))
+                .unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        publish_locked(&dir, &recovering).unwrap();
+        drop(held);
+
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        worker.join().unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<RotationRecoveryPending>()
+                .is_some()
+        );
+        assert!(
+            read_at(&dir, "fly", "account", "instance")
+                .unwrap()
+                .unwrap()
+                .rotation_recovery
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rotation_completion_refuses_a_changed_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
+        let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let original = recovering_record(&try_key_fingerprint(old_key).unwrap());
+        let changed = AuthorizedKeyRecord {
+            key_fingerprint: "SHA256:changed".into(),
+            ..original.clone()
+        };
+        record_authorized_at(temp.path(), &original).unwrap();
+        record_authorized_at(temp.path(), &changed).unwrap();
+
+        let result = record_rotation_completed_at(
+            temp.path(),
+            &original,
+            Path::new("/state/new-key"),
+            new_key,
+        );
+
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<CustodyChanged>()
+                .is_some()
+        );
+        assert_eq!(
+            read_at(temp.path(), "fly", "account", "instance").unwrap(),
+            Some(changed)
+        );
+    }
+
+    #[test]
+    fn ledger_lock_file_is_not_listed_as_custody() {
+        let temp = tempfile::tempdir().unwrap();
+        let row = record();
+        record_authorized_at(temp.path(), &row).unwrap();
+
+        assert_eq!(list_at(temp.path()).unwrap(), vec![row]);
+        // The base already ignores non-JSON entries; the lock's existence is
+        // the new behavior this positive-control test checks.
+        assert!(temp.path().join(".custody.lock").exists());
+    }
+
+    #[test]
+    fn ledger_lock_refuses_a_non_file_lock_path() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".custody.lock")).unwrap();
+
+        let result = record_authorized_at(temp.path(), &record());
+
+        assert!(result.is_err());
+        assert!(list_at(temp.path()).unwrap().is_empty());
     }
 }
