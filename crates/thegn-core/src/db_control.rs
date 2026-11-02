@@ -183,6 +183,26 @@ impl ControlStore for Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    fn freshest_live_daemon(
+        &self,
+        scope: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<Option<DaemonRow>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT {DAEMON_COLS} FROM daemons \
+                     WHERE scope = ?1 AND heartbeat_at >= ?2 \
+                     ORDER BY heartbeat_at DESC, started_at DESC, daemon_id DESC LIMIT 1"
+                ),
+                params![scope, now_ms - ttl_ms],
+                daemon_row,
+            )
+            .optional()?)
+    }
+
     fn put_lease(
         &self,
         session_id: &str,
@@ -586,5 +606,76 @@ mod tests {
         super::verify_v68_schema(db.conn()).expect("verify v68");
         db.put_daemon(&daemon("d", "/s", 1)).unwrap();
         assert_eq!(db.daemons().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn freshest_live_daemon_picks_the_newest_heartbeat_among_thousands() {
+        let db = Db::open_memory().unwrap();
+        db.conn().execute_batch("BEGIN").unwrap();
+        for n in 0..5_000 {
+            db.put_daemon(&daemon(&format!("d{n:05}"), "/state/a", 10_000 + n))
+                .unwrap();
+        }
+        db.put_daemon(&daemon("winner", "/state/a", 20_000))
+            .unwrap();
+        for n in 0..1_000 {
+            db.put_daemon(&daemon(&format!("foreign{n:04}"), "/state/b", 30_000))
+                .unwrap();
+            db.put_daemon(&daemon(&format!("stale{n:04}"), "/state/a", 1))
+                .unwrap();
+        }
+        db.conn().execute_batch("COMMIT").unwrap();
+
+        let winner = db
+            .freshest_live_daemon("/state/a", 20_500, 15_000)
+            .unwrap()
+            .expect("winner is live");
+        assert_eq!(winner.daemon_id, "winner");
+    }
+
+    #[test]
+    fn freshest_live_daemon_breaks_heartbeat_ties_by_start_then_id() {
+        let db = Db::open_memory().unwrap();
+        let mut first = daemon("a", "/state/a", 8_000);
+        first.started_at = 1_000;
+        let mut second = daemon("b", "/state/a", 8_000);
+        second.started_at = 2_000;
+        let mut third = daemon("c", "/state/a", 8_000);
+        third.started_at = 2_000;
+        db.put_daemon(&first).unwrap();
+        db.put_daemon(&second).unwrap();
+        db.put_daemon(&third).unwrap();
+
+        assert_eq!(
+            db.freshest_live_daemon("/state/a", 10_000, 6_000)
+                .unwrap()
+                .unwrap()
+                .daemon_id,
+            "c"
+        );
+
+        let newer_heartbeat = daemon("older-start", "/state/a", 9_000);
+        db.put_daemon(&newer_heartbeat).unwrap();
+        assert_eq!(
+            db.freshest_live_daemon("/state/a", 10_000, 6_000)
+                .unwrap()
+                .unwrap()
+                .daemon_id,
+            "older-start"
+        );
+    }
+
+    #[test]
+    fn freshest_live_daemon_is_none_when_every_row_is_stale_or_foreign() {
+        let db = Db::open_memory().unwrap();
+        db.put_daemon(&daemon("stale", "/state/a", 1)).unwrap();
+        db.put_daemon(&daemon("foreign", "/state/b", 9_000))
+            .unwrap();
+
+        assert!(
+            db.freshest_live_daemon("/state/a", 10_000, 6_000)
+                .unwrap()
+                .is_none()
+        );
     }
 }
