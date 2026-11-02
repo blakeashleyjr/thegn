@@ -7,7 +7,7 @@
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -340,22 +340,46 @@ pub(crate) fn terminate_event_group(child: &mut Child) {
 }
 
 /// Hand a child that outlived its shutdown budget to the detached reaper.
-/// If the reaper is unavailable or full, dropping the handle leaves the OS to
-/// reap the process when this process exits; shutdown itself remains bounded.
+/// If the reaper is unavailable, a dedicated waiter owns the child; if that
+/// thread cannot start, this call waits inline.
 pub(crate) fn reap_event_child(child: Child) {
-    match reaper_sender() {
-        Some(sender) => match sender.try_send(child) {
-            Ok(()) => {}
-            Err(TrySendError::Full(child)) | Err(TrySendError::Disconnected(child)) => {
-                tracing::debug!(
-                    "sandbox events: detached reaper unavailable; leaving child to init"
-                );
-                drop(child);
-            }
+    reap_event_child_with(child, reaper_sender());
+}
+
+fn reap_event_child_with(child: Child, reaper: Option<&Sender<Child>>) {
+    let child = match reaper {
+        Some(sender) => match sender.send(child) {
+            Ok(()) => return,
+            Err(mpsc::SendError(child)) => child,
         },
-        None => {
-            tracing::debug!("sandbox events: detached reaper unavailable; leaving child to init");
-            drop(child);
+        None => child,
+    };
+
+    let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let waiter_child = std::sync::Arc::clone(&child);
+    match crate::thread_name::try_spawn_named("thegn-sbx-wait", move || {
+        let child = waiter_child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut child) = child
+            && let Err(error) = child.wait()
+        {
+            tracing::debug!(target: "thegn::sandbox", %error, "sandbox events: waiter failed to reap child");
+        }
+    }) {
+        Ok(_waiter) => {}
+        Err(error) => {
+            tracing::debug!(target: "thegn::sandbox", %error, "sandbox events: waiter could not start; waiting inline");
+            let child = child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(mut child) = child
+                && let Err(error) = child.wait()
+            {
+                tracing::debug!(target: "thegn::sandbox", %error, "sandbox events: inline wait failed to reap child");
+            }
         }
     }
 }
@@ -371,11 +395,11 @@ fn reap_bounded(mut child: Child) {
         }
     }
     match reaper_sender() {
-        Some(sender) => match sender.try_send(child) {
+        Some(sender) => match sender.send(child) {
             Ok(()) => {}
-            Err(TrySendError::Full(mut child)) | Err(TrySendError::Disconnected(mut child)) => {
-                // A saturated reaper is exceptional. Preserve ownership and
-                // wait here rather than dropping a live Child handle.
+            Err(mpsc::SendError(mut child)) => {
+                // An unavailable reaper is exceptional. Preserve ownership
+                // and wait here rather than dropping a live Child handle.
                 Result::ok(child.wait());
             }
         },
@@ -385,18 +409,17 @@ fn reap_bounded(mut child: Child) {
     }
 }
 
-fn reaper_sender() -> Option<&'static SyncSender<Child>> {
-    static REAPER: OnceLock<Option<SyncSender<Child>>> = OnceLock::new();
+fn reaper_sender() -> Option<&'static Sender<Child>> {
+    static REAPER: OnceLock<Option<Sender<Child>>> = OnceLock::new();
     REAPER
         .get_or_init(|| {
-            let (sender, receiver) = mpsc::sync_channel::<Child>(64);
-            thread::Builder::new()
-                .spawn(move || {
-                    while let Ok(mut child) = receiver.recv() {
-                        Result::ok(child.wait());
-                    }
-                })
-                .ok()?;
+            let (sender, receiver) = mpsc::channel::<Child>();
+            crate::thread_name::try_spawn_named("thegn-sbx-proc", move || {
+                while let Ok(mut child) = receiver.recv() {
+                    Result::ok(child.wait());
+                }
+            })
+            .ok()?;
             Some(sender)
         })
         .as_ref()
@@ -408,6 +431,48 @@ mod tests {
 
     fn sh(script: &str) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script.into()]
+    }
+
+    #[cfg(unix)]
+    fn killed_event_child() -> (Child, u32) {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        configure_event_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        terminate_event_group(&mut child);
+        (child, pid)
+    }
+
+    #[cfg(unix)]
+    fn assert_pid_is_reaped(pid: u32) {
+        let pid = nix::unistd::Pid::from_raw(pid as i32);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while nix::sys::signal::kill(pid, None).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "killed child {pid} was not reaped"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_child_is_reaped_without_a_reaper() {
+        let (child, pid) = killed_event_child();
+        reap_event_child_with(child, None);
+        assert_pid_is_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_child_is_reaped_when_the_reaper_is_disconnected() {
+        let (sender, receiver) = std::sync::mpsc::channel::<Child>();
+        drop(receiver);
+        let (child, pid) = killed_event_child();
+        reap_event_child_with(child, Some(&sender));
+        assert_pid_is_reaped(pid);
     }
 
     #[test]
