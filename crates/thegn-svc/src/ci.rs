@@ -2108,8 +2108,10 @@ fn normalize_gitlab_host(raw: &str) -> Option<String> {
 }
 
 /// Accept only ordinary SSH/HTTP(S) git remotes with an unambiguous host and
-/// plain project path. Encoded paths and URL decorations are rejected before
-/// constructing an authenticated `glab api` request.
+/// plain project path. An SSH URL's port is the SSH daemon's port, not the
+/// provider API port, so it is omitted from the authority. Encoded paths and
+/// URL decorations are rejected before constructing an authenticated
+/// `glab api` request.
 fn parse_gitlab_remote(raw: &str) -> Option<GitlabRemote> {
     let raw = raw.trim();
     let (host, path) = if raw.contains("://") {
@@ -2129,9 +2131,12 @@ fn parse_gitlab_remote(raw: &str) -> Option<GitlabRemote> {
         {
             return None;
         }
+        // An ssh URL's port belongs to the SSH daemon, not the provider API.
         let host = match parsed.port() {
-            Some(port) => format!("{}:{port}", parsed.host_str()?),
-            None => parsed.host_str()?.to_string(),
+            Some(port) if parsed.scheme() != "ssh" => {
+                format!("{}:{port}", parsed.host_str()?)
+            }
+            _ => parsed.host_str()?.to_string(),
         };
         (
             host.to_ascii_lowercase(),
@@ -2875,6 +2880,70 @@ mod tests {
     }
 
     #[test]
+    fn parsed_authority_matrix() {
+        let cases = [
+            (
+                "ssh://git@gitlab.example.com:2222/group/repo.git",
+                Some(("gitlab.example.com", "group/repo")),
+            ),
+            (
+                "ssh://git@github.com:22/o/r.git",
+                Some(("github.com", "o/r")),
+            ),
+            (
+                "https://gitlab.example.com:8443/g/s/r.git",
+                Some(("gitlab.example.com:8443", "g/s/r")),
+            ),
+            (
+                "git@GitLab.COM:Group/Sub/Repo.git",
+                Some(("gitlab.com", "Group/Sub/Repo")),
+            ),
+            (
+                "https://gitlab.com/a/b/c/d/repo",
+                Some(("gitlab.com", "a/b/c/d/repo")),
+            ),
+            ("https://token@gitlab.com/g/r", None),
+            ("ssh://alice@gitlab.com/g/r", None),
+            ("deploy:pw@gitlab.com:g/r", None),
+            (
+                "https://gitlab.com.evil.test/g/r",
+                Some(("gitlab.com.evil.test", "g/r")),
+            ),
+            (
+                "https://evil.test/gitlab.com/g/r",
+                Some(("evil.test", "gitlab.com/g/r")),
+            ),
+            ("https://gitlab.com@evil.test/g/r", None),
+            ("gitlab.com:/g/r", None),
+            ("https://gitlab.com/g/r/", None),
+            ("https://gitlab.com/g%2Fr", None),
+            ("file:///srv/g/r.git", None),
+            ("git://gitlab.com/g/r", None),
+        ];
+
+        for (raw, expected) in cases {
+            let parsed = parse_gitlab_remote(raw);
+            let actual = parsed
+                .as_ref()
+                .map(|remote| (remote.host.as_str(), remote.project.as_str()));
+            assert_eq!(actual, expected, "{raw:?}");
+        }
+
+        assert_eq!(
+            system_from_remote_host("ssh://git@github.com:22/o/r.git"),
+            Some(CiSystem::GithubActions)
+        );
+        assert_eq!(
+            system_from_remote_host("https://gitlab.com.evil.test/g/r"),
+            None
+        );
+        assert_eq!(
+            system_from_remote_host("https://evil.test/gitlab.com/g/r"),
+            None
+        );
+    }
+
+    #[test]
     fn gitlab_remote_errors_never_echo_credentials_or_remote_text() {
         let secret_remote = "https://user:fixture-token@gitlab.example.test/group/repo";
         let error = parse_gitlab_remote_checked(secret_remote)
@@ -3418,7 +3487,7 @@ esac
             ("git@github.com:owner/repo.git", "github.com"),
             (
                 "ssh://git@ghe.example.test:2222/owner/repo.git",
-                "ghe.example.test:2222",
+                "ghe.example.test",
             ),
             ("https://ghe.example.test/owner/repo", "ghe.example.test"),
         ] {
