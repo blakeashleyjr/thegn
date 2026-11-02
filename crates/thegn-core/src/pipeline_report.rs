@@ -255,21 +255,17 @@ impl fmt::Display for NoteError {
     }
 }
 
-/// Trim and validate a report. Returns the trimmed text, or an error on
-/// empty / over the cap.
+/// Encode hostile characters visibly, then trim and validate a multiline
+/// report. LF is preserved, CRLF is normalized, tabs become spaces, a trailing
+/// CR is dropped, and other controls or format characters become U+FFFD.
+/// Hostile characters are never silently removed. Returns an error on empty
+/// or over-cap text.
 pub fn report_text(text: &str) -> Result<String, ReportError> {
-    // Reports are printed by the CLI and may be copied into a supervisor
-    // prompt. Preserve LF because the handoff format is intentionally
-    // multiline, but remove other controls and display-shaping format
-    // characters before storing it.
-    let t: String = text
-        .chars()
-        .filter(|c| (!c.is_control() || *c == '\n') && !is_format_control(*c))
-        .collect();
-    let t = t.trim();
-    if t.is_empty() {
+    let t = encode_hostile(text, true);
+    if !t.chars().any(|c| !c.is_whitespace() && c != '\u{fffd}') {
         return Err(ReportError::Empty);
     }
+    let t = t.trim();
     let len = t.chars().count();
     if len > REPORT_MAX_CHARS {
         return Err(ReportError::TooLong { len });
@@ -277,25 +273,43 @@ pub fn report_text(text: &str) -> Result<String, ReportError> {
     Ok(t.to_string())
 }
 
-/// Trim and validate a progress note. Returns the trimmed text, or an error
-/// on empty / over the cap.
+/// Encode hostile characters visibly, then trim and validate a single-line
+/// progress note. LF, CR, and tabs become spaces; a trailing CR is dropped;
+/// other controls or format characters become U+FFFD. Hostile characters are
+/// never silently removed. Returns an error on empty or over-cap text.
 pub fn note_text(text: &str) -> Result<String, NoteError> {
-    // Notes are rendered as one roster line / bullet. Remove all control
-    // characters rather than allowing a worker note to emit terminal escape
-    // sequences, reorder text, or forge additional output lines.
-    let t: String = text
-        .chars()
-        .filter(|c| !c.is_control() && !is_format_control(*c))
-        .collect();
-    let t = t.trim();
-    if t.is_empty() {
+    let t = encode_hostile(text, false);
+    if !t.chars().any(|c| !c.is_whitespace() && c != '\u{fffd}') {
         return Err(NoteError::Empty);
     }
+    let t = t.trim();
     let len = t.chars().count();
     if len > NOTE_MAX_CHARS {
         return Err(NoteError::TooLong { len });
     }
     Ok(t.to_string())
+}
+
+fn encode_hostile(text: &str, multiline: bool) -> String {
+    let mut chars = text.chars().peekable();
+    let mut encoded = String::with_capacity(text.len());
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') || chars.peek().is_none() {
+                continue;
+            }
+            encoded.push(if multiline { '\u{fffd}' } else { ' ' });
+        } else if c == '\n' {
+            encoded.push(if multiline { '\n' } else { ' ' });
+        } else if c == '\t' {
+            encoded.push(' ');
+        } else if c.is_control() || is_format_control(c) {
+            encoded.push('\u{fffd}');
+        } else {
+            encoded.push(c);
+        }
+    }
+    encoded
 }
 
 // --- verdict ----------------------------------------------------------------
@@ -677,15 +691,15 @@ mod tests {
         assert_eq!(report_text(""), Err(ReportError::Empty));
         assert_eq!(
             report_text("\x1b[31mhi\x07\nthere\r"),
-            Ok("[31mhi\nthere".into())
+            Ok("\u{fffd}[31mhi\u{fffd}\nthere".into())
         );
     }
 
     #[test]
-    fn report_text_removes_unicode_format_controls() {
+    fn report_text_visibly_encodes_unicode_format_controls() {
         assert_eq!(
             report_text("PASS\u{202e}LIAF\u{2028}x").unwrap(),
-            "PASSLIAFx"
+            "PASS\u{fffd}LIAF\u{fffd}x"
         );
     }
 
@@ -705,14 +719,51 @@ mod tests {
         assert_eq!(note_text(""), Err(NoteError::Empty));
         assert_eq!(
             note_text("first\nsecond\x1b[2J"),
-            Ok("firstsecond[2J".into())
+            Ok("first second\u{fffd}[2J".into())
         );
     }
 
     #[test]
-    fn note_text_removes_format_controls_and_rejects_format_only_input() {
-        assert_eq!(note_text("ok\u{2066}\u{200b}").unwrap(), "ok");
+    fn note_text_visibly_encodes_format_controls_and_rejects_format_only_input() {
+        assert_eq!(
+            note_text("ok\u{2066}\u{200b}").unwrap(),
+            "ok\u{fffd}\u{fffd}"
+        );
         assert_eq!(note_text("\u{202e}\u{2066}\u{200b}"), Err(NoteError::Empty));
+    }
+
+    #[test]
+    fn report_text_visibly_encodes_hostile_characters() {
+        let encoded = report_text("a\u{200f}b\u{2029}c\u{009b}d").unwrap();
+        assert_eq!(encoded, "a\u{fffd}b\u{fffd}c\u{fffd}d");
+        assert!(
+            encoded
+                .chars()
+                .all(|c| !(c.is_control() && c != '\n') && !is_format_control(c))
+        );
+    }
+
+    #[test]
+    fn report_text_normalises_crlf_and_encodes_a_lone_cr() {
+        assert_eq!(report_text("PASS\r\ngate: x\r").unwrap(), "PASS\ngate: x");
+        assert_eq!(report_text("a\rb").unwrap(), "a\u{fffd}b");
+        assert_eq!(report_text("a\tb").unwrap(), "a b");
+    }
+
+    #[test]
+    fn note_text_is_single_line_and_visibly_encoded() {
+        let encoded = note_text("a\nb\tc\rd\u{202e}e").unwrap();
+        assert_eq!(encoded, "a b c d\u{fffd}e");
+        assert!(!encoded.contains('\n'));
+    }
+
+    #[test]
+    fn encoding_keeps_the_char_cap_exact() {
+        let exact = format!("{}\u{202e}", "x".repeat(4_095));
+        assert_eq!(note_text(&exact).unwrap().chars().count(), 4_096);
+
+        let too_long = format!("{}\u{202e}", "x".repeat(4_096));
+        assert_eq!(note_text(&too_long), Err(NoteError::TooLong { len: 4_097 }));
     }
 
     #[test]
