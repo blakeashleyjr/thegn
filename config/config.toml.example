@@ -2460,6 +2460,9 @@ max_results = 1000
 [lsp]
 # enabled = true               # master switch
 # hover   = true               # show hover / signature previews
+# require_containment = false  # refuse a server that cannot join the thegn slice
+# With true, an unavailable systemd scope refuses the start; false warns once
+# and starts outside the slice, preserving the current best-effort behaviour.
 #
 # The `enabled` switch also gates the semantic blast-radius (items 313/316): the
 # `◈ semantic` diff footer's "N callers/F files · U untested · risk:R" tail and
