@@ -796,12 +796,21 @@ fn capture_to_store(
     }
 
     // Retention: prune older snapshots only after this one reads back intact.
-    if let Ok(all) = store.list(key) {
-        for stale in retention_prune_keeping(&all, snap_cfg.keep_clamped(), &manifest.id) {
-            if stale == manifest.id {
-                continue;
+    match store.list(key) {
+        Ok(all) => {
+            for stale in retention_prune_keeping(&all, snap_cfg.keep_clamped(), &manifest.id) {
+                if stale == manifest.id {
+                    continue;
+                }
+                let _ = store.delete(key, &stale); // best-effort: GC only
             }
-            let _ = store.delete(key, &stale); // best-effort: GC only
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::hibernate",
+                error = %format!("{error:#}"),
+                "snapshot retention pruning skipped because the manifest list could not be read"
+            );
         }
     }
     // best-effort: the sandbox is about to be destroyed anyway.
