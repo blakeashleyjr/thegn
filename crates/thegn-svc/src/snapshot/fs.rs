@@ -454,15 +454,21 @@ mod tests {
         // All scoped threads race from an initially absent destination;
         // hard_link lets one publisher win and refuses every later link.
         let outcomes = std::thread::scope(|scope| {
-            (0..8)
+            let barrier = std::sync::Barrier::new(8);
+            let handles: Vec<_> = (0..8)
                 .map(|n| {
                     let s = &s;
                     let k = &k;
+                    let barrier = &barrier;
                     scope.spawn(move || {
                         let bytes = format!("writer-{n}");
+                        barrier.wait();
                         (bytes.clone(), s.put(k, "gen-1", "bundle", bytes.as_bytes()))
                     })
                 })
+                .collect();
+            handles
+                .into_iter()
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
         });
