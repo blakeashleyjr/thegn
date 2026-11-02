@@ -5152,6 +5152,14 @@ fn lsp_report(cfg: &Config) {
     use thegn_svc::lsp::Registry;
     outln!("LSP servers ([lsp] + [[lsp.servers]])");
     outln!("  enabled       {}", yn(cfg.lsp.enabled));
+    outln!(
+        "  containment   {}",
+        if cfg.lsp.require_containment {
+            "required ([lsp] require_containment)"
+        } else {
+            "best-effort (one warning if the slice is unavailable)"
+        }
+    );
     if !cfg.lsp.enabled {
         outln!("  note          [lsp] enabled = false — every server below is masked");
     }
@@ -5212,6 +5220,7 @@ fn lsp_json(cfg: &Config) -> serde_json::Value {
     serde_json::json!({
         "enabled": cfg.lsp.enabled,
         "hover": cfg.lsp.hover,
+        "require_containment": cfg.lsp.require_containment,
         "servers": servers,
     })
 }
@@ -5576,6 +5585,7 @@ mod tests {
         }];
         let v = lsp_json(&cfg);
         assert_eq!(v["enabled"], serde_json::json!(false));
+        assert_eq!(v["require_containment"], serde_json::json!(false));
         let servers = v["servers"].as_array().unwrap();
         // 6 built-ins + the user zig entry.
         assert_eq!(servers.len(), 7);
