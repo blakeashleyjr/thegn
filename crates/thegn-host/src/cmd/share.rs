@@ -94,7 +94,12 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
 
     match launch {
         ShareLaunch::Process(plan) => {
+            let interrupt = crate::platform::InterruptGuard::install();
             begin_share(&db, &wt, port, generation, &kind)?;
+            if interrupt.fired() {
+                abandon_pending(&db, &wt, port, generation)?;
+                return Ok(());
+            }
             let statedir = match share::share_state_dir(&wt_path, &kind, port, generation) {
                 Ok(statedir) => statedir,
                 Err(error) => {
@@ -104,6 +109,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                     ));
                 }
             };
+            if interrupt.fired() {
+                abandon_pending(&db, &wt, port, generation)?;
+                return Ok(());
+            }
             let running = match share::start(&plan, &statedir, spec.ready_timeout) {
                 Ok(running) => running,
                 Err(error) => {
@@ -113,6 +122,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                     ));
                 }
             };
+            if interrupt.fired() {
+                cleanup_interrupted_share(&db, &wt, port, generation, || running.stop())?;
+                return Ok(());
+            }
             let endpoint = display_endpoint(&running.public_url, &kind);
             let display_endpoint = thegn_svc::lsp::sanitize_for_terminal(&endpoint);
             outln!("share: 127.0.0.1:{port} → {}", display_endpoint);
@@ -129,7 +142,6 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             }
             // Block until the client exits (Ctrl-C tears down the group).
             // CLI path: `thegn share` runs the tunnel in the foreground by design.
-            let interrupt = crate::platform::InterruptGuard::install();
             while !running.has_exited() {
                 if interrupt.fired() {
                     cleanup_interrupted_share(&db, &wt, port, generation, || running.stop())?;
@@ -556,8 +568,15 @@ mod tests {
             Err(anyhow::anyhow!("vpn: no recorded runtime for sidecar")),
         );
 
-        assert!(result.is_err(), "missing runtime record refuses before exposure");
-        assert!(db.list_shares().expect("read shares after refusal").is_empty());
+        assert!(
+            result.is_err(),
+            "missing runtime record refuses before exposure"
+        );
+        assert!(
+            db.list_shares()
+                .expect("read shares after refusal")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -580,7 +599,11 @@ mod tests {
             .expect("stop process share and delete its row");
 
         assert!(stopped.get(), "interrupted cleanup must stop the child");
-        assert!(db.list_shares().expect("read shares after cleanup").is_empty());
+        assert!(
+            db.list_shares()
+                .expect("read shares after cleanup")
+                .is_empty()
+        );
     }
 
     #[test]
