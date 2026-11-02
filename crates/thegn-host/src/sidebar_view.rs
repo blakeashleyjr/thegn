@@ -2684,6 +2684,47 @@ mod tests {
     }
 
     #[test]
+    fn jj_marker_is_caps_routed_and_toggleable() {
+        use crate::sidebar::{GitGlyphs, SidebarRow};
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "feature", "app");
+        row.git = Some(GitGlyphs {
+            jj: true,
+            ..GitGlyphs::default()
+        });
+        let text = |row: &SidebarRow, display: &SidebarDisplay| -> String {
+            compose_row_lines(
+                row, None, None, false, false, true, None, None, 40, &mut None, display,
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segments)
+                | crate::seg::Line::Split { r: segments, .. }
+                | crate::seg::Line::SplitMinLeft { r: segments, .. } => segments,
+                _ => Vec::new(),
+            })
+            .map(|segment| segment.text)
+            .collect()
+        };
+        // Positive control: the marker already renders at the base; pin its caps
+        // and toggle contract.
+        let marker = crate::caps::active_glyphs().jj;
+        assert!(text(&row, &SidebarDisplay::default()).contains(marker));
+        assert!(
+            !text(
+                &row,
+                &SidebarDisplay {
+                    show_jj: false,
+                    ..SidebarDisplay::default()
+                }
+            )
+            .contains(marker)
+        );
+
+        row.git = Some(GitGlyphs::default());
+        assert!(!text(&row, &SidebarDisplay::default()).contains(marker));
+    }
+
+    #[test]
     fn workspace_queue_token_fits_before_warm_and_shares_its_hit_span() {
         use crate::seg::{Line, Tok};
         use thegn_core::merge_queue_view::{MqRollup, MqTier};
