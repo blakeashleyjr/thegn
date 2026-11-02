@@ -261,6 +261,14 @@ capability id and a redacted view of its arguments — terminal input bytes and
 launch environment values are replaced by a size descriptor, never logged
 verbatim.
 
+Every tool in `tools/list` carries MCP `annotations`: the docs tools and the
+`read`-scope state tools are `readOnlyHint: true`; `sessions_kill`,
+`sessions_input` and `tools_run` are `destructiveHint: true`; `folders_assign`,
+`editor_open`, `sessions_open` and `sessions_fork` are write tools marked
+`destructiveHint: false`. A new write tool is marked destructive until it is
+reviewed. The hints help clients ask before acting; the scopes above are what
+thegn enforces.
+
 ## Third-party MCP aggregation (`mcp proxy`)
 
 `thegn mcp serve` is thegn's _own_ tool endpoint; `thegn mcp proxy` is the
