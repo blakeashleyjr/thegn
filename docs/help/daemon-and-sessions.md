@@ -327,5 +327,6 @@ A refused set remains pending for that pane, and a newer validated set replaces
 it. Reattach, fallback and exit discard unadmitted partial/pending clipboard
 state. Already accepted writes remain in writer FIFO order. If a complete set
 was still waiting when its pane exited, fell back or reattached, the status line
-says “Copy from a pane was not sent to the terminal clipboard (the pane exited
-or restarted first)”; the copied text is never shown.
+adds “Copy from a pane was not sent to the terminal clipboard (the pane exited
+or restarted first)” to any fresh exit or session message; the copied text is
+never shown.
