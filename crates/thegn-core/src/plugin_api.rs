@@ -2300,10 +2300,10 @@ pub static HOST_VERB_SUPPORT: &[HostVerbSupport] = &[
     HostVerbSupport {
         verb: HostVerb::Io,
         since: ApiVersion::new(0, 1, 0),
-        state: SupportState::Wired,
+        state: SupportState::Reserved,
         authority: "declared scheme:target capability",
         modes: BOTH_MODES,
-        owner: "plugin runtime",
+        owner: "THE-162 (no bounded I/O implementation)",
     },
     HostVerbSupport {
         verb: HostVerb::Notify,
@@ -3783,6 +3783,17 @@ timeout_secs = 5
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(verbs.len(), HOST_VERB_SUPPORT.len());
         assert_eq!(verbs, HostVerb::ALL.iter().copied().collect());
+    }
+
+    #[test]
+    fn io_verb_is_reserved_in_the_support_matrix() {
+        let row = HOST_VERB_SUPPORT
+            .iter()
+            .find(|row| row.verb == HostVerb::Io)
+            .expect("io has a host support row");
+
+        assert_eq!(row.state, SupportState::Reserved);
+        assert!(row.owner.contains("THE-162"));
     }
 
     #[test]
