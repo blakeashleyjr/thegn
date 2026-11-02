@@ -2109,6 +2109,41 @@ pub(crate) fn verify_v97_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v98: pipeline_leases.generation and the pipeline_lease_fence counter, the Lead-lease fencing generation (THE-208).
+pub(crate) fn migrate_v98(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "pipeline_leases", "generation") {
+        conn.execute(
+            "ALTER TABLE pipeline_leases ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pipeline_lease_fence (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_generation INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO pipeline_lease_fence (id, last_generation) VALUES (1, 0);",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v98_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "pipeline_leases", "generation") {
+        bail!("schema v98 migration did not add pipeline_leases.generation");
+    }
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pipeline_lease_fence WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    if count != 1 {
+        bail!("schema v98 migration did not create the pipeline_lease_fence row");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3495,13 +3530,71 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 97);
         let events = upgraded
             .merge_queue_events("/private/v97-worktree", 10)
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].target_base_oid, None);
         super::verify_v97_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v98_adds_pipeline_lease_generation_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v98_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        super::migrate_v63_leases(&conn).unwrap();
+        assert!(super::verify_v98_schema(&conn).is_err());
+        super::migrate_v98(&conn).unwrap();
+        super::migrate_v98(&conn).unwrap();
+        super::verify_v98_schema(&conn).unwrap();
+        let generation: i64 = conn
+            .query_row(
+                "SELECT last_generation FROM pipeline_lease_fence WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 0);
+    }
+
+    #[test]
+    fn v98_upgrades_a_real_v97_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v97.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.acquire_pipeline_lease("repo:linear:A-1", "lead-a", 300)
+                .unwrap()
+                .unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE pipeline_leases DROP COLUMN generation;\n\
+                     DROP TABLE pipeline_lease_fence;\n\
+                     PRAGMA user_version=97;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 98);
+        assert_eq!(
+            upgraded
+                .pipeline_lease_generation("repo:linear:A-1")
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            upgraded
+                .acquire_pipeline_lease_fenced("repo:linear:A-1", "lead-a", 300)
+                .unwrap(),
+            Ok(1)
+        );
+        super::verify_v98_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

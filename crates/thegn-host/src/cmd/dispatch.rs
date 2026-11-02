@@ -1319,15 +1319,15 @@ fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) ->
                 }
                 return Ok(());
             }
-            match db.acquire_pipeline_lease(name, owner, ttl)? {
-                Ok(()) => {
+            match db.acquire_pipeline_lease_fenced(name, owner, ttl)? {
+                Ok(generation) => {
                     if json {
                         return super::emit_json(
-                            &serde_json::json!({ "acquired": true, "owner": owner, "ttl": ttl }),
+                            &serde_json::json!({ "acquired": true, "owner": owner, "ttl": ttl, "generation": generation }),
                         );
                     }
                     outln!(
-                        "lease {}: held by {} for {ttl}s",
+                        "lease {}: held by {} for {ttl}s (generation {generation})",
                         pipeline_report::display_cell(name),
                         pipeline_report::display_cell(owner)
                     );
