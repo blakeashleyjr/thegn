@@ -679,66 +679,78 @@ fn sync_accounts_with_generation(
     let mut connectivity = ConnectivityEvidenceBatch::default();
     // The sink applies database pages while this blocking thread drives the shared
     // runtime (ms-scale).
-    let Some(()) = thegn_svc::bg_runtime::block_on(router.list_events_each(window, &tokens, |r| {
-        connectivity.observe(connectivity_evidence(
-            network_accounts.contains(r.account.as_str()),
-            &r.result,
-        ));
-        let mut page = match r.result {
-            Ok(p) => p,
-            Err(e) => {
-                record_failure(
-                    db,
-                    &r.account,
-                    r.provider,
-                    &e,
-                    &prior_errors,
-                    notify,
-                    generation,
+    let Some(skipped) = thegn_svc::bg_runtime::block_on(router.list_events_each_while(
+        window,
+        &tokens,
+        || crate::hydrate_schedule::generation_is_current(generation),
+        |r| {
+            connectivity.observe(connectivity_evidence(
+                network_accounts.contains(r.account.as_str()),
+                &r.result,
+            ));
+            let mut page = match r.result {
+                Ok(p) => p,
+                Err(e) => {
+                    record_failure(
+                        db,
+                        &r.account,
+                        r.provider,
+                        &e,
+                        &prior_errors,
+                        notify,
+                        generation,
+                    );
+                    return;
+                }
+            };
+            // The cache rows built from the page are a second copy of it, so they
+            // are accounted under the page's lease. Advisory on purpose: the data
+            // is already admitted and in hand, and throwing a valid page away —
+            // silently, since a pool refusal is nobody's fault — would be worse
+            // than one unaccounted copy. The pool is sized so this cannot happen
+            // to an account on its own (see `GLOBAL_MAX_BYTES`).
+            let derived = page.reserved().1;
+            if let Err(e) = page.reserve_derived(derived) {
+                tracing::debug!(
+                    target: "thegn::calendar",
+                    account = %r.account,
+                    error = %e,
+                    "cache rows exceed the shared budget — writing them anyway"
                 );
-                return;
             }
-        };
-        // The cache rows built from the page are a second copy of it, so they
-        // are accounted under the page's lease. Advisory on purpose: the data
-        // is already admitted and in hand, and throwing a valid page away —
-        // silently, since a pool refusal is nobody's fault — would be worse
-        // than one unaccounted copy. The pool is sized so this cannot happen
-        // to an account on its own (see `GLOBAL_MAX_BYTES`).
-        let derived = page.reserved().1;
-        if let Err(e) = page.reserve_derived(derived) {
-            tracing::debug!(
-                target: "thegn::calendar",
-                account = %r.account,
-                error = %e,
-                "cache rows exceed the shared budget — writing them anyway"
-            );
-        }
-        if apply_page_with_generation(db, &r.account, r.provider, &page, window, generation) {
-            changed = true;
-        }
-        let diagnostics = page.diagnostics();
-        let current_generation = crate::hydrate_schedule::generation_is_current(generation);
-        if current_generation && !diagnostics.is_empty() {
-            tracing::warn!(
-                target: "thegn::calendar",
-                account = %r.account,
-                quarantined = diagnostics.quarantined_events,
-                zones = diagnostics.unresolved_zones,
-                other = diagnostics.other,
-                overflow = diagnostics.overflow,
-                "calendar events could not be read"
-            );
-        }
-        if current_generation
-            && !page.is_unchanged()
-            && let Some(text) = note_page_diagnostics(&r.account, diagnostics)
-        {
-            notify(text);
-        }
-    })) else {
+            if apply_page_with_generation(db, &r.account, r.provider, &page, window, generation) {
+                changed = true;
+            }
+            let diagnostics = page.diagnostics();
+            let current_generation = crate::hydrate_schedule::generation_is_current(generation);
+            if current_generation && !diagnostics.is_empty() {
+                tracing::warn!(
+                    target: "thegn::calendar",
+                    account = %r.account,
+                    quarantined = diagnostics.quarantined_events,
+                    zones = diagnostics.unresolved_zones,
+                    other = diagnostics.other,
+                    overflow = diagnostics.overflow,
+                    "calendar events could not be read"
+                );
+            }
+            if current_generation
+                && !page.is_unchanged()
+                && let Some(text) = note_page_diagnostics(&r.account, diagnostics)
+            {
+                notify(text);
+            }
+        },
+    )) else {
         return false;
     };
+    if skipped > 0 {
+        tracing::debug!(
+            target: "thegn::calendar",
+            skipped,
+            "calendar pass superseded — queued accounts not started"
+        );
+    }
     if crate::hydrate_schedule::generation_is_current(generation) {
         match connectivity.outcome() {
             Some(ConnEvidence::Reachable) => thegn_core::connectivity::report_success(),
