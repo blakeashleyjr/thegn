@@ -109,8 +109,12 @@ replace the pin in `.actrc` in one commit. The default run does not load a
 secret file and does not reuse its job container. The anonymous default plus
 an explicit per-invocation `--secret-file .secrets` is the credential boundary:
 it gives the checked-out branch's workflow and composite-action code access to
-the token, so use it only on code you trust. Credentialed runs are not bound to
-a reviewed workflow revision. The token is unnecessary for anonymous access to
+the token, so use it only on code you trust. A credentialed run refuses unless
+`.github/` and `.actrc` match HEAD, and prints the HEAD it is bound to. A clean
+tree still runs the checked-out branch's committed workflow code, so use
+credentials only on commits you trust. Credentials cannot be combined with
+`--reuse`. Every run passes `--rm` unless `--reuse` is given, so act removes its
+containers after a failed run. The token is unnecessary for anonymous access to
 current public flake inputs. `--reuse` explicitly retains the container and its
 mutable `/nix` state; avoid carrying it across revisions or trust domains.
 
