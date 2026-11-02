@@ -1984,6 +1984,7 @@ fn verify_facts_with_report_head(
             artifact: None,
             artifact_identity: pipeline_run::ArtifactIdentity::NotPipeline,
             artifact_empty: false,
+            artifact_content: pipeline_run::ArtifactContent::NotRead,
             exists: false,
             tracked: false,
             dirty: false,
@@ -2014,6 +2015,11 @@ fn verify_facts_with_report_head(
         .join(&artifact)
         .symlink_metadata()
         .is_ok_and(|m| m.is_file() && m.len() == 0);
+    let artifact_content = if row.stage.is_some() && exists {
+        read_artifact_content(&wt.join(&artifact))
+    } else {
+        pipeline_run::ArtifactContent::NotRead
+    };
     let artifact_identity = match row.stage.as_deref() {
         None => pipeline_run::ArtifactIdentity::NotPipeline,
         Some(stage) => {
@@ -2050,6 +2056,7 @@ fn verify_facts_with_report_head(
         artifact: Some(artifact),
         artifact_identity,
         artifact_empty,
+        artifact_content,
         exists,
         tracked,
         dirty,
@@ -2087,6 +2094,24 @@ fn verify_facts_with_report_head(
         );
     }
     facts
+}
+
+fn read_artifact_content(path: &std::path::Path) -> pipeline_run::ArtifactContent {
+    use std::io::Read;
+
+    let Ok(file) = thegn_core::fsperm::open_regular_file_nofollow(path) else {
+        return pipeline_run::ArtifactContent::Unreadable;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(pipeline_run::ARTIFACT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return pipeline_run::ArtifactContent::Unreadable;
+    }
+    let over_limit = bytes.len() as u64 > pipeline_run::ARTIFACT_MAX_BYTES;
+    pipeline_run::classify_artifact_bytes(&bytes, over_limit)
 }
 
 /// Return Some(true/false) for git exit 0/1; any spawn or other exit failure is unknown.
@@ -2213,7 +2238,8 @@ fn reap_facts(
             || (matches!(
                 &f.artifact_identity,
                 pipeline_run::ArtifactIdentity::Canonical
-            ) && !f.artifact_empty),
+            ) && !f.artifact_empty
+                && f.artifact_content == pipeline_run::ArtifactContent::Valid),
     }
 }
 
@@ -5046,6 +5072,7 @@ mod tests {
             artifact: Some("artifact.md".into()),
             artifact_identity: pipeline_run::ArtifactIdentity::Canonical,
             artifact_empty: false,
+            artifact_content: pipeline_run::ArtifactContent::Valid,
             exists: true,
             tracked: true,
             dirty: false,
@@ -5067,6 +5094,7 @@ mod tests {
             artifact: Some("artifact.md".into()),
             artifact_identity: pipeline_run::ArtifactIdentity::Canonical,
             artifact_empty: false,
+            artifact_content: pipeline_run::ArtifactContent::Valid,
             exists: true,
             tracked: true,
             dirty: false,
@@ -5351,6 +5379,55 @@ mod tests {
         let mut row = row_in(&root, Some(ARTIFACT));
         row.report = Some("PASS\ngate: just test -- exit 0".into());
         done_gate(&row).unwrap();
+    }
+
+    #[test]
+    fn canonical_artifact_binary_committed_file_is_refused() {
+        let (_dir, root) = git_repo("canonical-binary");
+        commit_test_file(&root, ARTIFACT, "a\0b");
+        let mut row = row_in(&root, Some(ARTIFACT));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(error.contains("binary (contains NUL)"), "{error}");
+    }
+
+    #[test]
+    fn canonical_artifact_with_terminal_escape_is_refused() {
+        let (_dir, root) = git_repo("canonical-terminal-control");
+        commit_test_file(&root, ARTIFACT, "# x\x1b]52;c;x\x07");
+        let mut row = row_in(&root, Some(ARTIFACT));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(
+            error.contains("terminal control or bidi override"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn canonical_artifact_over_the_byte_bound_is_refused() {
+        let (_dir, root) = git_repo("canonical-too-large");
+        let content = "x".repeat(pipeline_run::ARTIFACT_MAX_BYTES as usize + 1);
+        commit_test_file(&root, ARTIFACT, &content);
+        let mut row = row_in(&root, Some(ARTIFACT));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        let error = done_gate(&row).unwrap_err().to_string();
+        assert!(error.contains("is larger than"), "{error}");
+    }
+
+    #[test]
+    fn reap_plan_does_not_close_a_binary_handoff() {
+        let (_dir, root) = git_repo("reap-binary-handoff");
+        commit_test_file(&root, ARTIFACT, "a\0b");
+        let mut row = row_in(&root, Some(ARTIFACT));
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
+        row.exit_code = Some(0);
+        let plan = reap_plan_rows(&[row], Some(&[]), &HashMap::new());
+        assert_eq!(plan.len(), 1);
+        assert!(
+            !matches!(&plan[0].verdict, pipeline_reap::ReapVerdict::CloseDone),
+            "binary handoff must not be reaped done"
+        );
     }
 
     #[test]
