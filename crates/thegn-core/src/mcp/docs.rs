@@ -574,7 +574,9 @@ mod tests {
         let reg = registry();
         let r = router(&reg, json!({}));
         let resp = r.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
-        for tool in resp["result"]["tools"].as_array().unwrap() {
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5);
+        for tool in tools {
             assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
             assert_eq!(tool["annotations"]["destructiveHint"], json!(false));
         }

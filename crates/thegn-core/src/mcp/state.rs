@@ -1230,6 +1230,7 @@ mod tests {
     fn tool_entries_annotate_read_write_and_destructive_classes() {
         let r = StateRouter::new(all_caps(), |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
+        assert_eq!(entries.len(), MCP_STATE_CAPS.len());
         for entry in &entries {
             let name = entry["name"].as_str().unwrap();
             let cap = MCP_STATE_CAPS
@@ -1238,6 +1239,10 @@ mod tests {
                 .unwrap();
             let read_only = scope_of(lookup(cap).unwrap()) == Scope::Read;
             assert_eq!(entry["annotations"]["readOnlyHint"], json!(read_only));
+            assert_eq!(
+                entry["annotations"]["destructiveHint"],
+                json!(!read_only && !NON_DESTRUCTIVE_WRITE_CAPS.contains(cap))
+            );
         }
 
         for (name, read_only, destructive) in [
