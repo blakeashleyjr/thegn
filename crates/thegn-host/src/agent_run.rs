@@ -686,7 +686,7 @@ fn agent_floor_gate_with_effective(
     provision_dispatch(dispatch, &|spec| {
         let report =
             thegn_core::sandbox::ensure_attested(spec, &crate::daemon::compose_guard(&full.daemon))
-                .map_err(|error| format!("{error:#}"))?;
+                .map_err(|error| thegn_core::sandbox::refusal_context(&error))?;
         let warning = compose_unverified_warning(spec, &report);
         thegn_core::sandbox_preflight::preflight_exec(spec)?;
         Ok(warning)
@@ -804,10 +804,16 @@ pub(crate) fn run_outcome_cancellable(
         Some(spec) => match thegn_core::sandbox::enter_argv_guarded(spec, &command) {
             Ok(guarded) => guarded.into_parts(),
             Err(error) => {
-                tracing::error!("{error}; refusing queued agent sandbox launch");
-                return AgentRunVerdict::NotStarted(format!(
-                    "{error}; refusing queued agent sandbox launch"
-                ));
+                let reason = format!(
+                    "{}; refusing queued agent sandbox launch ({error})",
+                    error.remediation_hint()
+                );
+                tracing::error!(
+                    target: "thegn::agent",
+                    %reason,
+                    "queued agent sandbox launch refused"
+                );
+                return AgentRunVerdict::NotStarted(reason);
             }
         },
         None => (
@@ -2275,6 +2281,38 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_agent_sandbox_refusal_names_the_fix_and_spawns_nothing() {
+        let worktree = tempfile::tempdir().unwrap();
+        let marker = worktree.path().join("spawned");
+        let template = format!(
+            "touch {}",
+            thegn_core::util::sh_quote(&marker.to_string_lossy())
+        );
+        let vars = vars();
+        let spec = thegn_core::sandbox::SandboxSpec {
+            volumes: vec![("/tmp/state".into(), "/mnt/state".into())],
+            ..sandbox_spec()
+        };
+        let task = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            command_template: &template,
+            sandbox: Some(spec),
+            ..task(TaskKind::MergeConflict, &vars)
+        };
+
+        match run_outcome(&task) {
+            AgentRunVerdict::NotStarted(reason) => {
+                assert!(reason.contains("[volume-name]"));
+                assert!(reason.contains("refusing queued agent sandbox launch"));
+            }
+            verdict => panic!("expected refused launch, got {verdict:?}"),
+        }
+        // The no-spawn check already held before this change; the class hint above is the regression assertion.
+        assert!(!marker.exists());
     }
 
     #[test]
