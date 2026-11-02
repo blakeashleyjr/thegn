@@ -24,8 +24,8 @@ use thegn_core::db::{CompatibleDb, Db, SchemaOperation};
 use thegn_core::merge_lifecycle::{LifecycleAction, LifecycleEvent, decide};
 use thegn_core::outln;
 use thegn_core::store::{
-    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    WorktreeAuxStore,
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeOperation,
+    MergeOutcomeWrite, WorktreeAuxStore,
 };
 
 use crate::integrate::{self, AttemptOutcome};
@@ -270,6 +270,7 @@ fn persist_landed_row(
         target_branch,
         location: "",
         status: MergeFinalStatus::Landed,
+        operation: MergeOutcomeOperation::RawLand,
         result_oid: Some(result_oid),
         conflict_paths: None,
         error_detail: None,

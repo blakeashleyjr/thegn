@@ -11,8 +11,9 @@ use crate::store::{
     MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
     MERGE_QUEUE_EVENTS_PER_WORKTREE, MergeAttemptResult, MergeCandidate, MergeClaim,
     MergeClaimActive, MergeClaimPhase, MergeClaimRequest, MergeClaimView, MergeEnqueueIdentity,
-    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    MergeQueueEvent, MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields, WorktreeAuxStore,
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeOperation,
+    MergeOutcomeWrite, MergeQueueEvent, MergeRegistryIdentity, MergeRetryOutcome,
+    MergeStatusFields, WorktreeAuxStore,
 };
 use crate::util;
 use anyhow::Result;
@@ -900,6 +901,27 @@ impl WorktreeAuxStore for Db {
             .as_ref()
             .map(|registry| registry.location.as_deref())
             .unwrap_or(observed.queue_location.as_deref());
+        let has_current_events: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('merge_queue_events') WHERE name = 'target_base_oid')",
+            [],
+            |row| row.get(0),
+        )?;
+        let candidate_oid = if has_current_events
+            && current
+                .queue
+                .as_ref()
+                .is_none_or(|row| row.status != outcome.status.as_str())
+        {
+            tx.query_row(
+                "SELECT candidate_oid FROM merge_queue WHERE worktree=?1",
+                [outcome.worktree],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        } else {
+            None
+        };
         let upsert = if has_claim_owner {
             "INSERT INTO merge_queue \
                 (worktree,branch,target_branch,status,queued_at,updated_at,\
@@ -938,6 +960,35 @@ impl WorktreeAuxStore for Db {
         )?;
         if has_claim_owner && changed == 0 {
             return Ok(MergeOutcomeWrite::Claimed);
+        }
+        if has_current_events
+            && current
+                .queue
+                .as_ref()
+                .is_none_or(|row| row.status != outcome.status.as_str())
+        {
+            let prior = current.queue.as_ref();
+            record_merge_event(
+                &tx,
+                &MergeQueueEvent {
+                    worktree: outcome.worktree.to_owned(),
+                    operation: outcome.operation.as_str().into(),
+                    outcome: if prior.is_some() {
+                        "transition"
+                    } else {
+                        "created"
+                    }
+                    .into(),
+                    old_status: prior.map_or_else(String::new, |row| row.status.clone()),
+                    new_status: Some(outcome.status.as_str().into()),
+                    row_updated_at: prior.map_or(0, |row| row.updated_at),
+                    candidate_oid,
+                    result_oid: outcome.result_oid.map(str::to_owned),
+                    target_base_oid: None,
+                    actor: format!("thegn pid {}", std::process::id()),
+                    at_ms: util::now_ms(),
+                },
+            )?;
         }
         tx.commit()?;
         Ok(MergeOutcomeWrite::Written)
