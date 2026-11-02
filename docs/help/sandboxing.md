@@ -310,8 +310,11 @@ provider placements. Only infrastructure names such as `PATH`, `HOME`,
 `TERM` and `LANG`, `LC_*`, `THEGN_*`, and names in
 `[profiles.<name>.sandbox] env_passthrough` are shared; that profile list
 replaces `[sandbox] env_passthrough`. At startup, the thegn process also unsets
-known credential environment families, keeping `SSH_AUTH_SOCK` only when the
-profile has `ssh/id`. Its git, gh and GnuPG directories are mounted read-only in
+names ending in `_TOKEN`, `_SECRET`, `_PASSWORD`, `_KEY`, `_AUTH`,
+`_CREDENTIAL`/`_CREDENTIALS` or `_PASSPHRASE`, plus cloud/package names such as
+`GOOGLE_APPLICATION_CREDENTIALS` and `DOCKER_AUTH_CONFIG`. It keeps
+`SSH_AUTH_SOCK` only when the profile has `ssh/id`. Its git, gh and GnuPG
+directories are mounted read-only in
 sandboxes; a pane that needs to write them, such as `gh auth login` or GnuPG
 signing, needs an explicit `[sandbox] mounts` grant. Startup refuses if the
 profile state or credential directories cannot be created. Startup also
@@ -495,7 +498,10 @@ passthrough drop credential-shaped variables plus `GH_CONFIG_DIR`, `GNUPGHOME`,
 variables (the resolver's `THEGN_SANDBOX` marker is retained). Autonomous
 sandbox specs also lose SSH identity mounts and mounts at
 or below `~/.ssh`, `~/.gnupg` and `~/.config/gh`; Git credential helpers are
-reset. `XDG_RUNTIME_DIR` and `GIT_CONFIG_GLOBAL` are kept for launcher plumbing
+reset. Autonomous agents (queue agents and autopilot) see the repository's
+`.git/hooks` and the worktree's `config.worktree` read-only, so they cannot plant
+a hook that host-side git later runs; interactive panes are unchanged.
+`XDG_RUNTIME_DIR` and `GIT_CONFIG_GLOBAL` are kept for launcher plumbing
 and commit identity. A broad `[sandbox] mounts` entry that exposes the whole
 home still exposes these directories; they are not masked inside a broad home
 mount. With `agent_sandbox` on, a queue agent whose sandbox cannot be
@@ -632,6 +638,15 @@ or host placement is configured. Also on the dev channel, failed agent-login upl
 agent logins” Failed with one line per account but do not stop provisioning. The resident bridge
 uses the pinned environment or workspace default; if that selection is unreadable, it skips
 connecting and logs a warning.
+On the dev channel, if the worktree location cannot be read, pane launches and
+provider connections are refused when a remote placement is configured
+(`[placement]`, `[sandbox.remote]`, or a non-local or host-pinned `[env.*]`);
+without one, panes use the local path.
+
+On any channel, closing a tab whose location cannot be read tears down by path
+only and warns on the status line that a remote sandbox may remain. Idle
+hibernation also keeps the sandbox, logs a warning and retries later when it
+cannot tell whether a shell is attached.
 
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and
@@ -722,6 +737,9 @@ On the dev channel, `max_lifetime_secs` is enforced by the Fly and VPS reapers
 (Hetzner and DigitalOcean). Providers without a lifetime reaper, such as
 machine0 and Sprites, do not enforce it; `thegn config validate` warns when it
 is set. Destroy those instances yourself or set the value to `0`.
+
+The Hetzner provider is experimental: its lifecycle has not been verified on a
+live account, and `thegn doctor` says so.
 
 On the dev channel, an unreadable or malformed VPS or Fly ledger record is
 refused rather than treated as absent. Destroy, retarget, address lookup,

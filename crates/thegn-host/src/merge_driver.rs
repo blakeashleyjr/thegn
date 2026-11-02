@@ -349,6 +349,40 @@ pub(crate) fn drive_queue(
     items: Vec<QueueItem>,
     progress: impl FnMut(&DriveStep),
 ) -> DriveOutcome {
+    match crate::merge_remote::sweep_orphan_ingest_refs(
+        &thegn_core::remote::GitLoc::Local(repo_root.to_path_buf()),
+        || {
+            db.list_merge_queue().map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            thegn_core::remote::GitLoc::from_db(
+                                &row.worktree,
+                                (!row.location.is_empty()).then_some(row.location.as_str()),
+                            ),
+                            row.branch.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        },
+    ) {
+        Ok(report) if report.deleted > 0 || report.failed > 0 || report.limit_reached => {
+            tracing::warn!(
+                target: "thegn::merge",
+                deleted = report.deleted,
+                failed = report.failed,
+                limit_reached = report.limit_reached,
+                "swept orphaned merge-queue ingest refs"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            target: "thegn::merge",
+            %error,
+            "merge-queue ingest ref sweep skipped"
+        ),
+    }
     let worktree_branches: HashMap<String, String> = items
         .iter()
         .map(|item| (item.worktree.clone(), item.branch.clone()))
@@ -743,6 +777,18 @@ fn recoverable_in_progress_status(status: &str) -> bool {
     )
 }
 
+/// Statuses the drain claims directly (no expired-claim recovery): every held status plus queued and ready.
+fn drain_admits_directly(status: &str) -> bool {
+    MqStatus::parse(status).is_some_and(|status| {
+        status.is_held() || matches!(status, MqStatus::Queued | MqStatus::Ready)
+    })
+}
+
+/// Whether an attempt starts from a held row (adoptable fast-forward repair; see candidate_drift).
+fn drain_attempt_is_held(status: &str) -> bool {
+    MqStatus::parse(status).is_some_and(MqStatus::is_held)
+}
+
 fn drive_queue_with(
     cfg: &MergeQueueConfig,
     full: &Config,
@@ -841,16 +887,7 @@ fn drive_queue_with(
             ));
             continue;
         }
-        let recovering: bool = if !matches!(
-            fresh.status.as_str(),
-            "queued"
-                | "deferred"
-                | "gate_failed"
-                | "gate_error"
-                | "needs_human"
-                | "ready"
-                | "agent_blocked"
-        ) {
+        let recovering: bool = if !drain_admits_directly(&fresh.status) {
             let active_claim = db.observe_merge_claim(&item.worktree);
             let now_ms = util::now_ms();
             let recoverable = match active_claim {
@@ -1050,10 +1087,7 @@ fn drive_queue_with(
                 ));
                 break;
             }
-            let held = matches!(
-                fresh.status.as_str(),
-                "agent_blocked" | "needs_human" | "gate_failed" | "gate_error" | "deferred"
-            );
+            let held = drain_attempt_is_held(&fresh.status);
             let attempt = match (actions.attempt)(&item.branch, &branch_loc, held) {
                 Ok(a) => a,
                 Err(e) => {

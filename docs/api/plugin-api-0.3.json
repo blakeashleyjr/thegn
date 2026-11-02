@@ -1026,9 +1026,9 @@
         "one_shot",
         "resident"
       ],
-      "owner": "plugin runtime",
+      "owner": "THE-162 (no bounded I/O implementation)",
       "since": "0.1.0",
-      "state": "wired",
+      "state": "reserved",
       "verb": "io"
     },
     {

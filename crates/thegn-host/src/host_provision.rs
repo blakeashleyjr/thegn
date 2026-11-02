@@ -12,6 +12,7 @@
 //! effort split where only workspace/clone are fatal — and neither exists here
 //! (the worktree is already bind-mounted). Delivery attestation failures fail
 //! their step and withhold the provision marker.
+//! A process-shared lease allows one provisioning transfer per environment and container at a time.
 
 use std::time::Duration;
 
@@ -30,6 +31,60 @@ use crate::agent::{ProvisionState, ProvisionStepView};
 const MARKER: &str = ".thegn-host-provisioned";
 const MARKER_VERSION: &str = "2";
 const TOOLCHAIN_PROVIDER_STEP: &str = "toolchain_provider";
+
+/// Held for one `provision_worktree_on_host` run: one transfer per (env, container) at a time (THE-441).
+struct ContainerLease {
+    _file: std::fs::File,
+}
+
+fn container_lease_path(
+    lock_dir: &std::path::Path,
+    env_name: &str,
+    container: &str,
+) -> std::path::PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(b"thegn-host-provision-lease-v1\0");
+    digest.update(env_name.as_bytes());
+    digest.update(b"\0");
+    digest.update(container.as_bytes());
+    lock_dir.join(format!("{:x}.lock", digest.finalize()))
+}
+
+#[allow(deprecated)]
+fn acquire_container_lease_in(
+    lock_dir: &std::path::Path,
+    env_name: &str,
+    container: &str,
+) -> std::io::Result<Option<ContainerLease>> {
+    thegn_core::fsperm::ensure_private_dir(lock_dir)?;
+    let path = container_lease_path(lock_dir, env_name, container);
+    let file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match thegn_core::fsperm::create_owner_only_exclusive(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thegn_core::fsperm::open_regular_file_nofollow(&path)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(ContainerLease { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn acquire_container_lease(
+    env_name: &str,
+    container: &str,
+) -> std::io::Result<Option<ContainerLease>> {
+    let lock_dir = thegn_core::util::thegn_dir().join("host-provision-leases");
+    acquire_container_lease_in(&lock_dir, env_name, container)
+}
 
 fn container_home(probe: Result<(bool, String, String), String>) -> Result<String, String> {
     let (ok, out, stderr) =
@@ -107,6 +162,22 @@ pub(crate) fn provision_worktree_on_host(
         return None; // bwrap/none: the pipeline targets OCI containers only
     }
     let container = spec.name.clone();
+
+    let _lease = match acquire_container_lease(env_name, &container) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            thegn_core::msg::warn(&format!(
+                "host worktree pipeline: another provisioning of container {container} is already running; this open skips it (the next open re-checks the provision marker)"
+            ));
+            return None;
+        }
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "host worktree pipeline: provisioning lease for container {container} unavailable: {error}; provisioning skipped"
+            ));
+            return None;
+        }
+    };
 
     // 2. A probed CONCRETE runner (container execs + tar push are inherent
     //    OciRunner methods; probe fills the runtime kind, one cheap exec).
@@ -714,6 +785,57 @@ pub(crate) fn plan_summary(req: &envplan::EnvRequirements, cfg: &Config) -> (Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_lease_is_exclusive_per_env_and_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_container_lease_in(dir.path(), "box", "tg-a").unwrap();
+        assert!(first.is_some());
+        assert!(
+            acquire_container_lease_in(dir.path(), "box", "tg-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            acquire_container_lease_in(dir.path(), "box", "tg-b")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            acquire_container_lease_in(dir.path(), "other", "tg-a")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn container_lease_is_freed_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = acquire_container_lease_in(dir.path(), "box", "tg-a").unwrap();
+        assert!(lease.is_some());
+        drop(lease);
+        assert!(
+            acquire_container_lease_in(dir.path(), "box", "tg-a")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn container_lease_file_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = acquire_container_lease_in(dir.path(), "box", "tg-a").unwrap();
+        assert!(lease.is_some());
+        if let Some(mode) =
+            thegn_core::fsperm::mode_bits(&container_lease_path(dir.path(), "box", "tg-a")).unwrap()
+        {
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "lease file permissions must exclude group/other"
+            );
+        }
+    }
 
     #[test]
     fn provision_generation_changes_with_the_plan() {

@@ -618,3 +618,79 @@ fn refund_returns_a_consumed_attempt_only_to_the_live_claim() {
     assert!(!db.refund_merge_agent_attempt(&claim).unwrap());
     assert_eq!(db.list_merge_queue().unwrap()[0].agent_attempts, 1);
 }
+
+#[test]
+fn claimed_transition_records_one_drive_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET candidate_oid='cand' WHERE worktree=?1",
+            [WT],
+        )
+        .unwrap();
+    let before = db.list_merge_queue().unwrap()[0].updated_at;
+
+    let claim = db
+        .replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+        .unwrap();
+
+    let events = db.merge_queue_events(WT, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operation, "drive");
+    assert_eq!(events[0].outcome, "transition");
+    assert_eq!(events[0].old_status, "queued");
+    assert_eq!(events[0].new_status.as_deref(), Some("folding"));
+    assert_eq!(events[0].row_updated_at, before);
+    assert_eq!(events[0].candidate_oid.as_deref(), Some("cand"));
+    assert_eq!(events[0].result_oid, None);
+    assert_eq!(events[0].actor, format!("thegn pid {}", std::process::id()));
+
+    db.replace_merge_status_claimed(
+        &claim,
+        "landed",
+        &MergeStatusFields {
+            result_oid: Some("res".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let events = db.merge_queue_events(WT, 10).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].old_status, "folding");
+    assert_eq!(events[0].new_status.as_deref(), Some("landed"));
+    assert_eq!(events[0].result_oid.as_deref(), Some("res"));
+}
+
+#[test]
+fn same_status_claimed_write_records_no_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    let claim = db
+        .replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+        .unwrap();
+    db.replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+        .unwrap();
+
+    assert_eq!(db.merge_queue_events(WT, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn lost_claim_records_no_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET claim_generation=claim_generation+1 WHERE worktree=?1",
+            [WT],
+        )
+        .unwrap();
+
+    let result = db.replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default());
+    assert!(matches!(result, Err(error) if error.to_string().contains(MERGE_CLAIM_LOST)));
+    assert!(db.merge_queue_events(WT, 10).unwrap().is_empty());
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+}

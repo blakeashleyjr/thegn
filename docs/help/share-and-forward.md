@@ -39,15 +39,21 @@ shared; activating it opens a detail popup listing the shares (the
 From the command line, `thegn share stop <port>` tears down a Tailscale share
 and removes its saved record only after teardown is confirmed; on failure it
 exits nonzero and keeps the record so you can retry. A share started by a
-foreground `thegn share start` is stopped by interrupting that command. Use
+foreground `thegn share start` ends when that command is interrupted. Use
 `thegn share stop <port> --forget` only to remove the saved record; it does not
 touch the tunnel.
+`thegn share start` refuses a port that already has a saved share; stop it
+first, or use `--forget` for a stale record. It records the share as `starting`
+before the tunnel comes up. `thegn share stop <port>` also tears down a
+Tailscale share left in `starting` or `failed` state.
 A Tailscale share runs `tailscale serve` in the worktree's VPN sidecar through
 the container runtime and container id recorded when that sidecar starts. If a
 running sidecar has no runtime record, share start refuses and stop cannot
 verify teardown; restarting the worktree sandbox lets thegn record the runtime.
 Stopping a share in thegn while it is still starting cancels the start, so
 the tunnel does not come up after the stop request.
+A Tailscale share reports its URL only after `tailscale serve status` in the
+sidecar shows it; if it does not, the serve is turned off and the share fails.
 A share client started by thegn runs in its own process group. Stopping it sends
 TERM to the group, then KILL after a short grace period if processes remain; the
 row stays `stopping…` until the group has exited.

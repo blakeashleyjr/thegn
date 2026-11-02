@@ -634,6 +634,7 @@ impl HostContract {
 
         let mut accepted_ids = HashSet::new();
         let mut accepted_surfaces: HashSet<String> = HashSet::new();
+        let mut accepted_issue_provider: Option<String> = None;
         for contrib in &manifest.contributions {
             let support = self.support_for(&contrib.extension_point);
             let reason = if !self
@@ -675,6 +676,12 @@ impl HostContract {
                     "duplicate surface {} (already declared by another contribution of this plugin)",
                     surface.as_str()
                 ))
+            } else if contrib.extension_point == ExtensionPoint::IssueProvider
+                && let Some(first) = &accepted_issue_provider
+            {
+                Some(format!(
+                    "a plugin may declare one IssueProvider contribution; {first} is already the issue provider"
+                ))
             } else {
                 None
             };
@@ -688,6 +695,9 @@ impl HostContract {
                 accepted_ids.insert(contrib.id.as_str().to_string());
                 if let Some(surface) = &contrib.surface {
                     accepted_surfaces.insert(surface.as_str().to_string());
+                }
+                if contrib.extension_point == ExtensionPoint::IssueProvider {
+                    accepted_issue_provider = Some(contrib.id.as_str().to_string());
                 }
                 neg.accepted_contributions.push(contrib.clone());
             }
@@ -2300,10 +2310,10 @@ pub static HOST_VERB_SUPPORT: &[HostVerbSupport] = &[
     HostVerbSupport {
         verb: HostVerb::Io,
         since: ApiVersion::new(0, 1, 0),
-        state: SupportState::Wired,
+        state: SupportState::Reserved,
         authority: "declared scheme:target capability",
         modes: BOTH_MODES,
-        owner: "plugin runtime",
+        owner: "THE-162 (no bounded I/O implementation)",
     },
     HostVerbSupport {
         verb: HostVerb::Notify,
@@ -3786,6 +3796,17 @@ timeout_secs = 5
     }
 
     #[test]
+    fn io_verb_is_reserved_in_the_support_matrix() {
+        let row = HOST_VERB_SUPPORT
+            .iter()
+            .find(|row| row.verb == HostVerb::Io)
+            .expect("io has a host support row");
+
+        assert_eq!(row.state, SupportState::Reserved);
+        assert!(row.owner.contains("THE-162"));
+    }
+
+    #[test]
     fn debug_adapter_extension_point_negotiates_reserved() {
         let point = ExtensionPoint::DebugAdapter;
         let encoded = serde_json::to_value(&point).unwrap();
@@ -3917,6 +3938,62 @@ timeout_secs = 5
                 .reason
                 .contains("duplicate surface support-test.surface")
         );
+    }
+
+    #[test]
+    fn negotiation_rejects_a_second_issue_provider_contribution() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::IssueProvider,
+            vec![Capability::new("surface", "provider")],
+            PluginMode::Resident,
+        );
+        let mut second = spec.manifest.contributions[0].clone();
+        second.id = ContributionId::new("support-test.second");
+        second.label = "Second".into();
+        second.surface = Some(SurfaceId::new("support-test.second-surface"));
+        spec.manifest.contributions.push(second);
+
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert_eq!(negotiated.accepted_contributions.len(), 1);
+        assert_eq!(
+            negotiated.accepted_contributions[0].id.as_str(),
+            "support-test.row"
+        );
+        assert_eq!(negotiated.rejected_contributions.len(), 1);
+        assert_eq!(
+            negotiated.rejected_contributions[0]
+                .contribution
+                .id
+                .as_str(),
+            "support-test.second"
+        );
+        let reason = &negotiated.rejected_contributions[0].reason;
+        assert!(reason.contains("one IssueProvider"));
+        assert!(reason.contains("support-test.row"));
+    }
+
+    #[test]
+    fn negotiation_keeps_one_issue_provider_beside_other_points() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::IssueProvider,
+            vec![
+                Capability::new("surface", "provider"),
+                Capability::new("surface", "statusbar"),
+            ],
+            PluginMode::Resident,
+        );
+        let mut status = spec.manifest.contributions[0].clone();
+        status.id = ContributionId::new("support-test.status");
+        status.extension_point = ExtensionPoint::StatusBarSegment;
+        status.label = "Status".into();
+        status.surface = Some(SurfaceId::new("support-test.status-surface"));
+        spec.manifest.contributions.push(status);
+
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert_eq!(negotiated.accepted_contributions.len(), 2);
+        assert!(negotiated.rejected_contributions.is_empty());
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
-    /// Show the merge-queue audit trail for a worktree (operator retry/remove/clear), newest first.
+    /// Show the merge-queue audit trail for a worktree (drain transitions and operator retry/remove/clear), newest first.
     History {
         #[command(flatten)]
         target: super::target::WorktreeFlag,
