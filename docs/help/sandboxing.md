@@ -638,6 +638,15 @@ or host placement is configured. Also on the dev channel, failed agent-login upl
 agent logins” Failed with one line per account but do not stop provisioning. The resident bridge
 uses the pinned environment or workspace default; if that selection is unreadable, it skips
 connecting and logs a warning.
+On the dev channel, if the worktree location cannot be read, pane launches and
+provider connections are refused when a remote placement is configured
+(`[placement]`, `[sandbox.remote]`, or a non-local or host-pinned `[env.*]`);
+without one, panes use the local path.
+
+On any channel, closing a tab whose location cannot be read tears down by path
+only and warns on the status line that a remote sandbox may remain. Idle
+hibernation also keeps the sandbox, logs a warning and retries later when it
+cannot tell whether a shell is attached.
 
 Pool state shows on the sidebar's project chip, not in this section.
 `thegn doctor` lists claimed warm-pool spares without a bound worktree and

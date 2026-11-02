@@ -115,6 +115,11 @@ repo trust behavior.
 Switching to a project that is not already warm shows an `Opening <name>…`
 spinner on the status line while its saved state loads off the UI thread; a
 warm project switches immediately.
+Creating, opening or cloning a project uses this same flow: database and git
+work runs off the UI thread, and the status line shows `Opening <name>…` before
+the project opens. Deleting the project you are in switches to the first
+remaining project in sidebar order (immediately if warm, otherwise with the
+spinner); deleting the last project leaves an empty view.
 
 The canonical action ids above use `*-project`. Existing bindings using
 `new-workspace`, `delete-workspace`, `switch-workspace`, `next-workspace`,
