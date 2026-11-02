@@ -1446,8 +1446,11 @@ mod tests {
         let row = record();
         let held = lock_ledger(&dir).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
         let worker = std::thread::spawn(move || {
-            sender.send(record_authorized_at(&dir, &row)).unwrap();
+            sender
+                .send(record_authorized_at(&worker_dir, &row))
+                .unwrap();
         });
 
         assert!(matches!(
@@ -1460,10 +1463,7 @@ mod tests {
         );
         drop(held);
 
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
+        receiver.recv().unwrap().unwrap();
         worker.join().unwrap();
         assert!(
             read_at(&dir, "fly", "env:FLY_WORK", "tg-project-feature")
@@ -1480,10 +1480,11 @@ mod tests {
         record_authorized_at(&dir, &row).unwrap();
         let held = lock_ledger(&dir).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
         let worker = std::thread::spawn(move || {
             sender
                 .send(record_revoked_at(
-                    &dir,
+                    &worker_dir,
                     "fly",
                     "env:FLY_WORK",
                     "tg-project-feature",
@@ -1501,10 +1502,7 @@ mod tests {
         );
         drop(held);
 
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
+        receiver.recv().unwrap().unwrap();
         worker.join().unwrap();
         assert_eq!(
             read_at(&dir, "fly", "env:FLY_WORK", "tg-project-feature").unwrap(),
@@ -1669,9 +1667,7 @@ mod tests {
         publish_locked(&dir, &recovering).unwrap();
         drop(held);
 
-        let result = receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
+        let result = receiver.recv().unwrap();
         worker.join().unwrap();
         assert!(
             result
@@ -1741,6 +1737,29 @@ mod tests {
         let result = record_authorized_at(temp.path(), &record());
 
         assert!(result.is_err());
+        assert!(list_at(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ledger_lock_refuses_a_dangling_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock = temp.path().join(".custody.lock");
+        let target = temp.path().join("missing-lock-target");
+        if let Err(error) = crate::fsperm::create_symlink(&target, &lock, false) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ),
+                "unexpected symlink fixture error: {error}"
+            );
+            return;
+        }
+
+        let result = record_authorized_at(temp.path(), &record());
+
+        assert!(result.is_err());
+        assert!(!target.exists());
         assert!(list_at(temp.path()).unwrap().is_empty());
     }
 }
