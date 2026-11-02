@@ -74,6 +74,61 @@ fn conformance_fixture_names_are_unique() {
 }
 
 #[test]
+fn conformance_matrix_carries_recurrence_instance_rows() {
+    let recurrence_fixture_names: Vec<_> = FIXTURES
+        .iter()
+        .filter(|fixture| {
+            fixture
+                .ics
+                .is_some_and(|(ics, _)| ics.contains("RECURRENCE-ID:"))
+                || fixture
+                    .json
+                    .is_some_and(|(json, _)| json.contains("\"recurrence_id\""))
+        })
+        .map(|fixture| fixture.name)
+        .collect();
+    let admitted_override = FIXTURES.iter().find(|fixture| {
+        matches!(
+            (fixture.ics, fixture.json),
+            (
+                Some((ics, Verdict::Admit)),
+                Some((json, Verdict::Admit))
+            ) if ics.contains("RECURRENCE-ID:") && json.contains("\"recurrence_id\"")
+        )
+    });
+    let Some(admitted_override) = admitted_override else {
+        panic!(
+            "missing admitted recurrence-instance fixture; recurrence rows: {recurrence_fixture_names:?}"
+        );
+    };
+    let (json, _) = admitted_override
+        .json
+        .expect("admitted override has a JSON representation");
+    let event: CalEvent = serde_json::from_str(json).expect("admitted override JSON deserializes");
+    assert!(
+        event.recurrence_id.is_some(),
+        "{} JSON must exercise the optional recurrence_id field",
+        admitted_override.name
+    );
+    let serialized = serde_json::to_value(&event).expect("calendar event serializes");
+    assert!(
+        serialized.get("recurrence_id").is_some(),
+        "{} recurrence_id must survive the CalEvent round trip",
+        admitted_override.name
+    );
+
+    let rejected_ics = FIXTURES.iter().find(|fixture| {
+        fixture.ics.is_some_and(|(ics, verdict)| {
+            ics.contains("RECURRENCE-ID:") && verdict == Verdict::Reject
+        })
+    });
+    assert!(
+        rejected_ics.is_some(),
+        "missing rejected malformed RECURRENCE-ID fixture; recurrence rows: {recurrence_fixture_names:?}"
+    );
+}
+
+#[test]
 fn a_duration_at_the_timedelta_limit_does_not_panic_the_window_filter() {
     let mut out = Vec::new();
     let mut report = IcsReport::default();
