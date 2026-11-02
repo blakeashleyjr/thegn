@@ -59,13 +59,6 @@
       ]
     },
     {
-      "issue": "THE-104",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "define-external-ide-inbound-boundary"
-      ]
-    },
-    {
       "issue": "THE-107",
       "project": "Plugin UI Platform",
       "changes": [
