@@ -85,6 +85,9 @@ pub struct VerifyFacts {
     pub artifact_identity: ArtifactIdentity,
     /// The artifact is a zero-byte regular file.
     pub artifact_empty: bool,
+    /// Bounded content classification; `NotRead` unless this is a pipeline
+    /// row whose artifact exists.
+    pub artifact_content: ArtifactContent,
     /// The file exists under the worktree.
     pub exists: bool,
     /// The file is committed in `HEAD` and unchanged at this path.
@@ -118,6 +121,59 @@ pub enum ArtifactIdentity {
     Canonical,
     /// The path names a different file than this row's canonical handoff.
     Mismatch { expected: String },
+}
+
+/// Bounds shared with the dispatch CLI's chunk-file reader.
+pub const ARTIFACT_MAX_BYTES: u64 = 1024 * 1024;
+/// Maximum number of lines accepted in a pipeline handoff.
+pub const ARTIFACT_MAX_LINES: usize = 8192;
+
+/// Bounded classification of a pipeline artifact's contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactContent {
+    /// No pipeline artifact was read, or the artifact does not exist.
+    NotRead,
+    /// The artifact is within bounds and contains permitted text.
+    Valid,
+    /// The artifact exceeds the byte bound.
+    TooLarge,
+    /// The artifact exceeds the line bound.
+    TooManyLines,
+    /// The artifact contains a NUL byte.
+    Binary,
+    /// The artifact is not valid UTF-8.
+    InvalidUtf8,
+    /// The artifact contains a C0/C1 control or bidi embedding, override, or isolate; `at` is the character index.
+    Control { at: usize },
+    /// The bounded open or read failed.
+    Unreadable,
+}
+
+/// Classify bounded artifact bytes without performing I/O.
+pub fn classify_artifact_bytes(bytes: &[u8], over_limit: bool) -> ArtifactContent {
+    if over_limit {
+        return ArtifactContent::TooLarge;
+    }
+    if bytes.contains(&0) {
+        return ArtifactContent::Binary;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return ArtifactContent::InvalidUtf8;
+    };
+    let lines = text.bytes().filter(|byte| *byte == b'\n').count()
+        + usize::from(!text.is_empty() && !text.ends_with('\n'));
+    if lines > ARTIFACT_MAX_LINES {
+        return ArtifactContent::TooManyLines;
+    }
+    for (at, character) in text.chars().enumerate() {
+        if (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+            || matches!(character as u32, 0x202A..=0x202E | 0x2066..=0x2069)
+        {
+            return ArtifactContent::Control { at };
+        }
+    }
+    ArtifactContent::Valid
 }
 
 /// Result of observing `git status --porcelain` for an artifact-bearing row.
@@ -253,6 +309,28 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
     }
     if f.stage.is_some() && f.artifact_empty && f.exists {
         reasons.push(format!("artifact {a:?} is empty"));
+    }
+    if f.stage.is_some() && f.exists {
+        let content_reason = match f.artifact_content {
+            ArtifactContent::NotRead | ArtifactContent::Valid => None,
+            ArtifactContent::TooLarge => Some(format!(
+                "artifact {a:?} is larger than {ARTIFACT_MAX_BYTES} bytes"
+            )),
+            ArtifactContent::TooManyLines => Some(format!(
+                "artifact {a:?} has more than {ARTIFACT_MAX_LINES} lines"
+            )),
+            ArtifactContent::Binary => Some(format!("artifact {a:?} is binary (contains NUL)")),
+            ArtifactContent::InvalidUtf8 => Some(format!("artifact {a:?} is not valid UTF-8")),
+            ArtifactContent::Control { at } => Some(format!(
+                "artifact {a:?} contains a terminal control or bidi override at character {at}"
+            )),
+            ArtifactContent::Unreadable => {
+                Some(format!("could not read artifact {a:?}; retry verification"))
+            }
+        };
+        if let Some(reason) = content_reason {
+            reasons.push(reason);
+        }
     }
     if f.worktree_state == Some(WorktreeState::Unknown) {
         reasons.push(
@@ -620,6 +698,7 @@ mod tests {
             artifact: artifact.map(str::to_string),
             artifact_identity: ArtifactIdentity::NotPipeline,
             artifact_empty: false,
+            artifact_content: ArtifactContent::NotRead,
             exists,
             tracked,
             dirty,
@@ -635,6 +714,78 @@ mod tests {
             report_verdict: crate::pipeline_report::Verdict::Pass,
             report_commit_binding: ReportCommitBinding::Unbound,
         }
+    }
+
+    #[test]
+    fn classify_artifact_bytes_table() {
+        let too_many_lines = b"x\n".repeat(ARTIFACT_MAX_LINES + 1);
+        let max_lines = b"x\n".repeat(ARTIFACT_MAX_LINES);
+        let cases = [
+            (b"# handoff\n".as_slice(), false, ArtifactContent::Valid),
+            (b"".as_slice(), true, ArtifactContent::TooLarge),
+            (b"a\0b".as_slice(), false, ArtifactContent::Binary),
+            (b"\xff\xfe".as_slice(), false, ArtifactContent::InvalidUtf8),
+            (&too_many_lines, false, ArtifactContent::TooManyLines),
+            (&max_lines, false, ArtifactContent::Valid),
+            (
+                b"ok\x1b[2J".as_slice(),
+                false,
+                ArtifactContent::Control { at: 2 },
+            ),
+            (
+                "a\u{202e}b".as_bytes(),
+                false,
+                ArtifactContent::Control { at: 1 },
+            ),
+            (
+                "a\u{0085}b".as_bytes(),
+                false,
+                ArtifactContent::Control { at: 1 },
+            ),
+            (b"a\r\n\tb\n".as_slice(), false, ArtifactContent::Valid),
+            ("\u{200d}".as_bytes(), false, ArtifactContent::Valid),
+        ];
+        for (bytes, over_limit, expected) in cases {
+            assert_eq!(classify_artifact_bytes(bytes, over_limit), expected);
+        }
+    }
+
+    #[test]
+    fn verify_report_refuses_each_bad_content_class_for_a_pipeline_row() {
+        let cases = [
+            (ArtifactContent::TooLarge, "is larger than 1048576 bytes"),
+            (ArtifactContent::TooManyLines, "has more than 8192 lines"),
+            (ArtifactContent::Binary, "is binary (contains NUL)"),
+            (ArtifactContent::InvalidUtf8, "is not valid UTF-8"),
+            (
+                ArtifactContent::Control { at: 2 },
+                "contains a terminal control or bidi override at character 2",
+            ),
+            (ArtifactContent::Unreadable, "could not read artifact"),
+        ];
+        for (content, reason) in cases {
+            let mut facts = facts_report(Some("x.md"), true, true, false, true);
+            facts.stage = Some("code".into());
+            facts.artifact_identity = ArtifactIdentity::Canonical;
+            facts.artifact_content = content;
+            let report = verify_report(&facts);
+            assert!(!report.ok, "{content:?} must refuse completion");
+            assert!(
+                report.reasons.iter().any(|actual| actual.contains(reason)),
+                "{report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_report_ignores_content_for_plain_rows() {
+        let mut facts = facts_report(Some("plain.md"), true, true, false, true);
+        facts.artifact_content = ArtifactContent::Binary;
+        let report = verify_report(&facts);
+        assert!(
+            report.ok,
+            "positive control: plain dispatch content is unchanged"
+        );
     }
 
     #[test]
