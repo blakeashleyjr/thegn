@@ -1,7 +1,7 @@
 //! Loop-owned lifecycle for the deep system-monitor sampler.
 use std::{
     sync::{Arc, Condvar, Mutex, MutexGuard},
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -143,8 +143,9 @@ impl Clock for LiveClock {
 
 type Factory = Arc<dyn Fn() -> Vec<Box<dyn Collector>> + Send + Sync>;
 type Wake = Arc<dyn Fn() -> Result<(), ()> + Send + Sync>;
-type Spawn =
-    Arc<dyn Fn(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> + Send + Sync>;
+type Spawn = Arc<
+    dyn Fn(&'static str, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> + Send + Sync,
+>;
 
 struct SpawnInputs {
     factory: Factory,
@@ -153,8 +154,11 @@ struct SpawnInputs {
     spawn: Spawn,
 }
 
-fn live_spawn(name: &str, task: Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> {
-    thread::Builder::new().name(name.to_owned()).spawn(task)
+fn live_spawn(
+    name: &'static str,
+    task: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<JoinHandle<()>> {
+    thegn_core::thread_name::try_spawn_named(name, task)
 }
 
 pub(crate) struct MonitorSampler {
