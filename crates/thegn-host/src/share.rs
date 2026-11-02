@@ -164,6 +164,20 @@ pub(crate) fn apply_share_persist(db: &thegn_core::db::Db, op: SharePersist) {
     }
 }
 
+/// Durable operation for an event the supervisor accepted. `other_generation_live` is whether
+/// another generation still occupies the same (worktree, port). Only an unconditional upsert is
+/// suppressed then (it would overwrite the newer generation's row); a fenced delete always runs
+/// because it can only remove this generation's own row.
+pub(crate) fn accepted_share_persist(
+    ev: &ShareEvent,
+    other_generation_live: bool,
+) -> Option<SharePersist> {
+    match share_persist_for(ev) {
+        SharePersist::MarkFailed { .. } if other_generation_live => None,
+        op => Some(op),
+    }
+}
+
 /// The lifecycle state of one share, as the UI sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShareState {
@@ -2014,5 +2028,306 @@ mod tests {
         assert!(!sup.is_stopping("/other", 3000, 100));
         assert!(!sup.is_stopping("/wt", 3001, 100));
         assert!(!sup.is_stopping("/wt", 3000, 99));
+    }
+
+    #[test]
+    fn old_generation_down_deletes_its_row_while_a_new_generation_starts() {
+        let db = thegn_core::db::Db::open_memory().expect("in-memory database");
+        let up61 = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://old.test").expect("valid URL"),
+        };
+        apply_share_persist(&db, share_persist_for(&up61));
+
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 62,
+            provider: "bore",
+            public: true,
+            state: ShareState::Starting,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        let down61 = ShareEvent::Down {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+        };
+        assert!(sup.on_event(down61.clone()));
+        let other = sup.has_other_generation("/wt", 3000, 61);
+        assert!(other);
+        let op = accepted_share_persist(&down61, other).expect("fenced delete runs");
+        apply_share_persist(&db, op);
+        assert!(db.list_shares().expect("list saved shares").is_empty());
+
+        let failed62 = ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 62,
+            provider: "bore",
+            error: "restart failed before Up".into(),
+            teardown_unverified: false,
+        };
+        assert!(sup.on_event(failed62.clone()));
+        let op = accepted_share_persist(&failed62, false).expect("failed start delete runs");
+        apply_share_persist(&db, op);
+        assert!(db.list_shares().expect("list saved shares").is_empty());
+    }
+
+    #[test]
+    fn old_generation_unverified_failure_never_overwrites_the_new_row() {
+        let db = thegn_core::db::Db::open_memory().expect("in-memory database");
+        let up62 = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 62,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://new.test").expect("valid URL"),
+        };
+        apply_share_persist(&db, share_persist_for(&up62));
+
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 62,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(
+                PublicEndpoint::parse_url("https://new.test").expect("valid URL"),
+            ),
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        let failed61 = ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            error: "teardown unverified".into(),
+            teardown_unverified: true,
+        };
+        assert!(sup.on_event(failed61.clone()));
+        assert!(accepted_share_persist(&failed61, true).is_none());
+        let rows = db.list_shares().expect("list saved shares");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].generation, 62);
+        assert_eq!(rows[0].state, "up");
+    }
+
+    #[test]
+    fn accepted_persist_keeps_fenced_ops_for_replaced_generations() {
+        let up = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 62,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://new.test").expect("valid URL"),
+        };
+        let down = ShareEvent::Down {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+        };
+        let failed_verified = ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            error: "provider failed".into(),
+            teardown_unverified: false,
+        };
+        let failed_unverified = ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            error: "teardown unverified".into(),
+            teardown_unverified: true,
+        };
+
+        assert!(matches!(
+            accepted_share_persist(&up, true),
+            Some(SharePersist::Upsert { generation: 62, .. })
+        ));
+        assert!(matches!(
+            accepted_share_persist(&down, true),
+            Some(SharePersist::DeleteIfOwned { generation: 61, .. })
+        ));
+        assert!(matches!(
+            accepted_share_persist(&failed_verified, true),
+            Some(SharePersist::DeleteIfOwned { generation: 61, .. })
+        ));
+        assert!(accepted_share_persist(&failed_unverified, true).is_none());
+        assert!(matches!(
+            accepted_share_persist(&failed_unverified, false),
+            Some(SharePersist::MarkFailed { generation: 61, .. })
+        ));
+    }
+
+    // Positive control: duplicate Up events are rejected by the supervisor already.
+    #[test]
+    fn duplicate_up_for_one_generation_is_rejected() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 7,
+            provider: "bore",
+            public: true,
+            state: ShareState::Starting,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+
+        let first = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 7,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://first.test").expect("valid URL"),
+        };
+        let second = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 7,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://second.test").expect("valid URL"),
+        };
+        assert!(sup.on_event(first));
+        assert!(!sup.on_event(second));
+        assert_eq!(
+            sup.views("/wt")[0].url.as_deref(),
+            Some("https://first.test")
+        );
+    }
+
+    // Positive control: a second terminal Down for a removed generation is a no-op.
+    #[test]
+    fn duplicate_down_is_a_noop() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 7,
+            provider: "bore",
+            public: true,
+            state: ShareState::Up(PublicEndpoint::parse_url("https://up.test").expect("valid URL")),
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        let down = ShareEvent::Down {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 7,
+        };
+
+        assert!(sup.on_event(down.clone()));
+        assert!(!sup.on_event(down));
+        assert!(sup.views("/wt").is_empty());
+    }
+
+    // Positive control: an Up arriving after stop cannot revive that generation.
+    #[test]
+    fn delayed_up_for_a_stopping_generation_is_rejected() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        let late_up = ShareEvent::Up {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 61,
+            provider: "bore",
+            url: PublicEndpoint::parse_url("https://late.test").expect("valid URL"),
+        };
+
+        assert!(!sup.on_event(late_up));
+        assert!(sup.is_stopping("/wt", 3000, 61));
+        assert!(sup.views("/wt")[0].url.is_none());
+    }
+
+    // Positive control: a terminal event for one provider leaves the reused port's new owner intact.
+    #[test]
+    fn provider_change_on_a_reused_port_keeps_generations_apart() {
+        let mut sup = ShareSupervisor::new();
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 100,
+            provider: "bore",
+            public: true,
+            state: ShareState::Stopping,
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        sup.instances.push(ShareInstance {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 101,
+            provider: "frp",
+            public: true,
+            state: ShareState::Up(PublicEndpoint::parse_url("https://b.test").expect("valid URL")),
+            shared: Shared::new(),
+            event_tx: None,
+            event_waker: None,
+        });
+        let failed_old = ShareEvent::Failed {
+            worktree: "/wt".into(),
+            port: 3000,
+            generation: 100,
+            provider: "bore",
+            error: "old provider stopped".into(),
+            teardown_unverified: false,
+        };
+
+        assert!(sup.on_event(failed_old));
+        let views = sup.views("/wt");
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].provider, "frp");
+        assert_eq!(views[0].url.as_deref(), Some("https://b.test"));
+        assert_eq!(sup.generation_of("/wt", 3000), Some(101));
     }
 }
