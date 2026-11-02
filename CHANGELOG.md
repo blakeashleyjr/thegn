@@ -9,6 +9,45 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.42] — 2026-10-28 (maintenance batch 79)
 
+### Added
+
+- `thegn merge history` lists a worktree's recorded retry, remove and clear
+  outcomes, newest first, with `--worktree`, `--limit` and `--json` options.
+- `thegn doctor --json` reports a skipped non-executable `tgproxy` sibling as
+  `model_proxy.tgproxy_skipped`.
+
+### Changed
+
+- Creating, opening or cloning a project runs database and git work off the UI
+  thread and shows the `Opening <name>…` spinner while it opens.
+- `thegn wt new --from-issue` names plugin issue providers it skips.
+- `[forward]` uses the one container runtime holding the worktree's container;
+  if multiple runtimes have one with that name, forwarding pauses with a
+  status-line explanation.
+
+### Fixed
+
+- Deleting the active project switches to the first remaining project; deleting
+  the last leaves an empty view.
+- Disabling or reloading a plugin stops its in-flight one-shot run, and failed
+  one-shot runs are reported on the status line.
+- An unverified pane-daemon health check makes `thegn daemon stop` exit
+  non-zero naming it and prevents startup from starting a second daemon beside
+  it.
+- (dev channel) Closing a worktree with `data = "sync"` skips files excluded
+  by `.git/info/exclude` or the global git excludes file; an unreadable warm-pool
+  ledger warns before provisioning fresh; autoscale keeps a host whose age and
+  use are both unknown; and idle hibernation keeps a sandbox when it cannot
+  tell whether a shell is attached.
+- Closing a tab whose worktree location cannot be read falls back to path-only
+  teardown and warns that a remote sandbox may remain.
+
+### Security
+
+- (dev channel) If the worktree location cannot be read, pane launches and
+  provider connections are refused when a remote placement is configured;
+  without one, panes use the local path.
+
 ## [0.1.0-alpha.41] — 2026-10-23 (maintenance batch 78)
 
 ### Changed
