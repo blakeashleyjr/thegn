@@ -1195,7 +1195,8 @@ pub trait ControlApi: Send + Sync + 'static {
     // provider seam the panel uses); the dispatch verbs and `worktree_create`
     // are local DB / git, like the merge verbs.
 
-    /// List tracker issues matching `filter` (`issues.list`); `complete` is false when any account was partial or failed.
+    /// List tracker issues matching `filter` (`issues.list`); `complete` is false when any account
+    /// was partial or failed.
     fn issues_list<'a>(
         &'a self,
         _filter: &'a thegn_core::issue::IssueFilter,
