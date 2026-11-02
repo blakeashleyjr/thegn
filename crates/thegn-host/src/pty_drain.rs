@@ -411,11 +411,14 @@ fn finish_exit(
     exit_code: Option<i32>,
     summary: &mut DrainSummary,
 ) {
-    if let Some(p) = ctx.panes.table.get_mut(&id) {
+    let discarded = if let Some(p) = ctx.panes.table.get_mut(&id) {
         p.clipboard
             .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
-        reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
-    }
+        reset_terminal_streams(&mut p.clipboard, &mut p.query_parser)
+    } else {
+        false
+    };
+    note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, discarded);
     if ctx.preview.pane_exit(id) {
         *ctx.dirty = true;
     }
@@ -429,13 +432,27 @@ fn finish_exit(
 /// Reset every per-pane parser that consumes the terminal output stream.
 /// Lifecycle boundaries must use this function so the OSC 52 and query
 /// scanners cannot retain different prefixes across a pane generation.
-/// Register every future streaming parser here.
+/// Register every future streaming parser here. Returns whether an unadmitted
+/// clipboard set was discarded.
 fn reset_terminal_streams(
     clipboard: &mut crate::queries::clipboard::Clipboard,
     query_parser: &mut crate::queries::QueryParser,
-) {
-    clipboard.reset();
+) -> bool {
+    let discarded = clipboard.reset();
     query_parser.reset();
+    discarded
+}
+
+/// Fixed, payload-free status for a pane clipboard set that was still waiting
+/// for writer capacity when its pane exited, fell back or reattached.
+const PANE_CLIPBOARD_DISCARDED: &str =
+    "Copy from a pane was not sent to the terminal clipboard (the pane exited or restarted first)";
+
+fn note_discarded_clipboard(model: &mut FrameModel, dirty: &mut bool, discarded: bool) {
+    if discarded {
+        model.status = PANE_CLIPBOARD_DISCARDED.to_string();
+        *dirty = true;
+    }
 }
 
 #[derive(Default)]
@@ -530,16 +547,24 @@ pub(crate) fn drain<T: Terminal>(
             }
             Ok(PaneEvent::SessionFallback(id)) => {
                 backlog.barrier(id);
-                if let Some(p) = ctx.panes.table.get_mut(&id) {
-                    reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
-                }
+                let discarded = ctx
+                    .panes
+                    .table
+                    .get_mut(&id)
+                    .map(|p| reset_terminal_streams(&mut p.clipboard, &mut p.query_parser))
+                    .unwrap_or(false);
+                note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, discarded);
                 fallbacks.push(id);
             }
             Ok(PaneEvent::Reattached(id)) => {
                 backlog.barrier(id);
-                if let Some(p) = ctx.panes.table.get_mut(&id) {
-                    reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
-                }
+                let discarded = ctx
+                    .panes
+                    .table
+                    .get_mut(&id)
+                    .map(|p| reset_terminal_streams(&mut p.clipboard, &mut p.query_parser))
+                    .unwrap_or(false);
+                note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, discarded);
                 reattached.push(id);
             }
             Err(tokio_mpsc::error::TryRecvError::Empty) => break,
@@ -2638,5 +2663,34 @@ mod tests {
             Some(Some("m0".into()))
         );
         assert_eq!(connect_failure_selection("/wt", Ok(None)), Some(None));
+    }
+
+    #[test]
+    fn reset_terminal_streams_reports_a_discarded_pending_clipboard_set() {
+        let mut clipboard = crate::queries::clipboard::Clipboard::default();
+        let mut query_parser = crate::queries::QueryParser::default();
+        clipboard.feed(b"\x1b]52;c;eA==\x07");
+        clipboard.submit(Err);
+
+        assert!(reset_terminal_streams(&mut clipboard, &mut query_parser));
+        assert!(!reset_terminal_streams(&mut clipboard, &mut query_parser));
+
+        clipboard.feed(b"\x1b]52;c;");
+        assert!(!reset_terminal_streams(&mut clipboard, &mut query_parser));
+    }
+
+    #[test]
+    fn discarded_clipboard_note_is_fixed_and_payload_free() {
+        let mut model = FrameModel::default();
+        let mut dirty = false;
+        note_discarded_clipboard(&mut model, &mut dirty, false);
+        assert!(model.status.is_empty());
+        assert!(!dirty);
+
+        note_discarded_clipboard(&mut model, &mut dirty, true);
+        assert_eq!(model.status, PANE_CLIPBOARD_DISCARDED);
+        assert!(dirty);
+        assert!(!model.status.contains("eA=="));
+        assert!(!model.status.chars().any(char::is_control));
     }
 }
