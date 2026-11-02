@@ -117,31 +117,29 @@ fn reaper(lane: CaptureLane) -> Result<&'static mpsc::SyncSender<ReapJob>, Probe
     static GIT_REAPER: OnceLock<Result<mpsc::SyncSender<ReapJob>, String>> = OnceLock::new();
     static CAPABILITY_REAPER: OnceLock<Result<mpsc::SyncSender<ReapJob>, String>> = OnceLock::new();
     let (holder, slots, name) = match lane {
-        CaptureLane::Git => (&GIT_REAPER, 2, "thegn-cleanup-reaper"),
-        CaptureLane::Capability => (&CAPABILITY_REAPER, 1, "thegn-capability-reaper"),
+        CaptureLane::Git => (&GIT_REAPER, 2, "thegn-git-reap"),
+        CaptureLane::Capability => (&CAPABILITY_REAPER, 1, "thegn-cap-reap"),
     };
     holder
         .get_or_init(|| {
             let (tx, rx) = mpsc::sync_channel::<ReapJob>(slots);
-            std::thread::Builder::new()
-                .name(name.into())
-                .spawn(move || {
-                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                    while let Ok((mut child, budget)) = rx.recv() {
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "blocking reap runs only on this dedicated background thread"
-                        )]
-                        let status = child.wait();
-                        if status.is_err() {
-                            // Unknown ownership/reap state must not free capacity for
-                            // an unbounded succession of unreaped children.
-                            std::mem::forget((child, budget));
-                        }
+            thegn_core::thread_name::try_spawn_named(name, move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                while let Ok((mut child, budget)) = rx.recv() {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "blocking reap runs only on this dedicated background thread"
+                    )]
+                    let status = child.wait();
+                    if status.is_err() {
+                        // Unknown ownership/reap state must not free capacity for
+                        // an unbounded succession of unreaped children.
+                        std::mem::forget((child, budget));
                     }
-                })
-                .map(|_| tx)
-                .map_err(|e| e.to_string())
+                }
+            })
+            .map(|_| tx)
+            .map_err(|e| e.to_string())
         })
         .as_ref()
         .map_err(|e| probe_error(format!("cleanup reaper unavailable: {e}")))
@@ -157,15 +155,13 @@ fn reap_later(child: std::process::Child, budget: Arc<GitBudget>, lane: CaptureL
     }
 }
 
-type WorkerSpawner = fn(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
-fn spawn_worker(name: &str, task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            task();
-        })
-        .map(drop)
+type WorkerSpawner = fn(&'static str, Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+fn spawn_worker(name: &'static str, task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    thegn_core::thread_name::try_spawn_named(name, move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        task();
+    })
+    .map(drop)
 }
 
 fn abort_setup(
@@ -251,7 +247,7 @@ fn capture_output_with(
         .map_err(|e| probe_error(format!("{prefix} could not start: {e}")))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let read = |name: &str, stream: Box<dyn Read + Send>| -> std::io::Result<_> {
+    let read = |name: &'static str, stream: Box<dyn Read + Send>| -> std::io::Result<_> {
         let (tx, rx) = std::sync::mpsc::channel();
         let budget = Arc::clone(&budget);
         worker(
@@ -268,14 +264,14 @@ fn capture_output_with(
         )?;
         Ok(rx)
     };
-    let out = match read("thegn-cleanup-stdout", Box::new(stdout)) {
+    let out = match read("thegn-probe-out", Box::new(stdout)) {
         Ok(rx) => rx,
         Err(error) => {
             abort_setup(child, &group, Arc::clone(&budget), lane);
             return Err(probe_error(format!("stdout worker unavailable: {error}")));
         }
     };
-    let err = match read("thegn-cleanup-stderr", Box::new(stderr)) {
+    let err = match read("thegn-probe-err", Box::new(stderr)) {
         Ok(rx) => rx,
         Err(error) => {
             abort_setup(child, &group, Arc::clone(&budget), lane);
@@ -288,7 +284,7 @@ fn capture_output_with(
         let (tx, rx) = mpsc::channel();
         let writer_budget = Arc::clone(&budget);
         if let Err(error) = worker(
-            "thegn-cleanup-stdin",
+            "thegn-probe-in",
             Box::new(move || {
                 let value = stdin.write_all(input.as_bytes());
                 drop(stdin);

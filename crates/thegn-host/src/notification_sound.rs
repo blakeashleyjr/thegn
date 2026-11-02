@@ -124,49 +124,46 @@ impl SoundRuntime {
         let stopping = Arc::clone(&self.stopping);
         let runtime = Arc::downgrade(self);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("thegn-sound-cfg".into())
-            .spawn(move || {
-                let _done = SignalDone(done_tx);
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                loop {
-                    let request = {
-                        let (pending, changed) = &*slot;
-                        let mut pending = pending.lock().unwrap();
-                        // Never upgrade `runtime` while this guard is held: if
-                        // the temporary Arc were the last reference, its Drop
-                        // would run `shutdown()` and re-lock this mutex.
-                        while pending.is_none() && !stopping.load(Ordering::Acquire) {
-                            pending = changed.wait(pending).unwrap();
-                        }
-                        pending.take()
-                    };
-                    let Some(request) = request else { break };
-                    let Some(runtime) = runtime.upgrade() else {
-                        break;
-                    };
-                    if runtime.stopping.load(Ordering::Acquire) {
-                        break;
+        let spawned = thegn_core::thread_name::try_spawn_named("thegn-sound-cfg", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let _done = SignalDone(done_tx);
+            loop {
+                let request = {
+                    let (pending, changed) = &*slot;
+                    let mut pending = pending.lock().unwrap();
+                    // Never upgrade `runtime` while this guard is held: if
+                    // the temporary Arc were the last reference, its Drop
+                    // would run `shutdown()` and re-lock this mutex.
+                    while pending.is_none() && !stopping.load(Ordering::Acquire) {
+                        pending = changed.wait(pending).unwrap();
                     }
-                    let Some(snapshot) = (runtime.builder)(&request.config, &runtime.stopping)
-                    else {
-                        break;
-                    };
-                    let snapshot = Arc::new(snapshot);
-                    let mut current = runtime.snapshot.lock().unwrap();
-                    if !runtime.stopping.load(Ordering::Acquire)
-                        && runtime.reload_generation.load(Ordering::Acquire) == request.generation
-                    {
-                        *current = snapshot;
-                    }
+                    pending.take()
+                };
+                let Some(request) = request else { break };
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                if runtime.stopping.load(Ordering::Acquire) {
+                    break;
                 }
-            })
-            // best-effort: an unavailable reload worker leaves the empty snapshot in place
-            .ok()
-            .map(|join| Worker {
-                join,
-                done: done_rx,
-            });
+                let Some(snapshot) = (runtime.builder)(&request.config, &runtime.stopping) else {
+                    break;
+                };
+                let snapshot = Arc::new(snapshot);
+                let mut current = runtime.snapshot.lock().unwrap();
+                if !runtime.stopping.load(Ordering::Acquire)
+                    && runtime.reload_generation.load(Ordering::Acquire) == request.generation
+                {
+                    *current = snapshot;
+                }
+            }
+        })
+        // best-effort: an unavailable reload worker leaves the empty snapshot in place
+        .ok()
+        .map(|join| Worker {
+            join,
+            done: done_rx,
+        });
         *self.reload_worker.lock().unwrap() = spawned;
     }
 
@@ -252,47 +249,45 @@ impl SoundRuntime {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
         let runtime = Arc::downgrade(self);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("thegn-sound".into())
-            .spawn(move || {
-                let _done = SignalDone(done_tx);
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                while let Ok(job) = rx.recv() {
-                    let Some(runtime) = runtime.upgrade() else { break };
-                    if runtime.stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    match job {
-                        SoundJob::File { path, volume } => {
-                            let snapshot = runtime.snapshot.lock().unwrap().clone();
-                            let Some(provider) = snapshot.provider.as_ref() else {
-                                runtime.request_fallback("no audio provider");
-                                continue;
-                            };
-                            if !supported_format(&path, &provider.caps().formats) {
-                                runtime.request_fallback("sound file format is unsupported");
-                                continue;
-                            }
-                            if let Err(error) =
-                                provider.play(&path, volume, &runtime.cancellation)
-                            {
-                                tracing::debug!(target: "thegn::notify_sound", %error, "audio provider failed");
-                                runtime.request_fallback_for(&error);
-                            }
+        let spawned = thegn_core::thread_name::try_spawn_named("thegn-sound", move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            let _done = SignalDone(done_tx);
+            while let Ok(job) = rx.recv() {
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                if runtime.stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                match job {
+                    SoundJob::File { path, volume } => {
+                        let snapshot = runtime.snapshot.lock().unwrap().clone();
+                        let Some(provider) = snapshot.provider.as_ref() else {
+                            runtime.request_fallback("no audio provider");
+                            continue;
+                        };
+                        if !supported_format(&path, &provider.caps().formats) {
+                            runtime.request_fallback("sound file format is unsupported");
+                            continue;
                         }
-                        SoundJob::Command(command) => {
-                            if let Err(error) = run_command(&command, &runtime.cancellation) {
-                                tracing::debug!(
-                                    target: "thegn::notify_sound",
-                                    %error,
-                                    "legacy sound command failed"
-                                );
-                                runtime.request_fallback_for(&error);
-                            }
+                        if let Err(error) = provider.play(&path, volume, &runtime.cancellation) {
+                            tracing::debug!(target: "thegn::notify_sound", %error, "audio provider failed");
+                            runtime.request_fallback_for(&error);
+                        }
+                    }
+                    SoundJob::Command(command) => {
+                        if let Err(error) = run_command(&command, &runtime.cancellation) {
+                            tracing::debug!(
+                                target: "thegn::notify_sound",
+                                %error,
+                                "legacy sound command failed"
+                            );
+                            runtime.request_fallback_for(&error);
                         }
                     }
                 }
-            });
+            }
+        });
         *self.worker.lock().unwrap() = Some(Worker {
             join: spawned.ok()?,
             done: done_rx,
