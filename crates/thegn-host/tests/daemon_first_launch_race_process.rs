@@ -281,6 +281,12 @@ mod unix_tests {
     }
 
     fn run_first_launch_race(scope: &Scope, runtime: Option<&Path>, candidates: Vec<PathBuf>) {
+        let database = scope.root.path().join("state/thegn/thegn.db");
+        drop(
+            thegn_core::db::Db::open_at(&database)
+                .expect("initialize isolated state database before daemon race"),
+        );
+
         let mut children = Vec::with_capacity(CHILD_COUNT);
         for index in 0..CHILD_COUNT {
             let command = match runtime {
