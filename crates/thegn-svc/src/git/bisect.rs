@@ -9,14 +9,18 @@ use thegn_core::gitrefs::{BisectState, find_culprit, parse_bisect};
 use thegn_core::remote::GitLoc;
 
 pub trait BisectOps: GitBackend {
-    /// Whether a bisect session is in progress.
-    fn bisecting(&self, loc: &GitLoc) -> bool {
-        loc.read_git_path("BISECT_LOG").is_some()
+    /// Whether a bisect session is in progress. A read failure is an error,
+    /// never "not bisecting".
+    fn bisecting(&self, loc: &GitLoc) -> Result<bool> {
+        Ok(loc
+            .read_git_path_checked("BISECT_LOG")
+            .context("read BISECT_LOG")?
+            .is_some())
     }
 
     /// The live bisect state, or `None` outside a session.
     fn bisect_state(&self, loc: &GitLoc) -> Result<Option<BisectState>> {
-        if !self.bisecting(loc) {
+        if !self.bisecting(loc)? {
             return Ok(None);
         }
         let refs = run_w(
@@ -35,7 +39,7 @@ pub trait BisectOps: GitBackend {
         let head = loc
             .git_text(&["rev-parse", "HEAD"])
             .map_err(|e| anyhow!("read bisect HEAD: {e}"))?;
-        Ok(Some(parse_bisect(&refs, terms.as_deref(), &head)))
+        Ok(Some(parse_bisect(&refs, terms.as_deref(), &head)?))
     }
 
     /// Start a session, optionally seeding bad/good (each mark checks out
@@ -111,7 +115,7 @@ mod tests {
         let bad_head = repo.head();
         let loc = repo.loc();
 
-        assert!(!CliGit.bisecting(&loc));
+        assert!(!CliGit.bisecting(&loc).unwrap());
         assert!(CliGit.bisect_state(&loc).unwrap().is_none());
 
         let mut culprit = CliGit
@@ -119,7 +123,7 @@ mod tests {
             .unwrap();
 
         // Mid-session: state is live and seeded with our endpoints.
-        assert!(CliGit.bisecting(&loc));
+        assert!(CliGit.bisecting(&loc).unwrap());
         let st = CliGit.bisect_state(&loc).unwrap().expect("live state");
         assert_eq!(st.bad_term, "bad");
         assert_eq!(st.good_term, "good");
@@ -137,10 +141,13 @@ mod tests {
             culprit = CliGit.bisect_mark(&loc, term, None).unwrap();
         }
         assert_eq!(culprit.unwrap(), culprit_sha);
-        assert!(CliGit.bisecting(&loc), "still in session until reset");
+        assert!(
+            CliGit.bisecting(&loc).unwrap(),
+            "still in session until reset"
+        );
 
         CliGit.bisect_reset(&loc).unwrap();
-        assert!(!CliGit.bisecting(&loc));
+        assert!(!CliGit.bisecting(&loc).unwrap());
         assert!(CliGit.bisect_state(&loc).unwrap().is_none());
         assert_eq!(CliGit.current_branch(&loc).unwrap(), "main");
         assert_eq!(
@@ -148,5 +155,26 @@ mod tests {
             bad_head,
             "reset returns to the pre-bisect HEAD"
         );
+    }
+
+    #[test]
+    fn unreadable_bisect_log_is_an_error_not_absence() {
+        let repo = TestRepo::new("bi-unreadable");
+        repo.commit_file("data.txt", "content\n", "initial");
+        let loc = repo.loc();
+        std::fs::create_dir(repo.dir.join(".git").join("BISECT_LOG")).unwrap();
+
+        assert!(CliGit.bisecting(&loc).is_err());
+        assert!(CliGit.bisect_state(&loc).is_err());
+    }
+
+    #[test]
+    fn absent_bisect_log_is_not_bisecting() {
+        let repo = TestRepo::new("bi-absent");
+        repo.commit_file("data.txt", "content\n", "initial");
+        let loc = repo.loc();
+
+        assert!(!CliGit.bisecting(&loc).unwrap());
+        assert!(CliGit.bisect_state(&loc).unwrap().is_none());
     }
 }
