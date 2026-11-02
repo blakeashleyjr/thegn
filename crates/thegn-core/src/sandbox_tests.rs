@@ -694,6 +694,7 @@ fn refusal_constructor_preserves_each_class_and_field() {
         RefusalClass::MountDrift,
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
+        RefusalClass::ContainerOwner,
     ] {
         let error = refusal(
             &spec,
@@ -731,6 +732,7 @@ fn refusal_remediation_every_class_has_label_and_text() {
         RefusalClass::MountDrift,
         RefusalClass::ControlSocketReachable,
         RefusalClass::StrictUnsupported,
+        RefusalClass::ContainerOwner,
     ] {
         let label = class.label();
         assert!(!label.is_empty());
@@ -746,6 +748,11 @@ fn refusal_remediation_every_class_has_label_and_text() {
         assert!(!remediation.is_empty());
         assert!(!remediation.ends_with('.'));
     }
+    assert_eq!(RefusalClass::ContainerOwner.label(), "container-owner");
+    assert_eq!(
+        RefusalClass::ContainerOwner.remediation(),
+        "another worktree's sandbox container has this container's name (worktree paths that differ only in punctuation or case share one): close that worktree's sandbox first, or rename one worktree directory"
+    );
 }
 
 #[test]
@@ -795,6 +802,95 @@ fn refusal_remediation_display_is_unchanged() {
         "safe message".into(),
     );
     assert_eq!(error.to_string(), "safe message");
+}
+
+#[test]
+fn owner_verdict_classifies_worktree_labels() {
+    let expected = "v1-expected";
+    assert_eq!(
+        owner_verdict(Some((true, "v1-expected\n".into())), expected),
+        OwnerVerdict::Ours
+    );
+    assert_eq!(
+        owner_verdict(Some((true, "\n".into())), expected),
+        OwnerVerdict::Legacy
+    );
+    assert_eq!(
+        owner_verdict(Some((true, "<no value>\n".into())), expected),
+        OwnerVerdict::Legacy
+    );
+    assert_eq!(
+        owner_verdict(Some((true, "v1-foreign".into())), expected),
+        OwnerVerdict::Foreign("v1-foreign".into())
+    );
+    assert_eq!(
+        owner_verdict(Some((true, "garbage".into())), expected),
+        OwnerVerdict::Foreign("garbage".into())
+    );
+    assert_eq!(owner_verdict(None, expected), OwnerVerdict::Unknown);
+    assert_eq!(
+        owner_verdict(Some((false, String::new())), expected),
+        OwnerVerdict::Unknown
+    );
+}
+
+#[test]
+fn owner_label_probe_reads_only_the_worktree_label() {
+    let spec = spec(Backend::Docker);
+    let argv = owner_label_probe_argv(&spec);
+    let mut expected = oci_prefix(&spec);
+    expected.extend([
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{index .Config.Labels \"thegn.worktree\"}}".into(),
+        spec.name.clone(),
+    ]);
+    assert_eq!(
+        argv, expected,
+        "the runtime must receive a Go template action"
+    );
+}
+
+#[test]
+fn foreign_or_unknown_owner_refuses_and_keeps_the_container() {
+    let spec = spec(Backend::Docker);
+    for verdict in [
+        OwnerVerdict::Foreign("v1-other".into()),
+        OwnerVerdict::Unknown,
+    ] {
+        let error = foreign_owner_refusal(&spec, &verdict)
+            .expect("foreign or unreadable owner must refuse before removal");
+        match error {
+            EnterError::Refused(refusal) => {
+                assert_eq!(refusal.class, RefusalClass::ContainerOwner);
+                assert!(refusal.message.contains(&spec.name));
+                assert!(refusal.message.contains("left running"));
+                assert!(!refusal.message.contains("stopped "));
+                assert!(!refusal.message.contains("shutdown refused for "));
+                assert!(!refusal.message.contains("still running after "));
+            }
+            other => panic!("expected structured container-owner refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(foreign_owner_refusal(&spec, &OwnerVerdict::Ours), None);
+    assert_eq!(foreign_owner_refusal(&spec, &OwnerVerdict::Legacy), None);
+}
+
+#[test]
+fn slug_colliding_worktrees_get_a_foreign_verdict() {
+    let first = "/w/feat-a";
+    let second = "/w/feat_a";
+    assert_eq!(container_name(first), container_name(second));
+    let first_label = crate::sandbox_manage::worktree_label_value(first.as_bytes());
+    let second_label = crate::sandbox_manage::worktree_label_value(second.as_bytes());
+    assert_ne!(first_label, second_label);
+    assert_eq!(
+        owner_verdict(Some((true, first_label)), &second_label),
+        OwnerVerdict::Foreign(crate::sandbox_manage::worktree_label_value(
+            first.as_bytes()
+        ))
+    );
 }
 
 #[test]
