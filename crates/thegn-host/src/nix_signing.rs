@@ -54,6 +54,13 @@ pub(crate) fn install_key_status() -> InstallKeyStatus {
 }
 
 fn install_key_status_in(dir: &Path) -> InstallKeyStatus {
+    install_key_status_in_with_owner_check(dir, thegn_core::fsperm::owned_by_current_user)
+}
+
+fn install_key_status_in_with_owner_check(
+    dir: &Path,
+    owner_check: impl FnOnce(&std::fs::Metadata) -> bool,
+) -> InstallKeyStatus {
     let metadata = match std::fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -63,8 +70,8 @@ fn install_key_status_in(dir: &Path) -> InstallKeyStatus {
             return InstallKeyStatus::Invalid(format!("cannot inspect {}: {error}", dir.display()));
         }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return InstallKeyStatus::Invalid("signing directory is not a real directory".to_string());
+    if let Err(reason) = validate_signing_directory(&metadata, owner_check(&metadata)) {
+        return InstallKeyStatus::Invalid(reason.to_string());
     }
 
     let secret = dir.join("secret-key");
@@ -94,6 +101,19 @@ fn install_key_status_in(dir: &Path) -> InstallKeyStatus {
             "public key without its secret (an interrupted key generation; the next host-cache provision replaces it)".to_string(),
         ),
     }
+}
+
+fn validate_signing_directory(
+    metadata: &std::fs::Metadata,
+    owned_by_current_user: bool,
+) -> Result<(), &'static str> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("signing directory is not a real directory");
+    }
+    if !owned_by_current_user {
+        return Err("signing directory is owned by another user");
+    }
+    Ok(())
 }
 
 fn load_or_create_in(
@@ -384,8 +404,9 @@ fn key_name_suffix(name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallKey, InstallKeyStatus, install_key_name, install_key_status_in, load_or_create_in,
-        parse_public_key, sign_argv, trust_script, trusted_key_conf_line,
+        InstallKey, InstallKeyStatus, install_key_name, install_key_status_in,
+        install_key_status_in_with_owner_check, load_or_create_in, parse_public_key, sign_argv,
+        trust_script, trusted_key_conf_line,
     };
     use std::path::Path;
 
@@ -422,6 +443,18 @@ mod tests {
         let dir = state.root().join("keys");
         assert_eq!(install_key_status_in(&dir), InstallKeyStatus::Missing);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn install_key_status_rejects_a_signing_directory_owned_by_another_user() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let dir = state.root().join("keys");
+        write_pair(&dir);
+
+        assert_eq!(
+            install_key_status_in_with_owner_check(&dir, |_| false),
+            InstallKeyStatus::Invalid("signing directory is owned by another user".to_string())
+        );
     }
 
     #[test]
