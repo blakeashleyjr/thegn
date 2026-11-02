@@ -96,12 +96,12 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
 - [x] 7.1 Pure SGR-subset → styled-cell-run parser in `thegn-core` (new
       module; substrate-free; fixture-driven tests from recorded difft
       output; unknown escapes stripped). 95% gate applies.
--      Evidence: `thegn_core::ansi_cells` (`crates/thegn-core/src/ansi_cells.rs`
+      Evidence: `thegn_core::ansi_cells` (`crates/thegn-core/src/ansi_cells.rs`
       and its tests).
 - [x] 7.2 `difft` as a managed tool (`Source::GithubRelease`, pinned,
       `path_fallbacks: ["difft"]`) registered in host `known()`; Probe in
       doctor.
--      Evidence: `difft` is registered in host `known()` (`managed_tool.rs`)
+      Evidence: `difft` is registered in host `known()` (`managed_tool.rs`)
       and resolves from `[managed_tools.difft] path` then PATH; managed
       downloads are dropped until reviewed SHA-256 pins exist (THE-182 owner
       default).
@@ -109,7 +109,7 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
       `--color always` / `--background` from theme / byte+graph limits /
       timeout; fallback to internal unified with a notice on any failure.
       Toggle key + new action id.
--      Evidence: `actions.rs` structural route and `diff_view.rs`; the toggle
+      Evidence: `actions.rs` structural route and `diff_view.rs`; the toggle
       is the diff modal's local `t` key, with no global action id because it
       only has meaning inside the modal.
 - [x] 7.4 `thegn diff --structural` (flag on the existing verb; catalog row

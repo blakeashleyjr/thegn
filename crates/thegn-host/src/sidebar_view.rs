@@ -2691,7 +2691,7 @@ mod tests {
             jj: true,
             ..GitGlyphs::default()
         });
-        let text = |row: &SidebarRow, display: &SidebarDisplay| -> String {
+        let texts = |row: &SidebarRow, display: &SidebarDisplay| -> Vec<String> {
             compose_row_lines(
                 row, None, None, false, false, true, None, None, 40, &mut None, display,
             )
@@ -2702,26 +2702,35 @@ mod tests {
                 | crate::seg::Line::SplitMinLeft { r: segments, .. } => segments,
                 _ => Vec::new(),
             })
-            .map(|segment| segment.text)
+            .map(|segment| segment.text.clone())
             .collect()
         };
         // Positive control: the marker already renders at the base; pin its caps
         // and toggle contract.
         let marker = crate::caps::active_glyphs().jj;
-        assert!(text(&row, &SidebarDisplay::default()).contains(marker));
         assert!(
-            !text(
+            texts(&row, &SidebarDisplay::default())
+                .iter()
+                .any(|segment| segment.as_str() == marker)
+        );
+        assert!(
+            !texts(
                 &row,
                 &SidebarDisplay {
                     show_jj: false,
                     ..SidebarDisplay::default()
                 }
             )
-            .contains(marker)
+            .iter()
+            .any(|segment| segment.as_str() == marker)
         );
 
         row.git = Some(GitGlyphs::default());
-        assert!(!text(&row, &SidebarDisplay::default()).contains(marker));
+        assert!(
+            !texts(&row, &SidebarDisplay::default())
+                .iter()
+                .any(|segment| segment.as_str() == marker)
+        );
     }
 
     #[test]
