@@ -855,7 +855,8 @@ uninstall_status=0
 uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
   "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
 [[ $uninstall_status == 1 && $(<"$case_bin/tg") == *"user change"* && ! -e $case_bin/thegn &&
-! -e $case_bin/tg-tui && -e $case_manifest && $uninstall_out == *"$case_bin/tg"* ]] || {
+! -e $case_bin/tg-tui && -e $case_manifest &&
+$uninstall_out == *"kept $case_bin/tg: changed since install"* ]] || {
   echo "modified artifact was not retained as an incomplete uninstall" >&2
   echo "$uninstall_out" >&2
   exit 1
@@ -870,6 +871,20 @@ uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME=
 [[ $uninstall_status == 1 && -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui &&
   -e $case_manifest && $uninstall_out == *"manifest line"* ]] || {
   echo "malformed manifest did not refuse before removal" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-refuses-duplicate-path: duplicate records refuse before any artifact is removed.
+install_uninstall_fixture uninstall-refuses-duplicate
+duplicate_manifest_line="$(sed -n '2p' "$case_manifest")"
+printf '%s\n' "$duplicate_manifest_line" >>"$case_manifest"
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui &&
+  -e $case_manifest && $uninstall_out == *"duplicate path"* ]] || {
+  echo "duplicate manifest path did not refuse before removal" >&2
   echo "$uninstall_out" >&2
   exit 1
 }
