@@ -1639,11 +1639,6 @@ fn index_add_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-fn index_remove_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
-    with_index_lock(dir, || index_remove_locked(dir, account))
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
