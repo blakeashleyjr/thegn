@@ -37,6 +37,7 @@ struct Reader<'a> {
     input: &'a str,
     pos: usize,
     subtree_elements: usize,
+    retained_elements: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -278,8 +279,11 @@ impl<'a> Reader<'a> {
                 } else if self.input[self.pos..].starts_with('<') {
                     let child = self.element(scope, depth + 1, root_phase, visit_response)?;
                     if !(depth == 1 && is(&child, DAV_NS, "response")) {
-                        if depth == 1 && children.len() >= MAX_EVENT_CHILDREN {
-                            return self.fail();
+                        if depth == 1 {
+                            self.retained_elements += self.subtree_elements;
+                            if self.retained_elements > MAX_EVENT_CHILDREN {
+                                return self.fail();
+                            }
                         }
                         children.push(child);
                     }
@@ -368,6 +372,7 @@ pub(super) fn walk_multistatus<'a>(
     let mut reader = Reader {
         input,
         subtree_elements: 0,
+        retained_elements: 0,
         pos: if input.starts_with('\u{feff}') {
             '\u{feff}'.len_utf8()
         } else {
