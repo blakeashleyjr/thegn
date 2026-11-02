@@ -1311,12 +1311,26 @@ impl RunningShare {
         if report.leaked_readers > 0 || matches!(report.outcome, StopOutcome::Failed(_)) {
             tracing::warn!(?report, "share teardown was incomplete");
         }
+        if report.truncated_lines > 0 || report.dropped_lines > 0 {
+            tracing::debug!(
+                truncated_lines = report.truncated_lines,
+                dropped_lines = report.dropped_lines,
+                "share provider output exceeded its bounds"
+            );
+        }
     }
 
     pub fn wait(self) {
         let report = self.wait_verified();
         if report.leaked_readers > 0 || matches!(report.outcome, StopOutcome::Failed(_)) {
             tracing::warn!(?report, "share teardown was incomplete");
+        }
+        if report.truncated_lines > 0 || report.dropped_lines > 0 {
+            tracing::debug!(
+                truncated_lines = report.truncated_lines,
+                dropped_lines = report.dropped_lines,
+                "share provider output exceeded its bounds"
+            );
         }
     }
 
@@ -1325,9 +1339,16 @@ impl RunningShare {
         let outcome = self.reap(outcome);
         let leaked_readers = self.join_readers();
         self.cleanup_files();
+        let truncated_lines = self
+            .endpoint_tracker
+            .truncated_lines
+            .load(Ordering::Relaxed);
+        let dropped_lines = self.endpoint_tracker.dropped_lines.load(Ordering::Relaxed);
         ShareTeardown {
             outcome,
             leaked_readers,
+            truncated_lines,
+            dropped_lines,
         }
     }
 
@@ -1335,9 +1356,16 @@ impl RunningShare {
         let outcome = self.reap(StopOutcome::AlreadyExited);
         let leaked_readers = self.join_readers();
         self.cleanup_files();
+        let truncated_lines = self
+            .endpoint_tracker
+            .truncated_lines
+            .load(Ordering::Relaxed);
+        let dropped_lines = self.endpoint_tracker.dropped_lines.load(Ordering::Relaxed);
         ShareTeardown {
             outcome,
             leaked_readers,
+            truncated_lines,
+            dropped_lines,
         }
     }
 
@@ -1448,13 +1476,18 @@ const SHARE_READER_JOIN: Duration = Duration::from_secs(2);
 pub struct ShareTeardown {
     pub outcome: StopOutcome,
     pub leaked_readers: usize,
+    pub truncated_lines: usize,
+    pub dropped_lines: usize,
 }
 
+/// Carries endpoint coordination and shared reader output-bound counters.
 #[derive(Clone, Default)]
 struct EndpointTracker {
     accepted: Arc<OnceLock<String>>,
     conflict: Arc<AtomicBool>,
     conflict_hook: Arc<Mutex<Option<ConflictHook>>>,
+    truncated_lines: Arc<std::sync::atomic::AtomicUsize>,
+    dropped_lines: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EndpointTracker {
@@ -2283,6 +2316,9 @@ fn drain_reader<R: Read>(
             } else if !oversized {
                 if line.len() == MAX_PROVIDER_LINE {
                     oversized = true;
+                    endpoint_tracker
+                        .truncated_lines
+                        .fetch_add(1, Ordering::Relaxed);
                     line.clear();
                 } else {
                     line.push(*byte);
@@ -2319,7 +2355,17 @@ fn emit_line(
             endpoint_tracker.observe(&url);
             let _ = url_tx.try_send(url);
         }
-        let _ = tx.try_send(text);
+        match tx.try_send(text) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                endpoint_tracker
+                    .dropped_lines
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // The receiver is dropped once startup returns, so post-startup
+            // diagnostics are discarded by design.
+            Err(mpsc::TrySendError::Disconnected(_)) => {}
+        }
     }
     line.clear();
     *oversized = false;
