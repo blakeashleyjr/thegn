@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::MergeOutcomeOperation;
 use crate::store::WorkspaceStore;
 
 const WORKTREE: &str = "/private/repo/feature";
