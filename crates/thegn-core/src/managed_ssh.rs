@@ -774,6 +774,48 @@ mod tests {
     }
 
     #[test]
+    fn global_rotation_completion_retires_only_the_matching_recovery_record() {
+        let _state = crate::testenv::IsolatedState::new();
+        let old_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
+        let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let old_fingerprint = try_key_fingerprint(old_key).unwrap();
+        let original = recovering_record(&old_fingerprint);
+        record_authorized_at(&dir(), &original).unwrap();
+
+        let unrelated = AuthorizedKeyRecord {
+            instance: "another-instance".into(),
+            ..original.clone()
+        };
+        record_authorized_at(&dir(), &unrelated).unwrap();
+
+        record_rotation_completed(
+            &original.provider,
+            &original.account,
+            &original.instance,
+            Path::new("/state/completed-key"),
+            new_key,
+            None,
+        )
+        .unwrap();
+
+        let completed = read(&original.provider, &original.account, &original.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed.key_fingerprint,
+            try_key_fingerprint(new_key).unwrap()
+        );
+        assert_eq!(completed.key_path, PathBuf::from("/state/completed-key"));
+        assert_eq!(completed.rotation_recovery, None);
+        assert_eq!(
+            read(&unrelated.provider, &unrelated.account, &unrelated.instance).unwrap(),
+            Some(unrelated),
+            "rotation completion must preserve recovery for a different instance tuple"
+        );
+    }
+
+    #[test]
     fn provision_publish_replaces_a_row_without_recovery() {
         let temp = tempfile::tempdir().unwrap();
         let old_key =
