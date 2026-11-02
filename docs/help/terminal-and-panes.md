@@ -165,6 +165,14 @@ detached; terminal providers open in a thegn tab. It has no default chord, so
 use the [[command-palette]] or bind the action id yourself. The `editor` action
 and `Alt-e` remain the terminal editor tool.
 
+IDE handoff is **outbound only**: thegn asks your editor to open a worktree or
+file (this action, the file-open keys, and `editor.open` on the control API and
+MCP), and nothing hands work back into thegn from an IDE or the OS. thegn
+registers no `thegn://` link handler or desktop/OS URL association, ships no IDE
+extension, and has no IDE-specific reveal request or socket. The `thegn://` names
+in the MCP resource list identify documents inside MCP, and a pairing link is
+something thegn shows you for a companion to open; neither is a link handler.
+
 ## Copy, search, replay
 
 - `Ctrl-Alt-c` (or `Ctrl-Shift-c`) — copy the selection, or the whole
