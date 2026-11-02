@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use thegn_core::store::{MergeClaimRequest, MergeClaimView};
 
 fn registered_row(db: &Db, root: &Path, worktree: &str, branch: &str) -> QueueItem {
@@ -711,4 +711,104 @@ fn recoverable_in_progress_status_table() {
         EXPIRED_RECOVERY_EXPECTED_STATUS,
         thegn_core::attention::MqStatus::Queued.as_str()
     );
+}
+
+#[test]
+fn drain_status_sets_follow_mq_status() {
+    use thegn_core::attention::MqStatus;
+
+    for status in MqStatus::ALL {
+        assert_eq!(
+            drain_attempt_is_held(status.as_str()),
+            status.is_held(),
+            "held status: {}",
+            status.as_str()
+        );
+        assert_eq!(
+            drain_admits_directly(status.as_str()),
+            status.is_held() || matches!(status, MqStatus::Queued | MqStatus::Ready),
+            "direct admission: {}",
+            status.as_str()
+        );
+    }
+
+    let cases = [
+        ("queued", true, false),
+        ("ready", true, false),
+        ("folding", false, false),
+        ("verifying", false, false),
+        ("landed", false, false),
+        ("agent_running", false, false),
+        ("deferred", true, true),
+        ("gate_failed", true, true),
+        ("gate_error", true, true),
+        ("needs_human", true, true),
+        ("agent_blocked", true, true),
+        ("future-status", false, false),
+        ("", false, false),
+    ];
+    for (status, admits, held) in cases {
+        assert_eq!(
+            drain_admits_directly(status),
+            admits,
+            "admission: {status:?}"
+        );
+        assert_eq!(drain_attempt_is_held(status), held, "held: {status:?}");
+    }
+}
+
+#[test]
+fn persisted_agent_blocked_row_is_retried_after_reopen_without_spending_an_attempt() {
+    // Positive control on the current drain: agent_blocked is already admitted by its raw status list.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("queue.sqlite");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_at(&db_path).unwrap();
+    let item = registered_row(&db, &root, "/worktrees/feature", "feature");
+    db.set_merge_agent_attempts(&item.worktree, 1).unwrap();
+    db.update_merge_status(
+        &item.worktree,
+        "agent_blocked",
+        None,
+        None,
+        Some("isolation floor unmet"),
+    )
+    .unwrap();
+    drop(db);
+
+    let db = Db::open_at(&db_path).unwrap();
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "agent_blocked");
+    let seen_held = Arc::new(AtomicBool::new(false));
+    let seen_held_capture = Arc::clone(&seen_held);
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let attempt_count_capture = Arc::clone(&attempt_count);
+    let outcome = drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        &root,
+        &db,
+        vec![QueueItem {
+            worktree: "/worktrees/feature".into(),
+            branch: "feature".into(),
+            location: String::new(),
+        }],
+        |_| {},
+        ready_actions(
+            move |_, _, held| {
+                seen_held_capture.store(held, Ordering::Relaxed);
+                attempt_count_capture.fetch_add(1, Ordering::Relaxed);
+                Ok(AttemptOutcome::Ready { tip: "tip".into() })
+            },
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
+    );
+
+    assert_eq!(attempt_count.load(Ordering::Relaxed), 1);
+    assert!(seen_held.load(Ordering::Relaxed));
+    assert_eq!(outcome.ready, vec!["feature".to_owned()]);
+    let row = db.list_merge_queue().unwrap().remove(0);
+    assert_eq!(row.status, "ready");
+    assert_eq!(row.agent_attempts, 1);
 }
