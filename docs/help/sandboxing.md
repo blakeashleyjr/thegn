@@ -310,8 +310,11 @@ provider placements. Only infrastructure names such as `PATH`, `HOME`,
 `TERM` and `LANG`, `LC_*`, `THEGN_*`, and names in
 `[profiles.<name>.sandbox] env_passthrough` are shared; that profile list
 replaces `[sandbox] env_passthrough`. At startup, the thegn process also unsets
-known credential environment families, keeping `SSH_AUTH_SOCK` only when the
-profile has `ssh/id`. Its git, gh and GnuPG directories are mounted read-only in
+names ending in `_TOKEN`, `_SECRET`, `_PASSWORD`, `_KEY`, `_AUTH`,
+`_CREDENTIAL`/`_CREDENTIALS` or `_PASSPHRASE`, plus cloud/package names such as
+`GOOGLE_APPLICATION_CREDENTIALS` and `DOCKER_AUTH_CONFIG`. It keeps
+`SSH_AUTH_SOCK` only when the profile has `ssh/id`. Its git, gh and GnuPG
+directories are mounted read-only in
 sandboxes; a pane that needs to write them, such as `gh auth login` or GnuPG
 signing, needs an explicit `[sandbox] mounts` grant. Startup refuses if the
 profile state or credential directories cannot be created. Startup also
