@@ -7,8 +7,9 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thegn_core::hooks::{HookContext, HookSpec};
 
@@ -71,6 +72,7 @@ fn run_with_log_root(
     cwd: &Path,
     log_root: &Path,
 ) -> HookRunResult {
+    let run = HookRunStamp::start();
     let allocation = log_path(log_root, &context.worktree, context.event);
     let (log_path, allocation_error) = match allocation {
         Ok(path) => (path, None),
@@ -84,11 +86,14 @@ fn run_with_log_root(
                 write_log(
                     &log_path,
                     context,
+                    &run,
                     HookRunState::Failed,
                     None,
                     Duration::ZERO,
-                    "",
-                    &stderr,
+                    HookLogOutput {
+                        stdout: "",
+                        stderr: &stderr,
+                    },
                 )
                 .err()
                 .map(|error| error.to_string())
@@ -156,9 +161,20 @@ fn run_with_log_root(
     let code = status.as_ref().and_then(|status| status.code());
     let elapsed = started.elapsed();
     let log_error = allocation_error.or_else(|| {
-        write_log(&log_path, context, state, code, elapsed, &stdout, &stderr)
-            .err()
-            .map(|error| error.to_string())
+        write_log(
+            &log_path,
+            context,
+            &run,
+            state,
+            code,
+            elapsed,
+            HookLogOutput {
+                stdout: &stdout,
+                stderr: &stderr,
+            },
+        )
+        .err()
+        .map(|error| error.to_string())
     });
     HookRunResult {
         command: spec.command.clone(),
@@ -313,6 +329,48 @@ const HOOK_LOG_ALLOCATION_ATTEMPTS: usize = 1000;
 static LAST_LOG_PRUNE: OnceLock<Mutex<std::collections::HashMap<PathBuf, i64>>> = OnceLock::new();
 static LAST_LOG_INDEX: OnceLock<Mutex<std::collections::HashMap<(PathBuf, String), u64>>> =
     OnceLock::new();
+static NEXT_RUN_ID_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// Identity of one hook execution, written into its artifact header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookRunStamp {
+    run_id: String,
+    started_unix_ms: u128,
+}
+
+struct HookLogOutput<'a> {
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
+impl HookRunStamp {
+    fn start() -> Self {
+        let started_unix_ms = unix_time_ms();
+        let mut bytes = [0_u8; 16];
+        let run_id = match getrandom::fill(&mut bytes) {
+            Ok(()) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+            Err(_) => {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let sequence = NEXT_RUN_ID_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                format!("p{}-t{nanos}-s{sequence}", std::process::id())
+            }
+        };
+        Self {
+            run_id,
+            started_unix_ms,
+        }
+    }
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 pub(crate) fn log_root() -> PathBuf {
     let state_home = thegn_core::util::xdg_state_home();
@@ -544,14 +602,27 @@ fn log_path(
     worktree: &str,
     event: thegn_core::hooks::HookEvent,
 ) -> std::io::Result<PathBuf> {
+    log_path_with(
+        log_root,
+        worktree,
+        event,
+        LAST_LOG_INDEX.get_or_init(|| Mutex::new(std::collections::HashMap::new())),
+    )
+}
+
+fn log_path_with(
+    log_root: &Path,
+    worktree: &str,
+    event: thegn_core::hooks::HookEvent,
+    indices: &Mutex<std::collections::HashMap<(PathBuf, String), u64>>,
+) -> std::io::Result<PathBuf> {
     let slug = log_dir_name(worktree)?;
     let dir = log_root.join(slug);
     thegn_core::fsperm::ensure_private_dir(&dir)?;
 
     let event_name = event.as_str().to_string();
     let key = (dir.clone(), event_name.clone());
-    let mut indices = LAST_LOG_INDEX
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+    let mut indices = indices
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut index = match indices.get(&key).copied() {
@@ -672,23 +743,29 @@ fn failure_tail(output: &str) -> String {
 fn write_log(
     path: &Path,
     context: &HookContext,
+    run: &HookRunStamp,
     state: HookRunState,
     code: Option<i32>,
     elapsed: Duration,
-    stdout: &str,
-    stderr: &str,
+    output: HookLogOutput<'_>,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         thegn_core::fsperm::ensure_private_dir(parent)?;
     }
-    let line = format!(
-        "event={} state={state:?} code={} elapsed_ms={} worktree_digest={} command=[redacted]\nstdout:\n{}\nstderr:\n{}\n",
+    let finished_unix_ms = unix_time_ms().max(run.started_unix_ms);
+    let header = format!(
+        "run_id={} event={} state={state:?} code={} started_unix_ms={} finished_unix_ms={finished_unix_ms} elapsed_ms={} worktree_digest={} command=[redacted]",
+        run.run_id,
         context.event.as_str(),
         code.map_or_else(|| "none".to_string(), |code| code.to_string()),
+        run.started_unix_ms,
         elapsed.as_millis(),
         worktree_digest(&context.worktree)?,
-        redact_output(stdout),
-        redact_output(stderr),
+    );
+    let line = format!(
+        "thegn-hook-run 1\n{header}\nstdout:\n{}\nstderr:\n{}\n",
+        redact_output(output.stdout),
+        redact_output(output.stderr),
     );
     thegn_core::fsperm::write_owner_only_atomic(path, line.as_bytes())
 }
@@ -1143,11 +1220,14 @@ mod tests {
         write_log(
             &path,
             &context(),
+            &HookRunStamp::start(),
             HookRunState::Failed,
             Some(3),
             Duration::from_millis(12),
-            "ACCESS_KEY=do-not-write",
-            "Bearer do-not-write",
+            HookLogOutput {
+                stdout: "ACCESS_KEY=do-not-write",
+                stderr: "Bearer do-not-write",
+            },
         )
         .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -1164,11 +1244,14 @@ mod tests {
         let error = write_log(
             &path,
             &context(),
+            &HookRunStamp::start(),
             HookRunState::Failed,
             Some(1),
             Duration::ZERO,
-            "output",
-            "error",
+            HookLogOutput {
+                stdout: "output",
+                stderr: "error",
+            },
         )
         .expect_err("a directory cannot be atomically replaced as a hook log");
         assert!(!error.to_string().is_empty());
@@ -1196,11 +1279,14 @@ mod tests {
         write_log(
             &path,
             &context(),
+            &HookRunStamp::start(),
             HookRunState::Succeeded,
             Some(0),
             Duration::from_millis(1),
-            "fresh",
-            "",
+            HookLogOutput {
+                stdout: "fresh",
+                stderr: "",
+            },
         )
         .unwrap();
 
@@ -1219,11 +1305,14 @@ mod tests {
         write_log(
             &path,
             &context(),
+            &HookRunStamp::start(),
             HookRunState::Succeeded,
             Some(0),
             Duration::from_millis(1),
-            "fresh",
-            "",
+            HookLogOutput {
+                stdout: "fresh",
+                stderr: "",
+            },
         )
         .unwrap();
 
@@ -1234,5 +1323,193 @@ mod tests {
         );
         assert!(std::fs::read(&other).unwrap().is_empty());
         crate::platform::test_assert_owner_only_permissions(&path, path.parent().unwrap());
+    }
+
+    #[test]
+    fn hook_log_header_carries_run_identity_and_wall_times() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let first = run_with_log_root(&spec("true", 2), &context(), cwd.path(), root.path());
+        let second = run_with_log_root(&spec("true", 2), &context(), cwd.path(), root.path());
+        let first_contents = std::fs::read_to_string(&first.log_path).unwrap();
+        let second_contents = std::fs::read_to_string(&second.log_path).unwrap();
+        let first_lines = first_contents.lines().collect::<Vec<_>>();
+        let second_lines = second_contents.lines().collect::<Vec<_>>();
+        assert!(first_lines.len() >= 2, "artifact: {first_contents}");
+        assert!(second_lines.len() >= 2, "artifact: {second_contents}");
+        assert_eq!(first_lines[0], "thegn-hook-run 1");
+        assert_eq!(second_lines[0], "thegn-hook-run 1");
+        let first_header = first_lines[1];
+        let second_header = second_lines[1];
+        fn fields(header: &str) -> std::collections::HashMap<&str, &str> {
+            header
+                .split_whitespace()
+                .filter_map(|field| field.split_once('=').map(|(key, value)| (key, value)))
+                .collect::<std::collections::HashMap<_, _>>()
+        }
+        let first_fields = fields(first_header);
+        let second_fields = fields(second_header);
+        let first_run_id = first_fields.get("run_id").copied().unwrap_or("");
+        let second_run_id = second_fields.get("run_id").copied().unwrap_or("");
+        let is_hex_id = |run_id: &str| {
+            run_id.len() == 32
+                && run_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let is_fallback_id = |run_id: &str| {
+            let Some((pid, timestamp)) =
+                run_id.strip_prefix('p').and_then(|id| id.split_once("-t"))
+            else {
+                return false;
+            };
+            let Some((nanos, sequence)) = timestamp.split_once("-s") else {
+                return false;
+            };
+            pid.parse::<u32>().is_ok()
+                && nanos.parse::<u128>().is_ok()
+                && sequence.parse::<u64>().is_ok()
+                && !sequence.contains('-')
+        };
+        assert!(
+            is_hex_id(first_run_id) || is_fallback_id(first_run_id),
+            "invalid run id in header {first_header}"
+        );
+        let second_run_id_is_valid = is_hex_id(second_run_id) || is_fallback_id(second_run_id);
+        assert!(
+            second_run_id_is_valid,
+            "invalid run id in header {second_header}"
+        );
+        assert_ne!(
+            first_run_id, second_run_id,
+            "runs shared an identity: {first_header}; {second_header}"
+        );
+        for header in [first_header, second_header] {
+            let parsed = fields(header);
+            let started = parsed
+                .get("started_unix_ms")
+                .and_then(|value| value.parse::<u128>().ok());
+            let finished = parsed
+                .get("finished_unix_ms")
+                .and_then(|value| value.parse::<u128>().ok());
+            assert!(
+                matches!((started, finished), (Some(started), Some(finished)) if started <= finished),
+                "invalid wall-time ordering in header {header}"
+            );
+            assert!(header.contains("state=Succeeded"), "header: {header}");
+        }
+    }
+
+    #[test]
+    fn hook_log_spawn_failure_header_still_carries_run_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let failed_cwd = root.path().join("missing-cwd");
+        let result = run_with_log_root(&spec("true", 2), &context(), &failed_cwd, root.path());
+        let contents = std::fs::read_to_string(result.log_path).unwrap();
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "thegn-hook-run 1");
+        let header = lines[1];
+        assert!(
+            header
+                .split_whitespace()
+                .any(|field| field.starts_with("run_id=")),
+            "header: {header}"
+        );
+        assert!(
+            header
+                .split_whitespace()
+                .any(|field| field.starts_with("started_unix_ms=")),
+            "header: {header}"
+        );
+        assert!(
+            header
+                .split_whitespace()
+                .any(|field| field.starts_with("finished_unix_ms=")),
+            "header: {header}"
+        );
+        assert!(header.contains("state=Failed"), "header: {header}");
+        assert!(header.contains("code=none"), "header: {header}");
+    }
+
+    #[test]
+    fn hook_log_two_process_allocators_never_share_an_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = format!("/isolated-hook-log-concurrent-{}", std::process::id());
+        // This fails to compile at the base revision because `log_path_with`
+        // is the seam this regression adds; its property already follows from
+        // the existing `create_new` retry loop.
+        // Each allocator models a separate process with its own empty index map.
+        // `create_new` resolves same-index races by making the loser retry.
+        let first_indices = Mutex::new(std::collections::HashMap::new());
+        let second_indices = Mutex::new(std::collections::HashMap::new());
+        let barrier = std::sync::Barrier::new(2);
+        let (first_paths, second_paths) = std::thread::scope(|scope| {
+            let first_barrier = &barrier;
+            let first_root = dir.path();
+            let first_worktree = worktree.as_str();
+            let first_indices_ref = &first_indices;
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                (0..25)
+                    .map(|_| {
+                        log_path_with(
+                            first_root,
+                            first_worktree,
+                            HookEvent::PostCreate,
+                            first_indices_ref,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let second_barrier = &barrier;
+            let second_root = dir.path();
+            let second_worktree = worktree.as_str();
+            let second_indices_ref = &second_indices;
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                (0..25)
+                    .map(|_| {
+                        log_path_with(
+                            second_root,
+                            second_worktree,
+                            HookEvent::PostCreate,
+                            second_indices_ref,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let first_paths = first.join().unwrap();
+            let second_paths = second.join().unwrap();
+            (first_paths, second_paths)
+        });
+        let all_paths = first_paths.iter().chain(&second_paths).collect::<Vec<_>>();
+        let unique_paths = all_paths
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(all_paths.len(), 50, "allocated {} paths", all_paths.len());
+        assert_eq!(
+            unique_paths.len(),
+            50,
+            "only {} unique paths from {} allocations",
+            unique_paths.len(),
+            all_paths.len()
+        );
+        assert!(
+            all_paths.iter().all(|path| path.is_file()),
+            "{} of {} reserved paths exist",
+            all_paths.iter().filter(|path| path.is_file()).count(),
+            all_paths.len()
+        );
+        let paths_owned_by_both = first_paths
+            .iter()
+            .filter(|path| second_paths.contains(path))
+            .count();
+        assert_eq!(
+            paths_owned_by_both, 0,
+            "allocators share {paths_owned_by_both} paths"
+        );
     }
 }
