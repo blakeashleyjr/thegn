@@ -499,4 +499,59 @@ mod tests {
         );
         assert!(fallback.is_some_and(|note| note.contains("does not support columns")));
     }
+
+    #[test]
+    fn editor_handoff_help_publishes_the_outbound_only_boundary() {
+        let pages = crate::help::pages::SOURCES
+            .iter()
+            .filter(|page| page.contains("\nid: terminal-and-panes\n"))
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1, "expected one terminal-and-panes help page");
+        let page = pages[0];
+        assert!(page.contains("outbound only"));
+        assert!(page.contains("editor.open"));
+        assert!(page.contains("thegn://"));
+    }
+
+    // Positive control: this absence check also passes on the pre-change base.
+    #[test]
+    fn public_help_and_api_schema_claim_no_inbound_ide_door() {
+        let mut public_text = crate::help::pages::SOURCES
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                let page_id = page
+                    .lines()
+                    .find_map(|line| line.strip_prefix("id: "))
+                    .unwrap_or("unknown-page");
+                (format!("help page {page_id} (index {index})"), *page)
+            })
+            .collect::<Vec<_>>();
+        public_text.push((
+            "docs/cli.md".to_string(),
+            include_str!("../../../docs/cli.md"),
+        ));
+        public_text.push((
+            "docs/api/control-v1.json".to_string(),
+            include_str!("../../../docs/api/control-v1.json"),
+        ));
+
+        let markers = [
+            "x-scheme-handler",
+            "cfbundleurltypes",
+            "thegn://open",
+            "thegn://reveal",
+            "thegn://focus",
+            "thegn://goto",
+        ];
+        for (page, text) in public_text {
+            let lowercase = text.to_lowercase();
+            for marker in markers {
+                assert!(
+                    !lowercase.contains(marker),
+                    "public {page} claims unsupported inbound IDE marker {marker:?}"
+                );
+            }
+        }
+    }
 }
