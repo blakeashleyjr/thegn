@@ -28,15 +28,20 @@ def has_reuse(args: list[str]) -> bool:
 
 
 def plan(
-    event: str, args: list[str], dirty: list[str] | None, head: str | None
+    event: str,
+    args: list[str],
+    dirty: list[str] | None,
+    head: str | None,
+    implicit_secrets: bool = False,
 ) -> tuple[list[str] | None, str]:
     """Build guarded act argv, or return a refusal message."""
-    credentialed = has_credentials(args)
+    credentialed = has_credentials(args) or implicit_secrets
+    credential_source = " (including default .secrets)" if implicit_secrets else ""
     reuse = has_reuse(args)
 
     if credentialed and reuse:
         return None, (
-            "act: --reuse cannot be combined with credentials "
+            f"act: --reuse cannot be combined with credentials{credential_source} "
             "(the retained container would carry them into later runs)"
         )
     if credentialed and (dirty is None or head is None):
@@ -48,14 +53,19 @@ def plan(
         if len(dirty) > 10:
             paths += ", ..."
         return None, (
-            f"act: credentialed runs require .github/ and .actrc to match HEAD {head}; "
+            f"act: credentialed runs require .github/ and .actrc to match HEAD {head}"
+            f"{credential_source}; "
             f"uncommitted: {paths}. Commit or stash them, or run without credentials."
         )
 
     command = ["act", event, *args]
     if not reuse and "--rm" not in args:
         command.append("--rm")
-    message = f"act: credentialed run bound to HEAD {head}" if credentialed else ""
+    message = (
+        f"act: credentialed run{credential_source} bound to HEAD {head}"
+        if credentialed
+        else ""
+    )
     return command, message
 
 
@@ -159,6 +169,26 @@ def self_test() -> int:
     argv, message = plan("push", ["--secret-file="], [], "abc123")
     cases.append(("blank-secret-file-value-still-credential", argv is not None and "abc123" in message))
 
+    dirty_argv, dirty_message = plan(
+        "push", [], [" M .github/workflows/ci.yml"], "abc123", True
+    )
+    reuse_argv, reuse_message = plan("push", ["--reuse"], [], "abc123", True)
+    clean_argv, clean_message = plan("push", [], [], "abc123", True)
+    cases.append(
+        (
+            "implicit-default-secrets-is-credential",
+            dirty_argv is None
+            and ".secrets" in dirty_message
+            and ".github/workflows/ci.yml" in dirty_message
+            and reuse_argv is None
+            and ".secrets" in reuse_message
+            and "--reuse cannot" in reuse_message
+            and clean_argv == ["act", "push", "--rm"]
+            and ".secrets" in clean_message
+            and "abc123" in clean_message,
+        )
+    )
+
     argv, _ = plan("push", ["-j", "lint"], None, None)
     cases.append(("job-flag-passthrough", argv == ["act", "push", "-j", "lint", "--rm"]))
 
@@ -177,13 +207,14 @@ def main(argv: list[str]) -> int:
         return 2
 
     event, *args = argv
-    if has_credentials(args):
+    implicit_secrets = (ROOT / ".secrets").exists()
+    if has_credentials(args) or implicit_secrets:
         dirty = dirty_paths()
         head = head_sha()
     else:
         dirty = None
         head = None
-    command, message = plan(event, args, dirty, head)
+    command, message = plan(event, args, dirty, head, implicit_secrets)
     if message:
         print(message, file=sys.stderr)
     if command is None:
