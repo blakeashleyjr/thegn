@@ -109,11 +109,14 @@ verifies the new commits. Otherwise they refuse with the reason; use
   drain's own status transitions (each status it wrote, with the landed commit
   as the result) as well as retry, remove and clear outcomes, newest first: who
   acted, the status before and after, and the candidate and result commits. A
-  landed drain transition also names the target base: the commit the target
-  branch pointed at before the land, so history shows candidate, base and
-  result for every drain landing. Up
-  to 200 events, including drain transitions, are kept per worktree; a removed
-  worktree's history is dropped with it.
+  manual outcome from `thegn merge land` (including the panel's land key),
+  `thegn land` or a `thegn integrate` fold is also recorded, under operation
+  `land`, `raw_land` or `integrate`, with its status before and after and result
+  commit. A newly created row has no prior status. A landed drain transition
+  also names the target base: the commit the target branch pointed at before
+  the land, so history shows candidate, base and result for every drain
+  landing. Up to 200 events, including drain transitions, are kept per
+  worktree; a removed worktree's history is dropped with it.
 
 ## Land strategy, signing, drivers
 
