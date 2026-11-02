@@ -892,6 +892,146 @@ mod tests {
     }
 
     #[test]
+    fn committed_page_and_cursor_survive_an_abrupt_handle_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.sqlite");
+        let db = Db::open_at(&path).unwrap();
+        let prior_rows = [row("prior")];
+        db.replace_calendar_account("acct", &prior_rows).unwrap();
+        db.put_calendar_sync("acct", "test-provider", "old-token", 1, 2)
+            .unwrap();
+
+        let new_rows = [row("new")];
+        let prior_uids = ["prior".to_owned()];
+        let result = db
+            .apply_calendar_page(
+                "acct",
+                &CalendarPageWrite::Delta {
+                    rows: &new_rows,
+                    tombstones: CalendarTombstones::Uids(&prior_uids),
+                },
+                &cursor("new-token"),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            CalendarPageApplied::Applied {
+                events_changed: true
+            }
+        );
+
+        // no Drop: no close and no WAL checkpoint, as when the process dies right after return
+        std::mem::forget(db);
+
+        let reopened = Db::open_at(&path).unwrap();
+        assert_eq!(
+            events(&reopened, "acct"),
+            vec![r#"{"uid":"new"}"#.to_owned()]
+        );
+        assert_eq!(token(&reopened, "acct"), "new-token");
+    }
+
+    #[test]
+    fn concurrent_reader_sees_the_old_or_the_complete_new_page() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.sqlite");
+        let setup = Db::open_at(&path).unwrap();
+        let prior_rows = [row("prior")];
+        setup.replace_calendar_account("acct", &prior_rows).unwrap();
+        setup
+            .put_calendar_sync("acct", "test-provider", "old-token", 1, 2)
+            .unwrap();
+        drop(setup);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_path = path.clone();
+        let writer_done = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            let db = Db::open_at(&writer_path).unwrap();
+            for page in 1..=40 {
+                let first_uid = format!("p{page}-a");
+                let second_uid = format!("p{page}-b");
+                let rows = [row(&first_uid), row(&second_uid)];
+                let previous_uids = if page == 1 {
+                    vec!["prior".to_owned()]
+                } else {
+                    vec![format!("p{}-a", page - 1), format!("p{}-b", page - 1)]
+                };
+                db.apply_calendar_page(
+                    "acct",
+                    &CalendarPageWrite::Delta {
+                        rows: &rows,
+                        tombstones: CalendarTombstones::Uids(&previous_uids),
+                    },
+                    &cursor(&format!("t{page}")),
+                )
+                .unwrap();
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        let reader_path = path.clone();
+        let reader_done = Arc::clone(&done);
+        let reader = std::thread::spawn(move || {
+            let db = Db::open_at(&reader_path).unwrap();
+            let mut observations = 0;
+            let mut violations = Vec::new();
+            let mut saw_done = false;
+            loop {
+                db.conn().execute_batch("BEGIN").unwrap();
+                let observed_events = events(&db, "acct");
+                let observed_token = token(&db, "acct");
+                db.conn().execute_batch("COMMIT").unwrap();
+                observations += 1;
+
+                let valid = if observed_token == "old-token" {
+                    observed_events == vec![r#"{"uid":"prior"}"#.to_owned()]
+                } else if let Some(page_number) = observed_token
+                    .strip_prefix('t')
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|page| (1..=40).contains(page))
+                {
+                    let first_uid = format!("p{page_number}-a");
+                    let second_uid = format!("p{page_number}-b");
+                    observed_events
+                        == vec![
+                            format!(r#"{{"uid":"{first_uid}"}}"#),
+                            format!(r#"{{"uid":"{second_uid}"}}"#),
+                        ]
+                } else {
+                    false
+                };
+                if !valid {
+                    violations.push(format!(
+                        "token {observed_token:?} with events {observed_events:?}"
+                    ));
+                }
+
+                if saw_done {
+                    break;
+                }
+                if reader_done.load(Ordering::Acquire) {
+                    saw_done = true;
+                }
+            }
+            (observations, violations)
+        });
+
+        writer.join().unwrap();
+        let (observations, violations) = reader.join().unwrap();
+        assert!(observations > 0, "reader made no observations");
+        assert!(
+            violations.is_empty(),
+            "inconsistent page snapshots: {violations:?}"
+        );
+    }
+
+    #[test]
     fn reminder_claim_has_one_winner_across_two_connections() {
         use std::sync::{Arc, Barrier};
 
