@@ -1367,6 +1367,9 @@ pub fn probes() -> Vec<ProbeReport> {
 // `thegn mcp secret list` can enumerate (the keyring cannot).
 // (`SecretStore`, `SecretRef`, `BareAs` are already imported at module top.)
 
+// Set and rm hold the index lock across the keyring mutation so the index never
+// disagrees with the last completed keyring change.
+
 /// Resolve one MCP upstream `env` value to its concrete value, at spawn.
 ///
 /// `keyring:` routes through the shared keyring service; a missing entry (or an
@@ -1390,19 +1393,51 @@ pub fn resolve_mcp_env(value: &str, consumer: &str) -> Result<String, String> {
 /// the name in the MCP index (so `list` can enumerate). The value never lands
 /// in config or argv.
 pub fn mcp_secret_set(account: &str, value: &str) -> Result<(), String> {
-    KeyringStore
-        .set(account, value)
-        .map_err(|e| e.message().to_string())?;
-    index_add(account)?;
-    Ok(())
+    let dir = secrets_dir().map_err(|e| e.to_string())?;
+    mcp_secret_set_in(&dir, &KeyringStore, account, value)
 }
 
 /// `thegn mcp secret rm` — remove from the keyring and the index.
 pub fn mcp_secret_rm(account: &str) -> Result<(), String> {
-    KeyringStore
-        .del(account)
-        .map_err(|error| error.message().to_string())?;
-    index_remove(account)?;
+    let dir = secrets_dir().map_err(|e| e.to_string())?;
+    mcp_secret_rm_in(&dir, &KeyringStore, account)
+}
+
+fn mcp_secret_set_in(
+    dir: &std::path::Path,
+    store: &dyn SecretStore,
+    account: &str,
+    value: &str,
+) -> Result<(), String> {
+    validate_mcp_account(account)?;
+    with_index_lock(dir, || {
+        let _names = index_read_in(dir)?;
+        store
+            .set(account, value)
+            .map_err(|error| error.message().to_string())?;
+        index_add_locked(dir, account)
+    })
+}
+
+fn mcp_secret_rm_in(
+    dir: &std::path::Path,
+    store: &dyn SecretStore,
+    account: &str,
+) -> Result<(), String> {
+    validate_mcp_account(account)?;
+    with_index_lock(dir, || {
+        let _names = index_read_in(dir)?;
+        store
+            .del(account)
+            .map_err(|error| error.message().to_string())?;
+        index_remove_locked(dir, account)
+    })
+}
+
+fn validate_mcp_account(account: &str) -> Result<(), String> {
+    if account.is_empty() || account.len() > MAX_ACCOUNT_BYTES {
+        return Err("invalid MCP secret account name".into());
+    }
     Ok(())
 }
 
@@ -1577,41 +1612,35 @@ fn with_index_lock<T>(
     action()
 }
 
-fn index_add_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
-    if account.is_empty() || account.len() > MAX_ACCOUNT_BYTES {
-        return Err("invalid MCP secret account name".into());
+fn index_add_locked(dir: &std::path::Path, account: &str) -> Result<(), String> {
+    let mut names = index_read_in(dir)?;
+    if !names.iter().any(|name| name == account) {
+        names.push(account.to_string());
+        names.sort();
+        index_write_in(dir, &names)?;
     }
-    with_index_lock(dir, || {
-        let mut names = index_read_in(dir)?;
-        if !names.iter().any(|name| name == account) {
-            names.push(account.to_string());
-            names.sort();
-            index_write_in(dir, &names)?;
-        }
-        Ok(())
-    })
+    Ok(())
 }
 
+fn index_remove_locked(dir: &std::path::Path, account: &str) -> Result<(), String> {
+    let mut names = index_read_in(dir)?;
+    let before = names.len();
+    names.retain(|name| name != account);
+    if names.len() != before {
+        index_write_in(dir, &names)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn index_add_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
+    validate_mcp_account(account)?;
+    with_index_lock(dir, || index_add_locked(dir, account))
+}
+
+#[cfg(test)]
 fn index_remove_in(dir: &std::path::Path, account: &str) -> Result<(), String> {
-    with_index_lock(dir, || {
-        let mut names = index_read_in(dir)?;
-        let before = names.len();
-        names.retain(|name| name != account);
-        if names.len() != before {
-            index_write_in(dir, &names)?;
-        }
-        Ok(())
-    })
-}
-
-fn index_add(account: &str) -> Result<(), String> {
-    let dir = secrets_dir().map_err(|e| e.to_string())?;
-    index_add_in(&dir, account)
-}
-
-fn index_remove(account: &str) -> Result<(), String> {
-    let dir = secrets_dir().map_err(|e| e.to_string())?;
-    index_remove_in(&dir, account)
+    with_index_lock(dir, || index_remove_locked(dir, account))
 }
 
 #[cfg(test)]
@@ -2563,6 +2592,142 @@ mod tests {
         std::fs::write(&index, b"not-json").unwrap();
         assert!(index_add_in(temp.path(), "new-name").is_err());
         assert_eq!(std::fs::read(index).unwrap(), b"not-json");
+    }
+
+    type RecordingGate = Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>;
+
+    struct RecordingStore {
+        ops: Arc<Mutex<Vec<String>>>,
+        gate: Mutex<RecordingGate>,
+    }
+
+    impl RecordingStore {
+        fn new(ops: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                ops,
+                gate: Mutex::new(None),
+            }
+        }
+
+        fn gated(
+            ops: Arc<Mutex<Vec<String>>>,
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                ops,
+                gate: Mutex::new(Some((entered, release))),
+            }
+        }
+    }
+
+    impl Probe for RecordingStore {
+        fn probe(&self) -> ProbeReport {
+            ProbeReport::new("secret", "fake", Availability::Ready)
+        }
+    }
+
+    impl SecretStore for RecordingStore {
+        fn kind(&self) -> SecretBackendKind {
+            SecretBackendKind::Keyring
+        }
+
+        fn caps(&self) -> SecretBackendCaps {
+            SecretBackendCaps {
+                writable: true,
+                listable: false,
+            }
+        }
+
+        fn get(&self, account: &str) -> std::result::Result<String, SecretError> {
+            Err(SecretError::not_found(account.to_string()))
+        }
+
+        fn set(&self, account: &str, _value: &str) -> std::result::Result<(), SecretError> {
+            self.ops.lock().unwrap().push(format!("set:{account}"));
+            if let Some((entered, release)) = self.gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(())
+        }
+
+        fn del(&self, account: &str) -> std::result::Result<(), SecretError> {
+            self.ops.lock().unwrap().push(format!("del:{account}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mcp_rm_waits_for_an_in_flight_set_on_the_index_lock() {
+        // Thread A owns the index lock while its fake keyring set is blocked;
+        // thread B signals before calling rm, then must remain outside the
+        // keyring until A has published the index entry and released the lock.
+        let temp = private_temp();
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store_a = RecordingStore::gated(Arc::clone(&ops), entered_tx, release_rx);
+        let dir_a = temp.path().to_path_buf();
+        let set_thread =
+            std::thread::spawn(move || mcp_secret_set_in(&dir_a, &store_a, "acct", "v"));
+        entered_rx.recv().unwrap();
+
+        let store_b = RecordingStore::new(Arc::clone(&ops));
+        let dir_b = temp.path().to_path_buf();
+        let (rm_started_tx, rm_started_rx) = std::sync::mpsc::channel();
+        let rm_thread = std::thread::spawn(move || {
+            rm_started_tx.send(()).unwrap();
+            mcp_secret_rm_in(&dir_b, &store_b, "acct")
+        });
+        rm_started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let only_set_reached_the_store = *ops.lock().unwrap() == vec!["set:acct"];
+
+        release_tx.send(()).unwrap();
+        set_thread.join().unwrap().unwrap();
+        rm_thread.join().unwrap().unwrap();
+        assert!(only_set_reached_the_store);
+        assert_eq!(*ops.lock().unwrap(), vec!["set:acct", "del:acct"]);
+        assert!(index_read_in(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mcp_set_refuses_a_corrupt_index_before_touching_the_keyring() {
+        let temp = private_temp();
+        let index = temp.path().join("mcp-index.json");
+        std::fs::write(&index, b"not-json").unwrap();
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let store = RecordingStore::new(Arc::clone(&ops));
+
+        assert!(mcp_secret_set_in(temp.path(), &store, "acct", "v").is_err());
+        assert!(ops.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(index).unwrap(), b"not-json");
+    }
+
+    #[test]
+    fn mcp_set_refuses_an_overlong_name_before_touching_the_keyring() {
+        let temp = private_temp();
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let store = RecordingStore::new(Arc::clone(&ops));
+        let account = "a".repeat(MAX_ACCOUNT_BYTES + 1);
+
+        assert!(mcp_secret_set_in(temp.path(), &store, &account, "v").is_err());
+        assert!(ops.lock().unwrap().is_empty());
+        assert!(!temp.path().join("mcp-index.json").exists());
+    }
+
+    #[test]
+    fn mcp_set_then_rm_round_trips_the_index() {
+        let temp = private_temp();
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let store = RecordingStore::new(Arc::clone(&ops));
+
+        mcp_secret_set_in(temp.path(), &store, "acct", "v").unwrap();
+        assert_eq!(index_read_in(temp.path()).unwrap(), vec!["acct"]);
+        mcp_secret_rm_in(temp.path(), &store, "acct").unwrap();
+        assert!(index_read_in(temp.path()).unwrap().is_empty());
+        assert_eq!(*ops.lock().unwrap(), vec!["set:acct", "del:acct"]);
     }
 
     #[test]
