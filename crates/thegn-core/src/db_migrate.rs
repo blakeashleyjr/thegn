@@ -2091,6 +2091,24 @@ pub(crate) fn verify_v96_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v97: merge_queue_events.target_base_oid, the target ref OID a landing CAS replaced (THE-395).
+pub(crate) fn migrate_v97(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "merge_queue_events", "target_base_oid") {
+        conn.execute(
+            "ALTER TABLE merge_queue_events ADD COLUMN target_base_oid TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v97_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "merge_queue_events", "target_base_oid") {
+        bail!("schema v97 migration did not add merge_queue_events.target_base_oid");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3438,9 +3456,52 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 96);
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
         assert_eq!(upgraded.list_merge_queue().unwrap().len(), 1);
         super::verify_v96_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v97_adds_merge_queue_events_target_base_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v97_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        super::migrate_v96(&conn).unwrap();
+        assert!(super::verify_v97_schema(&conn).is_err());
+        super::migrate_v97(&conn).unwrap();
+        super::migrate_v97(&conn).unwrap();
+        super::verify_v97_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v97_upgrades_a_real_v96_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v96.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.enqueue_merge("/private/v97-worktree", "feature", "main")
+                .unwrap();
+            db.remove_merge_entry("/private/v97-worktree").unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE merge_queue_events DROP COLUMN target_base_oid;\n\
+                     PRAGMA user_version=96;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 97);
+        let events = upgraded
+            .merge_queue_events("/private/v97-worktree", 10)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_base_oid, None);
+        super::verify_v97_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

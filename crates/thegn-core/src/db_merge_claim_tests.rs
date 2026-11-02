@@ -694,3 +694,78 @@ fn lost_claim_records_no_event() {
     assert!(db.merge_queue_events(WT, 10).unwrap().is_empty());
     assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
 }
+
+#[test]
+fn landed_claimed_write_records_the_target_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    let claim = db
+        .replace_merge_status_claimed(&claim, "folding", &MergeStatusFields::default())
+        .unwrap();
+
+    db.land_merge_status_claimed(
+        &claim,
+        &MergeStatusFields {
+            result_oid: Some("res".into()),
+            ..Default::default()
+        },
+        "base",
+    )
+    .unwrap();
+
+    let events = db.merge_queue_events(WT, 10).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].old_status, "folding");
+    assert_eq!(events[0].new_status.as_deref(), Some("landed"));
+    assert_eq!(events[0].result_oid.as_deref(), Some("res"));
+    assert_eq!(events[0].target_base_oid.as_deref(), Some("base"));
+    assert_eq!(events[1].target_base_oid, None);
+}
+
+#[test]
+fn land_with_an_empty_target_base_is_refused_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    let before_events = db.merge_queue_events(WT, 10).unwrap();
+
+    let result = db.land_merge_status_claimed(
+        &claim,
+        &MergeStatusFields {
+            result_oid: Some("res".into()),
+            ..Default::default()
+        },
+        " ",
+    );
+
+    assert!(matches!(result, Err(error) if error.to_string().contains("target base OID")));
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+    assert_eq!(db.merge_queue_events(WT, 10).unwrap(), before_events);
+}
+
+#[test]
+fn lost_claim_land_records_no_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(&dir.path().join("claims.sqlite"));
+    let claim = db.admit_merge_claim(&request()).unwrap().unwrap();
+    db.conn()
+        .execute(
+            "UPDATE merge_queue SET claim_generation=claim_generation+1 WHERE worktree=?1",
+            [WT],
+        )
+        .unwrap();
+
+    let result = db.land_merge_status_claimed(
+        &claim,
+        &MergeStatusFields {
+            result_oid: Some("res".into()),
+            ..Default::default()
+        },
+        "base",
+    );
+
+    assert!(matches!(result, Err(error) if error.to_string().contains(MERGE_CLAIM_LOST)));
+    assert!(db.merge_queue_events(WT, 10).unwrap().is_empty());
+    assert_eq!(db.list_merge_queue().unwrap()[0].status, "queued");
+}

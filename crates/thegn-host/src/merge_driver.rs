@@ -974,6 +974,20 @@ fn drive_queue_with(
         let post_release = std::cell::RefCell::new(None::<PostRelease>);
         let lifecycle_notes = std::cell::RefCell::new(Vec::<String>::new());
         let stop_drain = std::cell::Cell::new(false);
+        let record_write_error = |error: anyhow::Error| {
+            let message = if error
+                .to_string()
+                .contains(thegn_core::store::MERGE_CLAIM_LOST)
+            {
+                format!(
+                    "{}: merge claim lost; another drain recovered the row",
+                    item.branch
+                )
+            } else {
+                format!("{}: {error}", item.worktree)
+            };
+            *write_error.borrow_mut() = Some(message);
+        };
         let write_fields = |db: &Db, status: MqStatus, fields: &MergeStatusFields| {
             let result = if let Some(claim) = claim.borrow().as_ref() {
                 claim.write(db, status, fields)
@@ -981,18 +995,7 @@ fn drive_queue_with(
                 replace_status(db, &item.worktree, status, fields)
             };
             if let Err(error) = result {
-                let message = if error
-                    .to_string()
-                    .contains(thegn_core::store::MERGE_CLAIM_LOST)
-                {
-                    format!(
-                        "{}: merge claim lost; another drain recovered the row",
-                        item.branch
-                    )
-                } else {
-                    format!("{}: {error}", item.worktree)
-                };
-                *write_error.borrow_mut() = Some(message);
+                record_write_error(error);
             }
         };
         let set = |db: &Db, status: MqStatus, oid: Option<&str>, detail: Option<&str>| {
@@ -1002,6 +1005,22 @@ fn drive_queue_with(
                 error_detail: detail.map(str::to_owned),
             };
             write_fields(db, status, &fields);
+            fields
+        };
+        let set_landed = |db: &Db, commit: &str, target_base_oid: &str| {
+            let fields = MergeStatusFields {
+                result_oid: Some(commit.to_owned()),
+                conflict_paths: None,
+                error_detail: None,
+            };
+            let result = if let Some(claim) = claim.borrow().as_ref() {
+                claim.write_landed(db, &fields, target_base_oid)
+            } else {
+                replace_status(db, &item.worktree, MqStatus::Landed, &fields)
+            };
+            if let Err(error) = result {
+                record_write_error(error);
+            }
             fields
         };
         macro_rules! stop_on_write_error {
@@ -1147,7 +1166,7 @@ fn drive_queue_with(
                     // Carried out to the caller so the CLI can warn about any
                     // live checkout of the target left stale by the ref move.
                     out.resyncs.extend(resyncs);
-                    let fields = set(db, MqStatus::Landed, Some(&commit), None);
+                    let fields = set_landed(db, &commit, &old_oid);
                     let pending_write_error = write_error.borrow_mut().take();
                     if let Some(error) = pending_write_error {
                         out.bookkeeping_failed.push(RefAdvancedBookkeepingFailed {
