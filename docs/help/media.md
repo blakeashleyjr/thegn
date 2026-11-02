@@ -53,10 +53,11 @@ local player, without leaving the compositor. Hidden unless
 - With more than 64 players the player picker lists the first 64, and the
   status line says more were not shown; the Media section shows
   "+more sources not shown".
-- A control is skipped with “Media operation skipped because the player
-  changed” if the selected player went away or another process took over its
-  MPRIS name. Changing media configuration or player selection cancels waiting
-  controls from before the change.
+- A control or playlist pick is skipped with “Media operation skipped because
+  the player changed” if the selected player went away, another process took
+  over its MPRIS name, or (for a playlist) a different player is current than
+  the one the picker listed. Changing media configuration or player selection
+  cancels waiting controls from before the change.
 - If the player's state cannot be read before a control, the control is not
   sent and the status line says “Media operation needs the player's current
   state”. A read that does not answer within two seconds reports “Media

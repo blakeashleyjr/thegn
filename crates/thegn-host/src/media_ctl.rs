@@ -96,6 +96,7 @@ impl MediaOpOutcome {
             Self::Refused("shuffle") => "Media operation needs known shuffle state",
             Self::Refused("loop") => "Media operation needs known loop state",
             Self::Refused("queue") => "Media queue item needs the current player's state",
+            Self::Refused("playlist") => "Media playlist needs the current player's state",
             Self::Refused("state") => "Media operation needs the player's current state",
             Self::Refused(_) => "Media operation was refused",
             Self::Unsupported => "This player does not support that control",
@@ -540,26 +541,70 @@ fn queue_lease_check(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaylistLease {
+    pub(crate) id: String,
+    pub(crate) player: String,
+}
+
+pub(crate) fn playlist_key(player: &str, id: &str) -> String {
+    format!("media-playlist:{}:{player}{id}", player.len())
+}
+
+pub(crate) fn parse_playlist_key(rest: &str) -> Option<PlaylistLease> {
+    let (length, tail) = rest.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    let player = tail.get(..length)?;
+    let id = tail.get(length..)?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(PlaylistLease {
+        id: id.to_string(),
+        player: player.to_string(),
+    })
+}
+
+fn playlist_lease_check(
+    lease: &PlaylistLease,
+    current: Option<&thegn_core::media::MediaSnapshot>,
+) -> Result<(), MediaOpOutcome> {
+    let current_player = current
+        .map(|snapshot| snapshot.state.player.as_str())
+        .unwrap_or("");
+    if current_player == lease.player {
+        Ok(())
+    } else {
+        Err(MediaOpOutcome::Stale)
+    }
+}
+
 /// An async result that opens a secondary media picker palette.
 pub(crate) enum MediaPick {
-    Playlists(Result<thegn_core::media::PlaylistPage, String>),
+    Playlists {
+        listed_for: String,
+        page: Result<thegn_core::media::PlaylistPage, String>,
+    },
     Players(Result<Vec<String>, String>),
 }
 
 pub(crate) fn pick_palette(pick: MediaPick) -> Result<Vec<crate::palette::PaletteItem>, String> {
     match pick {
-        MediaPick::Playlists(Ok(page)) if page.items.is_empty() => {
+        MediaPick::Playlists { page: Ok(page), .. } if page.items.is_empty() => {
             Err("Media: nothing to pick".into())
         }
         MediaPick::Players(Ok(players)) if players.is_empty() => {
             Err("Media: nothing to pick".into())
         }
-        MediaPick::Playlists(Ok(page)) => Ok(page
+        MediaPick::Playlists {
+            listed_for,
+            page: Ok(page),
+        } => Ok(page
             .items
             .into_iter()
             .map(|playlist| {
                 crate::palette::PaletteItem::new(
-                    format!("media-playlist:{}", playlist.id),
+                    playlist_key(&listed_for, &playlist.id),
                     format!("\u{1f3b5} {}", playlist.name),
                 )
             })
@@ -574,16 +619,18 @@ pub(crate) fn pick_palette(pick: MediaPick) -> Result<Vec<crate::palette::Palett
                 )
             })
             .collect()),
-        MediaPick::Playlists(Err(error)) => {
-            Err(format!("Media: could not list playlists: {error}"))
-        }
+        MediaPick::Playlists {
+            page: Err(error), ..
+        } => Err(format!("Media: could not list playlists: {error}")),
         MediaPick::Players(Err(error)) => Err(format!("Media: could not list players: {error}")),
     }
 }
 
 pub(crate) fn pick_note(pick: &MediaPick) -> Option<String> {
     match pick {
-        MediaPick::Playlists(Ok(page)) if page.hidden() > 0 && !page.items.is_empty() => {
+        MediaPick::Playlists { page: Ok(page), .. }
+            if page.hidden() > 0 && !page.items.is_empty() =>
+        {
             let hidden = page.hidden();
             let noun = if hidden == 1 { "playlist" } else { "playlists" };
             Some(format!("Media: {hidden} more {noun} not shown"))
@@ -831,7 +878,7 @@ pub(crate) fn spawn_media_action(
 /// that was current when the request was made.
 pub(crate) fn spawn_media_playlist(
     cfg: thegn_core::config::MediaConfig,
-    id: String,
+    lease: PlaylistLease,
     generation: &MediaGeneration,
     tx: crate::media_watch::SnapshotSender,
     waker: TerminalWaker,
@@ -862,12 +909,36 @@ pub(crate) fn spawn_media_playlist(
                         return;
                     }
                     if !client.caps().playlists {
-                        tracing::debug!(target: "thegn::media", playlist = %id, "playlist activation is unsupported by the selected player");
+                        tracing::debug!(target: "thegn::media", playlist = %lease.id, "playlist activation is unsupported by the selected player");
                         publish_outcome(MediaOpOutcome::Unsupported, &outcome_waker);
                         return;
                     }
-                    if let Err(e) = client.activate_playlist(&id).await {
-                        tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+                    match bounded_read(&client, "playlist preflight").await {
+                        Ok(current) => {
+                            if let Err(outcome) = playlist_lease_check(&lease, current.as_ref()) {
+                                publish_outcome(outcome, &outcome_waker);
+                                return;
+                            }
+                        }
+                        Err(ReadFailure::Failed) => {
+                            publish_outcome(MediaOpOutcome::Refused("playlist"), &outcome_waker);
+                            return;
+                        }
+                        Err(ReadFailure::TimedOut) => {
+                            publish_outcome(MediaOpOutcome::TimedOut, &outcome_waker);
+                            return;
+                        }
+                    }
+                    if !generation_is_current(
+                        captured_generation,
+                        &generation_guard,
+                        &MEDIA_OP_OUTCOME,
+                    ) {
+                        pulse(&outcome_waker);
+                        return;
+                    }
+                    if let Err(e) = client.activate_playlist(&lease.id).await {
+                        tracing::warn!(target: "thegn::media", error = %e, "playlist {} activation failed", lease.id);
                         publish_outcome(MediaOpOutcome::Failed, &outcome_waker);
                     }
                     if let Some(delivery) = delivery_from_read(
@@ -905,22 +976,37 @@ pub(crate) fn spawn_media_pick(
                 Ok(client) if players => MediaPick::Players(
                     client.players().await.map_err(|error| error.to_string()),
                 ),
-                Ok(client) => match client.playlist_page().await {
-                    Ok(page) => MediaPick::Playlists(Ok(page)),
-                    Err(error) => {
-                        tracing::debug!(target: "thegn::media", error = %error, "media playlist fetch failed");
-                        MediaPick::Playlists(Err(error.to_string()))
+                Ok(client) => match bounded_read(&client, "playlist list").await {
+                    Ok(snapshot) => {
+                        let listed_for = match snapshot {
+                            Some(snapshot) => snapshot.state.player,
+                            None => String::new(),
+                        };
+                        match client.playlist_page().await {
+                            Ok(page) => MediaPick::Playlists { listed_for, page: Ok(page) },
+                            Err(error) => {
+                                tracing::debug!(target: "thegn::media", error = %error, "media playlist fetch failed");
+                                MediaPick::Playlists { listed_for, page: Err(error.to_string()) }
+                            }
+                        }
                     }
+                    Err(_) => MediaPick::Playlists {
+                        listed_for: String::new(),
+                        page: Err("could not read the current player".into()),
+                    },
                 },
                 Err(error) if players => MediaPick::Players(Err(error.to_string())),
-                Err(error) => MediaPick::Playlists(Err(error.to_string())),
+                Err(error) => MediaPick::Playlists { listed_for: String::new(), page: Err(error.to_string()) },
             }
         })
         .await;
         let pick = match result {
             Some(pick) => pick,
             None if players => MediaPick::Players(Err("timed out".into())),
-            None => MediaPick::Playlists(Err("timed out".into())),
+            None => MediaPick::Playlists {
+                listed_for: String::new(),
+                page: Err("timed out".into()),
+            },
         };
         slot.put(pick);
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -992,11 +1078,11 @@ mod tests {
     use super::{
         Latest, MEDIA_OP_BUDGET, MEDIA_READ_BUDGET, MEDIA_TRANSPORT_BUDGET, MediaGeneration,
         MediaOp, MediaOpChain, MediaOpOutcome, MediaOpTail, MediaPick, MediaPreflightError,
-        MediaShutdown, ReadFailure, cancel_op_chain, chain_op, chain_op_inner,
+        MediaShutdown, PlaylistLease, ReadFailure, cancel_op_chain, chain_op, chain_op_inner,
         chain_op_with_outcome, delivery_from_read, generation_is_current, loop_target,
-        op_supported, pick_note, pick_palette, queue_lease_check, record_refusal,
-        replace_in_flight, run_transport_op, shuffle_target, shutdown_media_parts, take_outcome,
-        within_media_budget,
+        op_supported, parse_playlist_key, pick_note, pick_palette, playlist_key,
+        playlist_lease_check, queue_lease_check, record_refusal, replace_in_flight,
+        run_transport_op, shuffle_target, shutdown_media_parts, take_outcome, within_media_budget,
     };
     use crate::panel::media::QueueItemLease;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -1235,11 +1321,11 @@ mod tests {
     #[test]
     fn pick_palette_distinguishes_error_from_empty() {
         assert!(matches!(
-            pick_palette(MediaPick::Playlists(Err("boom".into()))),
+            pick_palette(MediaPick::Playlists { listed_for: "spotify".into(), page: Err("boom".into()) }),
             Err(text) if text.contains("could not list playlists") && text.contains("boom")
         ));
         assert!(matches!(
-            pick_palette(MediaPick::Playlists(Ok(thegn_core::media::PlaylistPage::default()))),
+            pick_palette(MediaPick::Playlists { listed_for: "spotify".into(), page: Ok(thegn_core::media::PlaylistPage::default()) }),
             Err(text) if text == "Media: nothing to pick"
         ));
         assert!(matches!(
@@ -1251,19 +1337,50 @@ mod tests {
             Err(text) if text == "Media: nothing to pick"
         ));
 
-        let playlists = pick_palette(MediaPick::Playlists(Ok(
-            thegn_core::media::PlaylistPage::from_rows(vec![thegn_core::media::Playlist {
-                id: "playlist-id".into(),
-                name: "Favorites".into(),
-            }]),
-        )))
+        let playlists = pick_palette(MediaPick::Playlists {
+            listed_for: "spotify".into(),
+            page: Ok(thegn_core::media::PlaylistPage::from_rows(vec![
+                thegn_core::media::Playlist {
+                    id: "playlist-id".into(),
+                    name: "Favorites".into(),
+                },
+            ])),
+        })
         .unwrap();
         assert_eq!(playlists.len(), 1);
-        assert_eq!(playlists[0].key, "media-playlist:playlist-id");
+        assert_eq!(playlists[0].key, playlist_key("spotify", "playlist-id"));
 
         let items = pick_palette(MediaPick::Players(Ok(vec!["mpv".into()]))).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].key, "media-player:mpv");
+    }
+
+    #[test]
+    fn playlist_key_round_trips_players_with_colons() {
+        for player in ["spotify", "org.mpris.MediaPlayer2.vlc", "a:b", ""] {
+            for id in ["p1", "x:y"] {
+                let key = playlist_key(player, id);
+                let rest = key.strip_prefix("media-playlist:").unwrap();
+                assert_eq!(
+                    parse_playlist_key(rest),
+                    Some(PlaylistLease {
+                        id: id.to_string(),
+                        player: player.to_string(),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_playlist_key_refuses_malformed_keys() {
+        for rest in ["", "x", "3:ab", "99:spotifyp1", "1:\u{e9}x", "7:spotify"] {
+            assert_eq!(
+                parse_playlist_key(rest),
+                None,
+                "accepted malformed key {rest:?}"
+            );
+        }
     }
 
     #[test]
@@ -1278,7 +1395,7 @@ mod tests {
             total: thegn_core::media::MAX_PLAYLISTS + 5,
         };
         assert!(matches!(
-            pick_note(&MediaPick::Playlists(Ok(page))),
+            pick_note(&MediaPick::Playlists { listed_for: "spotify".into(), page: Ok(page) }),
             Some(text) if text.contains("5 more playlists not shown")
         ));
 
@@ -1289,9 +1406,21 @@ mod tests {
             }],
             total: 1,
         };
-        assert_eq!(pick_note(&MediaPick::Playlists(Ok(page))), None);
+        assert_eq!(
+            pick_note(&MediaPick::Playlists {
+                listed_for: "spotify".into(),
+                page: Ok(page)
+            }),
+            None
+        );
         assert_eq!(pick_note(&MediaPick::Players(Ok(Vec::new()))), None);
-        assert_eq!(pick_note(&MediaPick::Playlists(Err("failed".into()))), None);
+        assert_eq!(
+            pick_note(&MediaPick::Playlists {
+                listed_for: "spotify".into(),
+                page: Err("failed".into())
+            }),
+            None
+        );
 
         let page = thegn_core::media::PlaylistPage {
             items: vec![thegn_core::media::Playlist {
@@ -1301,7 +1430,11 @@ mod tests {
             total: 2,
         };
         assert_eq!(
-            pick_note(&MediaPick::Playlists(Ok(page))).as_deref(),
+            pick_note(&MediaPick::Playlists {
+                listed_for: "spotify".into(),
+                page: Ok(page)
+            })
+            .as_deref(),
             Some("Media: 1 more playlist not shown")
         );
     }
@@ -1578,6 +1711,64 @@ mod tests {
         };
 
         assert_eq!(queue_lease_check(&lease, Some(&snapshot)), Ok(()));
+    }
+
+    #[test]
+    fn playlist_lease_check_refuses_a_switched_player_as_stale() {
+        let lease = PlaylistLease {
+            id: "p1".into(),
+            player: "spotify".into(),
+        };
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "mpd".into(),
+                ..MediaState::default()
+            },
+            caps: MediaCaps::default(),
+        };
+
+        assert_eq!(
+            playlist_lease_check(&lease, Some(&snapshot)),
+            Err(MediaOpOutcome::Stale)
+        );
+        assert_eq!(
+            MediaOpOutcome::Stale.status_text(),
+            "Media operation skipped because the player changed"
+        );
+    }
+
+    #[test]
+    fn playlist_lease_check_refuses_an_unreadable_state() {
+        let lease = PlaylistLease {
+            id: "p1".into(),
+            player: "spotify".into(),
+        };
+        assert_eq!(
+            playlist_lease_check(&lease, None),
+            Err(MediaOpOutcome::Stale)
+        );
+    }
+
+    #[test]
+    fn playlist_lease_check_accepts_the_listing_player() {
+        let lease = PlaylistLease {
+            id: "p1".into(),
+            player: "spotify".into(),
+        };
+        let snapshot = MediaSnapshot {
+            state: MediaState {
+                player: "spotify".into(),
+                ..MediaState::default()
+            },
+            caps: MediaCaps::default(),
+        };
+
+        assert_eq!(playlist_lease_check(&lease, Some(&snapshot)), Ok(()));
+        let no_player_lease = PlaylistLease {
+            id: "p1".into(),
+            player: String::new(),
+        };
+        assert_eq!(playlist_lease_check(&no_player_lease, None), Ok(()));
     }
 
     #[tokio::test]
