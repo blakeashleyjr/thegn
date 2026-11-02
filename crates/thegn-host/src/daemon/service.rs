@@ -956,11 +956,24 @@ fn merge_issue_accounts(
         match result {
             Ok(mut rows) => issues.append(&mut rows),
             Err(thegn_svc::issue::IssueError::PartialList {
-                issues: mut rows,
+                issues: rows,
                 reason,
             }) => {
                 tracing::warn!(account = %account, provider, reason, "issues.list account was partial");
-                issues.append(&mut rows);
+                issues.extend(rows.into_iter().filter_map(|issue| {
+                    match thegn_svc::issue::validate_issue_identity(&issue) {
+                        Ok(()) => Some(issue),
+                        Err(error) => {
+                            tracing::warn!(
+                                account = %account,
+                                provider,
+                                error = %error,
+                                "partial issue identity rejected"
+                            );
+                            None
+                        }
+                    }
+                }));
                 incomplete.push(IssueListGap {
                     account,
                     provider: provider.to_string(),
@@ -3770,11 +3783,15 @@ mod tests {
         use thegn_svc::issue::IssueError;
 
         let a1 = thegn_core::issue::Issue {
+            provider: "linear".into(),
             id: "linear:A-1".into(),
+            number: "A-1".into(),
             ..Default::default()
         };
         let b1 = thegn_core::issue::Issue {
+            provider: "jira".into(),
             id: "jira:B-1".into(),
+            number: "B-1".into(),
             ..Default::default()
         };
         let listing = merge_issue_accounts(
@@ -3809,11 +3826,48 @@ mod tests {
     }
 
     #[test]
+    fn issues_list_partial_rows_with_a_bad_identity_are_dropped() {
+        use thegn_svc::issue::IssueError;
+
+        let valid = thegn_core::issue::Issue {
+            provider: "linear".into(),
+            id: "linear:A-1".into(),
+            number: "A-1".into(),
+            ..Default::default()
+        };
+        let mismatched = thegn_core::issue::Issue {
+            provider: "linear".into(),
+            id: "jira:B-1".into(),
+            number: "B-1".into(),
+            ..Default::default()
+        };
+        let listing = merge_issue_accounts(
+            vec![(
+                "work".into(),
+                "linear",
+                Err(IssueError::PartialList {
+                    issues: vec![valid.clone(), mismatched],
+                    reason: "page cap",
+                }),
+            )],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(listing.issues, vec![valid]);
+        assert!(!listing.complete);
+        assert_eq!(listing.incomplete.len(), 1);
+        assert_eq!(listing.incomplete[0].kind, "partial");
+    }
+
+    #[test]
     fn issues_list_single_partial_account_is_not_an_error() {
         use thegn_svc::issue::IssueError;
 
         let issue = thegn_core::issue::Issue {
+            provider: "linear".into(),
             id: "linear:A-1".into(),
+            number: "A-1".into(),
             ..Default::default()
         };
         let listing = merge_issue_accounts(
