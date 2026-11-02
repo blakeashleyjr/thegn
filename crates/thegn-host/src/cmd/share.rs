@@ -91,10 +91,10 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
     let kind = provider.kind().to_string();
     let launch = provider.launch()?;
     let generation = cli_generation()?;
-    begin_share(&db, &wt, port, generation, &kind)?;
 
     match launch {
         ShareLaunch::Process(plan) => {
+            begin_share(&db, &wt, port, generation, &kind)?;
             let statedir = match share::share_state_dir(&wt_path, &kind, port, generation) {
                 Ok(statedir) => statedir,
                 Err(error) => {
@@ -129,6 +129,14 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             }
             // Block until the client exits (Ctrl-C tears down the group).
             // CLI path: `thegn share` runs the tunnel in the foreground by design.
+            let interrupt = crate::platform::InterruptGuard::install();
+            while !running.has_exited() {
+                if interrupt.fired() {
+                    cleanup_interrupted_share(&db, &wt, port, generation, || running.stop())?;
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             running.wait();
             if !db
                 .delete_share_generation(&wt, port, generation)
@@ -147,6 +155,14 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                     Some(&thegn_core::profile::name()),
                 ),
             );
+            begin_share_after_preflight(
+                &db,
+                &wt,
+                port,
+                generation,
+                &kind,
+                thegn_svc::vpn::recorded_sidecar(&sidecar).map(|_| ()),
+            )?;
             let url = match share::serve_up(&sidecar, &serve) {
                 Ok(url) => url,
                 Err(error) => match share::serve_down(&sidecar, &serve) {
@@ -157,6 +173,14 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
                         ));
                     }
                     Err(teardown_error) => {
+                        if let Err(record_error) = thegn_svc::vpn::recorded_sidecar(&sidecar) {
+                            let error = error.context(format!(
+                                "share: serve start failed before exposure ({record_error:#}); teardown could not be verified ({teardown_error:#})"
+                            ));
+                            return Err(abandon_pending_with_error(
+                                &db, &wt, port, generation, error,
+                            ));
+                        }
                         let failed_record =
                             db.upsert_share(&wt, port, generation, &kind, None, "failed");
                         let mut message = format!(
@@ -228,6 +252,29 @@ fn begin_share(
     store
         .upsert_share(wt, port, generation, kind, None, "starting")
         .context("share: could not record the pending share; nothing was started")
+}
+
+fn begin_share_after_preflight(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+    kind: &str,
+    preflight: Result<()>,
+) -> Result<()> {
+    preflight.context("share: provider precondition failed; nothing was started")?;
+    begin_share(store, wt, port, generation, kind)
+}
+
+fn cleanup_interrupted_share(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+    stop: impl FnOnce(),
+) -> Result<()> {
+    stop();
+    abandon_pending(store, wt, port, generation)
 }
 
 fn abandon_pending(
@@ -493,6 +540,47 @@ mod tests {
         assert_eq!(row.generation, 41);
         assert_eq!(row.state, "up");
         assert_eq!(row.public_url.as_deref(), Some("https://demo.ts.net"));
+    }
+
+    #[test]
+    fn sidecar_preflight_refusal_leaves_no_share_row() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+
+        let result = begin_share_after_preflight(
+            &db,
+            "/worktree/demo",
+            3000,
+            9,
+            "tailscale",
+            Err(anyhow::anyhow!("vpn: no recorded runtime for sidecar")),
+        );
+
+        assert!(result.is_err(), "missing runtime record refuses before exposure");
+        assert!(db.list_shares().expect("read shares after refusal").is_empty());
+    }
+
+    #[test]
+    fn interrupted_process_cleanup_stops_and_removes_its_generation() {
+        let _state = IsolatedState::new();
+        let db = isolated_db(&_state);
+        begin_share(&db, "/worktree/demo", 3000, 7, "frp").expect("persist pending share");
+        db.upsert_share(
+            "/worktree/demo",
+            3000,
+            7,
+            "frp",
+            Some("https://share.example"),
+            "up",
+        )
+        .expect("mark share exposed");
+        let stopped = std::cell::Cell::new(false);
+
+        cleanup_interrupted_share(&db, "/worktree/demo", 3000, 7, || stopped.set(true))
+            .expect("stop process share and delete its row");
+
+        assert!(stopped.get(), "interrupted cleanup must stop the child");
+        assert!(db.list_shares().expect("read shares after cleanup").is_empty());
     }
 
     #[test]
