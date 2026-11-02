@@ -221,8 +221,10 @@ pub struct ExecParams {
 
 /// The captured result of an `exec`. `stdout`/`stderr` are UTF-8 (lossy for any
 /// non-UTF-8 bytes — git/text tooling output, incl. `-z` NUL separators which are
-/// valid UTF-8, round-trips exactly). Each stream is capped; its corresponding
-/// `*_truncated` flag is true when additional bytes were drained and discarded.
+/// valid UTF-8, round-trips exactly). Stderr is redacted with the core secret
+/// scrubber before it leaves the bridge agent. Each stream is capped; its
+/// corresponding `*_truncated` flag is true when additional bytes were drained
+/// and discarded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecResult {
     pub stdout: String,
@@ -1999,7 +2001,21 @@ fn do_exec(p: &ExecParams, cancel: &Arc<AtomicBool>) -> Result<ExecResult> {
     // timeout without cancelling us, so cap it here — deadline defaults above the
     // client's read timeout so a legitimately-slow-but-live command still finishes.
     let deadline = env_timeout("THEGN_BRIDGE_EXEC_DEADLINE_SECS", 90);
-    output_bounded(c, deadline, cancel).context("bridge exec failed")
+    let mut result = output_bounded(c, deadline, cancel).context("bridge exec failed")?;
+    // Diagnostics cross the bridge into host logs and status lines: scrub
+    // secret-shaped text (THE-312). stdout is data and is never rewritten.
+    result.stderr = thegn_core::ci_log::redact(&result.stderr);
+    // Redaction can expand short lines into markers. Keep the wire budget tied
+    // to the capture ceiling, and report the loss so the client fails closed.
+    if result.stderr.len() > MAX_CAPTURE_BYTES {
+        let mut end = MAX_CAPTURE_BYTES;
+        while !result.stderr.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.stderr.truncate(end);
+        result.stderr_truncated = true;
+    }
+    Ok(result)
 }
 
 /// Reject oversized command shapes before passing them to the operating system.
@@ -2181,6 +2197,9 @@ fn drain_capture(mut reader: impl Read, captured: Arc<Mutex<CapturedOutput>>) {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    const TOKEN: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const SECRET_OUTPUT_SCRIPT: &str = "printf '%s\\n' 'fatal: GITHUB_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaa' 'remote: https://user:hunter2pass@example.com/x.git' >&2; printf '%s\\n' 'ghp_aaaaaaaaaaaaaaaaaaaaaaaa'";
 
     #[test]
     fn fs_coalescer_emits_leading_and_trailing_notes_with_bounded_paths() {
@@ -3674,6 +3693,83 @@ mod tests {
         assert!(result.stdout_truncated);
         assert!(result.stderr_truncated);
         assert_eq!(result.exit, 0, "readers drain excess output so child exits");
+    }
+
+    #[test]
+    fn do_exec_redacts_secret_shaped_stderr() {
+        let result = do_exec(
+            &ExecParams {
+                argv: vec!["sh".into(), "-c".into(), SECRET_OUTPUT_SCRIPT.into()],
+                cwd: None,
+                env: vec![],
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert!(!result.stderr.contains(TOKEN));
+        assert!(!result.stderr.contains("hunter2pass"));
+        assert!(result.stderr.contains(thegn_core::ci_log::REDACTION_MARKER));
+        assert_eq!(result.stdout, format!("{TOKEN}\n"));
+    }
+
+    #[test]
+    fn do_exec_caps_redaction_expansion_and_marks_stderr_truncated() {
+        let result = do_exec(
+            &ExecParams {
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf '%s\\n' '-----BEGIN PRIVATE KEY-----' >&2; yes '' | head -c 90000 >&2"
+                        .into(),
+                ],
+                cwd: None,
+                env: vec![],
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert!(
+            result.stderr.len() <= MAX_CAPTURE_BYTES,
+            "redacted stderr must remain within the capture and frame budget"
+        );
+        assert!(result.stderr_truncated, "expanded stderr was clipped");
+    }
+
+    #[test]
+    fn do_exec_keeps_ordinary_stderr_verbatim() {
+        // Positive control: this assertion also passes at the base because the
+        // ordinary diagnostic has no secret-shaped text to redact.
+        let stderr = "fatal: not a git repository (or any of the parent directories): .git";
+        let result = do_exec(
+            &ExecParams {
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("printf '%s\\n' '{stderr}' >&2"),
+                ],
+                cwd: None,
+                env: vec![],
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(result.stderr, format!("{stderr}\n"));
+    }
+
+    #[test]
+    fn client_exec_returns_redacted_stderr() {
+        let client = connect();
+        let result = client
+            .exec(&["sh", "-c", SECRET_OUTPUT_SCRIPT], None, &[])
+            .unwrap();
+
+        assert!(!result.stderr.contains(TOKEN));
+        assert!(!result.stderr.contains("hunter2pass"));
+        assert!(result.stderr.contains(thegn_core::ci_log::REDACTION_MARKER));
+        assert_eq!(result.stdout, format!("{TOKEN}\n"));
     }
 
     #[test]
