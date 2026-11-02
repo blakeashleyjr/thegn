@@ -254,12 +254,14 @@ impl MediaPanelState {
         self.sources = unique;
     }
 
+    /// Returns whether a source result still matches the active request and snapshot.
     fn accepts_sources(&self, request: &MediaRequest, state: Option<&MediaState>) -> bool {
         request.generation == self.generation
             && request.watcher_generation == self.watcher_generation
             && request.identity.as_ref() == state.map(Self::identity).as_ref()
     }
 
+    /// Err keeps the last known rows and marks them; stale results are ignored.
     pub(crate) fn set_sources_result(
         &mut self,
         request: MediaRequest,
