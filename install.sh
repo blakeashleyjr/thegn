@@ -287,12 +287,14 @@ run_uninstall() {
       fi
       ;;
     esac
-    for seen_path in "${seen_paths[@]}"; do
-      if [[ $seen_path == "$entry_path" ]]; then
-        echo "install.sh: refusing manifest line $line_number: duplicate path $entry_path" >&2
-        return 1
-      fi
-    done
+    if ((${#seen_paths[@]})); then
+      for seen_path in "${seen_paths[@]}"; do
+        if [[ $seen_path == "$entry_path" ]]; then
+          echo "install.sh: refusing manifest line $line_number: duplicate path $entry_path" >&2
+          return 1
+        fi
+      done
+    fi
     seen_paths+=("$entry_path")
     manifest_hashes+=("$entry_hash")
     manifest_paths+=("$entry_path")
