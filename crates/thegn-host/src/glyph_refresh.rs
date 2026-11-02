@@ -21,7 +21,8 @@ fn jj_memo() -> &'static Mutex<HashMap<String, bool>> {
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record the jj state observed during the off-loop glyph scan.
+/// Record the jj state observed during the off-loop glyph scan. The following
+/// cache refresh re-confirms roots present in the glyph cache.
 pub(crate) fn record_jj(repo_root: &str, jj: bool) {
     jj_memo()
         .lock()
@@ -83,8 +84,8 @@ pub(crate) fn glyphs_from_row(row: &GlyphRow, jj: bool) -> GitGlyphs {
 /// `branches`) for every path in `paths` that has a cached row and is not
 /// already present. Never overwrites a row that a fresh scan already populated
 /// (path already in `git`); a path with no cache entry is left absent (renders
-/// blank, same as a never-scanned worktree). Unknown jj state renders no marker
-/// until the hydration thread records it.
+/// blank, same as a never-scanned worktree). On a cold start, a cache-restored
+/// row with unknown jj state renders no marker until hydration refreshes it.
 pub(crate) fn seed_glyphs_from_cache(
     git: &mut BTreeMap<String, GitGlyphs>,
     branches: &mut BTreeMap<String, String>,
