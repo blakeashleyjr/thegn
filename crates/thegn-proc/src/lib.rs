@@ -256,8 +256,9 @@ impl std::fmt::Display for ProcError {
 
 impl std::error::Error for ProcError {}
 
-/// Spawn `cmd` and run it to a bounded, fully reaped end. Overrides stdin (always null) and
-/// stdout/stderr (per `limits`); everything else (args, env, cwd) is the caller's. Unix: own
+/// Spawn `cmd` and run it to a bounded, fully reaped end. Overrides stdin (always null; use
+/// [`run_with_input`] for a payload) and stdout/stderr (per `limits`); everything else (args, env,
+/// cwd) is the caller's. Unix: own
 /// process group (`process_group(0)`). Blocking: call it from a worker thread, never the UI loop.
 /// Wall time <= timeout + term_grace + 2 * kill_settle + reader_grace + one BACKOFF_CAP.
 pub fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
@@ -265,10 +266,10 @@ pub fn run(cmd: &mut Command, limits: &Limits, cancel: &AtomicBool) -> Run {
 }
 
 /// Spawn `cmd` and run it to a bounded, fully reaped end, passing each stdout chunk to `consume`
-/// on the calling thread. Overrides stdin (always null) and stdout/stderr (per `limits`);
-/// everything else (args, env, cwd) is the caller's. Blocking: call it from a worker thread,
-/// never the UI loop. Wall time <= timeout + term_grace + 2 * kill_settle + reader_grace + one
-/// BACKOFF_CAP.
+/// on the calling thread. Overrides stdin (always null; use [`run_with_input`] for a payload) and
+/// stdout/stderr (per `limits`); everything else (args, env, cwd) is the caller's. Blocking: call
+/// it from a worker thread, never the UI loop. Wall time <= timeout + term_grace + 2 * kill_settle
+/// + reader_grace + one BACKOFF_CAP.
 pub fn run_consuming(
     cmd: &mut Command,
     limits: &Limits,
@@ -282,5 +283,38 @@ pub fn run_consuming(
     #[cfg(not(unix))]
     {
         fallback::run_consuming(cmd, limits, cancel, consume)
+    }
+}
+
+/// What a stdin payload passed to [`run_with_input`] achieved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputFeed {
+    /// Bytes the child's stdin pipe accepted.
+    pub written: u64,
+    /// Every byte was written and stdin was closed (the child saw EOF).
+    pub complete: bool,
+    /// Why feeding stopped early (BrokenPipe: the child closed stdin). None when complete, or when
+    /// the run ended first.
+    pub error: Option<io::ErrorKind>,
+}
+
+/// Like [`run`], but stdin is a pipe fed with `input` and closed once it is written (an empty `input`
+/// closes it at once). Unix: written non-blocking from the same poll(2) supervision loop (no extra
+/// thread); stdin is closed before the group is signalled, so a child that never reads cannot hold
+/// the run past `limits`. Relies on SIGPIPE being ignored (Rust's std main does this), so a closed
+/// pipe is an EPIPE error, not a signal.
+pub fn run_with_input(
+    cmd: &mut Command,
+    limits: &Limits,
+    input: &[u8],
+    cancel: &AtomicBool,
+) -> (Run, InputFeed) {
+    #[cfg(unix)]
+    {
+        unix::run_with_input(cmd, limits, input, cancel)
+    }
+    #[cfg(not(unix))]
+    {
+        fallback::run_with_input(cmd, limits, input, cancel)
     }
 }
