@@ -2467,10 +2467,11 @@ mod tests {
         assert_eq!(after.phase, "unclaimed");
         assert_eq!(after.generation, admitted.generation + 1);
         // The fold may land or stop at another reported status; only assert the
-        // ref movement when the drain reports a successful land.
+        // ref movement when the drain reports a successful land: the fold
+        // commit sits on top, so the feature tip must be an ancestor of main.
         if second_outcome.landed.iter().any(|branch| branch == "feat") {
             assert_eq!(
-                in_app_git(&root, &["rev-parse", "refs/heads/main"]),
+                in_app_git(&root, &["merge-base", "refs/heads/main", &feature_tip]),
                 feature_tip
             );
         }
