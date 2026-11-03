@@ -288,6 +288,126 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Read-only report of the local executable a provider connect would install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalBridgeReport {
+    Absent,
+    Unreadable {
+        path: std::path::PathBuf,
+        error: String,
+    },
+    Present {
+        path: std::path::PathBuf,
+        bytes: u64,
+        bridge: ResidentBridge,
+    },
+}
+
+impl LocalBridgeReport {
+    pub(crate) fn probe() -> Self {
+        Self::for_path(bridge_binary_path().as_deref())
+    }
+
+    pub(crate) fn for_path(path: Option<&std::path::Path>) -> Self {
+        let Some(path) = path else {
+            return Self::Absent;
+        };
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Self::Unreadable {
+                    path: path.to_path_buf(),
+                    error: format!("{error}"),
+                };
+            }
+        };
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut bytes = 0_u64;
+        loop {
+            let read = match Read::read(&mut file, &mut buffer) {
+                Ok(read) => read,
+                Err(error) => {
+                    return Self::Unreadable {
+                        path: path.to_path_buf(),
+                        error: format!("{error}"),
+                    };
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            bytes += read as u64;
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        Self::Present {
+            path: path.to_path_buf(),
+            bytes,
+            bridge: ResidentBridge::from_digest(&digest).expect("SHA-256 digest is lowercase hex"),
+        }
+    }
+
+    pub(crate) fn json(&self) -> serde_json::Value {
+        match self {
+            Self::Absent => serde_json::json!({
+                "state": "absent",
+                "path": null,
+                "sha256": null,
+                "bytes": null,
+                "resident_path": null,
+                "error": null,
+            }),
+            Self::Unreadable { path, error } => serde_json::json!({
+                "state": "unreadable",
+                "path": path.display().to_string(),
+                "sha256": null,
+                "bytes": null,
+                "resident_path": null,
+                "error": error,
+            }),
+            Self::Present {
+                path,
+                bytes,
+                bridge,
+            } => serde_json::json!({
+                "state": "present",
+                "path": path.display().to_string(),
+                "sha256": bridge.sha256(),
+                "bytes": bytes,
+                "resident_path": bridge.path(),
+                "error": null,
+            }),
+        }
+    }
+
+    pub(crate) fn lines(&self) -> Vec<String> {
+        let mut lines = vec!["Provider bridge (local artifact)".to_string()];
+        match self {
+            Self::Absent => lines.push(
+                "  artifact      none (provider connects run without a resident bridge; set THEGN_BRIDGE_BINARY or install thegn-musl beside thegn)".to_string(),
+            ),
+            Self::Unreadable { path, error } => lines.push(format!(
+                "  artifact      {} (unreadable: {error})",
+                path.display()
+            )),
+            Self::Present {
+                path,
+                bytes,
+                bridge,
+            } => {
+                lines.push(format!("  artifact      {} ({bytes} bytes)", path.display()));
+                lines.push(format!("  sha256        {}", bridge.sha256()));
+                lines.push(format!(
+                    "  resident      {} (re-verified before every launch)",
+                    bridge.path()
+                ));
+            }
+        }
+        lines
+    }
+}
+
 /// The env selection a resident-bridge connect resolves: the worktree's own pin, else its workspace's default, keyed
 /// by the DB-recorded repo root (falling back to `fallback_repo_root` when none is recorded). `Err` = a read failed.
 pub(crate) fn bridge_env_selection(
@@ -680,6 +800,63 @@ mod tests {
             resident_bridge_dir(&bridge),
             format!("{BRIDGE_ROOT}/{}", bridge.sha256())
         );
+    }
+
+    #[test]
+    fn local_bridge_report_is_absent_without_an_artifact() {
+        let report = LocalBridgeReport::for_path(None);
+        assert_eq!(report, LocalBridgeReport::Absent);
+        let json = report.json();
+        assert_eq!(json["state"], "absent");
+        assert!(json["sha256"].is_null());
+    }
+
+    #[test]
+    fn local_bridge_report_hashes_the_artifact_like_the_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge");
+        let data: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let report = LocalBridgeReport::for_path(Some(&path));
+        assert!(matches!(
+            report,
+            LocalBridgeReport::Present {
+                bytes: 200_000,
+                ref bridge,
+                ..
+            } if *bridge == resident_bridge_for(&std::fs::read(&path).unwrap())
+        ));
+    }
+
+    #[test]
+    fn local_bridge_report_names_an_unreadable_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-bridge");
+        let report = LocalBridgeReport::for_path(Some(&path));
+        assert!(matches!(
+            &report,
+            LocalBridgeReport::Unreadable { path: reported, error }
+                if reported == &path && !error.is_empty()
+        ));
+        assert_eq!(report.json()["state"], "unreadable");
+    }
+
+    #[test]
+    fn local_bridge_report_lines_and_json_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge");
+        std::fs::write(&path, b"bridge bytes").unwrap();
+        let report = LocalBridgeReport::for_path(Some(&path));
+        let LocalBridgeReport::Present { bridge, .. } = &report else {
+            panic!("written artifact should be present");
+        };
+        let lines = report.lines();
+        let json = report.json();
+
+        assert!(lines[3].contains(bridge.path()));
+        assert_eq!(json["resident_path"], bridge.path());
+        assert_eq!(json["sha256"], bridge.sha256());
     }
 
     #[test]
