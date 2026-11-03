@@ -166,8 +166,9 @@ generation alongside them. Pass all three values to the background monitor
 and pass `--lease-gen "<recorded lease generation>"` after `--owner` on every
 Lead mutation using `--lease`/`--owner`. Never re-evaluate `$$` or
 `$(hostname)` during this run. Acquire contention exits 2 with JSON
-`"acquired": false` and a `holder`: it is retryable, so stop and tell the user;
-do not start a second chain. A stale generation is refused as a `lead_lease`
+`"acquired": false` and a `holder`: another Lead holds it, so stop and tell
+the user; retry later and do not start a second chain. A stale generation is
+refused as a `lead_lease`
 conflict (`"error": "lead_lease"` with `--json`): stop, re-read the roster and
 reacquire before deciding again. Renewal keeps the generation; each acquisition
 after expiry or release prints a new one. Thegn checks the lease on claim,

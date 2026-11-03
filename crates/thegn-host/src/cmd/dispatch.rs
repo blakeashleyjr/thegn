@@ -210,6 +210,7 @@ pub enum Action {
     },
     /// Take, renew, release or inspect the pipeline monitor lease — the guard
     /// that stops two Leads driving one pipeline and filling the same slots.
+    ///
     /// Acquire contention exits 2 with JSON `acquired: false` and a holder;
     /// CLI argument errors also exit 2 but have no JSON. Invalid name/owner or
     /// storage errors exit 1. Renew exits 1 for missing, replaced or expired
@@ -5900,30 +5901,38 @@ mod tests {
             ],
             vec!["thegn", "dispatch", "set-status", "1", "done"],
         ];
-        for mut argv in commands {
-            argv.extend(["--lease", "l", "--owner", "o", "--lease-gen", "3"]);
+        for base_argv in commands {
+            let mut valid = base_argv.clone();
+            valid.extend(["--lease", "l", "--owner", "o", "--lease-gen", "3"]);
             assert!(
-                crate::Cli::try_parse_from(&argv).is_ok(),
+                crate::Cli::try_parse_from(&valid).is_ok(),
                 "{}",
-                argv.join(" ")
+                valid.join(" ")
             );
 
-            argv.retain(|arg| !matches!(*arg, "--lease" | "l" | "--owner" | "o"));
+            let mut missing_lease = base_argv.clone();
+            missing_lease.extend(["--lease-gen", "3"]);
             assert!(
-                crate::Cli::try_parse_from(&argv).is_err(),
+                crate::Cli::try_parse_from(&missing_lease).is_err(),
                 "{}",
-                argv.join(" ")
+                missing_lease.join(" ")
             );
 
-            let mut zero = argv.clone();
+            let mut zero = base_argv.clone();
             zero.extend(["--lease", "l", "--owner", "o", "--lease-gen", "0"]);
-            assert!(
-                crate::Cli::try_parse_from(&zero).is_err(),
+            let zero_error = match crate::Cli::try_parse_from(&zero) {
+                Err(error) => error,
+                Ok(_) => panic!("zero lease generation was accepted: {}", zero.join(" ")),
+            };
+            assert_eq!(
+                zero_error.kind(),
+                clap::error::ErrorKind::ValueValidation,
                 "{}",
                 zero.join(" ")
             );
-            let mut negative = argv;
-            negative.extend(["--lease", "l", "--owner", "o", "--lease-gen", "-1"]);
+
+            let mut negative = base_argv;
+            negative.extend(["--lease", "l", "--owner", "o", "--lease-gen=-1"]);
             assert!(
                 crate::Cli::try_parse_from(&negative).is_err(),
                 "{}",
