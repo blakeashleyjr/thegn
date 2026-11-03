@@ -341,6 +341,20 @@ fn contained_parent(worktree: &Path, path: &Path) -> bool {
         .is_ok_and(|resolved| resolved.starts_with(root))
 }
 
+/// Re-prove, immediately before a provider effect, that the selected config is still a regular, non-symlink file
+/// whose parent chain stays inside `worktree` (THE-520). Selection checked this when it read the file; a directory
+/// swapped for a symlink since then must not move the provider's snapshot or build context outside the worktree.
+pub fn revalidate_selected(worktree: &Path, path: &Path) -> std::io::Result<()> {
+    if safe_candidate(worktree, path) && contained_parent(worktree, path) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "devcontainer config is no longer a regular file inside the worktree",
+        ))
+    }
+}
+
 /// Return a config path relative to the repo root, using `/` separators.
 pub fn relative_path(worktree: &Path, config: &Path) -> PathBuf {
     config
@@ -580,5 +594,93 @@ mod tests {
 
         std::fs::remove_file(&alias).unwrap();
         std::fs::remove_dir_all(real).unwrap();
+    }
+
+    #[test]
+    fn revalidate_selected_accepts_the_selected_config_in_place() {
+        let root = temp();
+        std::fs::create_dir_all(root.join(".devcontainer/a")).unwrap();
+        std::fs::create_dir_all(root.join(".devcontainer/b")).unwrap();
+        std::fs::write(
+            root.join(".devcontainer/a/devcontainer.json"),
+            "{\"image\":\"a\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".devcontainer/b/devcontainer.json"),
+            "{\"image\":\"b\"}",
+        )
+        .unwrap();
+        let path = select_and_parse(&root, Some("a")).selected.unwrap();
+
+        assert!(revalidate_selected(&root, &path).is_ok());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revalidate_selected_refuses_a_variant_directory_swapped_for_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp();
+        std::fs::create_dir_all(root.join(".devcontainer/a")).unwrap();
+        std::fs::create_dir_all(root.join(".devcontainer/b")).unwrap();
+        std::fs::write(
+            root.join(".devcontainer/a/devcontainer.json"),
+            "{\"image\":\"a\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".devcontainer/b/devcontainer.json"),
+            "{\"image\":\"b\"}",
+        )
+        .unwrap();
+        let path = select_and_parse(&root, Some("a")).selected.unwrap();
+        let outside = root.with_extension("swap-outside");
+        std::fs::rename(root.join(".devcontainer/a"), &outside).unwrap();
+        symlink(&outside, root.join(".devcontainer/a")).unwrap();
+
+        assert!(revalidate_selected(&root, &path).is_err());
+
+        std::fs::remove_file(root.join(".devcontainer/a")).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revalidate_selected_refuses_a_config_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp();
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        let path = root.join(".devcontainer/devcontainer.json");
+        let content = "{\"image\":\"approved\"}";
+        std::fs::write(&path, content).unwrap();
+        let selected = select_and_parse(&root, None).selected.unwrap();
+        let outside_file = root.with_extension("outside-json");
+        std::fs::write(&outside_file, content).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&outside_file, &path).unwrap();
+
+        assert!(revalidate_selected(&root, &selected).is_err());
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(outside_file).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revalidate_selected_refuses_a_path_outside_the_worktree() {
+        let root = temp();
+        let other = temp();
+        let path = other.join(".devcontainer.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        assert!(revalidate_selected(&root, &path).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
     }
 }
