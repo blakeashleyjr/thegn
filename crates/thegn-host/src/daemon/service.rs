@@ -2211,7 +2211,8 @@ impl ControlApi for DaemonService {
             let job_for_provider = job_id_owned.clone();
             let (mut entry, warnings) = tokio::task::spawn_blocking(move || {
                 let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
-                let Some(client) = thegn_svc::ci::provider_for(&loc, &cfg) else {
+                let Some((client, context)) = thegn_svc::ci::provider_and_context_for(&loc, &cfg)
+                else {
                     return Ok(None);
                 };
                 let detail = client
@@ -2240,6 +2241,7 @@ impl ControlApi for DaemonService {
                 );
                 entry.truncated |= raw_truncated;
                 entry.head_sha = identity.head_sha;
+                entry.context = context.unwrap_or_default();
                 let warnings = identity
                     .warnings
                     .iter()

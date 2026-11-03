@@ -520,6 +520,7 @@ mod tests {
                 run_id: "run-1".into(),
                 job_id: "job-1".into(),
                 head_sha: "abc".into(),
+                context: String::new(),
             })
             .unwrap()
         );

@@ -50,10 +50,11 @@ pub(crate) fn candidate_from_notification(
     let body = n.source_ref.strip_prefix("ci-autofix:")?;
     let prefix = format!("{}:", n.worktree_path);
     let fields = body.strip_prefix(&prefix)?;
-    let mut fields = fields.splitn(3, ':');
+    let mut fields = fields.splitn(4, ':');
     let run_id = fields.next()?.trim();
     let job_id = fields.next()?.trim();
     let head_sha = fields.next()?.trim();
+    let context = fields.next().unwrap_or("").trim();
     if run_id.is_empty() || job_id.is_empty() || head_sha.is_empty() {
         return None;
     }
@@ -62,6 +63,7 @@ pub(crate) fn candidate_from_notification(
         run_id: run_id.to_string(),
         job_id: job_id.to_string(),
         head_sha: head_sha.to_string(),
+        context: context.to_string(),
     })
 }
 
@@ -89,10 +91,14 @@ fn consider_candidate_with_forge(
     }
 
     let candidate = entry.candidate();
-    let ref_id = format!(
+    let mut ref_id = format!(
         "ci-autofix:{}:{}:{}:{}",
         candidate.worktree, candidate.run_id, candidate.job_id, candidate.head_sha
     );
+    if !candidate.context.is_empty() {
+        ref_id.push(':');
+        ref_id.push_str(&candidate.context);
+    }
     let notify = |message: String| {
         if let Err(error) =
             db.put_notification_once("pr_queue_needs_human", &ref_id, &message, &entry.worktree)
@@ -1051,6 +1057,27 @@ mod tests {
                 handoff.entry.head_sha
             )
         );
+    }
+
+    #[test]
+    fn notification_candidate_keeps_the_provider_context() {
+        let notification = thegn_core::notification::Notification {
+            id: 1,
+            kind: thegn_core::notification::NotificationKind::PrQueueNeedsHuman,
+            source_ref: "ci-autofix:/wt/repo:run-7:job-3:abc123:github:github.com/o/r".into(),
+            message: "needs review".into(),
+            created_at_ms: 1,
+            read: false,
+            worktree_path: "/wt/repo".into(),
+        };
+        let candidate = candidate_from_notification(&notification).unwrap();
+        assert_eq!(candidate.head_sha, "abc123");
+        assert_eq!(candidate.context, "github:github.com/o/r");
+        let legacy = thegn_core::notification::Notification {
+            source_ref: "ci-autofix:/wt/repo:run-7:job-3:abc123".into(),
+            ..notification
+        };
+        assert_eq!(candidate_from_notification(&legacy).unwrap().context, "");
     }
 
     #[test]

@@ -668,6 +668,7 @@ pub(crate) fn spawn_ci_detail(
                     );
                     entry.truncated |= log.truncated;
                     entry.head_sha = detail.sha.clone();
+                    entry.context = thegn_svc::ci::cache_context(&loc, &cfg).unwrap_or_default();
                     if cfg.log_cache_runs > 0
                         && thegn_core::ci_log::cacheable_log_entry(&entry)
                         && let Some(db) = db.as_ref()
