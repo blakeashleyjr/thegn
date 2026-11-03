@@ -316,7 +316,7 @@ impl CalendarStore for Db {
                 recorded_at: row.get(5)?,
             })
         })?;
-        Ok(rows.collect()?)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
