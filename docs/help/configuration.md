@@ -233,6 +233,11 @@ values: `THEGN_EVENT`, `THEGN_REPO_ROOT`, `THEGN_WORKTREE`, `THEGN_BRANCH`,
 and `THEGN_WORKSPACE`. Hook entries do not inherit `env_passthrough`,
 `host_env_allow_extra`, credentials, or agent sockets. Output is captured in a
 per-worktree state log and failures are surfaced through notifications.
+Each run gets a new file under `$XDG_STATE_HOME/thegn/hooks/`, with a
+`<worktree-slug>-<digest>/<event>-<n>.log` name; an existing log is never
+overwritten. The first line is `thegn-hook-run 1`; the next records a unique
+run id, event, state, exit code, start/finish times, elapsed time and worktree
+digest. The command is recorded as `[redacted]`.
 
 Repo-local hook tables are trust-on-first-use gated. Until the existing repo
 trust request for `hooks.<event>` is approved, those entries are omitted and
