@@ -171,6 +171,14 @@ where
 /// Commands containing a path separator must be absolute. Bare names resolve
 /// only through absolute PATH entries.
 pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf, LspError> {
+    resolve_server_executable(cmd, path).map(|(path, _)| path)
+}
+
+/// Resolve a server command and return the identity attested for the selected executable.
+pub fn resolve_server_executable(
+    cmd: &str,
+    path: Option<&OsStr>,
+) -> Result<(PathBuf, ExecutableIdentity), LspError> {
     let configured = Path::new(cmd);
     if cmd.contains('/') || cmd.contains('\\') {
         if !configured.is_absolute() {
@@ -189,7 +197,7 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
             mtime_unix_s = ?identity.mtime_unix_s,
             "resolved language server executable"
         );
-        return Ok(configured.to_path_buf());
+        return Ok((configured.to_path_buf(), identity));
     }
     let Some(path) = path else {
         return Err(LspError::Spawn(format!(
@@ -220,12 +228,28 @@ pub fn resolve_server_command(cmd: &str, path: Option<&OsStr>) -> Result<PathBuf
             );
             // Preserve the candidate's final path component for argv[0]-based
             // shims such as mise, rustup, volta, and busybox.
-            return Ok(candidate);
+            return Ok((candidate, identity));
         }
     }
     Err(LspError::Spawn(format!(
         "{cmd} not found on absolute PATH entries"
     )))
+}
+
+/// Re-check, immediately before spawn, that `path` still resolves to the executable recorded at resolve time.
+/// A replaced, retargeted or re-moded binary is refused rather than started.
+pub fn reattest_server_executable(
+    path: &Path,
+    expected: &ExecutableIdentity,
+) -> Result<(), LspError> {
+    let current = server_executable_identity(path)?;
+    if &current != expected {
+        return Err(LspError::Spawn(format!(
+            "{} changed after it was resolved; not starting it",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The LSP resource contract.  These are protocol safety limits, not user
@@ -3110,6 +3134,96 @@ mod tests {
         if cfg!(unix) {
             assert_eq!(identity.mode, Some(0o750));
         }
+    }
+
+    #[test]
+    fn resolve_server_executable_returns_the_identity_it_attested() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+
+        let (resolved, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+
+        assert_eq!(resolved, executable);
+        assert_eq!(identity, server_executable_identity(&executable).unwrap());
+    }
+
+    #[test]
+    fn reattest_accepts_an_unchanged_server() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let (path, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+
+        assert!(reattest_server_executable(&path, &identity).is_ok());
+    }
+
+    #[test]
+    fn reattest_refuses_a_server_replaced_after_resolve() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let (path, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\necho replaced; exit 0\n").unwrap();
+
+        assert!(matches!(
+            reattest_server_executable(&path, &identity),
+            Err(LspError::Spawn(message)) if message.contains("changed after it was resolved")
+        ));
+    }
+
+    #[test]
+    fn reattest_refuses_a_mode_change_after_resolve() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let (path, identity) =
+            resolve_server_executable(executable.to_str().unwrap(), None).unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o750).unwrap();
+
+        assert!(matches!(
+            reattest_server_executable(&path, &identity),
+            Err(LspError::Spawn(message)) if message.contains("changed after it was resolved")
+        ));
+    }
+
+    #[test]
+    fn reattest_refuses_a_bare_name_candidate_replaced_after_resolve() {
+        if !cfg!(unix) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("srv");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        crate::plugin::platform::set_mode_for_test(&executable, 0o755).unwrap();
+        let path = std::env::join_paths([dir.path().as_os_str()]).unwrap();
+        let (candidate, identity) = resolve_server_executable("srv", Some(&path)).unwrap();
+        assert_eq!(candidate, executable);
+        std::fs::write(&executable, "#!/bin/sh\necho replaced; exit 0\n").unwrap();
+
+        assert!(matches!(
+            reattest_server_executable(&candidate, &identity),
+            Err(LspError::Spawn(message)) if message.contains("changed after it was resolved")
+        ));
     }
 
     #[test]
