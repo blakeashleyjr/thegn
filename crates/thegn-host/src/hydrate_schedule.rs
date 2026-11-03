@@ -237,7 +237,13 @@ impl ScheduleOwner {
         self.generation.clone()
     }
 
+    /// Supersede every outstanding scheduled fence, then stop the ticker: a
+    /// scheduled pass still running (for example a calendar pass's queued
+    /// accounts) observes its generation as stale and starts no further work,
+    /// and results already in flight are dropped at their fences. Untagged
+    /// (manual) work is not fenced. Idempotent: Drop calls this again.
     pub(crate) fn shutdown(&mut self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.ticker.shutdown();
     }
 }
