@@ -70,6 +70,9 @@ forms "legacy, unverified" (`fingerprint_verified` in `--json`).
 Only one `thegn secret ssh rotate` runs per key at a time; a second is refused
 before changes, and a custody record changed mid-rotation stops further remote
 changes.
+On the dev channel, provisioning an instance is refused while its managed SSH
+key rotation is unfinished. The message points to `thegn secret ssh rotate`;
+nothing is changed.
 Keyring operations run on one worker. While an earlier keyring call is stuck
 past its timeout, further keyring operations fail at once without starting,
 and nothing is written to a file instead.

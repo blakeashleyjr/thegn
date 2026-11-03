@@ -292,8 +292,8 @@ fn ensure_unclaimed(conn: &Connection, worktree: &str) -> Result<()> {
 fn record_merge_event(conn: &Connection, event: &MergeQueueEvent) -> Result<()> {
     conn.execute(
         "INSERT INTO merge_queue_events \
-         (worktree,operation,outcome,old_status,new_status,row_updated_at,candidate_oid,result_oid,actor,at_ms) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+         (worktree,operation,outcome,old_status,new_status,row_updated_at,candidate_oid,result_oid,target_base_oid,actor,at_ms) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
             event.worktree,
             event.operation,
@@ -303,6 +303,7 @@ fn record_merge_event(conn: &Connection, event: &MergeQueueEvent) -> Result<()> 
             event.row_updated_at,
             event.candidate_oid,
             event.result_oid,
+            event.target_base_oid,
             event.actor,
             event.at_ms,
         ],
@@ -313,6 +314,67 @@ fn record_merge_event(conn: &Connection, event: &MergeQueueEvent) -> Result<()> 
         params![event.worktree, MERGE_QUEUE_EVENTS_PER_WORKTREE as i64],
     )?;
     Ok(())
+}
+
+fn write_merge_status_claimed(
+    db: &Db,
+    claim: &MergeClaim,
+    status: &str,
+    fields: &MergeStatusFields,
+    target_base_oid: Option<&str>,
+) -> Result<MergeClaim> {
+    ensure_known_merge_status(status)?;
+    anyhow::ensure!(
+        status != "landed"
+            || fields
+                .result_oid
+                .as_deref()
+                .is_some_and(|oid| !oid.is_empty()),
+        "landed merge status requires a nonempty result OID"
+    );
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let now = util::now_ms();
+    let prior: Option<(String, i64, Option<String>)> = tx
+        .query_row(
+            "SELECT status,updated_at,candidate_oid FROM merge_queue \
+             WHERE worktree=?1 AND claim_owner=?2 AND claim_generation=?3",
+            params![claim.worktree, claim.owner_token, claim.generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let changed = tx.execute(
+        "UPDATE merge_queue SET status=?1,updated_at=?2,result_oid=?3,conflict_paths=?4,error_detail=?5 \
+         WHERE worktree=?6 AND claim_owner=?7 AND claim_generation=?8 \
+         AND (claim_phase='settled' OR \
+              (claim_phase='claimed_no_child' AND claim_lease_until_ms>=?9))",
+        params![status, util::now(), fields.result_oid, fields.conflict_paths, fields.error_detail,
+            claim.worktree, claim.owner_token, claim.generation, now],
+    )?;
+    anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
+    if let Some((old_status, old_updated_at, candidate_oid)) = prior
+        && old_status != status
+    {
+        record_merge_event(
+            &tx,
+            &MergeQueueEvent {
+                worktree: claim.worktree.clone(),
+                operation: "drive".into(),
+                outcome: "transition".into(),
+                old_status,
+                new_status: Some(status.to_string()),
+                row_updated_at: old_updated_at,
+                candidate_oid,
+                result_oid: fields.result_oid.clone(),
+                target_base_oid: target_base_oid.map(str::to_owned),
+                actor: format!("thegn pid {}", std::process::id()),
+                at_ms: now,
+            },
+        )?;
+    }
+    let updated = read_claim(&tx, &claim.worktree, &claim.repo_root)?
+        .ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
+    tx.commit()?;
+    Ok(updated)
 }
 
 impl Db {
@@ -1090,6 +1152,7 @@ impl WorktreeAuxStore for Db {
                     row_updated_at: updated_at,
                     candidate_oid,
                     result_oid,
+                    target_base_oid: None,
                     actor: format!("thegn pid {}", std::process::id()),
                     at_ms: util::now_ms(),
                 },
@@ -1111,6 +1174,7 @@ impl WorktreeAuxStore for Db {
                     row_updated_at: updated_at,
                     candidate_oid,
                     result_oid,
+                    target_base_oid: None,
                     actor: format!("thegn pid {}", std::process::id()),
                     at_ms: util::now_ms(),
                 },
@@ -1156,6 +1220,7 @@ impl WorktreeAuxStore for Db {
                 row_updated_at: updated_at,
                 candidate_oid,
                 result_oid,
+                target_base_oid: None,
                 actor: format!("thegn pid {}", std::process::id()),
                 at_ms: util::now_ms(),
             },
@@ -1220,6 +1285,7 @@ impl WorktreeAuxStore for Db {
             row_updated_at: updated_at,
             candidate_oid,
             result_oid,
+            target_base_oid: None,
             actor: actor.to_string(),
             at_ms: util::now_ms(),
         };
@@ -1241,7 +1307,7 @@ impl WorktreeAuxStore for Db {
     fn merge_queue_events(&self, worktree: &str, limit: usize) -> Result<Vec<MergeQueueEvent>> {
         let mut statement = self.conn().prepare(
             "SELECT worktree,operation,outcome,old_status,new_status,row_updated_at,\
-                    candidate_oid,result_oid,actor,at_ms \
+                    candidate_oid,result_oid,target_base_oid,actor,at_ms \
              FROM merge_queue_events WHERE worktree=?1 ORDER BY id DESC LIMIT ?2",
         )?;
         let events = statement
@@ -1255,8 +1321,9 @@ impl WorktreeAuxStore for Db {
                     row_updated_at: row.get(5)?,
                     candidate_oid: row.get(6)?,
                     result_oid: row.get(7)?,
-                    actor: row.get(8)?,
-                    at_ms: row.get(9)?,
+                    target_base_oid: row.get(8)?,
+                    actor: row.get(9)?,
+                    at_ms: row.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1448,57 +1515,20 @@ impl WorktreeAuxStore for Db {
         status: &str,
         fields: &MergeStatusFields,
     ) -> Result<MergeClaim> {
-        ensure_known_merge_status(status)?;
+        write_merge_status_claimed(self, claim, status, fields, None)
+    }
+
+    fn land_merge_status_claimed(
+        &self,
+        claim: &MergeClaim,
+        fields: &MergeStatusFields,
+        target_base_oid: &str,
+    ) -> Result<MergeClaim> {
         anyhow::ensure!(
-            status != "landed"
-                || fields
-                    .result_oid
-                    .as_deref()
-                    .is_some_and(|oid| !oid.is_empty()),
-            "landed merge status requires a nonempty result OID"
+            !target_base_oid.trim().is_empty(),
+            "landed target base OID must not be empty"
         );
-        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
-        let now = util::now_ms();
-        let prior: Option<(String, i64, Option<String>)> = tx
-            .query_row(
-                "SELECT status,updated_at,candidate_oid FROM merge_queue \
-                 WHERE worktree=?1 AND claim_owner=?2 AND claim_generation=?3",
-                params![claim.worktree, claim.owner_token, claim.generation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let changed = tx.execute(
-            "UPDATE merge_queue SET status=?1,updated_at=?2,result_oid=?3,conflict_paths=?4,error_detail=?5 \
-             WHERE worktree=?6 AND claim_owner=?7 AND claim_generation=?8 \
-             AND (claim_phase='settled' OR \
-                  (claim_phase='claimed_no_child' AND claim_lease_until_ms>=?9))",
-            params![status, util::now(), fields.result_oid, fields.conflict_paths, fields.error_detail,
-                claim.worktree, claim.owner_token, claim.generation, now],
-        )?;
-        anyhow::ensure!(changed == 1, MERGE_CLAIM_LOST);
-        if let Some((old_status, old_updated_at, candidate_oid)) = prior
-            && old_status != status
-        {
-            record_merge_event(
-                &tx,
-                &MergeQueueEvent {
-                    worktree: claim.worktree.clone(),
-                    operation: "drive".into(),
-                    outcome: "transition".into(),
-                    old_status,
-                    new_status: Some(status.to_string()),
-                    row_updated_at: old_updated_at,
-                    candidate_oid,
-                    result_oid: fields.result_oid.clone(),
-                    actor: format!("thegn pid {}", std::process::id()),
-                    at_ms: now,
-                },
-            )?;
-        }
-        let updated = read_claim(&tx, &claim.worktree, &claim.repo_root)?
-            .ok_or_else(|| anyhow::anyhow!(MERGE_CLAIM_LOST))?;
-        tx.commit()?;
-        Ok(updated)
+        write_merge_status_claimed(self, claim, "landed", fields, Some(target_base_oid))
     }
 
     // --- PR queue (v50) ---------------------------------------------------

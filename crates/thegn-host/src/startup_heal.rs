@@ -84,32 +84,30 @@ pub(crate) fn spawn(
     gate: std::sync::Arc<HealGate>,
     workspaces_dir: Option<PathBuf>,
 ) {
-    let spawned = std::thread::Builder::new()
-        .name("thegn-heal".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-            let (healed, _roots) = run(&cwd, &group_paths, start);
-            gate.complete();
-            if healed {
-                let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: consumer may be gone
-                let _ = waker.wake(); // best-effort: loop may be gone
-            }
-            if let Some(dir) = workspaces_dir {
-                let reclaimed = crate::workspace_create::sweep_stale_clone_staging(
-                    &dir,
-                    std::process::id(),
-                    crate::platform::pid_alive,
+    let spawned = thegn_core::thread_name::try_spawn_named("thegn-heal", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+        let (healed, _roots) = run(&cwd, &group_paths, start);
+        gate.complete();
+        if healed {
+            let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: consumer may be gone
+            let _ = waker.wake(); // best-effort: loop may be gone
+        }
+        if let Some(dir) = workspaces_dir {
+            let reclaimed = crate::workspace_create::sweep_stale_clone_staging(
+                &dir,
+                std::process::id(),
+                crate::platform::pid_alive,
+            );
+            if reclaimed > 0 {
+                tracing::info!(
+                    target: "thegn::startup",
+                    reclaimed,
+                    path = %dir.display(),
+                    "reclaimed stale workspace clone staging"
                 );
-                if reclaimed > 0 {
-                    tracing::info!(
-                        target: "thegn::startup",
-                        reclaimed,
-                        path = %dir.display(),
-                        "reclaimed stale workspace clone staging"
-                    );
-                }
             }
-        });
+        }
+    });
     if let Err(e) = spawned {
         tracing::warn!(
             target: "thegn::startup",

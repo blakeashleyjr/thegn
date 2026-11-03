@@ -727,4 +727,93 @@ mod tests {
             .is_some()
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_sandbox_paths_translates_a_symlinked_control_leaf_into_a_mount() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let mount = root.path().join("mnt");
+        let mounted_control = mount.join("ctl");
+        let runtime = root.path().join("rt");
+        let control = runtime.join("thegn");
+        std::fs::create_dir_all(&mounted_control).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        symlink(&mounted_control, &control).unwrap();
+
+        let (translated, refusal) = in_sandbox_paths(
+            std::slice::from_ref(&control),
+            &[(mount.as_path(), Path::new("/data"))],
+        );
+        assert_eq!(translated, paths(&["/data/ctl"]));
+        assert_eq!(refusal, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_sandbox_paths_translates_through_a_symlinked_mount_host() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let real = root.path().join("real");
+        let control = real.join("run/thegn");
+        let mount_host = root.path().join("hostlink");
+        std::fs::create_dir_all(&control).unwrap();
+        symlink(&real, &mount_host).unwrap();
+
+        let (translated, refusal) = in_sandbox_paths(
+            std::slice::from_ref(&control),
+            &[(mount_host.as_path(), Path::new("/data"))],
+        );
+        assert_eq!(translated, paths(&["/data/run/thegn"]));
+        assert_eq!(refusal, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_inside_control_dir_sees_through_a_symlinked_mount_host() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let control = root.path().join("run/thegn");
+        let key = control.join("key");
+        let mount_host = root.path().join("keylink");
+        std::fs::create_dir_all(&key).unwrap();
+        symlink(&key, &mount_host).unwrap();
+
+        assert_eq!(
+            mount_inside_control_dir(
+                std::slice::from_ref(&control),
+                &[(mount_host.as_path(), Path::new("/data"))],
+            ),
+            Some(ControlExposure {
+                control_dir: control,
+                visible_through: PathBuf::from("/data"),
+            })
+        );
+    }
+
+    // Positive control: canonicalization must not treat a lexical path under a mount as exposed
+    // when a symlink redirects that path outside every mounted host.
+    #[cfg(unix)]
+    #[test]
+    fn in_sandbox_paths_ignores_a_symlinked_ancestor_that_leaves_every_mount() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let other_run = root.path().join("other/run");
+        let control = other_run.join("thegn");
+        let mount = root.path().join("mnt");
+        let mounted_run = mount.join("run");
+        std::fs::create_dir_all(&control).unwrap();
+        std::fs::create_dir(&mount).unwrap();
+        symlink(&other_run, &mounted_run).unwrap();
+        let spelled_control = mounted_run.join("thegn");
+
+        let (translated, refusal) =
+            in_sandbox_paths(&[spelled_control], &[(mount.as_path(), Path::new("/data"))]);
+        assert!(translated.is_empty());
+        assert_eq!(refusal, None);
+    }
 }

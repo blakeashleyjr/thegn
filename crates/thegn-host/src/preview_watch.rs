@@ -22,15 +22,21 @@ pub(crate) fn spawn_probe(
     tx: UnboundedSender<crate::preview::ProbeResult>,
     waker: TerminalWaker,
 ) {
-    let spawn = std::thread::Builder::new().name("thegn-prev-prb".into()).spawn(move || {
+    let spawn = thegn_core::thread_name::try_spawn_named("thegn-prev-prb", move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let backoff = [0, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
         let mut pending: Vec<(crate::preview::ProbeRequest, Vec<SocketAddr>)> = requests
             .into_iter()
             .map(|request| {
                 let addresses = match request.host.as_str() {
-                    "::1" => vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), request.port)],
-                    "127.0.0.1" => vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), request.port)],
+                    "::1" => vec![SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::LOCALHOST),
+                        request.port,
+                    )],
+                    "127.0.0.1" => vec![SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        request.port,
+                    )],
                     "localhost" => vec![
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), request.port),
                         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), request.port),
@@ -48,7 +54,10 @@ pub(crate) fn spawn_probe(
                     TcpStream::connect_timeout(address, Duration::from_millis(250)).is_ok()
                 });
                 if ok {
-                    if tx.send(crate::preview::ProbeResult { request, ok }).is_err() {
+                    if tx
+                        .send(crate::preview::ProbeResult { request, ok })
+                        .is_err()
+                    {
                         tracing::debug!(target: "thegn::preview", "preview probe result receiver closed");
                     }
                     if let Err(error) = waker.wake() {
@@ -59,10 +68,15 @@ pub(crate) fn spawn_probe(
                 }
             }
             pending = retry;
-            if pending.is_empty() { break; }
+            if pending.is_empty() {
+                break;
+            }
         }
         for (request, _) in pending {
-            if tx.send(crate::preview::ProbeResult { request, ok: false }).is_err() {
+            if tx
+                .send(crate::preview::ProbeResult { request, ok: false })
+                .is_err()
+            {
                 tracing::debug!(target: "thegn::preview", "preview probe result receiver closed");
             }
             if let Err(error) = waker.wake() {
@@ -118,34 +132,32 @@ pub(crate) fn spawn_scan(
     tx: UnboundedSender<ScanResult>,
     waker: TerminalWaker,
 ) {
-    let _ = std::thread::Builder::new()
-        .name("thegn-prev-scan".into())
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let configured = configured_ports
-                .into_iter()
-                .filter_map(PortHint::configured)
-                .collect();
-            let package_path = worktree.join("package.json");
-            let (package, diagnostic) = match read_package(&package_path) {
-                Ok(Some(text)) => match parse_package_scripts(&text) {
-                    Ok(hints) => (hints, None),
-                    Err(error) => (Vec::new(), Some(error)),
-                },
-                Ok(None) => (Vec::new(), None),
+    let _ = thegn_core::thread_name::try_spawn_named("thegn-prev-scan", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let configured = configured_ports
+            .into_iter()
+            .filter_map(PortHint::configured)
+            .collect();
+        let package_path = worktree.join("package.json");
+        let (package, diagnostic) = match read_package(&package_path) {
+            Ok(Some(text)) => match parse_package_scripts(&text) {
+                Ok(hints) => (hints, None),
                 Err(error) => (Vec::new(), Some(error)),
-            };
-            let result = ScanResult {
-                generation,
-                worktree: worktree.to_string_lossy().into_owned(),
-                configured,
-                package,
-                diagnostic,
-            };
-            if tx.send(result).is_ok() {
-                let _ = waker.wake(); // best-effort: the loop may already be shutting down
-            }
-        }); // best-effort: a failed one-shot scan leaves static targets unknown/unavailable
+            },
+            Ok(None) => (Vec::new(), None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let result = ScanResult {
+            generation,
+            worktree: worktree.to_string_lossy().into_owned(),
+            configured,
+            package,
+            diagnostic,
+        };
+        if tx.send(result).is_ok() {
+            let _ = waker.wake(); // best-effort: the loop may already be shutting down
+        }
+    }); // best-effort: a failed one-shot scan leaves static targets unknown/unavailable
 }
 
 #[cfg(test)]

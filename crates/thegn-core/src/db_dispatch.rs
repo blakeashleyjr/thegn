@@ -1741,6 +1741,13 @@ impl Db {
                         },
                     ));
                 }
+                // The source is the finisher's natural parent and is being superseded by this
+                // claim, so it is exempt; any other parent gets the same check as put/claim.
+                if let Some(parent) = new.parent_id
+                    && parent != source_id
+                {
+                    self.validate_parent_edge(parent, new.issue_id)?;
+                }
                 if current.is_active() {
                     let changed = conn.execute(
                         "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
@@ -3007,6 +3014,143 @@ mod tests {
     }
 
     #[test]
+    fn parent_edge_status_table_is_exhaustive() {
+        fn parent_admits(status: AgentDispatchStatus) -> bool {
+            match status {
+                AgentDispatchStatus::Queued
+                | AgentDispatchStatus::Spawning
+                | AgentDispatchStatus::Running
+                | AgentDispatchStatus::WaitingHuman
+                | AgentDispatchStatus::PrOpen
+                | AgentDispatchStatus::Merged
+                | AgentDispatchStatus::Done => true,
+                AgentDispatchStatus::Abandoned
+                | AgentDispatchStatus::Failed
+                | AgentDispatchStatus::Unknown => false,
+            }
+        }
+
+        let statuses = [
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Spawning,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            AgentDispatchStatus::PrOpen,
+            AgentDispatchStatus::Merged,
+            AgentDispatchStatus::Done,
+            AgentDispatchStatus::Abandoned,
+            AgentDispatchStatus::Failed,
+            AgentDispatchStatus::Unknown,
+        ];
+        for status in statuses {
+            for claim in [false, true] {
+                let (db, _dir) = temp_db();
+                let parent = put_row(&db, "linear:CHILD", "/wt/parent");
+                match status {
+                    AgentDispatchStatus::Unknown => {
+                        db.conn()
+                            .execute(
+                                "UPDATE agent_dispatches SET status='future_state' WHERE id=?1",
+                                [parent],
+                            )
+                            .unwrap();
+                    }
+                    AgentDispatchStatus::Queued => {}
+                    other_status => db.update_dispatch_status(parent, other_status).unwrap(),
+                }
+                let child = crate::issue::NewDispatch {
+                    parent_id: Some(parent),
+                    ..crate::issue::NewDispatch::new("linear:CHILD", "/wt/child", "coder")
+                };
+                if parent_admits(status) {
+                    let admitted = if claim {
+                        db.claim_dispatch_admitted(child, 10, None, None, None)
+                            .unwrap()
+                            .is_ok()
+                    } else {
+                        db.put_dispatch_with_parent_check(child).is_ok()
+                    };
+                    assert!(admitted, "{status:?}; claim={claim} should admit");
+                } else {
+                    let error = if claim {
+                        db.claim_dispatch_admitted(child, 10, None, None, None)
+                            .unwrap_err()
+                    } else {
+                        db.put_dispatch_with_parent_check(child).unwrap_err()
+                    };
+                    assert_eq!(
+                        error
+                            .downcast_ref::<ParentDispatchConflict>()
+                            .map(|conflict| conflict.reason),
+                        Some(ParentEdgeReason::Ineligible(status)),
+                        "{status:?}; claim={claim}; error={error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_parent_refuses_a_new_child() {
+        let (db, _dir) = temp_db();
+        let parent = put_row(&db, "linear:CHILD", "/wt/gone");
+        db.update_dispatch_status(parent, AgentDispatchStatus::Done)
+            .unwrap();
+
+        assert_eq!(
+            db.prune_terminal_dispatches(crate::util::now_ms() + 100 * 24 * 60 * 60 * 1000)
+                .unwrap(),
+            1
+        );
+        assert!(db.get_dispatch(parent).unwrap().is_none());
+
+        let child = crate::issue::NewDispatch {
+            parent_id: Some(parent),
+            ..crate::issue::NewDispatch::new("linear:CHILD", "/wt/child", "coder")
+        };
+        let error = db
+            .claim_dispatch_admitted(child, 10, None, None, None)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ParentDispatchConflict>()
+                .map(|conflict| conflict.reason),
+            Some(ParentEdgeReason::Missing)
+        );
+        assert!(db.list_dispatches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parent_with_a_live_child_survives_prune() {
+        let (db, _dir) = temp_db();
+        let parent = put_row(&db, "linear:CHILD", "/wt/gone");
+        db.update_dispatch_status(parent, AgentDispatchStatus::Done)
+            .unwrap();
+        let first_child = crate::issue::NewDispatch {
+            parent_id: Some(parent),
+            ..crate::issue::NewDispatch::new("linear:CHILD", "/wt/child-1", "coder")
+        };
+        db.put_dispatch_with_parent_check(first_child).unwrap();
+
+        assert_eq!(
+            db.prune_terminal_dispatches(crate::util::now_ms() + 100 * 24 * 60 * 60 * 1000)
+                .unwrap(),
+            0
+        );
+        assert!(db.get_dispatch(parent).unwrap().is_some());
+
+        let second_child = crate::issue::NewDispatch {
+            parent_id: Some(parent),
+            ..crate::issue::NewDispatch::new("linear:CHILD", "/wt/child-2", "coder")
+        };
+        assert!(
+            db.claim_dispatch_admitted(second_child, 10, None, None, None)
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn admission_race_parent_abandoned_under_a_held_write_lock_refuses_the_child() {
         for claim in [false, true] {
             let (db, dir) = temp_db();
@@ -3771,6 +3915,83 @@ mod tests {
     }
 
     #[test]
+    fn resume_claim_refuses_a_foreign_parent_that_fails_validation() {
+        let cases = [
+            (None, ParentEdgeReason::Missing),
+            (Some("cross-issue"), ParentEdgeReason::CrossIssue),
+            (
+                Some("abandoned"),
+                ParentEdgeReason::Ineligible(AgentDispatchStatus::Abandoned),
+            ),
+        ];
+        for (parent_kind, expected_reason) in cases {
+            let (db, _dir) = temp_db();
+            let source = db
+                .put_agent_dispatch(pipeline_row("linear:X-RES", "/wt/res", "code", None, None))
+                .unwrap();
+            db.update_dispatch_status(source, AgentDispatchStatus::Running)
+                .unwrap();
+            let parent = match parent_kind {
+                None => 99_999,
+                Some("cross-issue") => put_row(&db, "linear:OTHER", "/wt/other"),
+                Some("abandoned") => {
+                    let id = put_row(&db, "linear:X-RES", "/wt/abandoned");
+                    db.update_dispatch_status(id, AgentDispatchStatus::Abandoned)
+                        .unwrap();
+                    id
+                }
+                Some(_) => unreachable!(),
+            };
+            let before = db.list_dispatches().unwrap().len();
+            let error = db
+                .claim_resume_dispatch(
+                    source,
+                    AgentDispatchStatus::Running,
+                    pipeline_row("linear:X-RES", "/wt/res", "code", None, Some(parent)),
+                    4,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ParentDispatchConflict>()
+                    .map(|conflict| conflict.reason),
+                Some(expected_reason),
+                "parent={parent}; error={error}"
+            );
+            assert_eq!(
+                db.get_dispatch(source).unwrap().unwrap().status,
+                AgentDispatchStatus::Running
+            );
+            assert!(db.dispatch_notes(source, None, 0).unwrap().is_empty());
+            assert_eq!(db.list_dispatches().unwrap().len(), before);
+        }
+    }
+
+    #[test]
+    fn resume_claim_keeps_the_source_as_parent() {
+        let (db, _dir) = temp_db();
+        let source = db
+            .put_agent_dispatch(pipeline_row("linear:X-RES", "/wt/res", "code", None, None))
+            .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::Failed)
+            .unwrap();
+
+        let finisher = db
+            .claim_resume_dispatch(
+                source,
+                AgentDispatchStatus::Failed,
+                pipeline_row("linear:X-RES", "/wt/res", "code", None, Some(source)),
+                4,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(finisher).unwrap().unwrap().parent_id,
+            Some(source)
+        );
+    }
+
+    #[test]
     fn retry_park_run_refuses_a_republished_run() {
         let (db, _dir) = temp_db();
         let id = put_row(&db, "linear:P-1", "/wt/p");
@@ -4053,12 +4274,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().report.as_deref(),
-            Some("before[2J\nafter")
+            Some("before\u{fffd}[2J\nafter")
         );
         db.append_dispatch_note(id, "first\nsecond\x07").unwrap();
         assert_eq!(
             db.dispatch_notes(id, None, 0).unwrap()[0].text,
-            "firstsecond"
+            "first second\u{fffd}"
         );
     }
 

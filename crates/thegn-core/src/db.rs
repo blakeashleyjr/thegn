@@ -220,7 +220,8 @@ mod db_open_memo;
 /// v94: merge_queue.enqueue_common_dir + enqueue_admin_dir, repository and worktree identity captured at enqueue (THE-230).
 /// v95: durable usage-alert claims and legacy inbox compaction (THE-1386).
 /// v96: merge_queue_events, the audit trail of operator retry/remove/clear transitions (THE-229).
-pub const SCHEMA_VERSION: i64 = 96;
+/// v97: merge_queue_events.target_base_oid, the target base a drain landing replaced (THE-395).
+pub const SCHEMA_VERSION: i64 = 97;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -684,16 +685,93 @@ fn try_shared_lock(file: &std::fs::File, database: &Path) -> Result<()> {
 fn try_exclusive_lock(file: &std::fs::File, database: &Path) -> Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "refusing database schema migration for {}: another thegn process is still using the old schema. Stop/restart the running host and daemon after rebuilding, then retry",
-            database.display()
-        ),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("{}", old_schema_lease_refusal(database))
+        }
         Err(std::fs::TryLockError::Error(e)) => {
             anyhow::bail!(
                 "take exclusive schema lease for {}: {e}",
                 database.display()
             )
         }
+    }
+}
+
+/// How long a process that lost the bootstrap race waits for the creating process.
+/// The same 5 s bound as the connection's SQLite busy_timeout.
+const SCHEMA_BOOTSTRAP_WAIT: std::time::Duration = std::time::Duration::from_millis(5000);
+/// Delay between attempts to acquire the bootstrap lease.
+const SCHEMA_BOOTSTRAP_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn old_schema_lease_refusal(database: &Path) -> String {
+    format!(
+        "refusing database schema migration for {}: another thegn process is still using the old schema. Stop/restart the running host and daemon after rebuilding, then retry",
+        database.display()
+    )
+}
+
+/// Result of waiting for the schema lease on a new database.
+#[derive(Debug, PartialEq, Eq)]
+enum BootstrapLease {
+    /// This process owns the exclusive side and can create the schema.
+    Exclusive,
+    /// Another process completed creation; this process owns its shared side.
+    Joined(i64),
+}
+
+fn wait_for_bootstrap_lease(
+    file: &std::fs::File,
+    conn: &Connection,
+    database: &Path,
+    wait: std::time::Duration,
+) -> Result<BootstrapLease> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(BootstrapLease::Exclusive),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                anyhow::bail!(
+                    "take exclusive schema lease for {}: {error}",
+                    database.display()
+                )
+            }
+        }
+
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let version = query_user_version(conn);
+                if version >= SCHEMA_VERSION {
+                    return Ok(BootstrapLease::Joined(version));
+                }
+                if version > 0 {
+                    if let Err(error) = file.unlock() {
+                        tracing::debug!(%error, "could not release bootstrap schema lease");
+                    }
+                    anyhow::bail!("{}", old_schema_lease_refusal(database));
+                }
+                if let Err(error) = file.unlock() {
+                    tracing::debug!(%error, "could not release empty bootstrap schema lease");
+                }
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                anyhow::bail!(
+                    "take shared schema lease for {}: {error}",
+                    database.display()
+                )
+            }
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!(
+                "state database {} is still being created by another thegn process after {}ms; retry shortly",
+                database.display(),
+                wait.as_millis()
+            );
+        }
+        std::thread::sleep(SCHEMA_BOOTSTRAP_POLL.min(deadline.saturating_duration_since(now)));
     }
 }
 
@@ -889,7 +967,23 @@ fn prepare_schema_access(conn: &Connection, database: &Path, initial: i64) -> Re
     }
 
     let file = open_schema_lock(database)?;
-    try_exclusive_lock(&file, database)?;
+    if observed == 0 {
+        match wait_for_bootstrap_lease(&file, conn, database, SCHEMA_BOOTSTRAP_WAIT)? {
+            BootstrapLease::Exclusive => {}
+            BootstrapLease::Joined(version) => {
+                *slot = Some(MigrationLease {
+                    database: database.to_path_buf(),
+                    file,
+                });
+                return Ok(SchemaAccess {
+                    version,
+                    _migration: None,
+                });
+            }
+        }
+    } else {
+        try_exclusive_lock(&file, database)?;
+    }
     observed = query_user_version(conn);
     if observed >= SCHEMA_VERSION {
         // Another authorized controller completed the migration before this
@@ -1715,6 +1809,7 @@ impl Db {
                     crate::db_migrate::verify_v94_schema(&conn)?;
                     crate::db_migrate::verify_v95_schema(&conn)?;
                     crate::db_migrate::verify_v96_schema(&conn)?;
+                    crate::db_migrate::verify_v97_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2395,6 +2490,7 @@ impl Db {
         crate::db_migrate::migrate_v94(&conn)?;
         crate::db_migrate::migrate_v95(&conn, ver < 95)?;
         crate::db_migrate::migrate_v96(&conn)?;
+        crate::db_migrate::migrate_v97(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2429,6 +2525,7 @@ impl Db {
             crate::db_migrate::verify_v94_schema(&conn)?;
             crate::db_migrate::verify_v95_schema(&conn)?;
             crate::db_migrate::verify_v96_schema(&conn)?;
+            crate::db_migrate::verify_v97_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
@@ -2832,3 +2929,7 @@ mod tests;
 #[cfg(test)]
 #[path = "db_state_guard_tests.rs"]
 mod state_guard_tests;
+
+#[cfg(test)]
+#[path = "db_bootstrap_lease_tests.rs"]
+mod bootstrap_lease_tests;

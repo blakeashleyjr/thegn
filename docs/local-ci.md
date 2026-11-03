@@ -86,9 +86,9 @@ cold-builds from scratch.
 1. `act` ships in the dev shell — enter it (`nix develop` / `direnv allow`).
 2. Start a container engine: Docker, or podman with the socket exported —
    `export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"`.
-3. No secrets file is needed for the default anonymous run. All current flake
-   inputs are public. If you deliberately need a token for a trusted workflow
-   debug, create `.secrets` yourself and opt in on that invocation.
+3. No secrets file is needed for an anonymous run. All current flake inputs are
+   public. If you create `.secrets`, act loads it by default, so the guard treats
+   every `just act` run as credentialed while that file exists.
 
 ### Run
 
@@ -105,14 +105,21 @@ just act-clean          # remove act containers if one wedges
 Defaults live in `.actrc`: the `catthehacker/ubuntu:act-latest` runner image
 is pinned by its index digest, and `linux/amd64` keeps runs identical on Apple
 silicon. To update the image, resolve and review the tag's new digest, then
-replace the pin in `.actrc` in one commit. The default run does not load a
-secret file and does not reuse its job container. The anonymous default plus
-an explicit per-invocation `--secret-file .secrets` is the credential boundary:
-it gives the checked-out branch's workflow and composite-action code access to
-the token, so use it only on code you trust. Credentialed runs are not bound to
-a reviewed workflow revision. The token is unnecessary for anonymous access to
-current public flake inputs. `--reuse` explicitly retains the container and its
-mutable `/nix` state; avoid carrying it across revisions or trust domains.
+replace the pin in `.actrc` in one commit. Without `.secrets` or explicit secret
+flags, the run is anonymous and does not reuse its job container. Act loads
+`.secrets` automatically when that file exists; it gives the checked-out
+workflow and composite-action code access to the token, so use it only on code
+you trust. A credentialed run refuses unless `.github/` and the repository's
+`.actrc` match HEAD, and prints the HEAD it is bound to. Those are the only paths
+the guard checks; other uncommitted working-tree files still run, so use
+credentials only on commits you trust. The guard sees flags passed to `just` and
+the repository's `.secrets`, but does not inspect `~/.actrc` or
+`$XDG_CONFIG_HOME/act/actrc`, where act can also read secret or reuse flags.
+Credentials cannot be combined with `--reuse`. Every run passes `--rm` unless
+`--reuse` is given, so act removes its containers after a failed run. The token
+is unnecessary for anonymous access to current public flake inputs. `--reuse`
+explicitly retains the container and its mutable `/nix` state; avoid carrying
+it across revisions or trust domains.
 
 ### Caveats
 

@@ -154,6 +154,8 @@ The machine-readable source for this classification is embedded in
 the API version each verb needs (a verb newer than the plugin's declared `api`
 is refused as unsupported). `x-thegn-host-call-capabilities` is the exact set
 of dispatchable catalog ids.
+The `io` host verb is reserved and not implemented; an `io` request is refused
+with an `unsupported` error naming it as reserved.
 `StatusBarSegment`, `NotificationSource`, and `PaletteAction` accept one-shot
 or resident plugins. `IssueProvider` is resident-only because provider calls
 need a reply channel. Palette actions and providers are on-demand; status and

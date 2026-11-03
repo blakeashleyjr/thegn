@@ -108,7 +108,10 @@ verifies the new commits. Otherwise they refuse with the reason; use
 - `thegn merge history` (`--worktree`, `--limit 1-200`, `--json`) lists the
   drain's own status transitions (each status it wrote, with the landed commit
   as the result) as well as retry, remove and clear outcomes, newest first: who
-  acted, the status before and after, and the candidate and result commits. Up
+  acted, the status before and after, and the candidate and result commits. A
+  landed drain transition also names the target base: the commit the target
+  branch pointed at before the land, so history shows candidate, base and
+  result for every drain landing. Up
   to 200 events, including drain transitions, are kept per worktree; a removed
   worktree's history is dropped with it.
 
@@ -276,6 +279,9 @@ target:
   the queue. The host re-reads the registered repo, branch, and remote location
   and uses that location to ingest the tip; it never treats the remote absolute
   path as a host-local path.
+  Each drain removes up to 64 leftover ingest refs under `refs/thegn/mq/` that
+  no queued entry uses. If the queue or ref list cannot be read, it removes
+  none.
 - **`push`** folds and gates in the provider clone, advances its local target,
   and pushes that target to `origin`. It needs no inbound host control endpoint,
   but origin—not the host queue—is the convergence authority.

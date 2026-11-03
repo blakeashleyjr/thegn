@@ -699,7 +699,8 @@
     },
     {
       "change": "define-external-ide-inbound-boundary",
-      "lifecycle": "active",
+      "archive_path": "openspec/changes/archive/2026-11-02-define-external-ide-inbound-boundary/",
+      "lifecycle": "archived",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -707,7 +708,7 @@
           "project": "Client API & Remote Access"
         }
       ],
-      "summary": "Decide and publish the external IDE inbound handoff and control boundary."
+      "summary": "Outbound-only IDE handoff boundary published (help + extending guide + contract tests); inbound integration deferred by the 2026-10-20 owner decision; archived in batch 81."
     },
     {
       "change": "detect-active-network-kind",

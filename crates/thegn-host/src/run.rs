@@ -1978,12 +1978,6 @@ fn request_preview_scan(
     );
 }
 
-/// Persist a share lifecycle event to the `shares` table (resurrection layer).
-fn persist_share_event(ev: &crate::share::ShareEvent) {
-    let op = crate::share::share_persist_for(ev);
-    crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
-}
-
 fn shutdown_shares(share_supervisor: &mut crate::share::ShareSupervisor) {
     for (worktree, port, generation) in share_supervisor.shutdown_all() {
         let op = crate::share::SharePersist::DeleteIfOwned {
@@ -15362,7 +15356,7 @@ async fn event_loop<T: Terminal>(
                 if stopping_generation && let crate::share::ShareEvent::Down { port, .. } = &ev {
                     model.status = format!("Stopped share :{port}");
                 }
-                let replaced_generation_is_live = match &ev {
+                let other_generation_live = match &ev {
                     crate::share::ShareEvent::Down {
                         worktree,
                         port,
@@ -15376,8 +15370,8 @@ async fn event_loop<T: Terminal>(
                     } => share_supervisor.has_other_generation(worktree, *port, *generation),
                     crate::share::ShareEvent::Up { .. } => false,
                 };
-                if !replaced_generation_is_live {
-                    persist_share_event(&ev);
+                if let Some(op) = crate::share::accepted_share_persist(&ev, other_generation_live) {
+                    crate::db_task::persist(move |db| crate::share::apply_share_persist(db, op));
                 }
                 model.shares = current_share_views(&share_supervisor, &session);
                 dirty = true;

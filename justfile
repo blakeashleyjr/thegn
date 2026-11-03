@@ -567,13 +567,14 @@ act-list:
     act -l
 
 # Run the whole CI workflow locally (the `push` event the server gate runs on).
+# Credentials require a clean HEAD; failed runs are removed unless `--reuse` is given.
 # Pass extra act flags after `--`, e.g. `just act -- --verbose`.
 act *ARGS: _act-check
-    act push {{ARGS}}
+    python3 -B test/act_guard.py push {{ARGS}}
 
 # Run a single CI job, e.g. `just act-job name=lint` or `just act-job name=test`.
 act-job name: _act-check
-    act push -j {{name}}
+    python3 -B test/act_guard.py push -j {{name}}
 
 # Remove containers left by `--reuse` runs or a wedged/half-installed run.
 act-clean:
@@ -1270,9 +1271,10 @@ test-apply-backend:
 
 # Supply-chain policy: every external GitHub Action is pinned to an immutable
 # commit SHA, recursively through local composite actions. Pure YAML scan; no
-# Cargo, no network.
+# Cargo, no network. Also self-test the local act credential and cleanup guard.
 test-action-pins:
     python3 -B test/action_pin_test.py
+    python3 -B test/act_guard.py --self-test
 
 # THE-789: the nextest isolate-state setup script tolerates /tmp churn.
 # Pure; no Cargo.
