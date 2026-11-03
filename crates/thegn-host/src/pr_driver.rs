@@ -369,7 +369,14 @@ pub(crate) fn drive_queue(
 
         let facts = PrQueueFacts {
             worktree: item.worktree.clone(),
-            agent_attempts: attempts,
+            // Let a pause-enabled foreign head reach the foreign-push hold
+            // even when its preserved budget is exhausted; no dispatch can
+            // pass the hold, and the persisted attempt count stays unchanged.
+            agent_attempts: if moved && cfg.pause_on_foreign_push {
+                0
+            } else {
+                attempts
+            },
             last_head_oid: item.last_head_oid.clone(),
             is_own: true, // fresh shared admission runs before any dispatch side effect
             agent_available: agent_cmd.is_some(),
