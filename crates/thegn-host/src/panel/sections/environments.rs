@@ -54,6 +54,10 @@ pub(super) fn summary(model: &crate::chrome::FrameModel) -> Vec<Seg> {
         v.push(seg(g(), " "));
         v.push(seg(hue(Hue::Red), format!("✗{missing}")));
     }
+    if model.panel.environments_error.is_some() {
+        v.push(seg(g(), " "));
+        v.push(seg(hue(Hue::Red), "binding?"));
+    }
     v
 }
 
@@ -62,6 +66,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut rows: Vec<PanelRow> = Vec::new();
     if ctx.full() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(d(), "ENVIRONMENTS")])));
+    }
+    if let Some(error) = &ctx.model.panel.environments_error {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            hue(Hue::Red),
+            format!(
+                "binding unreadable: {}",
+                display_clip(&display_cell(error), ctx.cols.saturating_sub(20).max(1))
+            ),
+        )])));
     }
     if envs.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
@@ -155,7 +168,10 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             list_w,
             ctx.rows.saturating_sub(rows.len() + 1),
         ));
-        rows.push(environment_hints(envs.get(cursor)));
+        rows.push(environment_hints(
+            envs.get(cursor),
+            ctx.model.panel.environments_error.is_some(),
+        ));
         if let Some(toolchain) = &ctx.model.panel.toolchain {
             rows.push(PanelRow::plain(Line::segs(vec![seg(
                 d(),
@@ -197,7 +213,10 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             rows.extend(detail_rows(e, ctx.cols));
         }
     }
-    rows.push(environment_hints(envs.get(ctx.ui.cursor)));
+    rows.push(environment_hints(
+        envs.get(ctx.ui.cursor),
+        ctx.model.panel.environments_error.is_some(),
+    ));
     if let Some(toolchain) = &ctx.model.panel.toolchain {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             d(),
@@ -207,10 +226,14 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-fn environment_hints(selected: Option<&EnvSnapshot>) -> PanelRow {
-    let enter_hint = selected
-        .map(|env| if env.bound { "bound" } else { "rebind here" })
-        .unwrap_or("rebind here");
+fn environment_hints(selected: Option<&EnvSnapshot>, unreadable: bool) -> PanelRow {
+    let enter_hint = if unreadable {
+        "bind unavailable"
+    } else {
+        selected
+            .map(|env| if env.bound { "bound" } else { "rebind here" })
+            .unwrap_or("rebind here")
+    };
     let mut hints = vec![("enter", enter_hint)];
     if selected.is_some_and(|env| env.placement == "provider") {
         hints.push(("t", "test"));
@@ -375,6 +398,66 @@ mod tests {
             rows: 20,
         };
         assert_eq!(content(&normal_ctx).len(), 3);
+    }
+
+    #[test]
+    fn unreadable_binding_shows_a_row_and_a_summary_badge() {
+        let model = FrameModel {
+            panel: PanelData {
+                environments: vec![env("one", "box1")],
+                environments_error: Some("database is locked".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Environments,
+            width: PanelWidth::Normal,
+            ..Default::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 20,
+        };
+        let rows = content(&ctx);
+        let warning = rows
+            .iter()
+            .find(|row| row_text(row).contains("binding unreadable"))
+            .expect("unreadable binding row");
+        assert!(row_text(warning).contains("database is locked"));
+        assert!(warning.hit.is_none());
+        assert!(
+            rows.iter()
+                .any(|row| { row.hit == Some(PanelHit::Row(Section::Environments, 0)) })
+        );
+        assert!(
+            summary(&model)
+                .iter()
+                .any(|part| part.text.contains("binding?"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row_text(row).contains("bind unavailable"))
+        );
+
+        let full_ui = PanelUi {
+            open: Section::Environments,
+            width: PanelWidth::Full,
+            ..Default::default()
+        };
+        let full_ctx = SectionCtx {
+            model: &model,
+            ui: &full_ui,
+            cols: 120,
+            rows: 20,
+        };
+        assert!(
+            content(&full_ctx)
+                .iter()
+                .any(|row| row_text(row).contains("binding unreadable"))
+        );
     }
 
     #[test]
