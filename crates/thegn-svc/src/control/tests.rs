@@ -57,7 +57,7 @@ impl ControlApi for FakeApi {
         &'a self,
         _filter: &'a thegn_core::issue::IssueFilter,
         repo: Option<&'a str>,
-    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+    ) -> BoxFuture<'a, ControlResult<super::IssueListing>> {
         self.record(&repo.map_or_else(
             || "issues_list".to_string(),
             |repo| format!("issues_list:repo={repo}"),
@@ -2055,4 +2055,30 @@ fn ci_logs_reply_without_warnings_still_decodes() {
     assert!(reply.warnings.is_empty());
     let encoded = serde_json::to_value(reply).unwrap();
     assert!(encoded.get("warnings").is_none());
+}
+
+#[test]
+fn issue_listing_serializes_issues_complete_and_incomplete() {
+    let encoded = serde_json::to_value(super::IssueListing {
+        issues: vec![],
+        complete: false,
+        incomplete: vec![super::IssueListGap {
+            account: "work".into(),
+            provider: "linear".into(),
+            kind: "partial".into(),
+            reason: "page cap".into(),
+        }],
+    })
+    .unwrap();
+
+    assert!(
+        encoded
+            .get("issues")
+            .is_some_and(serde_json::Value::is_array)
+    );
+    assert_eq!(
+        encoded.get("complete"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(encoded["incomplete"][0]["kind"], "partial");
 }

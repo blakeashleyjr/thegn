@@ -21,8 +21,9 @@ use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow, NotificationStore};
 use thegn_svc::control::{
     AttachKind, AttachReply, ControlApi, ControlError, ControlResult, DispatchPage, ForkSpec,
-    GitFileStatus, OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
-    SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition, WaitOutcome,
+    GitFileStatus, IssueListGap, IssueListing, OpenSpec, PreviewFetchReply, PreviewFetchRequest,
+    RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition,
+    WaitOutcome,
 };
 use thegn_svc::git::{CliGit, GitBackend};
 
@@ -936,6 +937,80 @@ fn issue_router_control_error(
         thegn_svc::issue::IssueError::Policy(_) => ControlError::FailedPrecondition(message),
         _ => ControlError::Internal(anyhow::anyhow!(message)),
     }
+}
+
+/// One account's listing: (account label, provider id, result).
+type AccountListing<'a> = (
+    String,
+    &'a str,
+    Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
+);
+
+fn merge_issue_accounts(
+    per_provider: Vec<AccountListing<'_>>,
+    limit: usize,
+) -> ControlResult<IssueListing> {
+    let total = per_provider.len();
+    let mut failed = Vec::new();
+    let mut issues = Vec::new();
+    let mut incomplete = Vec::new();
+
+    for (account, provider, result) in per_provider {
+        match result {
+            Ok(mut rows) => issues.append(&mut rows),
+            Err(thegn_svc::issue::IssueError::PartialList {
+                issues: rows,
+                reason,
+            }) => {
+                tracing::warn!(account = %account, provider, reason, "issues.list account was partial");
+                issues.extend(rows.into_iter().filter_map(|issue| {
+                    match thegn_svc::issue::validate_issue_identity(&issue) {
+                        Ok(()) => Some(issue),
+                        Err(error) => {
+                            tracing::warn!(
+                                account = %account,
+                                provider,
+                                error = %error,
+                                "partial issue identity rejected"
+                            );
+                            None
+                        }
+                    }
+                }));
+                incomplete.push(IssueListGap {
+                    account,
+                    provider: provider.to_string(),
+                    kind: "partial".into(),
+                    reason: reason.to_string(),
+                });
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                tracing::warn!(account = %account, provider, error = %reason, "issues.list account failed");
+                failed.push(format!("{provider}/{account}: {reason}"));
+                incomplete.push(IssueListGap {
+                    account,
+                    provider: provider.to_string(),
+                    kind: "failed".into(),
+                    reason,
+                });
+            }
+        }
+    }
+    if total > 0 && failed.len() == total {
+        return Err(ControlError::Internal(anyhow::anyhow!(
+            "issues.list: every configured account errored — {}",
+            failed.join("; ")
+        )));
+    }
+    if limit > 0 && issues.len() > limit {
+        issues.truncate(limit);
+    }
+    Ok(IssueListing {
+        complete: incomplete.is_empty(),
+        issues,
+        incomplete,
+    })
 }
 
 impl ControlApi for DaemonService {
@@ -2463,7 +2538,7 @@ impl ControlApi for DaemonService {
         &'a self,
         filter: &'a thegn_core::issue::IssueFilter,
         repo: Option<&'a str>,
-    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+    ) -> BoxFuture<'a, ControlResult<IssueListing>> {
         Box::pin(async move {
             let issues_cfg = self.issue_config_for_repo(repo).await?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
@@ -2472,34 +2547,8 @@ impl ControlApi for DaemonService {
                     "no issue tracker configured (set [issues] providers/accounts)",
                 ));
             }
-            // `list_issues` swallows every per-account error into a
-            // `tracing::warn!` and always answers `Ok` — over the control API
-            // that reaches a supervisor agent as "zero issues", not "your token
-            // is dead" (THE-72). Report per account instead: a partial failure
-            // still yields the accounts that worked, an all-failed run errors.
-            let per_provider = router.list_per_provider(filter).await;
-            let total = per_provider.len();
-            let mut failed: Vec<String> = Vec::new();
-            let mut issues = Vec::new();
-            for (account, provider, result) in per_provider {
-                match result {
-                    Ok(mut v) => issues.append(&mut v),
-                    Err(e) => {
-                        tracing::warn!(account = %account, provider, error = %e, "issues.list account failed");
-                        failed.push(format!("{provider}/{account}: {e}"));
-                    }
-                }
-            }
-            if total > 0 && failed.len() == total {
-                return Err(ControlError::Internal(anyhow::anyhow!(
-                    "issues.list: every configured account errored — {}",
-                    failed.join("; ")
-                )));
-            }
-            if filter.limit > 0 && issues.len() > filter.limit {
-                issues.truncate(filter.limit);
-            }
-            Ok(issues)
+            // Partial accounts keep their rows and every gap is reported.
+            merge_issue_accounts(router.list_per_provider(filter).await, filter.limit)
         })
     }
 
@@ -3730,6 +3779,187 @@ mod tests {
         for r in results {
             assert_uniform_miss(&r.unwrap_err(), "/not/registered");
         }
+    }
+
+    #[test]
+    fn issues_list_keeps_partial_rows_and_reports_the_gap() {
+        use thegn_svc::issue::IssueError;
+
+        let a1 = thegn_core::issue::Issue {
+            provider: "linear".into(),
+            id: "linear:A-1".into(),
+            number: "A-1".into(),
+            ..Default::default()
+        };
+        let b1 = thegn_core::issue::Issue {
+            provider: "jira".into(),
+            id: "jira:B-1".into(),
+            number: "B-1".into(),
+            ..Default::default()
+        };
+        let listing = merge_issue_accounts(
+            vec![
+                (
+                    "work".into(),
+                    "linear",
+                    Err(IssueError::PartialList {
+                        issues: vec![a1.clone()],
+                        reason: "page cap",
+                    }),
+                ),
+                ("home".into(), "jira", Ok(vec![b1.clone()])),
+            ],
+            0,
+        )
+        .unwrap();
+
+        assert!(listing.issues.contains(&a1));
+        assert!(listing.issues.contains(&b1));
+        assert!(!listing.complete);
+        assert_eq!(listing.incomplete.len(), 1);
+        assert_eq!(
+            listing.incomplete[0],
+            IssueListGap {
+                account: "work".into(),
+                provider: "linear".into(),
+                kind: "partial".into(),
+                reason: "page cap".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn issues_list_partial_rows_with_a_bad_identity_are_dropped() {
+        use thegn_svc::issue::IssueError;
+
+        let valid = thegn_core::issue::Issue {
+            provider: "linear".into(),
+            id: "linear:A-1".into(),
+            number: "A-1".into(),
+            ..Default::default()
+        };
+        let mismatched = thegn_core::issue::Issue {
+            provider: "linear".into(),
+            id: "jira:B-1".into(),
+            number: "B-1".into(),
+            ..Default::default()
+        };
+        let listing = merge_issue_accounts(
+            vec![(
+                "work".into(),
+                "linear",
+                Err(IssueError::PartialList {
+                    issues: vec![valid.clone(), mismatched],
+                    reason: "page cap",
+                }),
+            )],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(listing.issues, vec![valid]);
+        assert!(!listing.complete);
+        assert_eq!(listing.incomplete.len(), 1);
+        assert_eq!(listing.incomplete[0].kind, "partial");
+    }
+
+    #[test]
+    fn issues_list_single_partial_account_is_not_an_error() {
+        use thegn_svc::issue::IssueError;
+
+        let issue = thegn_core::issue::Issue {
+            provider: "linear".into(),
+            id: "linear:A-1".into(),
+            number: "A-1".into(),
+            ..Default::default()
+        };
+        let listing = merge_issue_accounts(
+            vec![(
+                "work".into(),
+                "linear",
+                Err(IssueError::PartialList {
+                    issues: vec![issue.clone()],
+                    reason: "page cap",
+                }),
+            )],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(listing.issues, vec![issue]);
+        assert!(!listing.complete);
+    }
+
+    #[test]
+    fn issues_list_failed_account_is_reported_not_silent() {
+        use thegn_svc::issue::IssueError;
+
+        let issue = thegn_core::issue::Issue {
+            id: "linear:A-1".into(),
+            ..Default::default()
+        };
+        let listing = merge_issue_accounts(
+            vec![
+                ("work".into(), "linear", Ok(vec![issue.clone()])),
+                ("home".into(), "jira", Err(IssueError::Api("401".into()))),
+            ],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(listing.issues, vec![issue]);
+        assert!(!listing.complete);
+        assert_eq!(listing.incomplete.len(), 1);
+        assert_eq!(listing.incomplete[0].kind, "failed");
+        assert!(listing.incomplete[0].reason.contains("401"));
+    }
+
+    #[test]
+    fn issues_list_all_failed_accounts_still_error() {
+        use thegn_svc::issue::IssueError;
+
+        let result = merge_issue_accounts(
+            vec![
+                ("work".into(), "linear", Err(IssueError::Api("401".into()))),
+                ("home".into(), "jira", Err(IssueError::Api("403".into()))),
+            ],
+            0,
+        );
+
+        match result {
+            Err(ControlError::Internal(error)) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("every configured account errored")
+                );
+            }
+            other => panic!("expected all-failed internal error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issues_list_complete_when_every_account_answers() {
+        let a1 = thegn_core::issue::Issue {
+            id: "linear:A-1".into(),
+            ..Default::default()
+        };
+        let b1 = thegn_core::issue::Issue {
+            id: "jira:B-1".into(),
+            ..Default::default()
+        };
+        let listing = merge_issue_accounts(
+            vec![
+                ("work".into(), "linear", Ok(vec![a1])),
+                ("home".into(), "jira", Ok(vec![b1])),
+            ],
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(listing.issues.len(), 1);
+        assert!(listing.complete);
+        assert!(listing.incomplete.is_empty());
     }
 
     #[tokio::test]
