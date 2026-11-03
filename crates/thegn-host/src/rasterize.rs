@@ -723,25 +723,22 @@ pub(crate) fn renderer_doctor_report(previewed: &Path) -> RendererDoctorReport {
             None
         }
     };
-    let bwrap = match renderer_for("bwrap", previewed) {
-        Ok(path) => Some(path),
-        Err(_) => None,
-    };
+    let bwrap = renderer_for("bwrap", previewed);
     let host_home = canonical_renderer_home(std::env::var_os("HOME").map(PathBuf::from));
     let cancel = AtomicBool::new(false);
-    let bwrap_usable = stage.as_ref().is_some_and(|stage| {
+    let usable = stage.as_ref().is_some_and(|stage| {
         bwrap
             .as_deref()
-            .is_some_and(|bwrap| bwrap_usable(bwrap, stage, host_home.as_deref(), &cancel))
+            .is_ok_and(|path| bwrap_usable(path, stage, host_home.as_deref(), &cancel))
     });
     let lookups = ["pdftoppm", "pdftotext", "mmdc"]
         .into_iter()
         .map(|program| (program, renderer_for(program, previewed)))
         .collect();
     RendererDoctorReport {
-        bwrap,
-        bwrap_usable,
-        rows: renderer_doctor_rows(lookups, bwrap_usable),
+        bwrap: bwrap.ok(),
+        bwrap_usable: usable,
+        rows: renderer_doctor_rows(lookups, usable),
     }
 }
 
