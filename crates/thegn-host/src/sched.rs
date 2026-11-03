@@ -131,19 +131,15 @@ impl AdmissionSnapshot {
     }
 
     pub(crate) fn wait_mean_us(&self) -> u64 {
-        if self.wait_samples == 0 {
-            0
-        } else {
-            self.wait_us_total / self.wait_samples
-        }
+        self.wait_us_total
+            .checked_div(self.wait_samples)
+            .unwrap_or(0)
     }
 
     pub(crate) fn service_mean_us(&self) -> u64 {
-        if self.service_samples == 0 {
-            0
-        } else {
-            self.service_us_total / self.service_samples
-        }
+        self.service_us_total
+            .checked_div(self.service_samples)
+            .unwrap_or(0)
     }
 }
 
