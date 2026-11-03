@@ -54,7 +54,17 @@
           worktreeMode = "global";
           nameScheme = "words";
           autoRemoveWorktree = true;
+          confirmDelete = false;
           themeAccent = "#f083ba";
+          themePreset = "storm";
+          themeFocusBorder = "#6ee7d8";
+          themePanePadding = 1;
+          themeUndercurl = "auto";
+          themeColor = "256";
+          themeGlyphs = "unicode";
+          themeAgentGlyphs = "symbol";
+          themeMascot = "knight";
+          themeMascotMotion = "still";
           monitorSystem = "htop";
           monitorGpu = "nvtop";
           agents = [
