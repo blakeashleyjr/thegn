@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use thegn_core::config::Config;
-use thegn_core::managed_ssh::{AuthorizedKeyRecord, RotationRecovery};
+use thegn_core::managed_ssh::{AuthorizedKeyRecord, CustodyChanged, RotationRecovery};
 
 static ROTATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -26,24 +26,6 @@ pub struct RotationSummary {
 struct ScopeLease {
     _file: std::fs::File,
 }
-
-#[derive(Debug)]
-struct CustodyChanged {
-    provider: String,
-    instance: String,
-}
-
-impl std::fmt::Display for CustodyChanged {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "managed SSH custody row {}/{} changed since this rotation read it; no further remote change was made",
-            self.provider, self.instance
-        )
-    }
-}
-
-impl std::error::Error for CustodyChanged {}
 
 #[derive(Debug)]
 struct RotationLeaseHeld {
@@ -496,15 +478,7 @@ fn rotate_scope(cfg: &Config, key_path: &Path, records: &[AuthorizedKeyRecord]) 
     }
 
     for record in &tracked {
-        ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
-        thegn_core::managed_ssh::record_rotation_completed(
-            &record.provider,
-            &record.account,
-            &record.instance,
-            key_path,
-            &new_public,
-            record.proxy_worktree.as_deref(),
-        )?;
+        thegn_core::managed_ssh::record_rotation_completed(record, key_path, &new_public)?;
     }
     // Custody now reflects the working canonical key even if deleting retired
     // local material fails. Surface that cleanup failure without lying about
@@ -545,8 +519,7 @@ fn publish_if_unchanged_in(
     expected: &AuthorizedKeyRecord,
     next: &AuthorizedKeyRecord,
 ) -> Result<()> {
-    ensure_unchanged(dir, expected)?;
-    thegn_core::managed_ssh::record_authorized_at(dir, next)
+    thegn_core::managed_ssh::publish_if_unchanged_at(dir, expected, next)
 }
 
 fn ensure_unchanged(dir: &Path, expected: &AuthorizedKeyRecord) -> Result<()> {
@@ -675,15 +648,11 @@ fn recover_pending(
             key_path.display()
         );
         for &index in &pending {
-            let record = &records[index];
-            ensure_unchanged(&thegn_core::managed_ssh::dir(), record)?;
+            let expected = records[index].clone();
             thegn_core::managed_ssh::record_rotation_completed(
-                &record.provider,
-                &record.account,
-                &record.instance,
+                &expected,
                 key_path,
                 &canonical_public,
-                record.proxy_worktree.as_deref(),
             )?;
             records[index].key_path = key_path.to_path_buf();
             records[index].key_fingerprint = recovery.key_fingerprint.clone();
