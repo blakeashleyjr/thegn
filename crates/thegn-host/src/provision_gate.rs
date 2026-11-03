@@ -494,7 +494,9 @@ pub(crate) fn provision_reserved(
 /// spare is ready or the env can't hand one over (caller provisions fresh). A
 /// spare ledger that cannot be read is reported visibly (status line and toast
 /// in the TUI) and returns `None`, so the caller provisions fresh; it is never
-/// silently treated as an empty pool.
+/// silently treated as an empty pool. The claiming worktree's declared egress
+/// policy is verified (and re-applied on drift) on the spare before hand-over;
+/// a failure quarantines the claim and the caller provisions fresh.
 pub fn claim_spare(
     cfg: &thegn_core::config::Config,
     worktree: &str,
@@ -547,6 +549,35 @@ pub fn claim_spare(
             }
         }
     };
+    let egress_loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(worktree));
+    let egress_env = cfg.resolve_env(
+        repo_root,
+        &egress_loc,
+        std::path::Path::new(worktree),
+        Some(env_name),
+    );
+    let egress_provider = crate::agent::provider_for_named(&env.provider, &name);
+    let egress = match egress_provider.as_ref() {
+        Some(provider) => {
+            let steps = crate::egress_admit::BlockingProviderEgress { provider };
+            claim_egress_gate(
+                Some((&steps, provider.caps().egress)),
+                &name,
+                &egress_env.sandbox.network_allow,
+                &egress_env.sandbox.network_block,
+            )
+        }
+        None => claim_egress_gate(
+            None,
+            &name,
+            &egress_env.sandbox.network_allow,
+            &egress_env.sandbox.network_block,
+        ),
+    };
+    if let Err(reason) = egress {
+        quarantine_claim_failure(&db, &name, worktree, &reason);
+        return None;
+    }
     // The claimed spare's provisioned-base checkpoint rides its pool row; the
     // recycle paths (stale reconcile / worktree delete) restore from it.
     tracing::debug!(
@@ -760,6 +791,32 @@ fn quarantine_claim_failure(db: &thegn_core::db::Db, name: &str, worktree: &str,
     thegn_core::msg::warn(&format!(
         "warm pool: claim of spare {name} for {worktree} failed ({reason}); {quarantine_status} and a fresh sandbox will be provisioned"
     ));
+}
+
+fn claim_egress_gate(
+    provider: Option<(&dyn crate::egress_admit::EgressSteps, bool)>,
+    name: &str,
+    allow: &[String],
+    block: &[String],
+) -> Result<(), String> {
+    if allow.is_empty() && block.is_empty() {
+        return Ok(());
+    }
+    let Some((steps, caps_egress)) = provider else {
+        return Err(format!(
+            "no provider is available to verify the claiming worktree's network egress policy on spare {name}"
+        ));
+    };
+    if crate::egress_admit::egress_admission(false, caps_egress, allow, block)
+        == crate::egress_admit::EgressAdmission::Skip
+    {
+        return Ok(());
+    }
+    crate::egress_admit::verify_existing_egress(steps, name, allow, block).map_err(|error| {
+        format!(
+            "the claiming worktree's network egress policy could not be verified on spare {name}: {error:#}"
+        )
+    })
 }
 
 /// On-open location rebind: build the `GitLoc` for the freshly RESOLVED
@@ -1347,5 +1404,128 @@ mod tests {
         assert!(
             matches!(result, Err(error) if error.to_string().contains("provider attach refused"))
         );
+    }
+
+    struct ScriptedClaimEgress {
+        calls: std::cell::RefCell<Vec<String>>,
+        applies: std::cell::RefCell<Vec<anyhow::Result<()>>>,
+        reads: std::cell::RefCell<Vec<anyhow::Result<Vec<thegn_svc::provider::PolicyRule>>>>,
+    }
+
+    impl crate::egress_admit::EgressSteps for ScriptedClaimEgress {
+        fn apply(&self, id: &str, _allow: &[String], _block: &[String]) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push(format!("apply:{id}"));
+            self.applies.borrow_mut().remove(0)
+        }
+
+        fn read_back(&self, id: &str) -> anyhow::Result<Vec<thegn_svc::provider::PolicyRule>> {
+            self.calls.borrow_mut().push(format!("read:{id}"));
+            self.reads.borrow_mut().remove(0)
+        }
+
+        fn destroy(&self, id: &str) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push(format!("destroy:{id}"));
+            Ok(())
+        }
+    }
+
+    fn claim_egress_lists() -> (Vec<String>, Vec<String>) {
+        (
+            vec!["allowed.test".to_string()],
+            vec!["blocked.test".to_string()],
+        )
+    }
+
+    #[test]
+    fn claim_egress_gate_matching_policy_is_verified_with_one_read() {
+        let (allow, block) = claim_egress_lists();
+        let fake = ScriptedClaimEgress {
+            calls: std::cell::RefCell::new(Vec::new()),
+            applies: std::cell::RefCell::new(Vec::new()),
+            reads: std::cell::RefCell::new(vec![Ok(thegn_svc::provider::rules_from(
+                &allow, &block,
+            )
+            .unwrap())]),
+        };
+
+        claim_egress_gate(Some((&fake, true)), "spare-1", &allow, &block).unwrap();
+
+        assert_eq!(*fake.calls.borrow(), vec!["read:spare-1"]);
+    }
+
+    #[test]
+    fn claim_egress_gate_reapplies_a_drifted_policy() {
+        let (allow, block) = claim_egress_lists();
+        let fake = ScriptedClaimEgress {
+            calls: std::cell::RefCell::new(Vec::new()),
+            applies: std::cell::RefCell::new(vec![Ok(())]),
+            reads: std::cell::RefCell::new(vec![
+                Ok(Vec::new()),
+                Ok(thegn_svc::provider::rules_from(&allow, &block).unwrap()),
+            ]),
+        };
+
+        claim_egress_gate(Some((&fake, true)), "spare-1", &allow, &block).unwrap();
+
+        assert_eq!(
+            *fake.calls.borrow(),
+            vec!["read:spare-1", "apply:spare-1", "read:spare-1"]
+        );
+    }
+
+    #[test]
+    fn claim_egress_gate_refuses_an_unverifiable_policy_naming_the_spare() {
+        let (allow, block) = claim_egress_lists();
+        let fake = ScriptedClaimEgress {
+            calls: std::cell::RefCell::new(Vec::new()),
+            applies: std::cell::RefCell::new(vec![Err(anyhow::anyhow!("apply failed"))]),
+            reads: std::cell::RefCell::new(vec![Ok(Vec::new())]),
+        };
+
+        let result = claim_egress_gate(Some((&fake, true)), "spare-1", &allow, &block);
+
+        assert!(matches!(result, Err(reason)
+            if reason.contains("spare-1")
+                && reason.contains("could not be verified")
+                && reason.contains("apply failed")));
+        assert_eq!(*fake.calls.borrow(), vec!["read:spare-1", "apply:spare-1"]);
+    }
+
+    #[test]
+    fn claim_egress_gate_without_declared_lists_makes_no_provider_call() {
+        let fake = ScriptedClaimEgress {
+            calls: std::cell::RefCell::new(Vec::new()),
+            applies: std::cell::RefCell::new(Vec::new()),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+
+        claim_egress_gate(Some((&fake, true)), "spare-1", &[], &[]).unwrap();
+        claim_egress_gate(None, "spare-1", &[], &[]).unwrap();
+
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn claim_egress_gate_refuses_declared_lists_without_a_provider() {
+        let (allow, block) = claim_egress_lists();
+
+        let result = claim_egress_gate(None, "spare-1", &allow, &block);
+
+        assert!(matches!(result, Err(reason)
+            if reason.contains("spare-1") && reason.contains("no provider")));
+    }
+
+    #[test]
+    fn claim_egress_gate_skips_a_provider_without_egress_translation() {
+        let (allow, block) = claim_egress_lists();
+        let fake = ScriptedClaimEgress {
+            calls: std::cell::RefCell::new(Vec::new()),
+            applies: std::cell::RefCell::new(Vec::new()),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+
+        claim_egress_gate(Some((&fake, false)), "spare-1", &allow, &block).unwrap();
+
+        assert!(fake.calls.borrow().is_empty());
     }
 }
