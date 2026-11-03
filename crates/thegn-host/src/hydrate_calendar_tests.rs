@@ -1893,7 +1893,10 @@ fn zoned_weekly_occurrence_is_one_materialization_for_cache_month_and_reminders(
         .find(|(day, _)| *day == d(2026, 3, 8))
         .and_then(|(_, events)| events.iter().find(|event| event.uid == "dst-weekly"))
         .expect("the occurrence occupies March 8");
-    assert!(std::sync::Arc::ptr_eq(a, b));
+    assert!(
+        std::sync::Arc::ptr_eq(a, b),
+        "March 7 and March 8 should share one occurrence Arc; March 7: {a:?}, March 8: {b:?}"
+    );
     assert_eq!(
         a.start,
         EventTime::Zoned {
@@ -1943,6 +1946,10 @@ fn zoned_weekly_occurrence_is_one_materialization_for_cache_month_and_reminders(
     )
     .unwrap();
     assert_eq!(due.reminders.len(), 1, "{:?}", due.reminders);
-    assert!(due.reminders[0].event_id.ends_with("/dst-weekly"));
+    assert!(
+        due.reminders[0].event_id.ends_with("/dst-weekly"),
+        "unexpected event id in due reminders: {:?}",
+        due.reminders[0].event_id
+    );
     assert_eq!(due.reminders[0].occurrence_start_ms, start_ms);
 }
