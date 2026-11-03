@@ -479,6 +479,21 @@ pub(crate) fn context_row_current(cached_context: &str, current_context: Option<
     }
 }
 
+/// A cached CI log is served only for its own run/job, with a known head, and never across a known provider-context change (an unknown current context keeps the row, like the run cache).
+pub(crate) fn served_log_cache_hit(
+    entry: &thegn_core::ci_log::CiLogEntry,
+    run_id: &str,
+    job_id: &str,
+    current_context: Option<&str>,
+) -> bool {
+    entry.run_id == run_id
+        && entry.job_id == job_id
+        && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
+        && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
+        && thegn_core::ci_log::cacheable_log_entry(entry)
+        && context_row_current(&entry.context, current_context)
+}
+
 /// Resolve CI context for cache readers without running git on remote/provider
 /// worktrees. Local origins are served by the memoised origin reader.
 pub(crate) fn reader_cache_context(
@@ -2495,6 +2510,64 @@ mod tests {
     #[test]
     fn unknown_current_context_keeps_branch_and_age_rule() {
         assert!(context_row_current("anything", None));
+    }
+
+    #[cfg(test)]
+    fn served_log(context: &str) -> thegn_core::ci_log::CiLogEntry {
+        thegn_core::ci_log::CiLogEntry {
+            worktree: "/wt/a".into(),
+            run_id: "11".into(),
+            job_id: "22".into(),
+            head_sha: "abc".into(),
+            text: "log".into(),
+            context: context.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn served_log_cache_hit_withholds_another_known_context() {
+        let entry = served_log("github:github.com/o/a");
+        assert!(!served_log_cache_hit(
+            &entry,
+            "11",
+            "22",
+            Some("github:github.com/o/b")
+        ));
+        assert!(served_log_cache_hit(
+            &entry,
+            "11",
+            "22",
+            Some("github:github.com/o/a")
+        ));
+    }
+
+    #[test]
+    fn served_log_cache_hit_keeps_a_row_when_the_context_is_unknown() {
+        assert!(served_log_cache_hit(&served_log(""), "11", "22", None));
+        assert!(served_log_cache_hit(
+            &served_log("github:github.com/o/a"),
+            "11",
+            "22",
+            None
+        ));
+        assert!(!served_log_cache_hit(
+            &served_log(""),
+            "11",
+            "22",
+            Some("github:github.com/o/a")
+        ));
+    }
+
+    #[test]
+    fn served_log_cache_hit_still_requires_the_requested_ids_and_a_head() {
+        let entry = served_log("");
+        assert!(!served_log_cache_hit(&entry, "wrong", "22", None));
+        let no_head = thegn_core::ci_log::CiLogEntry {
+            head_sha: String::new(),
+            ..entry
+        };
+        assert!(!served_log_cache_hit(&no_head, "11", "22", None));
     }
 
     #[test]

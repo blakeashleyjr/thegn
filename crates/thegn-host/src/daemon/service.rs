@@ -2186,12 +2186,30 @@ impl ControlApi for DaemonService {
             } else {
                 None
             };
+            let context = if cached.is_some() {
+                let context_path = path.clone();
+                let context_config = self.config.ci.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let loc = thegn_core::remote::GitLoc::for_worktree(&context_path);
+                        thegn_svc::ci::cache_context(&loc, &context_config)
+                    })
+                    .await
+                    .map_err(|e| {
+                        ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}"))
+                    })?,
+                )
+            } else {
+                None
+            }
+            .flatten();
             let cached = cached.filter(|entry| {
-                entry.run_id == run_id_owned
-                    && entry.job_id == job_id_owned
-                    && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
-                    && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
-                    && thegn_core::ci_log::cacheable_log_entry(entry)
+                crate::ci_refresh::served_log_cache_hit(
+                    entry,
+                    &run_id_owned,
+                    &job_id_owned,
+                    context.as_deref(),
+                )
             });
             if let Some(mut entry) = cached {
                 let (text, truncated) = thegn_core::ci_log::served_window(
