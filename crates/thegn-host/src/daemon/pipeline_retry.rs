@@ -767,7 +767,7 @@ async fn cold_stage_prompt(
 
     let facts = if crate::stage_prompt::needs_tracker(&stage.prompt) {
         let detail = svc
-            .issues_get(&row.issue_id, Some(row.worktree_path.as_str()))
+            .issues_get(&row.issue_id, Some(row.worktree_path.as_str()), None)
             .await
             .map_err(|e| anyhow::anyhow!("tracker lookup for {}: {e}", row.issue_id))?;
         crate::stage_prompt::IssueFacts {
