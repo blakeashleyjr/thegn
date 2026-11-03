@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -758,10 +758,11 @@ fn stream_bundle(
 }
 
 /// Materialize the bundle on the target host and fetch its branch ref into the
-/// supplied generation-scoped ref. Under the co-location model the drain runs on the
-/// target host, so `target` is `Local`; a remote target means the caller should
-/// have dispatched to that host's drain daemon (see Milestone B), so we fail
-/// loudly rather than trying to push a bundle the wrong way.
+/// supplied generation-scoped ref. The fetch is cancellable through the fold
+/// cancellation probe. Under the co-location model the drain runs on the target
+/// host, so `target` is `Local`; a remote target means the caller should have
+/// dispatched to that host's drain daemon (see Milestone B), so we fail loudly
+/// rather than trying to push a bundle the wrong way.
 fn fetch_from_custody(
     target: &GitLoc,
     branch: &str,
@@ -792,11 +793,7 @@ fn fetch_from_custody(
     // The random generation makes this an isolated fetch destination. The final
     // ref is published separately with an all-zero old OID, making it create-only.
     let refspec = format!("refs/heads/{branch}:{staging_ref}");
-    let outcome = thegn_core::git_run::run_command(
-        &mut target.git_command(&["fetch", &tmp_s, &refspec]),
-        &thegn_core::git_run::GitPolicy::read(deadline),
-        &AtomicBool::new(false),
-    );
+    let outcome = run_fetch_cancellable(target.git_command(&["fetch", &tmp_s, &refspec]), deadline);
     if !outcome.is_success() {
         let outcome_text = outcome.to_string();
         if let Err(error) = remove_staging_ref(target, &staging_ref) {
@@ -804,6 +801,7 @@ fn fetch_from_custody(
         }
         let error = match outcome {
             thegn_core::git_run::GitOutcome::Timeout => IngestError::Timeout { after: deadline },
+            thegn_core::git_run::GitOutcome::Cancelled => IngestError::Cancelled,
             thegn_core::git_run::GitOutcome::Exit { .. } => {
                 IngestError::InvalidBundle(outcome_text)
             }
@@ -870,6 +868,56 @@ fn remove_staging_ref(target: &GitLoc, staging_ref: &str) -> std::result::Result
     match ref_oid(target, staging_ref)? {
         Some(actual) => ref_update(target, &["update-ref", "-d", staging_ref, &actual]),
         None => Ok(()),
+    }
+}
+
+fn run_fetch_cancellable(mut cmd: Command, deadline: Duration) -> thegn_core::git_run::GitOutcome {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (tx, rx) = mpsc::channel();
+    let worker = match thegn_core::thread_name::try_spawn_named("thegn-mq-fetch", move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
+        let outcome = thegn_core::git_run::run_command(
+            &mut cmd,
+            &thegn_core::git_run::GitPolicy::read(deadline),
+            &worker_cancel,
+        );
+        if let Err(error) = tx.send(outcome) {
+            tracing::debug!(error = %error, "consumer fetch result receiver disconnected");
+        }
+    }) {
+        Ok(worker) => worker,
+        Err(error) => return thegn_core::git_run::GitOutcome::Spawn(error),
+    };
+
+    let mut cancellation_requested = false;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(outcome) => {
+                return match worker.join() {
+                    Ok(()) => outcome,
+                    Err(_) => thegn_core::git_run::GitOutcome::Supervise(
+                        "consumer fetch worker panicked after returning a result".to_string(),
+                    ),
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if !cancellation_requested && crate::fold_cancel::requested() {
+                    cancel.store(true, Ordering::Release);
+                    cancellation_requested = true;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return match worker.join() {
+                    Ok(()) => thegn_core::git_run::GitOutcome::Supervise(
+                        "consumer fetch worker exited without a result".to_string(),
+                    ),
+                    Err(_) => thegn_core::git_run::GitOutcome::Supervise(
+                        "consumer fetch worker panicked before returning a result".to_string(),
+                    ),
+                };
+            }
+        }
     }
 }
 
@@ -1343,6 +1391,78 @@ mod tests {
         );
         assert!(list_refs(&fixture.target).is_empty());
         assert_eq!(std::fs::read_dir(&temp_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_consumer_cancel_kills_a_hung_fetch_promptly() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let fixture = stores("source");
+        let temp_root = fixture._root.path().join("bundle-temp");
+        std::fs::create_dir(&temp_root).unwrap();
+        let (custody, generated) = custody_for_fixture(&fixture, &temp_root);
+        if let Err(error) =
+            install_reference_transaction_hook(&fixture, b"#!/bin/sh\nexec sleep 30\n")
+        {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("install hanging reference-transaction hook: {error}");
+        }
+
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+        let probe = polls.clone();
+        let _scope = crate::fold_cancel::scope(move || {
+            probe.set(probe.get() + 1);
+            probe.get() > 5
+        });
+        let started = Instant::now();
+        let result = fetch_from_custody(
+            &GitLoc::Local(fixture.target.clone()),
+            "feat",
+            custody,
+            &generated,
+            &fixture.oid,
+            Duration::from_secs(60),
+        );
+        let elapsed = started.elapsed();
+        let error = match result {
+            Err(error) => error,
+            Ok(()) => panic!("cancelled consumer unexpectedly succeeded"),
+        };
+        assert!(matches!(
+            error.downcast_ref::<IngestError>(),
+            Some(IngestError::Cancelled)
+        ));
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "cancelled fetch took {elapsed:?}"
+        );
+        assert!(list_refs(&fixture.target).is_empty());
+        assert_eq!(std::fs::read_dir(&temp_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_consumer_cancel_flag_reaches_the_executor() {
+        if thegn_core::util::which_path("sh").is_none() {
+            return;
+        }
+        let _scope = crate::fold_cancel::scope(|| true);
+        let started = Instant::now();
+        let outcome = run_fetch_cancellable(
+            std::process::Command::new("sh").args(["-c", "exec sleep 30"]),
+            Duration::from_secs(60),
+        );
+        assert!(matches!(
+            outcome,
+            thegn_core::git_run::GitOutcome::Cancelled
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancelled executor took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
