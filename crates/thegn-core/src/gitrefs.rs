@@ -343,21 +343,35 @@ pub struct BisectState {
 /// Build bisect state from `git for-each-ref refs/bisect
 /// --format=%(refname:short)%x1f%(objectname)` output, the BISECT_TERMS file
 /// content (`None` → default terms "bad"/"good"), and the current HEAD sha.
+/// Malformed terms, object ids, or ref rows are errors; no partial state is
+/// returned.
 ///
 /// Under refs/bisect the ref names are `<bad-term>`, `<good-term>-<sha>` and
 /// `skip-<sha>` (skip is always "skip", even with custom terms). Depending on
 /// ambiguity `%(refname:short)` may keep a `bisect/` or `refs/bisect/` prefix,
 /// so both are stripped before matching.
-pub fn parse_bisect(refs_out: &str, terms: Option<&str>, head: &str) -> BisectState {
+pub fn parse_bisect(
+    refs_out: &str,
+    terms: Option<&str>,
+    head: &str,
+) -> anyhow::Result<BisectState> {
     // BISECT_TERMS is two lines: the bad term first, the good term second
     // (write_terms() in git's bisect.c writes them in that order).
-    let mut lines = terms.unwrap_or("").lines();
-    let bad_term = lines.next().filter(|t| !t.is_empty()).unwrap_or("bad");
-    let good_term = lines.next().filter(|t| !t.is_empty()).unwrap_or("good");
+    let (bad_term, good_term) = if let Some(terms) = terms {
+        let lines = terms.lines().collect::<Vec<_>>();
+        anyhow::ensure!(
+            lines.len() == 2 && !lines[0].trim().is_empty() && !lines[1].trim().is_empty(),
+            "malformed BISECT_TERMS"
+        );
+        (lines[0].trim().to_owned(), lines[1].trim().to_owned())
+    } else {
+        ("bad".to_owned(), "good".to_owned())
+    };
+    anyhow::ensure!(valid_oid(head), "malformed bisect HEAD");
 
     let mut state = BisectState {
-        bad_term: bad_term.to_string(),
-        good_term: good_term.to_string(),
+        bad_term: bad_term.clone(),
+        good_term: good_term.clone(),
         bad: None,
         good: Vec::new(),
         skipped: Vec::new(),
@@ -365,22 +379,33 @@ pub fn parse_bisect(refs_out: &str, terms: Option<&str>, head: &str) -> BisectSt
         culprit: None,
     };
     let good_prefix = format!("{good_term}-");
-    for line in refs_out.lines() {
+    for (index, line) in refs_out.split_terminator('\n').enumerate() {
+        let row = index + 1;
         let Some((name, sha)) = line.split_once('\u{1f}') else {
-            continue;
+            anyhow::bail!("malformed bisect ref row {row}");
         };
+        anyhow::ensure!(
+            !name.is_empty() && !sha.contains('\u{1f}') && valid_oid(sha),
+            "malformed bisect ref row {row}"
+        );
         let name = name
             .trim_start_matches("refs/")
             .trim_start_matches("bisect/");
         if name == bad_term {
-            state.bad = Some(sha.to_string());
+            anyhow::ensure!(
+                state.bad.is_none(),
+                "duplicate bisect bad mark on row {row}"
+            );
+            state.bad = Some(sha.to_owned());
         } else if name.strip_prefix("skip-").is_some() {
-            state.skipped.push(sha.to_string());
+            state.skipped.push(sha.to_owned());
         } else if name.strip_prefix(good_prefix.as_str()).is_some() {
-            state.good.push(sha.to_string());
+            state.good.push(sha.to_owned());
+        } else {
+            anyhow::bail!("unknown bisect ref on row {row}");
         }
     }
-    state
+    Ok(state)
 }
 
 /// Scan bisect command stdout for the culprit line, anchored to the start of a
@@ -760,47 +785,95 @@ mod tests {
 
     #[test]
     fn bisect_default_terms_with_marks() {
+        let bad = "b".repeat(40);
+        let good_one = "1".repeat(40);
+        let good_two = "2".repeat(40);
+        let skipped = "3".repeat(40);
+        let head = "f".repeat(40);
         let refs = format!(
-            "bad{US}B\ngood-{}{US}G1\ngood-{}{US}G2\nskip-{}{US}S1",
-            "1".repeat(40),
-            "2".repeat(40),
-            "3".repeat(40),
+            "bad{US}{bad}\ngood-{good_one}{US}{good_one}\ngood-{good_two}{US}{good_two}\nskip-{skipped}{US}{skipped}",
         );
-        let st = parse_bisect(&refs, None, "HEADSHA");
+        let st = parse_bisect(&refs, None, &head).unwrap();
         assert_eq!(st.bad_term, "bad");
         assert_eq!(st.good_term, "good");
-        assert_eq!(st.bad.as_deref(), Some("B"));
-        assert_eq!(st.good, vec!["G1", "G2"]);
-        assert_eq!(st.skipped, vec!["S1"]);
-        assert_eq!(st.current, "HEADSHA");
+        assert_eq!(st.bad.as_deref(), Some(bad.as_str()));
+        assert_eq!(st.good, vec![good_one, good_two]);
+        assert_eq!(st.skipped, vec![skipped]);
+        assert_eq!(st.current, head);
         assert_eq!(st.culprit, None);
     }
 
     #[test]
     fn bisect_custom_terms() {
         // BISECT_TERMS: bad term on line 1, good term on line 2.
-        let refs = format!("broken{US}B\nfixed-aaa{US}G\nskip-bbb{US}S");
-        let st = parse_bisect(&refs, Some("broken\nfixed\n"), "H");
+        let bad = "b".repeat(40);
+        let good = "1".repeat(40);
+        let skipped = "2".repeat(40);
+        let head = "f".repeat(40);
+        let refs = format!("broken{US}{bad}\nfixed-{good}{US}{good}\nskip-{skipped}{US}{skipped}");
+        let st = parse_bisect(&refs, Some("broken\nfixed\n"), &head).unwrap();
         assert_eq!(
             (st.bad_term.as_str(), st.good_term.as_str()),
             ("broken", "fixed")
         );
-        assert_eq!(st.bad.as_deref(), Some("B"));
-        assert_eq!(st.good, vec!["G"]);
-        assert_eq!(st.skipped, vec!["S"]);
+        assert_eq!(st.bad.as_deref(), Some(bad.as_str()));
+        assert_eq!(st.good, vec![good]);
+        assert_eq!(st.skipped, vec![skipped]);
     }
 
     #[test]
     fn bisect_nothing_marked_and_prefixed_refnames() {
-        let st = parse_bisect("", None, "H");
+        let head = "f".repeat(40);
+        let bad = "b".repeat(40);
+        let good = "1".repeat(40);
+        let st = parse_bisect("", None, &head).unwrap();
         assert_eq!(st.bad, None);
         assert!(st.good.is_empty() && st.skipped.is_empty());
-        // refname:short may keep a bisect/ or refs/bisect/ prefix; an
-        // unrelated name and a separator-less line are ignored.
-        let refs = format!("bisect/bad{US}B\nrefs/bisect/good-x{US}G\nother{US}X\nnoseparator");
-        let st = parse_bisect(&refs, Some(""), "H");
-        assert_eq!(st.bad.as_deref(), Some("B"));
-        assert_eq!(st.good, vec!["G"]);
+        // refname:short may keep a bisect/ or refs/bisect/ prefix.
+        let refs = format!("bisect/bad{US}{bad}\nrefs/bisect/good-{good}{US}{good}");
+        let st = parse_bisect(&refs, None, &head).unwrap();
+        assert_eq!(st.bad.as_deref(), Some(bad.as_str()));
+        assert_eq!(st.good, vec![good]);
+    }
+
+    #[test]
+    fn bisect_rows_are_all_or_error() {
+        let sha = "a".repeat(40);
+        let other_sha = "b".repeat(40);
+        let head = "f".repeat(40);
+        let cases = [
+            ("separator-less row", "bad".to_owned()),
+            ("two separators", format!("bad{US}{sha}{US}{other_sha}")),
+            ("empty name", format!("{US}{sha}")),
+            ("short object id", format!("bad{US}abc")),
+            ("unknown ref", format!("other{US}{sha}")),
+            (
+                "duplicate bad mark",
+                format!("bad{US}{sha}\nbad{US}{other_sha}"),
+            ),
+        ];
+        for (case, refs) in cases {
+            assert!(parse_bisect(&refs, None, &head).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn bisect_terms_and_head_are_validated() {
+        let head = "f".repeat(40);
+        for (case, terms) in [
+            ("empty terms", ""),
+            ("one term", "broken\n"),
+            ("three terms", "a\nb\nc\n"),
+            ("blank bad term", " \nfixed\n"),
+            ("blank good term", "broken\n \n"),
+        ] {
+            assert!(parse_bisect("", Some(terms), &head).is_err(), "{case}");
+        }
+        assert!(parse_bisect("", None, "H").is_err(), "invalid HEAD");
+
+        let st = parse_bisect("", Some("broken\nfixed\n"), &head).unwrap();
+        assert_eq!(st.bad_term, "broken");
+        assert_eq!(st.good_term, "fixed");
     }
 
     #[test]
