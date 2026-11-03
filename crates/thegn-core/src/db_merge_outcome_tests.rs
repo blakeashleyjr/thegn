@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::MergeOutcomeOperation;
 use crate::store::WorkspaceStore;
 
 const WORKTREE: &str = "/private/repo/feature";
@@ -12,6 +13,7 @@ fn outcome(status: MergeFinalStatus) -> MergeFinalOutcome<'static> {
         target_branch: "main",
         location: "",
         status,
+        operation: MergeOutcomeOperation::Land,
         result_oid: (status == MergeFinalStatus::Landed).then_some("verified-commit"),
         conflict_paths: None,
         error_detail: None,
@@ -452,4 +454,138 @@ fn concurrent_distinct_finalizers_do_not_overwrite_the_winner() {
             "gate_error"
         }
     );
+}
+
+#[test]
+fn queue_aware_land_records_one_transition_event() {
+    let db = Db::open_memory().unwrap();
+    registered(&db);
+    db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+    db.update_merge_status(WORKTREE, "ready", None, None, None)
+        .unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+
+    assert_eq!(
+        db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+            .unwrap(),
+        MergeOutcomeWrite::Written
+    );
+    let events = db.merge_queue_events(WORKTREE, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.operation, "land");
+    assert_eq!(event.outcome, "transition");
+    assert_eq!(event.old_status, "ready");
+    assert_eq!(event.new_status.as_deref(), Some("landed"));
+    assert_eq!(event.result_oid.as_deref(), Some("verified-commit"));
+    assert!(event.actor.starts_with("thegn pid "));
+}
+
+#[test]
+fn raw_land_of_an_unqueued_worktree_records_a_created_event() {
+    let db = Db::open_memory().unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    let mut final_outcome = outcome(MergeFinalStatus::Landed);
+    final_outcome.operation = MergeOutcomeOperation::RawLand;
+
+    assert_eq!(
+        db.persist_merge_outcome(&observed, &final_outcome).unwrap(),
+        MergeOutcomeWrite::Written
+    );
+    let events = db.merge_queue_events(WORKTREE, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operation, "raw_land");
+    assert_eq!(events[0].outcome, "created");
+    assert_eq!(events[0].old_status, "");
+    assert_eq!(events[0].new_status.as_deref(), Some("landed"));
+}
+
+#[test]
+fn repeated_land_records_no_second_event() {
+    let db = Db::open_memory().unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+        .unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+        .unwrap();
+
+    assert_eq!(db.merge_queue_events(WORKTREE, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn integrate_same_status_records_no_event() {
+    let db = Db::open_memory().unwrap();
+    let mut final_outcome = outcome(MergeFinalStatus::Deferred);
+    final_outcome.operation = MergeOutcomeOperation::Integrate;
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.persist_merge_outcome(&observed, &final_outcome).unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.persist_merge_outcome(&observed, &final_outcome).unwrap();
+
+    let events = db.merge_queue_events(WORKTREE, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operation, "integrate");
+    assert_eq!(events[0].outcome, "created");
+}
+
+#[test]
+fn claimed_or_changed_outcome_records_no_event() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.update_merge_status(WORKTREE, "ready", None, None, None)
+        .unwrap();
+
+    assert_eq!(
+        db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+            .unwrap(),
+        MergeOutcomeWrite::QueueChanged
+    );
+    assert!(db.merge_queue_events(WORKTREE, 10).unwrap().is_empty());
+
+    let fresh_observation = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.persist_merge_outcome(&fresh_observation, &outcome(MergeFinalStatus::Landed))
+        .unwrap();
+    let events = db.merge_queue_events(WORKTREE, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].old_status, "ready");
+}
+
+#[test]
+fn event_failure_rolls_back_the_outcome() {
+    let db = Db::open_memory().unwrap();
+    db.enqueue_merge(WORKTREE, "feature", "main").unwrap();
+    db.update_merge_status(WORKTREE, "ready", None, None, None)
+        .unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_event BEFORE INSERT ON merge_queue_events \
+             BEGIN SELECT RAISE(ABORT, 'event refused'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+            .is_err()
+    );
+    assert_eq!(row(&db).status, "ready");
+    assert!(db.conn().is_autocommit());
+}
+
+#[test]
+fn compat_schema_without_event_column_still_writes_the_outcome() {
+    let db = Db::open_memory().unwrap();
+    db.conn()
+        .execute_batch("ALTER TABLE merge_queue_events DROP COLUMN target_base_oid")
+        .unwrap();
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+
+    assert_eq!(
+        db.persist_merge_outcome(&observed, &outcome(MergeFinalStatus::Landed))
+            .unwrap(),
+        MergeOutcomeWrite::Written
+    );
+    assert_eq!(row(&db).status, "landed");
 }
