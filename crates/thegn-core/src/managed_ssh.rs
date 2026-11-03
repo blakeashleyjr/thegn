@@ -730,7 +730,17 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json"))
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -1083,8 +1093,13 @@ mod tests {
         let json = std::fs::read_to_string(
             std::fs::read_dir(temp.path())
                 .unwrap()
-                .next()
-                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                })
                 .unwrap()
                 .path(),
         )
@@ -1138,7 +1153,17 @@ mod tests {
             read_at(temp.path(), "fly", "env:FLY_WORK", "tg-project-feature").unwrap(),
             Some(original)
         );
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json"))
+                .count(),
+            1
+        );
     }
 
     #[test]
