@@ -77,9 +77,14 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
 
 ## 6. jj coexistence (thegn-host)
 
-- [ ] 6.1 `.jj/` detection cached alongside the glyph scan (no subprocess);
+- [x] 6.1 `.jj/` detection cached alongside the glyph scan (no subprocess);
       sidebar badge glyph via `caps::active_glyphs()` + a
       `[ui] sidebar_show_*` toggle.
+      Evidence: `jj::is_colocated` runs on the hydration thread's glyph scan
+      (`hydrate.rs::collect_sidebar_status`); `glyph_refresh.rs` memoizes the
+      bit per repo root for loop-side seeding. The marker uses
+      `caps::active_glyphs().jj` and `[ui] sidebar_show_jj` (`config_ui.rs`);
+      `sidebar_view::tests::jj_marker_is_caps_routed_and_toggleable` pins it.
 - [x] 6.2 Staging/commit surfaces show a colocated-repo notice; detached HEAD
       in a colocated repo renders as the working copy, not an error state.
 - [x] 6.3 `auto_fetch` skips colocated repos unless `auto_fetch_colocated`;
@@ -88,18 +93,28 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
 
 ## 7. Structural diff (thegn-core + thegn-host)
 
-- [ ] 7.1 Pure SGR-subset → styled-cell-run parser in `thegn-core` (new
+- [x] 7.1 Pure SGR-subset → styled-cell-run parser in `thegn-core` (new
       module; substrate-free; fixture-driven tests from recorded difft
       output; unknown escapes stripped). 95% gate applies.
-- [ ] 7.2 `difft` as a managed tool (`Source::GithubRelease`, pinned,
+      Evidence: `thegn_core::ansi_cells` (`crates/thegn-core/src/ansi_cells.rs`
+      and its tests).
+- [x] 7.2 `difft` as a managed tool (`Source::GithubRelease`, pinned,
       `path_fallbacks: ["difft"]`) registered in host `known()`; Probe in
       doctor.
-- [ ] 7.3 DiffView modal structural route: off-loop subprocess with width /
+      Evidence: `difft` is registered in host `known()` (`managed_tool.rs`)
+      and resolves from `[managed_tools.difft] path` then PATH; managed
+      downloads are dropped until reviewed SHA-256 pins exist (THE-182 owner
+      default).
+- [x] 7.3 DiffView modal structural route: off-loop subprocess with width /
       `--color always` / `--background` from theme / byte+graph limits /
       timeout; fallback to internal unified with a notice on any failure.
       Toggle key + new action id.
-- [ ] 7.4 `thegn diff --structural` (flag on the existing verb; catalog row
+      Evidence: `actions.rs` structural route and `diff_view.rs`; the toggle
+      is the diff modal's local `t` key, with no global action id because it
+      only has meaning inside the modal.
+- [x] 7.4 `thegn diff --structural` (flag on the existing verb; catalog row
       unchanged).
+      Evidence: `cmd/diff.rs` `--structural` flag.
 - [x] 7.5 Guard test: stageable-diff call sites still pin `SANITIZED_DIFF`
       (`--no-ext-diff`) regardless of `structural_diff`.
 

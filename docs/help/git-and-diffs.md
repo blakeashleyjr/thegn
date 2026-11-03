@@ -187,7 +187,8 @@ folds refuse to run.
 
 In a repo colocated with [jujutsu](https://jj-vcs.github.io/) (a `.jj/`
 beside `.git/`), thegn stays out of the way rather than fighting it:
-worktree rows carry a jj marker, detached `HEAD` (jj's normal state) is
+worktree rows carry a jj marker (`ĵ`, or `j` on an ASCII terminal; hide it
+with `[ui] sidebar_show_jj = false`), detached `HEAD` (jj's normal state) is
 not shown as an error, and the panel header reads `HEAD (jj working copy)`.
 The Full git view shows a `jj: git index ignored` chip, and the Changes section
 ends with "jj colocated: staging here does not change jj's working copy."
@@ -195,6 +196,9 @@ Successful staging and commit actions add a status-line note that jj ignores
 the git index, and background `auto_fetch` skips the repo unless
 `[git] auto_fetch_colocated = true`. Reads are unchanged; mutations are
 warned about, not blocked.
+Thegn still talks only to git: it is not a jujutsu client. There is no jj
+backend, it runs no `jj` commands, and native jj parity (changes, operations,
+revsets) is out of scope.
 
 ## Syncing
 
