@@ -3641,8 +3641,9 @@ impl Drop for ProvisionedSandbox {
 /// rejected the request (e.g. a bad/expired token → 401); the caller decides
 /// whether that halts (failover off) or just warns (failover on). Returns a
 /// rollback guard only when this call created the sandbox; pre-existing
-/// sandboxes have their egress policy verified before return, and no-op paths
-/// return `None`.
+/// sandboxes and no-op paths return `None`. A pre-existing sandbox's egress
+/// policy is verified, and re-applied on drift, before return; an unverifiable
+/// one is an error (never destroyed).
 fn auto_provision_sandbox(
     cfg: &Config,
     env_name: &str,
