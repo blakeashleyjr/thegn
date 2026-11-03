@@ -15,7 +15,7 @@ use crate::store::{
     MergeQueueEvent, MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields, WorktreeAuxStore,
 };
 use crate::util;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::hash::BuildHasher;
@@ -614,7 +614,9 @@ impl WorktreeAuxStore for Db {
                provider=excluded.provider,
                public_url=excluded.public_url,
                state=excluded.state,
-               generation=excluded.generation",
+               generation=excluded.generation,
+               owner_pid=CASE WHEN shares.generation=excluded.generation THEN shares.owner_pid ELSE NULL END,
+               owner_start_ticks=CASE WHEN shares.generation=excluded.generation THEN shares.owner_start_ticks ELSE NULL END",
             params![
                 worktree,
                 local_port as i64,
@@ -631,7 +633,7 @@ impl WorktreeAuxStore for Db {
     /// All persisted shares, newest first (restore + panel listing).
     fn list_shares(&self) -> Result<Vec<ShareRow>> {
         let mut stmt = self.conn().prepare(
-            "SELECT worktree,local_port,provider,public_url,state,created_at,generation \
+            "SELECT worktree,local_port,provider,public_url,state,created_at,generation,owner_pid,owner_start_ticks \
              FROM shares ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -661,7 +663,7 @@ impl WorktreeAuxStore for Db {
         to: u64,
     ) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE shares SET generation=?4 WHERE worktree=?1 AND local_port=?2 AND generation=?3",
+            "UPDATE shares SET generation=?4, owner_pid=NULL, owner_start_ticks=NULL WHERE worktree=?1 AND local_port=?2 AND generation=?3",
             params![
                 worktree,
                 local_port as i64,
@@ -679,6 +681,22 @@ impl WorktreeAuxStore for Db {
             params![worktree, local_port as i64],
         )?;
         Ok(())
+    }
+
+    fn set_share_owner(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        generation: u64,
+        owner: crate::models::ShareOwner,
+    ) -> Result<bool> {
+        let start_ticks =
+            i64::try_from(owner.start_ticks).context("share owner start time out of range")?;
+        let changed = self.conn().execute(
+            "UPDATE shares SET owner_pid=?4, owner_start_ticks=?5 WHERE worktree=?1 AND local_port=?2 AND generation=?3",
+            params![worktree, local_port as i64, encode_share_generation(generation), i64::from(owner.pid), start_ticks],
+        )?;
+        Ok(changed > 0)
     }
 
     // --- auto port forwards (`[forward]`; resurrection layer) --------------
