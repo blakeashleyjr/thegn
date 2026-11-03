@@ -155,13 +155,29 @@ fn prompt_file_dir(
     let git_dir = thegn_core::git_memo::git_dir(worktree).ok_or_else(|| {
         "{prompt_file}: the worktree has no git dir to hold the prompt file".to_string()
     })?;
-    thegn_core::fsperm::ensure_private_dir_beneath(&git_dir, std::path::Path::new("thegn-task"))
-        .map_err(|error| {
-            format!(
-                "{{prompt_file}}: {}: {error}",
-                git_dir.join("thegn-task").display()
-            )
-        })
+    let directory = thegn_core::fsperm::ensure_private_dir_beneath(
+        &git_dir,
+        std::path::Path::new("thegn-task"),
+    )
+    .map_err(|error| {
+        format!(
+            "{{prompt_file}}: {}: {error}",
+            git_dir.join("thegn-task").display()
+        )
+    })?;
+    let removed = sweep_stale_prompt_files(
+        &directory,
+        std::time::SystemTime::now(),
+        bounded::MAX_TIMEOUT,
+    );
+    if removed > 0 {
+        tracing::info!(
+            target: "thegn::agent",
+            removed,
+            "removed stale prompt files left by an interrupted run"
+        );
+    }
+    Ok(directory)
 }
 
 #[cfg(unix)]
@@ -185,6 +201,61 @@ impl Drop for PromptFile {
             tracing::debug!(%error, "unable to remove prompt file");
         }
     }
+}
+
+/// Sweep crash-left prompt files older than `bounded::MAX_TIMEOUT`, the longest
+/// permitted agent deadline. Only regular `prompt-*` files are touched; links
+/// and other names are left alone. This runs in the agent worker, off the UI loop.
+#[cfg(unix)]
+fn sweep_stale_prompt_files(
+    directory: &thegn_core::fsperm::PrivateDir,
+    now: std::time::SystemTime,
+    max_age: std::time::Duration,
+) -> usize {
+    let names = match directory.file_names() {
+        Ok(names) => names,
+        Err(error) => {
+            // best-effort: a listing failure must not block an agent dispatch.
+            tracing::debug!(
+                target: "thegn::agent",
+                %error,
+                "unable to list prompt files for stale-file sweep"
+            );
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in names {
+        let Some(name) = entry.to_str() else {
+            continue;
+        };
+        if !name.starts_with("prompt-") {
+            continue;
+        }
+        let result = (|| {
+            let file = directory.open_regular_nofollow(name)?;
+            let modified = file.metadata()?.modified()?;
+            if now.duration_since(modified).is_ok_and(|age| age >= max_age) {
+                directory.remove_file(name)
+            } else {
+                Ok(false)
+            }
+        })();
+        match result {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(error) => {
+                // best-effort: an invalid or changing entry must not block dispatch.
+                tracing::debug!(
+                    target: "thegn::agent",
+                    name,
+                    %error,
+                    "unable to inspect stale prompt-file candidate"
+                );
+            }
+        }
+    }
+    removed
 }
 
 #[cfg(unix)]
@@ -934,7 +1005,7 @@ pub(crate) mod bounded {
     /// agent run would hold a queue claim forever.
     pub(crate) const AGENT_CEILING: Duration = Duration::from_secs(6 * 60 * 60);
     /// No configured deadline may exceed this (also keeps `Instant` math safe).
-    const MAX_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+    pub(crate) const MAX_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
     /// After the leader exits, how long the rest of its group may keep running.
     pub(crate) const QUIESCE_AFTER_LEADER: Duration = Duration::from_secs(15);
     const TERM_GRACE: Duration = Duration::from_secs(2);
@@ -2157,6 +2228,120 @@ mod tests {
         drop(file);
         assert_eq!(std::fs::read_dir(&moved_path).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_sweep_removes_an_aged_prompt_file_on_next_prepare() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let directory = prompt_file_dir(worktree.path().to_str().unwrap(), None).unwrap();
+        let (name, path) = directory.create_owner_only_temp(b"OLD-PROMPT").unwrap();
+        assert!(name.starts_with("prompt-"));
+        drop(directory);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60))
+            .unwrap();
+
+        let _directory = prompt_file_dir(worktree.path().to_str().unwrap(), None).unwrap();
+        assert!(
+            !path.exists(),
+            "stale prompt file should be removed on prepare"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_sweep_keeps_fresh_files_symlinks_and_other_names() {
+        use std::os::unix::fs::symlink;
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let directory = prompt_file_dir(worktree.path().to_str().unwrap(), None).unwrap();
+        let (fresh_name, fresh_path) = directory.create_owner_only_temp(b"FRESH").unwrap();
+        let notes_path = directory.path().join("notes.txt");
+        std::fs::write(&notes_path, b"KEEP").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&notes_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60))
+            .unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.txt");
+        std::fs::write(&target_path, b"TARGET").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60))
+            .unwrap();
+        let link_path = directory.path().join("prompt-link");
+        symlink(&target_path, &link_path).unwrap();
+
+        let now = std::time::SystemTime::now();
+        assert_eq!(
+            sweep_stale_prompt_files(&directory, now, bounded::MAX_TIMEOUT),
+            0
+        );
+        assert!(fresh_path.exists());
+        assert!(notes_path.exists());
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"TARGET");
+
+        let future = now + bounded::MAX_TIMEOUT + std::time::Duration::from_secs(60);
+        assert_eq!(
+            sweep_stale_prompt_files(&directory, future, bounded::MAX_TIMEOUT),
+            1
+        );
+        assert!(
+            !fresh_path.exists(),
+            "only the aged prompt-* file is removed"
+        );
+        assert!(directory.path().join("notes.txt").exists());
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"TARGET");
+        assert!(fresh_name.starts_with("prompt-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_sweep_bound_is_the_agent_deadline_ceiling() {
+        let max_age = bounded::MAX_TIMEOUT;
+        assert_eq!(max_age, std::time::Duration::from_secs(30 * 24 * 60 * 60));
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let directory = prompt_file_dir(worktree.path().to_str().unwrap(), None).unwrap();
+        let (name, path) = directory.create_owner_only_temp(b"BOUNDARY").unwrap();
+        assert!(name.starts_with("prompt-"));
+        let now =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100 * 24 * 60 * 60);
+        let modified = now - (max_age - std::time::Duration::from_secs(1));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+
+        assert_eq!(sweep_stale_prompt_files(&directory, now, max_age), 0);
+        assert!(
+            path.exists(),
+            "one second under the bound is a positive control"
+        );
     }
 
     #[cfg(unix)]
