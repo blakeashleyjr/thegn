@@ -323,6 +323,7 @@ ratchet-update:
     RATCHET_UPDATE=1 bash test/ratchet.sh i18n-literal 'jump|type to filter|matches|dismiss|offline|VIM NORMAL|VIM INSERT|NORMAL|EMACS|LOC|New terminal|New folder|Move to folder' crates/thegn-host/src/chrome.rs crates/thegn-host/src/statusbar_left.rs crates/thegn-host/src/statusbar_badges.rs crates/thegn-host/src/run.rs crates/thegn-host/src/handlers/status_line.rs crates/thegn-host/src/palette.rs crates/thegn-host/src/keymap_specs.rs
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core surface_gaps_ratchet_update -- --ignored
+    python3 -B test/dup_crates_guard.py --update
 
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
 # timings are machine-dependent. Three numbers: process/clap baseline; cold
@@ -759,6 +760,10 @@ ratchets:
     # adoption funnels through the one `adopt_window_size!` site.
     bash test/winsize-guard.sh --self-test
     bash test/winsize-guard.sh
+    # Dependency hygiene: no net-new duplicate crate versions in Cargo.lock (THE-196;
+    # baseline test/dup-crates-ratchet.txt, shrink-only).
+    python3 -B test/dup_crates_guard.py --self-test
+    python3 -B test/dup_crates_guard.py
 
 # The complete ratchet contract. Unlike `ratchets`, this also executes the
 # Rust-side platform/host-key/surface/completion/help checks and therefore
