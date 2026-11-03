@@ -2345,4 +2345,98 @@ mod tests {
             TeardownWrite::Failed(std::io::ErrorKind::BrokenPipe)
         );
     }
+
+    #[test]
+    fn repeated_sync_timeouts_leave_no_writer_worker_behind() {
+        let (alive_tx, alive_rx) = std::sync::mpsc::channel::<()>();
+        let mut logs = Vec::with_capacity(8);
+
+        for _ in 0..8 {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let sink_log = Arc::clone(&log);
+            let alive = alive_tx.clone();
+            let writer = FrameWriter::spawn_with(
+                true,
+                true,
+                |_| {},
+                move |bytes| {
+                    let _alive = &alive;
+                    release_rx.recv().unwrap();
+                    sink_log.lock().unwrap().push(bytes.to_vec());
+                    Ok(())
+                },
+            );
+
+            let started = Instant::now();
+            assert!(writer.submit_frame(vec![1], None));
+            assert!(started.elapsed() < SYNC_WRITE_BOUND + std::time::Duration::from_millis(150));
+            assert!(matches!(writer.take_status(), WriterStatus::Fatal(_)));
+
+            for _ in 0..16 {
+                assert!(!writer.submit_frame(vec![2], None));
+                assert_eq!(writer.try_submit_oob(vec![3]), Err(vec![3]));
+                assert_eq!(writer.try_submit_clipboard(vec![4], || {}), Err(vec![4]));
+            }
+
+            release_tx.send(()).unwrap();
+            drop(writer);
+            logs.push(log);
+        }
+
+        drop(alive_tx);
+        assert_eq!(
+            alive_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "a writer worker outlived its writer"
+        );
+        for log in logs {
+            assert!(log.lock().unwrap().len() <= 1);
+            assert!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .all(|bytes| bytes.as_slice() == &[1u8])
+            );
+        }
+    }
+
+    #[test]
+    fn sync_writer_drop_during_a_blocked_write_is_bounded_and_writes_nothing_later() {
+        let (alive_tx, alive_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let alive = alive_tx.clone();
+        let writer = FrameWriter::spawn_with(
+            true,
+            true,
+            |_| {},
+            move |bytes| {
+                let _alive = &alive;
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                sink_log.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            },
+        );
+
+        assert!(writer.submit_frame(vec![1], None));
+        started_rx
+            .recv_timeout(SYNC_WRITE_BOUND + std::time::Duration::from_secs(1))
+            .unwrap();
+        let dropping = Instant::now();
+        drop(writer);
+        assert!(dropping.elapsed() < WRITER_SHUTDOWN_BOUND + std::time::Duration::from_millis(100));
+
+        release_tx.send(()).unwrap();
+        drop(alive_tx);
+        assert_eq!(
+            alive_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "a writer worker outlived its writer"
+        );
+        assert_eq!(*log.lock().unwrap(), vec![vec![1]]);
+    }
 }
