@@ -608,8 +608,11 @@ pub(crate) fn remove_landed_with_config(
             };
         }
     };
-    if live_merge_claim(claim.as_ref(), thegn_core::util::now_ms()) {
-        let view = claim.expect("live claim must have a view");
+    let now = thegn_core::util::now_ms();
+    if let Some(view) = claim
+        .as_ref()
+        .filter(|view| live_merge_claim(Some(*view), now))
+    {
         return CleanupOutcome::Refused {
             class: CleanupRefusal::MergeClaimed,
             reason: format!(
@@ -1014,7 +1017,6 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use thegn_core::config::OnLanded;
-    use thegn_core::store::WorktreeAuxStore;
     use thegn_core::util;
 
     #[test]
