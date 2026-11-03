@@ -2897,6 +2897,14 @@ fn attempt_land_admitted(
     let ingested = match crate::merge_remote::ingest_tip(&loc, branch_name, branch_loc) {
         Ok(r) => r,
         Err(e) => {
+            if crate::fold_cancel::requested() {
+                return Ok(AttemptOutcome::GateError {
+                    reason: "integration cancelled".into(),
+                    log: String::new(),
+                    phase: GatePhase::Preparation,
+                    class: GateErrorClass::Cancelled,
+                });
+            }
             return Ok(AttemptOutcome::Unreachable {
                 detail: format!("{e:#}"),
             });
