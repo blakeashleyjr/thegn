@@ -34,6 +34,8 @@ All notable changes to **thegn** are documented here. The format follows
 - A CalDAV changes-only reply without a sync token falls back to a full fetch.
 - `thegn mcp secret set` and `rm` update the keyring and MCP secret index
   under one lock; a corrupt index is refused before the keyring is touched.
+- A sandbox events watcher killed during shutdown is waited on even if the
+  child reaper is full or unavailable, avoiding a zombie process.
 - A failed share restart deletes its own saved share row, so it does not
   return as a stale share on the next start.
 - (dev channel) Filesystem snapshot publication refuses to overwrite an
@@ -47,8 +49,9 @@ All notable changes to **thegn** are documented here. The format follows
 - Pipeline handoff files are read without following symlinks and must be
   bounded valid text: at most 1 MiB and 8,192 lines, without NUL, invalid
   UTF-8, terminal controls or bidi overrides.
-- `session open --resume-work` refuses a parent that is missing, belongs to
-  another issue, or is failed, abandoned or unknown.
+- `session open --resume-work` refuses any parent other than the row being
+  resumed when that parent is missing, belongs to another issue, or is failed,
+  abandoned or unknown.
 - CI autofix re-checks the worktree HEAD just before starting its agent; a
   moved or unreadable HEAD prevents the start and holds the row as
   `needs_human`. A successful attempt refund is reported as no attempt spent.
