@@ -960,6 +960,8 @@ class WorkflowPolicyTests(unittest.TestCase):
     def _sandbox_cas_stubs(self, temporary_path: Path) -> tuple[Path, dict[str, str]]:
         stub_dir = temporary_path / "bin"
         stub_dir.mkdir()
+        scratch_dir = temporary_path / "scratch"
+        scratch_dir.mkdir()
         (stub_dir / "skopeo").write_text(
             "#!/bin/sh\n"
             'case "$*" in\n'
@@ -1000,6 +1002,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                 "IMAGE": "img",
                 "TAG": "v1",
                 "HOME": str(temporary_path),
+                "TMPDIR": str(scratch_dir),
                 "GITHUB_OUTPUT": str(temporary_path / "github-output"),
                 "REGISTRY_TOKEN": "x",
                 "ACTOR": "a",
@@ -1060,7 +1063,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                 environment = base_environment.copy()
                 if changes:
                     environment.update(changes)
-                return subprocess.run(
+                result = subprocess.run(
                     ["bash", "-c", script],
                     env=environment,
                     check=False,
@@ -1068,6 +1071,12 @@ class WorkflowPolicyTests(unittest.TestCase):
                     text=True,
                     cwd=temporary_path,
                 )
+                leftovers = list((temporary_path / "scratch").iterdir())
+                self.assertEqual(
+                    [], leftovers,
+                    f"sandbox tag inspection left temporary files: {leftovers}; {details(result)}",
+                )
+                return result
 
             def details(result: subprocess.CompletedProcess[str]) -> str:
                 return f"returncode={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
