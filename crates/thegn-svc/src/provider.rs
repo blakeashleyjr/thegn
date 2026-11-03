@@ -31,9 +31,14 @@ use thegn_core::remote::SshTarget;
 /// Redirects are rejected so authenticated requests cannot be replayed to
 /// another host.
 pub(crate) fn provider_http_client() -> reqwest::Client {
+    provider_http_client_with_deadline(CONTROL_TIMEOUT)
+}
+
+/// Same policy with an injectable total deadline; tests use a short one.
+fn provider_http_client_with_deadline(total: std::time::Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(CONTROL_TIMEOUT)
+        .timeout(total)
         // Reap idle keep-alive sockets so a half-open connection to a sprite that
         // was suspended/rotated doesn't get reused into a silent stall.
         .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -84,6 +89,14 @@ async fn response_bytes(
     operation: &str,
     limit: usize,
 ) -> Result<Vec<u8>> {
+    if let Some(declared) = response.content_length()
+        && declared > limit as u64
+    {
+        anyhow::bail!(
+            "{provider}: {operation} response exceeded the {limit}-byte body limit (declared {declared} bytes)"
+        );
+    }
+
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -5513,6 +5526,172 @@ mod tests {
             serde_json::Value::Null
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_client_deadline_bounds_delayed_response_headers() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            release_rx.await.unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let result = provider_http_client_with_deadline(std::time::Duration::from_millis(300))
+            .get(format!("http://{address}/"))
+            .send()
+            .await;
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the client must time out while waiting for response headers"),
+        };
+        assert!(
+            redacted_transport_error("test", "GET", &error)
+                .to_string()
+                .contains("timed out")
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn control_client_deadline_bounds_a_slow_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, mut release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..64 {
+                tokio::select! {
+                    result = &mut release_rx => {
+                        result.unwrap();
+                        return;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        if socket.write_all(b"x").await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            release_rx.await.unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let response = provider_http_client_with_deadline(std::time::Duration::from_millis(300))
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let result = response_json(response, "test", "GET").await;
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("test: GET provider endpoint"));
+        assert!(error.contains("timed out") || error.contains("response body failed"));
+        assert!(elapsed < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn control_client_returns_a_redirect_without_following_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            release_rx.await.unwrap();
+        });
+
+        // Redirects are already disabled by the production client policy; this is a positive control.
+        let response = provider_http_client()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), target.accept())
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_reader_refuses_a_declared_oversized_body_before_reading_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                CONTROL_BODY_LIMIT + 1
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            release_rx.await.unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let response = provider_http_client()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            response_json(response, "test", "GET"),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+
+        let error = result
+            .expect("a declared oversized body must be refused without waiting for bytes")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("response exceeded the"));
+        assert!(error.contains("declared"));
+        assert!(elapsed < std::time::Duration::from_secs(5));
     }
 
     #[tokio::test]
