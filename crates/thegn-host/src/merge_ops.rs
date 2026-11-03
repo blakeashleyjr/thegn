@@ -17,7 +17,8 @@ use thegn_core::models::WorktreeRow;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{
     MergeCandidate, MergeClaimView, MergeEnqueueIdentity, MergeFinalOutcome, MergeFinalStatus,
-    MergeOutcomeObservation, MergeOutcomeWrite, WorkspaceStore, WorktreeAuxStore,
+    MergeOutcomeObservation, MergeOutcomeOperation, MergeOutcomeWrite, WorkspaceStore,
+    WorktreeAuxStore,
 };
 #[cfg(test)]
 use thegn_core::store::{MergeClaimRequest, MergeStatusFields};
@@ -425,6 +426,7 @@ pub(crate) fn record_ready_land(
         target_branch: record.target_branch,
         location: "",
         status: MergeFinalStatus::Landed,
+        operation: MergeOutcomeOperation::Land,
         result_oid: Some(record.result_oid),
         conflict_paths: None,
         error_detail: record.up_to_date.then_some("already merged"),

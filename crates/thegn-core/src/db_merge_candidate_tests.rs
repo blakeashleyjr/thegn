@@ -364,6 +364,7 @@ fn outcome_retry_and_claim_preserve_the_pair() {
                 target_branch: "main",
                 location: "",
                 status: MergeFinalStatus::Deferred,
+                operation: crate::store::MergeOutcomeOperation::Integrate,
                 result_oid: None,
                 conflict_paths: None,
                 error_detail: Some("retry me"),

@@ -12,8 +12,8 @@ use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::store::{
-    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    WorktreeAuxStore,
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeOperation,
+    MergeOutcomeWrite, WorktreeAuxStore,
 };
 
 pub(super) struct OutcomeObservations(HashMap<String, MergeOutcomeObservation>);
@@ -246,6 +246,7 @@ pub(super) fn persist(
             // A local fold must never manufacture remote placement authority.
             location: "",
             status: row.status,
+            operation: MergeOutcomeOperation::Integrate,
             result_oid: row.result_oid.as_deref(),
             conflict_paths: row.conflict_paths.as_deref(),
             error_detail: row.error_detail.as_deref(),
