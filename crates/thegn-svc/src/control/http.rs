@@ -1288,7 +1288,7 @@ pub(super) async fn issues_list(
         ..Default::default()
     };
     match state.api.issues_list(&filter, q.repo.as_deref()).await {
-        Ok(issues) => axum::Json(json!({ "issues": issues })).into_response(),
+        Ok(listing) => axum::Json(listing).into_response(),
         Err(e) => e.into_response(),
     }
 }
