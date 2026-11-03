@@ -3283,6 +3283,90 @@ mod tests {
     }
 
     #[test]
+    fn push_budget_matrix_never_refills_an_own_head_and_holds_only_on_a_foreign_push() {
+        for (pause_on_foreign_push, reset_attempts_on_push, own_head) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+            (false, true, true),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            let cell = format!(
+                "pause={pause_on_foreign_push}, reset={reset_attempts_on_push}, head={}",
+                if own_head { "own" } else { "foreign" }
+            );
+            let (dir, db) = temp_db("prq-push-budget-matrix");
+            let (checkout, initial_row) =
+                enqueue_pr_with_checkout(&dir, &db, 7, "feat", "https://github.com/me/repo/pull/7");
+            let key = initial_row.key;
+            db.set_pr_agent_attempts(&key, 2).unwrap();
+            let previous_head = if own_head { "head-b" } else { "head-a" };
+            db.update_pr_status(&key, "blocked_ci", Some("ci"), None, Some(previous_head))
+                .unwrap();
+
+            let mut config = cfg();
+            config.watch = vec![PrWatchKind::Ci];
+            config.own_prs_only = false;
+            config.agent_command = "true {prompt}".into();
+            config.agent_max_attempts = 5;
+            config.pause_on_foreign_push = pause_on_foreign_push;
+            config.reset_attempts_on_push = reset_attempts_on_push;
+            let forge = FakeForge::new(Some(failing_ci_pr("head-b"))).with_rerun_count(1);
+            let row = db.list_pr_queue().unwrap().remove(0);
+            drive_queue(
+                &config,
+                &Config::default(),
+                &forge,
+                &checkout,
+                &db,
+                vec![PrItem::from(&row)],
+                |_| {},
+            );
+
+            let current = db.list_pr_queue().unwrap().remove(0);
+            let detail = current.detail.as_deref().unwrap_or("");
+            if own_head {
+                assert!(
+                    current.agent_attempts >= 2,
+                    "{cell}: an already-recorded own head must not refill the attempt budget"
+                );
+                assert!(
+                    current.status != PrqStatus::NeedsHuman.as_str()
+                        || !detail.contains("someone else pushed"),
+                    "{cell}: an own head must not trigger the foreign-push hold"
+                );
+            } else if pause_on_foreign_push {
+                assert_eq!(
+                    current.status,
+                    PrqStatus::NeedsHuman.as_str(),
+                    "{cell}: a foreign head with pause enabled must be held"
+                );
+                assert!(
+                    detail.contains("someone else pushed"),
+                    "{cell}: the hold must explain the foreign push"
+                );
+                assert!(
+                    !forge.calls().iter().any(|call| call.starts_with("rerun")),
+                    "{cell}: a held foreign head must not spend a CI rerun"
+                );
+            } else if reset_attempts_on_push {
+                assert_eq!(
+                    current.agent_attempts, 0,
+                    "{cell}: a foreign head with pause disabled and reset enabled must refill the budget"
+                );
+            } else {
+                assert_eq!(
+                    current.agent_attempts, 2,
+                    "{cell}: reset disabled must keep the persisted attempt budget"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rebind_between_read_and_dispatch_holds_without_agent() {
         let (dir, db) = temp_db("prq-rebind-before-dispatch");
         let checkout = dir.path().join("checkout");
