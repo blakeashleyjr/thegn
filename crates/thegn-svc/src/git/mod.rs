@@ -1,8 +1,9 @@
-//! Git backend seam. `gix` for reads (status/diff/refs/log — the hot panel-poll
-//! path); the `git` CLI for porcelain writes gix can't yet cover (worktree add
-//! with checkout, push, merge, rebase) and for `GitLoc::Remote` (gix is local
-//! only). Native impl lands in Phase 2; the CLI fallback wraps thegn-core's
-//! existing `worktree`/`repo`/`util::git_*` code.
+//! Git backend seam. `gix` serves local reads: status, diff totals and per-file
+//! entries through `native_diff`, refs, and log. The git CLI serves writes and
+//! every remote/provider `GitLoc` (gix is local-only), and falls back when
+//! native diff cannot represent a path. The `model_scan` and `diff_files`
+//! groups in `benches/git_hot.rs` measure gix against the CLI; this doc reports
+//! no benchmark numbers.
 
 use anyhow::{Context, Result};
 use std::path::Path;
