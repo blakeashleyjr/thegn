@@ -2447,7 +2447,7 @@ mod tests {
 
     #[test]
     fn rename_move_failure_reports_gits_reason() {
-        let repo = temp_repo("rename-locked-reason");
+        let repo = temp_repo("rename-move-reason");
         let cfg = scratch_cfg(&repo);
         let path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
         add_checked(&repo, "old", "main", &path, &cfg).unwrap();
@@ -2463,7 +2463,7 @@ mod tests {
         let error = rename(&repo, &path, "old", "new", &cfg).unwrap_err();
 
         assert!(error.contains("rolled back"), "{error}");
-        assert!(error.contains("locked"), "{error}");
+        assert!(error.contains("locked working tree"), "{error}");
         assert!(branch_exists(&repo, "old"));
         assert!(!branch_exists(&repo, "new"));
         assert_eq!(
