@@ -28,8 +28,8 @@ use thegn_core::calendar::{CalEvent, CalendarWindow, ExpansionError};
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig};
 use thegn_core::db::Db;
 use thegn_core::store::{
-    CalendarCursor, CalendarPageApplied, CalendarPageWrite, CalendarRow, CalendarStore,
-    CalendarTombstones, EmptySnapshot,
+    CalendarCursor, CalendarDiagnosticCounts, CalendarPageApplied, CalendarPageWrite, CalendarRow,
+    CalendarStore, CalendarTombstones, EmptySnapshot,
 };
 use thegn_svc::calendar::{CalendarError, CalendarRouter, EventPage, PageMode};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -883,9 +883,13 @@ fn apply_page_with_generation(
         return false;
     }
     match db.apply_calendar_page(account, &write, &cursor) {
-        Ok(CalendarPageApplied::Applied { events_changed }) => events_changed,
+        Ok(CalendarPageApplied::Applied { events_changed }) => {
+            persist_page_diagnostics(db, account, page.diagnostics(), generation);
+            events_changed
+        }
         Ok(CalendarPageApplied::FreshnessOnly) => false,
         Ok(CalendarPageApplied::RejectedEmpty) => {
+            persist_page_diagnostics(db, account, page.diagnostics(), generation);
             tracing::warn!(
                 target: "thegn::calendar",
                 account = %account,
@@ -918,6 +922,33 @@ fn record_calendar_cache_failure(
             target: "thegn::calendar",
             %error,
             "could not record the calendar cache failure"
+        );
+    }
+}
+
+/// Persist the page's value-free diagnostic counts so `thegn doctor` can report the last fetch after the toast is
+/// gone. The DB is a cache: a failed write is logged and never fails the sync.
+fn persist_page_diagnostics(
+    db: &Db,
+    account: &str,
+    diagnostics: thegn_svc::calendar::PageDiagnostics,
+    generation: Option<&crate::hydrate_schedule::ScheduleFence>,
+) {
+    if !crate::hydrate_schedule::generation_is_current(generation) {
+        return;
+    }
+    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let counts = CalendarDiagnosticCounts {
+        quarantined_events: count(diagnostics.quarantined_events),
+        unresolved_zones: count(diagnostics.unresolved_zones),
+        other: count(diagnostics.other),
+        overflow: count(diagnostics.overflow),
+    };
+    if let Err(error) = db.put_calendar_diagnostics(account, &counts) {
+        tracing::debug!(
+            target: "thegn::calendar",
+            %error,
+            "could not record calendar diagnostics"
         );
     }
 }
