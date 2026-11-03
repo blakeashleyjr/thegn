@@ -159,7 +159,11 @@ an upgrade; `any` restores the legacy first-opener behavior. When
 running executable. Every database-using process holds a shared schema lease
 for its lifetime, so a rebuilt controller refuses to migrate until controllers
 using the old schema have exited. Stop the old host/daemon, rebuild, then start
-the pinned controller to upgrade.
+the pinned controller to upgrade. When two processes first open a brand-new
+state database together, the one that loses the creation race waits up to 5
+seconds for the other process to finish. It then opens the database; an existing
+older database still gets the old-schema refusal, and a long creation asks you
+to retry shortly.
 
 An operation that deliberately supports an older schema uses a separate,
 operation-declared compatibility handle; this never grants migration authority.
@@ -302,7 +306,10 @@ permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-l
   not apply. Your own `~/.claude/settings.json` and the command-scoped
   `permissions` grant still apply. An explicit `agent_command` runs exactly as
   written; add the flag yourself if it should skip project settings.
-  Interactive panes you open load project settings as usual.
+  Interactive panes you open load project settings as usual. A resurrected
+  pipeline-stage pane keeps its recorded stage and uses `--setting-sources user`;
+  if that stage was removed from the configuration, the agent relaunch is refused
+  and the shell fallback remains.
 
 A stage overrides any of these for its own launches — including `harness`, so
 one generic role can run on claude for reviews and pi for the fan-out — and

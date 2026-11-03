@@ -136,7 +136,12 @@ After an own-PR agent in the PR queue or CI autofix returns, thegn re-reads the
 PR and checks its author, forge account, repository and head before recording a
 push or updating the row. If the author, account or repository changed, the
 head moved to anything other than the agent's own push, or any of them cannot
-be verified, the row is held as `needs_human`.
+be verified, the row is held as `needs_human`. CI autofix also re-reads the
+worktree HEAD after admission and just before starting the agent; if it moved or
+cannot be read while the admission lease is still current, the agent is not
+started and the row is held as `needs_human`. The attempt is refunded when
+possible; if the refund fails, the notification says so. If the lease was lost,
+the row is left for the next refresh to re-evaluate.
 
 ## Review comment tasks
 

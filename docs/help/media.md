@@ -67,6 +67,11 @@ local player, without leaving the compositor. Hidden unless
   connection (for example, under a restricted password) is not sent. Shuffle,
   loop, volume and seek report “This player does not support that control”;
   play/pause, next and previous report “Media operation failed”.
+- If the native MPRIS route cannot connect or read a player, the playerctl
+  command-line backend is used when available. It offers shuffle, repeat and
+  volume only when reported by the player, and seek only with a reported track
+  length; an unsupported control reports “This player does not support that
+  control”.
 - When reading the player fails, the last track stays visible with a dim
   `stale` marker for up to three poll periods or ten seconds, whichever is
   longer; the status-bar badge turns amber and says `stale` for the same period.
