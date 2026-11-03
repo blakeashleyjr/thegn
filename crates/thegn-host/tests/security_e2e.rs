@@ -846,12 +846,7 @@ fn security_e2e_daemon_pane_cannot_see_or_write_the_state_run_dir() {
     fixture.assert_daemon_alive("after the state run directory probe");
 }
 
-#[test]
-fn security_e2e_hardened_pane_cannot_open_host_session() {
-    if !required_prerequisites() {
-        return;
-    }
-    let mut fixture = Fixture::new();
+fn assert_pane_cannot_open_host_session(fixture: &mut Fixture, label: &str) {
     let (config_home, config_path) = fixture.probe_config();
     let socket = fixture.socket.to_string_lossy();
     let command = format!(
@@ -865,9 +860,11 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
         ),
     )
     .expect("write attack config");
-    let host = fixture.host_sessions_with_config("host-open-control", &config_home);
+    let host_label = format!("{label}-host-open-control");
+    let host = fixture.host_sessions_with_config(&host_label, &config_home);
     fixture.assert_no_sessions(&host);
-    let version = fixture.run_pane("open-version-control", "./thegn --version");
+    let version_label = format!("{label}-open-version-control");
+    let version = fixture.run_pane(&version_label, "./thegn --version");
     assert!(
         version.status.success(),
         "in-pane thegn --version failed (program {}): stdout: {} stderr: {}",
@@ -879,30 +876,37 @@ fn security_e2e_hardened_pane_cannot_open_host_session() {
     let inner = format!(
         "env XDG_CONFIG_HOME={config_home_env} ./thegn session open --agent probe --worktree . --prompt x"
     );
-    let probe = fixture.run_pane("open-probe", &inner);
-    assert!(
-        !probe.status.success(),
-        "hardened pane opened a host session; stdout: {} stderr: {}",
-        String::from_utf8_lossy(&probe.stdout),
-        String::from_utf8_lossy(&probe.stderr)
-    );
-    let probe_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&probe.stdout),
-        String::from_utf8_lossy(&probe.stderr)
-    );
-    assert!(
-        probe_output.contains("no thegn pane daemon is running"),
-        "probe failed for an unrelated reason: {probe_output}"
-    );
+    let probe_label = format!("{label}-open-probe");
+    let probe = fixture.run_pane(&probe_label, &inner);
+    assert_fail_closed_daemon_probe(&probe, fixture.endpoint_layout, "host session open");
     let deadline = Instant::now() + Duration::from_secs(2);
-    while fixture.marker.exists() && Instant::now() < deadline {
+    while !fixture.marker.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(!fixture.marker.exists(), "host-only marker was created");
-    let host = fixture.host_sessions_with_config("sessions-after-open", &config_home);
+    let sessions_label = format!("{label}-sessions-after-open");
+    let host = fixture.host_sessions_with_config(&sessions_label, &config_home);
     fixture.assert_no_sessions(&host);
-    fixture.assert_daemon_alive("after the open probe");
+    let alive_context = format!("after {label} open probe");
+    fixture.assert_daemon_alive(&alive_context);
+}
+
+#[test]
+fn security_e2e_hardened_pane_cannot_open_host_session() {
+    if !required_prerequisites() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    assert_pane_cannot_open_host_session(&mut fixture, "open");
+}
+
+#[test]
+fn security_e2e_hardened_pane_cannot_open_host_session_without_xdg_runtime_dir() {
+    if !required_prerequisites() {
+        return;
+    }
+    let mut fixture = Fixture::new_without_runtime_dir();
+    assert_pane_cannot_open_host_session(&mut fixture, "no-runtime-open");
 }
 
 #[test]
