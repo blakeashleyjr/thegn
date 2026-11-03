@@ -3002,7 +3002,7 @@ mod tests {
         let spec = credential_free_spec_at(spec, None);
         let outside = fixture._root.path().join("outside-write");
         let script = format!(
-            "cd {} && printf probe > probe.txt && git add probe.txt && git -c commit.gpgsign=false -c user.name=t -c user.email=t@e commit -qm worker-probe && echo committed; printf pwned > {} 2>/dev/null; true",
+            "cd {} && printf probe > probe.txt && git add probe.txt && git -c commit.gpgsign=false -c user.name=t -c user.email=t@e commit -qm worker-probe && echo committed && {{ if printf pwned > {} 2>/dev/null; then echo outside-write-attempt:succeeded-inside-sandbox; else echo outside-write-attempt:denied; fi; }}",
             thegn_core::util::sh_quote(&fixture.worktree.to_string_lossy()),
             thegn_core::util::sh_quote(&outside.to_string_lossy())
         );
@@ -3022,6 +3022,12 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("committed"),
             "sandbox did not report the worker commit: {output:?}"
         );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("outside-write-attempt:succeeded-inside-sandbox")
+                || stdout.contains("outside-write-attempt:denied"),
+            "sandbox did not report the outside-write attempt outcome: {output:?}"
+        );
 
         let mut subject = thegn_core::util::git_cmd(&fixture.worktree);
         subject.args(["log", "-1", "--format=%s"]);
@@ -3038,7 +3044,7 @@ mod tests {
         assert!(tracked.status.success(), "git ls-files failed: {tracked:?}");
         assert_eq!(String::from_utf8_lossy(&tracked.stdout).trim(), "probe.txt");
 
-        let mut branch = thegn_core::util::git_cmd(&fixture.worktree);
+        let mut branch = thegn_core::util::git_cmd(fixture.common.parent().unwrap());
         branch.args(["rev-parse", "feat"]);
         let branch = run_git_control_command(&mut branch);
         assert!(
