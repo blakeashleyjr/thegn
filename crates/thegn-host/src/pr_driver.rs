@@ -351,13 +351,16 @@ pub(crate) fn drive_queue(
         let review_refresh =
             refresh_review_tasks(cfg, forge, repo_root, db, &item, &fetched, &mut out);
 
-        // A head thegn didn't produce means a teammate pushed. Two consequences,
-        // both deliberate: the attempt budget refills (a long-lived PR must not
-        // stay stuck), and — under `pause_on_foreign_push` — we stop rather than
-        // race whoever is working in there.
+        // A head thegn didn't produce means a teammate pushed. When
+        // `pause_on_foreign_push` is off, the attempt budget can refill so a
+        // long-lived PR does not stay stuck. With the pause enabled, preserve
+        // the budget while we stop rather than race whoever is working in there.
         let moved = pr_queue::foreign_push(item.last_head_oid.as_deref(), &head);
         let mut attempts = item.agent_attempts;
-        if moved && pr_queue::attempts_reset(item.last_head_oid.as_deref(), &head, cfg) {
+        if moved
+            && !cfg.pause_on_foreign_push
+            && pr_queue::attempts_reset(item.last_head_oid.as_deref(), &head, cfg)
+        {
             attempts = 0;
             if let Err(error) = db.set_pr_agent_attempts(&item.key, 0) {
                 tracing::debug!(target: "thegn::prq", %error, "could not persist PR agent budget reset after head change");
@@ -3316,6 +3319,8 @@ mod tests {
             config.reset_attempts_on_push = reset_attempts_on_push;
             let forge = FakeForge::new(Some(failing_ci_pr("head-b"))).with_rerun_count(1);
             let row = db.list_pr_queue().unwrap().remove(0);
+            // The default isolation floor holds the dispatch before an agent can run;
+            // these non-held cells prove the queue's resulting status under that floor.
             drive_queue(
                 &config,
                 &Config::default(),
@@ -3328,6 +3333,13 @@ mod tests {
 
             let current = db.list_pr_queue().unwrap().remove(0);
             let detail = current.detail.as_deref().unwrap_or("");
+            if own_head || !pause_on_foreign_push {
+                assert_eq!(
+                    current.status,
+                    PrqStatus::BlockedCi.as_str(),
+                    "{cell}: the default isolation floor holds the CI dispatch"
+                );
+            }
             if own_head {
                 assert!(
                     current.agent_attempts >= 2,
@@ -3347,6 +3359,10 @@ mod tests {
                 assert!(
                     detail.contains("someone else pushed"),
                     "{cell}: the hold must explain the foreign push"
+                );
+                assert_eq!(
+                    current.agent_attempts, 2,
+                    "{cell}: pausing on a foreign push must preserve the attempt budget"
                 );
                 assert!(
                     !forge.calls().iter().any(|call| call.starts_with("rerun")),
