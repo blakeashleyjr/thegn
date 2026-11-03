@@ -619,8 +619,9 @@ fn ensure_config_contained(workspace_folder: &Path, config_path: &Path) -> anyho
     thegn_core::devcontainer_select::revalidate_selected(workspace_folder, config_path).map_err(
         |error| {
             anyhow::anyhow!(
-                "devcontainer config {} is no longer a regular file inside the worktree ({error}); refusing provider use",
-                config_path.display()
+                "devcontainer config {} refused provider use ({:?})",
+                config_path.display(),
+                error.kind()
             )
         },
     )
@@ -837,11 +838,7 @@ mod tests {
         let error = CliProvider::with_executable("/bin/devcontainer")
             .prepare_start(&ws, &config_path, &digest, content, &[])
             .expect_err("a replaced config directory must refuse provider use");
-        assert!(
-            error
-                .to_string()
-                .contains("no longer a regular file inside the worktree")
-        );
+        assert!(error.to_string().contains("InvalidInput"));
         assert!(!std::fs::read_dir(&outside).unwrap().any(|entry| {
             entry
                 .unwrap()
