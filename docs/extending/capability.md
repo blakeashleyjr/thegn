@@ -31,10 +31,11 @@ Every external door projects `thegn_core::capability::CATALOG`
      `GapDisposition`: `Deferred { review }` names the issue that owns it), and
      `just ratchet-update` regenerates docs/api/surface-gaps.md;
      `gap_dispositions_cover_every_gap_exactly` and
-     `surface_gaps_doc_matches_the_table` fail otherwise. A surface a capability is _deliberately never_ exposed on
-     (e.g. admin verbs off MCP/plugin) is expressed by narrowing the row's
-     surface set, never by an excuse. A routed-but-inert row marks itself with
-     `stub: Some(reason)` so `thegn api coverage` counts it apart.
+     `surface_gaps_doc_matches_the_table` fail otherwise. A surface a
+     capability is _deliberately never_ exposed on (e.g. admin verbs off
+     MCP/plugin) is expressed by narrowing the row's surface set, never by an
+     excuse. A routed-but-inert row marks itself with `stub: Some(reason)` so
+     `thegn api coverage` counts it apart.
 5. **Wire schema**: new wire types derive `schemars::JsonSchema`, join
    `tests/control_schema.rs`'s list, and the snapshot is regenerated
    (`THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-svc --test
