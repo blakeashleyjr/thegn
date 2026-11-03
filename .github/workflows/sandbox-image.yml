@@ -182,7 +182,7 @@ jobs:
               exit 1
             }
           done
-          podman manifest create "$IMAGE:$TAG" \
+          podman manifest create --authfile "$HOME/.docker/config.json" "$IMAGE:$TAG" \
             "docker://$IMAGE@$amd64_digest" \
             "docker://$IMAGE@$arm64_digest"
           list_digest_file=manifest-digest.txt
