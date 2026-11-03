@@ -2694,6 +2694,17 @@ impl ControlApi for DaemonService {
         req: thegn_svc::control::DispatchPutReq,
     ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
         Box::pin(async move {
+            if let Err(error) =
+                thegn_core::pipeline_report::dispatch_text_field("issue_id", &req.issue_id)
+            {
+                return Err(ControlError::InvalidArgument(error.to_string()));
+            }
+            if let Err(error) = thegn_core::pipeline_report::dispatch_text_field(
+                "worktree_path",
+                &req.worktree_path,
+            ) {
+                return Err(ControlError::InvalidArgument(error.to_string()));
+            }
             let raw_issue = req.issue_id.clone();
             let raw_worktree = req.worktree_path.clone();
             let (issue_id, worktree_path) = match tokio::task::spawn_blocking(move || {
@@ -5668,6 +5679,18 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+        let path_result = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a\x1b[2J".into(),
+                agent_name: "claude".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            path_result,
+            Err(ControlError::InvalidArgument(message)) if !message.contains('\x1b')
+        ));
         assert!(
             svc.dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
                 .await
