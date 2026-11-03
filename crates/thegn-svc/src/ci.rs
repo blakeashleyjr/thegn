@@ -5189,6 +5189,12 @@ esac
             return;
         };
         let _env = install_gitlab_fake_path(&fake);
+        let cfg = CiConfig {
+            provider: CiProviderKind::Gitlab,
+            ..CiConfig::default()
+        };
+        let (client, context) = provider_and_context_for(&loc, &cfg).unwrap();
+        assert!(context.is_none());
         assert!(
             thegn_core::util::git_cmd(repo.path())
                 .args([
@@ -5201,14 +5207,44 @@ esac
                 .unwrap()
                 .success()
         );
-        let client = GitlabCi {
-            binding: GitlabBinding::NoOrigin,
-            ..GitlabCi::default()
-        };
         assert!(matches!(
             client.runs(&loc, None, 10),
             Err(CiError::NotConfigured)
         ));
+        assert!(!fake.path().join("calls.log").exists());
+    }
+
+    #[test]
+    fn gitlab_bound_invalid_selection_stays_refused_after_the_origin_is_fixed() {
+        let Some((repo, fake, loc)) = gitlab_bound_fixture(Some("https://gitlab.example.test/"))
+        else {
+            return;
+        };
+        let _env = install_gitlab_fake_path(&fake);
+        let cfg = CiConfig {
+            provider: CiProviderKind::Gitlab,
+            ..CiConfig::default()
+        };
+        let (client, context) = provider_and_context_for(&loc, &cfg).unwrap();
+        assert!(context.is_none());
+        assert!(
+            thegn_core::util::git_cmd(repo.path())
+                .args([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://gitlab.example.test/group/repo.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        match client.runs(&loc, None, 10) {
+            Err(CiError::Other(message)) => {
+                assert_eq!(message, "invalid GitLab remote authority or project path")
+            }
+            result => panic!("expected invalid GitLab remote refusal, got {result:?}"),
+        }
         assert!(!fake.path().join("calls.log").exists());
     }
 
