@@ -87,6 +87,15 @@ pub trait ControlStore {
     /// Daemons for `scope` whose heartbeat is within `ttl_ms` of `now_ms` — the
     /// discovery query clients attach through.
     fn live_daemons(&self, scope: &str, now_ms: i64, ttl_ms: i64) -> Result<Vec<DaemonRow>>;
+    /// The single freshest live daemon for `scope` (largest heartbeat, then the
+    /// latest start, then the largest id), read with `LIMIT 1` so discovery never
+    /// materialises the whole registry. Same liveness rule as [`Self::live_daemons`].
+    fn freshest_live_daemon(
+        &self,
+        scope: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<Option<DaemonRow>>;
 
     // --- session leases ---
     /// Open a lease; returns its rowid.
