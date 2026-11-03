@@ -5530,7 +5530,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_client_deadline_bounds_delayed_response_headers() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -5621,6 +5621,7 @@ mod tests {
         let target_address = target.local_addr().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 1024];
@@ -5630,6 +5631,7 @@ mod tests {
                 "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+            release_rx.await.unwrap();
         });
 
         // Redirects are already disabled by the production client policy; this is a positive control.
@@ -5644,6 +5646,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        release_tx.send(()).unwrap();
         server.await.unwrap();
     }
 
