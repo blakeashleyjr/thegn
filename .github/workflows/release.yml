@@ -1038,6 +1038,16 @@ jobs:
               "(release.py verify-assets refused; see its message above)"
             exit 1
           fi
+      - name: Screen Homebrew metadata bytes
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! python3 packaging/screen_metadata.py "$PUBLISH_ROOT/metadata/thegn-$TAG-homebrew.rb"; then
+            echo "::error::Homebrew metadata screening refused the approved formula."
+            exit 1
+          fi
       - name: Materialize Homebrew deploy key
         if: steps.publication.outputs.ready == 'true'
         env:
@@ -1082,6 +1092,11 @@ jobs:
               commit -m "thegn $TAG"
             new="$(git -C "$PUBLISH_ROOT/tap" rev-parse HEAD)"
             printf 'new=%s\n' "$new" >> "$GITHUB_OUTPUT"
+            if ! git -C "$PUBLISH_ROOT/tap" cat-file blob HEAD:Formula/thegn.rb \
+              | cmp -s - "$PUBLISH_ROOT/metadata/thegn-$TAG-homebrew.rb"; then
+              echo "::error::The Homebrew commit does not carry the approved formula bytes."
+              exit 1
+            fi
             if ! GIT_SSH_COMMAND="$tap_ssh" git -C "$PUBLISH_ROOT/tap" \
               push --force-with-lease="refs/heads/$branch:$old" origin \
               "HEAD:refs/heads/$branch"; then
@@ -1267,6 +1282,17 @@ jobs:
             echo "::error::The generated AUR metadata does not match the release PKGBUILD."
             exit 1
           fi
+      - name: Screen AUR metadata bytes
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! python3 packaging/screen_metadata.py \
+            "$RUNNER_TEMP/aur-metadata/PKGBUILD" "$RUNNER_TEMP/aur-metadata/.SRCINFO"; then
+            echo "::error::AUR metadata screening refused the approved files."
+            exit 1
+          fi
       - name: Materialize AUR deploy key
         if: steps.publication.outputs.ready == 'true'
         env:
@@ -1310,6 +1336,16 @@ jobs:
               commit -m "thegn $TAG"
             new="$(git -C "$PUBLISH_ROOT/aur" rev-parse HEAD)"
             printf 'new=%s\n' "$new" >> "$GITHUB_OUTPUT"
+            if ! git -C "$PUBLISH_ROOT/aur" cat-file blob HEAD:PKGBUILD \
+              | cmp -s - "$RUNNER_TEMP/aur-metadata/PKGBUILD"; then
+              echo "::error::The AUR commit does not carry the approved PKGBUILD bytes."
+              exit 1
+            fi
+            if ! git -C "$PUBLISH_ROOT/aur" cat-file blob HEAD:.SRCINFO \
+              | cmp -s - "$RUNNER_TEMP/aur-metadata/.SRCINFO"; then
+              echo "::error::The AUR commit does not carry the approved .SRCINFO bytes."
+              exit 1
+            fi
             if ! GIT_SSH_COMMAND="$aur_ssh" git -C "$PUBLISH_ROOT/aur" \
               push --force-with-lease="refs/heads/$branch:$old" origin \
               "HEAD:refs/heads/$branch"; then
