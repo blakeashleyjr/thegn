@@ -74,7 +74,12 @@ async fn upstream(script: Script) -> Upstream {
                         write_json(&mut socket, 200, rest, &[]).await;
                     }
                 }
-                Script::Stall => std::future::pending::<()>().await,
+                Script::Stall => {
+                    let _hold_task = tokio::spawn(async move {
+                        let _hold = socket;
+                        std::future::pending::<()>().await
+                    });
+                }
                 Script::Sse(events) => write_sse(&mut socket, events).await,
             }
         }
@@ -307,7 +312,7 @@ async fn e2e_rate_limited_lane_cools_down_then_fails_back() {
         first: (
             429,
             json!({"error":"slow down"}),
-            vec![("retry-after".into(), "1".into())],
+            vec![("retry-after".into(), "5".into())],
         ),
         rest: completion("from-a"),
     })
@@ -345,7 +350,7 @@ async fn e2e_rate_limited_lane_cools_down_then_fails_back() {
         first.hits.load(Ordering::SeqCst)
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut failed_back = false;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -464,8 +469,7 @@ async fn e2e_stream_falls_through_a_lane_that_sends_no_first_byte() {
         post_openai(&proxy, request("standard", "hello", true)),
     )
     .await
-    .expect("stream request exceeded its generous deadline")
-    .unwrap();
+    .expect("stream request exceeded its generous deadline");
     let result = content(response).await;
     assert_eq!(
         result.0, 200,
@@ -535,7 +539,7 @@ async fn e2e_anthropic_stream_is_translated_from_openai_sse() {
 async fn e2e_budget_refusal_never_reaches_the_upstream() {
     let dir = TempDir::new().unwrap();
     let refused = upstream(Script::Json(200, completion("unexpected"), vec![])).await;
-    let mut limited_cfg = single_route_config(&dir, &refused);
+    let mut limited_cfg = single_route_config(dir.path(), &refused);
     limited_cfg.budget.enabled = true;
     limited_cfg.budget.on_breach = BudgetBreach::Refuse;
     limited_cfg.budget.scopes.insert(
@@ -573,6 +577,13 @@ async fn e2e_budget_refusal_never_reaches_the_upstream() {
             "budget refusal status/body for {path}: {} {}",
             result.0, result.1
         );
+        assert!(
+            result
+                .1
+                .contains("budget cap reached for scope 'workspace:/e2e'"),
+            "budget refusal reason for {path}: {}",
+            result.1
+        );
     }
     assert_eq!(
         refused.hits.load(Ordering::SeqCst),
@@ -582,7 +593,7 @@ async fn e2e_budget_refusal_never_reaches_the_upstream() {
     );
 
     let allowed = upstream(Script::Json(200, completion("allowed"), vec![])).await;
-    let normal_cfg = single_route_config(&dir, &allowed);
+    let normal_cfg = single_route_config(dir.path(), &allowed);
     let (normal_proxy, _, _normal_task) = start_proxy(normal_cfg).await;
     let response =
         content(post_openai(&normal_proxy, request("standard", "hello", false)).await).await;
@@ -609,7 +620,7 @@ async fn e2e_subscription_lane_records_zero_cost_and_cache_tokens() {
         "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
         "usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}
     }), vec![])).await;
-    let mut cfg = single_route_config(&dir, &upstream);
+    let mut cfg = single_route_config(dir.path(), &upstream);
     cfg.providers[0].subscription = true;
     cfg.providers[0].input_usd_per_mtok = 12.0;
     cfg.providers[0].output_usd_per_mtok = 34.0;
