@@ -185,9 +185,10 @@ repo other people push to:
 - **`own_prs_only`** — a PR you didn't author is watched and displayed
   but never written to. If thegn cannot tell who you are, it assumes the
   PR is not yours.
-- **`reset_attempts_on_push`** — a new commit refills the attempt
-  budget, because a pull request lives for days and a one-shot budget
-  would exhaust once and stick forever. Only a commit thegn did _not_
+- **`reset_attempts_on_push`** — when `pause_on_foreign_push` is off, a new
+  commit refills the attempt budget, because a pull request lives for days and
+  a one-shot budget would exhaust once and stick forever. A foreign push held
+  for a human preserves the existing budget. Only a commit thegn did _not_
   create counts: after an agent run, thegn records the run's own push when the
   worktree's HEAD descends from the head the agent started on and matches the PR
   head on the forge, so an agent cannot top up its own budget or trip

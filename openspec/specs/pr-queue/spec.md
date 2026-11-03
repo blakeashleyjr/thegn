@@ -237,12 +237,19 @@ while `own_prs_only` is set, nor for an entry with no worktree to work in.
   is enabled
 - **THEN** its state is tracked and displayed but no agent is dispatched
 
-#### Scenario: The attempt budget refills when the branch moves
+#### Scenario: The attempt budget refills when the branch moves and is not held
 
 - **WHEN** a new commit that thegn did not create appears on a queued pull
-  request's head
+  request's head and `pause_on_foreign_push` is disabled
 - **THEN** its agent attempt budget is reset so a long-lived pull request is not
   permanently stuck
+
+#### Scenario: A held foreign push preserves the attempt budget
+
+- **WHEN** a new commit that thegn did not create appears on a queued pull
+  request's head and `pause_on_foreign_push` is enabled
+- **THEN** the entry is held for a human with its existing agent attempt budget
+  unchanged
 
 ### Requirement: A green pull request is merged under the forge's own rules
 
