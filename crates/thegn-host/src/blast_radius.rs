@@ -24,7 +24,7 @@ use thegn_core::semantic_graph::{
     BlastRadius, CallerRef, ChangedEntity, compute_blast_radius, entity_id, is_test_entity,
 };
 use thegn_core::store::{SemEdgeRow, SemEntityRow, SemanticStore};
-use thegn_svc::lsp::{CancelToken, LspError, Position, path_to_uri};
+use thegn_svc::lsp::{CancelToken, LspError, Position, path_to_uri_os};
 
 use termwiz::terminal::TerminalWaker;
 
@@ -268,7 +268,7 @@ fn build_graph_with_file_persist_hook(
             }
             Err(_) => continue,
         };
-        let uri = path_to_uri(&abs_s);
+        let uri = path_to_uri_os(&abs);
         let _ = client.did_open(&uri, &src); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
         // Precise name (selectionRange) positions for the references query.
         let symbols = match client.document_symbols_with(&uri, cancel) {
