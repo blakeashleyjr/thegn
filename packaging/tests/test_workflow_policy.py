@@ -779,6 +779,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             line for line in following_lines if "podman manifest create" in line
         )
         create_command = create_line
+        self.assertIn('--authfile "$HOME/.docker/config.json"', create_command)
         self.assertIn("@$amd64_digest", create_command)
         self.assertIn("@$arm64_digest", create_command)
         self.assertNotIn("$TAG-amd64", create_command)
