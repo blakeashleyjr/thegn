@@ -921,6 +921,17 @@ fn refuse_plugin_issue_id(id: &str) -> ControlResult<()> {
     Ok(())
 }
 
+fn control_issue_ref(id: &str, account: &str) -> ControlResult<thegn_core::issue::IssueRef> {
+    let shown_id: String = id.chars().take(256).collect();
+    let Some((provider, _)) = id.split_once(':') else {
+        return Err(ControlError::InvalidArgument(format!(
+            "issues: an account-qualified issue id must be `<provider>:<key>`: {shown_id}"
+        )));
+    };
+    thegn_core::issue::IssueRef::new(provider, account, id)
+        .map_err(|error| ControlError::InvalidArgument(format!("issues: {error} for {shown_id}")))
+}
+
 /// Preserve typed client errors for router failures while keeping the
 /// existing diagnostic text for internal failures.
 fn issue_router_control_error(
@@ -933,7 +944,10 @@ fn issue_router_control_error(
         thegn_svc::issue::IssueError::Unsupported(_)
         | thegn_svc::issue::IssueError::UnsupportedPatchFields(_)
         | thegn_svc::issue::IssueError::EmptyPatch
-        | thegn_svc::issue::IssueError::Parse(_) => ControlError::InvalidArgument(message),
+        | thegn_svc::issue::IssueError::Parse(_)
+        | thegn_svc::issue::IssueError::UnknownAccount { .. } => {
+            ControlError::InvalidArgument(message)
+        }
         thegn_svc::issue::IssueError::Policy(_) => ControlError::FailedPrecondition(message),
         _ => ControlError::Internal(anyhow::anyhow!(message)),
     }
@@ -2558,16 +2572,21 @@ impl ControlApi for DaemonService {
         &'a self,
         id: &'a str,
         repo: Option<&'a str>,
+        account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
             let issues_cfg = self.issue_config_for_repo(repo).await?;
             refuse_plugin_issue_id(id)?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
-            router
-                .get_issue(id)
-                .await
-                .map_err(|e| issue_router_control_error("get", &shown_id, e))
+            let result = match account {
+                Some(account) => {
+                    let issue_ref = control_issue_ref(id, account)?;
+                    router.get_issue_ref(&issue_ref).await
+                }
+                None => router.get_issue(id).await,
+            };
+            result.map_err(|e| issue_router_control_error("get", &shown_id, e))
         })
     }
 
@@ -2576,16 +2595,21 @@ impl ControlApi for DaemonService {
         id: &'a str,
         patch: &'a thegn_core::issue::IssuePatch,
         repo: Option<&'a str>,
+        account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
             let issues_cfg = self.issue_config_for_repo(repo).await?;
             refuse_plugin_issue_id(id)?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
-            router
-                .update_issue(id, patch)
-                .await
-                .map_err(|e| issue_router_control_error("update", &shown_id, e))
+            match account {
+                Some(account) => {
+                    let issue_ref = control_issue_ref(id, account)?;
+                    router.update_issue_ref(&issue_ref, patch).await
+                }
+                None => router.update_issue(id, patch).await,
+            }
+            .map_err(|e| issue_router_control_error("update", &shown_id, e))
         })
     }
 
@@ -2594,16 +2618,21 @@ impl ControlApi for DaemonService {
         id: &'a str,
         body: &'a str,
         repo: Option<&'a str>,
+        account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
             let shown_id: String = id.chars().take(256).collect();
             let issues_cfg = self.issue_config_for_repo(repo).await?;
             refuse_plugin_issue_id(id)?;
             let router = thegn_svc::issue::IssueRouter::from_config(&issues_cfg);
-            router
-                .add_comment(id, body)
-                .await
-                .map_err(|e| issue_router_control_error("comment", &shown_id, e))
+            match account {
+                Some(account) => {
+                    let issue_ref = control_issue_ref(id, account)?;
+                    router.add_comment_ref(&issue_ref, body).await
+                }
+                None => router.add_comment(id, body).await,
+            }
+            .map_err(|e| issue_router_control_error("comment", &shown_id, e))
         })
     }
 
@@ -3772,11 +3801,11 @@ mod tests {
         let patch = thegn_core::issue::IssuePatch::default();
         let results = [
             svc.issues_list(&filter, repo).await.map(|_| ()),
-            svc.issues_get("linear:T-1", repo).await.map(|_| ()),
-            svc.issues_update("linear:T-1", &patch, repo)
+            svc.issues_get("linear:T-1", repo, None).await.map(|_| ()),
+            svc.issues_update("linear:T-1", &patch, repo, None)
                 .await
                 .map(|_| ()),
-            svc.issues_comment("linear:T-1", "hi", repo).await,
+            svc.issues_comment("linear:T-1", "hi", repo, None).await,
         ];
         for r in results {
             assert_uniform_miss(&r.unwrap_err(), "/not/registered");
@@ -3969,11 +3998,14 @@ mod tests {
         let (svc, _rx) = service(0);
         let patch = thegn_core::issue::IssuePatch::default();
         for result in [
-            svc.issues_get("plugin:demo:1", None).await.map(|_| ()),
-            svc.issues_update("plugin:demo:1", &patch, None)
+            svc.issues_get("plugin:demo:1", None, None)
                 .await
                 .map(|_| ()),
-            svc.issues_comment("plugin:demo:1", "hello", None).await,
+            svc.issues_update("plugin:demo:1", &patch, None, None)
+                .await
+                .map(|_| ()),
+            svc.issues_comment("plugin:demo:1", "hello", None, None)
+                .await,
         ] {
             match result.unwrap_err() {
                 ControlError::FailedPrecondition(message) => {
@@ -3982,6 +4014,68 @@ mod tests {
                 }
                 error => panic!("expected plugin issue refusal, got {error:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn issues_account_unknown_is_invalid_argument_without_a_backend_call() {
+        let (svc, _rx) = service(0);
+        let patch = thegn_core::issue::IssuePatch::default();
+        for result in [
+            svc.issues_get("linear:T-1", None, Some("work"))
+                .await
+                .map(|_| ()),
+            svc.issues_update("linear:T-1", &patch, None, Some("work"))
+                .await
+                .map(|_| ()),
+            svc.issues_comment("linear:T-1", "hi", None, Some("work"))
+                .await,
+        ] {
+            match result {
+                Err(ControlError::InvalidArgument(message)) => assert!(
+                    message.contains("no configured linear issue account named work"),
+                    "{message}"
+                ),
+                Err(error) => panic!("expected InvalidArgument, got {error:?}"),
+                Ok(()) => panic!("unknown account unexpectedly routed"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issues_account_requires_a_namespaced_id_and_a_valid_account() {
+        let (svc, _rx) = service(0);
+        let unnamespaced = svc.issues_get("T-1", None, Some("work")).await;
+        assert!(
+            matches!(unnamespaced, Err(ControlError::InvalidArgument(message)) if message.contains("`<provider>:<key>`"))
+        );
+
+        for account in ["", "has space"] {
+            let result = svc.issues_get("linear:T-1", None, Some(account)).await;
+            assert!(
+                matches!(result, Err(ControlError::InvalidArgument(message)) if message.contains("invalid issue ref account"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issues_account_keeps_the_plugin_refusal_first() {
+        let (svc, _rx) = service(0);
+        let result = svc.issues_get("plugin:demo:1", None, Some("work")).await;
+        assert!(
+            matches!(result, Err(ControlError::FailedPrecondition(message)) if message.contains("TUI process hosting the plugin"))
+        );
+    }
+
+    #[tokio::test]
+    async fn issues_account_keeps_repo_confinement_first() {
+        let (svc, _rx) = service(0);
+        let result = svc
+            .issues_get("linear:T-1", Some("/not/registered"), Some("work"))
+            .await;
+        match result {
+            Err(error) => assert_uniform_miss(&error, "/not/registered"),
+            Ok(_) => panic!("unregistered repo unexpectedly routed"),
         }
     }
 
@@ -4052,15 +4146,17 @@ mod tests {
             Err(ControlError::Unimplemented(_))
         ));
         for e in [
-            svc.issues_get("linear:T-1", r)
+            svc.issues_get("linear:T-1", r, None)
                 .await
                 .map(|_| ())
                 .unwrap_err(),
-            svc.issues_update("linear:T-1", &patch, r)
+            svc.issues_update("linear:T-1", &patch, r, None)
                 .await
                 .map(|_| ())
                 .unwrap_err(),
-            svc.issues_comment("linear:T-1", "hi", r).await.unwrap_err(),
+            svc.issues_comment("linear:T-1", "hi", r, None)
+                .await
+                .unwrap_err(),
         ] {
             assert!(
                 !matches!(e, ControlError::NotFound(ref m) if m.contains("not registered")),
