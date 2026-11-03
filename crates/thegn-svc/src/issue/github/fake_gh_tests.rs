@@ -57,6 +57,31 @@ esac
     script
 }
 
+fn fake_gh_rows(dir: &std::path::Path, rows: usize) -> std::path::PathBuf {
+    let json_path = dir.join("rows.json");
+    let rows = (1..=rows)
+        .map(|number| {
+            serde_json::json!({
+                "number": number,
+                "title": "t",
+                "state": "OPEN",
+                "url": format!("https://github.com/o/r/issues/{number}")
+            })
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(&json_path, serde_json::to_vec(&rows).unwrap()).unwrap();
+
+    let script = dir.join("gh-rows");
+    let log = dir.join("argv.log");
+    let body = format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\ncat '{}'\n",
+        log.display(),
+        json_path.display()
+    );
+    make_exec(&script, &body);
+    script
+}
+
 fn backend(
     dir: &std::path::Path,
     gh: std::path::PathBuf,
@@ -350,7 +375,64 @@ async fn zero_list_and_search_limits_use_the_gh_default_page_size() {
 
     let logged = calls(d.path());
     assert_eq!(logged.len(), 2);
-    assert!(logged[0].contains("--limit 100"), "{}", logged[0]);
-    assert!(logged[1].contains("--limit 100"), "{}", logged[1]);
+    assert!(logged[0].contains("--limit 101"), "{}", logged[0]);
+    assert!(logged[1].contains("--limit 101"), "{}", logged[1]);
     assert!(!logged.iter().any(|call| call.contains("--limit 0")));
+}
+
+#[tokio::test]
+async fn cap_zero_limit_list_over_the_cap_is_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh_rows(dir.path(), 101);
+    let b = backend(dir.path(), gh, &["--repo", "o/r"], true);
+
+    match b.list_issues(&IssueFilter::default()).await {
+        Err(IssueError::PartialList { issues, reason }) => {
+            assert_eq!(issues.len(), 100);
+            assert!(reason.contains("100-issue cap"), "{reason}");
+        }
+        other => panic!("expected capped partial list, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cap_zero_limit_list_of_exactly_the_cap_is_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh_rows(dir.path(), 100);
+    let b = backend(dir.path(), gh, &["--repo", "o/r"], true);
+
+    let issues = b.list_issues(&IssueFilter::default()).await.unwrap();
+    assert_eq!(issues.len(), 100);
+}
+
+#[tokio::test]
+async fn cap_zero_limit_search_over_the_cap_is_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh_rows(dir.path(), 101);
+    let b = backend(dir.path(), gh, &["--repo", "o/r"], true);
+
+    match b.search("q", 0).await {
+        Err(IssueError::PartialList { issues, reason }) => {
+            assert_eq!(issues.len(), 100);
+            assert!(reason.contains("100-issue cap"), "{reason}");
+        }
+        other => panic!("expected capped partial search, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cap_positive_limit_met_exactly_is_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh_rows(dir.path(), 5);
+    let b = backend(dir.path(), gh, &["--repo", "o/r"], true);
+
+    let issues = b
+        .list_issues(&IssueFilter {
+            limit: 5,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(issues.len(), 5);
+    assert!(calls(dir.path())[0].contains("--limit 5"));
 }
