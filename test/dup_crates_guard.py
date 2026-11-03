@@ -25,7 +25,11 @@ VERSION = re.compile(r'^\s*version\s*=\s*("(?:[^"\\]|\\.)*")\s*$')
 
 
 def parse_lock(text: str) -> dict[str, set[str]]:
-    """Read package name/version pairs from Cargo.lock package blocks."""
+    """Read package name/version pairs from Cargo.lock package blocks.
+
+    Versions are deduplicated by name, so identical versions from different
+    sources count once; cargo-deny may report those source splits separately.
+    """
     packages: dict[str, set[str]] = {}
     in_package = False
     name: str | None = None
@@ -143,9 +147,7 @@ def self_test() -> int:
         ),
         (
             "a third version fails",
-            check(
-                {"crate": ["1.0", "2.0", "3.0"]}, {"crate": 2}
-            )
+            check({"crate": ["1.0", "2.0", "3.0"]}, {"crate": 2})
             == ["more versions of crate: 3 > 2"],
         ),
         (
@@ -165,6 +167,29 @@ def self_test() -> int:
     rendered = render(header, {"crate": ["1.0", "2.0"]})
     cases.append(
         ("render keeps the header byte-for-byte", rendered.startswith("".join(header)))
+    )
+    cases.append(
+        (
+            "allowlist round-trips its header and counts",
+            load_allowlist(rendered) == (header, {"crate": 2}),
+        )
+    )
+
+    malformed_allowlists = [
+        "crate 2 1.0\n",
+        "crate 1 1.0\n",
+        "crate 2 1.0 2.0\ncrate 2 3.0 4.0\n",
+    ]
+    rejected_malformed_allowlists = True
+    for malformed in malformed_allowlists:
+        try:
+            load_allowlist(malformed)
+        except ValueError:
+            continue
+        rejected_malformed_allowlists = False
+        break
+    cases.append(
+        ("malformed allowlist entries raise ValueError", rejected_malformed_allowlists)
     )
 
     lock_excerpt = '''[[package]]
