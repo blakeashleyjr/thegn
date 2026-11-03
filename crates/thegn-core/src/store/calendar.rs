@@ -86,7 +86,9 @@ impl CalendarTombstones<'_> {
     }
 }
 
-/// One complete provider page and its cache mutation semantics.
+/// One complete provider page and its cache mutation semantics. There is deliberately no partial
+/// variant: a provider fetch either yields a complete page or an error (an over-budget fetch is
+/// an admission error, never a truncated page), so a partial page cannot reach the cache.
 pub enum CalendarPageWrite<'a> {
     /// A 304-style response; only cursor freshness is updated.
     Unchanged,
