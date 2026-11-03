@@ -2410,7 +2410,8 @@ mod tests {
             .unwrap();
         assert_eq!(held.generation, admitted.generation);
         assert_ne!(held.phase, "unclaimed");
-        holder.release_merge_claim(&claim).unwrap();
+        let settled = holder.settle_merge_claim_no_child(&claim).unwrap();
+        holder.release_merge_claim(&settled).unwrap();
 
         let released = holder
             .observe_merge_claim(feature.to_str().unwrap())
@@ -2443,7 +2444,8 @@ mod tests {
             .unwrap();
         assert_eq!(held.generation, admitted.generation);
         assert_ne!(held.phase, "unclaimed");
-        holder.release_merge_claim(&claim).unwrap();
+        let settled = holder.settle_merge_claim_no_child(&claim).unwrap();
+        holder.release_merge_claim(&settled).unwrap();
 
         let feature_tip = in_app_git(&feature, &["rev-parse", "HEAD"]);
         let second_messages = drain_messages(&in_app_drain_config(), &root);
