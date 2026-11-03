@@ -143,6 +143,15 @@ pub(crate) fn platform_set_mode_for_test(path: &std::path::Path, mode: u32) -> i
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+#[cfg(test)]
+pub(crate) fn platform_non_utf8_path_for_test(
+    parent: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    Some(parent.join(std::ffi::OsStr::from_bytes(b"src-\xff.rs")))
+}
+
 pub(crate) fn platform_is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
     matches!(
         raw_os_error,
