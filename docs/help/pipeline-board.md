@@ -155,7 +155,9 @@ returns the row as `needs-decision` for the Lead. A live Lead lease binds claims
 and status changes to its owner; see [[cli]] for `--lease`, `--owner`, and the
 audited `--admin --why` override. If the stage or effective agent configuration
 changes between claim and launch, launch is refused and the row is marked
-`failed` for retry.
+`failed` for retry. `thegn dispatch lease acquire` prints the lease generation,
+including as `generation` in `--json`. Each new acquisition gets a higher
+generation; a live same-owner reacquire returns the current generation.
 
 Progress notes are limited to 2,000 notes and 2 MiB of text per dispatch row.
 Further `thegn dispatch note` requests are refused with a pointer to
@@ -179,7 +181,10 @@ and names every matching row.
 Dispatch identity fields reject terminal control and Unicode format characters.
 `dispatch put` also refuses a missing, cross-issue or ineligible parent row;
 the control API reports identity text as an invalid argument and parent
-refusals as failed preconditions.
+refusals as failed preconditions. A new dispatch row is refused before
+write once 4,096 rows are active (`queued`, `spawning`, `running`,
+`waiting_human` or `pr_open`); finish, fail or abandon rows before dispatching
+more.
 
 Over the control API, `GET /v1/dispatches` returns one newest-first page.
 `limit` defaults to 2048 and accepts 1 to 4096; `before` is the last row id of

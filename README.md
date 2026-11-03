@@ -295,6 +295,14 @@ GNOME/KDE/rofi/wofi), or a `thegn.app` bundle on macOS (see below).
 thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
 
+`./install.sh --uninstall [--dry-run]` removes files recorded in
+`$XDG_DATA_HOME/thegn/install-manifest` inside the install roots only when
+their SHA-256 still matches. Changed files are kept
+and reported, your config is never removed, and a malformed or forged manifest
+is refused before removal. Dry-run prints what would be removed or kept. Pass
+the same bindir used for installation; uninstall cannot be combined with
+`--batteries`.
+
 ### macOS app launcher
 
 thegn is a TUI, so on macOS the launcher entry is a generated `thegn.app` in

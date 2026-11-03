@@ -609,7 +609,13 @@ its ledger row remains until the provider confirms destruction, so a failed
 destroy leaves it listed for a later retry.
 A stale or released spare is recycled from its base checkpoint only when the
 provider's checkpoint list confirms that checkpoint exists; if the list cannot
-be read, the spare is destroyed instead.
+be read, the spare is destroyed instead. On the dev channel, after a
+checkpoint restore, `thegn env restore` and warm-pool recycle verify an
+environment's non-empty network allow/block policy when the provider supports
+egress control. If needed, the policy is re-applied and read back. If
+verification fails, `thegn env restore` fails and reports that the sandbox is
+running without verified egress; warm-pool recycle destroys the spare. A
+successful `env restore` reports the verified counts.
 
 If a worktree's environment selection cannot be read from the state database,
 thegn never falls back to the default environment. `thegn env` verbs report an
@@ -617,7 +623,11 @@ error; worktree deletion refuses before removing anything; closing a tab does
 path-only cleanup and warns that an SSH sandbox container may remain. On the
 dev channel, provider SSH connect, warm-pool operations, hibernation,
 provisioning and host placement are refused or skipped with the reason. The
-close auto-checkpoint is also skipped with a warning on the dev channel.
+close auto-checkpoint is also skipped with a warning on the dev channel. In
+the panel's System → Environments section, an unreadable selection marks no
+environment bound, adds a red `binding unreadable: <reason>` row and a
+`binding?` badge, and Enter refuses to rebind until the state database is
+readable.
 
 When the state database exists but the worktree's recorded location cannot be
 read or is unrecognised, writes and code runs refuse instead of using the host
