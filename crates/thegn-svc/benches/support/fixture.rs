@@ -138,7 +138,7 @@ pub fn build(n: usize, dirty: usize) -> GitFixture {
 }
 
 /// Build one linked worktree with `files` committed text files, half of which
-/// are rewritten with added and removed lines to produce a committed-base diff.
+/// are rewritten with added and removed lines to produce a worktree-vs-HEAD diff.
 /// The fixture owns the tempdir; use `.worktrees` for its single local GitLoc.
 pub fn build_diff(files: usize) -> GitFixture {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -151,10 +151,6 @@ pub fn build_diff(files: usize) -> GitFixture {
         "[user]\n\tname = bench\n\temail = bench@example.invalid\n[init]\n\tdefaultBranch = main\n",
     )
     .unwrap();
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", root.join("state"));
-    }
-
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"], &home, &gitconfig);

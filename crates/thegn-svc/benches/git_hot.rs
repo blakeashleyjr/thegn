@@ -8,8 +8,8 @@
 //!   * parametrized by worktree count (1 / 4 / 14) to expose scaling;
 //!   * gix-native (`GixGit`) vs subprocess (`CliGit`) so the provider choice is
 //!     a measured number, not folklore.
-//!   * committed diff entry collection (`diff_files`) at 40 / 2,000 files, with
-//!     gix-native vs CLI timings.
+//!   * worktree-vs-HEAD diff entry collection (`diff_files`) at 40 / 2,000
+//!     files, with gix-native vs CLI timings.
 //!
 //! Run all groups with `cargo bench -p thegn-svc --bench git_hot`; run only the
 //! diff comparison with `cargo bench -p thegn-svc --bench git_hot -- diff_files`.
@@ -83,22 +83,49 @@ fn bench_git_hot(c: &mut Criterion) {
     }
     scan.finish();
 
-    // Compare the same committed-change fixture through both backends. The
-    // entry-count assertion makes the timing comparison meaningful.
+    // Compare uncommitted worktree edits against HEAD through both backends.
+    // GixGit falls back to git on native errors, so hide git from PATH during
+    // its count check and timing; failures then surface instead of timing CLI.
+    // Criterion's warm iterations hit native_diff's stat-keyed memo.
     let mut diffs = c.benchmark_group("diff_files");
     for n in [40, 2_000] {
         let f = fixture::build_diff(n);
         let loc = &f.worktrees[0];
-        let gix_count = gix.diff_files(loc, "HEAD").unwrap().len();
         let cli_count = CliGit.diff_files(loc, "HEAD").unwrap().len();
+        let empty_bin = f.dir.path().join("empty-bin");
+        std::fs::create_dir(&empty_bin).unwrap();
+
+        let path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", &empty_bin);
+        }
+        let gix_count = gix.diff_files(loc, "HEAD").unwrap().len();
+        unsafe {
+            match path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
         assert_eq!(
             gix_count, cli_count,
             "diff entry count differs for {n} files"
         );
 
+        let path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", &empty_bin);
+        }
         diffs.bench_with_input(BenchmarkId::new("gix", n), &n, |b, _| {
             b.iter(|| black_box(gix.diff_files(loc, "HEAD").unwrap().len()))
         });
+        unsafe {
+            match path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
         diffs.bench_with_input(BenchmarkId::new("cli", n), &n, |b, _| {
             b.iter(|| black_box(CliGit.diff_files(loc, "HEAD").unwrap().len()))
         });
