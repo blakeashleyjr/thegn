@@ -5,6 +5,7 @@
 //! [`crate::graphics::kitty_image`] for display. Every path degrades to a text
 //! fallback upstream when it errors, so a missing `pdftoppm` / `mmdc` (or a
 //! terminal without graphics) never breaks the preview — it just shows text.
+//! PDF renderers run under bwrap when a usable installation is available.
 //! No AI/agent dependency anywhere.
 
 use std::ffi::{OsStr, OsString};
@@ -434,6 +435,185 @@ fn renderer_command(program: &Path, stage: &RenderStage) -> Command {
     command
 }
 
+fn renderer_bwrap_argv(
+    stage: &Path,
+    host_home: Option<&Path>,
+    hide: &[PathBuf],
+    program_ro: Option<&Path>,
+    inner: &[OsString],
+) -> Vec<OsString> {
+    // `--die-with-parent` and the pid namespace from `--unshare-all` ensure
+    // preview_jobs' process-group kill also tears down this sandbox, even
+    // though `--new-session` moves the renderer into its own session.
+    let mut argv: Vec<OsString> = [
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    for dir in hide {
+        argv.push(OsString::from("--tmpfs"));
+        argv.push(dir.as_os_str().to_owned());
+    }
+    if let Some(home) = host_home {
+        argv.push(OsString::from("--tmpfs"));
+        argv.push(home.as_os_str().to_owned());
+    }
+    if let Some(program_ro) = program_ro {
+        argv.extend([
+            OsString::from("--ro-bind"),
+            program_ro.as_os_str().to_owned(),
+            program_ro.as_os_str().to_owned(),
+        ]);
+    }
+    argv.extend([
+        OsString::from("--bind"),
+        stage.as_os_str().to_owned(),
+        stage.as_os_str().to_owned(),
+        OsString::from("--chdir"),
+        stage.as_os_str().to_owned(),
+        OsString::from("--"),
+    ]);
+    argv.extend(inner.iter().cloned());
+    argv
+}
+
+fn renderer_hidden_dirs() -> Vec<PathBuf> {
+    let mut hidden = vec![PathBuf::from("/tmp")];
+    for dir in [PathBuf::from("/var/tmp"), PathBuf::from("/run/user")] {
+        if dir.is_dir() {
+            hidden.push(dir);
+        }
+    }
+    hidden
+}
+
+fn renderer_prefix_under_home(home: Option<&Path>, canonical_program: &Path) -> Option<PathBuf> {
+    let home = home.filter(|home| *home != Path::new("/"))?;
+    if !canonical_program.starts_with(home) {
+        return None;
+    }
+    let parent = canonical_program.parent()?;
+    let grandparent = parent.parent();
+    grandparent
+        .filter(|prefix| prefix.starts_with(home) && *prefix != home)
+        .or_else(|| (parent.starts_with(home) && parent != home).then_some(parent))
+        .map(Path::to_path_buf)
+}
+
+static BWRAP_PROBES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
+> = std::sync::OnceLock::new();
+static BWRAP_PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn bwrap_usable(bwrap: &Path, stage: &RenderStage) -> bool {
+    let probes = BWRAP_PROBES.get_or_init(Default::default);
+    if let Some(usable) = probes
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(bwrap)
+        .copied()
+    {
+        return usable;
+    }
+
+    // Serialize misses, then recheck so concurrent preview jobs spawn at most
+    // one namespace probe for each bwrap path in this process.
+    let _probe_guard = BWRAP_PROBE_LOCK
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(usable) = probes
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(bwrap)
+        .copied()
+    {
+        return usable;
+    }
+
+    let mut command = Command::new(bwrap);
+    command
+        .args([
+            "--die-with-parent",
+            "--unshare-all",
+            "--ro-bind",
+            "/",
+            "/",
+            "true",
+        ])
+        .env_clear()
+        .envs(renderer_env(std::env::vars_os(), stage.path()));
+    let usable =
+        crate::preview_jobs::run_renderer_quiet(&mut command, &AtomicBool::new(false)).is_ok();
+    probes
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(bwrap.to_path_buf(), usable);
+    usable
+}
+
+fn renderer_launch(
+    program: &Path,
+    stage: &RenderStage,
+    bwrap: Option<&Path>,
+    host_home: Option<&Path>,
+    hide: &[PathBuf],
+) -> Command {
+    let Some(bwrap) = bwrap else {
+        return renderer_command(program, stage);
+    };
+    let canonical = program
+        .canonicalize()
+        .unwrap_or_else(|_| program.to_path_buf());
+    let mut command = Command::new(bwrap);
+    command
+        .args(renderer_bwrap_argv(
+            stage.path(),
+            host_home,
+            hide,
+            renderer_prefix_under_home(host_home, &canonical).as_deref(),
+            &[canonical.into_os_string()],
+        ))
+        .env_clear()
+        .envs(renderer_env(std::env::vars_os(), stage.path()))
+        .current_dir(stage.path());
+    command
+}
+
+fn contained_renderer_command(program: &Path, stage: &RenderStage, previewed: &Path) -> Command {
+    let bwrap = renderer_for("bwrap", previewed)
+        .ok()
+        .filter(|bwrap| bwrap_usable(bwrap, stage));
+    if bwrap.is_none() {
+        tracing::debug!(
+            target: "thegn::preview",
+            program = %program.display(),
+            "renderer containment unavailable; running uncontained"
+        );
+    }
+    let host_home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home != Path::new("/"));
+    renderer_launch(
+        program,
+        stage,
+        bwrap.as_deref(),
+        host_home.as_deref(),
+        &renderer_hidden_dirs(),
+    )
+}
+
 /// Whether declared source dimensions are within the decode budget. Pure.
 fn check_dimensions(w: u32, h: u32, limits: DecodeLimits) -> Result<(), String> {
     if w == 0 || h == 0 {
@@ -586,7 +766,7 @@ pub fn pdf_page1(path: &Path, cancel: &AtomicBool) -> Result<Raster, String> {
         .map_err(|e| format!("preview staging failed: {e}"))?;
     let program = renderer_for("pdftoppm", path)
         .map_err(|e| format!("pdftoppm: {}", e.describe("pdftoppm")))?;
-    let mut cmd = renderer_command(&program, &stage);
+    let mut cmd = contained_renderer_command(&program, &stage, path);
     cmd.args(pdftoppm_args(&staged));
     let out = crate::preview_jobs::run_renderer(&mut cmd, cancel)
         .map_err(|e| format!("pdftoppm: {}", capture_err(&e)))?;
@@ -620,7 +800,7 @@ pub fn pdf_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
         Err(RendererLookup::Missing) => return Err("no text extractor available".to_string()),
         Err(error) => return Err(error.describe("pdftotext")),
     };
-    let mut cmd = renderer_command(&program, &stage);
+    let mut cmd = contained_renderer_command(&program, &stage, path);
     cmd.args(pdftotext_args(&staged));
     match crate::preview_jobs::run_renderer(&mut cmd, cancel) {
         Ok(out) | Err(C::Capped(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
@@ -1135,6 +1315,187 @@ mod tests {
         );
         let home = format!("HOME={}", stage.path().join("home").display());
         assert!(output.lines().any(|line| line == home));
+    }
+
+    #[test]
+    fn renderer_bwrap_argv_unshares_everything_and_binds_only_the_stage() {
+        let stage = Path::new("/stage/x");
+        let argv = renderer_bwrap_argv(
+            stage,
+            Some(Path::new("/home/u")),
+            &[PathBuf::from("/tmp"), PathBuf::from("/run/user")],
+            None,
+            &[OsString::from("/usr/bin/pdftoppm")],
+        );
+        let strings: Vec<_> = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        for required in ["--unshare-all", "--die-with-parent", "--new-session"] {
+            assert!(strings.iter().any(|arg| arg == required));
+        }
+        assert!(!strings.iter().any(|arg| arg == "--share-net"));
+        assert!(!strings.iter().any(|arg| arg == "--dev-bind"));
+        for pair in [
+            ["--tmpfs", "/home/u"],
+            ["--tmpfs", "/tmp"],
+            ["--tmpfs", "/run/user"],
+            ["--chdir", "/stage/x"],
+        ] {
+            assert!(strings.windows(2).any(|window| window == pair));
+        }
+        assert!(
+            strings
+                .windows(3)
+                .any(|window| window == ["--bind", "/stage/x", "/stage/x"])
+        );
+        let bind = strings.iter().position(|arg| arg == "--bind").unwrap();
+        assert_eq!(strings.iter().filter(|arg| *arg == "--bind").count(), 1);
+        assert!(
+            strings
+                .iter()
+                .enumerate()
+                .filter(|(_, arg)| *arg == "--tmpfs")
+                .all(|(index, _)| index < bind)
+        );
+        assert_eq!(strings[strings.len() - 2], "--");
+        assert_eq!(strings[strings.len() - 1], "/usr/bin/pdftoppm");
+    }
+
+    #[test]
+    fn renderer_bwrap_argv_rebinds_a_renderer_installed_under_home() {
+        let argv = renderer_bwrap_argv(
+            Path::new("/stage/x"),
+            Some(Path::new("/home/u")),
+            &[PathBuf::from("/tmp")],
+            Some(Path::new("/home/u/.local")),
+            &[OsString::from("/home/u/.local/bin/pdftoppm")],
+        );
+        let strings: Vec<_> = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let tmpfs = strings
+            .windows(2)
+            .position(|window| window == ["--tmpfs", "/home/u"])
+            .unwrap();
+        let ro_bind = strings
+            .windows(3)
+            .position(|window| window == ["--ro-bind", "/home/u/.local", "/home/u/.local"])
+            .unwrap();
+        let bind = strings.iter().position(|arg| arg == "--bind").unwrap();
+        assert!(tmpfs < ro_bind && ro_bind < bind);
+    }
+
+    #[test]
+    fn renderer_bwrap_prefix_under_home_never_rebinds_the_whole_home() {
+        let cases = [
+            (
+                Some(Path::new("/home/u")),
+                Path::new("/home/u/.local/bin/pdftoppm"),
+                Some(Path::new("/home/u/.local")),
+            ),
+            (
+                Some(Path::new("/home/u")),
+                Path::new("/home/u/bin/pdftoppm"),
+                Some(Path::new("/home/u/bin")),
+            ),
+            (
+                Some(Path::new("/home/u")),
+                Path::new("/usr/bin/pdftoppm"),
+                None,
+            ),
+            (None, Path::new("/home/u/bin/x"), None),
+            (Some(Path::new("/")), Path::new("/usr/bin/x"), None),
+        ];
+        for (home, program, expected) in cases {
+            assert_eq!(
+                renderer_prefix_under_home(home, program).as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_launch_wraps_in_bwrap_only_when_usable() {
+        let stage = RenderStage::new().unwrap();
+        let wrapped = renderer_launch(
+            Path::new("/nonexistent/pdftoppm"),
+            &stage,
+            Some(Path::new("/nonexistent/bwrap")),
+            None,
+            &[],
+        );
+        assert_eq!(wrapped.get_program(), OsStr::new("/nonexistent/bwrap"));
+        assert_eq!(
+            wrapped.get_args().last(),
+            Some(OsStr::new("/nonexistent/pdftoppm"))
+        );
+        assert_eq!(wrapped.get_current_dir(), Some(stage.path().as_os_str()));
+        assert!(wrapped.get_envs().any(|(key, value)| {
+            key == OsStr::new("HOME") && value == Some(stage.path().join("home").as_os_str())
+        }));
+
+        let unwrapped =
+            renderer_launch(Path::new("/nonexistent/pdftoppm"), &stage, None, None, &[]);
+        assert_eq!(unwrapped.get_program(), OsStr::new("/nonexistent/pdftoppm"));
+        assert_eq!(unwrapped.get_args().count(), 0);
+    }
+
+    #[test]
+    fn renderer_bwrap_contains_a_canary_renderer() {
+        if cfg!(windows) {
+            return;
+        }
+        let Some(bwrap) = thegn_core::util::which_path("bwrap").map(PathBuf::from) else {
+            if !thegn_core::testenv::require_or_skip("bwrap on PATH", false) {
+                return;
+            }
+            unreachable!("unavailable bwrap prerequisite was reported as available");
+        };
+        let stage = RenderStage::new().unwrap();
+        if !thegn_core::testenv::require_or_skip(
+            "bwrap with user namespaces",
+            bwrap_usable(&bwrap, &stage),
+        ) {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let fake_home = base.path().join("home");
+        std::fs::create_dir(&fake_home).unwrap();
+        let secret = fake_home.join("secret.txt");
+        std::fs::write(&secret, "canary-secret").unwrap();
+        let outside = base.path().join("outside.txt");
+        let Some(sh) = thegn_core::util::which_path("sh").map(PathBuf::from) else {
+            if !thegn_core::testenv::require_or_skip("sh on PATH", false) {
+                return;
+            }
+            unreachable!("unavailable sh prerequisite was reported as available");
+        };
+        let script = "cat \"$1\" > \"$3/leak\" 2>/dev/null; echo ok > \"$3/made\"; echo pwned > \"$2\" 2>/dev/null; true";
+        let inner = [
+            sh.as_os_str().to_owned(),
+            OsString::from("-c"),
+            OsString::from(script),
+            OsString::from("sh"),
+            secret.as_os_str().to_owned(),
+            outside.as_os_str().to_owned(),
+            stage.path().as_os_str().to_owned(),
+        ];
+        let argv = renderer_bwrap_argv(stage.path(), Some(&fake_home), &[], None, &inner);
+        let mut command = Command::new(&bwrap);
+        command
+            .args(argv)
+            .env_clear()
+            .envs(renderer_env(std::env::vars_os(), stage.path()));
+        crate::preview_jobs::run_renderer(&mut command, &AtomicBool::new(false)).unwrap();
+        assert!(stage.path().join("made").is_file());
+        let leak = std::fs::read_to_string(stage.path().join("leak"));
+        assert!(match leak {
+            Ok(contents) => !contents.contains("canary-secret"),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        });
+        assert!(!outside.exists());
     }
 
     #[test]
