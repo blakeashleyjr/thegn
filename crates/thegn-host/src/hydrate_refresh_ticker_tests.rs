@@ -1,6 +1,7 @@
 //! Real production-thread regression with a finite, owned clock. No fixture
 //! starts a sampler, opens a database, resolves credentials, or runs a provider.
 use super::*;
+use crate::hydrate_schedule::{generation_is_current, scheduled_delivery};
 use std::sync::{Mutex, mpsc};
 use thegn_core::config::{CalendarAccount, CalendarProviderKind, Config};
 
