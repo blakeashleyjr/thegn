@@ -904,7 +904,7 @@ mod tests {
         for needle in [
             format!("{MAX_FIELD_BYTES} bytes"),
             format!("{MAX_LABEL_CHARS} characters"),
-            format!("{MAX_COMBINING_RUN} combining marks"),
+            format!("{MAX_COMBINING_RUN} combining accent marks"),
             format!("{MAX_ID_BYTES} bytes"),
             format!("{MAX_QUEUE_ITEMS} queue rows"),
             format!("{MAX_PLAYLISTS} playlists"),
@@ -942,8 +942,7 @@ mod tests {
         .admitted();
         assert!(zero_width.title.len() <= MAX_FIELD_BYTES);
         let zero_width_label = display_text(&zero_width.title);
-        assert!(zero_width_label.chars().count() <= MAX_LABEL_CHARS + 3);
-        assert!(!zero_width_label.contains('\u{200b}'));
+        assert!(zero_width_label.is_empty());
 
         let oversized_id = QueueItem {
             id: "x".repeat(MAX_ID_BYTES + 1),
