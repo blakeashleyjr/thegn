@@ -231,7 +231,7 @@ fn run_inner(
         Stream::Null => Stdio::null(),
         _ => Stdio::piped(),
     });
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
             return (
@@ -259,10 +259,10 @@ fn run_inner(
                     .name("thegn-proc-feed".to_owned())
                     .spawn(move || {
                         let result = stdin.write_all(&payload);
-                        drop(stdin);
                         if feed_tx.send(result).is_err() {
                             // The run ended before it could observe the writer result.
                         }
+                        drop(stdin);
                     });
                 match spawned {
                     Ok(handle) => drop(handle),
