@@ -649,6 +649,102 @@ fn contained_renderer_command_with_cancel(
     )
 }
 
+/// Doctor view of one document-preview renderer (THE-364): where it resolves
+/// and whether a preview would run it contained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RendererDoctorRow {
+    pub(crate) program: &'static str,
+    /// "ready" | "missing" | "shadowed" | "unverifiable"
+    pub(crate) state: &'static str,
+    pub(crate) path: Option<PathBuf>,
+    /// `RendererLookup::describe` text when not ready.
+    pub(crate) detail: Option<String>,
+    pub(crate) contained: bool,
+    /// "bwrap" | "uncontained: no usable bwrap" | "uncontained: Mermaid containment is not implemented" | "not run"
+    pub(crate) containment: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RendererDoctorReport {
+    pub(crate) bwrap: Option<PathBuf>,
+    pub(crate) bwrap_usable: bool,
+    pub(crate) rows: Vec<RendererDoctorRow>,
+}
+
+/// Pure: classify resolved lookups. Order of `lookups` is kept.
+fn renderer_doctor_rows(
+    lookups: Vec<(&'static str, Result<PathBuf, RendererLookup>)>,
+    bwrap_usable: bool,
+) -> Vec<RendererDoctorRow> {
+    lookups
+        .into_iter()
+        .map(|(program, lookup)| match lookup {
+            Ok(path) => {
+                let (contained, containment) = match program {
+                    "mmdc" => (false, "uncontained: Mermaid containment is not implemented"),
+                    "pdftoppm" | "pdftotext" if bwrap_usable => (true, "bwrap"),
+                    _ => (false, "uncontained: no usable bwrap"),
+                };
+                RendererDoctorRow {
+                    program,
+                    state: "ready",
+                    path: Some(path),
+                    detail: None,
+                    contained,
+                    containment,
+                }
+            }
+            Err(lookup) => {
+                let state = match &lookup {
+                    RendererLookup::Missing => "missing",
+                    RendererLookup::Shadowed(_) => "shadowed",
+                    RendererLookup::Unverifiable(_) => "unverifiable",
+                };
+                RendererDoctorRow {
+                    program,
+                    state,
+                    path: None,
+                    detail: Some(lookup.describe(program)),
+                    contained: false,
+                    containment: "not run",
+                }
+            }
+        })
+        .collect()
+}
+
+/// Effectful (spawns at most the one cached bwrap probe): resolve pdftoppm,
+/// pdftotext, and mmdc in that order for `previewed`.
+pub(crate) fn renderer_doctor_report(previewed: &Path) -> RendererDoctorReport {
+    let stage = match RenderStage::new() {
+        Ok(stage) => Some(stage),
+        Err(error) => {
+            tracing::debug!(target: "thegn::preview", %error, "renderer doctor staging unavailable");
+            None
+        }
+    };
+    let bwrap = match renderer_for("bwrap", previewed) {
+        Ok(path) => Some(path),
+        Err(_) => None,
+    };
+    let host_home = canonical_renderer_home(std::env::var_os("HOME").map(PathBuf::from));
+    let cancel = AtomicBool::new(false);
+    let bwrap_usable = stage.as_ref().is_some_and(|stage| {
+        bwrap
+            .as_deref()
+            .is_some_and(|bwrap| bwrap_usable(bwrap, stage, host_home.as_deref(), &cancel))
+    });
+    let lookups = ["pdftoppm", "pdftotext", "mmdc"]
+        .into_iter()
+        .map(|program| (program, renderer_for(program, previewed)))
+        .collect();
+    RendererDoctorReport {
+        bwrap,
+        bwrap_usable,
+        rows: renderer_doctor_rows(lookups, bwrap_usable),
+    }
+}
+
 /// Whether declared source dimensions are within the decode budget. Pure.
 fn check_dimensions(w: u32, h: u32, limits: DecodeLimits) -> Result<(), String> {
     if w == 0 || h == 0 {
@@ -1885,5 +1981,94 @@ mod tests {
     #[test]
     fn garbage_bytes_error_not_panic() {
         assert!(decode_and_fit(b"not an image", PREVIEW_LIMITS).is_err());
+    }
+
+    #[test]
+    fn renderer_doctor_rows_never_report_mermaid_contained() {
+        let rows = renderer_doctor_rows(vec![("mmdc", Ok(PathBuf::from("/usr/bin/mmdc")))], true);
+        assert!(!rows[0].contained);
+        assert_eq!(
+            rows[0].containment,
+            "uncontained: Mermaid containment is not implemented"
+        );
+    }
+
+    #[test]
+    fn renderer_doctor_rows_contain_pdf_renderers_only_with_usable_bwrap() {
+        let lookups = || {
+            vec![
+                ("pdftoppm", Ok(PathBuf::from("/usr/bin/pdftoppm"))),
+                ("pdftotext", Ok(PathBuf::from("/usr/bin/pdftotext"))),
+            ]
+        };
+        let contained = renderer_doctor_rows(lookups(), true);
+        assert!(contained.iter().all(|row| row.contained));
+        assert!(contained.iter().all(|row| row.containment == "bwrap"));
+
+        let uncontained = renderer_doctor_rows(lookups(), false);
+        assert!(uncontained.iter().all(|row| !row.contained));
+        assert!(
+            uncontained
+                .iter()
+                .all(|row| { row.containment == "uncontained: no usable bwrap" })
+        );
+    }
+
+    #[test]
+    fn renderer_doctor_rows_report_missing_shadowed_and_unverifiable_as_not_run() {
+        let shadowed = PathBuf::from("/repo/bin/pdftotext");
+        let rows = renderer_doctor_rows(
+            vec![
+                ("pdftoppm", Err(RendererLookup::Missing)),
+                ("pdftotext", Err(RendererLookup::Shadowed(shadowed.clone()))),
+                (
+                    "mmdc",
+                    Err(RendererLookup::Unverifiable("fixture failure".to_string())),
+                ),
+            ],
+            true,
+        );
+        assert_eq!(rows[0].state, "missing");
+        assert_eq!(
+            rows[0].detail.as_deref(),
+            Some("pdftoppm not found on PATH")
+        );
+        assert_eq!(rows[1].state, "shadowed");
+        let shadowed_detail = format!(
+            "pdftotext at {} is inside the previewed repository or one of its worktrees; refusing to run it",
+            shadowed.display()
+        );
+        assert_eq!(rows[1].detail.as_deref(), Some(shadowed_detail.as_str()));
+        assert_eq!(rows[2].state, "unverifiable");
+        assert_eq!(
+            rows[2].detail.as_deref(),
+            Some(
+                "cannot verify mmdc: the previewed repository's worktrees are unreadable (fixture failure); refusing to run it"
+            )
+        );
+        assert!(
+            rows.iter().all(|row| {
+                row.path.is_none() && !row.contained && row.containment == "not run"
+            })
+        );
+    }
+
+    #[test]
+    fn renderer_doctor_report_lists_the_three_renderers_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let previewed = temp.path().join("preview.md");
+        std::fs::write(&previewed, "preview").unwrap();
+
+        let report = renderer_doctor_report(&previewed);
+
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .map(|row| row.program)
+                .collect::<Vec<_>>(),
+            ["pdftoppm", "pdftotext", "mmdc"]
+        );
+        assert!(!report.rows[2].contained);
     }
 }
