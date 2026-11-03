@@ -1321,6 +1321,18 @@ mod tests {
         let worktree = tempfile::tempdir().expect("isolated worktree");
         let _state = crate::testenv::IsolatedState::new();
         let db = Db::open_memory().expect("in-memory db");
+        let worktree_path = worktree.path().to_string_lossy().into_owned();
+        db.put_workspace(&worktree_path, "test", "dir")
+            .expect("register workspace");
+        db.put_worktree(
+            "test/main",
+            &worktree_path,
+            &worktree_path,
+            "main",
+            None,
+            None,
+        )
+        .expect("register worktree");
         let config = Config {
             sandbox: thegn_core::config::SandboxConfig {
                 enabled: false,
@@ -1329,8 +1341,8 @@ mod tests {
             ..cfg()
         };
         let spec = OpenSpec {
-            cwd: Some(worktree.path().to_string_lossy().into_owned()),
-            worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            cwd: Some(worktree_path.clone()),
+            worktree: Some(worktree_path.clone()),
             ..OpenSpec::default()
         };
         let launch = AgentLaunch {
@@ -1354,11 +1366,15 @@ mod tests {
         let rendered = command_for(&config, "claude", &launch.prompt, true, None, false, None)
             .expect("oversized prompt renders");
         assert!(
-            message.contains(&format!("{} bytes, over 102400 byte limit", rendered.len())),
+            message.contains(&format!(
+                "{} bytes, over the {} byte limit",
+                rendered.len(),
+                crate::agent_run::MAX_RENDERED_COMMAND_BYTES
+            )),
             "error must report rendered and permitted byte sizes: {message}"
         );
         assert_eq!(
-            db.worktree_agent(worktree.path().to_string_lossy().as_ref())
+            db.worktree_agent(&worktree_path)
                 .expect("worktree agent read"),
             None
         );
@@ -1402,6 +1418,18 @@ mod tests {
         let worktree = tempfile::tempdir().expect("isolated worktree");
         let _state = crate::testenv::IsolatedState::new();
         let db = Db::open_memory().expect("in-memory db");
+        let worktree_path = worktree.path().to_string_lossy().into_owned();
+        db.put_workspace(&worktree_path, "test", "dir")
+            .expect("register workspace");
+        db.put_worktree(
+            "test/main",
+            &worktree_path,
+            &worktree_path,
+            "main",
+            None,
+            None,
+        )
+        .expect("register worktree");
         let config = Config {
             sandbox: thegn_core::config::SandboxConfig {
                 enabled: false,
@@ -1410,15 +1438,15 @@ mod tests {
             ..cfg()
         };
         let spec = OpenSpec {
-            cwd: Some(worktree.path().to_string_lossy().into_owned()),
-            worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            cwd: Some(worktree_path.clone()),
+            worktree: Some(worktree_path.clone()),
             ..OpenSpec::default()
         };
         let launch = AgentLaunch {
             agent: "claude".into(),
             prompt: "x".repeat(4 * 1024),
             headless: Some(true),
-            bind_worktree: false,
+            bind_worktree: true,
             resume: None,
             continue_last: false,
             stage: None,
@@ -1433,6 +1461,13 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "THEGN_PROMPT" && value == &launch.prompt),
             "the small prompt remains in the launch environment"
+        );
+        assert_eq!(
+            db.worktree_agent(&worktree_path)
+                .expect("worktree agent read")
+                .as_deref(),
+            Some("claude"),
+            "the small prompt still binds the selected agent"
         );
     }
 }
