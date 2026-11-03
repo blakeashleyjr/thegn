@@ -198,7 +198,8 @@ else. A week is how long you have to notice.
   already past its grace period, now. `--force` ignores the remaining
   time and clears the lot.
   `thegn merge sweep` exits non-zero when a local worktree was refused or only
-  partly cleaned up, so scripts can tell. Existing THE-596 branch holds and
+  partly cleaned up, so scripts can tell. A `claim_busy` or `merge_claimed`
+  refusal also makes that sweep incomplete. Existing THE-596 branch holds and
   rows that cannot be identified as belonging to this repository are reported
   as informational and do not change the exit status.
   `thegn merge sweep --json` prints the same result as one JSON document; each

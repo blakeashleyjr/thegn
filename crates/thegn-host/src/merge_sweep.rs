@@ -2722,16 +2722,7 @@ mod retry_tests {
     fn cleanup_retry_merge_claimed_refusal_writes_no_marker() {
         let fixture = refused_fixture("retry-merge-claimed");
         clear_dispatch(&fixture);
-        rusqlite::Connection::open(&fixture.db_path)
-            .unwrap()
-            .execute(
-                "UPDATE merge_queue SET claim_owner='other-drain-token', claim_generation=claim_generation+1, claim_phase='claimed_no_child', claim_lease_until_ms=?2, claim_owner_hint='other-drain' WHERE worktree=?1",
-                rusqlite::params![
-                    fixture.worktree.to_string_lossy().as_ref(),
-                    util::now_ms() + 60_000,
-                ],
-            )
-            .unwrap();
+        let _claim = claim_landed_fixture(&fixture);
         let before = fixture.db.list_merge_queue().unwrap();
 
         let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
@@ -2749,11 +2740,12 @@ mod retry_tests {
     fn cleanup_retry_expired_merge_claim_does_not_block_cleanup() {
         let fixture = refused_fixture("retry-expired-merge-claim");
         clear_dispatch(&fixture);
+        let claim = claim_landed_fixture(&fixture);
         rusqlite::Connection::open(&fixture.db_path)
             .unwrap()
             .execute(
-                "UPDATE merge_queue SET claim_owner='other-drain-token', claim_generation=claim_generation+1, claim_phase='claimed_no_child', claim_lease_until_ms=1, claim_owner_hint='other-drain' WHERE worktree=?1",
-                [fixture.worktree.to_string_lossy().as_ref()],
+                "UPDATE merge_queue SET claim_lease_until_ms=1 WHERE worktree=?1",
+                [claim.worktree.as_str()],
             )
             .unwrap();
 
@@ -2765,6 +2757,47 @@ mod retry_tests {
                 entry.class == crate::merge_lifecycle::CleanupRefusal::MergeClaimed
             })
         );
+    }
+
+    fn claim_landed_fixture(fixture: &RetryFixture) -> thegn_core::store::MergeClaim {
+        let row = fixture
+            .db
+            .list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == fixture.worktree.to_string_lossy().as_ref())
+            .expect("fixture has a landed queue row");
+        let commit = row.result_oid.expect("landed fixture has a result OID");
+        let worktree = fixture.worktree.to_string_lossy().into_owned();
+        fixture
+            .db
+            .update_merge_status(&worktree, "queued", None, None, None)
+            .unwrap();
+        let claim = fixture
+            .db
+            .admit_merge_claim(&thegn_core::store::MergeClaimRequest {
+                worktree,
+                branch: row.branch,
+                repo_root: fixture.root.to_string_lossy().into_owned(),
+                target_branch: row.target_branch,
+                location: row.location,
+                expected_status: "queued".into(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: Some("other-drain".into()),
+            })
+            .unwrap()
+            .expect("claim admitted for fixture row");
+        fixture
+            .db
+            .land_merge_status_claimed(
+                &claim,
+                &thegn_core::store::MergeStatusFields {
+                    result_oid: Some(commit.clone()),
+                    ..Default::default()
+                },
+                &commit,
+            )
+            .unwrap()
     }
 
     #[test]
