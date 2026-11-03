@@ -277,7 +277,7 @@ pub fn worktree_from_container_name(db: &Db, name: &str) -> Option<String> {
     };
     rows.iter()
         .find(|row| owns(&row.worktree, name))
-        .or_else(|| rows.iter().find(|row| owns(&row.worktree, &lookup)))
+        .or_else(|| rows.iter().find(|row| owns(&row.worktree, lookup)))
         .map(|row| row.worktree.clone())
 }
 

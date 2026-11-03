@@ -5167,8 +5167,10 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
     // than allow-listing exact names: profile, sidecar, and service containers
     // must not be misread as orphans and force-removed while their worktree lives.
     // Try the unstripped name first because a real worktree slug may end in a
-    // companion suffix. If that aliases one worktree's main container and
-    // another's companion, keep it (fail-closed over-keep), never remove it.
+    // companion suffix. This check can only add keeps; names without a companion
+    // suffix keep the existing behavior. If that aliases one worktree's main
+    // container and another's companion, keep it (fail-closed over-keep),
+    // never remove it.
     // Reaping is fail-closed: any container that maps to an active worktree by any
     // of these forms is kept.
     let active_bases: Vec<Vec<String>> = active_worktrees
