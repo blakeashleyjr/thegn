@@ -61,9 +61,12 @@ pub struct CalendarDiagnosticCounts {
     pub overflow: i64,
 }
 
+/// Last recorded diagnostics for one calendar account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalendarDiagnosticsRow {
+    /// Configured calendar account name.
     pub account: String,
+    /// Parser diagnostic counts recorded for the last applied page.
     pub counts: CalendarDiagnosticCounts,
     /// When the page was applied (`util::now()`).
     pub recorded_at: i64,
