@@ -5,8 +5,9 @@ name: sandbox-image
 # out nothing, pushes each archive by digest under a generation-qualified tag,
 # assembles and verifies the list from those digests, then attests the list and
 # both children before printing its digest for DEFAULT_BASE_DIGEST.
-# The publisher refuses a destination tag that moved during the run and reads it back after the push.
 # (crates/thegn-core/src/image.rs).
+# The publisher refuses a destination tag that moved during the run and reads
+# it back after the push.
 # Per-run architecture tags remain in GHCR; retention cleanup is tracked under THE-502.
 #
 # Registry pull is the ALTERNATE delivery route (the default is registry-less
@@ -156,11 +157,18 @@ jobs:
             skopeo inspect --raw --authfile "$HOME/.docker/config.json" \
               "docker://$IMAGE:$TAG" >"$raw" 2>"$err" || status=$?
             if [[ $status == 0 ]]; then
-              echo "sha256:$(sha256sum "$raw" | cut -d ' ' -f1)"
+              digest="sha256:$(sha256sum "$raw" | cut -d ' ' -f1)" || {
+                rm -f "$raw" "$err"
+                return 1
+              }
+              rm -f "$raw" "$err"
+              echo "$digest"
             elif grep -qiE 'manifest unknown|name unknown' "$err"; then
+              rm -f "$raw" "$err"
               echo absent
             else
               cat "$err" >&2
+              rm -f "$raw" "$err"
               return 1
             fi
           }
@@ -227,11 +235,18 @@ jobs:
             skopeo inspect --raw --authfile "$HOME/.docker/config.json" \
               "docker://$IMAGE:$TAG" >"$raw" 2>"$err" || status=$?
             if [[ $status == 0 ]]; then
-              echo "sha256:$(sha256sum "$raw" | cut -d ' ' -f1)"
+              digest="sha256:$(sha256sum "$raw" | cut -d ' ' -f1)" || {
+                rm -f "$raw" "$err"
+                return 1
+              }
+              rm -f "$raw" "$err"
+              echo "$digest"
             elif grep -qiE 'manifest unknown|name unknown' "$err"; then
+              rm -f "$raw" "$err"
               echo absent
             else
               cat "$err" >&2
+              rm -f "$raw" "$err"
               return 1
             fi
           }
@@ -277,11 +292,18 @@ jobs:
             skopeo inspect --raw --authfile "$HOME/.docker/config.json" \
               "docker://$IMAGE:$TAG" >"$raw" 2>"$err" || status=$?
             if [[ $status == 0 ]]; then
-              echo "sha256:$(sha256sum "$raw" | cut -d ' ' -f1)"
+              digest="sha256:$(sha256sum "$raw" | cut -d ' ' -f1)" || {
+                rm -f "$raw" "$err"
+                return 1
+              }
+              rm -f "$raw" "$err"
+              echo "$digest"
             elif grep -qiE 'manifest unknown|name unknown' "$err"; then
+              rm -f "$raw" "$err"
               echo absent
             else
               cat "$err" >&2
+              rm -f "$raw" "$err"
               return 1
             fi
           }
