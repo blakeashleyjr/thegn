@@ -74,3 +74,6 @@ establish a live regression. No cadence/cache/resync policy changes are included
 
 The benchmark protocol that defines timing boundaries, fixtures, sampling and thresholds for comparing runs is in
 [performance-benchmark-protocol.md](performance-benchmark-protocol.md).
+
+Which background workers exist, what wakes them and what bounds them is inventoried in
+[runtime-workers.md](runtime-workers.md).
