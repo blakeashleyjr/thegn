@@ -148,6 +148,7 @@ impl Db {
 mod tests {
     use super::*;
     use crate::ci_log::{HARD_MAX_LOG_BYTES, HARD_MAX_LOG_LINES, REDACTION_MARKER};
+    use crate::store::CacheStore;
 
     fn raw_entry(text: String) -> CiLogEntry {
         let mut entry = CiLogEntry::new("/wt/ci", "run", "job", "tests", "ordinary\n", 20, 1024, 1);
@@ -347,7 +348,6 @@ mod tests {
 
     #[test]
     fn ci_log_cache_round_trips_the_provider_context() {
-        use crate::store::CacheStore;
         let db = Db::open_memory().unwrap();
         let mut entry = CiLogEntry::new("/wt/a", "run", "job", "tests", "log", 10, 1024, 1);
         entry.head_sha = "sha".into();
