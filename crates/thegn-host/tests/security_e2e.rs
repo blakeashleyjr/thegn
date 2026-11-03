@@ -857,9 +857,8 @@ fn with_fake_listener(
         };
         (captured, report)
     });
-    if let Err(error) = fs::remove_file(socket) {
-        tracing::debug!(target: "security_e2e", %error, path = %socket.display(), "remove fake listener socket");
-    }
+    // The socket is inside a temporary directory, so cleanup is best-effort.
+    let _remove_result = fs::remove_file(socket);
     (captured, report)
 }
 
@@ -956,7 +955,7 @@ fn assert_pane_cannot_replace_daemon_socket(fixture: &mut Fixture, label: &str) 
 
     let after_socket = fs::symlink_metadata(&fixture.socket);
     assert!(
-        after_socket.is_ok_and(|metadata| {
+        after_socket.as_ref().is_ok_and(|metadata| {
             std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
                 && (
                     std::os::unix::fs::MetadataExt::dev(&metadata),
@@ -969,7 +968,7 @@ fn assert_pane_cannot_replace_daemon_socket(fixture: &mut Fixture, label: &str) 
     if let Some(before_lock) = lock_identity {
         let after_lock = fs::symlink_metadata(&lock);
         assert!(
-            after_lock.is_ok_and(|metadata| {
+            after_lock.as_ref().is_ok_and(|metadata| {
                 !metadata.file_type().is_symlink()
                     && (
                         std::os::unix::fs::MetadataExt::dev(&metadata),
@@ -1001,7 +1000,7 @@ fn security_e2e_host_client_sends_nothing_to_a_listener_in_a_shared_parent() {
         .expect("shared-parent fixture directory");
     fs::set_permissions(
         directory.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o777).into(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
     )
     .expect("make fake listener parent shared");
     let socket = directory.path().join("daemon.sock");
@@ -1040,11 +1039,8 @@ fn security_e2e_host_client_sends_nothing_through_a_symlinked_socket_parent() {
         .expect("symlink-parent fixture directory");
     let real = directory.path().join("real");
     fs::create_dir(&real).expect("create real private listener parent");
-    fs::set_permissions(
-        &real,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700).into(),
-    )
-    .expect("make real listener parent private");
+    fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("make real listener parent private");
     let alias = directory.path().join("alias");
     std::os::unix::fs::symlink(&real, &alias).expect("symlink listener parent");
     let listener_socket = real.join("daemon.sock");
@@ -1112,6 +1108,7 @@ fn security_e2e_fake_listener_counts_a_real_client() {
     let preflight_listener = bind_probe.expect("preflight Unix socket bind");
     drop(preflight_listener);
     fs::remove_file(&socket).expect("remove preflight socket");
+    // The client connects before stop is set; accept drains the backlog before checking the flag.
     let (captured, report) = with_fake_listener(&socket, || {
         let mut stream = std::os::unix::net::UnixStream::connect(&socket)
             .expect("connect real fake-listener client");
