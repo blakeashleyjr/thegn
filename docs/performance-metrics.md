@@ -43,6 +43,23 @@ terminal or relay. It does not acknowledge physical paint or an application's
 response. Hardware/terminal/reader buffering before host observation remains
 outside coverage. Input without display damage can wait for unrelated frames.
 
+**Background admission.** The separate `sched admission` event reports
+`sched_admitted`, `sched_refused`, `sched_unavailable`, `sched_started`,
+`sched_finished`, `sched_in_flight`, `sched_queued`, `sched_wait_samples`,
+`sched_wait_mean_us`, `sched_wait_max_us`, `sched_service_samples`,
+`sched_service_mean_us`, and `sched_service_max_us`. These are cumulative since
+process start, not per interval. Wait and service samples are collected only
+while perf diagnostics are enabled; zero samples means timing was unobserved,
+including when work completed with diagnostics off. `sched_refused` counts every
+saturated submission; the older scheduler debug counter counts only
+replaceable refusals. This ledger excludes direct `spawn_blocking` and
+`std::thread` workers. Its fixed storage is eleven `AtomicU64`s (88 bytes),
+with no labels, locks, or timer. At most `BG_PERMITS` boxed closures can be
+queued or running; each carries its permit and, only while timing is enabled,
+up to two `Instant`s across queued and running work. `sched_in_flight` is
+admitted minus finished, and `sched_queued` is admitted minus started.
+Finished includes panicked work.
+
 Version 2 fixes idle dispatch omission and preserves earliest pending input
 instead of overwriting it. Those corrections and expanded model-call coverage
 must not be compared to old rollups as if instrumentation were unchanged.
