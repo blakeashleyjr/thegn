@@ -17,8 +17,19 @@ pub const OVERRIDE_FORCE_DONE: &str = "force_done";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeadProof<'a> {
     Unbound,
-    Lease { name: &'a str, owner: &'a str },
-    Admin { why: &'a str },
+    Lease {
+        name: &'a str,
+        owner: &'a str,
+    },
+    /// A lease proof presenting the generation returned by acquire; stale generations are refused after reacquisition.
+    Fenced {
+        name: &'a str,
+        owner: &'a str,
+        generation: i64,
+    },
+    Admin {
+        why: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +44,11 @@ pub enum LeadLeaseConflict {
     Mismatch {
         bound: String,
         presented: String,
+    },
+    StaleGeneration {
+        lease: String,
+        presented: i64,
+        current: i64,
     },
 }
 
@@ -54,6 +70,14 @@ impl std::fmt::Display for LeadLeaseConflict {
                 f,
                 "dispatch row is bound to Lead lease {bound:?}, not {presented:?}; acquire it with `thegn dispatch lease acquire --name <lease> --owner <you>` and pass `--lease/--owner`, or use `--admin --why '<reason>'`"
             ),
+            Self::StaleGeneration {
+                lease,
+                presented,
+                current,
+            } => write!(
+                f,
+                "Lead lease {lease:?} generation {presented} is stale (current generation {current}); the lease was re-acquired since this Lead took it. Re-read the roster and reacquire the lease before deciding again"
+            ),
         }
     }
 }
@@ -66,30 +90,53 @@ fn lead_check(
     now: i64,
 ) -> Result<Option<String>> {
     match proof {
-        LeadProof::Lease { name, owner } => {
+        LeadProof::Lease { name, owner } | LeadProof::Fenced { name, owner, .. } => {
             validate_lease_text("name", name)?;
             validate_lease_text("owner", owner)?;
+            let presented_generation = match proof {
+                LeadProof::Fenced { generation, .. } => {
+                    if generation <= 0 {
+                        return Err(anyhow::Error::new(LeaseInputError {
+                            field: "generation",
+                            reason: "must be positive",
+                        }));
+                    }
+                    Some(generation)
+                }
+                _ => None,
+            };
             if let Some(other) = bound.iter().find(|lease| lease.as_str() != name) {
                 return Err(anyhow::Error::new(LeadLeaseConflict::Mismatch {
                     bound: other.clone(),
                     presented: name.to_string(),
                 }));
             }
-            let row: Option<(String, i64)> = conn
+            let row: Option<(String, i64, i64)> = conn
                 .query_row(
-                    "SELECT owner, expires_at_ms FROM pipeline_leases WHERE name=?1",
+                    "SELECT owner, expires_at_ms, generation FROM pipeline_leases WHERE name=?1",
                     [name],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            if !matches!(row.as_ref(), Some((held, expires)) if held.as_str() == owner && *expires > now)
+            let current_generation = row.as_ref().map(|(_, _, generation)| *generation);
+            if !matches!(row.as_ref(), Some((held, expires, _)) if held.as_str() == owner && *expires > now)
             {
                 let holder = row
-                    .filter(|(_, expires)| *expires > now)
-                    .map(|(held, _)| held);
+                    .as_ref()
+                    .filter(|(_, expires, _)| *expires > now)
+                    .map(|(held, _, _)| held.clone());
                 return Err(anyhow::Error::new(LeadLeaseConflict::NotHeld {
                     lease: name.to_string(),
                     holder,
+                }));
+            }
+            if let (Some(presented), Some(current)) = (presented_generation, current_generation)
+                && presented != current
+            {
+                return Err(anyhow::Error::new(LeadLeaseConflict::StaleGeneration {
+                    lease: name.to_string(),
+                    presented,
+                    current,
                 }));
             }
             Ok(None)
@@ -725,7 +772,7 @@ impl Db {
                 self.validate_parent_edge(parent_id, new.issue_id)?;
             }
             let id = self.put_agent_dispatch(new)?;
-            if let LeadProof::Lease { name, .. } = proof {
+            if let LeadProof::Lease { name, .. } | LeadProof::Fenced { name, .. } = proof {
                 conn.execute(
                     "UPDATE agent_dispatches SET lead_lease=?1 WHERE id=?2",
                     rusqlite::params![name, id],
@@ -1154,18 +1201,32 @@ impl Db {
     /// same owner always succeeds, so a live monitor keeps its own lease by
     /// heartbeating.
     ///
-    /// One `INSERT … ON CONFLICT DO UPDATE … WHERE` statement, so acquisition is
-    /// atomic: the `WHERE` decides, inside the write lock, whether the existing
-    /// row may be taken over. Each acquisition also deletes at most 256 expired
-    /// rows, bounding cleanup work while the expiry index avoids a table scan.
-    /// Lease names and owners are each capped at 128 bytes, so valid rows add
-    /// at most 64 KiB of identity text to one cleanup batch.
+    /// See [`Self::acquire_pipeline_lease_fenced`] for the generation returned
+    /// by this compatibility form.
     pub fn acquire_pipeline_lease(
         &self,
         name: &str,
         owner: &str,
         ttl_secs: i64,
     ) -> Result<std::result::Result<(), String>> {
+        Ok(self
+            .acquire_pipeline_lease_fenced(name, owner, ttl_secs)?
+            .map(|_| ()))
+    }
+
+    /// Take (or renew) a lease and return its monotonic fencing generation.
+    /// A live renewal by the same owner preserves its generation; an absent,
+    /// expired, or legacy generation-zero lease receives a new global value.
+    /// The counter survives row release and expiry cleanup, so deleting a lease
+    /// cannot make a later acquisition reuse an earlier generation.
+    /// Each acquisition also deletes at most 256 expired rows, bounding cleanup
+    /// work while the expiry index avoids a table scan.
+    pub fn acquire_pipeline_lease_fenced(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl_secs: i64,
+    ) -> Result<std::result::Result<i64, String>> {
         validate_lease_text("name", name)?;
         validate_lease_text("owner", owner)?;
         if !(MIN_LEASE_TTL_SECS..=MAX_LEASE_TTL_SECS).contains(&ttl_secs) {
@@ -1186,7 +1247,21 @@ impl Db {
             })?;
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<std::result::Result<(), String>> {
+        let result = (|| -> Result<std::result::Result<i64, String>> {
+            let current: Option<(String, i64, i64)> = conn
+                .query_row(
+                    "SELECT owner, expires_at_ms, generation FROM pipeline_leases WHERE name=?1",
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((held, expires_at_ms, _)) = current.as_ref()
+                && *expires_at_ms > now
+                && held.as_str() != owner
+            {
+                return Ok(Err(held.clone()));
+            }
+
             conn.execute(
                 "DELETE FROM pipeline_leases
                  WHERE rowid IN (
@@ -1196,29 +1271,36 @@ impl Db {
                  )",
                 rusqlite::params![now, name],
             )?;
-            let changed = conn.execute(
-                "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)
+            let generation = match current {
+                Some((_, expires_at_ms, generation)) if expires_at_ms > now && generation > 0 => {
+                    generation
+                }
+                _ => {
+                    let changed = conn.execute(
+                        "UPDATE pipeline_lease_fence SET last_generation = last_generation + 1 WHERE id = 1",
+                        [],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("pipeline lease fence row is missing");
+                    }
+                    conn.query_row(
+                        "SELECT last_generation FROM pipeline_lease_fence WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )?
+                }
+            };
+            conn.execute(
+                "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms, generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(name) DO UPDATE SET
                    owner=excluded.owner,
                    acquired_at_ms=excluded.acquired_at_ms,
-                   expires_at_ms=excluded.expires_at_ms
-                 WHERE pipeline_leases.owner = excluded.owner
-                    OR pipeline_leases.expires_at_ms <= ?3",
-                rusqlite::params![name, owner, now, expires],
+                   expires_at_ms=excluded.expires_at_ms,
+                   generation=excluded.generation",
+                rusqlite::params![name, owner, now, expires, generation],
             )?;
-            if changed > 0 {
-                return Ok(Ok(()));
-            }
-            let holder = conn
-                .query_row(
-                    "SELECT owner FROM pipeline_leases WHERE name=?1",
-                    [name],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-                .ok_or_else(|| anyhow::anyhow!("lease row disappeared during acquisition"))?;
-            Ok(Err(holder))
+            Ok(Ok(generation))
         })();
         match result {
             Ok(outcome) => {
@@ -1230,6 +1312,19 @@ impl Db {
                 Err(err)
             }
         }
+    }
+
+    /// Return the stored generation for a lease, including an expired row.
+    pub fn pipeline_lease_generation(&self, name: &str) -> Result<Option<i64>> {
+        validate_lease_text("name", name)?;
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT generation FROM pipeline_leases WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Renew a live lease only while it is still held by `owner`.
@@ -1609,7 +1704,7 @@ impl Db {
                 return Ok(Err(DispatchAdmissionDecision::Claim(decision)));
             }
             let id = self.put_agent_dispatch(new)?;
-            if let LeadProof::Lease { name, .. } = proof {
+            if let LeadProof::Lease { name, .. } | LeadProof::Fenced { name, .. } = proof {
                 conn.execute(
                     "UPDATE agent_dispatches SET lead_lease=?1 WHERE id=?2",
                     rusqlite::params![name, id],
@@ -1777,7 +1872,7 @@ impl Db {
                     return Ok(Err(decision));
                 }
                 let finisher = self.put_agent_dispatch(new)?;
-                if let LeadProof::Lease { name, .. } = proof {
+                if let LeadProof::Lease { name, .. } | LeadProof::Fenced { name, .. } = proof {
                     conn.execute(
                         "UPDATE agent_dispatches SET lead_lease=?1 WHERE id=?2",
                         rusqlite::params![name, finisher],
@@ -2441,6 +2536,261 @@ mod tests {
                 .is_err()
         );
         assert!(db.pipeline_lease_row("release-error").unwrap().is_some());
+    }
+
+    #[test]
+    fn lease_generation_is_monotonic_across_takeover_release_and_cleanup() {
+        let db = Db::open_memory().unwrap();
+        let g1 = db
+            .acquire_pipeline_lease_fenced("g", "a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g1 > 0);
+        assert_eq!(
+            db.acquire_pipeline_lease_fenced("g", "a", MIN_LEASE_TTL_SECS)
+                .unwrap(),
+            Ok(g1)
+        );
+        db.renew_pipeline_lease("g", "a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.pipeline_lease_generation("g").unwrap(), Some(g1));
+
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET expires_at_ms=1 WHERE name='g'",
+                [],
+            )
+            .unwrap();
+        let g2 = db
+            .acquire_pipeline_lease_fenced("g", "b", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g2 > g1);
+        db.release_pipeline_lease_row("g", "b").unwrap();
+        let g3 = db
+            .acquire_pipeline_lease_fenced("g", "a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g3 > g2);
+        let g4 = db
+            .acquire_pipeline_lease_fenced("h", "a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g4 > g3);
+
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET expires_at_ms=1 WHERE name='g'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.acquire_pipeline_lease_fenced("h", "a", MIN_LEASE_TTL_SECS)
+                .unwrap(),
+            Ok(g4),
+            "a live same-owner acquire renews without consuming a generation"
+        );
+        assert_eq!(db.pipeline_lease_row("g").unwrap(), None);
+        let g5 = db
+            .acquire_pipeline_lease_fenced("g", "a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g5 > g4);
+    }
+
+    #[test]
+    fn same_owner_reacquire_after_expiry_gets_a_new_generation() {
+        let db = Db::open_memory().unwrap();
+        let g1 = db
+            .acquire_pipeline_lease_fenced("same-owner", "a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET expires_at_ms=1 WHERE name='same-owner'",
+                [],
+            )
+            .unwrap();
+        let g2 = db
+            .acquire_pipeline_lease_fenced("same-owner", "a", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g2 > g1);
+    }
+
+    #[test]
+    fn fenced_proof_with_a_stale_generation_is_refused_and_writes_nothing() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:F-1";
+        let g1 = db
+            .acquire_pipeline_lease_fenced(lease, "lead", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE pipeline_leases SET expires_at_ms=1 WHERE name=?1",
+                [lease],
+            )
+            .unwrap();
+        let g2 = db
+            .acquire_pipeline_lease_fenced(lease, "lead", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g2 > g1);
+        let before = db.list_dispatches().unwrap();
+        let stale = db.put_dispatch_with_parent_check_led(
+            crate::issue::NewDispatch::new("linear:F-1", "/wt/f", "a"),
+            LeadProof::Fenced {
+                name: lease,
+                owner: "lead",
+                generation: g1,
+            },
+        );
+        assert!(matches!(
+            stale,
+            Err(ref error) if error.downcast_ref::<LeadLeaseConflict>() == Some(&LeadLeaseConflict::StaleGeneration {
+                lease: lease.to_string(),
+                presented: g1,
+                current: g2,
+            })
+        ));
+        assert_eq!(db.list_dispatches().unwrap(), before);
+
+        let id = db
+            .put_dispatch_with_parent_check_led(
+                crate::issue::NewDispatch::new("linear:F-1", "/wt/f", "a"),
+                LeadProof::Fenced {
+                    name: lease,
+                    owner: "lead",
+                    generation: g2,
+                },
+            )
+            .unwrap();
+        let bound: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT lead_lease FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound.as_deref(), Some(lease));
+    }
+
+    #[test]
+    fn fenced_proof_rejects_non_positive_generation() {
+        let db = Db::open_memory().unwrap();
+        for generation in [0, -1] {
+            let result = db.put_dispatch_with_parent_check_led(
+                crate::issue::NewDispatch::new("linear:F-2", "/wt/f", "a"),
+                LeadProof::Fenced {
+                    name: "repo:linear:F-2",
+                    owner: "lead",
+                    generation,
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(ref error) if error.downcast_ref::<LeaseInputError>() == Some(&LeaseInputError {
+                    field: "generation",
+                    reason: "must be positive",
+                })
+            ));
+        }
+        assert!(db.list_dispatches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fenced_proof_on_another_owners_lease_is_not_held() {
+        let db = Db::open_memory().unwrap();
+        let generation = db
+            .acquire_pipeline_lease_fenced("held", "x", MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        let result = db.put_dispatch_with_parent_check_led(
+            crate::issue::NewDispatch::new("linear:F-3", "/wt/f", "a"),
+            LeadProof::Fenced {
+                name: "held",
+                owner: "y",
+                generation,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ref error) if matches!(
+                error.downcast_ref::<LeadLeaseConflict>(),
+                Some(LeadLeaseConflict::NotHeld { lease, .. }) if lease == "held"
+            )
+        ));
+        assert!(db.list_dispatches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_acquire_has_exactly_one_owner() {
+        let (db, dir) = temp_db();
+        drop(db);
+        let path = dir.path().join("thegn.db");
+        let first_db = Db::open_at(&path).unwrap();
+        let second_db = Db::open_at(&path).unwrap();
+        // Both connections start from the same initialized database and meet before either transaction.
+        let barrier = std::sync::Barrier::new(2);
+        let (first_result, second_result) = std::thread::scope(|scope| {
+            let first_barrier = &barrier;
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first_db.acquire_pipeline_lease_fenced("race", "first", MIN_LEASE_TTL_SECS)
+            });
+            let second_barrier = &barrier;
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                second_db.acquire_pipeline_lease_fenced("race", "second", MIN_LEASE_TTL_SECS)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let first_result = first_result.unwrap();
+        let second_result = second_result.unwrap();
+        let winner = match (first_result, second_result) {
+            (Ok(_), Err(owner)) => owner,
+            (Err(owner), Ok(_)) => owner,
+            outcomes => panic!("expected one winner and one observed holder, got {outcomes:?}"),
+        };
+        let winner_db = Db::open_at(&path).unwrap();
+        let stored = winner_db.pipeline_lease_row("race").unwrap().unwrap().0;
+        assert_eq!(stored, winner);
+    }
+
+    #[test]
+    fn acquire_rolls_back_on_storage_error() {
+        let db = Db::open_memory().unwrap();
+        let before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_generation FROM pipeline_lease_fence WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_lease_fence BEFORE UPDATE ON pipeline_lease_fence \
+                 BEGIN SELECT RAISE(ABORT, 'fence refused'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.acquire_pipeline_lease_fenced("fresh", "owner", MIN_LEASE_TTL_SECS)
+                .is_err()
+        );
+        assert_eq!(db.pipeline_lease_row("fresh").unwrap(), None);
+        let after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_generation FROM pipeline_lease_fence WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

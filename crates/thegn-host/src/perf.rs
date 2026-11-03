@@ -1186,6 +1186,26 @@ impl LoopPerf {
             "perf rollup"
         );
 
+        // Background admission (sched.rs): cumulative since process start, like db_open.
+        let sched = crate::sched::admission_snapshot();
+        tracing::info!(
+            target: "thegn::perf",
+            sched_admitted = sched.admitted,
+            sched_refused = sched.refused,
+            sched_unavailable = sched.unavailable,
+            sched_started = sched.started,
+            sched_finished = sched.finished,
+            sched_in_flight = sched.in_flight(),
+            sched_queued = sched.queued(),
+            sched_wait_samples = sched.wait_samples,
+            sched_wait_mean_us = sched.wait_mean_us(),
+            sched_wait_max_us = sched.wait_us_max,
+            sched_service_samples = sched.service_samples,
+            sched_service_mean_us = sched.service_mean_us(),
+            sched_service_max_us = sched.service_us_max,
+            "sched admission"
+        );
+
         // Per-source breakdown at debug level (mirrors the startup/frame tiers).
         for &s in &WakeSource::ALL {
             let n = self.items(s);

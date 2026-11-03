@@ -10,6 +10,26 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params, params_from_iter};
 
+/// Admission refused because the dispatch roster already contains its maximum
+/// number of active rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RosterActiveCeiling {
+    pub active: usize,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for RosterActiveCeiling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatch roster already holds {} active rows (limit {}): finish, fail or abandon rows before dispatching more",
+            self.active, self.limit
+        )
+    }
+}
+
+impl std::error::Error for RosterActiveCeiling {}
+
 impl NotificationStore for Db {
     fn record_usage_alert(
         &self,
@@ -432,7 +452,11 @@ impl NotificationStore for Db {
         )?)
     }
 
-    /// Record a new agent dispatch.  Returns the new row id.
+    /// Record a new agent dispatch. Returns the new row id. Admission stops at
+    /// [`Db::ROSTER_ACTIVE_LIMIT`] so the active roster remains complete for
+    /// safety readers that use the same cap. Callers using an IMMEDIATE
+    /// transaction make the count and insert atomic; direct callers can
+    /// overshoot only if concurrent writers race between those statements.
     fn put_agent_dispatch(&self, new: crate::issue::NewDispatch<'_>) -> Result<i64> {
         for (field, value) in [
             ("issue_id", Some(new.issue_id)),
@@ -447,6 +471,35 @@ impl NotificationStore for Db {
                 crate::pipeline_report::dispatch_text_field(field, value)
                     .map_err(anyhow::Error::new)?;
             }
+        }
+        use crate::issue::AgentDispatchStatus as S;
+
+        let active_statuses = [
+            S::Queued,
+            S::Spawning,
+            S::Running,
+            S::WaitingHuman,
+            S::PrOpen,
+        ];
+        let statuses = active_statuses
+            .iter()
+            .map(|status| status.as_str().to_string())
+            .collect::<Vec<_>>();
+        let placeholders = (1..=statuses.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let active: i64 = self.conn().query_row(
+            &format!("SELECT COUNT(*) FROM agent_dispatches WHERE status IN ({placeholders})"),
+            params_from_iter(statuses.iter()),
+            |row| row.get(0),
+        )?;
+        let active = usize::try_from(active)?;
+        if active >= Db::ROSTER_ACTIVE_LIMIT {
+            return Err(anyhow::Error::new(RosterActiveCeiling {
+                active,
+                limit: Db::ROSTER_ACTIVE_LIMIT,
+            }));
         }
         self.conn().execute(
             r#"INSERT INTO agent_dispatches
@@ -1720,5 +1773,97 @@ mod tests {
             !cursor_details.contains("TEMP B-TREE"),
             "cursor query must avoid a temporary sort; plan:\n{cursor_details}"
         );
+    }
+
+    fn seed_dispatch_rows(db: &Db, count: usize, status: &str) {
+        db.conn()
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1) \
+                 INSERT INTO agent_dispatches \
+                 (issue_id, worktree_path, agent_name, dispatched_at_ms, status) \
+                 SELECT 'linear:CAP', '/wt/cap', 'a', i, ?2 FROM n",
+                params![count as i64, status],
+            )
+            .unwrap();
+    }
+
+    fn dispatch_row_count(db: &Db) -> i64 {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM agent_dispatches", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn roster_active_ceiling_refuses_the_row_readers_could_not_see() {
+        let db = Db::open_memory().unwrap();
+        seed_dispatch_rows(&db, Db::ROSTER_ACTIVE_LIMIT - 1, "queued");
+
+        db.put_agent_dispatch(crate::issue::NewDispatch::new("linear:CAP", "/wt/cap", "a"))
+            .unwrap();
+        let error = db
+            .put_agent_dispatch(crate::issue::NewDispatch::new("linear:CAP", "/wt/cap", "a"))
+            .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<RosterActiveCeiling>(),
+            Some(&RosterActiveCeiling {
+                active: Db::ROSTER_ACTIVE_LIMIT,
+                limit: Db::ROSTER_ACTIVE_LIMIT,
+            })
+        );
+        assert_eq!(dispatch_row_count(&db), Db::ROSTER_ACTIVE_LIMIT as i64);
+    }
+
+    #[test]
+    fn roster_active_ceiling_frees_a_slot_when_a_row_finishes() {
+        let db = Db::open_memory().unwrap();
+        seed_dispatch_rows(&db, Db::ROSTER_ACTIVE_LIMIT, "queued");
+        let first_id: i64 = db
+            .conn()
+            .query_row("SELECT id FROM agent_dispatches LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        db.update_dispatch_status(first_id, crate::issue::AgentDispatchStatus::Done)
+            .unwrap();
+        // Positive control: a terminal transition releases one admission slot.
+        db.put_agent_dispatch(crate::issue::NewDispatch::new("linear:CAP", "/wt/cap", "a"))
+            .unwrap();
+        assert_eq!(dispatch_row_count(&db), Db::ROSTER_ACTIVE_LIMIT as i64 + 1);
+    }
+
+    #[test]
+    fn roster_active_ceiling_ignores_terminal_rows() {
+        let db = Db::open_memory().unwrap();
+        seed_dispatch_rows(&db, 5000, "done");
+
+        db.put_agent_dispatch(crate::issue::NewDispatch::new("linear:CAP", "/wt/cap", "a"))
+            .unwrap();
+        assert_eq!(dispatch_row_count(&db), 5001);
+    }
+
+    #[test]
+    fn roster_active_ceiling_refusal_through_checked_put_writes_nothing() {
+        let db = Db::open_memory().unwrap();
+        seed_dispatch_rows(&db, Db::ROSTER_ACTIVE_LIMIT, "queued");
+
+        let error = db
+            .put_dispatch_with_parent_check(crate::issue::NewDispatch::new(
+                "linear:CAP",
+                "/wt/cap",
+                "a",
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RosterActiveCeiling>(),
+            Some(&RosterActiveCeiling {
+                active: Db::ROSTER_ACTIVE_LIMIT,
+                limit: Db::ROSTER_ACTIVE_LIMIT,
+            })
+        );
+        assert_eq!(dispatch_row_count(&db), Db::ROSTER_ACTIVE_LIMIT as i64);
     }
 }

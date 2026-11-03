@@ -997,23 +997,47 @@ impl CalendarRouter {
         &self,
         window: CalendarWindow,
         tokens: &BTreeMap<String, String>,
-        mut sink: impl FnMut(AccountResult),
+        sink: impl FnMut(AccountResult),
     ) {
+        self.list_events_each_while(window, tokens, || true, sink)
+            .await;
+    }
+
+    /// Like [`Self::list_events_each`], but stops starting queued accounts once
+    /// `keep_starting` returns false (a superseded pass). Fetches already in
+    /// flight still finish and reach `sink`; skipped accounts are simply not
+    /// fetched this pass.
+    pub async fn list_events_each_while(
+        &self,
+        window: CalendarWindow,
+        tokens: &BTreeMap<String, String>,
+        keep_starting: impl Fn() -> bool,
+        mut sink: impl FnMut(AccountResult),
+    ) -> usize {
         let mut queues: [VecDeque<&AccountBackend>; 3] = std::array::from_fn(|_| VecDeque::new());
         for account in &self.accounts {
             queues[account.class.index()].push_back(account);
         }
         let mut running = [0_usize; 3];
         let mut in_flight = FuturesUnordered::new();
+        let mut stopped_starting = false;
         loop {
-            for class in [FetchClass::Network, FetchClass::Command, FetchClass::Local] {
-                let class_index = class.index();
-                while running[class_index] < class.limit()
-                    && let Some(account) = queues[class_index].pop_front()
+            if !stopped_starting {
+                'launch: for class in [FetchClass::Network, FetchClass::Command, FetchClass::Local]
                 {
-                    running[class_index] += 1;
-                    let token = tokens.get(&account.name).map(String::as_str).unwrap_or("");
-                    in_flight.push(fetch_account(account, &window, token));
+                    let class_index = class.index();
+                    while running[class_index] < class.limit() && !queues[class_index].is_empty() {
+                        if !keep_starting() {
+                            stopped_starting = true;
+                            break 'launch;
+                        }
+                        let Some(account) = queues[class_index].pop_front() else {
+                            break 'launch;
+                        };
+                        running[class_index] += 1;
+                        let token = tokens.get(&account.name).map(String::as_str).unwrap_or("");
+                        in_flight.push(fetch_account(account, &window, token));
+                    }
                 }
             }
             let Some((class, result)) = in_flight.next().await else {
@@ -1022,6 +1046,7 @@ impl CalendarRouter {
             running[class.index()] -= 1;
             sink(result);
         }
+        queues.iter().map(VecDeque::len).sum()
     }
 
     /// Fetch every account, returning results **per account**.

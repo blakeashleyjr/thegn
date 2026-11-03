@@ -873,6 +873,10 @@ pub struct PanelData {
     /// off-loop from the config by hydration (placement kind, region/size, token
     /// presence). Empty without any `[env.*]`.
     pub environments: Vec<crate::env_ui::EnvSnapshot>,
+    /// Why the active worktree's environment selection could not be read
+    /// (THE-419): the Environments section marks no env bound and Enter refuses
+    /// to rebind. `None` when the read succeeded or no `[env.*]` is configured.
+    pub environments_error: Option<String>,
     /// Presence-only toolchain state for the active worktree. Hydrated from
     /// the provider cache; no process probe occurs during rendering.
     pub toolchain: Option<crate::toolchain_ui::ToolchainStatus>,

@@ -513,12 +513,44 @@ pub(crate) fn spawn_ci_action(
     });
 }
 
+/// (worktree, run id, schedule generation) of a CI drill fetch in flight.
+type CiDetailKey = (std::path::PathBuf, String, Option<u64>);
+static CI_DETAIL_IN_FLIGHT: std::sync::Mutex<std::collections::BTreeSet<CiDetailKey>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Held by the one fetch allowed per key; dropping it (any return path or a panic) frees the key.
+struct CiDetailClaim(CiDetailKey);
+
+fn claim_ci_detail(key: CiDetailKey) -> Option<CiDetailClaim> {
+    let inserted = CI_DETAIL_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone());
+    // Build the claim only after a successful insert; its Drop takes this same lock.
+    if inserted {
+        Some(CiDetailClaim(key))
+    } else {
+        None
+    }
+}
+
+impl Drop for CiDetailClaim {
+    fn drop(&mut self) {
+        let mut in_flight = CI_DETAIL_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        in_flight.remove(&self.0);
+    }
+}
+
 /// Fetch a CI run's full detail (jobs/steps) + the failing jobs' log tails off
 /// the loop, then deliver them into the live modal overlay via a
 /// `RefreshKind::CiDetail` on the refresh channel (applied by
 /// `crate::detail::apply_ci_detail`). The header already painted from the cached
 /// run; this fills the drill. On any fetch error we fall back to the cached run
 /// so the modal still shows the header rather than crashing or spawning a pane.
+/// At most one fetch per worktree, run and schedule generation runs at a time;
+/// a repeat request while it runs is dropped.
 pub(crate) fn spawn_ci_detail(
     worktree: std::path::PathBuf,
     cfg: &thegn_core::config::CiConfig,
@@ -532,7 +564,20 @@ pub(crate) fn spawn_ci_detail(
     let cfg = cfg.clone();
     let tx = refresh_tx.clone();
     let waker = waker.clone();
+    let Some(claim) = claim_ci_detail((
+        wt.clone(),
+        run.id.clone(),
+        generation.as_ref().map(|(_, g)| *g),
+    )) else {
+        tracing::debug!(
+            target: "thegn::ci",
+            run = %run.id,
+            "CI run detail fetch already in flight; coalesced"
+        );
+        return;
+    };
     tokio::task::spawn_blocking(move || {
+        let _claim = claim;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
         let db = thegn_core::db::Db::open().ok();
@@ -2854,5 +2899,56 @@ mod tests {
             "reaping 5 children should cost at most ONE thread, not one each \
              (before={threads_before}, after={threads_after})"
         );
+    }
+
+    #[test]
+    fn ci_detail_claim_coalesces_a_repeat_for_the_same_run() {
+        let key = (
+            std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-coalesce"),
+            "run-1".to_string(),
+            None,
+        );
+
+        let first = claim_ci_detail(key.clone());
+        assert!(first.is_some());
+        assert!(claim_ci_detail(key.clone()).is_none());
+        assert!(claim_ci_detail(key.clone()).is_none());
+
+        drop(first);
+        assert!(claim_ci_detail(key).is_some());
+    }
+
+    #[test]
+    fn ci_detail_claim_keys_on_worktree_run_and_generation() {
+        let worktree = std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-keys");
+        let other_worktree =
+            std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-keys-other");
+        let key = (worktree.clone(), "run-1".to_string(), None);
+
+        let first = claim_ci_detail(key);
+        let other_run = claim_ci_detail((worktree.clone(), "run-2".to_string(), None));
+        let other_worktree = claim_ci_detail((other_worktree, "run-1".to_string(), None));
+        let other_generation = claim_ci_detail((worktree, "run-1".to_string(), Some(7)));
+
+        assert!(first.is_some());
+        assert!(other_run.is_some());
+        assert!(other_worktree.is_some());
+        assert!(other_generation.is_some());
+    }
+
+    #[test]
+    fn ci_detail_claim_is_released_by_a_panicking_holder() {
+        let key = (
+            std::path::PathBuf::from("/nonexistent/thegn-ci-detail-claim-panic"),
+            "run-1".to_string(),
+            None,
+        );
+
+        let result = std::panic::catch_unwind(|| {
+            let _claim = claim_ci_detail(key.clone()).unwrap();
+            panic!("boom");
+        });
+        assert!(result.is_err());
+        assert!(claim_ci_detail(key).is_some());
     }
 }

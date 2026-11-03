@@ -411,31 +411,63 @@ fn finish_exit(
     exit_code: Option<i32>,
     summary: &mut DrainSummary,
 ) {
-    if let Some(p) = ctx.panes.table.get_mut(&id) {
+    let discarded = if let Some(p) = ctx.panes.table.get_mut(&id) {
         p.clipboard
             .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
-        reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
-    }
+        reset_terminal_streams(&mut p.clipboard, &mut p.query_parser)
+    } else {
+        false
+    };
     if ctx.preview.pane_exit(id) {
         *ctx.dirty = true;
     }
     // A degraded pane that exited needs no watchdog entry. (A missed prune
     // is harmless memory — pane ids are monotonic and never reused.)
     ctx.degraded_at.remove(&id);
+    let status_before_exit = discarded.then(|| ctx.model.status.clone());
+    // handle_exit owns the exit status; append the clipboard notice only after it returns.
     summary.left_for_materialize |= handle_exit(ctx, id, exit_code);
+    if let Some(status_before_exit) = status_before_exit {
+        let status_changed = ctx.model.status != status_before_exit;
+        note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, true, status_changed);
+    }
     summary.exited.push(id);
 }
 
 /// Reset every per-pane parser that consumes the terminal output stream.
 /// Lifecycle boundaries must use this function so the OSC 52 and query
 /// scanners cannot retain different prefixes across a pane generation.
-/// Register every future streaming parser here.
+/// Register every future streaming parser here. Returns whether an unadmitted
+/// clipboard set was discarded.
 fn reset_terminal_streams(
     clipboard: &mut crate::queries::clipboard::Clipboard,
     query_parser: &mut crate::queries::QueryParser,
-) {
-    clipboard.reset();
+) -> bool {
+    let discarded = clipboard.reset();
     query_parser.reset();
+    discarded
+}
+
+/// Fixed, payload-free status for a pane clipboard set that was still waiting
+/// for writer capacity when its pane exited, fell back or reattached.
+const PANE_CLIPBOARD_DISCARDED: &str =
+    "Copy from a pane was not sent to the terminal clipboard (the pane exited or restarted first)";
+
+pub(crate) fn note_discarded_clipboard(
+    model: &mut FrameModel,
+    dirty: &mut bool,
+    discarded: bool,
+    append_to_status: bool,
+) {
+    if discarded {
+        if append_to_status && !model.status.is_empty() {
+            model.status.push_str("; ");
+            model.status.push_str(PANE_CLIPBOARD_DISCARDED);
+        } else {
+            model.status = PANE_CLIPBOARD_DISCARDED.to_string();
+        }
+        *dirty = true;
+    }
 }
 
 #[derive(Default)]
@@ -510,7 +542,7 @@ pub(crate) fn drain<T: Terminal>(
 
     // 1. Receive — stash raw chunks, no parsing. Stop at the high-water so the
     // bounded channel backpressures the reader threads (and the child).
-    let mut fallbacks: Vec<u32> = Vec::new();
+    let mut fallbacks: Vec<(u32, bool)> = Vec::new();
     let mut reattached: Vec<u32> = Vec::new();
     while backlog.total < crate::loop_policy::BACKLOG_HIGH_WATER {
         match rx.try_recv() {
@@ -530,16 +562,23 @@ pub(crate) fn drain<T: Terminal>(
             }
             Ok(PaneEvent::SessionFallback(id)) => {
                 backlog.barrier(id);
-                if let Some(p) = ctx.panes.table.get_mut(&id) {
-                    reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
-                }
-                fallbacks.push(id);
+                let discarded = ctx
+                    .panes
+                    .table
+                    .get_mut(&id)
+                    .map(|p| reset_terminal_streams(&mut p.clipboard, &mut p.query_parser))
+                    .unwrap_or(false);
+                fallbacks.push((id, discarded));
             }
             Ok(PaneEvent::Reattached(id)) => {
                 backlog.barrier(id);
-                if let Some(p) = ctx.panes.table.get_mut(&id) {
-                    reset_terminal_streams(&mut p.clipboard, &mut p.query_parser);
-                }
+                let discarded = ctx
+                    .panes
+                    .table
+                    .get_mut(&id)
+                    .map(|p| reset_terminal_streams(&mut p.clipboard, &mut p.query_parser))
+                    .unwrap_or(false);
+                note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, discarded, false);
                 reattached.push(id);
             }
             Err(tokio_mpsc::error::TryRecvError::Empty) => break,
@@ -564,8 +603,11 @@ pub(crate) fn drain<T: Terminal>(
     // A warm reattach degraded to a fresh session: repaint the persisted
     // scrollback tail + arm the relaunch overlay (before parsing the fresh
     // session's output, so the restored history lands underneath it).
-    for id in fallbacks {
+    for (id, discarded) in fallbacks {
         crate::handlers::daemon_lifecycle::handle_session_fallback(ctx, id);
+        // The fallback handler sets the fresh-session/relaunch status. Add the
+        // discard notice afterwards so its Enter-to-relaunch instruction stays visible.
+        note_discarded_clipboard(&mut *ctx.model, &mut *ctx.dirty, discarded, true);
     }
 
     // 2+3+4. Parse ordinary and pending-exit panes under one shared budget,
@@ -2638,5 +2680,68 @@ mod tests {
             Some(Some("m0".into()))
         );
         assert_eq!(connect_failure_selection("/wt", Ok(None)), Some(None));
+    }
+
+    #[test]
+    fn reset_terminal_streams_reports_a_discarded_pending_clipboard_set() {
+        let mut clipboard = crate::queries::clipboard::Clipboard::default();
+        let mut query_parser = crate::queries::QueryParser::default();
+        clipboard.feed(b"\x1b]52;c;eA==\x07");
+        clipboard.submit(Err);
+
+        assert!(reset_terminal_streams(&mut clipboard, &mut query_parser));
+        assert!(!reset_terminal_streams(&mut clipboard, &mut query_parser));
+
+        clipboard.feed(b"\x1b]52;c;");
+        assert!(!reset_terminal_streams(&mut clipboard, &mut query_parser));
+    }
+
+    #[test]
+    fn discarded_clipboard_note_is_fixed_and_payload_free() {
+        let mut model = FrameModel::default();
+        let mut dirty = false;
+        note_discarded_clipboard(&mut model, &mut dirty, false, false);
+        assert!(model.status.is_empty());
+        assert!(!dirty);
+
+        note_discarded_clipboard(&mut model, &mut dirty, true, false);
+        assert_eq!(model.status, PANE_CLIPBOARD_DISCARDED);
+        assert!(dirty);
+        assert!(!model.status.contains("eA=="));
+        assert!(!model.status.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn fallback_status_keeps_relaunch_instruction_and_adds_clipboard_discard_notice() {
+        let (pane_tx, _pane_rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let (ctrl_tx, _ctrl_rx) = tokio_mpsc::channel::<thegn_svc::provider::ExecControl>(8);
+        let mut panes = Panes::new(pane_tx);
+        let mut pane = crate::pane::PtyPane::test_stream(ctrl_tx, 24, 80);
+        pane.set_fallback_restore(None, Some("claude --continue".into()));
+        panes.table.insert(9, pane);
+        let mut model = FrameModel::default();
+        let mut degraded_at = std::collections::HashMap::new();
+        let visible = std::collections::HashSet::from([9]);
+        let mut dirty_panes = std::collections::HashSet::new();
+        let mut dirty = false;
+
+        crate::handlers::daemon_lifecycle::apply_session_fallback(
+            &mut degraded_at,
+            &mut panes,
+            &mut model,
+            &visible,
+            &mut dirty_panes,
+            &mut dirty,
+            9,
+        );
+        note_discarded_clipboard(&mut model, &mut dirty, true, true);
+
+        assert!(model.status.contains("press Enter to relaunch"));
+        assert!(
+            model
+                .status
+                .contains("Copy from a pane was not sent to the terminal clipboard")
+        );
+        assert!(dirty);
     }
 }

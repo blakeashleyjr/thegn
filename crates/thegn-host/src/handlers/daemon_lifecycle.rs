@@ -280,7 +280,7 @@ pub(crate) fn handle_session_fallback(ctx: &mut crate::pty_drain::DrainCtx<'_>, 
 /// event touches, so the degrade record + status wordings are unit-testable
 /// without a `DrainCtx` (the same split `detach_exited_terminal` uses).
 #[allow(clippy::too_many_arguments)]
-fn apply_session_fallback(
+pub(crate) fn apply_session_fallback(
     degraded_at: &mut std::collections::HashMap<u32, std::time::Instant>,
     panes: &mut Panes,
     model: &mut crate::chrome::FrameModel,

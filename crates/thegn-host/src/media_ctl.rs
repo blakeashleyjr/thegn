@@ -1052,20 +1052,20 @@ pub(crate) fn spawn_media_sources(
     waker: TerminalWaker,
 ) {
     let handle = tokio::spawn(async move {
-        let client = match crate::media_secret::client_for(&cfg).await {
-            Ok(client) => client,
+        let sources: Result<Vec<String>, String> = match crate::media_secret::client_for(&cfg).await
+        {
             Err(error) => {
                 tracing::debug!(target: "thegn::media", %error, "media sources unavailable");
-                return;
+                Err(error.to_string())
             }
-        };
-        let sources = match within_media_budget(client.players()).await {
-            Some(Ok(sources)) => sources,
-            Some(Err(error)) => {
-                tracing::debug!(target: "thegn::media", %error, "media source listing failed");
-                return;
-            }
-            None => return,
+            Ok(client) => match within_media_budget(client.players()).await {
+                Some(Ok(sources)) => Ok(sources),
+                Some(Err(error)) => {
+                    tracing::debug!(target: "thegn::media", %error, "media source listing failed");
+                    Err(error.to_string())
+                }
+                None => Err("media source listing timed out".to_string()),
+            },
         };
         slot.put(MediaSourcesDelivery { request, sources });
         let _ = waker.wake();
