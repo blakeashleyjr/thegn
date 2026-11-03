@@ -1205,31 +1205,40 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
-    /// Read one issue with its detail and comments (`issues.get`).
+    /// Read one issue with its detail and comments (`issues.get`). `account`
+    /// names the configured tracker account that owns the issue; it routes by
+    /// exact provider + account instead of by id prefix.
     fn issues_get<'a>(
         &'a self,
         _id: &'a str,
         _repo: Option<&'a str>,
+        _account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
-    /// Patch an issue (`issues.update`); returns the updated issue.
+    /// Patch an issue (`issues.update`); returns the updated issue. `account`
+    /// names the configured tracker account that owns the issue; it routes by
+    /// exact provider + account instead of by id prefix.
     fn issues_update<'a>(
         &'a self,
         _id: &'a str,
         _patch: &'a thegn_core::issue::IssuePatch,
         _repo: Option<&'a str>,
+        _account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
-    /// Post a comment on an issue (`issues.comment`).
+    /// Post a comment on an issue (`issues.comment`). `account` names the
+    /// configured tracker account that owns the issue; it routes by exact
+    /// provider + account instead of by id prefix.
     fn issues_comment<'a>(
         &'a self,
         _id: &'a str,
         _body: &'a str,
         _repo: Option<&'a str>,
+        _account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
