@@ -128,6 +128,7 @@ impl<'a> DocsRouter<'a> {
             {
                 "name": "search_docs",
                 "description": "Full-text search thegn's help corpus (how to use thegn: worktrees, sidebar, merge queue, sandboxing, keybindings, …). Returns matching page ids to read with read_doc.",
+                "annotations": { "readOnlyHint": true, "destructiveHint": false },
                 "inputSchema": { "type": "object",
                     "properties": { "query": { "type": "string", "description": "Search terms" } },
                     "required": ["query"] },
@@ -135,6 +136,7 @@ impl<'a> DocsRouter<'a> {
             {
                 "name": "read_doc",
                 "description": "Read a help page's full markdown by id (from list_docs or search_docs). Includes the generated `keybindings` (effective keymap) and `config-reference` (every config key) pages.",
+                "annotations": { "readOnlyHint": true, "destructiveHint": false },
                 "inputSchema": { "type": "object",
                     "properties": { "id": { "type": "string", "description": "Page id, e.g. 'getting-started', 'merge-queue', 'keybindings'" } },
                     "required": ["id"] },
@@ -142,17 +144,20 @@ impl<'a> DocsRouter<'a> {
             {
                 "name": "list_docs",
                 "description": "List every help page (id + title) — the browse index for thegn's documentation.",
+                "annotations": { "readOnlyHint": true, "destructiveHint": false },
                 "inputSchema": { "type": "object", "properties": {} },
             },
             {
                 "name": "get_config",
                 "description": "The user's current effective thegn config as JSON (secrets redacted). Pass a dotted `key` for one value, or omit for the whole tree.",
+                "annotations": { "readOnlyHint": true, "destructiveHint": false },
                 "inputSchema": { "type": "object",
                     "properties": { "key": { "type": "string", "description": "Dotted key, e.g. 'sandbox.backend' (optional)" } } },
             },
             {
                 "name": "explain_config",
                 "description": "Explain how a config key resolves: its effective value and which layer (builtin/user/profile/workspace/runtime) set it, with the value at each layer.",
+                "annotations": { "readOnlyHint": true, "destructiveHint": false },
                 "inputSchema": { "type": "object",
                     "properties": {
                         "key": { "type": "string", "description": "Dotted key, e.g. 'sandbox.backend'" } },
@@ -562,5 +567,18 @@ mod tests {
         assert_eq!(v["sandbox"]["backend"], "podman");
         assert_eq!(v["accounts"][0]["name"], "work");
         assert_eq!(v["keybinds"]["quit"], "ctrl-q");
+    }
+
+    #[test]
+    fn docs_tools_are_annotated_read_only() {
+        let reg = registry();
+        let r = router(&reg, json!({}));
+        let resp = r.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5);
+        for tool in tools {
+            assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
+            assert_eq!(tool["annotations"]["destructiveHint"], json!(false));
+        }
     }
 }
