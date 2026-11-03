@@ -644,6 +644,9 @@ pub(crate) fn config_digest(path: &Path) -> anyhow::Result<[u8; 32]> {
 }
 
 fn closure_digest(config_dir: &Path, config_bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+    const MAX_COMPOSE_REFERENCE_DEPTH: usize = 4;
+    const MAX_COMPOSE_REFERENCES: usize = 256;
+
     let text = std::str::from_utf8(config_bytes)
         .map_err(|error| anyhow::anyhow!("devcontainer config is not UTF-8: {error}"))?;
     let config = thegn_core::devcontainer::parse(text)
@@ -654,6 +657,9 @@ fn closure_digest(config_dir: &Path, config_bytes: &[u8]) -> anyhow::Result<[u8;
     hasher.update(b"thegn.devcontainer.closure.v1\0");
     hasher.update((config_bytes.len() as u64).to_le_bytes());
     hasher.update(config_bytes);
+    // Keep the original digest bytes unchanged when the selected Compose files
+    // contain no internal references.
+    let mut original_bytes = std::collections::HashMap::new();
     for reference in references {
         let relative = reference.strip_prefix(config_dir).map_err(|error| {
             anyhow::anyhow!(
@@ -673,7 +679,123 @@ fn closure_digest(config_dir: &Path, config_bytes: &[u8]) -> anyhow::Result<[u8;
         hasher.update(relative.as_bytes());
         hasher.update([0]);
         hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
+        hasher.update(&bytes);
+        original_bytes.insert(reference, bytes);
+    }
+    if let thegn_core::devcontainer::ImageSource::Compose(compose) = &config.source {
+        let compose_files = compose
+            .files
+            .iter()
+            .map(|name| config_dir.join(name))
+            .collect::<Vec<_>>();
+        let mut pending: std::collections::VecDeque<(PathBuf, usize)> =
+            compose_files.into_iter().map(|path| (path, 0)).collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut reference_count = 0_usize;
+        while let Some((compose_path, depth)) = pending.pop_front() {
+            let resolved_compose_path = compose_path.canonicalize().map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot read devcontainer reference `{}`: {error}",
+                    compose_path.display()
+                )
+            })?;
+            if !visited.insert(resolved_compose_path) {
+                continue;
+            }
+            let compose_bytes = if let Some(bytes) = original_bytes.get(&compose_path) {
+                bytes.clone()
+            } else {
+                std::fs::read(&compose_path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot read devcontainer reference `{}`: {error}",
+                        compose_path.display()
+                    )
+                })?
+            };
+            let compose_text = std::str::from_utf8(&compose_bytes)
+                .map_err(|error| anyhow::anyhow!("Compose file is not UTF-8: {error}"))?;
+            let references = thegn_core::devcontainer_overlay::compose_file_references(
+                config_dir,
+                &compose_path,
+                compose_text,
+            )
+            .map_err(anyhow::Error::msg)?;
+            for reference in references {
+                reference_count += 1;
+                anyhow::ensure!(
+                    reference_count <= MAX_COMPOSE_REFERENCES,
+                    "Compose references exceed the {MAX_COMPOSE_REFERENCES} limit; refusing provider use"
+                );
+                let relative = {
+                    let base_components: Vec<_> = config_dir.components().collect();
+                    let path_components: Vec<_> = reference.path.components().collect();
+                    let common = base_components
+                        .iter()
+                        .zip(&path_components)
+                        .take_while(|(left, right)| left == right)
+                        .count();
+                    let mut relative = PathBuf::new();
+                    for _ in common..base_components.len() {
+                        relative.push("..");
+                    }
+                    for component in &path_components[common..] {
+                        relative.push(component.as_os_str());
+                    }
+                    relative
+                };
+                let relative = relative.to_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "devcontainer reference {} has a non-UTF-8 relative path",
+                        reference.path.display()
+                    )
+                })?;
+                hasher.update(b"compose-ref\0");
+                hasher.update([match reference.kind {
+                    thegn_core::devcontainer_overlay::ComposeReferenceKind::EnvFile => 0,
+                    thegn_core::devcontainer_overlay::ComposeReferenceKind::Dockerfile => 1,
+                    thegn_core::devcontainer_overlay::ComposeReferenceKind::ExtendsFile => 2,
+                    thegn_core::devcontainer_overlay::ComposeReferenceKind::Include => 3,
+                }]);
+                hasher.update(relative.as_bytes());
+                hasher.update([0]);
+                let exists = match std::fs::symlink_metadata(&reference.path) {
+                    Ok(_) => {
+                        let bytes = std::fs::read(&reference.path).map_err(|error| {
+                            anyhow::anyhow!(
+                                "cannot read devcontainer reference `{relative}`: {error}"
+                            )
+                        })?;
+                        hasher.update((bytes.len() as u64).to_le_bytes());
+                        hasher.update(&bytes);
+                        original_bytes.insert(reference.path.clone(), bytes);
+                        true
+                    }
+                    Err(error)
+                        if !reference.required && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        hasher.update(b"absent\0");
+                        false
+                    }
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "cannot read devcontainer reference `{relative}`: {error}"
+                        ));
+                    }
+                };
+                if matches!(
+                    reference.kind,
+                    thegn_core::devcontainer_overlay::ComposeReferenceKind::ExtendsFile
+                        | thegn_core::devcontainer_overlay::ComposeReferenceKind::Include
+                ) && exists
+                {
+                    anyhow::ensure!(
+                        depth < MAX_COMPOSE_REFERENCE_DEPTH,
+                        "Compose references exceed the {MAX_COMPOSE_REFERENCE_DEPTH} limit; refusing provider use"
+                    );
+                    pending.push_back((reference.path, depth + 1));
+                }
+            }
+        }
     }
     Ok(hasher.finalize().into())
 }
@@ -1147,6 +1269,244 @@ mod tests {
         let config_path = dir.path().join("devcontainer.json");
         std::fs::write(&config_path, r#"{ "image": "repo" }"#).unwrap();
         assert!(config_digest(&config_path).is_ok());
+    }
+
+    #[test]
+    fn closure_digest_changes_when_a_compose_env_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("compose.yml"),
+            "services:\n  app:\n    env_file: .env\n",
+        )
+        .unwrap();
+        std::fs::write(config_dir.join(".env"), "TOKEN=first\n").unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        std::fs::write(config_dir.join(".env"), "TOKEN=second\n").unwrap();
+        let error = verify_config_digest(&config_path, &digest).unwrap_err();
+        assert!(error.to_string().contains("refusing provider use"));
+    }
+
+    #[test]
+    fn closure_digest_changes_when_an_extended_compose_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("compose.yml"),
+            "services:\n  app:\n    extends:\n      file: base.yml\n      service: base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("base.yml"),
+            "services: {base: {image: one}}\n",
+        )
+        .unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        std::fs::write(
+            config_dir.join("base.yml"),
+            "services: {base: {image: two}}\n",
+        )
+        .unwrap();
+        let error = verify_config_digest(&config_path, &digest).unwrap_err();
+        assert!(error.to_string().contains("refusing provider use"));
+    }
+
+    #[test]
+    fn closure_digest_changes_when_an_included_compose_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::write(config_dir.join("compose.yml"), "include: inc.yml\n").unwrap();
+        std::fs::write(
+            config_dir.join("inc.yml"),
+            "services: {app: {image: one}}\n",
+        )
+        .unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        std::fs::write(
+            config_dir.join("inc.yml"),
+            "services: {app: {image: two}}\n",
+        )
+        .unwrap();
+        let error = verify_config_digest(&config_path, &digest).unwrap_err();
+        assert!(error.to_string().contains("refusing provider use"));
+    }
+
+    #[test]
+    fn closure_digest_changes_when_a_compose_build_dockerfile_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("docker")).unwrap();
+        std::fs::write(
+            config_dir.join("compose.yml"),
+            "services:\n  app:\n    build:\n      context: ..\n      dockerfile: docker/Dockerfile\n",
+        )
+        .unwrap();
+        let dockerfile = dir.path().join("docker/Dockerfile");
+        std::fs::write(&dockerfile, "FROM scratch\n").unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        std::fs::write(&dockerfile, "FROM alpine:3\n").unwrap();
+        let error = verify_config_digest(&config_path, &digest).unwrap_err();
+        assert!(error.to_string().contains("refusing provider use"));
+    }
+
+    #[test]
+    fn closure_digest_refuses_an_escaping_compose_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("compose.yml"),
+            "services:\n  app:\n    env_file: ../../outside/.env\n",
+        )
+        .unwrap();
+        let error = config_digest(&config_path).unwrap_err().to_string();
+        assert!(error.contains("../../outside/.env"), "{error}");
+        assert!(error.contains("escapes the repository"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closure_digest_refuses_a_compose_env_file_symlinked_outside_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("compose.yml"),
+            "services:\n  app:\n    env_file: .env\n",
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("outside.env"), "TOKEN=outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("outside.env"), config_dir.join(".env"))
+            .unwrap();
+        let error = config_digest(&config_path).unwrap_err().to_string();
+        assert!(error.contains(".env"), "{error}");
+        assert!(
+            error.contains("escapes the repository through a symlink"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn closure_digest_tolerates_a_missing_optional_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("compose.yml"),
+            "services:\n  app:\n    env_file:\n      - path: optional.env\n        required: false\n",
+        )
+        .unwrap();
+        let first = config_digest(&config_path).unwrap();
+        let second = config_digest(&config_path).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn closure_digest_refuses_compose_include_cycles_beyond_the_depth_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["a.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        std::fs::write(config_dir.join("a.yml"), "include: b.yml\n").unwrap();
+        std::fs::write(config_dir.join("b.yml"), "include: a.yml\n").unwrap();
+        assert!(config_digest(&config_path).is_ok());
+
+        for index in 0..6 {
+            let next = index + 1;
+            let contents = if next < 6 {
+                format!("include: {next}.yml\n")
+            } else {
+                "services: {}\n".to_string()
+            };
+            std::fs::write(config_dir.join(format!("{index}.yml")), contents).unwrap();
+        }
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["0.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        let error = config_digest(&config_path).unwrap_err().to_string();
+        assert!(
+            error.contains("Compose references exceed the 4 limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn closure_digest_refuses_too_many_compose_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{ "dockerComposeFile": ["compose.yml"], "service": "app" }"#,
+        )
+        .unwrap();
+        let mut compose = String::from("services:\n  app:\n    env_file:\n");
+        for index in 0..257 {
+            compose.push_str(&format!(
+                "      - path: missing-{index}.env\n        required: false\n"
+            ));
+        }
+        std::fs::write(config_dir.join("compose.yml"), compose).unwrap();
+        let error = config_digest(&config_path).unwrap_err().to_string();
+        assert!(
+            error.contains("Compose references exceed the 256 limit"),
+            "{error}"
+        );
     }
 
     #[test]

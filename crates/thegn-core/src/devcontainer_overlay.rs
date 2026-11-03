@@ -942,6 +942,373 @@ pub fn referenced_files(
     Ok(paths)
 }
 
+/// The kind of file reference found inside a Compose file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ComposeReferenceKind {
+    EnvFile,
+    Dockerfile,
+    ExtendsFile,
+    Include,
+}
+
+/// One file referenced from a Compose file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeReference {
+    pub kind: ComposeReferenceKind,
+    pub path: PathBuf,
+    pub required: bool,
+}
+
+/// Files one Compose file references, resolved against that file's directory
+/// and contained in the repository that `config_dir` belongs to.
+///
+/// Build context directories are checked for containment but are not returned;
+/// their contents remain outside this closure.
+pub fn compose_file_references(
+    config_dir: &Path,
+    compose_file: &Path,
+    yaml: &str,
+) -> Result<Vec<ComposeReference>, String> {
+    let mut document = serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .map_err(|_| "is not a valid Compose file".to_string())?;
+    document
+        .apply_merge()
+        .map_err(|_| "is not a valid Compose file".to_string())?;
+    let root = document
+        .as_mapping()
+        .ok_or_else(|| "is not a valid Compose file".to_string())?;
+    let mut references = Vec::new();
+    if let Some(services) = mapping_value(root, "services")
+        && let Some(services) = services.as_mapping()
+    {
+        for (_, service) in services {
+            let Some(service) = service.as_mapping() else {
+                continue;
+            };
+            if let Some(env_file) = mapping_value(service, "env_file") {
+                collect_env_files(config_dir, compose_file, env_file, &mut references)?;
+            }
+            if let Some(build) = mapping_value(service, "build") {
+                collect_build_files(config_dir, compose_file, build, &mut references)?;
+            }
+            if let Some(extends) = mapping_value(service, "extends")
+                && let Some(extends) = extends.as_mapping()
+                && let Some(file) = mapping_value(extends, "file")
+            {
+                let reference = file.as_str().ok_or_else(|| {
+                    "Compose reference `extends.file` is not a string".to_string()
+                })?;
+                references.push(resolve_compose_reference(
+                    config_dir,
+                    compose_file,
+                    reference,
+                    ComposeReferenceKind::ExtendsFile,
+                    true,
+                )?);
+            }
+        }
+    }
+    if let Some(include) = mapping_value(root, "include") {
+        collect_include(config_dir, compose_file, include, &mut references)?;
+    }
+    references.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.required.cmp(&right.required))
+    });
+    references.dedup();
+    Ok(references)
+}
+
+fn mapping_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    mapping.get(&serde_yaml::Value::String(key.to_string()))
+}
+
+fn collect_env_files(
+    config_dir: &Path,
+    compose_file: &Path,
+    value: &serde_yaml::Value,
+    references: &mut Vec<ComposeReference>,
+) -> Result<(), String> {
+    match value {
+        serde_yaml::Value::String(path) => references.push(resolve_compose_reference(
+            config_dir,
+            compose_file,
+            path,
+            ComposeReferenceKind::EnvFile,
+            true,
+        )?),
+        serde_yaml::Value::Sequence(paths) => {
+            for item in paths {
+                if let Some(path) = item.as_str() {
+                    references.push(resolve_compose_reference(
+                        config_dir,
+                        compose_file,
+                        path,
+                        ComposeReferenceKind::EnvFile,
+                        true,
+                    )?);
+                } else if let Some(item) = item.as_mapping() {
+                    let path = mapping_value(item, "path")
+                        .and_then(serde_yaml::Value::as_str)
+                        .ok_or_else(|| {
+                            "Compose reference `env_file.path` is not a string".to_string()
+                        })?;
+                    let required = mapping_value(item, "required")
+                        .and_then(serde_yaml::Value::as_bool)
+                        .unwrap_or(true);
+                    references.push(resolve_compose_reference(
+                        config_dir,
+                        compose_file,
+                        path,
+                        ComposeReferenceKind::EnvFile,
+                        required,
+                    )?);
+                } else {
+                    return Err("Compose reference `env_file` has an invalid entry".to_string());
+                }
+            }
+        }
+        _ => return Err("Compose reference `env_file` has an invalid shape".to_string()),
+    }
+    Ok(())
+}
+
+fn collect_build_files(
+    config_dir: &Path,
+    compose_file: &Path,
+    value: &serde_yaml::Value,
+    references: &mut Vec<ComposeReference>,
+) -> Result<(), String> {
+    let (context, dockerfile, inline) = if let Some(context) = value.as_str() {
+        (context, None, false)
+    } else if let Some(build) = value.as_mapping() {
+        let context = mapping_value(build, "context")
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or(".");
+        let dockerfile = mapping_value(build, "dockerfile").and_then(serde_yaml::Value::as_str);
+        let inline = mapping_value(build, "dockerfile_inline").is_some();
+        (context, dockerfile, inline)
+    } else {
+        return Err("Compose reference `build.context` has an invalid shape".to_string());
+    };
+    let resolved_context = resolve_compose_path(config_dir, compose_file, context)?;
+    if let Some(dockerfile) = dockerfile {
+        let path = resolve_compose_from_base(config_dir, &resolved_context, dockerfile)?;
+        references.push(resolve_compose_reference_path(
+            config_dir,
+            dockerfile,
+            path,
+            ComposeReferenceKind::Dockerfile,
+            true,
+        )?);
+    } else if !inline {
+        references.push(resolve_compose_reference_path(
+            config_dir,
+            "Dockerfile",
+            resolved_context.join("Dockerfile"),
+            ComposeReferenceKind::Dockerfile,
+            false,
+        )?);
+    }
+    Ok(())
+}
+
+fn collect_include(
+    config_dir: &Path,
+    compose_file: &Path,
+    value: &serde_yaml::Value,
+    references: &mut Vec<ComposeReference>,
+) -> Result<(), String> {
+    match value {
+        serde_yaml::Value::String(path) => references.push(resolve_compose_reference(
+            config_dir,
+            compose_file,
+            path,
+            ComposeReferenceKind::Include,
+            true,
+        )?),
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                if let Some(path) = item.as_str() {
+                    references.push(resolve_compose_reference(
+                        config_dir,
+                        compose_file,
+                        path,
+                        ComposeReferenceKind::Include,
+                        true,
+                    )?);
+                } else if let Some(item) = item.as_mapping() {
+                    let paths = mapping_value(item, "path")
+                        .ok_or_else(|| "Compose reference `include.path` is missing".to_string())?;
+                    let paths = if let Some(path) = paths.as_str() {
+                        vec![path]
+                    } else if let Some(paths) = paths.as_sequence() {
+                        paths
+                            .iter()
+                            .map(|path| {
+                                path.as_str().ok_or_else(|| {
+                                    "Compose reference `include.path` is not a string".to_string()
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        return Err("Compose reference `include.path` has an invalid shape".into());
+                    };
+                    for path in paths {
+                        references.push(resolve_compose_reference(
+                            config_dir,
+                            compose_file,
+                            path,
+                            ComposeReferenceKind::Include,
+                            true,
+                        )?);
+                    }
+                    if let Some(env_file) = mapping_value(item, "env_file") {
+                        collect_env_files(config_dir, compose_file, env_file, references)?;
+                    }
+                } else {
+                    return Err("Compose reference `include` has an invalid entry".into());
+                }
+            }
+        }
+        _ => return Err("Compose reference `include` has an invalid shape".into()),
+    }
+    Ok(())
+}
+
+fn resolve_compose_reference(
+    config_dir: &Path,
+    compose_file: &Path,
+    reference: &str,
+    kind: ComposeReferenceKind,
+    required: bool,
+) -> Result<ComposeReference, String> {
+    let path = resolve_compose_path(config_dir, compose_file, reference)?;
+    Ok(ComposeReference {
+        kind,
+        path,
+        required,
+    })
+}
+
+fn resolve_compose_reference_path(
+    config_dir: &Path,
+    reference: &str,
+    path: PathBuf,
+    kind: ComposeReferenceKind,
+    required: bool,
+) -> Result<ComposeReference, String> {
+    validate_compose_reference(reference)?;
+    let checked = check_compose_containment(config_dir, &path, reference)?;
+    Ok(ComposeReference {
+        kind,
+        path: checked,
+        required,
+    })
+}
+
+fn resolve_compose_path(
+    config_dir: &Path,
+    compose_file: &Path,
+    reference: &str,
+) -> Result<PathBuf, String> {
+    let compose_dir = compose_file.parent().unwrap_or(config_dir);
+    let root = repository_root(config_dir);
+    let canonical_root = root.canonicalize().map_err(|_| {
+        format!("Compose reference `{reference}` cannot verify repository containment")
+    })?;
+    let canonical_dir = compose_dir.canonicalize().map_err(|_| {
+        format!("Compose reference `{reference}` cannot verify repository containment")
+    })?;
+    if !canonical_dir.starts_with(&canonical_root) {
+        return Err(format!(
+            "Compose reference `{reference}` escapes the repository through a symlink"
+        ));
+    }
+    resolve_compose_from_base(config_dir, &canonical_dir, reference)
+}
+
+fn validate_compose_reference(reference: &str) -> Result<(), String> {
+    let refuse = |reason: &str| format!("Compose reference `{reference}` {reason}");
+    if reference.contains('$') {
+        return Err(refuse(
+            "uses variable interpolation; thegn cannot verify it",
+        ));
+    }
+    if reference.contains("://") || reference.starts_with("git@") {
+        return Err(refuse("is a remote build context"));
+    }
+    if Path::new(reference).is_absolute() {
+        return Err(refuse("is absolute"));
+    }
+    Ok(())
+}
+
+fn resolve_compose_from_base(
+    config_dir: &Path,
+    base: &Path,
+    reference: &str,
+) -> Result<PathBuf, String> {
+    validate_compose_reference(reference)?;
+    let refuse = |reason: &str| format!("Compose reference `{reference}` {reason}");
+    let root = repository_root(config_dir).canonicalize().map_err(|_| {
+        format!("Compose reference `{reference}` cannot verify repository containment")
+    })?;
+    let relative_dir = base
+        .strip_prefix(&root)
+        .map_err(|_| refuse("escapes the repository"))?;
+    let reference_path = Path::new(reference);
+    let mut parts: Vec<std::ffi::OsString> = relative_dir
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    for component in reference_path.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_os_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if !parts.is_empty() => {
+                parts.pop();
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return Err(refuse("escapes the repository")),
+        }
+    }
+    let resolved = parts.into_iter().fold(root, |path, part| path.join(part));
+    check_compose_containment(config_dir, &resolved, reference)
+}
+
+fn check_compose_containment(
+    config_dir: &Path,
+    resolved: &Path,
+    reference: &str,
+) -> Result<PathBuf, String> {
+    let root = repository_root(config_dir);
+    let mut existing = resolved;
+    while std::fs::symlink_metadata(existing).is_err() {
+        existing = existing.parent().ok_or_else(|| {
+            format!("Compose reference `{reference}` cannot verify repository containment")
+        })?;
+    }
+    let canonical_existing = existing.canonicalize().map_err(|_| {
+        format!("Compose reference `{reference}` cannot verify repository containment")
+    })?;
+    let canonical_root = root.canonicalize().map_err(|_| {
+        format!("Compose reference `{reference}` cannot verify repository containment")
+    })?;
+    if !canonical_existing.starts_with(canonical_root) {
+        return Err(format!(
+            "Compose reference `{reference}` escapes the repository through a symlink"
+        ));
+    }
+    Ok(resolved.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1607,5 +1974,208 @@ mod tests {
         let error = referenced_files(&escaping, &config_dir).unwrap_err();
         assert!(error.contains("../../outside/Dockerfile"), "{error}");
         assert!(error.contains("escapes the repository"), "{error}");
+    }
+
+    #[test]
+    fn compose_file_references_collects_env_build_extends_and_include() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let compose_file = config_dir.join("compose.yml");
+        let refs = compose_file_references(
+            &config_dir,
+            &compose_file,
+            r#"
+x-common: &common
+  env_file: merged.env
+services:
+  app:
+    <<: *common
+    env_file: [".env", {path: "opt.env", required: false}]
+    build: {context: "..", dockerfile: "docker/Dockerfile"}
+    extends: {file: "base.yml", service: x}
+  worker:
+    build: "app"
+  merged:
+    <<: *common
+include: ["inc.yml"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                ComposeReference {
+                    kind: ComposeReferenceKind::EnvFile,
+                    path: config_dir.join(".env"),
+                    required: true,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::Dockerfile,
+                    path: config_dir.join("app/Dockerfile"),
+                    required: false,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::ExtendsFile,
+                    path: config_dir.join("base.yml"),
+                    required: true,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::Include,
+                    path: config_dir.join("inc.yml"),
+                    required: true,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::EnvFile,
+                    path: config_dir.join("merged.env"),
+                    required: true,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::EnvFile,
+                    path: config_dir.join("opt.env"),
+                    required: false,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::Dockerfile,
+                    path: dir.path().join("docker/Dockerfile"),
+                    required: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_file_references_refuses_absolute_escaping_interpolated_and_remote_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let compose_file = config_dir.join("compose.yml");
+        for (yaml, reference, reason) in [
+            (
+                "services: {app: {env_file: /tmp/env}}",
+                "/tmp/env",
+                "is absolute",
+            ),
+            (
+                "services: {app: {env_file: ../../outside/.env}}",
+                "../../outside/.env",
+                "escapes the repository",
+            ),
+            (
+                "services: {app: {env_file: '${ENV_FILE}'}}",
+                "${ENV_FILE}",
+                "uses variable interpolation",
+            ),
+            (
+                "services: {app: {build: {context: 'https://example.com/r.git'}}}",
+                "https://example.com/r.git",
+                "is a remote build context",
+            ),
+        ] {
+            let error = compose_file_references(&config_dir, &compose_file, yaml).unwrap_err();
+            assert!(error.contains(reference), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn compose_file_references_collects_include_maps_and_ignores_inline_dockerfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let refs = compose_file_references(
+            &config_dir,
+            &config_dir.join("compose.yml"),
+            "services:\n  app:\n    build:\n      dockerfile_inline: 'FROM scratch'\ninclude:\n  - path: [one.yml, two.yml]\n    env_file:\n      - path: extra.env\n        required: false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                ComposeReference {
+                    kind: ComposeReferenceKind::EnvFile,
+                    path: config_dir.join("extra.env"),
+                    required: false,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::Include,
+                    path: config_dir.join("one.yml"),
+                    required: true,
+                },
+                ComposeReference {
+                    kind: ComposeReferenceKind::Include,
+                    path: config_dir.join("two.yml"),
+                    required: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_file_references_refuses_malformed_reference_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let compose_file = config_dir.join("compose.yml");
+        for yaml in [
+            "services: {app: {env_file: 3}}",
+            "services: {app: {env_file: [3]}}",
+            "services: {app: {env_file: [{required: false}]}}",
+            "services: {app: {build: 3}}",
+            "services: {app: {extends: {file: []}}}",
+            "include: {}",
+            "include: [{}]",
+            "include: [{path: true}]",
+            "include: [{path: [valid.yml, 3]}]",
+        ] {
+            assert!(
+                compose_file_references(&config_dir, &compose_file, yaml).is_err(),
+                "accepted malformed Compose reference shape: {yaml}"
+            );
+        }
+        assert!(
+            compose_file_references(
+                &config_dir,
+                &compose_file,
+                "services: {app: {extends: {service: base}}}"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn compose_file_references_of_a_file_without_services_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        assert!(
+            compose_file_references(&config_dir, &config_dir.join("compose.yml"), "{}")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            compose_file_references(&config_dir, &config_dir.join("compose.yml"), "services: {}")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compose_file_references_refuses_invalid_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let error =
+            compose_file_references(&config_dir, &config_dir.join("compose.yml"), "services: [")
+                .unwrap_err();
+        assert!(error.contains("is not a valid Compose file"), "{error}");
+        let error = compose_file_references(
+            &config_dir,
+            &config_dir.join("compose.yml"),
+            "- scalar top level",
+        )
+        .unwrap_err();
+        assert!(error.contains("is not a valid Compose file"), "{error}");
     }
 }
