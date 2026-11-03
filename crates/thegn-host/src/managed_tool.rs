@@ -2379,6 +2379,248 @@ mod tests {
         assert!(!outside.exists());
     }
 
+    #[cfg(unix)]
+    fn canary_limits() -> Limits {
+        Limits {
+            timeout: Duration::from_secs(300),
+            term_grace: Duration::from_secs(2),
+            read_grace: Duration::from_secs(2),
+        }
+    }
+
+    #[cfg(unix)]
+    fn canary_script(secret: &Path, socket: &Path, outside: &Path) -> String {
+        let secret = thegn_core::util::sh_quote(&secret.to_string_lossy());
+        let socket = thegn_core::util::sh_quote(&socket.to_string_lossy());
+        let outside = thegn_core::util::sh_quote(&outside.to_string_lossy());
+        format!(
+            "{{\n  if cat {secret} >/dev/null 2>&1; then\n    echo secret=read\n  else\n    echo secret=denied\n  fi\n  printf 'token=%s\\n' \"${{THEGN_CANARY_TOKEN:-}}\"\n  printf 'ssh=%s\\n' \"${{SSH_AUTH_SOCK:-}}\"\n  printf 'control=%s\\n' \"${{THEGN_CONTROL_SOCKET:-}}\"\n  if [ -e {socket} ]; then\n    echo socket=visible\n  else\n    echo socket=hidden\n  fi\n  echo pwned > {outside} 2>/dev/null\n  echo done\n}} > \"$HOME/canary-report\"\nexit 0\n"
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_contained_report(home: &Path, outside: &Path) {
+        let report = std::fs::read_to_string(home.join("canary-report"))
+            .expect("the installer canary script must write its report");
+        for expected in [
+            "secret=denied",
+            "token=",
+            "ssh=",
+            "control=",
+            "socket=hidden",
+            "done",
+        ] {
+            assert!(
+                report.lines().any(|line| line == expected),
+                "canary report missing {expected:?}: {report}"
+            );
+        }
+        assert!(!report.contains("canary-secret"), "{report}");
+        assert!(!report.contains("canary-token-value"), "{report}");
+        assert!(
+            !outside.exists(),
+            "installer wrote outside staging: {}",
+            outside.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn runs_contained(
+        installer: &str,
+        probe: &[OsString],
+        staging: &Path,
+        home: &Path,
+        tool_bin: Option<&Path>,
+    ) -> bool {
+        match installer_command(
+            installer,
+            probe,
+            staging,
+            home,
+            HostInstall::Refuse,
+            "canary",
+            tool_bin,
+        ) {
+            Ok((mut command, InstallerContainment::Bwrap)) => {
+                run_bounded(&mut command, canary_limits(), false).is_ok()
+            }
+            Ok((_, InstallerContainment::HostUnsafe)) | Err(_) => false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Create the local npm tarball fixture."
+    )]
+    // acceptance canary; passes while containment holds.
+    fn installer_canary_npm_install_script_is_contained() {
+        let bwrap = usable_bwrap();
+        if !thegn_core::testenv::require_or_skip("bwrap with user namespaces", bwrap.is_some()) {
+            return;
+        }
+        let socket_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = socket_dir.path().join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let socket_text = socket.to_str().unwrap();
+        let state = crate::testenv::IsolatedState::with_env(&[
+            ("THEGN_CANARY_TOKEN", "canary-token-value"),
+            ("SSH_AUTH_SOCK", socket_text),
+            ("THEGN_CONTROL_SOCKET", socket_text),
+        ]);
+        let secret = state.root().join(".ssh/id_canary");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, "canary-secret").unwrap();
+        let managed = state.root().join("data/canary");
+        let (home, staging) = installer_workspace(&managed, "canary").unwrap();
+        let outside = managed.parent().unwrap().join("outside-canary");
+
+        if !thegn_core::testenv::require_or_skip("npm", util::have("npm")) {
+            return;
+        }
+        let npm = util::which_path("npm").unwrap();
+        let npm_path = Path::new(&npm);
+        let probe = [OsString::from(&npm), OsString::from("--version")];
+        if !thegn_core::testenv::require_or_skip(
+            "npm usable inside the installer sandbox",
+            runs_contained(&npm, &probe, staging.path(), home.path(), Some(npm_path)),
+        ) {
+            return;
+        }
+
+        let package = home.path().join("pkg/package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"thegn-installer-canary","version":"1.0.0","scripts":{"install":"sh ./canary.sh"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("canary.sh"),
+            canary_script(&secret, &socket, &outside),
+        )
+        .unwrap();
+        let tarball = home.path().join("canary.tgz");
+        let tar_status = Command::new("tar")
+            .args([OsString::from("-czf"), tarball.as_os_str().to_owned()])
+            .args([
+                OsString::from("-C"),
+                home.path().join("pkg").into_os_string(),
+            ])
+            .arg("package")
+            .status()
+            .expect("create local npm canary archive");
+        assert!(tar_status.success(), "tar failed to create fixture archive");
+
+        let inner = [
+            OsString::from(&npm),
+            OsString::from("install"),
+            OsString::from("--offline"),
+            OsString::from("--no-audit"),
+            OsString::from("--no-fund"),
+            OsString::from("--prefix"),
+            staging.path().as_os_str().to_owned(),
+            tarball.into_os_string(),
+        ];
+        let (mut command, containment) = installer_command(
+            &npm,
+            &inner,
+            staging.path(),
+            home.path(),
+            HostInstall::Refuse,
+            "canary",
+            Some(npm_path),
+        )
+        .unwrap();
+        assert_eq!(containment, InstallerContainment::Bwrap);
+        run_bounded(&mut command, canary_limits(), false).expect("run npm install canary");
+
+        assert_contained_report(home.path(), &outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // acceptance canary; passes while containment holds.
+    fn installer_canary_cargo_build_script_is_contained() {
+        let bwrap = usable_bwrap();
+        if !thegn_core::testenv::require_or_skip("bwrap with user namespaces", bwrap.is_some()) {
+            return;
+        }
+        let socket_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = socket_dir.path().join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let socket_text = socket.to_str().unwrap();
+        let state = crate::testenv::IsolatedState::with_env(&[
+            ("THEGN_CANARY_TOKEN", "canary-token-value"),
+            ("SSH_AUTH_SOCK", socket_text),
+            ("THEGN_CONTROL_SOCKET", socket_text),
+        ]);
+        let secret = state.root().join(".ssh/id_canary");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, "canary-secret").unwrap();
+        let managed = state.root().join("data/canary");
+        let (home, staging) = installer_workspace(&managed, "canary").unwrap();
+        let outside = managed.parent().unwrap().join("outside-canary");
+
+        if !thegn_core::testenv::require_or_skip("cargo", util::have("cargo")) {
+            return;
+        }
+        let cargo = util::which_path("cargo").unwrap();
+        let probe = [OsString::from(&cargo), OsString::from("--version")];
+        if !thegn_core::testenv::require_or_skip(
+            "cargo usable inside the installer sandbox",
+            runs_contained(&cargo, &probe, staging.path(), home.path(), None),
+        ) {
+            return;
+        }
+
+        let crate_root = home.path().join("crate");
+        std::fs::create_dir_all(crate_root.join("src")).unwrap();
+        std::fs::write(
+            crate_root.join("Cargo.toml"),
+            "[package]\nname = \"thegn-installer-canary\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(crate_root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            crate_root.join("canary.sh"),
+            canary_script(&secret, &socket, &outside),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_root.join("build.rs"),
+            "fn main() {\n    let manifest_dir = std::env::var(\"CARGO_MANIFEST_DIR\").expect(\"manifest dir\");\n    let status = std::process::Command::new(\"sh\").arg(std::path::Path::new(&manifest_dir).join(\"canary.sh\")).status().expect(\"run installer canary\");\n    assert!(status.success(), \"installer canary script failed\");\n}\n",
+        )
+        .unwrap();
+
+        let inner = [
+            OsString::from(&cargo),
+            OsString::from("install"),
+            OsString::from("--offline"),
+            OsString::from("--path"),
+            crate_root.as_os_str().to_owned(),
+            OsString::from("--root"),
+            staging.path().as_os_str().to_owned(),
+            OsString::from("--target-dir"),
+            home.path().join("target").into_os_string(),
+        ];
+        let (mut command, containment) = installer_command(
+            &cargo,
+            &inner,
+            staging.path(),
+            home.path(),
+            HostInstall::Refuse,
+            "canary",
+            None,
+        )
+        .unwrap();
+        assert_eq!(containment, InstallerContainment::Bwrap);
+        run_bounded(&mut command, canary_limits(), false).expect("run cargo install canary");
+        assert!(staging.path().join("bin/thegn-installer-canary").exists());
+        assert_contained_report(home.path(), &outside);
+    }
+
     #[test]
     fn installer_child_sees_only_the_allowlist() {
         let home = Path::new("/synthetic-home");
