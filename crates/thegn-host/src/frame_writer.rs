@@ -2396,7 +2396,7 @@ mod tests {
                 log.lock()
                     .unwrap()
                     .iter()
-                    .all(|bytes| bytes.as_slice() == &[1u8])
+                    .all(|bytes| bytes.as_slice() == [1u8])
             );
         }
     }
@@ -2425,7 +2425,7 @@ mod tests {
         assert!(writer.submit_frame(vec![1], None));
         started_rx
             .recv_timeout(SYNC_WRITE_BOUND + std::time::Duration::from_secs(1))
-            .unwrap();
+            .expect("writer worker did not start the blocked sink before the sync timeout");
         let dropping = Instant::now();
         drop(writer);
         assert!(dropping.elapsed() < WRITER_SHUTDOWN_BOUND + std::time::Duration::from_millis(100));
