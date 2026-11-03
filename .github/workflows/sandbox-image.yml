@@ -1,9 +1,10 @@
 name: sandbox-image
 # Build + publish the multi-arch base sandbox image (hosts-as-resources):
 # every run first admits one commit on main's lineage and builds only that commit.
-# per-arch nix builds on native runners → generation-qualified pushes recorded
-# by digest → assemble + verify the manifest list from those frozen digests →
-# print its digest, which release commits pin as DEFAULT_BASE_DIGEST
+# Credential-free per-arch builders upload OCI archives; the publisher checks
+# out nothing, pushes each archive by digest under a generation-qualified tag,
+# assembles and verifies the list from those digests, then attests the list and
+# both children before printing its digest for DEFAULT_BASE_DIGEST.
 # (crates/thegn-core/src/image.rs).
 # Per-run architecture tags remain in GHCR; retention cleanup is tracked under THE-502.
 #
@@ -95,7 +96,6 @@ jobs:
     needs: admit
     permissions:
       contents: read
-      packages: write
     strategy:
       matrix:
         include:
@@ -109,33 +109,19 @@ jobs:
         with:
           ref: ${{ needs.admit.outputs.sha }}
       - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
-      - name: build + load
-        run: |
-          nix build .#sandbox-image
-          ./result | podman load
-      - name: push generation-qualified per-arch image
-        env:
-          TAG: ${{ needs.admit.outputs.tag }}
-          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-          OCI_ARCH: ${{ matrix.oci_arch }}
+      - name: build the per-arch OCI archive
         run: |
           set -euo pipefail
-          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
-          ref="$IMAGE:$TAG-$OCI_ARCH-g$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          digest_file=arch-digest.txt
-          podman tag thegn-sandbox:latest "$ref"
-          podman push --digestfile "$digest_file" "$ref"
-          digest="$(cat "$digest_file")"
-          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
-            echo "::error::registry returned an invalid image digest"
-            exit 1
-          }
+          nix build .#sandbox-image
+          mkdir -p "$RUNNER_TEMP/sandbox-image"
+          ./result > "$RUNNER_TEMP/sandbox-image/image.tar"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digest-${{ matrix.oci_arch }}
-          path: arch-digest.txt
+          name: image-${{ matrix.oci_arch }}
+          path: ${{ runner.temp }}/sandbox-image/image.tar
           if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
   manifest:
     needs: [admit, build]
     runs-on: ubuntu-24.04
@@ -147,14 +133,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: digest-amd64
-          path: digests/amd64
+          name: image-amd64
+          path: images/amd64
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: digest-arm64
-          path: digests/arm64
-      - name: assemble + push manifest list from frozen digests
-        id: push
+          name: image-arm64
+          path: images/arm64
+      - name: push per-arch archives by digest
+        id: arch
         env:
           TAG: ${{ needs.admit.outputs.tag }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -163,20 +149,45 @@ jobs:
           set -euo pipefail
           printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" \
             --authfile "$HOME/.docker/config.json" --password-stdin
-          amd64_digest="$(cat digests/amd64/arch-digest.txt)"
-          arm64_digest="$(cat digests/arm64/arch-digest.txt)"
+          for oci_arch in amd64 arm64; do
+            archive="images/$oci_arch/image.tar"
+            [[ -f "$archive" && ! -L "$archive" ]] || {
+              echo "::error::downloaded OCI archive is missing or unsafe"
+              exit 1
+            }
+            ref="$IMAGE:$TAG-$oci_arch-g$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            digest_file="arch-$oci_arch.digest"
+            skopeo copy --dest-authfile "$HOME/.docker/config.json" \
+              --digestfile "$digest_file" "docker-archive:$archive" "docker://$ref"
+            digest="$(cat "$digest_file")"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+              echo "::error::registry returned an invalid image digest"
+              exit 1
+            }
+            echo "${oci_arch}_digest=$digest" >> "$GITHUB_OUTPUT"
+          done
+      - name: assemble + push manifest list from frozen digests
+        id: push
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          AMD64_DIGEST: ${{ steps.arch.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.arch.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          amd64_digest="$AMD64_DIGEST"
+          arm64_digest="$ARM64_DIGEST"
           for digest in "$amd64_digest" "$arm64_digest"; do
             [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
               echo "::error::artifact contains an invalid image digest"
               exit 1
             }
           done
-          podman manifest create "$IMAGE:$TAG" \
+          podman manifest create --authfile "$HOME/.docker/config.json" "$IMAGE:$TAG" \
             "docker://$IMAGE@$amd64_digest" \
             "docker://$IMAGE@$arm64_digest"
           list_digest_file=manifest-digest.txt
           podman manifest push --all --digestfile "$list_digest_file" \
-            "$IMAGE:$TAG" "docker://$IMAGE:$TAG"
+            --authfile "$HOME/.docker/config.json" "$IMAGE:$TAG" "docker://$IMAGE:$TAG"
           list_digest="$(cat "$list_digest_file")"
           [[ "$list_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
             echo "::error::registry returned an invalid manifest digest"
@@ -228,6 +239,18 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Attest amd64 image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.amd64_digest }}
+          push-to-registry: true
+      - name: Attest arm64 image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.arm64_digest }}
           push-to-registry: true
       - name: print the list digest (pin as DEFAULT_BASE_DIGEST)
         env:

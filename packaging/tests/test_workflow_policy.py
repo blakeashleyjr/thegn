@@ -749,7 +749,7 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_sandbox_image_tag_resolved_once(self) -> None:
         jobs = read_workflow("sandbox-image.yml")["jobs"]
         expected = "${{ needs.admit.outputs.tag }}"
-        for job_name in ("build", "manifest"):
+        for job_name in ("manifest",):
             steps = jobs[job_name]["steps"]
             self.assertFalse(
                 any(step.get("name") == "resolve tag" for step in steps),
@@ -762,6 +762,10 @@ class WorkflowPolicyTests(unittest.TestCase):
             ]
             self.assertTrue(tag_envs, f"{job_name} must pass TAG to publication steps")
             self.assertTrue(all(tag == expected for tag in tag_envs), tag_envs)
+        self.assertFalse(
+            any("TAG" in step.get("env", {}) for step in jobs["build"]["steps"]),
+            "builders must not receive the publication tag",
+        )
 
     def test_sandbox_image_manifest_uses_digests_only(self) -> None:
         manifest = read_workflow("sandbox-image.yml")["jobs"]["manifest"]
@@ -775,34 +779,40 @@ class WorkflowPolicyTests(unittest.TestCase):
             line for line in following_lines if "podman manifest create" in line
         )
         create_command = create_line
+        self.assertIn('--authfile "$HOME/.docker/config.json"', create_command)
         self.assertIn("@$amd64_digest", create_command)
         self.assertIn("@$arm64_digest", create_command)
         self.assertNotIn("$TAG-amd64", create_command)
         self.assertNotIn("$TAG-arm64", create_command)
 
     def test_sandbox_image_pushes_are_generation_qualified(self) -> None:
-        build = read_workflow("sandbox-image.yml")["jobs"]["build"]
-        scripts = "\n".join(step.get("run", "") for step in build["steps"])
+        jobs = read_workflow("sandbox-image.yml")["jobs"]
+        manifest = jobs["manifest"]
+        scripts = "\n".join(step.get("run", "") for step in manifest["steps"])
         self.assertIn("$GITHUB_RUN_ID", scripts)
         self.assertIn("$GITHUB_RUN_ATTEMPT", scripts)
-        self.assertIn('podman push --digestfile "$digest_file"', scripts)
+        self.assertIn("skopeo copy", scripts)
+        self.assertIn("--digestfile", scripts)
+        self.assertIn("docker-archive:", scripts)
+        build = jobs["build"]
         artifact = next(
             step
             for step in build["steps"]
             if step.get("uses", "").startswith("actions/upload-artifact@")
         )
-        self.assertEqual("digest-${{ matrix.oci_arch }}", artifact["with"]["name"])
-        self.assertEqual("arch-digest.txt", artifact["with"]["path"])
+        self.assertEqual("image-${{ matrix.oci_arch }}", artifact["with"]["name"])
+        self.assertEqual("${{ runner.temp }}/sandbox-image/image.tar", artifact["with"]["path"])
         self.assertEqual("error", artifact["with"]["if-no-files-found"])
+        self.assertEqual(1, artifact["with"]["retention-days"])
+        self.assertEqual(0, artifact["with"]["compression-level"])
 
     def test_sandbox_image_packages_write_is_per_job(self) -> None:
         workflow = read_workflow("sandbox-image.yml")
         jobs = workflow["jobs"]
         self.assertEqual({"contents": "read"}, workflow["permissions"])
         self.assertNotIn("packages", jobs["admit"]["permissions"])
-        for job_name in ("build", "manifest"):
-            with self.subTest(job=job_name):
-                self.assertEqual("write", jobs[job_name]["permissions"]["packages"])
+        self.assertEqual({"contents": "read"}, jobs["build"]["permissions"])
+        self.assertEqual("write", jobs["manifest"]["permissions"]["packages"])
         self.assertEqual("write", jobs["manifest"]["permissions"]["id-token"])
         self.assertEqual("write", jobs["manifest"]["permissions"]["attestations"])
 
@@ -851,6 +861,101 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertGreater(print_index, attest_index)
         self.assertGreater(print_index, verify_index)
+
+    def test_sandbox_image_builders_hold_no_registry_credentials(self) -> None:
+        build = read_workflow("sandbox-image.yml")["jobs"]["build"]
+        self.assertEqual({"contents": "read"}, build["permissions"])
+        self.assertFalse(
+            any(
+                "secrets." in value
+                for step in build["steps"]
+                for value in step.get("env", {}).values()
+            )
+        )
+        scripts = "\n".join(step.get("run", "") for step in build["steps"])
+        for forbidden in ("login", "podman push", "skopeo copy", "GITHUB_TOKEN"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, scripts)
+
+    def test_sandbox_image_publisher_runs_no_candidate_code(self) -> None:
+        manifest = read_workflow("sandbox-image.yml")["jobs"]["manifest"]
+        downloads = [
+            step["with"]["name"]
+            for step in manifest["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        self.assertEqual({"image-amd64", "image-arm64"}, set(downloads))
+        for step in manifest["steps"]:
+            uses = step.get("uses", "")
+            if uses:
+                self.assertTrue(
+                    uses.startswith(("actions/download-artifact@", "actions/attest-build-provenance@")),
+                    uses,
+                )
+            self.assertFalse(uses.startswith(("actions/checkout@", "DeterminateSystems/")))
+        scripts = "\n".join(step.get("run", "") for step in manifest["steps"])
+        for forbidden in ("./result", "nix ", "podman load", "bash images/", "sh images/", "source "):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, scripts)
+
+    def test_sandbox_image_publisher_pushes_downloaded_archives_by_digest(self) -> None:
+        manifest = read_workflow("sandbox-image.yml")["jobs"]["manifest"]
+        steps = manifest["steps"]
+        downloads = [
+            step["with"]["name"]
+            for step in steps
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        self.assertEqual({"image-amd64", "image-arm64"}, set(downloads))
+        arch_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("name") == "push per-arch archives by digest"
+        )
+        push_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("name") == "assemble + push manifest list from frozen digests"
+        )
+        arch = steps[arch_index]
+        self.assertEqual("arch", arch["id"])
+        for required in (
+            "skopeo copy", "--digestfile", "docker-archive:",
+            "-g$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT", "! -L",
+        ):
+            self.assertIn(required, arch["run"])
+        self.assertLess(arch_index, push_index)
+        push_env = steps[push_index]["env"]
+        self.assertEqual("${{ steps.arch.outputs.amd64_digest }}", push_env["AMD64_DIGEST"])
+        self.assertEqual("${{ steps.arch.outputs.arm64_digest }}", push_env["ARM64_DIGEST"])
+
+    def test_sandbox_image_children_are_attested(self) -> None:
+        steps = read_workflow("sandbox-image.yml")["jobs"]["manifest"]["steps"]
+        verify_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("name") == "verify pushed manifest by digest"
+        )
+        print_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("name") == "print the list digest (pin as DEFAULT_BASE_DIGEST)"
+        )
+        attestations = [
+            (index, step)
+            for index, step in enumerate(steps)
+            if step.get("uses", "").startswith("actions/attest-build-provenance@")
+        ]
+        self.assertEqual(3, len(attestations))
+        self.assertEqual(
+            {
+                "${{ steps.push.outputs.digest }}",
+                "${{ steps.push.outputs.amd64_digest }}",
+                "${{ steps.push.outputs.arm64_digest }}",
+            },
+            {step["with"]["subject-digest"] for _, step in attestations},
+        )
+        for index, step in attestations:
+            self.assertGreater(index, verify_index)
+            self.assertLess(index, print_index)
+            self.assertEqual("${{ env.IMAGE }}", step["with"]["subject-name"])
+            self.assertIs(step["with"]["push-to-registry"], True)
 
     def test_release_build_enables_the_iroh_feature(self) -> None:
         steps = read_workflow("release.yml")["jobs"]["build"]["steps"]
