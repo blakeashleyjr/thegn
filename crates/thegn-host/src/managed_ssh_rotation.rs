@@ -1314,6 +1314,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_and_clear_recovery_keep_the_stamped_row_for_the_next_cas() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = thegn_core::managed_ssh::dir();
+        let mut record = thegn_core::managed_ssh::record_authorized_at(
+            &dir,
+            &custody_record("instance-a", None),
+        )
+        .unwrap();
+        let initial_generation = record.generation;
+
+        update_recovery(&mut record, recovery_marker("pending")).unwrap();
+        let updated = thegn_core::managed_ssh::read_at(
+            &dir,
+            &record.provider,
+            &record.account,
+            &record.instance,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record, updated);
+        assert!(record.generation > initial_generation);
+        assert!(record.rotation_recovery.is_some());
+
+        let updated_generation = record.generation;
+        clear_recovery(&mut record).unwrap();
+        let cleared = thegn_core::managed_ssh::read_at(
+            &dir,
+            &record.provider,
+            &record.account,
+            &record.instance,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record, cleared);
+        assert!(record.generation > updated_generation);
+        assert!(record.rotation_recovery.is_none());
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "test runs the generated remote script with a local sh"

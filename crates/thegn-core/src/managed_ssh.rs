@@ -959,6 +959,13 @@ mod tests {
         assert!(format!("{error:#}").contains("generation counter"));
         assert!(list_at(temp.path()).unwrap().is_empty());
 
+        std::fs::remove_file(&counter).unwrap();
+        std::fs::create_dir(&counter).unwrap();
+        let error = record_authorized_at(temp.path(), &record()).unwrap_err();
+        assert!(format!("{error:#}").contains("generation counter"));
+        assert!(list_at(temp.path()).unwrap().is_empty());
+
+        std::fs::remove_dir(&counter).unwrap();
         std::fs::write(&counter, "18446744073709551615").unwrap();
         let error = record_authorized_at(temp.path(), &record()).unwrap_err();
         assert!(format!("{error:#}").contains("exhausted"));
