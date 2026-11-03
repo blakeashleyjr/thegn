@@ -939,12 +939,15 @@ fn issue_router_control_error(
     }
 }
 
+/// One account's listing: (account label, provider id, result).
+type AccountListing<'a> = (
+    String,
+    &'a str,
+    Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
+);
+
 fn merge_issue_accounts(
-    per_provider: Vec<(
-        String,
-        &str,
-        Result<Vec<thegn_core::issue::Issue>, thegn_svc::issue::IssueError>,
-    )>,
+    per_provider: Vec<AccountListing<'_>>,
     limit: usize,
 ) -> ControlResult<IssueListing> {
     let total = per_provider.len();
