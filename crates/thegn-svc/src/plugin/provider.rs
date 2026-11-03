@@ -1186,20 +1186,26 @@ done
             (results, extra, after_close)
         });
 
-        assert!(matches!(
-            extra,
-            Err(BridgeError::Transport(message)) if message == SessionFailure::Full.to_string()
-        ));
+        assert!(
+            matches!(
+                &extra,
+                Err(BridgeError::Transport(message)) if message == &SessionFailure::Full.to_string()
+            ),
+            "unexpected overflow result: {extra:?}"
+        );
         assert_eq!(results.len(), MAX_QUEUED_FRAMES);
         assert!(results.iter().all(|result| matches!(
             result,
             Err(BridgeError::Transport(message)) if message == &SessionFailure::Closed.to_string()
-        )));
+        )), "pending calls did not all fail as closed: {results:?}");
         assert!(bridge.pending.lock().unwrap().calls.is_empty());
-        assert!(matches!(
-            after_close,
-            Ok(Err(BridgeError::Transport(message))) if message == SessionFailure::Closed.to_string()
-        ));
+        assert!(
+            matches!(
+                &after_close,
+                Ok(Err(BridgeError::Transport(message))) if message == &SessionFailure::Closed.to_string()
+            ),
+            "unexpected post-close result: {after_close:?}"
+        );
     }
 
     #[test]
@@ -1250,7 +1256,7 @@ done
     }
 
     #[test]
-    fn saturating_one_provider_bridge_leaves_another_admitting() {
+    fn independent_provider_bridges_have_independent_pending_capacity() {
         let (shared_a, bridge_a) = detached_bridge(Duration::from_secs(30));
         let (shared_b, bridge_b) = detached_bridge(Duration::from_secs(30));
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1294,19 +1300,25 @@ done
             (results_a, extra_a, result_b)
         });
 
-        assert!(matches!(
-            extra_a,
-            Err(BridgeError::Transport(message)) if message == SessionFailure::Full.to_string()
-        ));
-        assert!(matches!(
-            result_b,
-            Err(BridgeError::Transport(message)) if message == SessionFailure::Closed.to_string()
-        ));
+        assert!(
+            matches!(
+                &extra_a,
+                Err(BridgeError::Transport(message)) if message == &SessionFailure::Full.to_string()
+            ),
+            "unexpected saturated bridge result: {extra_a:?}"
+        );
+        assert!(
+            matches!(
+                &result_b,
+                Err(BridgeError::Transport(message)) if message == &SessionFailure::Closed.to_string()
+            ),
+            "independent bridge did not admit its call: {result_b:?}"
+        );
         assert_eq!(results_a.len(), MAX_QUEUED_FRAMES);
         assert!(results_a.iter().all(|result| matches!(
             result,
             Err(BridgeError::Transport(message)) if message == &SessionFailure::Closed.to_string()
-        )));
+        )), "saturated bridge calls did not all fail as closed: {results_a:?}");
         assert!(bridge_a.pending.lock().unwrap().calls.is_empty());
         assert!(bridge_b.pending.lock().unwrap().calls.is_empty());
     }
@@ -1321,7 +1333,7 @@ done
 
         rt.block_on(async {
             for _round in 0..3 {
-                let results = futures_util::future::join_all((0..24).map(|call| {
+                let results = futures_util::future::join_all((0_usize..24).map(|call| {
                     let op = if call.is_multiple_of(2) {
                         "list_issues"
                     } else {
