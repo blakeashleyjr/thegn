@@ -191,7 +191,7 @@ def validate_texts(
             problems.append("version-metadata uses substring grep -F instead of exact equality")
 
     if not re.search(r"bridge\s*\?\s*null\s*,", package) or (
-        "--set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn" not in package
+        '" --set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn"' not in package
     ):
         problems.append("nix/package.nix has no optional bridge reference")
 
@@ -394,7 +394,8 @@ def fixture(version: str) -> tuple[str, str, str, str, set[str]]:
     package = '''
       bridge ? null,
       version ? (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version,
-      --set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn
+      lib.optionalString (bridge != null)
+      " --set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn"
       install -Dm644 ${src}/LICENSE-MIT $out/share/licenses/thegn/LICENSE-MIT
       install -Dm644 ${src}/LICENSE-APACHE $out/share/licenses/thegn/LICENSE-APACHE
     '''
@@ -443,9 +444,24 @@ def self_test() -> int:
 
     good = cases[0]
     bad_fixtures = (
-        (good[1].replace('version = cargoVersion;', 'version = "1.0.0";', 1), good[2], "quoted version"),
-        (good[1].replace("[mit asl20]", "[mit]"), good[2], "MIT-only license"),
-        (good[1], good[2].replace("install -Dm644 ${src}/LICENSE-APACHE", "# omitted"), "missing license install"),
+        (
+            good[1].replace('version = cargoVersion;', 'version = "1.0.0";', 1),
+            good[2],
+            "quoted version",
+            "cargoCommonArgs does not use version = cargoVersion",
+        ),
+        (
+            good[1].replace("[mit asl20]", "[mit]"),
+            good[2],
+            "MIT-only license",
+            "thegn Nix license assertion does not match [mit asl20]",
+        ),
+        (
+            good[1],
+            good[2].replace("install -Dm644 ${src}/LICENSE-APACHE", "# omitted"),
+            "missing license install",
+            "nix/package.nix does not install LICENSE-APACHE",
+        ),
         (
             good[1].replace(
                 'test "$(${thegn}/bin/thegn --version)" = "thegn ${cargoVersion}"',
@@ -453,6 +469,7 @@ def self_test() -> int:
             ),
             good[2],
             "substring version check",
+            "version-metadata uses substring grep -F instead of exact equality",
         ),
         (
             good[1].replace(
@@ -462,6 +479,7 @@ def self_test() -> int:
             ),
             good[2],
             "dev package without bridge reference",
+            "dev package (thegnDev) does not reference the musl bridge on x86_64-linux",
         ),
         (
             good[1].replace(
@@ -472,12 +490,16 @@ def self_test() -> int:
             ),
             good[2],
             "stable package with bridge reference",
+            "stable package (thegn) must not carry a bridge reference",
         ),
     )
-    for flake, package, label in bad_fixtures:
+    for flake, package, label, expected_problem in bad_fixtures:
         problems = validate_texts(good[0], flake, package, good[3], good[4])
-        if not problems:
-            print(f"SELF-TEST FAIL: {label} drift was accepted")
+        if expected_problem not in problems:
+            print(
+                f"SELF-TEST FAIL: {label} drift did not produce the expected problem: "
+                f"{expected_problem!r}; got {problems!r}"
+            )
             return 1
         print(f"SELF-TEST OK: rejected {label} drift")
 
