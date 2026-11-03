@@ -552,6 +552,7 @@ impl DevcontainerProvider for CliProvider {
         env: &[(String, String)],
     ) -> anyhow::Result<PreparedStartup> {
         let executable = self.executable()?.to_path_buf();
+        ensure_config_contained(workspace_folder, config_path)?;
         let snapshot = snapshot_config(config_path, config_digest, config_content)?;
         let provider_config_path = snapshot.path().to_path_buf();
         let mut command = Command::new(&executable);
@@ -580,6 +581,7 @@ impl DevcontainerProvider for CliProvider {
         // The child receives the immutable snapshot, so a repository edit
         // after this check cannot change what the provider parses. Keep the
         // check for the expected stale-session behavior.
+        ensure_config_contained(workspace_folder, config_path)?;
         verify_config_digest(config_path, config_digest)?;
         Ok(PreparedStartup {
             command,
@@ -611,6 +613,17 @@ impl DevcontainerProvider for CliProvider {
             command.into(),
         ])
     }
+}
+
+fn ensure_config_contained(workspace_folder: &Path, config_path: &Path) -> anyhow::Result<()> {
+    thegn_core::devcontainer_select::revalidate_selected(workspace_folder, config_path).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "devcontainer config {} is no longer a regular file inside the worktree ({error}); refusing provider use",
+                config_path.display()
+            )
+        },
+    )
 }
 
 /// Hash the selected config and its referenced files for the provider trust
@@ -803,6 +816,61 @@ mod tests {
             .prepare_start(dir.path(), &config_path, &digest, content, &[])
             .expect_err("changed config must not reach the provider");
         assert!(error.to_string().contains("changed after trust approval"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_refuses_a_config_directory_swapped_outside_the_workspace_before_any_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let config_path = ws.join(".devcontainer/devcontainer.json");
+        let content = b"{\"image\":\"approved\"}";
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::rename(ws.join(".devcontainer"), &outside).unwrap();
+        symlink(&outside, ws.join(".devcontainer")).unwrap();
+
+        let error = CliProvider::with_executable("/bin/devcontainer")
+            .prepare_start(&ws, &config_path, &digest, content, &[])
+            .expect_err("a replaced config directory must refuse provider use");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer a regular file inside the worktree")
+        );
+        assert!(!std::fs::read_dir(&outside).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".thegn-devcontainer-")
+        }));
+    }
+
+    #[test]
+    fn provider_still_prepares_an_unchanged_config_inside_the_workspace() {
+        // Positive control: the same in-workspace layout is accepted at the base.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let config_path = ws.join(".devcontainer/devcontainer.json");
+        let content = b"{\"image\":\"approved\"}";
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+        let digest = config_digest(&config_path).unwrap();
+
+        let prepared = CliProvider::with_executable("/bin/devcontainer").prepare_start(
+            &ws,
+            &config_path,
+            &digest,
+            content,
+            &[],
+        );
+
+        assert!(prepared.is_ok());
     }
 
     #[test]
