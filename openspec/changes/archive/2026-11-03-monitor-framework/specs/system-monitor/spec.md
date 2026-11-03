@@ -80,10 +80,12 @@ screen permits; tab content scrolls within the available interior.
 ### Requirement: A panel with no source is removed before layout
 
 Overview panels whose source health is Absent MUST be removed before layout so
-remaining panels can use their space. The Overview power panel SHALL remain
-omitted until power discovery resolves to Ok or Absent. Other board views may
-retain a panel for an unavailable collector and render its absent mark; missing
-readings MUST NOT be displayed as zero.
+remaining panels can use their space. The Overview power panel SHALL be placed
+only once the power-supply source reports Ok or Failing, or base stats carry a
+battery reading. Other board views may retain a panel for an unavailable
+collector and render its absent mark; missing readings MUST NOT be displayed as
+zero. CPU and GPU board views render the active ellipsis glyph for a Warming
+source; disk maps Warming and Denied readings to its state marks.
 
 #### Scenario: An Overview source is absent
 
@@ -93,7 +95,8 @@ readings MUST NOT be displayed as zero.
 
 #### Scenario: Power discovery is incomplete
 
-- **WHEN** power discovery has not resolved to Ok or Absent
+- **WHEN** the power-supply source has not reported Ok or Failing and base stats
+  carry no battery reading
 - **THEN** the Overview power panel is not placed
 - **AND** the power-supply collector is not demanded by that panel
 
@@ -171,9 +174,9 @@ across restarts.
 
 At 240×60, the monitor perf workload SHALL report Overview and CPU model
 rebuild and paint medians against reference targets of 2 ms and 0.3 ms. Those
-wall-clock targets are informational and are not enforced by CI. Rendering allocation tests SHALL
-keep their pinned allocation ceilings, and rasters SHALL be computed only
-during repaint.
+wall-clock targets are informational and are not enforced by CI. Rendering
+allocation tests SHALL keep their pinned allocation ceilings, and rasters SHALL
+be computed only during repaint.
 
 #### Scenario: The perf workload reports a frame
 
