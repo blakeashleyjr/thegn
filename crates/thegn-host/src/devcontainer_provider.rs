@@ -212,6 +212,11 @@ impl DevcontainerSession {
     }
 
     fn verify_config(&self) -> anyhow::Result<()> {
+        ensure_config_contained(&self.handle.workspace_folder, &self.handle.config_path)?;
+        ensure_config_contained(
+            &self.handle.workspace_folder,
+            self.handle.config_snapshot.path(),
+        )?;
         verify_config_digest(&self.handle.config_path, &self.handle.config_digest)
     }
 
@@ -597,6 +602,8 @@ impl DevcontainerProvider for CliProvider {
     }
 
     fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> anyhow::Result<Vec<String>> {
+        ensure_config_contained(&handle.workspace_folder, &handle.config_path)?;
+        ensure_config_contained(&handle.workspace_folder, handle.config_snapshot.path())?;
         verify_config_digest(&handle.config_path, &handle.config_digest)?;
         // The CLI accepts the command after the workspace/config options. Keep
         // it as one shell command so the core's normalized command semantics
@@ -781,7 +788,7 @@ mod tests {
         let provider = CliProvider::with_executable("/bin/devcontainer");
         let handle = DevcontainerHandle {
             executable: "/bin/devcontainer".into(),
-            workspace_folder: "/repo/worktree".into(),
+            workspace_folder: dir.path().into(),
             config_path: config_path.clone(),
             config_digest: digest,
             config_snapshot: snapshot,
@@ -793,7 +800,7 @@ mod tests {
                 "/bin/devcontainer".into(),
                 "exec".into(),
                 "--workspace-folder".into(),
-                "/repo/worktree".into(),
+                dir.path().display().to_string(),
                 "--config".into(),
                 handle.config_snapshot.path().display().to_string(),
                 "sh".into(),
@@ -892,6 +899,92 @@ mod tests {
             .exec_argv(&handle, "printf ok")
             .expect_err("changed config must not produce an exec command");
         assert!(error.to_string().contains("changed after trust approval"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_refuses_exec_after_the_config_directory_is_swapped_outside_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let config_path = ws.join(".devcontainer/devcontainer.json");
+        let content = b"{\"image\":\"approved\"}";
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        let snapshot = snapshot_config(&config_path, &digest, content).unwrap();
+        let handle = DevcontainerHandle {
+            executable: "/bin/devcontainer".into(),
+            workspace_folder: ws.clone(),
+            config_path: config_path.clone(),
+            config_digest: digest,
+            config_snapshot: snapshot,
+            env: Vec::new(),
+        };
+        let outside = dir.path().join("outside");
+        std::fs::rename(ws.join(".devcontainer"), &outside).unwrap();
+        symlink(outside, ws.join(".devcontainer")).unwrap();
+
+        let result =
+            CliProvider::with_executable("/bin/devcontainer").exec_argv(&handle, "printf ok");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("InvalidInput"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_refuses_exec_when_the_snapshot_is_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let config_path = ws.join(".devcontainer/devcontainer.json");
+        let content = b"{\"image\":\"approved\"}";
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        let snapshot = snapshot_config(&config_path, &digest, content).unwrap();
+        let handle = DevcontainerHandle {
+            executable: "/bin/devcontainer".into(),
+            workspace_folder: ws,
+            config_path: config_path.clone(),
+            config_digest: digest,
+            config_snapshot: snapshot,
+            env: Vec::new(),
+        };
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, content).unwrap();
+        std::fs::remove_file(handle.config_snapshot.path()).unwrap();
+        symlink(outside, handle.config_snapshot.path()).unwrap();
+
+        let result =
+            CliProvider::with_executable("/bin/devcontainer").exec_argv(&handle, "printf ok");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("InvalidInput"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_session_is_invalidated_when_the_config_directory_is_swapped() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let worktree = ws.to_str().unwrap();
+        let config_path = ws.join(".devcontainer/devcontainer.json");
+        let content = b"{\"image\":\"approved\"}";
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+        install_failing_test_session(worktree, &config_path).unwrap();
+        assert!(session_for(worktree).is_some());
+
+        let outside = dir.path().join("outside");
+        std::fs::rename(ws.join(".devcontainer"), &outside).unwrap();
+        symlink(outside, ws.join(".devcontainer")).unwrap();
+
+        assert!(session_for(worktree).is_none());
+        remove_test_session(worktree);
     }
 
     #[cfg(unix)]
