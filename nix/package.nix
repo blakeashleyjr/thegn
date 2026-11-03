@@ -57,7 +57,7 @@
   isDev = channel == "dev";
   bridgeArgs =
     lib.optionalString (bridge != null)
-    "--set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn";
+    " --set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn";
   # The dev build coexists with a stable install under distinct names.
   binName =
     if isDev
@@ -161,7 +161,7 @@ in
       # (git/lazygit/delta/gh/gdu) regardless of the user's PATH.
       wrapProgram $out/bin/${binName} \
         --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
-        --prefix PATH : ${lib.makeBinPath runtimeDeps} ${bridgeArgs}
+        --prefix PATH : ${lib.makeBinPath runtimeDeps}${bridgeArgs}
     '';
 
     meta = {
