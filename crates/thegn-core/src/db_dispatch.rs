@@ -6393,4 +6393,191 @@ mod tests {
         );
         // Queue enrollment (`merge add`) remains outside this lease decision chain.
     }
+
+    fn rows_in_every_status(db: &Db) -> Vec<(i64, &'static str)> {
+        let statuses = [
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Spawning,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            AgentDispatchStatus::PrOpen,
+            AgentDispatchStatus::Merged,
+            AgentDispatchStatus::Abandoned,
+            AgentDispatchStatus::Done,
+            AgentDispatchStatus::Failed,
+        ];
+        let mut rows = Vec::with_capacity(statuses.len() + 1);
+        for (index, status) in statuses.into_iter().enumerate() {
+            let issue_id = format!("linear:FENCE-{index}");
+            let worktree = format!("/wt/fence-{index}");
+            let id = put_row(db, &issue_id, &worktree);
+            db.update_dispatch_status(id, status).unwrap();
+            rows.push((id, status.as_str()));
+        }
+        let issue_id = "linear:FENCE-9";
+        let id = put_row(db, issue_id, "/wt/fence-9");
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET status='zombie' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        rows.push((id, "zombie"));
+        rows
+    }
+
+    fn run_fence_row_snapshot(db: &Db, id: i64) -> (String, Option<String>, Option<String>, i64) {
+        db.conn()
+            .query_row(
+                "SELECT status, session_id, artifact_path, run_gen FROM agent_dispatches WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn run_fence_table_publish_admits_only_reservations() {
+        let db = Db::open_memory().unwrap();
+        for (id, stored) in rows_in_every_status(&db) {
+            let before = run_fence_row_snapshot(&db, id);
+            let parsed = AgentDispatchStatus::parse(stored);
+            let outcome = db.publish_dispatch_run(id, "s-new", "a.md").unwrap();
+            if matches!(
+                parsed,
+                AgentDispatchStatus::Queued | AgentDispatchStatus::Spawning
+            ) {
+                assert_eq!(outcome, DispatchRunPublishOutcome::Published, "{stored}");
+                let after = run_fence_row_snapshot(&db, id);
+                assert_eq!(after.0, AgentDispatchStatus::Running.as_str(), "{stored}");
+                assert_eq!(after.1.as_deref(), Some("s-new"), "{stored}");
+                assert_eq!(after.2.as_deref(), Some("a.md"), "{stored}");
+                assert_eq!(after.3, before.3 + 1, "{stored}");
+            } else {
+                assert_eq!(
+                    outcome,
+                    DispatchRunPublishOutcome::StateChanged { status: parsed },
+                    "{stored}"
+                );
+                assert_eq!(run_fence_row_snapshot(&db, id), before, "{stored}");
+            }
+        }
+    }
+
+    #[test]
+    fn run_fence_table_bind_admits_only_active_sessionless_rows() {
+        let db = Db::open_memory().unwrap();
+        for (id, stored) in rows_in_every_status(&db) {
+            let before = run_fence_row_snapshot(&db, id);
+            let parsed = AgentDispatchStatus::parse(stored);
+            let bound = db.bind_dispatch_session(id, "s-bind").unwrap();
+            assert_eq!(bound, parsed.is_active(), "{stored}");
+            let after = run_fence_row_snapshot(&db, id);
+            if parsed.is_active() {
+                assert_eq!(after.0, before.0, "{stored}");
+                assert_eq!(after.1.as_deref(), Some("s-bind"), "{stored}");
+                assert_eq!(after.2, before.2, "{stored}");
+                assert_eq!(after.3, before.3 + 1, "{stored}");
+                assert!(
+                    !db.bind_dispatch_session(id, "s-overwrite").unwrap(),
+                    "{stored}"
+                );
+                assert_eq!(run_fence_row_snapshot(&db, id), after, "{stored}");
+            } else {
+                assert_eq!(after, before, "{stored}");
+            }
+        }
+    }
+
+    #[test]
+    fn run_fence_table_fenced_cas_refuses_a_stale_run_for_every_status() {
+        let db = Db::open_memory().unwrap();
+        for (id, stored) in rows_in_every_status(&db) {
+            let stale = db.dispatch_run_ref(id).unwrap().unwrap();
+            let parsed = AgentDispatchStatus::parse(stored);
+            if parsed.is_active() {
+                assert!(db.bind_dispatch_session(id, "s-newer").unwrap(), "{stored}");
+            } else {
+                db.conn()
+                    .execute(
+                        "UPDATE agent_dispatches SET run_gen=run_gen+1 WHERE id=?1",
+                        [id],
+                    )
+                    .unwrap();
+            }
+            let status_after_bump = run_fence_row_snapshot(&db, id).0;
+            assert!(
+                !db.compare_and_set_dispatch_status_run(
+                    &stale,
+                    parsed,
+                    AgentDispatchStatus::Failed,
+                    None,
+                )
+                .unwrap(),
+                "stale generation must refuse for {stored}"
+            );
+            assert_eq!(
+                run_fence_row_snapshot(&db, id).0,
+                status_after_bump,
+                "{stored}"
+            );
+
+            let fresh = db.dispatch_run_ref(id).unwrap().unwrap();
+            let changed = db
+                .compare_and_set_dispatch_status_run(
+                    &fresh,
+                    parsed,
+                    AgentDispatchStatus::Failed,
+                    None,
+                )
+                .unwrap();
+            if stored == "zombie" {
+                // The fenced CAS binds expected.as_str(); today's SQL cannot match raw legacy text.
+                assert!(!changed, "{stored}");
+                assert_eq!(run_fence_row_snapshot(&db, id).0, "zombie");
+            } else {
+                assert!(changed, "{stored}");
+                assert_eq!(run_fence_row_snapshot(&db, id).0, "failed", "{stored}");
+            }
+        }
+    }
+
+    #[test]
+    fn run_fence_table_exit_stamp_is_run_fenced_not_status_fenced() {
+        let db = Db::open_memory().unwrap();
+        for (id, stored) in rows_in_every_status(&db) {
+            let fresh = db.dispatch_run_ref(id).unwrap().unwrap();
+            let status = run_fence_row_snapshot(&db, id).0;
+            assert_eq!(
+                db.stamp_dispatch_exit(&fresh, Some(7)).unwrap(),
+                ExitStamp::Stamped,
+                "{stored}"
+            );
+            assert_eq!(
+                db.stamp_dispatch_exit(&fresh, Some(8)).unwrap(),
+                ExitStamp::AlreadyStamped,
+                "{stored}"
+            );
+            let stale = crate::issue::DispatchRunRef {
+                run_gen: fresh.run_gen - 1,
+                ..fresh.clone()
+            };
+            assert_eq!(
+                db.stamp_dispatch_exit(&stale, Some(9)).unwrap(),
+                ExitStamp::Stale,
+                "{stored}"
+            );
+            assert_eq!(run_fence_row_snapshot(&db, id).0, status, "{stored}");
+        }
+        let missing = crate::issue::DispatchRunRef {
+            id: 999_999,
+            issue_id: "linear:FENCE-MISSING".into(),
+            session_id: String::new(),
+            run_gen: 0,
+        };
+        assert_eq!(
+            db.stamp_dispatch_exit(&missing, Some(1)).unwrap(),
+            ExitStamp::Missing
+        );
+    }
 }
