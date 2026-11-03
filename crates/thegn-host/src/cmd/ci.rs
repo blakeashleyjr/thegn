@@ -446,14 +446,13 @@ fn log(
                 .ok()
                 .and_then(|db| db.get_ci_log(&key, run_id, job_id).ok().flatten())
         })
-        .flatten()
-        .filter(|entry| {
-            entry.run_id == run_id
-                && entry.job_id == job_id
-                && thegn_svc::ci::validate_ci_id(&entry.run_id).is_ok()
-                && thegn_svc::ci::validate_ci_id(&entry.job_id).is_ok()
-                && thegn_core::ci_log::cacheable_log_entry(entry)
-        });
+        .flatten();
+    let current_context = cached
+        .as_ref()
+        .and_then(|_| thegn_svc::ci::cache_context(&GitLoc::for_worktree(&wt), &cfg.ci));
+    let cached = cached.filter(|entry| {
+        crate::ci_refresh::served_log_cache_hit(entry, run_id, job_id, current_context.as_deref())
+    });
     let entry = if let Some(mut entry) = cached {
         // Cache rows have already been redacted and bounded. Re-apply the
         // configured policy so a later config change cannot widen a response.
