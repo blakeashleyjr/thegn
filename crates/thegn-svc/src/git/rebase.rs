@@ -1167,6 +1167,7 @@ mod tests {
         let source_url = format!("file://{}", src.dir.display());
         dst.out(&["fetch", "-q", "--depth", "2", &source_url, "main"]);
         dst.out(&["reset", "-q", "--hard", "FETCH_HEAD"]);
+        assert_eq!(dst.out(&["rev-parse", "--is-shallow-repository"]), "true");
 
         let boundary = dst.sha_of("c3");
         let head = dst.head();
@@ -1219,10 +1220,27 @@ mod tests {
     #[test]
     fn failed_parent_probe_never_selects_root() {
         let r = linear("failed-parent-probe");
-        assert!(base_for(&r.loc(), &"0".repeat(40)).is_err());
+        let error = base_for(&r.loc(), &"0".repeat(40)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("verify rebase target"),
+            "unexpected parent-probe error: {error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("shallow-clone boundary"),
+            "a failed parent probe must not be classified as a shallow boundary: {error:#}"
+        );
 
         let dir = tempfile::tempdir_in("/tmp").unwrap();
-        assert!(base_for(&GitLoc::Local(dir.path().to_path_buf()), &"0".repeat(40)).is_err());
+        let error =
+            base_for(&GitLoc::Local(dir.path().to_path_buf()), &"0".repeat(40)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("verify rebase target"),
+            "unexpected parent-probe error outside a repository: {error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("shallow-clone boundary"),
+            "a failed parent probe must not be classified as a shallow boundary: {error:#}"
+        );
     }
 
     #[test]
