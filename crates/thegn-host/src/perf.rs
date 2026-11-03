@@ -468,6 +468,12 @@ impl Default for Histo {
     }
 }
 
+/// Fewest samples for which a p95 is not simply the window's maximum: the p95
+/// rank is ceil(0.95 n), which is below n only from n = 20. Below this a tail
+/// percentile describes one or two samples, so surfaces must show the count
+/// and mark the window sparse rather than present a tail.
+pub(crate) const TAIL_MIN_SAMPLES: u64 = 20;
+
 // ---------------------------------------------------------------------------
 // Wake-source attribution + loop self-profiler.
 // ---------------------------------------------------------------------------
@@ -941,7 +947,11 @@ pub struct PerfSnapshot {
     pub writer_queue_p99_us: u64,
     pub writer_write_p99_us: u64,
     pub writer_completion_p99_us: u64,
+    /// Bucket lower edge; read with `writer_frames`.
+    pub writer_completion_p95_us: u64,
     pub writer_input_p99_us: u64,
+    /// Bucket lower edge; read with `writer_input_samples`.
+    pub writer_input_p95_us: u64,
     pub hydrate_calls: u64,
     pub hydrate_child_calls: u64,
     pub wakes_per_s: f64,
@@ -951,6 +961,8 @@ pub struct PerfSnapshot {
     pub render_skips_per_s: f64,
     pub render_p50_us: u64,
     pub render_p99_us: u64,
+    /// Bucket lower edge; read with `frame_samples`.
+    pub render_p95_us: u64,
     /// Full-recompose frame cost percentiles (0 when no full frame rendered).
     /// The blended `render_p*` averages these into the cheap pane frames.
     pub render_full_p50_us: u64,
@@ -962,6 +974,8 @@ pub struct PerfSnapshot {
     /// to distinguish no observations from the zero-microsecond bucket.
     pub input_p50_us: u64,
     pub input_p99_us: u64,
+    /// Bucket lower edge; read with `input_samples`.
+    pub input_p95_us: u64,
     /// Switch→first-frame latency percentiles (0 when no switch happened).
     /// Tab/worktree switches only; workspace switches are `switch_ws_*`.
     pub switch_p50_us: u64,
@@ -1050,7 +1064,9 @@ impl LoopPerf {
             writer_queue_p99_us: self.writer.queue_us.percentile_us(0.99),
             writer_write_p99_us: self.writer.write_us.percentile_us(0.99),
             writer_completion_p99_us: self.writer.completion_us.percentile_us(0.99),
+            writer_completion_p95_us: self.writer.completion_us.percentile_us(0.95),
             writer_input_p99_us: self.writer.input_completion_us.percentile_us(0.99),
+            writer_input_p95_us: self.writer.input_completion_us.percentile_us(0.95),
             hydrate_calls: cpu[Subsys::Hydrate as usize].1,
             hydrate_child_calls: cpu[Subsys::HydrateChild as usize].1,
             wakes_per_s: self.wakes as f64 / secs,
@@ -1060,12 +1076,14 @@ impl LoopPerf {
             render_skips_per_s: self.render_skips as f64 / secs,
             render_p50_us: self.render_us.percentile_us(0.50),
             render_p99_us: self.render_us.percentile_us(0.99),
+            render_p95_us: self.render_us.percentile_us(0.95),
             render_full_p50_us: self.render_full_us.percentile_us(0.50),
             render_full_p99_us: self.render_full_us.percentile_us(0.99),
             render_incr_p50_us: self.render_incr_us.percentile_us(0.50),
             render_incr_p99_us: self.render_incr_us.percentile_us(0.99),
             input_p50_us: self.input_us.percentile_us(0.50),
             input_p99_us: self.input_us.percentile_us(0.99),
+            input_p95_us: self.input_us.percentile_us(0.95),
             switch_p50_us: self.switch_us.percentile_us(0.50),
             switch_p99_us: self.switch_us.percentile_us(0.99),
             switch_ws_p50_us: self.switch_ws_us.percentile_us(0.50),
@@ -1119,7 +1137,9 @@ impl LoopPerf {
             writer_queue_p99_us = snap.writer_queue_p99_us,
             writer_write_p99_us = snap.writer_write_p99_us,
             writer_completion_p99_us = snap.writer_completion_p99_us,
+            writer_completion_p95_us = snap.writer_completion_p95_us,
             writer_input_p99_us = snap.writer_input_p99_us,
+            writer_input_p95_us = snap.writer_input_p95_us,
             hydrate_calls = snap.hydrate_calls,
             hydrate_child_calls = snap.hydrate_child_calls,
             cpu_hydrate_child_ms = cpu_ms[Subsys::HydrateChild as usize],
@@ -1135,6 +1155,7 @@ impl LoopPerf {
             render_skips_per_s = snap.render_skips_per_s,
             render_p50_us = snap.render_p50_us,
             render_p99_us = snap.render_p99_us,
+            render_p95_us = snap.render_p95_us,
             // Loop-thread `Db::open` (THE-179). `max` is the number to read:
             // SQLite's busy_timeout here is 5s, so one contended open on the
             // loop is a five-second freeze that a mean would hide entirely.
@@ -1147,6 +1168,7 @@ impl LoopPerf {
             render_incr_p99_us = snap.render_incr_p99_us,
             input_p50_us = snap.input_p50_us,
             input_p99_us = snap.input_p99_us,
+            input_p95_us = snap.input_p95_us,
             switch_p50_us = snap.switch_p50_us,
             switch_p99_us = snap.switch_p99_us,
             switch_ws_p50_us = snap.switch_ws_p50_us,
@@ -1372,6 +1394,34 @@ mod tests {
         // p50 lands in the fast bucket; p99 (rank 990 > 900 fast) reaches the outliers.
         assert_eq!(p50, 512);
         assert!(p99 >= 8192, "p99 {p99} should reflect the 16ms outliers");
+    }
+
+    #[test]
+    fn histo_p95_lands_in_the_tail_bucket() {
+        // Positive control: the existing bucket histogram already computes this correctly.
+        let mut h = Histo::new();
+        for _ in 0..900 {
+            h.record_us(1_000);
+        }
+        for _ in 0..100 {
+            h.record_us(16_000);
+        }
+        assert_eq!(h.percentile_us(0.95), 8192);
+
+        let mut fast = Histo::new();
+        for _ in 0..1_000 {
+            fast.record_us(1_000);
+        }
+        assert_eq!(fast.percentile_us(0.95), 512);
+    }
+
+    #[test]
+    fn tail_min_samples_is_the_smallest_count_whose_p95_is_not_the_maximum() {
+        for n in 1..TAIL_MIN_SAMPLES {
+            assert_eq!((0.95 * n as f64).ceil() as u64, n);
+        }
+        let n = TAIL_MIN_SAMPLES;
+        assert!(((0.95 * n as f64).ceil() as u64) < n);
     }
 
     #[test]
@@ -1683,5 +1733,38 @@ mod tests {
         let current = crate::mem::alloc_stats();
         assert_eq!(snap.malloc.trims_idle, current.trims_idle);
         assert_eq!(snap.malloc.arena_cap, current.arena_cap);
+    }
+
+    #[test]
+    fn rollup_reports_p95_beside_p99_with_sample_counts() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut lp = LoopPerf::new();
+        for _ in 0..19 {
+            lp.render_us.record_us(1_000);
+            lp.input_us.record_us(1_000);
+            lp.writer.completion_us.record_us(1_000);
+            lp.writer.input_completion_us.record_us(1_000);
+        }
+        lp.render_us.record_us(16_000);
+        lp.input_us.record_us(16_000);
+        lp.writer.completion_us.record_us(16_000);
+        lp.writer.input_completion_us.record_us(16_000);
+
+        let snap = lp.rollup(Instant::now(), 0, 0, 0);
+        assert_eq!(snap.frame_samples, 20);
+        assert_eq!(snap.render_p95_us, 512);
+        assert_eq!(snap.render_p99_us, 8192);
+        assert_eq!(snap.input_samples, 20);
+        assert_eq!(snap.input_p95_us, 512);
+        assert_eq!(snap.input_p99_us, 8192);
+        assert_eq!(snap.writer_frames, 20);
+        assert_eq!(snap.writer_completion_p95_us, 512);
+        assert_eq!(snap.writer_completion_p99_us, 8192);
+        assert_eq!(snap.writer_input_samples, 20);
+        assert_eq!(snap.writer_input_p95_us, 512);
+        assert_eq!(snap.writer_input_p99_us, 8192);
     }
 }
