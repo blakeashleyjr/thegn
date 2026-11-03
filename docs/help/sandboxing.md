@@ -114,7 +114,10 @@ recreates them on the next launch. Pane entry and launch preflight both select
 the first service replica, so they enter the same container. A refused sandbox
 entry names its refusal class and gives a one-line remediation; for example,
 `mount-unresolvable` advises creating the mount source or removing the mount
-from the config, then relaunching.
+from the config, then relaunching. Compose preflight distinguishes a missing
+service, one with no running container, and a scaled service whose replica 1 is
+not running. For a scaled service whose replica 1 is not running, bring it back,
+for example with `docker compose up -d <service>`.
 
 Before launch, every local mount source is resolved to a real path. If a
 required source cannot be resolved, the launch is refused with its source and

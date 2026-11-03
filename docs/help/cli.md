@@ -75,7 +75,9 @@ key rotation is unfinished. The message points to `thegn secret ssh rotate`;
 nothing is changed.
 Keyring operations run on one worker. While an earlier keyring call is stuck
 past its timeout, further keyring operations fail at once without starting,
-and nothing is written to a file instead.
+and nothing is written to a file instead. `thegn mcp secret set` and `rm`
+update the keyring and MCP secret index under one lock; a corrupt index is
+refused before the keyring is touched.
 
 The managed file store (the keyring fallback) refuses to read token files
 accessible to other users or with extra hard links. Its message names the file
@@ -447,6 +449,9 @@ With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 `missing_row` before the command fails.
 
 `dispatch claim`, `dispatch put`, `session open --stage --issue`, `session open --resume-work` and `dispatch set-status` take `--lease <name> --owner <id>` where applicable. A claim, put or resume binds its row to that lease; further mutations for that issue require the same live lease. `--admin --why '<reason>'` on claim, put or set-status is the manual override and is recorded on the row. Rows created without a lease behave as before.
+`session open --resume-work` also checks any resumed row's parent other than the
+resume source in the same transaction. A missing parent, one from another issue,
+or one that is failed, abandoned or unknown is refused.
 
 The `[pipeline.transport_retry]` budget is stored on each dispatch row and
 counted once per run. It survives daemon restarts without exceeding the
