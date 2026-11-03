@@ -1051,6 +1051,13 @@ pub fn path_to_uri(path: &str) -> String {
     format!("file://{}", percent_encode_path(path))
 }
 
+/// [`path_to_uri`] for an OS path. A path that is not valid UTF-8 is refused
+/// (empty string, like any other unsupported path) instead of being encoded as
+/// its lossy text, which names a different file.
+pub fn path_to_uri_os(path: &Path) -> String {
+    path.to_str().map(path_to_uri).unwrap_or_default()
+}
+
 /// Decode a canonical local `file:` URI. Remote authorities and ambiguous URI
 /// components are rejected instead of being interpreted as filesystem text.
 pub fn uri_to_path(uri: &str) -> String {
@@ -2112,7 +2119,7 @@ impl LspClient {
     /// Run the `initialize`/`initialized` handshake, capturing the server's
     /// declared `capabilities` for the request gate.
     pub fn initialize(&self, root: &Path) -> Result<(), LspError> {
-        let uri = path_to_uri(&root.to_string_lossy());
+        let uri = path_to_uri_os(root);
         if uri.is_empty() {
             return Err(LspError::Bounded("workspace identity path limit".into()));
         }
@@ -4194,6 +4201,47 @@ mod tests {
         let uri = path_to_uri(p);
         assert!(uri.contains("%20"), "space should be encoded: {uri}");
         assert_eq!(uri_to_path(&uri), p);
+    }
+
+    #[test]
+    fn path_to_uri_os_refuses_a_non_utf8_path_instead_of_a_lossy_one() {
+        let Some(path) = crate::plugin::platform::non_utf8_path_for_test(Path::new("/tmp/proj"))
+        else {
+            return;
+        };
+
+        assert_eq!(path_to_uri_os(&path), "");
+        assert_eq!(
+            path_to_uri(&path.to_string_lossy()),
+            "file:///tmp/proj/src-%EF%BF%BD.rs"
+        );
+    }
+
+    #[test]
+    fn path_to_uri_os_matches_path_to_uri_for_utf8_paths() {
+        for path in [
+            "/home/u/proj/src/lib.rs",
+            "/home/u/my proj/a b.rs",
+            "/x/€.rs",
+        ] {
+            assert_eq!(path_to_uri_os(Path::new(path)), path_to_uri(path));
+        }
+        assert_eq!(path_to_uri_os(Path::new("rel/a.rs")), "");
+    }
+
+    #[test]
+    fn initialize_refuses_a_non_utf8_root_before_writing() {
+        let (client, captured, _server_writer) = capturing_client();
+        let Some(root) = crate::plugin::platform::non_utf8_path_for_test(Path::new("/tmp")) else {
+            return;
+        };
+
+        assert!(matches!(
+            client.initialize(&root),
+            Err(LspError::Bounded(message)) if message == "workspace identity path limit"
+        ));
+        assert!(!String::from_utf8_lossy(&captured.lock().unwrap()).contains("initialize"));
+        client.shutdown(Duration::from_millis(100));
     }
 
     #[test]

@@ -2492,7 +2492,7 @@ fn spawn_refs_fetch(
             };
             if let Some(client) = client {
                 server = true;
-                let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
+                let uri = thegn_svc::lsp::path_to_uri_os(&root.join(&file));
                 if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
                     let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
                 }
@@ -2575,7 +2575,7 @@ fn spawn_hover_fetch(
                 Err(_) => None,
             };
             if let Some(client) = client {
-                let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
+                let uri = thegn_svc::lsp::path_to_uri_os(&root.join(&file));
                 if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
                     let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
                 }
@@ -2654,7 +2654,7 @@ fn outline_rows(
             Err(_) => None,
         };
         if let Some(client) = client {
-            let uri = thegn_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
+            let uri = thegn_svc::lsp::path_to_uri_os(&root.join(file));
             let _ = client.did_open(&uri, text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
             match client.document_symbols_with(&uri, cancel) {
                 Ok(syms) if !syms.is_empty() => {
