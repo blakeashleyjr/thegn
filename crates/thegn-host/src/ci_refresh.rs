@@ -479,7 +479,8 @@ pub(crate) fn context_row_current(cached_context: &str, current_context: Option<
     }
 }
 
-/// A cached CI log is served only for its own run/job, with a known head, and never across a known provider-context change (an unknown current context keeps the row, like the run cache).
+/// A cached CI log is served only for its own run/job, with a known head, and never across a
+/// known provider-context change (an unknown current context keeps the row, like the run cache).
 pub(crate) fn served_log_cache_hit(
     entry: &thegn_core::ci_log::CiLogEntry,
     run_id: &str,
@@ -2512,7 +2513,6 @@ mod tests {
         assert!(context_row_current("anything", None));
     }
 
-    #[cfg(test)]
     fn served_log(context: &str) -> thegn_core::ci_log::CiLogEntry {
         thegn_core::ci_log::CiLogEntry {
             worktree: "/wt/a".into(),
