@@ -1,8 +1,11 @@
 //! Bounded, namespace-aware reader for the small DAV multistatus subset used
 //! by CalDAV. The transport caps the body; each admitted response is also
-//! charged to the account admission meter.
+//! charged to the account admission meter. Element counts and retained root
+//! children are capped as well.
 
 use std::{borrow::Cow, collections::BTreeMap};
+
+use thegn_core::calendar::admission::MAX_EVENT_CHILDREN;
 
 use super::CalendarError;
 
@@ -33,6 +36,8 @@ fn parse_error(offset: usize) -> CalendarError {
 struct Reader<'a> {
     input: &'a str,
     pos: usize,
+    subtree_elements: usize,
+    retained_elements: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -102,6 +107,13 @@ impl<'a> Reader<'a> {
         visit_response: &mut impl FnMut(&Element<'a>) -> Result<(), CalendarError>,
     ) -> Result<Element<'a>, CalendarError> {
         if depth > MAX_XML_DEPTH || !self.input[self.pos..].starts_with('<') {
+            return self.fail();
+        }
+        if depth == 2 {
+            self.subtree_elements = 0;
+        }
+        self.subtree_elements += 1;
+        if self.subtree_elements > MAX_EVENT_CHILDREN {
             return self.fail();
         }
         self.pos += 1;
@@ -267,6 +279,12 @@ impl<'a> Reader<'a> {
                 } else if self.input[self.pos..].starts_with('<') {
                     let child = self.element(scope, depth + 1, root_phase, visit_response)?;
                     if !(depth == 1 && is(&child, DAV_NS, "response")) {
+                        if depth == 1 {
+                            self.retained_elements += self.subtree_elements;
+                            if self.retained_elements > MAX_EVENT_CHILDREN {
+                                return self.fail();
+                            }
+                        }
                         children.push(child);
                     }
                 } else {
@@ -344,6 +362,7 @@ pub(super) struct DavResource<'a> {
     pub(super) href: String,
     pub(super) ics_raw: &'a str,
     pub(super) deleted: bool,
+    pub(super) etag: Option<String>,
 }
 
 pub(super) fn walk_multistatus<'a>(
@@ -352,6 +371,8 @@ pub(super) fn walk_multistatus<'a>(
 ) -> Result<String, CalendarError> {
     let mut reader = Reader {
         input,
+        subtree_elements: 0,
+        retained_elements: 0,
         pos: if input.starts_with('\u{feff}') {
             '\u{feff}'.len_utf8()
         } else {
@@ -525,6 +546,7 @@ fn process_response<'a>(
                 href,
                 ics_raw: "",
                 deleted: true,
+                etag: None,
             });
         }
         return Err(CalendarError::Api(format!(
@@ -538,6 +560,7 @@ fn process_response<'a>(
     }
     let mut calendar: Option<(&str, u16)> = None;
     let mut saw_etag = false;
+    let mut etag = None;
     for propstat in propstats {
         if !propstat.text.trim().is_empty() {
             return Err(CalendarError::Parse(
@@ -596,6 +619,19 @@ fn process_response<'a>(
                     return Err(CalendarError::Parse("duplicate CalDAV getetag".into()));
                 }
                 saw_etag = true;
+                if !property.children.is_empty() {
+                    return Err(CalendarError::Parse("nested CalDAV getetag".into()));
+                }
+                if property.inner.trim().len() > crate::http::MAX_REQUEST_BYTES {
+                    return Err(CalendarError::BodyLimit(
+                        "calendar resource etag exceeds limit",
+                    ));
+                }
+                let decoded = decode_text(property.inner.trim())?;
+                let decoded = decoded.trim();
+                if (200..300).contains(&code) && !decoded.is_empty() {
+                    etag = Some(decoded.to_string());
+                }
             }
         }
     }
@@ -616,6 +652,7 @@ fn process_response<'a>(
         href,
         ics_raw,
         deleted: false,
+        etag,
     })
 }
 
