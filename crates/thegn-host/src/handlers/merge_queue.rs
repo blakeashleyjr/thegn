@@ -2220,4 +2220,257 @@ mod tests {
         assert_eq!(conflict_row_status(Some("x")), MqStatus::NeedsHuman);
         assert_eq!(conflict_row_status(None), MqStatus::Deferred);
     }
+
+    fn in_app_git(repo: &Path, args: &[&str]) -> String {
+        #[expect(clippy::disallowed_methods, reason = "the test fixture invokes git")]
+        let output = thegn_core::util::git_cmd(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn in_app_queue() -> (crate::testenv::IsolatedState, PathBuf, PathBuf) {
+        let state = crate::testenv::IsolatedState::new();
+        let repo = state.root().join("repo");
+        let feature = state.root().join("feature");
+        std::fs::create_dir_all(&repo).unwrap();
+        in_app_git(&repo, &["init", "-q", "-b", "main"]);
+        in_app_git(&repo, &["config", "user.name", "Merge Queue Test"]);
+        in_app_git(
+            &repo,
+            &["config", "user.email", "merge-queue@example.invalid"],
+        );
+        in_app_git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        in_app_git(&repo, &["add", "base.txt"]);
+        in_app_git(
+            &repo,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        let feature_arg = feature.to_str().unwrap().to_owned();
+        in_app_git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", &feature_arg, "main"],
+        );
+        std::fs::write(feature.join("feat.txt"), "feature\n").unwrap();
+        in_app_git(&feature, &["add", "feat.txt"]);
+        in_app_git(
+            &feature,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "feature"],
+        );
+
+        let root = repo.canonicalize().unwrap();
+        let feature = feature.canonicalize().unwrap();
+        let db = Db::open().unwrap();
+        db.put_worktree(
+            "feat",
+            root.to_str().unwrap(),
+            feature.to_str().unwrap(),
+            "feat",
+            None,
+            None,
+        )
+        .unwrap();
+        db.enqueue_merge(feature.to_str().unwrap(), "feat", "main")
+            .unwrap();
+        (state, root, feature)
+    }
+
+    fn hold_in_app_row(root: &Path, feature: &Path) -> (Db, thegn_core::store::MergeClaim) {
+        let holder = Db::open().unwrap();
+        holder
+            .set_merge_agent_attempts(feature.to_str().unwrap(), 1)
+            .unwrap();
+        let claim = holder
+            .admit_merge_claim(&thegn_core::store::MergeClaimRequest {
+                worktree: feature.to_str().unwrap().to_owned(),
+                branch: "feat".into(),
+                repo_root: root.to_str().unwrap().to_owned(),
+                target_branch: "main".into(),
+                location: String::new(),
+                expected_status: "queued".into(),
+                lease_until_ms: thegn_core::util::now_ms() + 60_000,
+                owner_hint: Some("cli-drain".into()),
+            })
+            .unwrap()
+            .expect("holder acquires the queue row");
+        (holder, claim)
+    }
+
+    fn in_app_drain_config() -> Config {
+        Config {
+            merge_queue: thegn_core::config::MergeQueueConfig {
+                enabled: true,
+                gate_on: false,
+                organize_folders: false,
+                target_branch: "main".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn drain_messages(cfg: &Config, root: &Path) -> Vec<DriveMsg> {
+        let sent = std::cell::RefCell::new(Vec::new());
+        drive_blocking(cfg, root, |message| sent.borrow_mut().push(message));
+        sent.into_inner()
+    }
+
+    fn done_outcome(messages: &[DriveMsg]) -> &DriveOutcome {
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, DriveMsg::Done(_)))
+                .count(),
+            1,
+            "in-app drain sends exactly one Done message"
+        );
+        assert!(matches!(messages.last(), Some(DriveMsg::Done(_))));
+        match messages.last().unwrap() {
+            DriveMsg::Done(outcome) => outcome,
+            _ => unreachable!("last message was checked to be Done"),
+        }
+    }
+
+    #[test]
+    fn in_app_drain_skips_a_row_claimed_by_another_drain() {
+        let (_state, root, feature) = in_app_queue();
+        let (holder, _claim) = hold_in_app_row(&root, &feature);
+        let before_row = holder.list_merge_queue().unwrap().remove(0);
+        let before_claim = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let before_main = in_app_git(&root, &["rev-parse", "refs/heads/main"]);
+
+        let messages = drain_messages(&in_app_drain_config(), &root);
+        let outcome = done_outcome(&messages);
+        assert!(
+            !messages.iter().any(|message| matches!(
+                message,
+                DriveMsg::Step { worktree, .. } if worktree == feature.to_str().unwrap()
+            )),
+            "held row must not produce a progress step"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("claimed by another drain"))
+        );
+        assert!(outcome.landed.is_empty());
+        assert!(outcome.ready.is_empty());
+        let after_row = holder.list_merge_queue().unwrap().remove(0);
+        assert_eq!(after_row.status, "queued");
+        assert_eq!(after_row.agent_attempts, before_row.agent_attempts);
+        assert_eq!(
+            in_app_git(&root, &["rev-parse", "refs/heads/main"]),
+            before_main
+        );
+        let after_claim = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_claim.generation, before_claim.generation);
+        assert_ne!(after_claim.phase, "unclaimed");
+        assert_eq!(after_claim.owner_hint, before_claim.owner_hint);
+    }
+
+    #[test]
+    fn in_app_drain_leaves_the_claim_owner_able_to_settle() {
+        let (_state, root, feature) = in_app_queue();
+        let (holder, claim) = hold_in_app_row(&root, &feature);
+        let admitted = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+
+        let messages = drain_messages(&in_app_drain_config(), &root);
+        let outcome = done_outcome(&messages);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("claimed by another drain"))
+        );
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            DriveMsg::Step { worktree, .. } if worktree == feature.to_str().unwrap()
+        )));
+        let held = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.generation, admitted.generation);
+        assert_ne!(held.phase, "unclaimed");
+        holder.release_merge_claim(&claim).unwrap();
+
+        let released = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.phase, "unclaimed");
+        assert_eq!(released.generation, admitted.generation);
+    }
+
+    #[test]
+    fn in_app_drain_admits_the_row_after_the_owner_releases() {
+        let (_state, root, feature) = in_app_queue();
+        let (holder, claim) = hold_in_app_row(&root, &feature);
+        let admitted = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+
+        let first_messages = drain_messages(&in_app_drain_config(), &root);
+        let first_outcome = done_outcome(&first_messages);
+        assert!(
+            first_outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("claimed by another drain"))
+        );
+        let held = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.generation, admitted.generation);
+        assert_ne!(held.phase, "unclaimed");
+        holder.release_merge_claim(&claim).unwrap();
+
+        let feature_tip = in_app_git(&feature, &["rev-parse", "HEAD"]);
+        let second_messages = drain_messages(&in_app_drain_config(), &root);
+        assert!(second_messages.iter().any(|message| matches!(
+            message,
+            DriveMsg::Step { worktree, .. } if worktree == feature.to_str().unwrap()
+        )));
+        let second_outcome = done_outcome(&second_messages);
+        assert!(
+            !second_outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("claimed by another drain"))
+        );
+        let after = holder
+            .observe_merge_claim(feature.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.phase, "unclaimed");
+        assert_eq!(after.generation, admitted.generation + 1);
+        // The fold may land or stop at another reported status; only assert the
+        // ref movement when the drain reports a successful land.
+        if second_outcome.landed.iter().any(|branch| branch == "feat") {
+            assert_eq!(
+                in_app_git(&root, &["rev-parse", "refs/heads/main"]),
+                feature_tip
+            );
+        }
+    }
 }
