@@ -3085,13 +3085,42 @@ mod tests {
             std::os::unix::fs::symlink(&moved, &feat_wt).unwrap();
 
             let sentinel = root.join("fixer-ran");
-            let outcome = drive_queue(
+            let outcome = drive_queue_with(
                 &cfg(&format!("touch {} && {FIXER}", sentinel.display()), 2),
                 &Config::default(),
                 &root,
                 &db,
                 vec![queued],
                 |_| {},
+                DriveActions {
+                    attempt: |_: &str, _: &thegn_core::remote::GitLoc, _: bool| {
+                        Ok(AttemptOutcome::Conflict {
+                            paths: vec!["base.txt".into()],
+                            submodule_conflicts: Vec::new(),
+                            driver_refusal: None,
+                        })
+                    },
+                    floor: |worktree: &str| match verify_fixer_checkout_for_dispatch(
+                        &root,
+                        worktree,
+                        "feat",
+                        Some(&target_head),
+                    ) {
+                        Ok(()) => panic!("symlinked worktree passed fixer verification"),
+                        Err(reason) => crate::agent_run::AgentDispatch::InfraHold(format!(
+                            "worktree identity drift: {reason}"
+                        )),
+                    },
+                    runner:
+                        |_: &str,
+                         _: &str,
+                         _: &str,
+                         _: &str,
+                         _: &Failure,
+                         _: Option<thegn_core::sandbox::SandboxSpec>| {
+                            panic!("symlinked worktree reached the fixer")
+                        },
+                },
             );
             assert_eq!(out(&root, &["rev-parse", "main"]), main_before);
             assert_eq!(outcome.agent_blocked, ["feat"]);
