@@ -1904,15 +1904,27 @@ pub fn gap_disposition(id: &str, s: Surface) -> Option<GapDisposition> {
         .map(|(_, _, disposition)| *disposition)
 }
 
-/// The generated exclusion document (`docs/api/surface-gaps.md`).
-pub fn render_surface_gaps_doc() -> String {
+fn write_surface_gap_doc_row(
+    doc: &mut String,
+    id: &str,
+    surface: &str,
+    disposition: Option<GapDisposition>,
+    reason: &str,
+) {
     use std::fmt::Write as _;
 
+    let code = disposition.map_or("unclassified", GapDisposition::code);
+    let review = disposition.and_then(GapDisposition::review).unwrap_or("-");
+    writeln!(doc, "| {id} | {surface} | {code} | {review} | {reason} |")
+        .expect("writing a String cannot fail");
+}
+
+/// The generated exclusion document (`docs/api/surface-gaps.md`).
+pub fn render_surface_gaps_doc() -> String {
     let mut rows: Vec<_> = SURFACE_GAPS
         .iter()
         .map(|(id, surface, reason)| {
-            let disposition = gap_disposition(id, *surface)
-                .expect("every surface gap has an explicit disposition");
+            let disposition = gap_disposition(id, *surface);
             (*id, surface.as_str(), disposition, *reason)
         })
         .collect();
@@ -1922,9 +1934,7 @@ pub fn render_surface_gaps_doc() -> String {
         "# Control-surface gaps\n\nGenerated from `thegn_core::capability::SURFACE_GAPS` and `GAP_DISPOSITIONS` by\n`just ratchet-update`; do not edit by hand. `thegn api coverage` reports the same\ndispositions.\n\nDisposition codes: `deferred` (owed; the review issue owns the decision), `blocked`\n(waiting on the named issue), `superseded` (replaced by the named capability),\n`local-only` (operates on caller-local files or custody), `unsafe` (would widen\ntrust on this surface; not planned).\n\n| Capability | Surface | Disposition | Review | Reason |\n| --- | --- | --- | --- | --- |\n",
     );
     for (id, surface, disposition, reason) in rows {
-        let review = disposition.review().unwrap_or("-");
-        writeln!(doc, "| {id} | {surface} | {} | {review} | {reason} |")
-            .expect("writing a String cannot fail");
+        write_surface_gap_doc_row(&mut doc, id, surface, disposition, reason);
     }
     doc
 }
@@ -2518,6 +2528,22 @@ mod tests {
             table_rows(DOC),
             table_rows(&render_surface_gaps_doc()),
             "regenerate with `just ratchet-update`",
+        );
+    }
+
+    #[test]
+    fn surface_gaps_doc_marks_missing_dispositions_unclassified() {
+        let mut doc = String::new();
+        write_surface_gap_doc_row(
+            &mut doc,
+            "test.capability",
+            "http",
+            None,
+            "missing classification",
+        );
+        assert_eq!(
+            doc, "| test.capability | http | unclassified | - | missing classification |\n",
+            "a gap without a disposition renders as unclassified instead of panicking",
         );
     }
 }
