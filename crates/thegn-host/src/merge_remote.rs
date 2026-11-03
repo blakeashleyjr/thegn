@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -758,11 +758,10 @@ fn stream_bundle(
 }
 
 /// Materialize the bundle on the target host and fetch its branch ref into the
-/// supplied generation-scoped ref. The fetch is cancellable through the fold
-/// cancellation probe. Under the co-location model the drain runs on the target
-/// host, so `target` is `Local`; a remote target means the caller should have
-/// dispatched to that host's drain daemon (see Milestone B), so we fail loudly
-/// rather than trying to push a bundle the wrong way.
+/// supplied generation-scoped ref. Under the co-location model the drain runs on the
+/// target host, so `target` is `Local`; a remote target means the caller should
+/// have dispatched to that host's drain daemon (see Milestone B), so we fail
+/// loudly rather than trying to push a bundle the wrong way.
 fn fetch_from_custody(
     target: &GitLoc,
     branch: &str,
@@ -903,7 +902,7 @@ fn run_fetch_cancellable(mut cmd: Command, deadline: Duration) -> thegn_core::gi
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !cancellation_requested && crate::fold_cancel::requested() {
-                    cancel.store(true, Ordering::Release);
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
                     cancellation_requested = true;
                 }
             }
@@ -1450,10 +1449,9 @@ mod tests {
         }
         let _scope = crate::fold_cancel::scope(|| true);
         let started = Instant::now();
-        let outcome = run_fetch_cancellable(
-            std::process::Command::new("sh").args(["-c", "exec sleep 30"]),
-            Duration::from_secs(60),
-        );
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        let outcome = run_fetch_cancellable(cmd, Duration::from_secs(60));
         assert!(matches!(
             outcome,
             thegn_core::git_run::GitOutcome::Cancelled
