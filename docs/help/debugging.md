@@ -101,6 +101,13 @@ The bundle treats those as separate log sinks.
 log line, while `thegn logs tail --json` escapes them, so hostile log messages
 cannot drive your terminal.
 
+`THEGN_SYNC_WRITER=1`, and the stock renderer selected with
+`THEGN_RENDERER=termwiz`, make terminal writes wait for completion in FIFO
+order on the writer thread. Each wait is capped at three seconds. If a write
+times out, the compositor exits with a terminal-writer error and drops queued
+bytes; a syscall already blocked in the operating system is not cancelled. Use
+these settings only to diagnose rendering problems.
+
 ## Performance and profiling
 
 Set `THEGN_PERF=1` before launching the compositor to enable the runtime
