@@ -4053,12 +4053,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             db.get_dispatch(id).unwrap().unwrap().report.as_deref(),
-            Some("before[2J\nafter")
+            Some("before\u{fffd}[2J\nafter")
         );
         db.append_dispatch_note(id, "first\nsecond\x07").unwrap();
         assert_eq!(
             db.dispatch_notes(id, None, 0).unwrap()[0].text,
-            "firstsecond"
+            "first second\u{fffd}"
         );
     }
 
