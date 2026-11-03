@@ -5695,6 +5695,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_client_deadline_bounds_a_stalled_tls_handshake() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut client_hello = [0u8; 1024];
+            let n = socket.read(&mut client_hello).await.unwrap();
+            assert!(n > 0);
+            release_rx.await.unwrap();
+        });
+
+        // Positive control: the configured total deadline already covers the TLS handshake.
+        let started = std::time::Instant::now();
+        let result = provider_http_client_with_deadline(std::time::Duration::from_millis(300))
+            .get(format!("https://{address}/"))
+            .send()
+            .await;
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the client must time out during the stalled TLS handshake"),
+        };
+        assert!(
+            redacted_transport_error("test", "GET", &error)
+                .to_string()
+                .contains("timed out")
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn control_reader_reports_a_connection_cut_mid_body_as_a_transport_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n{\"partial\"")
+                .await
+                .unwrap();
+        });
+
+        let response = provider_http_client()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let result = response_json(response, "test", "GET").await;
+        server.await.unwrap();
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("test: GET provider endpoint"));
+        assert!(!error.contains("decode GET response JSON"));
+    }
+
+    #[tokio::test]
+    async fn control_reader_returns_an_encoded_body_undecoded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let encoded_body: &[u8] = b"\x1f\x8b\x08\x00not-really-gzip";
+        assert_eq!(encoded_body.len(), 19);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(n > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 19\r\n\r\n\x1f\x8b\x08\x00not-really-gzip",
+                )
+                .await
+                .unwrap();
+        });
+
+        // The client enables no decompression, so CONTROL_BODY_LIMIT bounds held bytes; if
+        // decompression is enabled, this test must gain a decompressed-size ceiling.
+        let response = provider_http_client()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let body = response_bytes(response, "test", "GET", CONTROL_BODY_LIMIT)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(body.as_slice(), encoded_body);
+    }
+
+    #[tokio::test]
     async fn download_dir_skips_size_drift_using_actual_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let provider = ListingProvider::new(
