@@ -515,8 +515,8 @@ fn renderer_prefix_under_home(home: Option<&Path>, canonical_program: &Path) -> 
 fn canonical_renderer_home(home: Option<PathBuf>) -> Option<PathBuf> {
     home.filter(|home| !home.as_os_str().is_empty() && home != Path::new("/"))
         .map(|home| {
-            let canonical = home.canonicalize().ok();
-            canonical_home_or_lexical(home, canonical)
+            let canonical = home.canonicalize();
+            canonical_home_or_lexical(home, canonical.ok())
         })
 }
 
