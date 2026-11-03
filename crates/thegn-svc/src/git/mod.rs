@@ -1387,7 +1387,8 @@ pub(crate) fn parse_worktrees_lines(out: &str) -> Result<Vec<WorktreeInfo>> {
     let mut has_head_field = false;
     let mut previous_was_blank = false;
 
-    for line in out.lines() {
+    let lines = out.strip_suffix('\n').unwrap_or(out);
+    for line in lines.split('\n') {
         if line.is_empty() {
             anyhow::ensure!(!previous_was_blank, "malformed worktree list: empty record");
             let worktree = current
@@ -1430,6 +1431,10 @@ pub(crate) fn parse_worktrees_lines(out: &str) -> Result<Vec<WorktreeInfo>> {
             .as_mut()
             .context("malformed worktree list: field before worktree record")?;
         anyhow::ensure!(line != "HEAD", "malformed worktree HEAD object id");
+        anyhow::ensure!(
+            has_head || has_bare || line.starts_with("HEAD ") || line == "bare",
+            "worktree field before HEAD"
+        );
         if let Some(oid) = line.strip_prefix("HEAD ") {
             anyhow::ensure!(!has_head && !has_bare, "duplicate worktree HEAD field");
             anyhow::ensure!(worktree_head_oid(oid), "malformed worktree HEAD object id");
@@ -1439,7 +1444,6 @@ pub(crate) fn parse_worktrees_lines(out: &str) -> Result<Vec<WorktreeInfo>> {
             has_bare = true;
         } else if let Some(branch) = line.strip_prefix("branch ") {
             anyhow::ensure!(has_head, "worktree head field before HEAD");
-            anyhow::ensure!(!has_bare, "worktree head field before HEAD");
             anyhow::ensure!(!has_head_field, "duplicate worktree head field");
             anyhow::ensure!(!branch.is_empty(), "malformed worktree branch field");
             let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
@@ -1450,7 +1454,6 @@ pub(crate) fn parse_worktrees_lines(out: &str) -> Result<Vec<WorktreeInfo>> {
             anyhow::bail!("malformed worktree branch field");
         } else if line == "detached" {
             anyhow::ensure!(has_head, "worktree head field before HEAD");
-            anyhow::ensure!(!has_bare, "worktree head field before HEAD");
             anyhow::ensure!(!has_head_field, "duplicate worktree head field");
             worktree.head = WorktreeHead::Detached;
             has_head_field = true;
@@ -4283,6 +4286,9 @@ mod tests {
         assert_eq!(worktrees[6].path, "/unborn");
         assert_eq!(worktrees[6].head, WorktreeHead::Branch("main".into()));
         assert!(parse_worktrees_lines(" \n\t\n").unwrap().is_empty());
+
+        let cr_path = parse_worktrees_lines(&format!("worktree /a\r\nHEAD {sha1}\n")).unwrap();
+        assert_eq!(cr_path[0].path, "/a\r");
     }
 
     #[test]
@@ -4290,6 +4296,8 @@ mod tests {
         let oid = "a".repeat(40);
         let cases = [
             "worktree /a\nbranch refs/heads/evil\nbare\n".to_string(),
+            format!("worktree /a\nprunable\nHEAD {oid}\nbranch refs/heads/x\n"),
+            "worktree /a\nfoo\nbare\n".to_string(),
             format!("worktree /a\nworktree /x\nHEAD {oid}\ndetached\n"),
             format!("worktree /a\n\nworktree /x\nHEAD {oid}\ndetached\n"),
             format!("worktree /r\nHEAD {oid}\nbranch refs/heads/a\nbranch refs/heads/b\n"),
