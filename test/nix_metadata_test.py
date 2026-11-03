@@ -190,6 +190,34 @@ def validate_texts(
         if "grep -F" in check:
             problems.append("version-metadata uses substring grep -F instead of exact equality")
 
+    if not re.search(r"bridge\s*\?\s*null\s*,", package) or (
+        "--set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn" not in package
+    ):
+        problems.append("nix/package.nix has no optional bridge reference")
+
+    dev_block = block_after(flake, "thegnDev = pkgs.callPackage ./nix/package.nix")
+    if dev_block is None or not re.search(
+        r'bridge\s*=\s*if\s+system\s*==\s*"x86_64-linux"\s+'
+        r"then\s+thegnMusl\s+else\s+null\s*;",
+        dev_block,
+    ):
+        problems.append("dev package (thegnDev) does not reference the musl bridge on x86_64-linux")
+
+    stable_block = block_after(flake, "thegn = pkgs.callPackage ./nix/package.nix")
+    if stable_block is None or "bridge" in stable_block:
+        problems.append("stable package (thegn) must not carry a bridge reference")
+
+    if not re.search(
+        r"(?m)^\s*grep\s+-q\s+['\"]THEGN_BRIDGE_BINARY['\"]\s+"
+        r"\$\{thegnDev\}/bin/thegn-dev\s*$",
+        check,
+    ) or not re.search(
+        r"(?m)^\s*grep\s+-q\s+['\"]\$\{thegnMusl\}/bin/thegn['\"]\s+"
+        r"\$\{thegnDev\}/bin/thegn-dev\s*$",
+        check,
+    ):
+        problems.append("version-metadata does not verify the dev bridge reference")
+
     return problems
 
 
@@ -311,7 +339,10 @@ def fixture(version: str) -> tuple[str, str, str, str, set[str]]:
       cargoCommonArgs = { pname = "thegn"; version = cargoVersion; };
       cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
       thegn = pkgs.callPackage ./nix/package.nix { version = cargoVersion; };
-      thegnDev = pkgs.callPackage ./nix/package.nix { version = cargoVersion; channel = "dev"; };
+      thegnDev = pkgs.callPackage ./nix/package.nix {
+        version = cargoVersion; channel = "dev";
+        bridge = if system == "x86_64-linux" then thegnMusl else null;
+      };
       thegnMusl = muslRustPlatform.buildRustPackage {
         pname = "thegn-musl"; version = cargoVersion;
         installPhase = ''
@@ -354,12 +385,16 @@ def fixture(version: str) -> tuple[str, str, str, str, set[str]]:
           test "$(${thegn}/bin/thegn --version)" = "thegn ${cargoVersion}"
           test "$(${thegnDev}/bin/thegn-dev --version)" = "thegn ${cargoVersion}"
           test "$(${thegnMusl}/bin/thegn --version)" = "thegn ${cargoVersion}"
+          grep -q 'THEGN_BRIDGE_BINARY' ${thegnDev}/bin/thegn-dev
+          grep -q '${thegnMusl}/bin/thegn' ${thegnDev}/bin/thegn-dev
         '';
       };
       dev-docker-shim = null;
     '''
     package = '''
+      bridge ? null,
       version ? (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version,
+      --set-default THEGN_BRIDGE_BINARY ${bridge}/bin/thegn
       install -Dm644 ${src}/LICENSE-MIT $out/share/licenses/thegn/LICENSE-MIT
       install -Dm644 ${src}/LICENSE-APACHE $out/share/licenses/thegn/LICENSE-APACHE
     '''
@@ -418,6 +453,25 @@ def self_test() -> int:
             ),
             good[2],
             "substring version check",
+        ),
+        (
+            good[1].replace(
+                '        bridge = if system == "x86_64-linux" then thegnMusl else null;\n',
+                "",
+                1,
+            ),
+            good[2],
+            "dev package without bridge reference",
+        ),
+        (
+            good[1].replace(
+                'thegn = pkgs.callPackage ./nix/package.nix { version = cargoVersion; };',
+                'thegn = pkgs.callPackage ./nix/package.nix '
+                '{ version = cargoVersion; bridge = thegnMusl; };',
+                1,
+            ),
+            good[2],
+            "stable package with bridge reference",
         ),
     )
     for flake, package, label in bad_fixtures:
