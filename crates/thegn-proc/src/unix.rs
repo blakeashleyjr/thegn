@@ -59,23 +59,25 @@ struct Feed<'a> {
     state: InputFeed,
 }
 
+const FEED_PUMP_CAP: usize = 1 << 20;
+
 impl Feed<'_> {
     fn pending(&self) -> bool {
         self.stdin.is_some()
     }
 
     fn pump(&mut self) {
-        let mut written_this_call = 0;
+        let mut written_this_call: usize = 0;
         while self.stdin.is_some() {
             if self.pos == self.input.len() {
                 self.close();
                 self.state.complete = true;
                 return;
             }
-            if written_this_call >= 1024 * 1024 {
+            if written_this_call >= FEED_PUMP_CAP {
                 return;
             }
-            let remaining = (self.input.len() - self.pos).min(1024 * 1024 - written_this_call);
+            let remaining = (self.input.len() - self.pos).min(FEED_PUMP_CAP - written_this_call);
             let fd = self.stdin.as_ref().map_or(-1, AsRawFd::as_raw_fd);
             // SAFETY: stdin is a live owned descriptor and the input slice is valid for remaining bytes.
             let count =
@@ -551,10 +553,8 @@ fn run_inner(
         .into_iter()
         .flatten()
         .find_map(|pipe| set_nonblocking(pipe).err());
-    if setup_error.is_some() {
-        if let Some(error) = setup_error.as_ref()
-            && pipes.feed.pending()
-        {
+    if let Some(error) = setup_error {
+        if pipes.feed.pending() {
             pipes.feed.state.error = Some(error.kind());
         }
         pipes.feed.close();
