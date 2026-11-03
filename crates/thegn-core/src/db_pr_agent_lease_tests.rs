@@ -248,6 +248,7 @@ fn duplicate_ci_candidate_refuses_and_spends_nothing() {
         run_id: "run".into(),
         job_id: "job".into(),
         head_sha: "head-a".into(),
+        context: String::new(),
     };
     assert!(matches!(
         db.admit_pr_agent(&request(&first_key, 0, Some(&candidate)))
@@ -280,6 +281,7 @@ fn refused_admission_leaves_ci_candidate_unclaimed() {
         run_id: "run".into(),
         job_id: "budget".into(),
         head_sha: "head-a".into(),
+        context: String::new(),
     };
     assert!(matches!(
         db.admit_pr_agent(&request(&key, 3, Some(&candidate)))
@@ -299,6 +301,7 @@ fn database_failure_rolls_back_ci_candidate_and_attempt() {
         run_id: "run".into(),
         job_id: "failure".into(),
         head_sha: "head-a".into(),
+        context: String::new(),
     };
     assert!(
         db.admit_pr_agent(&request(&key, 0, Some(&candidate)))
@@ -318,12 +321,56 @@ fn unchanged_admission_update_is_an_error_and_rolls_back_candidate() {
         run_id: "run".into(),
         job_id: "ignored".into(),
         head_sha: "head-a".into(),
+        context: String::new(),
     };
     assert!(
         db.admit_pr_agent(&request(&key, 0, Some(&candidate)))
             .is_err()
     );
     assert!(db.claim_ci_autofix(&candidate).unwrap());
+}
+
+#[test]
+fn ci_candidate_from_another_provider_context_is_admitted_once() {
+    let db = Db::open_memory().unwrap();
+    let first = enqueue(&db, 8);
+    let second = enqueue(&db, 9);
+    let third = enqueue(&db, 10);
+    let candidate_a = CiLogCandidate {
+        worktree: "/repo/wt".into(),
+        run_id: "same-run".into(),
+        job_id: "same-job".into(),
+        head_sha: "same-head".into(),
+        context: "github:github.com/o/a".into(),
+    };
+    let candidate_b = CiLogCandidate {
+        context: "github:github.com/o/b".into(),
+        ..candidate_a.clone()
+    };
+    assert!(matches!(
+        db.admit_pr_agent(&request(&first, 0, Some(&candidate_a)))
+            .unwrap(),
+        PrAgentAdmission::Admitted(_)
+    ));
+    assert!(matches!(
+        db.admit_pr_agent(&request(&second, 0, Some(&candidate_b)))
+            .unwrap(),
+        PrAgentAdmission::Admitted(_)
+    ));
+    assert!(matches!(
+        db.admit_pr_agent(&request(&third, 0, Some(&candidate_b)))
+            .unwrap(),
+        PrAgentAdmission::Refused(PrAgentRefusal::DuplicateCandidate)
+    ));
+    assert_eq!(
+        db.list_pr_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.key == third)
+            .unwrap()
+            .agent_attempts,
+        0
+    );
 }
 
 #[test]

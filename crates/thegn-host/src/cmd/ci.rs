@@ -527,6 +527,7 @@ fn log(
             );
             entry.truncated |= raw.truncated;
             entry.head_sha = identity.head_sha;
+            entry.context = thegn_svc::ci::cache_context(&loc, &cfg.ci).unwrap_or_default();
             if cfg.ci.log_cache_runs > 0
                 && thegn_core::ci_log::cacheable_log_entry(&entry)
                 && let Ok(db) = Db::open()

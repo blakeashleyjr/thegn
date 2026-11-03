@@ -1202,6 +1202,7 @@ fn refresh_ci_cache_for(
                     host_path,
                     loc,
                     client: client.as_ref(),
+                    context: context.clone(),
                     cfg,
                     full,
                     db: &db,
@@ -1248,6 +1249,8 @@ struct IngestArgs<'a> {
     host_path: &'a std::path::Path,
     loc: &'a thegn_core::remote::GitLoc,
     client: &'a dyn thegn_svc::ci::CiProvider,
+    /// Provider context from the same origin snapshot as `client`.
+    context: Option<String>,
     cfg: &'a thegn_core::config::CiConfig,
     full: &'a thegn_core::config::Config,
     db: &'a thegn_core::db::Db,
@@ -1266,6 +1269,7 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
         host_path,
         loc,
         client,
+        context,
         cfg,
         full,
         db,
@@ -1432,7 +1436,7 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
                     old,
                     &run.sha,
                     job.finished_at.as_deref(),
-                )
+                ) && thegn_core::ci_log::cached_log_context_matches(old, context.as_deref())
             }) {
                 if let Ok(mut memo) = ingest_memo().lock() {
                     memo.touch(job_key, now, cfg.poll_interval_secs, false);
@@ -1481,6 +1485,7 @@ fn ingest_failed_logs_with(args: IngestArgs<'_>) {
             );
             entry.truncated |= log.truncated;
             entry.head_sha = run.sha.clone();
+            entry.context = context.clone().unwrap_or_default();
             if !crate::hydrate_schedule::generation_is_current(generation.as_ref()) {
                 run_complete = false;
                 continue;
@@ -1743,6 +1748,7 @@ mod tests {
             host_path: temp.path(),
             loc: &loc,
             client,
+            context: None,
             cfg: &cfg,
             full: &full,
             db: &db,
@@ -2075,6 +2081,7 @@ mod tests {
             host_path: temp.path(),
             loc: &loc,
             client,
+            context: None,
             cfg: &cfg,
             full: &full,
             db: &db,
@@ -2119,6 +2126,7 @@ mod tests {
             host_path: temp.path(),
             loc: &loc,
             client: &provider,
+            context: None,
             cfg: &cfg,
             full: &full,
             db: &db,
@@ -2370,6 +2378,105 @@ mod tests {
                 .context,
             "github:github.com/o/b"
         );
+    }
+
+    #[test]
+    fn cached_log_from_another_provider_context_is_refetched_and_restamped() {
+        use thegn_core::store::CacheStore;
+
+        let old_temp = private_tempdir();
+        let old_db = thegn_core::db::Db::open_at(&old_temp.path().join("ci.db")).unwrap();
+        let key = thegn_core::remote::GitLoc::worktree_cache_key(old_temp.path());
+        let old = thegn_core::ci_log::CiLogEntry {
+            worktree: key.clone(),
+            run_id: "run".into(),
+            job_id: "job-run".into(),
+            text: "old".into(),
+            fetched_at: 100,
+            head_sha: "sha".into(),
+            context: "github:github.com/o/old".into(),
+            ..Default::default()
+        };
+        old_db.put_ci_log(&old).unwrap();
+        let provider = FakeCi::new(&[]).with_detail("run", "sha");
+        let loc = thegn_core::remote::GitLoc::for_worktree(old_temp.path());
+        let cfg = thegn_core::config::CiConfig::default();
+        let full = thegn_core::config::Config::default();
+        let mut budget = CallBudget {
+            remaining: MAX_LOG_INGEST_CALLS,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: None,
+        };
+        let runs = [ci_run("run", "sha")];
+        ingest_failed_logs_with(IngestArgs {
+            host_path: old_temp.path(),
+            loc: &loc,
+            client: &provider,
+            context: Some("github:github.com/o/new".into()),
+            cfg: &cfg,
+            full: &full,
+            db: &old_db,
+            runs: &runs,
+            budget: &mut budget,
+            waker: None,
+            generation: None,
+            now: 80_000,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(
+            provider
+                .log_calls
+                .lock()
+                .unwrap()
+                .contains(&("run".into(), "job-run".into()))
+        );
+        assert_eq!(
+            old_db
+                .get_ci_log(&key, "run", "job-run")
+                .unwrap()
+                .unwrap()
+                .context,
+            "github:github.com/o/new"
+        );
+
+        let current_temp = private_tempdir();
+        let current_db = thegn_core::db::Db::open_at(&current_temp.path().join("ci.db")).unwrap();
+        let current_key = thegn_core::remote::GitLoc::worktree_cache_key(current_temp.path());
+        current_db
+            .put_ci_log(&thegn_core::ci_log::CiLogEntry {
+                worktree: current_key,
+                run_id: "run".into(),
+                job_id: "job-run".into(),
+                text: "current".into(),
+                fetched_at: 100,
+                head_sha: "sha".into(),
+                context: "github:github.com/o/new".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let current_provider = FakeCi::new(&[]).with_detail("run", "sha");
+        let current_loc = thegn_core::remote::GitLoc::for_worktree(current_temp.path());
+        let mut current_budget = CallBudget {
+            remaining: MAX_LOG_INGEST_CALLS,
+            bytes_remaining: MAX_LOG_INGEST_BYTES,
+            deadline: None,
+        };
+        ingest_failed_logs_with(IngestArgs {
+            host_path: current_temp.path(),
+            loc: &current_loc,
+            client: &current_provider,
+            context: Some("github:github.com/o/new".into()),
+            cfg: &cfg,
+            full: &full,
+            db: &current_db,
+            runs: &runs,
+            budget: &mut current_budget,
+            waker: None,
+            generation: None,
+            now: 80_001,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(current_provider.log_calls.lock().unwrap().is_empty());
     }
 
     #[test]
