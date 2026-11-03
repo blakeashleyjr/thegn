@@ -2806,3 +2806,129 @@ fn share_secret_echoed_by_a_failing_client_never_reaches_the_start_error_or_trac
         "tracing contained the secret; records: {records:?}"
     );
 }
+
+#[test]
+fn bounded_reader_counts_each_oversized_line_once() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let (url_tx, _url_rx) = std::sync::mpsc::sync_channel(1);
+    let tracker = super::EndpointTracker::default();
+    let mut input = vec![b'x'; super::MAX_PROVIDER_LINE + 10];
+    input.extend_from_slice(b"\n");
+    input.extend(std::iter::repeat_n(b'z', super::MAX_PROVIDER_LINE));
+    input.extend_from_slice(b"\n");
+    input.resize(input.len() + 2 * super::MAX_PROVIDER_LINE, b'y');
+    input.extend_from_slice(b"\nok\n");
+
+    super::drain_reader(
+        std::io::Cursor::new(input),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+        tracker.clone(),
+    );
+
+    assert_eq!(
+        tracker
+            .truncated_lines
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        tracker
+            .dropped_lines
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        rx.recv().expect("line at the provider limit"),
+        "z".repeat(super::MAX_PROVIDER_LINE)
+    );
+    assert_eq!(rx.recv().expect("following bounded line"), "ok");
+}
+
+#[test]
+fn bounded_reader_counts_diagnostics_dropped_by_a_full_queue() {
+    let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+    let (url_tx, _url_rx) = std::sync::mpsc::sync_channel(1);
+    let tracker = super::EndpointTracker::default();
+
+    super::drain_reader(
+        std::io::Cursor::new(b"a\nb\nc\n".to_vec()),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+        tracker.clone(),
+    );
+
+    assert_eq!(
+        tracker
+            .dropped_lines
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        tracker
+            .truncated_lines
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn bounded_reader_does_not_count_a_disconnected_diagnostic_queue() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    drop(rx);
+    let (url_tx, _url_rx) = std::sync::mpsc::sync_channel(1);
+    let tracker = super::EndpointTracker::default();
+
+    super::drain_reader(
+        std::io::Cursor::new(b"a\nb\n".to_vec()),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+        tracker.clone(),
+    );
+
+    assert_eq!(
+        tracker
+            .dropped_lines
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_verified_reports_truncated_provider_output() {
+    let state = tempfile::tempdir().expect("private temporary share state");
+    let plan = SharePlan {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "printf '%05000d\\n' 0; printf 'listening at trunc.example:4123\\n'; exec sleep 30"
+                .into(),
+        ],
+        env: vec![],
+        files: vec![],
+        url_rule: UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    };
+
+    let running = start(&plan, state.path(), Duration::from_secs(5)).expect("start");
+    let report = running.stop_verified();
+
+    assert_eq!(report.truncated_lines, 1);
+    assert_eq!(report.dropped_lines, 0);
+    assert_eq!(report.leaked_readers, 0);
+}
