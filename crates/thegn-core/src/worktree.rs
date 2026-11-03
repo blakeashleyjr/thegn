@@ -675,23 +675,10 @@ pub fn resolve_base_checked(root: &Path, cfg: &Config) -> Result<String, String>
             )
         })?,
         outcome => {
-            let bare_error = outcome.to_string();
-            let head = crate::git_run::git_run(
-                root,
-                &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                &crate::git_run::GitPolicy::read(worktree_git_deadline()),
-                &cancel,
-            );
-            return match head {
-                outcome if outcome.is_success() => Err(format!(
-                    "could not check repository type in {}: {bare_error}",
-                    root.display()
-                )),
-                outcome => Err(format!(
-                    "could not read HEAD in {}: {outcome}",
-                    root.display()
-                )),
-            };
+            return Err(format!(
+                "could not read HEAD in {}: {outcome}",
+                root.display()
+            ));
         }
     };
     if bare.trim() == "true" {
@@ -1725,14 +1712,23 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        checked_temp_repo_in(&repo);
-        assert!(checked_git_ok(&repo, &["branch", "feature"]));
+        temp_repo_in(&repo);
+        assert!(
+            util::git_cmd(&repo)
+                .args(["branch", "feature"])
+                .status()
+                .unwrap()
+                .success()
+        );
         let other_worktree = scratch.path().join("other");
         let other_worktree = other_worktree.to_string_lossy().into_owned();
-        assert!(checked_git_ok(
-            &repo,
-            &["worktree", "add", "-q", "-b", "other", &other_worktree,]
-        ));
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "add", "-q", "-b", "other", &other_worktree])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let checked = BranchSet::load_checked(&repo).unwrap();
         let best_effort = BranchSet::load(&repo);
@@ -1752,12 +1748,18 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        checked_temp_repo_in(&repo);
+        temp_repo_in(&repo);
         let cfg = Config::default();
         assert_eq!(cfg.base_branch, "auto");
         assert_eq!(resolve_base_checked(&repo, &cfg).unwrap(), "main");
 
-        assert!(checked_git_ok(&repo, &["checkout", "-q", "--detach"]));
+        assert!(
+            util::git_cmd(&repo)
+                .args(["checkout", "-q", "--detach"])
+                .status()
+                .unwrap()
+                .success()
+        );
         assert_eq!(resolve_base_checked(&repo, &cfg).unwrap(), "main");
 
         let not_repo = scratch.path().join("not-repo");
@@ -1771,17 +1773,40 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        checked_temp_repo_in(&repo);
+        temp_repo_in(&repo);
         assert_eq!(default_branch_checked(&repo).unwrap(), "main");
 
-        assert!(checked_git_ok(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/trunk",
-            ]
-        ));
+        assert!(
+            util::git_cmd(&repo)
+                .args([
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(default_branch_checked(&repo).unwrap(), "main");
+
+        assert!(
+            util::git_cmd(&repo)
+                .args(["update-ref", "refs/remotes/origin/trunk", "HEAD"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            util::git_cmd(&repo)
+                .args([
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
         assert_eq!(default_branch_checked(&repo).unwrap(), "trunk");
 
         let not_repo = scratch.path().join("not-repo");
@@ -1789,28 +1814,35 @@ mod tests {
         assert!(default_branch_checked(&not_repo).is_err());
     }
 
-    fn checked_temp_repo_in(dir: &Path) {
-        for args in [
-            &["init", "-q", "-b", "main"][..],
-            &["config", "user.email", "t@t.t"],
-            &["config", "user.name", "t"],
-            &["config", "commit.gpgsign", "false"],
-            &["commit", "--allow-empty", "-q", "-m", "init"],
-        ] {
-            assert!(checked_git_ok(dir, args));
-        }
-    }
+    #[test]
+    fn checked_resolve_base_uses_default_branch_for_bare_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        temp_repo_in(&source);
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test fixture runs bounded git commands in its private tempdir"
-    )]
-    fn checked_git_ok(dir: &Path, args: &[&str]) -> bool {
-        util::git_cmd(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(args)
-            .status()
-            .is_ok_and(|status| status.success())
+        let bare = scratch.path().join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        assert!(
+            util::git_cmd(&bare)
+                .args(["init", "--bare", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bare_remote = bare.to_string_lossy().into_owned();
+        assert!(
+            util::git_cmd(&source)
+                .args(["push", &bare_remote, "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert_eq!(
+            resolve_base_checked(&bare, &Config::default()).unwrap(),
+            "main"
+        );
     }
 
     #[test]
