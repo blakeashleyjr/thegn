@@ -81,6 +81,33 @@ pub(crate) fn verify_existing_egress(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestoredEgress {
+    Skipped,
+    Verified,
+}
+
+pub(crate) fn reverify_restored_egress(
+    steps: &dyn EgressSteps,
+    caps_egress: bool,
+    id: &str,
+    checkpoint: &str,
+    allow: &[String],
+    block: &[String],
+) -> Result<RestoredEgress> {
+    if egress_admission(false, caps_egress, allow, block) == EgressAdmission::Skip {
+        return Ok(RestoredEgress::Skipped);
+    }
+
+    verify_existing_egress(steps, id, allow, block)
+        .map(|()| RestoredEgress::Verified)
+        .map_err(|error| {
+            anyhow!(
+                "sandbox {id} was restored to checkpoint {checkpoint} but its network egress policy could not be re-verified ({error:#}); it is running WITHOUT the verified egress policy"
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressAdmission {
     Skip,
     AdmitFresh,
@@ -125,7 +152,8 @@ impl EgressSteps for BlockingProviderEgress<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EgressAdmission, EgressSteps, admit_egress, egress_admission, verify_existing_egress,
+        EgressAdmission, EgressSteps, RestoredEgress, admit_egress, egress_admission,
+        reverify_restored_egress, verify_existing_egress,
     };
     use std::cell::RefCell;
     use thegn_svc::provider::{PolicyRule, rules_from};
@@ -245,6 +273,76 @@ mod tests {
             failed_verification.calls(),
             ["read:sandbox-1", "apply:sandbox-1", "read:sandbox-1"]
         );
+    }
+
+    #[test]
+    fn restored_sandbox_without_policy_or_egress_caps_makes_no_provider_call() {
+        let (allow, block) = lists();
+        let empty: Vec<String> = Vec::new();
+        let unsupported = ScriptedEgress::new(vec![], vec![]);
+        assert_eq!(
+            reverify_restored_egress(&unsupported, false, "sandbox-1", "cp-1", &allow, &block)
+                .unwrap(),
+            RestoredEgress::Skipped
+        );
+        assert!(unsupported.calls().is_empty());
+
+        let no_policy = ScriptedEgress::new(vec![], vec![]);
+        assert_eq!(
+            reverify_restored_egress(&no_policy, true, "sandbox-1", "cp-1", &empty, &empty)
+                .unwrap(),
+            RestoredEgress::Skipped
+        );
+        assert!(no_policy.calls().is_empty());
+    }
+
+    #[test]
+    fn restored_sandbox_with_matching_policy_is_verified_without_reapply() {
+        let (allow, block) = lists();
+        let steps = ScriptedEgress::new(vec![], vec![Ok(rules_from(&allow, &block).unwrap())]);
+
+        assert_eq!(
+            reverify_restored_egress(&steps, true, "sandbox-1", "cp-1", &allow, &block).unwrap(),
+            RestoredEgress::Verified
+        );
+        assert_eq!(steps.calls(), ["read:sandbox-1"]);
+    }
+
+    #[test]
+    fn restored_sandbox_with_drifted_policy_is_reapplied_and_verified() {
+        let (allow, block) = lists();
+        let steps = ScriptedEgress::new(
+            vec![Ok(())],
+            vec![Ok(Vec::new()), Ok(rules_from(&allow, &block).unwrap())],
+        );
+
+        assert_eq!(
+            reverify_restored_egress(&steps, true, "sandbox-1", "cp-1", &allow, &block).unwrap(),
+            RestoredEgress::Verified
+        );
+        assert_eq!(
+            steps.calls(),
+            ["read:sandbox-1", "apply:sandbox-1", "read:sandbox-1"]
+        );
+    }
+
+    #[test]
+    fn restored_sandbox_that_cannot_be_verified_is_refused_without_destroy() {
+        let (allow, block) = lists();
+        let steps = ScriptedEgress::new(
+            vec![Err(anyhow::anyhow!("apply failed"))],
+            vec![Ok(Vec::new())],
+        );
+
+        let result = reverify_restored_egress(&steps, true, "sandbox-1", "cp-1", &allow, &block);
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("checkpoint cp-1"));
+        assert!(message.contains("sandbox-1"));
+        assert!(message.contains("apply failed"));
+        assert!(message.contains("WITHOUT the verified egress policy"));
+        assert_eq!(steps.calls(), ["read:sandbox-1", "apply:sandbox-1"]);
     }
 
     #[test]
