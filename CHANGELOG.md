@@ -9,6 +9,65 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.45] — 2026-11-03 (maintenance batch 82)
 
+### Added
+
+- `./install.sh --uninstall` (with `--dry-run`) removes unchanged files recorded
+  by the install manifest, keeps and reports changed files, preserves config,
+  and refuses a malformed manifest before removal.
+- MCP `tools/list` marks tools with `readOnlyHint` and `destructiveHint`
+  annotations so clients can distinguish read-only, destructive and other
+  writes.
+- With `THEGN_PERF=1`, the `thegn::perf` rollup adds a separate
+  `sched admission` event with cumulative background-work counters.
+- (dev channel) `thegn doctor` reports the host-cache signer for provider
+  environments that use it, without exposing key material; JSON includes its
+  signer state.
+
+### Changed
+
+- `thegn dispatch lease acquire` prints the lease generation, also in `--json`.
+  A first take, or a take after expiry, gets a higher generation than any
+  before it; a live same-owner acquire keeps the current one.
+- `thegn merge history` records outcomes from `thegn merge land`, its panel
+  action, `thegn land` and `thegn integrate`.
+- Dispatch refuses a new row before writing when 4,096 rows are active.
+- `issues.list` returns `issues`, `complete` and `incomplete`; validated rows
+  from partial accounts are kept and the affected accounts are reported. The
+  request fails only when every configured account fails.
+- Hook-run logs start with `thegn-hook-run 1` and include a unique run id and
+  start/finish times; the command is recorded as `[redacted]`.
+- Queue-agent and autopilot sandbox refusals lead with the refusal class and
+  its fix. The queue records the refusal reason without starting the agent.
+- The Media section keeps the last player list and marks it “sources may be
+  stale” or “sources unavailable” when listing players fails; it marks the
+  up-next queue “queue unavailable” when that cannot be read.
+- A pane clipboard copy discarded because the pane exited or restarted adds a
+  fixed status note; the copied text is never included.
+
+### Fixed
+
+- The Environments section no longer marks a default environment bound when
+  the worktree selection cannot be read; it reports `binding unreadable` and
+  refuses to rebind.
+- Stale `{prompt_file}` files left by an interrupted local agent run are
+  removed when a later run prepares that directory, after 30 days.
+- GitLab CI no longer sends API requests to the SSH port from an `ssh://`
+  remote with a non-default port.
+- An open CI run drill fetches its run details and logs once instead of again
+  on every CI refresh.
+- After a configuration reload, a calendar refresh still working through
+  accounts under the old settings starts no further account fetches; fetches
+  already in flight finish.
+- (dev channel) Managed SSH key provisioning, rotation, completion and revoke
+  share one lock, preventing provisioning from overwriting an unfinished
+  rotation record and preventing two rotations from both succeeding.
+
+### Security
+
+- (dev channel) After a checkpoint restore, `thegn env restore` and warm-pool
+  recycle verify the environment's network egress policy, re-applying it if
+  needed. An unverifiable restore fails the command or destroys the spare.
+
 ## [0.1.0-alpha.44] — 2026-11-03 (maintenance batch 81)
 
 ### Added
