@@ -624,9 +624,9 @@ path-only cleanup and warns that an SSH sandbox container may remain. On the
 dev channel, provider SSH connect, warm-pool operations, hibernation,
 provisioning and host placement are refused or skipped with the reason. The
 close auto-checkpoint is also skipped with a warning on the dev channel. In
-the panel's System → Environments section, an unreadable selection marks no
-environment bound, adds a red `binding unreadable: <reason>` row and a
-`binding?` badge, and Enter refuses to rebind until the state database is
+the panel's system → environments section, an unreadable selection marks
+no environment bound, adds a red `binding unreadable: <reason>` row and a
+`binding?` badge, and `↵` refuses to rebind until the state database is
 readable.
 
 When the state database exists but the worktree's recorded location cannot be
