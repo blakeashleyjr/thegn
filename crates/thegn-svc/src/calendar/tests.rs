@@ -2164,6 +2164,101 @@ async fn parallel_command_accounts_run_one_at_a_time() {
     assert_eq!(completed, 5);
 }
 
+#[tokio::test(start_paused = true)]
+async fn superseded_pass_starts_no_further_account() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(
+        (0..3)
+            .map(|index| {
+                (
+                    format!("command-{index}"),
+                    FetchClass::Command,
+                    "command",
+                    std::time::Duration::from_secs(1),
+                    false,
+                    active.clone(),
+                )
+            })
+            .collect(),
+    );
+    let done = std::cell::Cell::new(0_usize);
+    let start = tokio::time::Instant::now();
+    let skipped = router
+        .list_events_each_while(
+            calendar_window(),
+            &BTreeMap::new(),
+            || done.get() == 0,
+            |_| done.set(done.get() + 1),
+        )
+        .await;
+
+    assert_eq!(skipped, 2);
+    assert_eq!(done.get(), 1);
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(start),
+        std::time::Duration::from_secs(1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_superseded_before_start_fetches_nothing() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(
+        (0..2)
+            .map(|index| {
+                (
+                    format!("network-{index}"),
+                    FetchClass::Network,
+                    "ics-url",
+                    std::time::Duration::from_secs(1),
+                    false,
+                    active.clone(),
+                )
+            })
+            .collect(),
+    );
+    let done = std::cell::Cell::new(0_usize);
+    let skipped = router
+        .list_events_each_while(
+            calendar_window(),
+            &BTreeMap::new(),
+            || false,
+            |_| done.set(done.get() + 1),
+        )
+        .await;
+
+    assert_eq!(skipped, 2);
+    assert_eq!(done.get(), 0);
+    assert_eq!(active.max.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unsuperseded_pass_matches_list_events_each() {
+    let active = std::sync::Arc::new(ActiveFetches::default());
+    let router = timed_router(
+        (0..8)
+            .map(|index| {
+                (
+                    format!("network-{index}"),
+                    FetchClass::Network,
+                    "ics-url",
+                    std::time::Duration::from_secs(1),
+                    false,
+                    active.clone(),
+                )
+            })
+            .collect(),
+    );
+    let mut done = 0;
+    let skipped = router
+        .list_events_each_while(calendar_window(), &BTreeMap::new(), || true, |_| done += 1)
+        .await;
+
+    assert_eq!(skipped, 0);
+    assert_eq!(done, 8);
+    assert_eq!(active.max.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
 #[test]
 fn an_empty_config_builds_an_unconfigured_router() {
     let r = router(&CalendarConfig::default());
