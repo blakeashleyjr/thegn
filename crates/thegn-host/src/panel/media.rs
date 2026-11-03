@@ -34,7 +34,8 @@ pub(crate) struct MediaQueueDelivery {
 #[derive(Debug)]
 pub(crate) struct MediaSourcesDelivery {
     pub(crate) request: MediaRequest,
-    pub(crate) sources: Vec<String>,
+    /// Err means the listing failed or timed out; its text is for logs only.
+    pub(crate) sources: Result<Vec<String>, String>,
 }
 
 /// Source/queue selection and identity-checked asynchronous decoration. Late
@@ -43,6 +44,7 @@ pub(crate) struct MediaSourcesDelivery {
 pub(crate) struct MediaPanelState {
     pub(crate) sources: Vec<String>,
     pub(crate) sources_truncated: bool,
+    pub(crate) sources_unavailable: bool,
     pub(crate) queue: Vec<QueueItem>,
     pub(crate) queue_truncated: usize,
     pub(crate) queue_error: Option<String>,
@@ -90,6 +92,7 @@ impl MediaPanelState {
         let Some(state) = state else {
             self.sources.clear();
             self.sources_truncated = false;
+            self.sources_unavailable = false;
             self.clear_queue();
             self.caps = None;
             if self.snapshot_identity.is_some() {
@@ -232,12 +235,10 @@ impl MediaPanelState {
         state: Option<&MediaState>,
         sources: Vec<String>,
     ) {
-        if request.generation != self.generation
-            || request.watcher_generation != self.watcher_generation
-            || request.identity.as_ref() != state.map(Self::identity).as_ref()
-        {
+        if !self.accepts_sources(&request, state) {
             return;
         }
+        self.sources_unavailable = false;
         let mut unique = Vec::with_capacity(sources.len().min(MAX_SOURCES));
         let mut seen = HashSet::with_capacity(sources.len().min(MAX_SOURCES));
         self.sources_truncated = false;
@@ -251,6 +252,29 @@ impl MediaPanelState {
             }
         }
         self.sources = unique;
+    }
+
+    /// Returns whether a source result still matches the active request and snapshot.
+    fn accepts_sources(&self, request: &MediaRequest, state: Option<&MediaState>) -> bool {
+        request.generation == self.generation
+            && request.watcher_generation == self.watcher_generation
+            && request.identity.as_ref() == state.map(Self::identity).as_ref()
+    }
+
+    /// Err keeps the last known rows and marks them; stale results are ignored.
+    pub(crate) fn set_sources_result(
+        &mut self,
+        request: MediaRequest,
+        state: Option<&MediaState>,
+        sources: Result<Vec<String>, String>,
+    ) {
+        match sources {
+            Ok(sources) => self.set_sources(request, state, sources),
+            Err(_) if self.accepts_sources(&request, state) => {
+                self.sources_unavailable = true;
+            }
+            Err(_) => {}
+        }
     }
 
     pub(crate) fn set_art(&mut self, state: Option<&MediaState>, art: ArtMosaic) {
@@ -572,5 +596,55 @@ mod tests {
 
         assert_eq!(panel.queue.len(), 3);
         assert_eq!(panel.queue_truncated, 897);
+    }
+
+    #[test]
+    fn failed_source_listing_keeps_last_known_sources_and_marks_them() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 0);
+        let initial = panel.take_sources_request(Some(&current)).unwrap();
+        panel.set_sources(initial, Some(&current), vec!["one".into()]);
+
+        panel.begin_request(Some(&current));
+        let request = panel.take_sources_request(Some(&current)).unwrap();
+        panel.set_sources_result(request, Some(&current), Err("boom".into()));
+
+        assert_eq!(panel.sources, ["one"]);
+        assert!(panel.sources_unavailable);
+    }
+
+    #[test]
+    fn stale_failed_source_delivery_is_ignored() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 0);
+        let request = panel.take_sources_request(Some(&current)).unwrap();
+
+        let mut changed = current.clone();
+        changed.track_id = Some("next".into());
+        panel.sync_snapshot(Some(&changed), Some(MediaCaps::default()), 0);
+        panel.set_sources_result(request, Some(&changed), Err("boom".into()));
+
+        assert!(!panel.sources_unavailable);
+    }
+
+    #[test]
+    fn successful_source_delivery_clears_the_unavailable_mark() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 0);
+        let failed = panel.take_sources_request(Some(&current)).unwrap();
+        panel.set_sources_result(failed, Some(&current), Err("boom".into()));
+        assert!(panel.sources_unavailable);
+
+        panel.begin_request(Some(&current));
+        let successful = panel.take_sources_request(Some(&current)).unwrap();
+        panel.set_sources_result(successful, Some(&current), Ok(vec!["two".into()]));
+        assert_eq!(panel.sources, ["two"]);
+        assert!(!panel.sources_unavailable);
+
+        panel.sync_snapshot(None, None, 0);
+        assert!(!panel.sources_unavailable);
     }
 }
