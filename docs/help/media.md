@@ -71,6 +71,12 @@ local player, without leaving the compositor. Hidden unless
   `stale` marker for up to three poll periods or ten seconds, whichever is
   longer; the status-bar badge turns amber and says `stale` for the same period.
   After that the section shows “provider unavailable” instead of “no player”.
+- If the up-next queue cannot be read, the Media section shows “queue
+  unavailable” rather than an empty queue at full panel width when the provider
+  supports a queue. At half or full panel width, if listing players fails, the
+  section keeps the last player list and adds “sources may be stale” (or
+  “sources unavailable” when it had none); the next successful listing clears
+  it.
 
 Spotify remains a reserved backend kind: the supported desktop route is the
 existing MPRIS integration (or SMTC/AppleScript on their platforms), with no

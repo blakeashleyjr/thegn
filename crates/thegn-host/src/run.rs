@@ -13886,7 +13886,7 @@ async fn event_loop<T: Terminal>(
         }
         if let Some(delivery) = media_sources_slot.take() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            panel_ui.media.set_sources(
+            panel_ui.media.set_sources_result(
                 delivery.request,
                 model.panel.media.as_ref(),
                 delivery.sources,
