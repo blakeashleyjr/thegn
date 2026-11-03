@@ -2088,6 +2088,7 @@ fn collect_sidebar_status(
         // jj colocation is a repo-level property (a `.jj/` beside `.git/`); a
         // cheap stat on the glyph-scan cadence, never a `jj` subprocess.
         let jj = thegn_core::jj::is_colocated(std::path::Path::new(&repo_root));
+        crate::glyph_refresh::record_jj(&repo_root, jj);
         status.git.insert(
             path.clone(),
             crate::sidebar::GitGlyphs {
@@ -2138,6 +2139,8 @@ fn collect_sidebar_status(
     }
     // Serve other workspaces' last-known glyphs from cache (never scanning, never
     // wakes a sandbox) so a switch shows them instantly instead of blank.
+    // Refresh their jj bits here, off-loop, so loop-side seeding never stats.
+    crate::glyph_refresh::refresh_cached_jj();
     crate::glyph_refresh::seed_from_global_cache(
         &mut status.git,
         &mut status.branches,
