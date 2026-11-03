@@ -325,7 +325,7 @@ impl LocalBridgeReport {
         let mut buffer = [0_u8; 64 * 1024];
         let mut bytes = 0_u64;
         loop {
-            let read = match Read::read(&mut file, &mut buffer) {
+            let read = match read_retrying(&mut file, &mut buffer) {
                 Ok(read) => read,
                 Err(error) => {
                     return Self::Unreadable {
@@ -405,6 +405,15 @@ impl LocalBridgeReport {
             }
         }
         lines
+    }
+}
+
+fn read_retrying(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match Read::read(reader, buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
     }
 }
 
@@ -809,6 +818,30 @@ mod tests {
         let json = report.json();
         assert_eq!(json["state"], "absent");
         assert!(json["sha256"].is_null());
+    }
+
+    #[test]
+    fn local_bridge_report_read_retries_interrupted_reads() {
+        struct InterruptedOnce(bool);
+
+        impl Read for InterruptedOnce {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                if buffer.is_empty() {
+                    return Ok(0);
+                }
+                buffer[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let mut reader = InterruptedOnce(false);
+        let mut buffer = [0_u8; 1];
+        assert_eq!(read_retrying(&mut reader, &mut buffer).unwrap(), 1);
+        assert_eq!(buffer, [b'x']);
     }
 
     #[test]
