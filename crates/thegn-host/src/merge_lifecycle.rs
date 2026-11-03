@@ -34,6 +34,7 @@ pub(crate) enum CleanupRefusal {
     Database,
     Identity,
     ClaimBusy,
+    MergeClaimed,
     Unsafe,
     Remote,
     Resources,
@@ -46,6 +47,7 @@ impl CleanupRefusal {
             Self::Database => "database",
             Self::Identity => "identity",
             Self::ClaimBusy => "claim_busy",
+            Self::MergeClaimed => "merge_claimed",
             Self::Unsafe => "unsafe",
             Self::Remote => "remote",
             Self::Resources => "resources",
@@ -58,12 +60,19 @@ impl CleanupRefusal {
             Self::Database => "database unavailable",
             Self::Identity => "queue identity changed",
             Self::ClaimBusy => "cleanup already in progress",
+            Self::MergeClaimed => "merge claim held",
             Self::Unsafe => "unsafe or unverified checkout",
             Self::Remote => "remote worktree",
             Self::Resources => "attached runtime resources",
             Self::Removal => "removal failed",
         }
     }
+}
+
+fn live_merge_claim(view: Option<&thegn_core::store::MergeClaimView>, now_ms: i64) -> bool {
+    view.is_some_and(|view| {
+        view.phase != "unclaimed" && view.lease_until_ms.is_none_or(|until| until >= now_ms)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -590,6 +599,26 @@ pub(crate) fn remove_landed_with_config(
             reason: "selected landed queue identity is invalid".into(),
         };
     }
+    let claim = match db.observe_merge_claim(worktree) {
+        Ok(claim) => claim,
+        Err(error) => {
+            return CleanupOutcome::Refused {
+                class: CleanupRefusal::Database,
+                reason: format!("merge claim unavailable: {error}"),
+            };
+        }
+    };
+    if live_merge_claim(claim.as_ref(), thegn_core::util::now_ms()) {
+        let view = claim.expect("live claim must have a view");
+        return CleanupOutcome::Refused {
+            class: CleanupRefusal::MergeClaimed,
+            reason: format!(
+                "a drain holds this row (claim generation {}, owner {}); cleanup retries after it is released",
+                view.generation,
+                crate::merge_sweep::safe_display(view.owner_hint.as_deref().unwrap_or("unnamed"))
+            ),
+        };
+    }
     // Merge reclaim shares the same process as interactive deletion in the TUI.
     // Serialize it with sidebar/workspace destroy workers so hooks, provider
     // teardown, and git removal cannot run twice for one physical path.
@@ -706,6 +735,12 @@ pub(crate) fn remove_landed_with_config(
             .find(|r| r.worktree == worktree);
         if current != queue_before {
             return Err("merge queue entry changed during cleanup".into());
+        }
+        let claim = db
+            .observe_merge_claim(worktree)
+            .map_err(|error| format!("merge claim unavailable: {error}"))?;
+        if live_merge_claim(claim.as_ref(), thegn_core::util::now_ms()) {
+            return Err("merge claim acquired during cleanup".into());
         }
         let cache_now = db.worktree_record(worktree).map_err(|e| e.to_string())?;
         if cache_now
@@ -979,6 +1014,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use thegn_core::config::OnLanded;
+    use thegn_core::store::WorktreeAuxStore;
     use thegn_core::util;
 
     #[test]
@@ -1793,6 +1829,187 @@ mod tests {
         assert!(feat.is_dir());
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&feat).unwrap();
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fixture reads HEAD from its private test repository"
+    )]
+    fn land_under_claim(
+        db: &Db,
+        root: &Path,
+        worktree: &str,
+        branch: &str,
+    ) -> (String, thegn_core::store::MergeClaim) {
+        let output = cleanup::test_git(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let commit = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        db.enqueue_merge(worktree, branch, "main").unwrap();
+        let claim = db
+            .admit_merge_claim(&thegn_core::store::MergeClaimRequest {
+                worktree: worktree.into(),
+                branch: branch.into(),
+                repo_root: root.to_string_lossy().into_owned(),
+                target_branch: "main".into(),
+                location: String::new(),
+                expected_status: "queued".into(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: Some("other-drain".into()),
+            })
+            .unwrap()
+            .expect("claim admitted for queued fixture row");
+        let claim = db
+            .land_merge_status_claimed(
+                &claim,
+                &thegn_core::store::MergeStatusFields {
+                    result_oid: Some(commit.clone()),
+                    ..Default::default()
+                },
+                &commit,
+            )
+            .unwrap();
+        (commit, claim)
+    }
+
+    #[test]
+    fn landed_remove_skips_a_row_another_drain_holds() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-merge-claimed");
+        let feat_s = feat.to_string_lossy().to_string();
+        let (commit, claim) = land_under_claim(&db, &root, &feat_s, "feat");
+        let before = db.list_merge_queue().unwrap();
+
+        let notes =
+            apply_landed_reported(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.text().contains("merge claim held"))
+        );
+        assert!(feat.is_dir());
+        assert!(util::git_ok(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+        ));
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+
+        let settled = db.settle_merge_claim_no_child(&claim).unwrap();
+        db.release_merge_claim(&settled).unwrap();
+        let retry_notes =
+            apply_landed_reported(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
+        assert!(!retry_notes.is_empty());
+        assert!(!feat.is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_outcome_merge_claimed_is_typed() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-merge-claimed-typed");
+        let feat_s = feat.to_string_lossy().to_string();
+        let (commit, _claim) = land_under_claim(&db, &root, &feat_s, "feat");
+        let before = db.list_merge_queue().unwrap();
+
+        let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+
+        assert!(matches!(
+            outcome,
+            CleanupOutcome::Refused {
+                class: CleanupRefusal::MergeClaimed,
+                ..
+            }
+        ));
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+        assert!(feat.is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&feat).unwrap();
+    }
+
+    #[test]
+    fn live_merge_claim_table() {
+        let now_ms = 10_000;
+        let cells = [
+            ("none", None, false),
+            (
+                "unclaimed",
+                Some(thegn_core::store::MergeClaimView {
+                    worktree: "/wt".into(),
+                    generation: 1,
+                    phase: "unclaimed".into(),
+                    lease_until_ms: Some(now_ms + 1),
+                    owner_hint: None,
+                }),
+                false,
+            ),
+            (
+                "claimed_no_child live",
+                Some(thegn_core::store::MergeClaimView {
+                    worktree: "/wt".into(),
+                    generation: 1,
+                    phase: "claimed_no_child".into(),
+                    lease_until_ms: Some(now_ms),
+                    owner_hint: None,
+                }),
+                true,
+            ),
+            (
+                "claimed_no_child expired",
+                Some(thegn_core::store::MergeClaimView {
+                    worktree: "/wt".into(),
+                    generation: 1,
+                    phase: "claimed_no_child".into(),
+                    lease_until_ms: Some(now_ms - 1),
+                    owner_hint: None,
+                }),
+                false,
+            ),
+            (
+                "claimed_no_child without lease",
+                Some(thegn_core::store::MergeClaimView {
+                    worktree: "/wt".into(),
+                    generation: 1,
+                    phase: "claimed_no_child".into(),
+                    lease_until_ms: None,
+                    owner_hint: None,
+                }),
+                true,
+            ),
+            (
+                "settled live",
+                Some(thegn_core::store::MergeClaimView {
+                    worktree: "/wt".into(),
+                    generation: 1,
+                    phase: "settled".into(),
+                    lease_until_ms: Some(now_ms + 1),
+                    owner_hint: None,
+                }),
+                true,
+            ),
+            (
+                "settled expired",
+                Some(thegn_core::store::MergeClaimView {
+                    worktree: "/wt".into(),
+                    generation: 1,
+                    phase: "settled".into(),
+                    lease_until_ms: Some(now_ms - 1),
+                    owner_hint: None,
+                }),
+                false,
+            ),
+        ];
+        for (cell, view, expected) in cells {
+            assert_eq!(
+                live_merge_claim(view.as_ref(), now_ms),
+                expected,
+                "cell: {cell}"
+            );
+        }
     }
 
     // A `thegn land` files the worktree into Merged in place: the sidebar folder
