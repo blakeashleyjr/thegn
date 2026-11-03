@@ -15,6 +15,7 @@ fn queued_db() -> Db {
         },
     )
     .unwrap();
+    // The enqueue already sets this status; this adds a result OID for the event assertion below.
     db.update_merge_status(WORKTREE, "queued", Some("result-oid"), None, None)
         .unwrap();
     db
@@ -68,6 +69,29 @@ fn refusal_without_a_row_records_nothing() {
             .unwrap()
     );
     assert!(db.merge_queue_events(WORKTREE, 10).unwrap().is_empty());
+}
+
+#[test]
+fn refusal_on_an_older_events_schema_is_not_recorded() {
+    let db = queued_db();
+    let before = db.list_merge_queue().unwrap();
+    db.conn()
+        .execute_batch("ALTER TABLE merge_queue_events DROP COLUMN target_base_oid")
+        .unwrap();
+
+    assert!(
+        !db.record_merge_refusal(WORKTREE, "land", "not_ready")
+            .unwrap()
+    );
+
+    let event_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM merge_queue_events", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(event_count, 0);
+    assert_eq!(db.list_merge_queue().unwrap(), before);
 }
 
 #[test]
