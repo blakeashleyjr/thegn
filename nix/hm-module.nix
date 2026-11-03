@@ -359,7 +359,7 @@ in {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       example = "storm";
-      description = "Named palette preset (prism, storm, light, abyss, ember, aurora) or a local theme name from $XDG_CONFIG_HOME/thegn/themes. Unset (null) = the binary's default.";
+      description = "Built-in palette preset name (for example, prism, storm or nord) or a local theme name from $XDG_CONFIG_HOME/thegn/themes. Unset (null) = the binary's default.";
     };
 
     themeFocusBorder = lib.mkOption {
