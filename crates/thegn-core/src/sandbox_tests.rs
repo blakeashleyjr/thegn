@@ -2463,6 +2463,34 @@ fn identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees(
 }
 
 #[test]
+fn identify_orphans_keeps_a_live_worktree_whose_slug_ends_in_a_companion_suffix() {
+    let active = vec!["/wt/feat-tgvpn".to_string(), "/wt/fix-tgagent".to_string()];
+    let feat = container_name("/wt/feat-tgvpn");
+    let containers = vec![
+        feat.clone(),
+        container_name("/wt/fix-tgagent"),
+        container_name_with_profile("/wt/feat-tgvpn", Some("sealed")),
+        vpn_sidecar_name(&feat),
+        container_name("/wt/dead"),
+    ];
+
+    assert_eq!(
+        identify_orphans(&active, &containers),
+        vec![container_name("/wt/dead")]
+    );
+}
+
+#[test]
+fn identify_orphans_overkeeps_a_main_container_that_aliases_a_companion() {
+    // Positive control: this name is already kept at the base as the live
+    // worktree's VPN companion; the raw-name pass preserves that decision.
+    let active = vec!["/wt/feat".to_string()];
+    let containers = vec![container_name("/wt/feat-tgvpn")];
+
+    assert!(identify_orphans(&active, &containers).is_empty());
+}
+
+#[test]
 fn identify_orphans_spares_compose_service_containers_of_live_worktrees() {
     let active = vec!["/w/my.repo".to_string(), "/w/my-repo".to_string()];
     let first = container_name("/w/my.repo");
