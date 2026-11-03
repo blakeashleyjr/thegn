@@ -3,7 +3,6 @@
 # SHRINK-ONLY. Enforced by `thread_builders_go_through_spawn_named_ratchet` in crates/thegn-host/src/platform_ratchet_tests.rs; regenerate with `just ratchet-update`.
 
 automation_runtime.rs
-bounded_git_probe.rs
 db_task.rs
 devcontainer_startup.rs
 diff_watch.rs
@@ -19,20 +18,15 @@ measure/mod.rs
 mise_provider.rs
 model_proxy_daemon.rs
 monitor.rs
-monitor_sampler.rs
-notification_sound.rs
 pane_pty.rs
-pane_writer.rs
 perf.rs
 platform/mod.rs
 plugins.rs
 preview_jobs.rs
-preview_watch.rs
 proc_worker.rs
 run.rs
 sandbox_events.rs
 share.rs
-startup_heal.rs
 task.rs
 theme_store.rs
 voice.rs

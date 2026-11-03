@@ -125,6 +125,12 @@ For local OCI containers that thegn creates directly (not compose), thegn
 records each writable, non-cache bind source's identity before creating the
 container and checks it again afterward. If the source was swapped, thegn
 removes the container and refuses the launch.
+If a container with this worktree's container name belongs to another worktree
+(paths differing only in punctuation or case can share a name), or its owner
+cannot be read, the launch is refused with the `container-owner` class and the
+other container stays running.
+Close that worktree's sandbox first or rename one worktree directory. An older
+container without an owner label follows the existing reuse and recreate checks.
 
 **Sealed agent panes need a managed account.** The only exception to the
 deny list is the _managed_ per-account credential dir thegn creates under
@@ -642,6 +648,13 @@ On the dev channel, if the worktree location cannot be read, pane launches and
 provider connections are refused when a remote placement is configured
 (`[placement]`, `[sandbox.remote]`, or a non-local or host-pinned `[env.*]`);
 without one, panes use the local path.
+On the dev channel, if the environment selection itself cannot be read while a
+remote placement is configured, the launch stops in the halt modal with the
+read error instead of using the default environment. Without a remote
+placement, a local shell is not refused for that read error. For host
+placement, if another provisioning run for the same container is active, this
+open skips provisioning; when `THEGN_LOG` is set, the warning is written to
+`thegn.log`. The next open checks again.
 
 On any channel, closing a tab whose location cannot be read tears down by path
 only and warns on the status line that a remote sandbox may remain. Idle
@@ -709,6 +722,9 @@ checks the digest again before running the helper; changed bytes are refused
 with `thegn: resident bridge digest mismatch`.
 When a provider's `exec_command` uses `ssh` with a host, its checked bridge
 launch is passed to the remote shell as one quoted word.
+The resident bridge scrubs secret-shaped text, including tokens, credentials in
+URLs, and private-key blocks, from command error output before returning it;
+standard output is returned unchanged.
 
 A remote checkout with commits or changes made since thegn last synced it is kept for recovery, and thegn shows how to recover it.
 

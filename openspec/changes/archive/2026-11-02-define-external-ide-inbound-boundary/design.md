@@ -26,3 +26,14 @@ confirmation, replay/expiry, error reporting, packaging, and uninstall.
 An adopted option requires a new implementation change that names catalog
 operations, scopes, wire/schema additions, platform registrations, lifecycle,
 tests, docs, and rollback. Until that change lands, inbound remains unsupported.
+
+## Decision (2026-10-20)
+
+The owner triage considered deferring inbound support, adding a CLI-only inbound
+path, or adding a full URL handler and extension. Choose deferral: no named
+inbound client requires this product surface, and every registered scheme adds
+attack surface and ongoing platform support. The owner decision was to defer
+inbound integration and publish an outbound-only boundary.
+
+The owner triage's CLI-only and full-URL options are deferred. The paired
+thin-client option in the original decision matrix is also deferred.

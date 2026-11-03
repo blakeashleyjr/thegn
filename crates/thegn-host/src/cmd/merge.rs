@@ -393,6 +393,7 @@ struct HistoryEventJson<'a> {
     row_updated_at: i64,
     candidate_oid: Option<&'a str>,
     result_oid: Option<&'a str>,
+    target_base_oid: Option<&'a str>,
     actor: &'a str,
     at_ms: i64,
 }
@@ -409,6 +410,7 @@ fn history_json(events: &[MergeQueueEvent]) -> Vec<HistoryEventJson<'_>> {
             row_updated_at: event.row_updated_at,
             candidate_oid: event.candidate_oid.as_deref(),
             result_oid: event.result_oid.as_deref(),
+            target_base_oid: event.target_base_oid.as_deref(),
             actor: &event.actor,
             at_ms: event.at_ms,
         })
@@ -438,6 +440,15 @@ fn history_line(event: &MergeQueueEvent) -> String {
         oids.push_str(&format!(
             "  result {}",
             crate::merge_sweep::safe_display(result)
+                .chars()
+                .take(12)
+                .collect::<String>()
+        ));
+    }
+    if let Some(target_base) = &event.target_base_oid {
+        oids.push_str(&format!(
+            "  base {}",
+            crate::merge_sweep::safe_display(target_base)
                 .chars()
                 .take(12)
                 .collect::<String>()
@@ -1998,6 +2009,7 @@ mod history_tests {
             row_updated_at: 5,
             candidate_oid: Some("a".repeat(40)),
             result_oid: None,
+            target_base_oid: None,
             actor: actor.to_owned(),
             at_ms: 1_700_000_000_000,
         }
@@ -2040,6 +2052,28 @@ mod history_tests {
     fn history_json_is_empty_when_there_are_no_events() {
         let value = serde_json::to_value(history_json(&[])).unwrap();
         assert_eq!(value, serde_json::json!([]));
+    }
+
+    #[test]
+    fn history_line_shows_the_short_target_base() {
+        let event = MergeQueueEvent {
+            target_base_oid: Some("b".repeat(40)),
+            ..event("thegn pid 42")
+        };
+        let line = history_line(&event);
+        assert!(line.contains("base bbbbbbbbbbbb"));
+        assert!(!line.contains(&"b".repeat(40)));
+    }
+
+    #[test]
+    fn history_json_carries_target_base_oid() {
+        let event_with_base = MergeQueueEvent {
+            target_base_oid: Some("b".repeat(40)),
+            ..event("a")
+        };
+        let value = serde_json::to_value(history_json(&[event_with_base, event("b")])).unwrap();
+        assert_eq!(value[0]["target_base_oid"], "b".repeat(40));
+        assert!(value[1]["target_base_oid"].is_null());
     }
 
     #[test]

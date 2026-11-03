@@ -49,6 +49,7 @@ use thegn_core::calendar::display::{DisplayText, Field};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::log_redact::redact_text_line;
+use thegn_core::store::NotificationStore;
 use thegn_core::store::WorkspaceStore;
 
 use crate::agent::LaunchSpec;
@@ -265,9 +266,37 @@ pub(crate) fn remembered_agent_relaunch(
     if cfg.agent_command(&name).is_none() {
         return Ok(None);
     }
+    let stage = match recorded_stage(&db, worktree, &name) {
+        Ok(stage) => stage,
+        Err(()) => {
+            // Without a reliable stage, do not resurrect an autonomous agent
+            // with project settings and hooks enabled; keep the resolved shell.
+            return Ok(None);
+        }
+    };
     // Resolve the resume form FIRST (cheap config read): the session-store
     // walk must never run for a non-opted entry.
-    let cmd_override = resume_command_override(cfg, &name, worktree, &db);
+    let mut cmd_override = resume_command_override(cfg, &name, worktree, &db, stage.as_deref());
+    if let Some(stage_name) = stage.as_deref()
+        && cmd_override.is_none()
+    {
+        cmd_override = Some(
+            crate::daemon::agent_open::command_for(
+                cfg,
+                &name,
+                "",
+                false,
+                None,
+                false,
+                Some(stage_name),
+            )
+            .map(|cmd| cmd.to_string())
+            .map_err(|source| RelaunchRefusal {
+                agent: name.clone(),
+                source,
+            })?,
+        );
+    }
     crate::direnv_warm::launch_spec_synced_with(
         cfg,
         worktree,
@@ -279,7 +308,7 @@ pub(crate) fn remembered_agent_relaunch(
             // Resurrection is not a choice event: the record already holds
             // this agent, and a relaunch must never be able to change it.
             suppress_agent_record: true,
-            stage: None,
+            stage: stage.as_deref(),
         },
     )
     // Fail open: an unresolvable agent spec (provider down, sandbox error)
@@ -293,12 +322,36 @@ pub(crate) fn remembered_agent_relaunch(
     })
 }
 
+/// Read the newest dispatch stage only when it belongs to the remembered agent.
+fn recorded_stage(db: &Db, worktree: &str, agent: &str) -> Result<Option<String>, ()> {
+    let Some(dispatch_id) = db.dispatch_for_worktree(worktree).map_err(|_| ())? else {
+        return Ok(None);
+    };
+    let Some(dispatch) = db.get_dispatch(dispatch_id).map_err(|_| ())? else {
+        return Ok(None);
+    };
+    if dispatch.agent_name != agent {
+        return Ok(None);
+    }
+    Ok(dispatch
+        .stage
+        .filter(|stage| !stage.trim().is_empty())
+        .map(|stage| stage.trim().to_owned()))
+}
+
 /// The resume-form command for a remembered agent, when it applies: the
 /// entry opted in (`resume = true`), a session was discovered whose recorded
 /// cwd is this worktree (newest first, bounded walk), the harness advertises
 /// RESUME, and the id passes the shape check. Any miss ⇒ `None` — a cold
-/// launch of the entry's interactive command, exactly as before.
-fn resume_command_override(cfg: &Config, name: &str, worktree: &str, db: &Db) -> Option<String> {
+/// launch of the entry's configured-stage command, or interactive command
+/// when there is no recorded stage.
+fn resume_command_override(
+    cfg: &Config,
+    name: &str,
+    worktree: &str,
+    db: &Db,
+    stage: Option<&str>,
+) -> Option<String> {
     // Cheap opt-in check FIRST — the filesystem walk never runs for
     // non-opted entries.
     let entry = cfg.agents.iter().find(|a| a.name == name)?;
@@ -328,7 +381,7 @@ fn resume_command_override(cfg: &Config, name: &str, worktree: &str, db: &Db) ->
     // id-shape-validated, refuses non-RESUME harnesses. (`continue_last` is
     // the THE-86 transport-retry form — a resurrection relaunch resumes an
     // EXPLICIT discovered session, it never continues blind.)
-    crate::daemon::agent_open::command_for(cfg, name, "", false, Some(&id), false, None)
+    crate::daemon::agent_open::command_for(cfg, name, "", false, Some(&id), false, stage)
         .ok()
         .map(|cmd| cmd.to_string())
 }
@@ -1117,5 +1170,130 @@ mod tests {
             "codex",
             RelaunchRefusalKind::ProviderLaunch,
         )));
+    }
+
+    fn record_dispatch(wt: &str, agent: &str, stage: Option<&str>) {
+        Db::open()
+            .unwrap()
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage,
+                ..thegn_core::issue::NewDispatch::new("linear:THE-1", wt, agent)
+            })
+            .unwrap();
+    }
+
+    fn cfg_with_code_stage(agents: &[(&str, bool)]) -> Config {
+        let mut cfg = cfg_with(agents);
+        cfg.pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "code".into(),
+                agent: "claude".into(),
+                prompt: "x".into(),
+                ..Default::default()
+            });
+        cfg
+    }
+
+    #[test]
+    fn resurrected_stage_pane_relaunches_with_project_hooks_off() {
+        with_state("stage-hooks-off", |_| {
+            let cfg = cfg_with_code_stage(&[("claude", false)]);
+            let wt = worktree_path("stage-hooks-off");
+            register(&wt, "claude");
+            record_dispatch(&wt, "claude", Some("code"));
+
+            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("stage dispatch relaunches");
+            let argv = spec.argv.join(" ");
+            assert!(
+                argv.contains("--setting-sources user"),
+                "stage relaunch must disable project hooks; argv: {argv}"
+            );
+        });
+    }
+
+    #[test]
+    fn resurrected_stage_resume_keeps_project_hooks_off() {
+        with_state("stage-resume-hooks-off", |state| {
+            let mut cfg = cfg_with_code_stage(&[("claude", true)]);
+            let home = state.join("claude-home");
+            with_usage(&mut cfg, &home);
+            let wt = worktree_path("stage-resume-hooks-off");
+            register(&wt, "claude");
+            record_dispatch(&wt, "claude", Some("code"));
+            seed_session(&home, &wt, "0c1f-uuid");
+
+            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("stage dispatch relaunches");
+            let argv = spec.argv.join(" ");
+            assert!(
+                argv.contains("--resume 0c1f-uuid"),
+                "the newest session remains resumed; argv: {argv}"
+            );
+            assert!(
+                argv.contains("--setting-sources user"),
+                "resumed stage launch must disable project hooks; argv: {argv}"
+            );
+        });
+    }
+
+    #[test]
+    fn resurrected_pane_with_a_removed_stage_is_refused_not_relaunched_with_hooks() {
+        with_state("removed-stage", |_| {
+            let cfg = cfg_with(&[("claude", false)]);
+            let wt = worktree_path("removed-stage");
+            register(&wt, "claude");
+            record_dispatch(&wt, "claude", Some("gone"));
+
+            match remembered_agent_relaunch(&cfg, &wt, 3) {
+                Err(refusal) => assert!(
+                    refusal
+                        .source
+                        .to_string()
+                        .contains("unknown pipeline stage"),
+                    "removed-stage refusal should explain the config mismatch: {}",
+                    refusal.source
+                ),
+                Ok(outcome) => {
+                    panic!("a removed stage must refuse agent resurrection, got {outcome:?}")
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn interactive_pane_without_a_stage_dispatch_relaunches_unchanged() {
+        // Positive control: no dispatch row remains the interactive launch path.
+        with_state("interactive-no-stage", |_| {
+            let cfg = cfg_with(&[("claude", false)]);
+            let wt = worktree_path("interactive-no-stage");
+            register(&wt, "claude");
+
+            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("remembered interactive agent relaunches");
+            let argv = spec.argv.join(" ");
+            assert!(!argv.contains("--setting-sources"), "argv: {argv}");
+        });
+    }
+
+    #[test]
+    fn dispatch_for_another_agent_does_not_apply_its_stage() {
+        // Positive control: the latest dispatch belongs to another agent.
+        with_state("other-agent-stage", |_| {
+            let cfg = cfg_with_code_stage(&[("claude", false)]);
+            let wt = worktree_path("other-agent-stage");
+            register(&wt, "claude");
+            record_dispatch(&wt, "codex", Some("code"));
+
+            let (_, spec) = remembered_agent_relaunch(&cfg, &wt, 3)
+                .unwrap()
+                .expect("remembered interactive agent relaunches");
+            let argv = spec.argv.join(" ");
+            assert!(!argv.contains("--setting-sources"), "argv: {argv}");
+        });
     }
 }

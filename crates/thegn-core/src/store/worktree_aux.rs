@@ -37,7 +37,9 @@ pub const MERGE_QUEUE_EVENTS_PER_WORKTREE: usize = 200;
 /// "remove" (`thegn merge clear` removes row by row and is recorded as "remove"), or "drive"
 /// (a status transition written by the merge-queue drain under its claim). Drive events have
 /// outcome "transition", `new_status` is the status written, and `result_oid` is the result OID
-/// written by that transition. Retry outcomes include "rearmed", "not_retryable" and "claimed";
+/// written by that transition. `target_base_oid` is set only on a drain `landed` transition after
+/// its CAS advanced the target ref; it is the OID the CAS replaced. It is `None` for every other
+/// event and for rows written before v97. Retry outcomes include "rearmed", "not_retryable" and "claimed";
 /// remove outcomes include "deleted". `row_updated_at` is the row's `updated_at` before the
 /// transition (its version). Operator actions and drive transitions use the process actor
 /// (`thegn pid N`); automatic cleanup uses a distinct actor such as `thegn close` (or
@@ -52,6 +54,7 @@ pub struct MergeQueueEvent {
     pub row_updated_at: i64,
     pub candidate_oid: Option<String>,
     pub result_oid: Option<String>,
+    pub target_base_oid: Option<String>,
     pub actor: String,
     pub at_ms: i64,
 }
@@ -496,6 +499,15 @@ pub trait WorktreeAuxStore {
         claim: &MergeClaim,
         status: &str,
         fields: &MergeStatusFields,
+    ) -> Result<MergeClaim>;
+
+    /// Write landed under this live claim, recording target_base_oid (the target ref OID the landing CAS replaced) on the
+    /// drive event. Same claim fencing as [`Self::replace_merge_status_claimed`].
+    fn land_merge_status_claimed(
+        &self,
+        claim: &MergeClaim,
+        fields: &MergeStatusFields,
+        target_base_oid: &str,
     ) -> Result<MergeClaim>;
 
     // --- PR queue (v50) ---------------------------------------------------

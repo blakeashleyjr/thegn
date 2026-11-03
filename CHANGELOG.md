@@ -7,7 +7,57 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.44] — 2026-11-03 (maintenance batch 81)
+
 ## [0.1.0-alpha.43] — 2026-11-02 (maintenance batch 80)
+
+### Added
+
+- `[lsp] require_containment = true` refuses to start a language server that
+  cannot join the thegn resource slice; the default keeps starting it with one
+  warning, and `thegn doctor` shows which applies.
+
+### Changed
+
+- `thegn merge history` also lists the merge-queue drain's own status
+  transitions, with the landed commit as the result.
+- `thegn share start` refuses a port that already has a saved share and records
+  it as `starting` before the tunnel comes up; `thegn share stop` also tears
+  down a Tailscale share left `starting` or `failed`.
+- A plugin declares at most one `IssueProvider`; `thegn plugin check` reports a
+  further one as rejected. The `io` host verb is reserved and answered with an
+  `unsupported` error.
+- (dev channel) The Hetzner provider is labelled experimental: `thegn doctor`
+  and the configuration example say its lifecycle is not verified on a live
+  account.
+
+### Fixed
+
+- A sandbox launch whose container name is held by another worktree's
+  container, or whose owner cannot be read, is refused with `container-owner`
+  instead of removing that running container.
+- A Tailscale share reports its URL only once `tailscale serve status` shows
+  it; otherwise the serve is turned off and the share fails.
+- A media playlist listed for one player is not activated on a different
+  player; the pick is skipped with the "player changed" message.
+- Each merge-queue drain removes leftover `refs/thegn/mq/` ingest refs that no
+  queued entry uses.
+- (dev channel) Provisioning refuses to overwrite a managed SSH key record
+  whose rotation is unfinished and points at `thegn secret ssh rotate`. A
+  second provisioning of the same host-placed container while one runs is
+  skipped; the next open checks again.
+
+### Security
+
+- Queue agents and autopilot see the repository's `.git/hooks` and the
+  worktree's `config.worktree` read-only, so they cannot plant a hook that
+  host-side git later runs.
+- A named-profile startup also unsets credential names ending in `_KEY`,
+  `_AUTH`, `_CREDENTIAL`/`_CREDENTIALS` or `_PASSPHRASE`, and
+  `DOCKER_AUTH_CONFIG`.
+- (dev channel) An unreadable environment selection halts a launch when a
+  remote placement is configured instead of using the default environment;
+  the resident bridge also scrubs secret-shaped text from command error output.
 
 ## [0.1.0-alpha.42] — 2026-10-28 (maintenance batch 79)
 
@@ -2292,7 +2342,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.43...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.44...HEAD
+[0.1.0-alpha.44]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.43...v0.1.0-alpha.44
 [0.1.0-alpha.43]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.42...v0.1.0-alpha.43
 [0.1.0-alpha.42]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.41...v0.1.0-alpha.42
 [0.1.0-alpha.41]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.40...v0.1.0-alpha.41

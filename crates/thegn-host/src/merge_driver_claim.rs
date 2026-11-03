@@ -183,6 +183,31 @@ impl RowClaim {
         Ok(())
     }
 
+    pub(super) fn write_landed(
+        &self,
+        db: &Db,
+        fields: &MergeStatusFields,
+        target_base_oid: &str,
+    ) -> anyhow::Result<()> {
+        let mut claim = self
+            .claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match db.land_merge_status_claimed(&claim, fields, target_base_oid) {
+            Ok(updated) => *claim = updated,
+            Err(error) => {
+                if error
+                    .to_string()
+                    .contains(thegn_core::store::MERGE_CLAIM_LOST)
+                {
+                    self.lost.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn consume_attempt(&self, db: &Db, max: u32) -> anyhow::Result<MergeAttemptResult> {
         let claim = self
             .claim

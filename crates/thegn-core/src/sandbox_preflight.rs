@@ -157,18 +157,48 @@ pub(crate) fn preflight_exec_with(spec: &SandboxSpec, run: &PreflightRunner) -> 
     }
 }
 
-fn compose_exec_failure(stderr: &str) -> Option<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeExecFailure {
+    ServiceNotFound,
+    NoRunningContainer,
+    ReplicaNotRunning,
+}
+
+impl ComposeExecFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ServiceNotFound => "Compose preflight failed: service was not found",
+            Self::NoRunningContainer => {
+                "Compose preflight failed: service has no running container"
+            }
+            Self::ReplicaNotRunning => {
+                "Compose preflight failed: replica 1 of the service is not running (thegn enters replica 1 of a scaled service; start the service or bring replica 1 back, e.g. `docker compose up -d <service>`)"
+            }
+        }
+    }
+}
+
+fn classify_compose_exec_failure(stderr: &str) -> Option<ComposeExecFailure> {
     let lower = stderr.to_ascii_lowercase();
     if lower.contains("no such service") || lower.contains("no service found") {
-        Some("Compose preflight failed: service was not found".into())
+        Some(ComposeExecFailure::ServiceNotFound)
+    } else if lower.contains("is not running container #")
+        || lower.contains("no such container")
+        || lower.contains("no container with name or id")
+    {
+        Some(ComposeExecFailure::ReplicaNotRunning)
     } else if lower.contains("is not running")
         || lower.contains("no container found for")
         || lower.contains("service has no container")
     {
-        Some("Compose preflight failed: service has no running container".into())
+        Some(ComposeExecFailure::NoRunningContainer)
     } else {
         None
     }
+}
+
+fn compose_exec_failure(stderr: &str) -> Option<String> {
+    classify_compose_exec_failure(stderr).map(|failure| failure.message().to_string())
 }
 
 /// Like `sandbox::output_with_timeout` but captures **stderr** (where a container
@@ -425,5 +455,68 @@ mod tests {
             Some("Compose preflight failed: service has no running container".into())
         );
         assert_eq!(compose_exec_failure("permission denied"), None);
+
+        let stderr = "no service found: api";
+        assert_eq!(
+            classify_compose_exec_failure(stderr),
+            Some(ComposeExecFailure::ServiceNotFound),
+            "producer output should retain the service-not-found classification: {stderr}"
+        );
+        assert_eq!(
+            classify_compose_exec_failure("no such service: api"),
+            Some(ComposeExecFailure::ServiceNotFound),
+            "the alternate service-not-found producer output should have a typed classification"
+        );
+        for stderr in [
+            "service \"api\" is not running",
+            "no container found for service api",
+            "service has no container",
+        ] {
+            assert_eq!(
+                classify_compose_exec_failure(stderr),
+                Some(ComposeExecFailure::NoRunningContainer),
+                "producer output should retain the no-running-container classification: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_replica_one_missing_is_its_own_outcome() {
+        for stderr in [
+            "service \"app\" is not running container #1",
+            "Error: no container with name or ID \"proj_app_1\" found: no such container",
+            "Error: No such container: proj-app-1",
+        ] {
+            assert_eq!(
+                classify_compose_exec_failure(stderr),
+                Some(ComposeExecFailure::ReplicaNotRunning),
+                "missing replica 1 producer output should have its own outcome: {stderr}"
+            );
+        }
+        assert!(
+            ComposeExecFailure::ReplicaNotRunning
+                .message()
+                .contains("replica 1")
+        );
+    }
+
+    #[test]
+    fn compose_preflight_surfaces_the_replica_outcome_through_the_runner() {
+        let compose = crate::sandbox_compose::ComposeSpec {
+            files: vec!["compose.yml".into()],
+            service: Some("app".into()),
+            run_services: Vec::new(),
+        };
+        let mut spec = base_spec(Backend::Docker);
+        spec.name = "thegn-x".into();
+        spec.compose = Some(compose.encode());
+        let result = preflight_exec_with(&spec, &|_argv| {
+            Some((
+                false,
+                "service \"app\" is not running container #1\n".into(),
+            ))
+        });
+
+        assert!(result.unwrap_err().contains("replica 1"));
     }
 }
