@@ -107,12 +107,14 @@ pub struct PrQueueConfig {
     /// What happens when `agent_isolation_floor` can't be met: `degrade` (default)
     /// or `fail`. This cannot weaken the `[sandbox]` floor's miss policy.
     pub agent_on_floor_miss: crate::config::OnFloorMiss,
-    /// Refill the attempt budget when the PR's head commit changes.
+    /// Refill the attempt budget when the PR's head commit changes and
+    /// `pause_on_foreign_push` is disabled.
     ///
     /// On by default, and the reason is structural: a pull request lives for
     /// days, so the merge queue's one-shot budget would exhaust once and leave
     /// the row stuck forever. Only a head thegn did **not** create refills it, so
-    /// an agent cannot top up its own budget by pushing.
+    /// an agent cannot top up its own budget by pushing. A foreign push held
+    /// for a human preserves the existing budget.
     pub reset_attempts_on_push: bool,
     /// Stop and ask for a human when the PR's head moved and thegn didn't move
     /// it — someone else pushed. Prevents an agent from racing a teammate.
