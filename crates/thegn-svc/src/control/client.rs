@@ -23,7 +23,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use thegn_core::control_wire::{
     EventDecoder, EventFrame, FeedFilter, Hello, MAX_WIRE_FRAME, PROTO_VERSION,
 };
-use thegn_core::store::{ControlStore, DaemonRow};
+use thegn_core::store::ControlStore;
 
 use super::ControlErrorCode;
 use super::{
@@ -101,11 +101,9 @@ impl std::fmt::Debug for ControlAddr {
 /// registry: freshest heartbeat wins. Returns its unix-socket address; `None`
 /// means "no daemon running" (callers degrade gracefully).
 pub fn discover(store: &dyn ControlStore, scope: &str, now_ms: i64) -> Option<ControlAddr> {
-    let mut live = store
-        .live_daemons(scope, now_ms, DAEMON_HEARTBEAT_TTL_MS)
-        .ok()?;
-    live.sort_by_key(|d: &DaemonRow| d.heartbeat_at);
-    live.pop()
+    store
+        .freshest_live_daemon(scope, now_ms, DAEMON_HEARTBEAT_TTL_MS)
+        .ok()?
         .map(|d| ControlAddr::Unix(PathBuf::from(d.endpoint)))
 }
 
@@ -2105,6 +2103,7 @@ mod tests {
     use super::*;
     use thegn_core::control_wire::MAX_WIRE_PAYLOAD;
     use thegn_core::db::Db;
+    use thegn_core::store::DaemonRow;
 
     #[tokio::test]
     async fn start_attach_publishes_hello_before_buffered_snapshot() {
@@ -3805,6 +3804,36 @@ mod tests {
         db.put_daemon(&daemon_row("stale-2", "/scope/a", "/run/2.sock", 0))
             .unwrap();
         assert!(discover(&db, "/scope/a", now).is_none());
+    }
+
+    // Positive controls: the fresh-same-scope winner and all-stale behavior
+    // above are unchanged while the many-row path exercises bounded lookup.
+    #[test]
+    fn discover_reads_the_freshest_row_among_thousands_of_live_rows() {
+        let db = Db::open_memory().unwrap();
+        let now = 1_000_000;
+        for n in 0..5_000 {
+            db.put_daemon(&daemon_row(
+                &format!("d{n:05}"),
+                "/scope/a",
+                &format!("/run/{n}.sock"),
+                now - 5_000 + n,
+            ))
+            .unwrap();
+        }
+        db.put_daemon(&daemon_row(
+            "winner",
+            "/scope/a",
+            "/run/fresh.sock",
+            now - 1,
+        ))
+        .unwrap();
+
+        let got = discover(&db, "/scope/a", now).expect("live daemon exists");
+        match got {
+            ControlAddr::Unix(path) => assert_eq!(path, PathBuf::from("/run/fresh.sock")),
+            other => panic!("expected a unix addr, got {other:?}"),
+        }
     }
 
     async fn reject_first_frame(payload: Vec<u8>, events: bool) -> anyhow::Error {
