@@ -329,6 +329,8 @@ pub trait WorktreeAuxStore {
 
     /// Unconditionally remove a share record. Reserved for explicit CLI `share stop`.
     fn delete_share(&self, worktree: &str, local_port: u16) -> Result<()>;
+    /// Record the owning CLI process only while `(worktree, local_port, generation)` still matches.
+    /// `Ok(false)` means the row changed or was taken over before the owner could be recorded.
     fn set_share_owner(
         &self,
         worktree: &str,

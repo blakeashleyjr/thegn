@@ -165,6 +165,8 @@ pub(crate) fn apply_share_persist(db: &thegn_core::db::Db, op: SharePersist) {
 }
 
 /// Liveness of a share row's recorded owner (one /proc read for a recorded owner; none otherwise).
+/// An unreadable or mismatched `/proc/<pid>/stat` is treated as exited; on Linux this is reliable
+/// only when the CLI and host share the same pid namespace and procfs is readable.
 pub(crate) fn owner_state_of(row: &thegn_core::db::ShareRow) -> thegn_core::share::ShareOwnerState {
     thegn_core::share::share_owner_state(
         row.owner,

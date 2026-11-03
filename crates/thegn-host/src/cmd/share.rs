@@ -274,7 +274,16 @@ fn begin_share(
 
 fn current_owner() -> Option<ShareOwner> {
     let pid = std::process::id();
-    crate::platform::process_start_ticks(pid).map(|start_ticks| ShareOwner { pid, start_ticks })
+    match crate::platform::process_start_ticks(pid) {
+        Some(start_ticks) => Some(ShareOwner { pid, start_ticks }),
+        None => {
+            tracing::debug!(
+                pid,
+                "could not read share CLI start time; owner will be unrecorded"
+            );
+            None
+        }
+    }
 }
 
 fn record_cli_owner(
@@ -476,7 +485,7 @@ fn list_lines(
                 row.state.clone()
             };
             format!(
-                "{:<6} {:<6} {:<10} {}",
+                "{:<6} {:<6} {:<17} {}",
                 row.local_port,
                 row.provider,
                 state,
@@ -657,6 +666,7 @@ mod tests {
             }
         });
         assert!(lines[0].contains("up (owner exited)"));
+        assert_eq!(&lines[0][32..], "https://demo.test");
         assert!(!lines[1].contains("owner exited"));
         let json = serde_json::to_value(listed_shares(&rows, |row| {
             if row.owner.is_some() {
