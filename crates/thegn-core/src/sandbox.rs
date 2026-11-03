@@ -766,6 +766,18 @@ impl EnterError {
 
 impl std::error::Error for EnterError {}
 
+/// Render an error chain for a user-visible surface, leading with the typed sandbox refusal's class and
+/// remediation when the chain carries an [`EnterError`] (THE-306). Other errors render as `{error:#}`.
+pub fn refusal_context(error: &anyhow::Error) -> String {
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<EnterError>())
+    {
+        Some(refused) => format!("{}: {error:#}", refused.remediation_hint()),
+        None => format!("{error:#}"),
+    }
+}
+
 impl From<VolumeAdmissionError> for EnterError {
     fn from(e: VolumeAdmissionError) -> Self {
         EnterError::Volume(e)
