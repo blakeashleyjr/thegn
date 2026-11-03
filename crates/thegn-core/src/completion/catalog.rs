@@ -605,6 +605,7 @@ pub const CATALOG: &[Slot] = &[
     // Lead lease proof values required by pipeline mutations.
     slot("dispatch claim", "lease", SourceKind::Structural),
     slot("dispatch claim", "owner", SourceKind::Structural),
+    slot("dispatch claim", "lease_gen", SourceKind::Structural),
     slot(
         "dispatch claim",
         "why",
@@ -612,6 +613,7 @@ pub const CATALOG: &[Slot] = &[
     ),
     slot("dispatch put", "lease", SourceKind::Structural),
     slot("dispatch put", "owner", SourceKind::Structural),
+    slot("dispatch put", "lease_gen", SourceKind::Structural),
     slot(
         "dispatch put",
         "why",
@@ -619,8 +621,10 @@ pub const CATALOG: &[Slot] = &[
     ),
     slot("dispatch set-status", "lease", SourceKind::Structural),
     slot("dispatch set-status", "owner", SourceKind::Structural),
+    slot("dispatch set-status", "lease_gen", SourceKind::Structural),
     slot("session open", "lease", SourceKind::Structural),
     slot("session open", "owner", SourceKind::Structural),
+    slot("session open", "lease_gen", SourceKind::Structural),
     // The lease verbs take an action word, an owner token, a TTL and a lease
     // name: all operator-chosen strings with no enumerable source.
     slot("dispatch lease", "action", SourceKind::Structural),
