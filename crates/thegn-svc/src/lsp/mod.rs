@@ -3218,6 +3218,7 @@ mod tests {
         let path = std::env::join_paths([dir.path().as_os_str()]).unwrap();
         let (candidate, identity) = resolve_server_executable("srv", Some(&path)).unwrap();
         assert_eq!(candidate, executable);
+        assert!(reattest_server_executable(&candidate, &identity).is_ok());
         std::fs::write(&executable, "#!/bin/sh\necho replaced; exit 0\n").unwrap();
 
         assert!(matches!(
