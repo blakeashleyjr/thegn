@@ -73,11 +73,16 @@ impl ControlApi for FakeApi {
         &'a self,
         id: &'a str,
         repo: Option<&'a str>,
+        account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
-        self.record(&repo.map_or_else(
+        let mut call = repo.map_or_else(
             || format!("issues_get:{id}"),
             |repo| format!("issues_get:{id}:repo={repo}"),
-        ));
+        );
+        if let Some(account) = account {
+            call.push_str(&format!(":account={account}"));
+        }
+        self.record(&call);
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -90,11 +95,16 @@ impl ControlApi for FakeApi {
         id: &'a str,
         _patch: &'a thegn_core::issue::IssuePatch,
         repo: Option<&'a str>,
+        account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
-        self.record(&repo.map_or_else(
+        let mut call = repo.map_or_else(
             || format!("issues_update:{id}"),
             |repo| format!("issues_update:{id}:repo={repo}"),
-        ));
+        );
+        if let Some(account) = account {
+            call.push_str(&format!(":account={account}"));
+        }
+        self.record(&call);
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -107,11 +117,16 @@ impl ControlApi for FakeApi {
         id: &'a str,
         _body: &'a str,
         repo: Option<&'a str>,
+        account: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>> {
-        self.record(&repo.map_or_else(
+        let mut call = repo.map_or_else(
             || format!("issues_comment:{id}"),
             |repo| format!("issues_comment:{id}:repo={repo}"),
-        ));
+        );
+        if let Some(account) = account {
+            call.push_str(&format!(":account={account}"));
+        }
+        self.record(&call);
         Box::pin(async {
             Err(super::ControlError::Unimplemented(
                 "recording issue fixture",
@@ -1920,6 +1935,62 @@ async fn issue_routes_forward_optional_repo_context() {
             format!("/v1/issues/ABC/comment?repo={encoded_repo}"),
             r#"{"body":"fixture"}"#,
             "issues_comment:ABC:repo=/tmp/repo with space",
+        ),
+    ];
+    for (method, path, body, call) in cases {
+        let r = rig(false);
+        let admin = token(&r, "admin");
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {admin}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = router(r.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(r.api.calls(), vec![call.to_string()]);
+    }
+}
+
+#[tokio::test]
+async fn issue_routes_forward_an_account() {
+    let cases = [
+        (
+            "GET",
+            "/v1/issues/ABC?account=work",
+            "",
+            "issues_get:ABC:account=work",
+        ),
+        (
+            "POST",
+            "/v1/issues/ABC?account=work",
+            "{}",
+            "issues_update:ABC:account=work",
+        ),
+        (
+            "POST",
+            "/v1/issues/ABC/comment?account=work",
+            r#"{"body":"fixture"}"#,
+            "issues_comment:ABC:account=work",
+        ),
+        (
+            "GET",
+            "/v1/issues/ABC?repo=%2Ftmp%2Fr&account=work",
+            "",
+            "issues_get:ABC:repo=/tmp/r:account=work",
+        ),
+        (
+            "POST",
+            "/v1/issues/ABC?repo=%2Ftmp%2Fr&account=work",
+            "{}",
+            "issues_update:ABC:repo=/tmp/r:account=work",
+        ),
+        (
+            "POST",
+            "/v1/issues/ABC/comment?repo=%2Ftmp%2Fr&account=work",
+            r#"{"body":"fixture"}"#,
+            "issues_comment:ABC:repo=/tmp/r:account=work",
         ),
     ];
     for (method, path, body, call) in cases {
