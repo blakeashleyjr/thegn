@@ -552,11 +552,14 @@ fn preview_renderers_report() {
         let state = row["state"].as_str().unwrap_or("unverifiable");
         let location = row["path"]
             .as_str()
-            .map_or_else(|| row["detail"].as_str().unwrap_or(""), |path| path);
-        outln!(
-            "  {program:<13} {state} {location} ({})",
+            .or_else(|| row["detail"].as_str())
+            .unwrap_or("");
+        let containment = if row["contained"].as_bool() == Some(true) {
+            "contained: bwrap"
+        } else {
             row["containment"].as_str().unwrap_or("not run")
-        );
+        };
+        outln!("  {program:<13} {state} {location} ({containment})");
     }
 }
 
