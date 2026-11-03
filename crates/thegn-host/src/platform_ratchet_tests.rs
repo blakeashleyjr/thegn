@@ -329,3 +329,35 @@ fn thread_names_fit_the_comm_limit_ratchet() {
         "A thread name literal must start with `thegn-` and be at most 15 bytes (the Linux comm limit; longer names are truncated in /proc and break attribution). Use `thegn_core::thread_name::spawn_named`/`try_spawn_named`; the allowlist is seeded debt (THE-931) and shrink-only.",
     );
 }
+
+#[test]
+fn burned_down_builder_files_use_spawn_named_with_entry_qos() {
+    // THE-931 slice f: these files left thread-builder-host-ratchet.txt; keep them there.
+    const ENTRY_QOS: &[&str] = &[
+        "bounded_git_probe.rs",
+        "notification_sound.rs",
+        "pane_writer.rs",
+        "preview_watch.rs",
+        "startup_heal.rs",
+    ];
+    const BUILDER_ONLY: &[&str] = &["monitor_sampler.rs"]; // QoS is declared inside the boxed task it spawns
+
+    for file in ENTRY_QOS.iter().chain(BUILDER_ONLY) {
+        let path = format!("{MANIFEST}/src/{file}");
+        let body = std::fs::read_to_string(path).expect("read production source file");
+        assert!(
+            !thegn_core::test_support::thread_spawn::builds_thread_directly(&body),
+            "{file} still builds a thread directly"
+        );
+        assert!(body.contains("spawn_named("), "{file} has no named spawn");
+    }
+
+    for file in ENTRY_QOS {
+        let path = format!("{MANIFEST}/src/{file}");
+        let body = std::fs::read_to_string(path).expect("read production source file");
+        assert!(
+            spawn_named_without_entry_qos(&body).is_empty(),
+            "{file} has a named thread without entry QoS"
+        );
+    }
+}
