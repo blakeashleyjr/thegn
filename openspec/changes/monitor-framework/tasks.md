@@ -31,13 +31,16 @@ Re-owned to THE-1362 (batch 72): THE-829 is Done; that issue ticks the delivered
       uptime collectors.
       Evidence: `collect/registry.rs`, `coverage.rs`, `collect/linux/{loadavg,psi,uptime}.rs` —
       `collect::registry::tests::due_respects_mode_demand_phase_absent_and_retry_backoff`,
-      `coverage::tests::collector_health_adds_coverage_without_downgrading_snapshot`.
+      `coverage::tests::collector_health_adds_coverage_without_downgrading_snapshot`,
+      `collect::linux::loadavg::tests::held_file_updates_and_bad_data_is_parse_error`.
 - [x] F4: Add the MonitorSampler worker: spawn on open, join on close, park
       while hidden or paused, use a three-frame pool, and provide
       `post_external`.
       Evidence: `monitor_sampler.rs`, `monitor_sampler_tests.rs`,
       `collect/frame.rs` — `monitor_sampler_tests::closed_does_not_spawn_and_open_reuses_one_named_worker`,
       `monitor_sampler_tests::hidden_and_paused_use_untimed_parks_then_open_samples`,
+      `monitor_sampler_tests::close_closes_once_and_wakes_for_loop_owned_reap`,
+      `monitor_sampler_tests::external_writes_are_latest_wins_while_parked`,
       `collect::frame::tests::pool_reuses_three_reset_allocations_and_drops_excess`.
 - [x] F5a: Build the shared monitor kit basics.
       Evidence: `monitor/kit/`, `monitor/kit/tests.rs` —
@@ -51,6 +54,7 @@ Re-owned to THE-1362 (batch 72): THE-829 is Done; that issue ticks the delivered
 - [x] F6b: Integrate the board, global keys, Escape layering, and `+N hidden`.
       Evidence: `monitor/board_tests.rs`, `monitor_tests.rs` —
       `board_tests::zoom_uses_solver_area_and_escape_unzooms_before_close`,
+      `board_tests::hidden_count_label_is_only_present_when_solver_drops_panels`,
       `monitor_tests::global_keys_stay_global_on_the_processes_tab`.
 - [x] F6c (THE-836): Mechanically carve monitor tabs into their modules.
       Evidence: `monitor/tabs/` and per-tab view tests —
@@ -61,15 +65,16 @@ Re-owned to THE-1362 (batch 72): THE-829 is Done; that issue ticks the delivered
 - [x] F8: Implement Overview and its help section.
       Evidence: `monitor/tabs/overview.rs`, `docs/help/system-monitor.md` —
       `monitor::tabs::overview_view_tests::overview_renders_all_target_sizes_and_terminal_levels`,
-      `help::ratchet_tests::registry_validates_cleanly`.
+      `docs/help/system-monitor.md` ("## Overview");
+      generic help gate: `help::ratchet_tests::registry_validates_cleanly`.
 - [x] F9a: Add the test harness (`e2e_freeze`, snapshots, and fill-ratio).
       Evidence: `monitor/snapshot.rs`, `e2e_freeze.rs`, view snapshot tests —
       `monitor::snapshot::tests::fill_ratio_known_grids`,
       `e2e_freeze::tests::freeze_frame_is_stable_and_reuses_buffers`.
 - [x] F9b: Add performance gates.
       Evidence: CPU and Overview `view_budget_tests.rs` —
-      `cpu::view_budget_tests::cpu_usage_paint_stays_within_its_pinned_allocation_budget`,
-      `overview::view_budget_tests::populated_overview_panels_stay_within_the_pinned_paint_budget`.
+      `monitor::tabs::cpu::view_budget_tests::cpu_usage_paint_stays_within_its_pinned_allocation_budget`,
+      `monitor::tabs::overview::view_budget_tests::populated_overview_panels_stay_within_the_pinned_paint_budget`.
 
 ## 3. Shared readers
 
