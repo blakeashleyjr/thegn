@@ -638,10 +638,29 @@ fn snapshots(cfg: &Config, worktree: Option<String>) -> Result<()> {
 
 /// Restore the env's sandbox to a checkpoint.
 fn restore(cfg: &Config, worktree: Option<String>, cp: &str) -> Result<()> {
+    let env = resolve_for(cfg, worktree.clone())?;
     let (provider, id) = provider_and_id(cfg, worktree)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(provider.restore(&id, cp))?;
+    let egress = crate::egress_admit::reverify_restored_egress(
+        &ProviderEgressSteps {
+            provider: &provider,
+            runtime: &rt,
+        },
+        provider.caps().egress,
+        &id,
+        cp,
+        &env.sandbox.network_allow,
+        &env.sandbox.network_block,
+    )?;
     outln!("restored {id} to checkpoint {cp}");
+    if egress == crate::egress_admit::RestoredEgress::Verified {
+        outln!(
+            "verified network policy: {} allow, {} block",
+            env.sandbox.network_allow.len(),
+            env.sandbox.network_block.len()
+        );
+    }
     Ok(())
 }
 

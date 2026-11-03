@@ -810,6 +810,18 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
             return false;
         }
     }
+    let repo_root = Path::new(&spare.repo_path);
+    let ctx = thegn_core::repo::main_worktree(repo_root).unwrap_or_else(|| repo_root.to_path_buf());
+    let loc = match GitLoc::for_worktree_op(&ctx, "warm pool recycle") {
+        Ok(loc) => loc,
+        Err(error) => {
+            thegn_core::msg::warn(&format!(
+                "warm pool: cannot resolve the network policy for {name} ({error}); destroying instead of recycling"
+            ));
+            return false;
+        }
+    };
+    let resolved = cfg.resolve_env(repo_root, &loc, &ctx, Some(env_name));
     let restored = crate::agent::block_on_provider(|| async {
         tokio::time::timeout(RESTORE_TIMEOUT, provider.restore(name, cp))
             .await
@@ -822,6 +834,19 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
     });
     match restored {
         Ok(()) => {
+            if let Err(error) = crate::egress_admit::reverify_restored_egress(
+                &crate::egress_admit::BlockingProviderEgress {
+                    provider: &provider,
+                },
+                provider.caps().egress,
+                name,
+                cp,
+                &resolved.sandbox.network_allow,
+                &resolved.sandbox.network_block,
+            ) {
+                thegn_core::msg::warn(&format!("warm pool: {error:#}; destroying it instead"));
+                return false;
+            }
             // Re-assert the provisioned marker: it is written AFTER the
             // checkpoint step (agent.rs), so the checkpoint a restore reverts
             // to does NOT contain it — without this, a claiming worktree would
