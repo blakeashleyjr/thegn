@@ -13,8 +13,9 @@
 use anyhow::{Context, Result, bail};
 use thegn_core::config::{Config, ShareProviderKind};
 use thegn_core::db::{Db, ShareRow};
+use thegn_core::models::ShareOwner;
 use thegn_core::outln;
-use thegn_core::share::build_share_spec;
+use thegn_core::share::{ShareOwnerState, build_share_spec};
 use thegn_core::store::WorktreeAuxStore;
 use thegn_svc::share::{self, ShareLaunch, ShareProvider};
 
@@ -96,6 +97,11 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
         ShareLaunch::Process(plan) => {
             let interrupt = crate::platform::InterruptGuard::install();
             begin_share(&db, &wt, port, generation, &kind)?;
+            if let Err(error) = record_cli_owner(&db, &wt, port, generation, current_owner()) {
+                return Err(abandon_pending_with_error(
+                    &db, &wt, port, generation, error,
+                ));
+            }
             if interrupt.fired() {
                 abandon_pending(&db, &wt, port, generation)?;
                 return Ok(());
@@ -266,6 +272,32 @@ fn begin_share(
         .context("share: could not record the pending share; nothing was started")
 }
 
+fn current_owner() -> Option<ShareOwner> {
+    let pid = std::process::id();
+    crate::platform::process_start_ticks(pid).map(|start_ticks| ShareOwner { pid, start_ticks })
+}
+
+fn record_cli_owner(
+    store: &dyn WorktreeAuxStore,
+    wt: &str,
+    port: u16,
+    generation: u64,
+    owner: Option<ShareOwner>,
+) -> Result<()> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let recorded = store
+        .set_share_owner(wt, port, generation, owner)
+        .context("share: could not record the share owner; nothing was started")?;
+    if !recorded {
+        bail!(
+            "share: pending share record changed before its owner was recorded; nothing was started"
+        );
+    }
+    Ok(())
+}
+
 fn begin_share_after_preflight(
     store: &dyn WorktreeAuxStore,
     wt: &str,
@@ -340,24 +372,14 @@ fn list(json: bool) -> Result<()> {
     let db = Db::open().context("share: open the state DB")?;
     let rows = db.list_shares().context("share: read the state DB")?;
     if json {
-        return super::emit_json(&rows);
+        return super::emit_json(&listed_shares(&rows, crate::share::owner_state_of));
     }
     if rows.is_empty() {
         outln!("no shares");
         return Ok(());
     }
-    for r in &rows {
-        outln!(
-            "{:<6} {:<6} {:<10} {}",
-            r.local_port,
-            r.provider,
-            r.state,
-            r.public_url
-                .as_deref()
-                .map(thegn_svc::lsp::sanitize_for_terminal)
-                .as_deref()
-                .unwrap_or("—"),
-        );
+    for line in list_lines(&rows, crate::share::owner_state_of) {
+        outln!("{line}");
     }
     Ok(())
 }
@@ -388,6 +410,15 @@ fn stop_with_store(
         return Ok(());
     }
     if row.provider != "tailscale" {
+        if crate::share::owner_state_of(&row) == ShareOwnerState::Exited
+            && let Some(owner) = row.owner
+        {
+            bail!(
+                "share: the `thegn share start` that owned port {port} (pid {}) has exited; its {} client may still be running: check for it, then use `thegn share stop {port} --forget` to drop the stale record",
+                owner.pid,
+                row.provider
+            );
+        }
         bail!(
             "share: share on port {port} is owned by a running `thegn share start` (provider {}); interrupt that process, or use --forget to drop a stale record",
             row.provider
@@ -424,6 +455,51 @@ fn stop_with_store(
     finish_stop(store, &row, || share::serve_down(&sidecar, &serve))?;
     outln!("share: verified teardown for port {port}");
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ListedShare<'a> {
+    #[serde(flatten)]
+    row: &'a ShareRow,
+    owner_state: &'static str,
+}
+
+fn list_lines(
+    rows: &[ShareRow],
+    owner_state: impl Fn(&ShareRow) -> ShareOwnerState,
+) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let state = if owner_state(row) == ShareOwnerState::Exited {
+                format!("{} (owner exited)", row.state)
+            } else {
+                row.state.clone()
+            };
+            format!(
+                "{:<6} {:<6} {:<10} {}",
+                row.local_port,
+                row.provider,
+                state,
+                row.public_url
+                    .as_deref()
+                    .map(thegn_svc::lsp::sanitize_for_terminal)
+                    .as_deref()
+                    .unwrap_or("—"),
+            )
+        })
+        .collect()
+}
+
+fn listed_shares<'a>(
+    rows: &'a [ShareRow],
+    owner_state: impl Fn(&ShareRow) -> ShareOwnerState,
+) -> Vec<ListedShare<'a>> {
+    rows.iter()
+        .map(|row| ListedShare {
+            row,
+            owner_state: owner_state(row).as_str(),
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -520,6 +596,102 @@ mod tests {
 
     fn isolated_db(state: &IsolatedState) -> Db {
         Db::open_at(&state.root().join("share-stop.sqlite")).expect("open isolated DB")
+    }
+
+    #[test]
+    fn record_cli_owner_stamps_only_this_generation() {
+        let state = IsolatedState::new();
+        let db = isolated_db(&state);
+        begin_share(&db, "/worktree/demo", 3000, 7, "bore").unwrap();
+        let owner = ShareOwner {
+            pid: 4242,
+            start_ticks: 99,
+        };
+        record_cli_owner(&db, "/worktree/demo", 3000, 7, Some(owner)).unwrap();
+        assert_eq!(db.list_shares().unwrap()[0].owner, Some(owner));
+        let result = record_cli_owner(&db, "/worktree/demo", 3000, 8, Some(owner));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("changed before its owner was recorded")
+        );
+        assert_eq!(db.list_shares().unwrap()[0].owner, Some(owner));
+        record_cli_owner(&db, "/worktree/demo", 3000, 7, None).unwrap();
+        assert_eq!(db.list_shares().unwrap()[0].owner, Some(owner));
+    }
+
+    #[test]
+    fn list_rows_mark_an_exited_owner() {
+        let rows = vec![
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3000,
+                provider: "bore".into(),
+                public_url: Some("https://demo.test".into()),
+                state: "up".into(),
+                created_at: 0,
+                generation: 41,
+                owner: Some(ShareOwner {
+                    pid: 4242,
+                    start_ticks: 99,
+                }),
+            },
+            ShareRow {
+                worktree: "/worktree/demo".into(),
+                local_port: 3001,
+                provider: "frp".into(),
+                public_url: None,
+                state: "up".into(),
+                created_at: 0,
+                generation: 42,
+                owner: None,
+            },
+        ];
+        let lines = list_lines(&rows, |row| {
+            if row.owner.is_some() {
+                ShareOwnerState::Exited
+            } else {
+                ShareOwnerState::Unrecorded
+            }
+        });
+        assert!(lines[0].contains("up (owner exited)"));
+        assert!(!lines[1].contains("owner exited"));
+        let json = serde_json::to_value(listed_shares(&rows, |row| {
+            if row.owner.is_some() {
+                ShareOwnerState::Exited
+            } else {
+                ShareOwnerState::Unrecorded
+            }
+        }))
+        .unwrap();
+        let entries = json.as_array().expect("one JSON array");
+        assert_eq!(entries[0]["owner_state"], "exited");
+        assert_eq!(entries[0]["owner"]["pid"], 4242);
+        assert_eq!(entries[1]["owner_state"], "unrecorded");
+        assert!(entries[1].get("owner").is_none());
+    }
+
+    #[test]
+    fn stop_names_an_exited_owner_of_a_process_row() {
+        let state = IsolatedState::new();
+        let db = isolated_db(&state);
+        let row = stored_row(&db, "bore", Some("https://public.example"));
+        let owner = ShareOwner {
+            pid: std::process::id(),
+            start_ticks: i64::MAX as u64,
+        };
+        assert!(
+            db.set_share_owner("/worktree/demo", 3000, row.generation, owner)
+                .unwrap()
+        );
+        let result = stop_with_store(&Config::default(), &db, "/worktree/demo", 3000, false);
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("has exited"));
+        assert!(message.contains(&owner.pid.to_string()));
+        assert_eq!(db.list_shares().unwrap().len(), 1);
     }
 
     #[test]
@@ -684,6 +856,7 @@ mod tests {
             state: "up".to_string(),
             created_at: 0,
             generation: 41,
+            owner: None,
         };
         assert_eq!(
             stop_plan(&up_row, false, Some(443), None),
@@ -747,6 +920,7 @@ mod tests {
                 state: "up".to_string(),
                 created_at: 0,
                 generation: 41,
+                owner: None,
             };
             assert_eq!(stop_plan(&row, true, None, None), StopPlan::Forget);
         }
@@ -791,6 +965,7 @@ mod tests {
             state: "up".to_string(),
             created_at: 0,
             generation: 41,
+            owner: None,
         };
         assert_eq!(
             stop_plan(

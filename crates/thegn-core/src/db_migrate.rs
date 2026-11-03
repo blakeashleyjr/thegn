@@ -2197,6 +2197,28 @@ pub(crate) fn verify_v100_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v101: shares.owner_pid + shares.owner_start_ticks, the `thegn share start` process that owns a share row (THE-341).
+pub(crate) fn migrate_v101(conn: &Connection) -> Result<()> {
+    for column in ["owner_pid", "owner_start_ticks"] {
+        if !has_column(conn, "shares", column) {
+            conn.execute(
+                &format!("ALTER TABLE shares ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v101_schema(conn: &Connection) -> Result<()> {
+    for column in ["owner_pid", "owner_start_ticks"] {
+        if !has_column(conn, "shares", column) {
+            bail!("schema v101 migration did not add shares.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3742,7 +3764,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 100);
         assert_eq!(
             upgraded
                 .get_calendar_sync("work")
@@ -3759,6 +3780,64 @@ mod tests {
         upgraded.put_calendar_diagnostics("work", &counts).unwrap();
         assert_eq!(upgraded.calendar_diagnostics().unwrap()[0].counts, counts);
         super::verify_v100_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v101_adds_share_owner_columns_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v101_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shares (worktree TEXT NOT NULL, local_port INTEGER NOT NULL, provider TEXT NOT NULL,
+             public_url TEXT, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+             generation INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (worktree, local_port))",
+        )
+        .unwrap();
+        assert!(super::verify_v101_schema(&conn).is_err());
+        super::migrate_v101(&conn).unwrap();
+        super::migrate_v101(&conn).unwrap();
+        super::verify_v101_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v101_upgrades_a_real_v100_database() {
+        use crate::models::ShareOwner;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v100.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.upsert_share("/wt/v100", 3000, 7, "bore", Some("https://x.test"), "up")
+                .unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE shares DROP COLUMN owner_pid;
+                     ALTER TABLE shares DROP COLUMN owner_start_ticks;
+                     PRAGMA user_version=100;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 101);
+        let rows = upgraded.list_shares().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].owner, None);
+        let owner = ShareOwner {
+            pid: 4242,
+            start_ticks: 99,
+        };
+        assert!(
+            upgraded
+                .set_share_owner("/wt/v100", 3000, 7, owner)
+                .unwrap()
+        );
+        assert_eq!(upgraded.list_shares().unwrap()[0].owner, Some(owner));
+        super::verify_v101_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

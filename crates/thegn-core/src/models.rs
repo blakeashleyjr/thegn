@@ -14,6 +14,16 @@ pub struct ShareRow {
     pub created_at: i64,
     /// Owning supervisor/CLI run; `0` means this row predates schema v81.
     pub generation: u64,
+    /// The owning `thegn share start` process; `None` = unrecorded (pre-v101 rows, host-supervised shares).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<ShareOwner>,
+}
+
+/// The `thegn share start` process that owns a share row: pid + kernel start time (clock ticks since boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ShareOwner {
+    pub pid: u32,
+    pub start_ticks: u64,
 }
 
 /// A persisted auto port forward (`[forward]`) — the resurrection record for a
