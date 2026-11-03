@@ -789,6 +789,349 @@ fn assert_fail_closed_daemon_probe(probe: &Captured, layout: &str, route: &str) 
     );
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct FakeListenerReport {
+    connections: usize,
+    bytes: usize,
+}
+
+#[cfg(unix)]
+fn with_fake_listener(
+    socket: &Path,
+    probe: impl FnOnce() -> Captured,
+) -> (Captured, FakeListenerReport) {
+    let listener = std::os::unix::net::UnixListener::bind(socket)
+        .unwrap_or_else(|error| panic!("bind fake listener at {}: {error}", socket.display()));
+    listener
+        .set_nonblocking(true)
+        .expect("set fake listener nonblocking");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (captured, report) = thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            let mut report = FakeListenerReport {
+                connections: 0,
+                bytes: 0,
+            };
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        report.connections += 1;
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make accepted fake connection blocking");
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .expect("bound fake connection read");
+                        let mut buf = Vec::new();
+                        match (&mut stream).take(OUTPUT_LIMIT).read_to_end(&mut buf) {
+                            Ok(_) => report.bytes += buf.len(),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                ) =>
+                            {
+                                report.bytes += buf.len();
+                            }
+                            Err(error) => panic!("read fake listener connection: {error}"),
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept fake listener connection: {error}"),
+                }
+            }
+            report
+        });
+        let probe_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(probe));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let report = handle.join().expect("join fake listener counter");
+        let captured = match probe_result {
+            Ok(captured) => captured,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        (captured, report)
+    });
+    // The socket is inside a temporary directory, so cleanup is best-effort.
+    let _remove_result = fs::remove_file(socket);
+    (captured, report)
+}
+
+#[cfg(unix)]
+fn isolated_cli_env(
+    command: &mut Command,
+    state: &IsolatedState,
+    runtime: &Path,
+    config_home: &Path,
+) {
+    command.envs(state_env_all(state.root()));
+    command
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", BUS_SENTINEL)
+        .env_remove("THEGN_LOG")
+        .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
+        .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY")
+        .env("XDG_CONFIG_HOME", config_home);
+}
+
+#[cfg(unix)]
+fn host_probe_against(
+    socket_in_config: &Path,
+    listener_socket: &Path,
+    label: &str,
+) -> (Captured, FakeListenerReport) {
+    let state = IsolatedState::new();
+    let runtime = tempfile::Builder::new()
+        .prefix("tg-sec-")
+        .tempdir_in("/tmp")
+        .expect("private runtime directory");
+    let captures = tempfile::tempdir_in(state.root()).expect("private probe captures");
+    let config_home = state.root().join("probe-config");
+    let config_dir = config_home.join("thegn");
+    fs::create_dir_all(&config_dir).expect("create probe config directory");
+    let config_path = config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[daemon]\nsocket = {:?}\n",
+            socket_in_config.to_string_lossy()
+        ),
+    )
+    .expect("write probe config");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_thegn"));
+    command.args(["session", "list", "--json"]);
+    isolated_cli_env(&mut command, &state, runtime.path(), &config_home);
+    with_fake_listener(listener_socket, || {
+        run_bounded(&mut command, captures.path(), label, PROCESS_TIMEOUT)
+    })
+}
+
+#[cfg(unix)]
+fn assert_pane_cannot_replace_daemon_socket(fixture: &mut Fixture, label: &str) {
+    let before_socket =
+        fs::symlink_metadata(&fixture.socket).expect("stat daemon socket before pane");
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_socket(&before_socket.file_type()),
+        "daemon endpoint before pane is not a socket: path={} mode={:?}",
+        fixture.socket.display(),
+        before_socket.file_type()
+    );
+    let socket_identity = (
+        std::os::unix::fs::MetadataExt::dev(&before_socket),
+        std::os::unix::fs::MetadataExt::ino(&before_socket),
+    );
+    let lock = fixture.socket.with_extension("sock.lock");
+    let lock_identity = fs::symlink_metadata(&lock).ok().map(|metadata| {
+        (
+            std::os::unix::fs::MetadataExt::dev(&metadata),
+            std::os::unix::fs::MetadataExt::ino(&metadata),
+        )
+    });
+
+    let socket_q = shell_quote(fixture.socket.to_str().expect("socket path is UTF-8"));
+    let lock_q = shell_quote(lock.to_str().expect("lock path is UTF-8"));
+    let parent_q = shell_quote(
+        fixture
+            .socket
+            .parent()
+            .expect("socket has parent")
+            .to_str()
+            .expect("socket parent is UTF-8"),
+    );
+    let inner = format!(
+        "rm -f {socket_q} {lock_q}; mkdir -p {parent_q} && : > {socket_q}; ln -sf /dev/null {lock_q}; :"
+    );
+    let pane = fixture.run_pane(&format!("{label}-replace-probe"), &inner);
+    let pane_details = format!(
+        "pane stdout: {} stderr: {}",
+        String::from_utf8_lossy(&pane.stdout),
+        String::from_utf8_lossy(&pane.stderr)
+    );
+
+    let after_socket = fs::symlink_metadata(&fixture.socket);
+    assert!(
+        after_socket.as_ref().is_ok_and(|metadata| {
+            std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
+                && (
+                    std::os::unix::fs::MetadataExt::dev(metadata),
+                    std::os::unix::fs::MetadataExt::ino(metadata),
+                ) == socket_identity
+        }),
+        "daemon socket inode changed or endpoint is no longer a socket: path={} before={socket_identity:?} after={after_socket:?}; {pane_details}",
+        fixture.socket.display()
+    );
+    if let Some(before_lock) = lock_identity {
+        let after_lock = fs::symlink_metadata(&lock);
+        assert!(
+            after_lock.as_ref().is_ok_and(|metadata| {
+                !metadata.file_type().is_symlink()
+                    && (
+                        std::os::unix::fs::MetadataExt::dev(metadata),
+                        std::os::unix::fs::MetadataExt::ino(metadata),
+                    ) == before_lock
+            }),
+            "daemon lock inode changed or lock became a symlink: path={} before={before_lock:?} after={after_lock:?}; {pane_details}",
+            lock.display()
+        );
+    }
+    fixture.assert_daemon_alive(&format!(
+        "after {label} replacement attempt; {pane_details}"
+    ));
+    let (config_home, _) = fixture.probe_config();
+    let host = fixture.host_sessions_with_config(&format!("{label}-after-replace"), &config_home);
+    fixture.assert_no_sessions(&host);
+}
+
+// Pins THE-307 "fake-server replacement receives zero bytes."
+#[cfg(unix)]
+#[test]
+fn security_e2e_host_client_sends_nothing_to_a_listener_in_a_shared_parent() {
+    if !required_prerequisites() {
+        return;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("tg-sec-shared-")
+        .tempdir_in("/tmp")
+        .expect("shared-parent fixture directory");
+    fs::set_permissions(
+        directory.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )
+    .expect("make fake listener parent shared");
+    let socket = directory.path().join("daemon.sock");
+    let (probe, report) = host_probe_against(&socket, &socket, "shared-parent-client");
+    let output = format!(
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    assert!(
+        !probe.status.success(),
+        "client unexpectedly succeeded; {output}"
+    );
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).contains("no_daemon"),
+        "client did not report no_daemon; {output}"
+    );
+    assert!(
+        report.connections == 0 && report.bytes == 0,
+        "fake listener accepted {} connections and {} bytes; {output}",
+        report.connections,
+        report.bytes
+    );
+}
+
+// Pins THE-307 "fake-server replacement receives zero bytes."
+#[cfg(unix)]
+#[test]
+fn security_e2e_host_client_sends_nothing_through_a_symlinked_socket_parent() {
+    if !required_prerequisites() {
+        return;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("tg-sec-link-")
+        .tempdir_in("/tmp")
+        .expect("symlink-parent fixture directory");
+    let real = directory.path().join("real");
+    fs::create_dir(&real).expect("create real private listener parent");
+    fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("make real listener parent private");
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).expect("symlink listener parent");
+    let listener_socket = real.join("daemon.sock");
+    let configured_socket = alias.join("daemon.sock");
+    let (probe, report) = host_probe_against(
+        &configured_socket,
+        &listener_socket,
+        "symlink-parent-client",
+    );
+    let output = format!(
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    assert!(
+        !probe.status.success(),
+        "client unexpectedly succeeded; {output}"
+    );
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).contains("no_daemon"),
+        "client did not report no_daemon; {output}"
+    );
+    assert!(
+        report.connections == 0 && report.bytes == 0,
+        "fake listener accepted {} connections and {} bytes; {output}",
+        report.connections,
+        report.bytes
+    );
+}
+
+// Pins THE-307 "fake-server replacement receives zero bytes."
+#[cfg(unix)]
+#[test]
+fn security_e2e_hardened_pane_cannot_replace_the_daemon_socket() {
+    if !required_prerequisites() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    assert_pane_cannot_replace_daemon_socket(&mut fixture, "replace");
+}
+
+// Pins THE-307 "fake-server replacement receives zero bytes."
+#[cfg(unix)]
+#[test]
+fn security_e2e_hardened_pane_cannot_replace_the_daemon_socket_without_xdg_runtime_dir() {
+    if !required_prerequisites() {
+        return;
+    }
+    let mut fixture = Fixture::new_without_runtime_dir();
+    assert_pane_cannot_replace_daemon_socket(&mut fixture, "no-runtime-replace");
+}
+
+#[cfg(unix)]
+#[test]
+fn security_e2e_fake_listener_counts_a_real_client() {
+    let directory = tempfile::Builder::new()
+        .prefix("tg-sec-counter-")
+        .tempdir_in("/tmp")
+        .expect("fake listener counter directory");
+    let socket = directory.path().join("listener.sock");
+    let bind_probe = std::os::unix::net::UnixListener::bind(&socket);
+    if !thegn_core::testenv::require_or_skip("unix socket bind", bind_probe.is_ok()) {
+        return;
+    }
+    let preflight_listener = bind_probe.expect("preflight Unix socket bind");
+    drop(preflight_listener);
+    fs::remove_file(&socket).expect("remove preflight socket");
+    // The client connects before stop is set; accept drains the backlog before checking the flag.
+    let (captured, report) = with_fake_listener(&socket, || {
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket)
+            .expect("connect real fake-listener client");
+        stream.write_all(b"hello").expect("write client bytes");
+        drop(stream);
+        Captured {
+            program: "UnixStream client".to_owned(),
+            status: <ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    });
+    assert_eq!(
+        (report.connections, report.bytes),
+        (1, 5),
+        "listener counters differ; program={} status={} stdout={} stderr={}",
+        captured.program,
+        captured.status,
+        String::from_utf8_lossy(&captured.stdout),
+        String::from_utf8_lossy(&captured.stderr)
+    );
+}
+
 #[test]
 fn security_e2e_daemon_pane_cannot_see_or_write_the_state_run_dir() {
     if !required_prerequisites() {
