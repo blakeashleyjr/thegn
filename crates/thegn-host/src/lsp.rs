@@ -328,12 +328,13 @@ impl LspInner {
             // is exactly the background hog the slice exists to bound. The
             // wrap is fail-safe: no published policy / unusable systemd-run ⇒
             // the server spawns unwrapped, with the degraded case logged once
-            // per process. Off-loop, so the wrap's probe spawn is fine here.
-            let resolved = thegn_svc::lsp::resolve_server_command(
+            // per process. Off-loop, so the wrap's probe spawn is fine here. The
+            // recorded executable identity is re-checked right before spawn.
+            let (resolved_path, identity) = thegn_svc::lsp::resolve_server_executable(
                 &spec.command,
                 std::env::var_os("PATH").as_deref(),
             )?;
-            let resolved = resolved.to_str().ok_or_else(|| {
+            let resolved = resolved_path.to_str().ok_or_else(|| {
                 LspError::Spawn("resolved language server path is not valid UTF-8".into())
             })?;
             let mut argv = spec.argv();
@@ -350,6 +351,7 @@ impl LspInner {
                 }
             }
             self.containment_gate(wrap)?;
+            thegn_svc::lsp::reattest_server_executable(&resolved_path, &identity)?;
             let client = LspClient::start_argv_with_identity(
                 &argv,
                 &spec.language_id,
