@@ -17,9 +17,10 @@ batteries_alacritty_version="0.17.0"
 
 usage() {
   cat >&2 <<'EOF'
-usage: ./install.sh [--dry-run] [bindir]
+usage: ./install.sh [--dry-run] [--uninstall] [bindir]
 
   --dry-run  print the install plan without building or changing files
+  --uninstall remove the artifacts recorded in the install manifest (only files whose hash still matches); your config is kept
   --batteries install Linux user-local Alacritty/font batteries
 
 bindir defaults to ~/.local/bin.
@@ -33,6 +34,7 @@ shell_quote() {
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dry_run=0
 batteries=0
+uninstall=0
 bindir=""
 
 while (($#)); do
@@ -42,6 +44,9 @@ while (($#)); do
     ;;
   --batteries)
     batteries=1
+    ;;
+  --uninstall)
+    uninstall=1
     ;;
   -h | --help)
     usage
@@ -63,6 +68,12 @@ while (($#)); do
   esac
   shift
 done
+
+if ((uninstall && batteries)); then
+  echo "install.sh: --uninstall cannot be combined with --batteries" >&2
+  usage
+  exit 2
+fi
 
 bindir="${bindir:-$HOME/.local/bin}"
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
@@ -175,6 +186,198 @@ sha256() {
   printf '%s\n' "${output%% *}"
 }
 
+acquire_install_lock() {
+  # mkdir is the portable atomic per-bindir lock primitive (including macOS).
+  mkdir -p "$bindir"
+  install_lock="$bindir/.thegn-install.lock"
+  if ! mkdir "$install_lock" 2>/dev/null; then
+    lock_pid=""
+    if [[ -f $install_lock/pid ]]; then
+      IFS= read -r lock_pid <"$install_lock/pid" || true
+    fi
+    if [[ $lock_pid =~ ^[0-9]+$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      echo "install.sh: another install is running (pid $lock_pid); lock $install_lock" >&2
+      exit 1
+    fi
+    if [[ ! -e $install_lock/pid ]]; then
+      if stat -c %Y "$install_lock" >/dev/null 2>&1; then
+        lock_mtime="$(stat -c %Y "$install_lock")"
+      else
+        lock_mtime="$(stat -f %m "$install_lock")"
+      fi
+      lock_age=$(($(date +%s) - lock_mtime))
+      if ((lock_age <= 10)); then
+        echo "install.sh: another install is starting; lock $install_lock" >&2
+        exit 1
+      fi
+    fi
+    rm -rf -- "$install_lock"
+    if ! mkdir "$install_lock" 2>/dev/null; then
+      echo "install.sh: could not reclaim install lock $install_lock" >&2
+      exit 1
+    fi
+  fi
+  remove_install_lock() {
+    local lock_pid=""
+    if [[ -f $install_lock/pid ]]; then
+      IFS= read -r lock_pid <"$install_lock/pid" || true
+    fi
+    if [[ $lock_pid == "$$" ]]; then
+      rm -rf -- "$install_lock"
+    fi
+  }
+  trap remove_install_lock EXIT
+  printf '%s\n' "$$" >"$install_lock/pid.tmp"
+  mv -f -- "$install_lock/pid.tmp" "$install_lock/pid"
+}
+
+run_uninstall() {
+  local manifest_size header line line_number=1 entry_hash entry_path remainder path_kept=0 index seen_path
+  local -a manifest_hashes=() manifest_paths=() kept_paths=()
+  local -a seen_paths=()
+
+  if [[ ! -e $manifest_file && ! -L $manifest_file ]]; then
+    echo "install.sh: no install manifest at $manifest_file; nothing to uninstall" >&2
+    return 1
+  fi
+  if [[ -L $manifest_dir || ! -d $manifest_dir ]]; then
+    echo "install.sh: refusing install manifest directory $manifest_dir: is a symlink or not a directory" >&2
+    return 1
+  fi
+  if [[ -L $manifest_file || ! -f $manifest_file ]]; then
+    echo "install.sh: refusing install manifest $manifest_file: is a symlink or not a regular file" >&2
+    return 1
+  fi
+  manifest_size="$(wc -c <"$manifest_file")"
+  if ((manifest_size > 65536)); then
+    echo "install.sh: refusing install manifest $manifest_file: exceeds 65536 bytes" >&2
+    return 1
+  fi
+  if ! cmp -s -- "$manifest_file" <(LC_ALL=C tr -d '\000' <"$manifest_file"); then
+    echo "install.sh: refusing install manifest $manifest_file: contains NUL bytes" >&2
+    return 1
+  fi
+  if ! IFS= read -r header <"$manifest_file" || [[ $header != 'thegn-install-manifest 1' ]]; then
+    echo "install.sh: refusing install manifest $manifest_file: invalid version header" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((line_number += 1))
+    if [[ ! $line =~ ^[0-9a-f]{64}$'\t'/.+$ ]]; then
+      echo "install.sh: refusing manifest line $line_number: entry is outside this install's roots; pass the bindir you installed to" >&2
+      return 1
+    fi
+    entry_hash="${line%%$'\t'*}"
+    entry_path="${line#*$'\t'}"
+    case "$entry_path" in
+    "$bindir/thegn" | "$tg_tui" | "$bindir/tg" | "$batteries_marker" | "$batteries_config" | "$batteries_root/bin/alacritty") ;;
+    *)
+      if ((desktop_integration)) && [[ $entry_path == "$icon_file" || $entry_path == "$desktop_file" ]]; then
+        :
+      elif [[ $entry_path == "$batteries_font_dir/"* ]]; then
+        remainder="${entry_path#"$batteries_font_dir/"}"
+        if [[ -z $remainder || $remainder == */* || $remainder != *.ttf ]]; then
+          echo "install.sh: refusing manifest line $line_number: entry is outside this install's roots; pass the bindir you installed to" >&2
+          return 1
+        fi
+      else
+        echo "install.sh: refusing manifest line $line_number: entry is outside this install's roots; pass the bindir you installed to" >&2
+        return 1
+      fi
+      ;;
+    esac
+    if ((${#seen_paths[@]})); then
+      for seen_path in "${seen_paths[@]}"; do
+        if [[ $seen_path == "$entry_path" ]]; then
+          echo "install.sh: refusing manifest line $line_number: duplicate path $entry_path" >&2
+          return 1
+        fi
+      done
+    fi
+    seen_paths+=("$entry_path")
+    manifest_hashes+=("$entry_hash")
+    manifest_paths+=("$entry_path")
+  done < <(tail -n +2 "$manifest_file")
+
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    echo "install.sh: sha256sum or shasum is required to verify the install manifest" >&2
+    return 1
+  fi
+  if ((!dry_run)); then
+    acquire_install_lock
+  fi
+  if [[ -e $config_file || -L $config_file ]]; then
+    echo "kept your config: $config_file"
+  fi
+  if ((macos_app)) && [[ -e $macos_app_dir/thegn.app || -L $macos_app_dir/thegn.app ]]; then
+    echo "install.sh: $macos_app_dir/thegn.app is not tracked by the manifest and must be removed by hand"
+  fi
+  for ((index = 0; index < ${#manifest_paths[@]}; index++)); do
+    entry_path="${manifest_paths[index]}"
+    if [[ ! -e $entry_path && ! -L $entry_path ]]; then
+      echo "already absent: $entry_path"
+      continue
+    fi
+    if [[ -L $entry_path ]]; then
+      if ((dry_run)); then
+        echo "would keep $entry_path: is a symlink"
+      else
+        echo "refusing $entry_path: is a symlink"
+      fi
+      ((path_kept += 1))
+      kept_paths+=("$entry_path")
+      continue
+    fi
+    if [[ ! -f $entry_path ]]; then
+      if ((dry_run)); then
+        echo "would keep $entry_path: is not a regular file"
+      else
+        echo "refusing $entry_path: is not a regular file"
+      fi
+      ((path_kept += 1))
+      kept_paths+=("$entry_path")
+      continue
+    fi
+    if [[ $(sha256 "$entry_path") != "${manifest_hashes[index]}" ]]; then
+      if ((dry_run)); then
+        echo "would keep $entry_path: changed since install"
+      else
+        echo "kept $entry_path: changed since install"
+      fi
+      ((path_kept += 1))
+      kept_paths+=("$entry_path")
+      continue
+    fi
+    if ((dry_run)); then
+      echo "would remove $entry_path"
+    elif rm -f -- "$entry_path"; then
+      echo "removed $entry_path"
+    else
+      echo "kept $entry_path: removal failed" >&2
+      ((path_kept += 1))
+      kept_paths+=("$entry_path")
+    fi
+  done
+  if ((dry_run)); then
+    if ((path_kept)); then
+      echo "install.sh: uninstall incomplete; kept paths are listed above" >&2
+      return 1
+    fi
+    echo "would remove manifest $manifest_file"
+    return 0
+  fi
+  if ((path_kept)); then
+    echo "install.sh: uninstall incomplete; kept: ${kept_paths[*]}" >&2
+    return 1
+  fi
+  rm -f -- "$manifest_file"
+  rmdir "$batteries_font_dir" 2>/dev/null || true
+  rmdir "$batteries_root/bin" 2>/dev/null || true
+  rmdir "$batteries_root" 2>/dev/null || true
+  return 0
+}
+
 preflight() {
   preflight_conflict=0
   local dir
@@ -265,6 +468,11 @@ preflight() {
   fi
 }
 
+if ((uninstall)); then
+  run_uninstall
+  exit $?
+fi
+
 preflight
 if ((preflight_conflict)); then
   exit 1
@@ -303,48 +511,7 @@ if ((dry_run)); then
   exit 0
 fi
 
-# mkdir is the portable atomic per-bindir lock primitive (including macOS).
-mkdir -p "$bindir"
-install_lock="$bindir/.thegn-install.lock"
-if ! mkdir "$install_lock" 2>/dev/null; then
-  lock_pid=""
-  if [[ -f $install_lock/pid ]]; then
-    IFS= read -r lock_pid <"$install_lock/pid" || true
-  fi
-  if [[ $lock_pid =~ ^[0-9]+$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
-    echo "install.sh: another install is running (pid $lock_pid); lock $install_lock" >&2
-    exit 1
-  fi
-  if [[ ! -e $install_lock/pid ]]; then
-    if stat -c %Y "$install_lock" >/dev/null 2>&1; then
-      lock_mtime="$(stat -c %Y "$install_lock")"
-    else
-      lock_mtime="$(stat -f %m "$install_lock")"
-    fi
-    lock_age=$(($(date +%s) - lock_mtime))
-    if ((lock_age <= 10)); then
-      echo "install.sh: another install is starting; lock $install_lock" >&2
-      exit 1
-    fi
-  fi
-  rm -rf -- "$install_lock"
-  if ! mkdir "$install_lock" 2>/dev/null; then
-    echo "install.sh: could not reclaim install lock $install_lock" >&2
-    exit 1
-  fi
-fi
-remove_install_lock() {
-  local lock_pid=""
-  if [[ -f $install_lock/pid ]]; then
-    IFS= read -r lock_pid <"$install_lock/pid" || true
-  fi
-  if [[ $lock_pid == "$$" ]]; then
-    rm -rf -- "$install_lock"
-  fi
-}
-trap remove_install_lock EXIT
-printf '%s\n' "$$" >"$install_lock/pid.tmp"
-mv -f -- "$install_lock/pid.tmp" "$install_lock/pid"
+acquire_install_lock
 
 preflight
 if ((preflight_conflict)); then

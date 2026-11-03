@@ -774,4 +774,207 @@ PATH="$fakebin:$PATH" HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HO
   exit 1
 }
 
+install_uninstall_fixture() {
+  local name="$1"
+  case_home="$tmp/$name-home"
+  case_config="$tmp/$name-config"
+  case_data="$tmp/$name-data"
+  case_bin="$tmp/$name-bin"
+  case_manifest="$case_data/thegn/install-manifest"
+  case_config_file="$case_config/thegn/config.toml"
+  mkdir -p "$case_home"
+  PATH="$fakebin:$PATH" HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+    "$install_repo/install.sh" "$case_bin" >"$tmp/$name-install.out"
+  cp "$case_config_file" "$tmp/$name-config-original"
+}
+
+# uninstall-dry-run: every tracked artifact gets a plan row; all bytes and the lock state stay untouched.
+install_uninstall_fixture uninstall-dry-run
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall --dry-run "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 0 ]] || {
+  echo "uninstall dry-run failed" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+while IFS=$'\t' read -r _ uninstall_path; do
+  [[ -n $uninstall_path ]] || continue
+  [[ $uninstall_out == *"would remove $uninstall_path"* ]] || {
+    echo "uninstall dry-run omitted $uninstall_path" >&2
+    echo "$uninstall_out" >&2
+    exit 1
+  }
+done < <(tail -n +2 "$case_manifest")
+[[ -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui && -e $case_manifest && ! -e $case_bin/.thegn-install.lock ]] || {
+  echo "uninstall dry-run changed installed artifacts, the manifest, or the lock" >&2
+  exit 1
+}
+if ((freedesktop)); then
+  [[ -e $case_data/icons/hicolor/scalable/apps/thegn.svg && -e $case_data/applications/thegn.desktop ]] || {
+    echo "uninstall dry-run changed desktop integration artifacts" >&2
+    exit 1
+  }
+fi
+cmp -s -- "$tmp/uninstall-dry-run-config-original" "$case_config_file" || {
+  echo "uninstall dry-run changed the user config" >&2
+  exit 1
+}
+
+# uninstall-clean: tracked files and manifest disappear, while user config bytes remain intact.
+install_uninstall_fixture uninstall-clean
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 0 ]] || {
+  echo "clean uninstall failed" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+[[ ! -e $case_bin/thegn && ! -e $case_bin/tg && ! -e $case_bin/tg-tui && ! -e $case_manifest &&
+  ! -e $case_bin/.thegn-install.lock ]] || {
+  echo "clean uninstall left tracked artifacts, manifest, or lock" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+if ((freedesktop)); then
+  [[ ! -e $case_data/icons/hicolor/scalable/apps/thegn.svg && ! -e $case_data/applications/thegn.desktop ]] || {
+    echo "clean uninstall left desktop integration artifacts" >&2
+    exit 1
+  }
+fi
+cmp -s -- "$tmp/uninstall-clean-config-original" "$case_config_file" || {
+  echo "clean uninstall changed the user config" >&2
+  exit 1
+}
+
+# uninstall-keeps-modified: a changed wrapper stays, while unchanged artifacts are removed.
+install_uninstall_fixture uninstall-keeps-modified
+printf '\nuser change\n' >>"$case_bin/tg"
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && $(<"$case_bin/tg") == *"user change"* && ! -e $case_bin/thegn &&
+! -e $case_bin/tg-tui && -e $case_manifest &&
+$uninstall_out == *"kept $case_bin/tg: changed since install"* ]] || {
+  echo "modified artifact was not retained as an incomplete uninstall" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-refuses-malformed-manifest: an invalid record refuses before touching any installed path.
+install_uninstall_fixture uninstall-refuses-malformed
+printf 'not-a-hash\t%s\n' "$case_bin/thegn" >>"$case_manifest"
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui &&
+  -e $case_manifest && $uninstall_out == *"manifest line"* ]] || {
+  echo "malformed manifest did not refuse before removal" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-refuses-duplicate-path: duplicate records refuse before any artifact is removed.
+install_uninstall_fixture uninstall-refuses-duplicate
+duplicate_manifest_line="$(sed -n '2p' "$case_manifest")"
+printf '%s\n' "$duplicate_manifest_line" >>"$case_manifest"
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui &&
+  -e $case_manifest && $uninstall_out == *"duplicate path"* ]] || {
+  echo "duplicate manifest path did not refuse before removal" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-refuses-oversized-manifest: the size cap is checked before any artifact removal.
+install_uninstall_fixture uninstall-refuses-oversized
+head -c 65537 /dev/zero >>"$case_manifest"
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui &&
+  -e $case_manifest && $uninstall_out == *"exceeds 65536 bytes"* ]] || {
+  echo "oversized manifest did not refuse before removal" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-refuses-forged-entry: an out-of-root path rejects the whole manifest before removal.
+install_uninstall_fixture uninstall-refuses-forged-entry
+victim_file="$tmp/uninstall-forged-victim"
+printf 'victim\n' >"$victim_file"
+victim_hash="$(test_sha256 "$victim_file")"
+printf '%s\t%s\n' "$victim_hash" "$victim_file" >>"$case_manifest"
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui &&
+  -e $victim_file && -e $case_manifest && $uninstall_out == *"outside this install's roots"* ]] || {
+  echo "forged manifest entry did not refuse before removal" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-refuses-other-bindir: the manifest path set is bound to the supplied bindir.
+install_uninstall_fixture uninstall-refuses-other-bindir
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$tmp/uninstall-other-bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && -e $case_bin/thegn && -e $case_bin/tg && -e $case_bin/tg-tui &&
+  -e $case_manifest && $uninstall_out == *"outside this install's roots"* ]] || {
+  echo "uninstall with another bindir did not refuse before removal" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-keeps-symlink: the link is kept and its target is never changed.
+install_uninstall_fixture uninstall-keeps-symlink
+victim_link_target="$tmp/uninstall-symlink-victim"
+printf 'symlink victim\n' >"$victim_link_target"
+rm -f -- "$case_bin/tg-tui"
+ln -s "$victim_link_target" "$case_bin/tg-tui"
+uninstall_status=0
+uninstall_out="$(HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" 2>&1)" || uninstall_status=$?
+[[ $uninstall_status == 1 && -L $case_bin/tg-tui && $(<"$victim_link_target") == 'symlink victim' &&
+! -e $case_bin/thegn && ! -e $case_bin/tg && -e $case_manifest && $uninstall_out == *"$case_bin/tg-tui"* ]] || {
+  echo "uninstall did not keep a symlink and its target safely" >&2
+  echo "$uninstall_out" >&2
+  exit 1
+}
+
+# uninstall-then-reinstall: a clean uninstall permits a fresh install and manifest publication.
+install_uninstall_fixture uninstall-then-reinstall
+uninstall_status=0
+HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall "$case_bin" >"$tmp/uninstall-then-reinstall-uninstall.out" 2>&1 || uninstall_status=$?
+[[ $uninstall_status == 0 ]] || {
+  echo "uninstall before reinstall failed" >&2
+  cat "$tmp/uninstall-then-reinstall-uninstall.out" >&2
+  exit 1
+}
+PATH="$fakebin:$PATH" HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" "$case_bin" >"$tmp/uninstall-then-reinstall.out"
+[[ $(head -n 1 "$case_manifest") == 'thegn-install-manifest 1' && -x $case_bin/thegn && -x $case_bin/tg &&
+-x $case_bin/tg-tui ]] || {
+  echo "reinstall after uninstall did not publish a fresh complete install" >&2
+  cat "$tmp/uninstall-then-reinstall.out" >&2
+  exit 1
+}
+
+# uninstall-rejects-batteries: positive control; the existing unknown-option path already exits 2 at base.
+install_uninstall_fixture uninstall-rejects-batteries
+uninstall_status=0
+HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
+  "$install_repo/install.sh" --uninstall --batteries "$case_bin" >"$tmp/uninstall-rejects-batteries.out" 2>&1 ||
+  uninstall_status=$?
+[[ $uninstall_status == 2 && -e $case_bin/thegn && -e $case_manifest ]] || {
+  echo "uninstall with --batteries did not refuse as a usage error" >&2
+  cat "$tmp/uninstall-rejects-batteries.out" >&2
+  exit 1
+}
+
 echo "install plan checks passed"
