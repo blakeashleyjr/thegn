@@ -125,9 +125,31 @@
     specialArgs = {inherit pkgs;};
   };
 
+  evalWithOptions = options:
+    lib.evalModules {
+      modules = [
+        stub
+        (import ./hm-module.nix self)
+        {
+          programs.thegn =
+            {
+              enable = true;
+              package = thegn;
+            }
+            // options;
+        }
+      ];
+      specialArgs = {inherit pkgs;};
+    };
+
+  invalidThemeColor = evalWithOptions {themeColor = "24bit";};
+  oversizedThemePanePadding = evalWithOptions {themePanePadding = 65536;};
+
   minimalConfig = minimal.config.xdg.configFile."thegn/config.toml".source;
   maximalConfig = maximal.config.xdg.configFile."thegn/config.toml".source;
 in
+  assert !(builtins.tryEval (builtins.deepSeq invalidThemeColor.config.programs.thegn.themeColor true)).success;
+  assert !(builtins.tryEval (builtins.deepSeq oversizedThemePanePadding.config.programs.thegn.themePanePadding true)).success;
   assert minimal.config.home.packages == [thegn];
   assert maximal.config.home.packages == [thegn];
     pkgs.runCommand "thegn-hm-module-eval" {} ''
