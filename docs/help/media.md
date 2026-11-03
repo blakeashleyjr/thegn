@@ -99,7 +99,7 @@ arrives, before anything is stored or drawn:
   cut between characters. A longer artwork URL, or one with a control
   character, is dropped.
 - A label shows at most 256 characters and ends in `...` when visible text
-  was cut. At most 30 combining marks are kept after one character.
+  was cut. At most 30 combining accent marks are kept after one character.
 - A track, queue or playlist id over 1024 bytes, or one with a control
   character, is rejected rather than shortened; a queue or playlist row
   with such an id is left out.
