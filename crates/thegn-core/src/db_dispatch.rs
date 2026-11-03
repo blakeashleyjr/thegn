@@ -6426,12 +6426,31 @@ mod tests {
         rows
     }
 
-    fn run_fence_row_snapshot(db: &Db, id: i64) -> (String, Option<String>, Option<String>, i64) {
+    type RunFenceRowSnapshot = (
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    fn run_fence_row_snapshot(db: &Db, id: i64) -> RunFenceRowSnapshot {
         db.conn()
             .query_row(
-                "SELECT status, session_id, artifact_path, run_gen FROM agent_dispatches WHERE id=?1",
+                "SELECT status, session_id, artifact_path, run_gen, exit_code, exited_at_ms \
+                 FROM agent_dispatches WHERE id=?1",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap()
     }
@@ -6505,7 +6524,9 @@ mod tests {
                     )
                     .unwrap();
             }
-            let status_after_bump = run_fence_row_snapshot(&db, id).0;
+            let row_after_bump = run_fence_row_snapshot(&db, id);
+            // The zombie legacy row's stale cell is refused by the status clause,
+            // not the run fence.
             assert!(
                 !db.compare_and_set_dispatch_status_run(
                     &stale,
@@ -6516,11 +6537,7 @@ mod tests {
                 .unwrap(),
                 "stale generation must refuse for {stored}"
             );
-            assert_eq!(
-                run_fence_row_snapshot(&db, id).0,
-                status_after_bump,
-                "{stored}"
-            );
+            assert_eq!(run_fence_row_snapshot(&db, id), row_after_bump, "{stored}");
 
             let fresh = db.dispatch_run_ref(id).unwrap().unwrap();
             let changed = db
@@ -6547,17 +6564,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         for (id, stored) in rows_in_every_status(&db) {
             let fresh = db.dispatch_run_ref(id).unwrap().unwrap();
-            let status = run_fence_row_snapshot(&db, id).0;
-            assert_eq!(
-                db.stamp_dispatch_exit(&fresh, Some(7)).unwrap(),
-                ExitStamp::Stamped,
-                "{stored}"
-            );
-            assert_eq!(
-                db.stamp_dispatch_exit(&fresh, Some(8)).unwrap(),
-                ExitStamp::AlreadyStamped,
-                "{stored}"
-            );
+            let before = run_fence_row_snapshot(&db, id);
             let stale = crate::issue::DispatchRunRef {
                 run_gen: fresh.run_gen - 1,
                 ..fresh.clone()
@@ -6567,7 +6574,30 @@ mod tests {
                 ExitStamp::Stale,
                 "{stored}"
             );
-            assert_eq!(run_fence_row_snapshot(&db, id).0, status, "{stored}");
+            let after_stale = run_fence_row_snapshot(&db, id);
+            assert_eq!(after_stale, before, "{stored}");
+            assert_eq!(
+                after_stale.4, None,
+                "stale stamp must leave exit_code NULL: {stored}"
+            );
+            assert_eq!(
+                after_stale.5, None,
+                "stale stamp must leave exited_at_ms NULL: {stored}"
+            );
+            assert_eq!(
+                db.stamp_dispatch_exit(&fresh, Some(7)).unwrap(),
+                ExitStamp::Stamped,
+                "{stored}"
+            );
+            let after_fresh = run_fence_row_snapshot(&db, id);
+            assert_eq!(after_fresh.4, Some(7), "{stored}");
+            assert!(after_fresh.5.is_some(), "{stored}");
+            assert_eq!(
+                db.stamp_dispatch_exit(&fresh, Some(8)).unwrap(),
+                ExitStamp::AlreadyStamped,
+                "{stored}"
+            );
+            assert_eq!(run_fence_row_snapshot(&db, id), after_fresh, "{stored}");
         }
         let missing = crate::issue::DispatchRunRef {
             id: 999_999,
