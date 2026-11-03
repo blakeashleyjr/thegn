@@ -3641,7 +3641,8 @@ impl Drop for ProvisionedSandbox {
 /// rejected the request (e.g. a bad/expired token → 401); the caller decides
 /// whether that halts (failover off) or just warns (failover on). Returns a
 /// rollback guard only when this call created the sandbox; pre-existing
-/// sandboxes and no-op paths return `None`.
+/// sandboxes have their egress policy verified before return, and no-op paths
+/// return `None`.
 fn auto_provision_sandbox(
     cfg: &Config,
     env_name: &str,
@@ -3721,9 +3722,6 @@ fn auto_provision_sandbox(
                     )
                 }),
             );
-            if !created {
-                return Ok(guard);
-            }
             let repo_root: PathBuf = Db::open()
                 .ok()
                 .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -3734,19 +3732,19 @@ fn auto_provision_sandbox(
             let resolved = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
             let allow = &resolved.sandbox.network_allow;
             let block = &resolved.sandbox.network_block;
-            if crate::egress_admit::egress_admission(true, provider.caps().egress, allow, block)
-                == crate::egress_admit::EgressAdmission::AdmitFresh
-            {
-                crate::egress_admit::admit_egress(
-                    &crate::egress_admit::BlockingProviderEgress {
-                        provider: &provider,
-                    },
-                    &name,
-                    allow,
-                    block,
-                )?;
+            crate::egress_admit::gate_handed_sandbox(
+                &crate::egress_admit::BlockingProviderEgress {
+                    provider: &provider,
+                },
+                created,
+                provider.caps().egress,
+                &name,
+                allow,
+                block,
+            )?;
+            if created {
+                thegn_core::msg::info(&format!("provisioned sandbox {provisioned_name}"));
             }
-            thegn_core::msg::info(&format!("provisioned sandbox {provisioned_name}"));
             Ok(guard)
         }
         Err(e) => Err(e),
