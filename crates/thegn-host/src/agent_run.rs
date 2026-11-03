@@ -869,6 +869,11 @@ pub(crate) fn run_outcome_cancellable(
         tracing::warn!(
             target: "thegn::agent",
             kind = %task.kind,
+            bounded_env_copies = if matches!(task.kind, TaskKind::MergeConflict | TaskKind::GateFailure) {
+                "THEGN_TASK_PROMPT,THEGN_MERGE_PROMPT"
+            } else {
+                "THEGN_TASK_PROMPT"
+            },
             original_prompt_bytes = task.prompt.len(),
             max_env_bytes = MAX_RENDERED_COMMAND_BYTES,
             "agent prompt was bounded to fit the environment; task data omitted"
@@ -2635,7 +2640,7 @@ mod tests {
             .unwrap()
             .expect("bounded rendered prompt should fit the command transport");
         assert!(command.len() <= MAX_RENDERED_COMMAND_BYTES);
-        assert!(MAX_RENDERED_COMMAND_BYTES < 128 * 1024);
+        const { assert!(MAX_RENDERED_COMMAND_BYTES < 128 * 1024) };
     }
 
     #[test]
