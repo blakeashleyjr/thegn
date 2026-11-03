@@ -32,10 +32,13 @@ pub(crate) struct Clipboard {
 }
 
 impl Clipboard {
-    pub fn reset(&mut self) {
+    /// Reset the stream and report whether a complete pending set was discarded.
+    /// An unfinished partial sequence is not a set and does not count.
+    pub fn reset(&mut self) -> bool {
+        let discarded = self.pending.take().is_some();
         self.state = State::Text;
         self.partial = Vec::new();
-        self.pending = None;
+        discarded
     }
 
     pub fn feed(&mut self, input: &[u8]) {
@@ -344,5 +347,22 @@ mod tests {
         assert!(!c.has_pending());
         c.feed(b"\x1b]52;c;eg==\x07");
         assert!(c.has_pending());
+    }
+
+    #[test]
+    fn reset_reports_only_a_discarded_complete_set() {
+        let mut c = Clipboard::default();
+        assert!(!c.reset());
+
+        c.feed(b"\x1b]52;c;eA==\x07");
+        c.submit(Err);
+        assert!(c.reset());
+
+        c.feed(b"\x1b]52;c;eA==\x07");
+        assert_eq!(pending(&mut c), Some(b"\x1b]52;c;eA==\x07".to_vec()));
+        assert!(!c.reset());
+
+        c.feed(b"\x1b]52;c;");
+        assert!(!c.reset());
     }
 }
