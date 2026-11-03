@@ -1248,7 +1248,8 @@ pub struct IssuesQuery {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IssueRepoQuery {
-    /// Configured tracker account that owns the issue (`[[issues.accounts]]` name); routes the call to exactly that account.
+    /// Configured tracker account that owns the issue (`[[issues.issue_accounts]]` `name`);
+    /// routes the call to exactly that account.
     #[serde(default)]
     account: Option<String>,
     /// Filesystem path on the daemon host used to apply a repo's `[issues]` overlay.
