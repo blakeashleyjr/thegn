@@ -972,8 +972,12 @@ fn stale_staging_pid(file_name: &str, name: Option<&str>) -> Option<u32> {
 
 const CLONE_CLAIM_SUFFIX: &str = ".clone-claim";
 const CLONE_CLAIM_READ_LIMIT: u64 = 64;
+static CLONE_CLAIM_RECLAIM_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 struct CloneClaim {
+    // This path is resolved through the parent name. If that directory is replaced while a clone
+    // runs, Drop may leave the old parent's claim behind; a later clone reclaims its dead token.
     path: std::path::PathBuf,
     token: String,
 }
@@ -1064,9 +1068,12 @@ fn claim_clone_destination(
                         parent.join(name).display()
                     );
                 }
-                std::fs::remove_file(&path).with_context(|| {
-                    format!("reclaim dead workspace clone claim {}", path.display())
-                })?;
+                if !reclaim_dead_clone_claim(&path, holder)? {
+                    anyhow::bail!(
+                        "workspace clone claim {} changed while it was being reclaimed; retry",
+                        path.display()
+                    );
+                }
                 reclaimed = true;
             }
             Err(error) => {
@@ -1079,6 +1086,55 @@ fn claim_clone_destination(
         "workspace clone claim {} was taken by another clone; retry",
         path.display()
     )
+}
+
+fn reclaim_dead_clone_claim(path: &std::path::Path, expected: (u32, u64)) -> Result<bool> {
+    let sequence = CLONE_CLAIM_RECLAIM_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let parent = path
+        .parent()
+        .context("clone claim has no parent directory")?;
+    let file_name = path
+        .file_name()
+        .context("clone claim has no file name")?
+        .to_string_lossy();
+    let aside = parent.join(format!(
+        ".{file_name}.reclaim-{}-{}-{timestamp}-{sequence}",
+        std::process::id(),
+        expected.1
+    ));
+    match std::fs::rename(path, &aside) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("move dead workspace clone claim {} aside", path.display())
+            });
+        }
+    }
+
+    if read_clone_claim(&aside).is_ok_and(|holder| holder == expected) {
+        std::fs::remove_file(&aside).with_context(|| {
+            format!("remove reclaimed workspace clone claim {}", aside.display())
+        })?;
+        return Ok(true);
+    }
+
+    // Restore without replacing a claim another process may have created at the original path.
+    // If that path is occupied, retain the aside file rather than deleting a possibly-live token.
+    std::fs::hard_link(&aside, path).with_context(|| {
+        format!(
+            "restore changed workspace clone claim {} from {}",
+            path.display(),
+            aside.display()
+        )
+    })?;
+    std::fs::remove_file(&aside)
+        .with_context(|| format!("remove restored workspace clone claim {}", aside.display()))?;
+    Ok(false)
 }
 
 fn read_clone_claim(path: &std::path::Path) -> Result<(u32, u64)> {
@@ -2851,6 +2907,24 @@ Receiving objects: 100% (10/10)\rdone.\n";
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "1 9");
         drop(claim);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn clone_claim_reclaim_preserves_a_replacement_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".ws.clone-claim");
+        // Models a fresh holder replacing the dead token after the first contender read it but
+        // before that contender renames the path aside. Reclaim must verify the moved token.
+        std::fs::write(&path, "5151 8\n").unwrap();
+
+        assert!(!reclaim_dead_clone_claim(&path, (4242, 7)).unwrap());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "5151 8\n");
+        let entries = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from(".ws.clone-claim")]);
     }
 
     #[test]
