@@ -187,7 +187,7 @@ sha256() {
 }
 
 validate_desktop_entry() {
-  local file="$1" launcher="$2" line key value seen=$'\n' group_seen=0
+  local file="$1" launcher="$2" validator_file="${3:-$1}" line key value seen=$'\n' group_seen=0
   local type_ok=0 name_ok=0 installer_ok=0 exec_ok=0 tryexec_ok=0 icon_ok=0
   local key_pattern='^[A-Za-z0-9-]+(\[[A-Za-z0-9_@.-]+\])?='
   local validator_output
@@ -251,7 +251,7 @@ validate_desktop_entry() {
   fi
 
   if command -v desktop-file-validate >/dev/null 2>&1; then
-    if ! validator_output="$(desktop-file-validate "$file" 2>&1)"; then
+    if ! validator_output="$(desktop-file-validate "$validator_file" 2>&1)"; then
       echo "install.sh: desktop entry $file: desktop-file-validate rejected it" >&2
       if [[ -n $validator_output ]]; then
         printf '%s\n' "$validator_output" >&2
@@ -596,6 +596,7 @@ fi
 
 declare -a journal_targets=() journal_backups=() staged_files=()
 backup_dir=""
+desktop_validation_dir=""
 rollback_install() {
   local i target backup failed=0
   for ((i = ${#journal_targets[@]} - 1; i >= 0; i--)); do
@@ -628,6 +629,9 @@ cleanup_install() {
   fi
   if [[ -n ${batteries_staging-} ]]; then
     rm -rf -- "$batteries_staging"
+  fi
+  if [[ -n $desktop_validation_dir ]]; then
+    rm -rf -- "$desktop_validation_dir"
   fi
   if ((${#staged_files[@]} > 0)); then
     rm -f -- "${staged_files[@]}"
@@ -891,14 +895,24 @@ if ((desktop_integration)); then
   tg_launcher="$bindir/tg"
   mkdir -p "$apps_dir"
   stage_file "$desktop_file" 0644
-  desktop_tmp="$staged_path.desktop"
-  if ! mv -n -- "$staged_path" "$desktop_tmp" ||
-    [[ -e $staged_path || -L $staged_path || ! -f $desktop_tmp ]]; then
-    echo "install.sh: could not prepare a staged .desktop filename for validation" >&2
-    exit 1
-  fi
-  staged_files[${#staged_files[@]} - 1]="$desktop_tmp"
-  staged_path="$desktop_tmp"
+  desktop_tmp="$staged_path"
+  desktop_validation_dir="$(mktemp -d /tmp/thegn-desktop-validate.XXXXXXXX)"
+  desktop_validation_real="$(cd -P "$desktop_validation_dir" && pwd)"
+  xdg_data_real="$(cd -P "$XDG_DATA_HOME" && pwd)"
+  case "$desktop_validation_real/" in
+  "$xdg_data_real/"*)
+    rm -rf -- "$desktop_validation_dir"
+    desktop_validation_dir="$(mktemp -d /var/tmp/thegn-desktop-validate.XXXXXXXX)"
+    desktop_validation_real="$(cd -P "$desktop_validation_dir" && pwd)"
+    case "$desktop_validation_real/" in
+    "$xdg_data_real/"*)
+      echo "install.sh: could not create desktop validation directory outside XDG_DATA_HOME" >&2
+      exit 1
+      ;;
+    esac
+    ;;
+  esac
+  desktop_validator_tmp="$desktop_validation_dir/thegn.desktop"
   cat >"$desktop_tmp" <<EOF
 [Desktop Entry]
 Type=Application
@@ -916,7 +930,8 @@ Keywords=git;worktree;terminal;ide;multiplexer;thegn;
 StartupNotify=true
 EOF
   chmod 0644 "$desktop_tmp"
-  validate_desktop_entry "$desktop_tmp" "$tg_launcher" || {
+  cp -- "$desktop_tmp" "$desktop_validator_tmp"
+  validate_desktop_entry "$desktop_tmp" "$tg_launcher" "$desktop_validator_tmp" || {
     echo "install.sh: refusing to install an invalid desktop entry" >&2
     exit 1
   }

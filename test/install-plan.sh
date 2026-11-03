@@ -986,7 +986,7 @@ HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
 }
 
 if ((freedesktop)); then
-  # desktop-validate-staged: validation sees the private staged path before publication.
+  # desktop-validate-staged: the validator sees a private .desktop copy before publication.
   dfv_bin="$tmp/dfv-bin"
   dfv_data="$tmp/dfv-data"
   dfv_log="$tmp/dfv.log"
@@ -999,9 +999,10 @@ if ((freedesktop)); then
     exit 1
   }
   dfv_logged_path="$(<"$dfv_log")"
-  [[ $(dirname "$dfv_logged_path") == "$dfv_data/applications" &&
-  $(basename "$dfv_logged_path") == .thegn-install.* && -f $dfv_data/applications/thegn.desktop ]] || {
-    echo "desktop validator did not receive the staged entry before publication: $dfv_logged_path" >&2
+  [[ $(basename "$dfv_logged_path") == thegn.desktop &&
+  $(dirname "$dfv_logged_path") != "$dfv_data/applications" &&
+  $dfv_logged_path != "$dfv_data"/* && -f $dfv_data/applications/thegn.desktop ]] || {
+    echo "desktop validator did not receive a private named copy before publication: $dfv_logged_path" >&2
     exit 1
   }
 
