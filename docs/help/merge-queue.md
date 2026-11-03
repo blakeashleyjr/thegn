@@ -352,9 +352,9 @@ prompt file left by an interrupted run is removed when a later local agent run
 prepares that directory, if the regular `prompt-*` file is over 30 days old.
 
 If a queue agent is refused at sandbox entry, it is not started and its row
-records the refusal class and fix; merge-queue rows stay agent-blocked, while
-PR-queue rows need human attention. Autopilot records the same refusal hint in
-its failure state.
+records the refusal class and fix; merge-queue rows stay
+`agent_blocked`, while PR-queue rows need `needs_human`. Autopilot records the
+same refusal hint in its failure state.
 
 What the agent is _told_ is yours to change. Leave a prompt empty for
 thegn's built-in instructions, or override one per blocker kind:

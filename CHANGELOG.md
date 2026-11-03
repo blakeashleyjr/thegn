@@ -17,8 +17,8 @@ All notable changes to **thegn** are documented here. The format follows
 - MCP `tools/list` marks tools with `readOnlyHint` and `destructiveHint`
   annotations so clients can distinguish read-only, destructive and other
   writes.
-- With `THEGN_PERF=1`, the perf log includes a separate `sched admission` event
-  with cumulative background-work counters.
+- With `THEGN_PERF=1`, the `thegn::perf` rollup adds a separate
+  `sched admission` event with cumulative background-work counters.
 - (dev channel) `thegn doctor` reports the host-cache signer for provider
   environments that use it, without exposing key material; JSON includes its
   signer state.
@@ -26,8 +26,8 @@ All notable changes to **thegn** are documented here. The format follows
 ### Changed
 
 - `thegn dispatch lease acquire` prints the lease generation, also in `--json`.
-  New acquisitions after a first take or expiry receive a higher generation;
-  a live same-owner acquire returns the current generation.
+  A first take, or a take after expiry, gets a higher generation than any
+  before it; a live same-owner acquire keeps the current one.
 - `thegn merge history` records outcomes from `thegn merge land`, its panel
   action, `thegn land` and `thegn integrate`.
 - Dispatch refuses a new row before writing when 4,096 rows are active.
@@ -53,11 +53,11 @@ All notable changes to **thegn** are documented here. The format follows
   removed when a later run prepares that directory, after 30 days.
 - GitLab CI no longer sends API requests to the SSH port from an `ssh://`
   remote with a non-default port.
-- An open CI run drill fetches run details and logs once per worktree, run and
-  generation, instead of fetching again on each CI refresh.
-- After a configuration reload supersedes a calendar pass, it starts no more
-  queued account fetches; already-running fetches finish under the existing
-  fence.
+- An open CI run drill fetches its run details and logs once instead of again
+  on every CI refresh.
+- After a configuration reload, a calendar refresh still working through
+  accounts under the old settings starts no further account fetches; fetches
+  already in flight finish.
 - (dev channel) Managed SSH key provisioning, rotation, completion and revoke
   share one lock, preventing provisioning from overwriting an unfinished
   rotation record and preventing two rotations from both succeeding.
