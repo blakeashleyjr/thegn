@@ -307,7 +307,10 @@ fn drive_claim(
             db,
             run_id,
             dispatch_id,
-            &format!("autopilot sandbox setup failed: {e}"),
+            &format!(
+                "autopilot sandbox setup failed: {}",
+                thegn_core::sandbox::refusal_context(&e)
+            ),
         );
         return;
     }
