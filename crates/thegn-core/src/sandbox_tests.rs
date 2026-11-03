@@ -794,6 +794,20 @@ fn refusal_remediation_hint_names_class_path_and_fix() {
 }
 
 #[test]
+fn refusal_context_leads_with_the_remediation_hint() {
+    let mut spec = spec(Backend::Docker);
+    spec.volumes = vec![("/tmp/state".into(), "/mnt/state".into())];
+    let error =
+        anyhow::Error::new(enter_argv(&spec, "true").expect_err("invalid volume name must refuse"))
+            .context("outer step");
+
+    let context = refusal_context(&error);
+    assert!(context.starts_with("sandbox entry refused [volume-name]"));
+    assert!(context.contains("outer step"));
+    assert_eq!(refusal_context(&anyhow::anyhow!("boom")), "boom");
+}
+
+#[test]
 fn refusal_remediation_display_is_unchanged() {
     let error = refusal(
         &spec(Backend::Docker),
