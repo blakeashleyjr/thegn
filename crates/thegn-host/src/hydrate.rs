@@ -2088,6 +2088,7 @@ fn collect_sidebar_status(
         // jj colocation is a repo-level property (a `.jj/` beside `.git/`); a
         // cheap stat on the glyph-scan cadence, never a `jj` subprocess.
         let jj = thegn_core::jj::is_colocated(std::path::Path::new(&repo_root));
+        crate::glyph_refresh::record_jj(&repo_root, jj);
         status.git.insert(
             path.clone(),
             crate::sidebar::GitGlyphs {
@@ -2138,6 +2139,8 @@ fn collect_sidebar_status(
     }
     // Serve other workspaces' last-known glyphs from cache (never scanning, never
     // wakes a sandbox) so a switch shows them instantly instead of blank.
+    // Refresh their jj bits here, off-loop, so loop-side seeding never stats.
+    crate::glyph_refresh::refresh_cached_jj();
     crate::glyph_refresh::seed_from_global_cache(
         &mut status.git,
         &mut status.branches,
@@ -3565,10 +3568,11 @@ pub(crate) fn build_panel(
     panel.hosts = crate::host_ui::host_snapshots(app_cfg, db);
     // Per-[env.*] display snapshots for the System ▸ Environments section (kind,
     // region/size, token presence, effective binding). Skip the DB read if empty.
-    let bound = (!app_cfg.env.is_empty())
-        .then(|| db.effective_env(&cwd.to_string_lossy(), &scope_repo_root.to_string_lossy()))
-        .flatten();
-    panel.environments = crate::env_ui::env_snapshots(app_cfg, bound.as_deref());
+    let (environments, environments_error) = crate::env_ui::env_panel(app_cfg, || {
+        db.effective_env_checked(&cwd.to_string_lossy(), &scope_repo_root.to_string_lossy())
+    });
+    panel.environments = environments;
+    panel.environments_error = environments_error;
     let toolchain_root = thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
     panel.toolchain = Some(crate::toolchain_ui::worktree_status(
         app_cfg,

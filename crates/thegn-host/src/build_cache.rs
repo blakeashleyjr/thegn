@@ -446,7 +446,10 @@ where
             spec.mounts.truncate(mount_count_before_cache_policy);
             return SandboxCacheDecision {
                 active: false,
-                reason: format!("sandbox volume admission refused for compiler cache: {error}"),
+                reason: format!(
+                    "compiler cache not applied: {} ({error})",
+                    error.remediation_hint()
+                ),
             };
         }
     };
@@ -916,6 +919,31 @@ mod tests {
                 .contains_key("SCCACHE_IGNORE_SERVER_IO_ERROR")
         );
         assert!(spec.env_block.iter().any(|k| k == "RUSTC_WRAPPER"));
+    }
+
+    #[test]
+    fn sandbox_cache_volume_refusal_reason_names_the_fix() {
+        if thegn_core::util::which_path("sccache").is_none() {
+            return;
+        }
+        let mut cfg = Config::default();
+        cfg.sandbox.compiler_cache = SandboxCompilerCache::Auto;
+        cfg.disk.sccache_dir = format!("/tmp/thegn-sccache-volume-refusal-{}", std::process::id());
+        let mut spec = SandboxSpec {
+            volumes: vec![("/tmp/state".into(), "/mnt/state".into())],
+            ..policy_bwrap_spec()
+        };
+        spec.env_overrides
+            .insert("RUSTC_WRAPPER".into(), "sccache".into());
+
+        let decision =
+            apply_sandbox_compiler_cache_with(&mut spec, &cfg, Path::new("/repo"), &[], |_| {
+                panic!("a refused probe spec must not be probed")
+            });
+
+        assert!(!decision.active);
+        assert!(decision.reason.contains("[volume-name]"));
+        assert!(decision.reason.contains("sandbox volume refused (pair 0;"));
     }
 
     #[test]

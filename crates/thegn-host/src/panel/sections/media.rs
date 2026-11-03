@@ -152,6 +152,16 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
                 "+more sources not shown",
             )])));
         }
+        if media.sources_unavailable {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                d(),
+                if media.sources.is_empty() {
+                    "sources unavailable"
+                } else {
+                    "sources may be stale"
+                },
+            )])));
+        }
     }
     rows.extend(detail_rows(ctx, state, policy));
     if policy.show_queue {
@@ -718,5 +728,80 @@ mod tests {
             rest = &rest[end + 1..];
         }
         assert!(found > 0, "the Media renderer still paints action rows");
+    }
+
+    #[test]
+    fn failed_source_listing_renders_a_hitless_marker() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.media = Some(state());
+        let mut ui = crate::panel::PanelUi {
+            width: crate::layout::PanelWidth::Half,
+            ..Default::default()
+        };
+        ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            Some(MediaCaps {
+                queue: true,
+                ..MediaCaps::default()
+            }),
+            0,
+        );
+        let request = ui
+            .media
+            .take_sources_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media
+            .set_sources_result(request, model.panel.media.as_ref(), Err("x".into()));
+        let unavailable = {
+            let ctx = SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 40,
+                rows: 30,
+            };
+            content(&ctx)
+        };
+        assert!(
+            unavailable
+                .iter()
+                .any(|row| { line_text(&row.line) == "sources unavailable" && row.hit.is_none() })
+        );
+
+        ui.media.begin_request(model.panel.media.as_ref());
+        let request = ui
+            .media
+            .take_sources_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_sources_result(
+            request,
+            model.panel.media.as_ref(),
+            Ok(vec!["player".into()]),
+        );
+        ui.media.begin_request(model.panel.media.as_ref());
+        let request = ui
+            .media
+            .take_sources_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media
+            .set_sources_result(request, model.panel.media.as_ref(), Err("x".into()));
+        let stale = {
+            let ctx = SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 40,
+                rows: 30,
+            };
+            content(&ctx)
+        };
+        assert!(
+            stale
+                .iter()
+                .any(|row| { line_text(&row.line) == "sources may be stale" && row.hit.is_none() })
+        );
+        assert!(
+            stale
+                .iter()
+                .any(|row| row.hit == Some(PanelHit::Row(Section::Media, 0)))
+        );
     }
 }

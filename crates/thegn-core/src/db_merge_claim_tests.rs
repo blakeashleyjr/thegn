@@ -548,6 +548,7 @@ fn claim_aware_persist_refuses_a_claimed_row() {
         target_branch: "main",
         location: "",
         status: MergeFinalStatus::Landed,
+        operation: crate::store::MergeOutcomeOperation::Land,
         result_oid: Some("verified-commit"),
         conflict_paths: None,
         error_detail: None,

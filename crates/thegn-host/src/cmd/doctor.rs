@@ -3266,6 +3266,25 @@ fn env_devshell(cfg: &Config, e: &thegn_core::config::EnvConfig) -> String {
         .to_string()
 }
 
+fn signer_line(status: &crate::nix_signing::InstallKeyStatus) -> String {
+    use crate::nix_signing::InstallKeyStatus;
+
+    match status {
+        InstallKeyStatus::Present { name } => {
+            format!("signer: {name} (per-installation key)")
+        }
+        InstallKeyStatus::Missing => {
+            "signer: none yet (created at the first host-cache provision)".to_string()
+        }
+        InstallKeyStatus::Invalid(reason) => {
+            let reason = reason.chars().take(200).collect::<String>();
+            format!(
+                "signer: INVALID ({reason}); sandboxes will not trust the host cache until it is fixed"
+            )
+        }
+    }
+}
+
 /// Provider dev-env caching health: for each `[env.*]` with a provider, the
 /// devShell attr its sandbox enters, whether a persistent binary cache is
 /// configured, and — when `host_cache = true` — whether the resident musl bridge
@@ -3279,6 +3298,10 @@ fn provider_cache_report(cfg: &Config) {
         outln!("  (no provider envs configured)");
         return;
     }
+    let signer = names
+        .iter()
+        .any(|name| cfg.env[*name].provider.host_cache)
+        .then(crate::nix_signing::install_key_status);
     let bridge = crate::bridge_sup::bridge_binary_path();
     for name in names {
         let e = &cfg.env[name];
@@ -3307,6 +3330,9 @@ fn provider_cache_report(cfg: &Config) {
                     );
                 }
             }
+            if let Some(status) = signer.as_ref() {
+                outln!("               {}", signer_line(status));
+            }
         }
     }
 }
@@ -3318,12 +3344,36 @@ fn provider_cache_lifecycle_note(provider: &str) -> Option<&'static str> {
 }
 
 fn provider_cache_json(cfg: &Config) -> serde_json::Value {
+    let names = provider_env_names(cfg);
+    let signer = names
+        .iter()
+        .any(|name| cfg.env[*name].provider.host_cache)
+        .then(crate::nix_signing::install_key_status);
+    provider_cache_json_with(cfg, signer.as_ref())
+}
+
+fn provider_cache_json_with(
+    cfg: &Config,
+    signer: Option<&crate::nix_signing::InstallKeyStatus>,
+) -> serde_json::Value {
     let bridge_present = crate::bridge_sup::bridge_binary_path().is_some();
     let mut map = serde_json::Map::new();
     for name in provider_env_names(cfg) {
         let e = &cfg.env[name];
         let p = &e.provider;
         let kind = EnvProviderKind::of(p.provider.trim());
+        let signer_name = if p.host_cache {
+            signer.and_then(crate::nix_signing::InstallKeyStatus::name)
+        } else {
+            None
+        };
+        let signer_state = if p.host_cache {
+            signer
+                .map(crate::nix_signing::InstallKeyStatus::state)
+                .unwrap_or("missing")
+        } else {
+            "unused"
+        };
         map.insert(
             name.clone(),
             serde_json::json!({
@@ -3334,6 +3384,8 @@ fn provider_cache_json(cfg: &Config) -> serde_json::Value {
                 "host_cache": p.host_cache,
                 "bridge_present": bridge_present,
                 "host_cache_effective": p.host_cache && bridge_present,
+                "signer": signer_name,
+                "signer_state": signer_state,
             }),
         );
     }
@@ -6039,6 +6091,7 @@ args = ["--verbose"]
 
     #[test]
     fn provider_cache_reports_env_devshell_and_bridge_relation() {
+        let _state = crate::testenv::IsolatedState::new();
         // No provider envs by default → the surface is an empty object.
         let cfg = Config::default();
         assert!(provider_env_names(&cfg).is_empty());
@@ -6100,6 +6153,59 @@ args = ["--verbose"]
         assert_eq!(env_devshell(&cfg, &plain), "default");
         // The human report runs without panicking.
         provider_cache_report(&cfg);
+    }
+
+    #[test]
+    fn provider_cache_reports_the_installation_signer_without_key_material() {
+        use crate::nix_signing::InstallKeyStatus;
+        use thegn_core::config::{EnvConfig, EnvProviderConfig};
+
+        let cfg = Config {
+            env: [
+                (
+                    "sprites".to_string(),
+                    EnvConfig {
+                        provider: EnvProviderConfig {
+                            provider: "sprites".into(),
+                            host_cache: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "vps".to_string(),
+                    EnvConfig {
+                        provider: EnvProviderConfig {
+                            provider: "hetzner".into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let present = InstallKeyStatus::Present {
+            name: "thegn-0123456789abcdef-1".into(),
+        };
+        let json = provider_cache_json_with(&cfg, Some(&present));
+        assert_eq!(json["sprites"]["signer"], "thegn-0123456789abcdef-1");
+        assert_eq!(json["sprites"]["signer_state"], "present");
+        assert!(json["vps"]["signer"].is_null());
+        assert_eq!(json["vps"]["signer_state"], "unused");
+
+        let json = provider_cache_json_with(&cfg, Some(&InstallKeyStatus::Missing));
+        assert!(json["sprites"]["signer"].is_null());
+        assert_eq!(json["sprites"]["signer_state"], "missing");
+
+        assert!(signer_line(&present).contains("thegn-0123456789abcdef-1"));
+        assert!(signer_line(&InstallKeyStatus::Missing).contains("none yet"));
+        let invalid = signer_line(&InstallKeyStatus::Invalid("x".repeat(500)));
+        assert!(invalid.len() <= 300);
+        assert!(invalid.contains("INVALID"));
     }
 
     fn hard_link_test_supported() -> bool {

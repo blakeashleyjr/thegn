@@ -90,8 +90,8 @@ pub use worktree_aux::{
     MERGE_CLAIM_ACTIVE, MERGE_CLAIM_LOST, MERGE_CLAIM_MAX_LEASE_MS, MERGE_CLAIM_OWNER_HINT_MAX,
     MERGE_QUEUE_EVENTS_PER_WORKTREE, MergeAttemptResult, MergeCandidate, MergeClaim,
     MergeClaimActive, MergeClaimPhase, MergeClaimRequest, MergeClaimView, MergeEnqueueIdentity,
-    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    MergeQueueEvent, MergeRegistryIdentity, MergeRetryOutcome, MergeStatusFields, PrClearOutcome,
-    PrRemoval, WorktreeAuxStore,
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeOperation,
+    MergeOutcomeWrite, MergeQueueEvent, MergeRegistryIdentity, MergeRetryOutcome,
+    MergeStatusFields, PrClearOutcome, PrRemoval, WorktreeAuxStore,
 };
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

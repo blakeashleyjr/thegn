@@ -7,6 +7,26 @@
 
 use thegn_core::config::{Config, EnvProviderConfig, PlacementMode};
 
+/// Build environment snapshots together with the checked worktree selection.
+/// A failed selection read is shown as unavailable rather than guessing that
+/// the default `local` environment is bound.
+pub(crate) fn env_panel(
+    cfg: &Config,
+    selection: impl FnOnce() -> anyhow::Result<Option<String>>,
+) -> (Vec<EnvSnapshot>, Option<String>) {
+    if cfg.env.is_empty() {
+        return (Vec::new(), None);
+    }
+    match selection() {
+        Ok(bound) => (env_snapshots(cfg, bound.as_deref()), None),
+        Err(error) => {
+            let message = format!("{error:#}");
+            tracing::debug!(target: "thegn::env", error = %message, "environment selection is unreadable");
+            (env_snapshots(cfg, None), Some(message))
+        }
+    }
+}
+
 /// One environment as shown in the panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvSnapshot {
@@ -200,10 +220,21 @@ pub(crate) fn placement_change(
     (from != target.placement).then(|| (from.to_string(), target.placement.clone()))
 }
 
-pub(crate) fn bind_action(envs: &[EnvSnapshot], cursor: usize, worktree: &str) -> BindAction {
+pub(crate) fn bind_action(
+    envs: &[EnvSnapshot],
+    cursor: usize,
+    worktree: &str,
+    selection_error: Option<&str>,
+) -> BindAction {
     let Some(env) = envs.get(cursor) else {
         return BindAction::Status("no environment selected".to_string());
     };
+    if worktree.trim().is_empty() {
+        return BindAction::Status("no active worktree to bind (open one first)".to_string());
+    }
+    if selection_error.is_some() {
+        return BindAction::Status("cannot bind env: this worktree's environment selection could not be read; retry once the state database is readable".to_string());
+    }
     match bind_decision(env, worktree) {
         BindDecision::NoWorktree => {
             BindAction::Status("no active worktree to bind (open one first)".to_string())
@@ -420,7 +451,12 @@ pub fn panel_key(
     };
     match key {
         KeyCode::Enter => {
-            match bind_action(&model.panel.environments, cursor, worktree) {
+            match bind_action(
+                &model.panel.environments,
+                cursor,
+                worktree,
+                model.panel.environments_error.as_deref(),
+            ) {
                 BindAction::Status(status) => model.status = status,
                 BindAction::Bind { name, worktree } => {
                     model.status = format!("binding env '{name}'…");
@@ -559,13 +595,74 @@ mod tests {
             snapshot("b", "provider", false),
         ];
         assert_eq!(
-            bind_action(&envs, 1, "/worktree"),
+            bind_action(&envs, 1, "/worktree", None),
             BindAction::Confirm {
                 name: "b".into(),
                 from: "local".into(),
                 to: "provider".into(),
             }
         );
+    }
+
+    #[test]
+    fn env_panel_reports_an_unreadable_selection_and_marks_nothing_bound() {
+        let mut cfg = Config::default();
+        cfg.env
+            .insert("a".into(), thegn_core::config::EnvConfig::default());
+        cfg.env.insert("b".into(), provider_env("fly", "", ""));
+
+        let (snapshots, error) = env_panel(&cfg, || Err(anyhow::anyhow!("database is locked")));
+
+        assert!(snapshots.iter().all(|snapshot| !snapshot.bound));
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| !snapshot.detail.iter().any(|(key, _)| key == "bound"))
+        );
+        assert!(error.is_some_and(|message| message.contains("database is locked")));
+    }
+
+    #[test]
+    fn env_panel_does_not_read_the_selection_without_envs() {
+        assert_eq!(
+            env_panel(&Config::default(), || panic!("must not read")),
+            (Vec::new(), None)
+        );
+    }
+
+    #[test]
+    fn env_panel_marks_the_bound_env_when_the_read_succeeds() {
+        let mut cfg = Config::default();
+        cfg.env
+            .insert("a".into(), thegn_core::config::EnvConfig::default());
+        cfg.env.insert("b".into(), provider_env("fly", "", ""));
+
+        let (snapshots, error) = env_panel(&cfg, || Ok(Some("b".into())));
+
+        assert_eq!(error, None);
+        assert!(!snapshots[0].bound);
+        assert!(snapshots[1].bound);
+    }
+
+    #[test]
+    fn enter_refuses_to_rebind_while_the_selection_is_unreadable() {
+        let envs = [
+            snapshot("a", "local", false),
+            snapshot("b", "provider", false),
+        ];
+
+        assert!(matches!(
+            bind_action(&envs, 1, "/worktree", Some("database is locked")),
+            BindAction::Status(status) if status.contains("could not be read")
+        ));
+        assert!(matches!(
+            bind_action(&envs, 1, "/worktree", None),
+            BindAction::Confirm { .. }
+        ));
+        assert!(matches!(
+            bind_action(&envs, 1, "", Some("database is locked")),
+            BindAction::Status(status) if status.contains("no active worktree")
+        ));
     }
 
     #[test]

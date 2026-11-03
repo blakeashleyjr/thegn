@@ -34,8 +34,12 @@ pub enum MergeRetryOutcome {
 pub const MERGE_QUEUE_EVENTS_PER_WORKTREE: usize = 200;
 
 /// One operator, drain, or lifecycle transition on a merge-queue row. `operation` is "retry",
-/// "remove" (`thegn merge clear` removes row by row and is recorded as "remove"), or "drive"
-/// (a status transition written by the merge-queue drain under its claim). Drive events have
+/// "remove" (`thegn merge clear` removes row by row and is recorded as "remove"), "drive"
+/// (a status transition written by the merge-queue drain under its claim), "land" (queue-aware
+/// `thegn merge land` or the panel land key), "raw_land" (`thegn land`), or "integrate"
+/// (`thegn integrate` folds). Land, raw-land, and integrate events have outcome "transition"
+/// when a row existed with another status, or "created" when the command created the row; for
+/// created rows `old_status` is empty. Drive events have
 /// outcome "transition", `new_status` is the status written, and `result_oid` is the result OID
 /// written by that transition. `target_base_oid` is set only on a drain `landed` transition after
 /// its CAS advanced the target ref; it is the OID the CAS replaced. It is `None` for every other
@@ -170,9 +174,32 @@ impl MergeFinalStatus {
     }
 }
 
+/// Command that finalized a merge-queue row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcomeOperation {
+    /// Queue-aware `thegn merge land` or the panel land key.
+    Land,
+    /// Raw `thegn land` command.
+    RawLand,
+    /// `thegn integrate` fold.
+    Integrate,
+}
+
+impl MergeOutcomeOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Land => "land",
+            Self::RawLand => "raw_land",
+            Self::Integrate => "integrate",
+        }
+    }
+}
+
 /// Complete replacement of the outcome columns. `None` means SQL NULL, unlike
 /// `update_merge_status`. Finalization preserves an existing row's nomination
-/// time and attempt budget; it is not an enqueue/retry gesture.
+/// time and attempt budget; it is not an enqueue/retry gesture. The operation
+/// names the command that finalized the row and its audit event. Event-write
+/// errors roll back the outcome write.
 pub struct MergeFinalOutcome<'a> {
     pub worktree: &'a str,
     pub branch: &'a str,
@@ -183,6 +210,7 @@ pub struct MergeFinalOutcome<'a> {
     /// remote descriptors must match exactly, never by filesystem path alone.
     pub location: &'a str,
     pub status: MergeFinalStatus,
+    pub operation: MergeOutcomeOperation,
     pub result_oid: Option<&'a str>,
     pub conflict_paths: Option<&'a str>,
     pub error_detail: Option<&'a str>,
