@@ -958,8 +958,8 @@ fn assert_pane_cannot_replace_daemon_socket(fixture: &mut Fixture, label: &str) 
         after_socket.as_ref().is_ok_and(|metadata| {
             std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
                 && (
-                    std::os::unix::fs::MetadataExt::dev(&metadata),
-                    std::os::unix::fs::MetadataExt::ino(&metadata),
+                    std::os::unix::fs::MetadataExt::dev(metadata),
+                    std::os::unix::fs::MetadataExt::ino(metadata),
                 ) == socket_identity
         }),
         "daemon socket inode changed or endpoint is no longer a socket: path={} before={socket_identity:?} after={after_socket:?}; {pane_details}",
@@ -971,8 +971,8 @@ fn assert_pane_cannot_replace_daemon_socket(fixture: &mut Fixture, label: &str) 
             after_lock.as_ref().is_ok_and(|metadata| {
                 !metadata.file_type().is_symlink()
                     && (
-                        std::os::unix::fs::MetadataExt::dev(&metadata),
-                        std::os::unix::fs::MetadataExt::ino(&metadata),
+                        std::os::unix::fs::MetadataExt::dev(metadata),
+                        std::os::unix::fs::MetadataExt::ino(metadata),
                     ) == before_lock
             }),
             "daemon lock inode changed or lock became a symlink: path={} before={before_lock:?} after={after_lock:?}; {pane_details}",
