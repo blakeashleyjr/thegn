@@ -368,14 +368,21 @@ fn is_gallery_selector(path: &Path) -> bool {
 fn visible_row(row: &[tg_kit::ratatui::buffer::Cell]) -> String {
     let mut text = String::new();
     let mut skip_continuation = false;
+    let mut skipped_cells = 0;
     for cell in row {
         if skip_continuation {
             skip_continuation = false;
+            skipped_cells += 1;
             continue;
         }
         let symbol = cell.symbol();
         text.push_str(symbol);
         skip_continuation = UnicodeWidthStr::width(symbol) > 1;
+    }
+    // Keep the snapshot's cell count stable while omitting Ratatui's duplicate
+    // continuation-cell symbol for a wide grapheme.
+    for _ in 0..skipped_cells {
+        text.push(' ');
     }
     text
 }
