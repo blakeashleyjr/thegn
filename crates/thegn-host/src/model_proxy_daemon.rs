@@ -821,6 +821,54 @@ fn wait_for_proxy_exit(old_cfg: &ModelProxyConfig) -> bool {
     reap_spawned_child() || matches!(probe(old_cfg), ProbeState::Down)
 }
 
+/// What a config reload does about the running proxy (THE-180).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestartPreflight {
+    /// Stop the old proxy and start the new config.
+    Proceed,
+    /// The new config cannot start; keep the old proxy running. Carries the reason.
+    KeepOld(String),
+}
+
+/// Decides, BEFORE the old proxy is stopped, whether a reloaded config can start.
+/// Only a changed listen address is probed: an unchanged one is held by the old
+/// proxy itself. `Down` and `Owned` proceed; anything else keeps the old proxy.
+fn restart_preflight(
+    old: &ModelProxyConfig,
+    desired: &ModelProxyConfig,
+    probe_new: impl FnOnce(SocketAddr) -> ProbeState,
+) -> RestartPreflight {
+    let new_addr = listen_addr(desired);
+    if new_addr == listen_addr(old) {
+        return RestartPreflight::Proceed;
+    }
+    match probe_new(new_addr) {
+        ProbeState::Down | ProbeState::Owned => RestartPreflight::Proceed,
+        ProbeState::Foreign(reason) => RestartPreflight::KeepOld(format!(
+            "the new listen address {} is held by a non-thegn or unauthenticated listener ({reason})",
+            desired.listen
+        )),
+        ProbeState::Incompatible(version) => RestartPreflight::KeepOld(format!(
+            "the new listen address {} is held by incompatible tgproxy protocol {version}",
+            desired.listen
+        )),
+        ProbeState::LocalError(reason) => {
+            RestartPreflight::KeepOld(format!("cannot load model-proxy secret: {reason}"))
+        }
+    }
+}
+
+/// The live wrapper: reads the host secret only when the listen address changed.
+fn restart_preflight_live(old: &ModelProxyConfig, desired: &ModelProxyConfig) -> RestartPreflight {
+    if listen_addr(old) == listen_addr(desired) {
+        return RestartPreflight::Proceed;
+    }
+    match host_secret() {
+        Ok(secret) => restart_preflight(old, desired, |addr| probe_with(addr, &secret)),
+        Err(error) => RestartPreflight::KeepOld(format!("cannot load model-proxy secret: {error}")),
+    }
+}
+
 fn supervisor_wait(step: SupervisorStep, failures: u32) -> Option<Duration> {
     if step == SupervisorStep::Idle {
         None
@@ -858,6 +906,15 @@ pub fn spawn_supervisor(cfg: &Config) {
                 let (seen, desired) = DESIRED.snapshot();
                 let desired = desired.unwrap_or_default();
                 let step = supervisor_step(&desired, applied.as_ref());
+                let held: Option<String> = match (step, applied.as_ref()) {
+                    (SupervisorStep::Restart, Some(old)) => {
+                        match restart_preflight_live(old, &desired) {
+                            RestartPreflight::KeepOld(reason) => Some(reason),
+                            RestartPreflight::Proceed => None,
+                        }
+                    }
+                    _ => None,
+                };
                 match step {
                     SupervisorStep::Stop => {
                         match stop(&desired) {
@@ -875,6 +932,36 @@ pub fn spawn_supervisor(cfg: &Config) {
                         }
                         applied = None;
                         failures = 0;
+                    }
+                    SupervisorStep::Restart if held.is_some() => {
+                        failures = failures.saturating_add(1);
+                        if failures == 1
+                            && let Some(reason) = held.as_deref()
+                        {
+                            tracing::warn!(
+                                target: "thegn::proxy",
+                                %reason,
+                                "reloaded model-proxy config cannot start; keeping the running proxy"
+                            );
+                        }
+                        if let Some(old) = applied.as_ref() {
+                            match ensure_running(old) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        target: "thegn::proxy",
+                                        "last good model proxy is not ready while a reload is held"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::debug!(
+                                        target: "thegn::proxy",
+                                        %error,
+                                        "could not keep the last good model proxy running"
+                                    );
+                                }
+                            }
+                        }
                     }
                     SupervisorStep::Restart => {
                         let old = applied.as_ref().expect("Restart has an applied config");
@@ -1394,6 +1481,134 @@ mod tests {
             supervisor_step(&ModelProxyConfig::default(), None),
             SupervisorStep::Idle
         );
+    }
+
+    #[test]
+    fn restart_preflight_keeps_the_old_proxy_when_the_new_listen_is_foreign() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 512];
+            let count = stream.read(&mut request).unwrap();
+            assert!(count > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let old = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let desired = ModelProxyConfig {
+            enabled: true,
+            listen: addr.to_string(),
+            ..Default::default()
+        };
+
+        let result = restart_preflight(&old, &desired, |addr| {
+            probe_with(addr, b"preflight-test-secret")
+        });
+
+        match result {
+            RestartPreflight::KeepOld(reason) => {
+                assert!(reason.contains("non-thegn"), "unexpected reason: {reason}");
+                assert!(
+                    reason.contains(&desired.listen),
+                    "unexpected reason: {reason}"
+                );
+            }
+            RestartPreflight::Proceed => panic!("foreign listener must keep the old proxy"),
+        }
+        server.join().expect("foreign listener thread");
+    }
+
+    #[test]
+    fn restart_preflight_proceeds_when_the_listen_is_unchanged() {
+        let old = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let desired = old.clone();
+
+        assert_eq!(
+            restart_preflight(&old, &desired, |_| {
+                panic!("an unchanged listen address must not be probed")
+            }),
+            RestartPreflight::Proceed
+        );
+    }
+
+    #[test]
+    fn restart_preflight_proceeds_when_the_new_listen_is_free_or_already_owned() {
+        let old = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let desired = ModelProxyConfig {
+            enabled: true,
+            listen: "127.0.0.1:47999".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            restart_preflight(&old, &desired, |_| ProbeState::Down),
+            RestartPreflight::Proceed
+        );
+        assert_eq!(
+            restart_preflight(&old, &desired, |_| ProbeState::Owned),
+            RestartPreflight::Proceed
+        );
+    }
+
+    #[test]
+    fn restart_preflight_keeps_the_old_proxy_on_an_incompatible_listener_or_a_secret_error() {
+        let old = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let desired = ModelProxyConfig {
+            enabled: true,
+            listen: "127.0.0.1:47999".into(),
+            ..Default::default()
+        };
+
+        let incompatible = restart_preflight(&old, &desired, |_| ProbeState::Incompatible(9));
+        assert!(matches!(
+            incompatible,
+            RestartPreflight::KeepOld(reason) if reason.contains("incompatible tgproxy protocol 9")
+        ));
+
+        let local_error = restart_preflight(&old, &desired, |_| {
+            ProbeState::LocalError("no secret".into())
+        });
+        assert!(matches!(
+            local_error,
+            RestartPreflight::KeepOld(reason) if reason.contains("cannot load model-proxy secret")
+        ));
+    }
+
+    #[test]
+    fn restart_preflight_probes_only_the_new_address() {
+        let old = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let desired = ModelProxyConfig {
+            enabled: true,
+            listen: "127.0.0.1:47999".into(),
+            ..Default::default()
+        };
+        let mut seen = None;
+
+        let result = restart_preflight(&old, &desired, |addr| {
+            seen = Some(addr);
+            ProbeState::Down
+        });
+
+        assert_eq!(result, RestartPreflight::Proceed);
+        assert_eq!(seen, Some(listen_addr(&desired)));
+        assert_ne!(seen, Some(listen_addr(&old)));
     }
 
     #[test]
