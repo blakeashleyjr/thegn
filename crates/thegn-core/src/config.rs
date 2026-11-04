@@ -3608,7 +3608,7 @@ pub use crate::config_weather::{WeatherConfig, WeatherProviderKind, WeatherUnits
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AppsConfig {
-    /// Tab focused on startup. Valid ids come from `BUILTIN_TABS`.
+    /// Tab focused on startup: a built-in id or `plugin:<plugin>:<contribution>`.
     #[schemars(with = "AppTabId")]
     pub default_tab: String,
     /// Order for `work` and enabled apps. Enabled but unlisted apps are appended; duplicates are ignored.
@@ -3642,9 +3642,9 @@ impl AppsConfig {
         let mut errors = Vec::new();
         let known = Self::BUILTIN_TABS.join(", ");
         let default = self.default_tab.trim();
-        if !Self::BUILTIN_TABS.contains(&default) {
+        if !Self::BUILTIN_TABS.contains(&default) && !Self::is_plugin_tab_id(default) {
             errors.push(format!(
-                "unknown app tab {:?}; known tabs are {known}",
+                "unknown app tab {:?}; known tabs are {known} or plugin:<plugin>:<contribution>",
                 default
             ));
         } else if default == "observe" && !observe_enabled {
@@ -3655,15 +3655,17 @@ impl AppsConfig {
         }
         for (index, id) in self.tab_order.iter().enumerate() {
             let id = id.trim();
-            if !Self::BUILTIN_TABS.contains(&id) {
+            if !Self::BUILTIN_TABS.contains(&id) && !Self::is_plugin_tab_id(id) {
                 errors.push(format!(
-                    "apps.tab_order[{index}]: unknown app tab {id:?}; known tabs are {known}"
+                    "apps.tab_order[{index}]: unknown app tab {id:?}; known tabs are {known} or plugin:<plugin>:<contribution>"
                 ));
             }
         }
         errors
     }
 
+    /// Orders only built-in tabs. Plugin ids are resolved by the host after
+    /// plugin discovery completes.
     pub fn effective_tab_order(&self, observe_enabled: bool) -> Vec<String> {
         let mut out = Vec::new();
         for id in &self.tab_order {
@@ -3688,6 +3690,24 @@ impl AppsConfig {
         out
     }
 
+    /// Whether `id` is a syntactically valid namespaced plugin contribution id.
+    pub fn is_plugin_tab_id(id: &str) -> bool {
+        let mut parts = id.split(':');
+        let (Some("plugin"), Some(plugin), Some(contribution), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        [plugin, contribution].iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
+    }
+
+    /// Resolves the default among built-in tabs only. Plugin ids are resolved
+    /// by the host after plugin discovery completes.
     pub fn normalized_default_tab(&self, observe_enabled: bool) -> String {
         let default = self.default_tab.trim();
         let order = self.effective_tab_order(observe_enabled);
@@ -3699,7 +3719,7 @@ impl AppsConfig {
     }
 }
 
-/// Schema-only enum for the ids retained as strings by the public config API.
+/// Schema-only built-in enum and plugin-id pattern for public string ids.
 struct AppTabId;
 
 impl schemars::JsonSchema for AppTabId {
@@ -3717,7 +3737,22 @@ impl schemars::JsonSchema for AppTabId {
     fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
         schemars::schema::Schema::Object(schemars::schema::SchemaObject {
             instance_type: Some(schemars::schema::InstanceType::String.into()),
-            enum_values: Some(vec!["work".into(), "observe".into()]),
+            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                any_of: Some(vec![
+                    schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+                        enum_values: Some(vec!["work".into(), "observe".into()]),
+                        ..Default::default()
+                    }),
+                    schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+                        string: Some(Box::new(schemars::schema::StringValidation {
+                            pattern: Some("^plugin:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$".into()),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                ]),
+                ..Default::default()
+            })),
             ..Default::default()
         })
     }

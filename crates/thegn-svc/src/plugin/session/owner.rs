@@ -324,7 +324,10 @@ async fn running(
                 Ok(0) => return CloseReason::WriteFailed,
                 Ok(len) => if let Some((bytes, offset, _)) = &mut active {
                     *offset += len;
-                    if *offset == bytes.len() { active = None; }
+                    if *offset == bytes.len() {
+                        shared.written(bytes.len());
+                        active = None;
+                    }
                 },
                 Err(error) => { process.errors.push(format!("stdin write: {error}")); return CloseReason::WriteFailed; }
             },

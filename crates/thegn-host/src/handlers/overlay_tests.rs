@@ -8,7 +8,7 @@ use crate::session::{Session, WorktreeGroup};
 struct TestTile;
 
 impl tg_kit::AppTile for TestTile {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "test"
     }
 

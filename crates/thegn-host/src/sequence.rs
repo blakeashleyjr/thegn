@@ -61,8 +61,24 @@ pub struct SequenceMatcher {
 }
 
 impl SequenceMatcher {
+    pub(crate) fn filtered(&self, keep: impl Fn(&[Key], &Action) -> bool) -> Self {
+        Self {
+            sequences: self
+                .sequences
+                .iter()
+                .filter(|(keys, action)| keep(keys, action))
+                .cloned()
+                .collect(),
+            current: Vec::new(),
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn entries(&self) -> &[(Vec<Key>, Action)] {
+        &self.sequences
     }
 
     pub fn add_sequence(&mut self, sequence: Vec<Key>, action: Action) {

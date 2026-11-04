@@ -519,7 +519,7 @@ mod tests {
     struct SpyTile(Arc<AtomicUsize>);
 
     impl AppTile for SpyTile {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "spy"
         }
         fn title(&self) -> String {

@@ -485,6 +485,7 @@ mod repo_scope_tests {
                 scopes: vec![thegn_core::control::Scope::Exec],
                 mode: PluginMode::Resident,
                 enabled,
+                background: false,
                 trusted_native: false,
             },
             dir: None,

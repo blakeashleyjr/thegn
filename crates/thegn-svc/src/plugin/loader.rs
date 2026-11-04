@@ -678,6 +678,7 @@ mod tests {
             scopes: Vec::new(),
             mode: Default::default(),
             enabled: true,
+            background: false,
             trusted_native: false,
         }
     }
