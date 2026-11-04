@@ -957,6 +957,260 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertEqual("${{ env.IMAGE }}", step["with"]["subject-name"])
             self.assertIs(step["with"]["push-to-registry"], True)
 
+    def _sandbox_cas_stubs(self, temporary_path: Path) -> tuple[Path, dict[str, str]]:
+        stub_dir = temporary_path / "bin"
+        stub_dir.mkdir()
+        scratch_dir = temporary_path / "scratch"
+        scratch_dir.mkdir()
+        (stub_dir / "skopeo").write_text(
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            '  *"docker://$IMAGE@$LIST_DIGEST"*) cat "$STUB_PUSHED";;\n'
+            '  *"docker://$IMAGE:$TAG"*)\n'
+            '    if [ "${STUB_INSPECT_ERROR:-0}" = 1 ]; then\n'
+            '      echo "unauthorized: authentication required" >&2; exit 1\n'
+            '    elif [ -f "$STUB_TAG" ]; then cat "$STUB_TAG"\n'
+            '    else echo "manifest unknown" >&2; exit 1; fi;;\n'
+            '  *) echo "unexpected skopeo request: $*" >&2; exit 2;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        (stub_dir / "skopeo").chmod(0o755)
+        (stub_dir / "podman").write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = login ]; then cat >/dev/null; exit 0; fi\n'
+            'if [ "$1" = manifest ] && [ "$2" = create ]; then exit 0; fi\n'
+            'if [ "$1" = manifest ] && [ "$2" = push ]; then\n'
+            '  while [ "$#" -gt 0 ]; do\n'
+            '    if [ "$1" = --digestfile ]; then digest_file="$2"; shift 2; else shift; fi\n'
+            "  done\n"
+            '  printf "push\\n" >> "$STUB_LOG"\n'
+            '  printf "pushed-list" > "$STUB_PUSHED"\n'
+            '  cp "$STUB_PUSHED" "$STUB_TAG"\n'
+            '  digest="sha256:$(sha256sum "$STUB_PUSHED" | cut -d \' \' -f1)"\n'
+            '  printf "%s\\n" "$digest" > "$digest_file"\n'
+            '  exit 0\n'
+            "fi\n"
+            'echo "unexpected podman request: $*" >&2; exit 2\n',
+            encoding="utf-8",
+        )
+        (stub_dir / "podman").chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{stub_dir}{os.pathsep}{environment.get('PATH', '')}",
+                "IMAGE": "img",
+                "TAG": "v1",
+                "HOME": str(temporary_path),
+                "TMPDIR": str(scratch_dir),
+                "GITHUB_OUTPUT": str(temporary_path / "github-output"),
+                "REGISTRY_TOKEN": "x",
+                "ACTOR": "a",
+                "AMD64_DIGEST": "sha256:" + "1" * 64,
+                "ARM64_DIGEST": "sha256:" + "2" * 64,
+                "STUB_TAG": str(temporary_path / "tag"),
+                "STUB_PUSHED": str(temporary_path / "pushed"),
+                "STUB_LOG": str(temporary_path / "calls.log"),
+                "STUB_INSPECT_ERROR": "0",
+            }
+        )
+        (temporary_path / "github-output").write_text("", encoding="utf-8")
+        (temporary_path / "calls.log").write_text("", encoding="utf-8")
+        return stub_dir, environment
+
+    def test_sandbox_image_records_the_destination_tag_first(self) -> None:
+        steps = read_workflow("sandbox-image.yml")["jobs"]["manifest"]["steps"]
+        prior_index = next(
+            index for index, step in enumerate(steps) if step.get("id") == "prior"
+        )
+        arch_index = next(
+            index for index, step in enumerate(steps) if step.get("id") == "arch"
+        )
+        push_index = next(
+            index for index, step in enumerate(steps) if step.get("id") == "push"
+        )
+        download_indexes = [
+            index for index, step in enumerate(steps)
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        prior = steps[prior_index]
+        push = steps[push_index]
+        self.assertGreater(prior_index, max(download_indexes))
+        self.assertLess(prior_index, arch_index)
+        self.assertEqual("${{ needs.admit.outputs.tag }}", prior["env"]["TAG"])
+        self.assertIn("skopeo inspect --raw", prior["run"])
+        self.assertIn('"docker://$IMAGE:$TAG"', prior["run"])
+        self.assertEqual("${{ steps.prior.outputs.digest }}", push["env"]["PRIOR_DIGEST"])
+        self.assertLess(
+            push["run"].index('"$now" != "$PRIOR_DIGEST"'),
+            push["run"].index("podman manifest push"),
+        )
+
+    def test_sandbox_image_destination_tag_cas_rehearsal(self) -> None:
+        if shutil.which("bash") is None or shutil.which("sha256sum") is None:
+            self.skipTest("bash and sha256sum are required for the sandbox image CAS rehearsal")
+        steps = read_workflow("sandbox-image.yml")["jobs"]["manifest"]["steps"]
+        prior_script = next(step["run"] for step in steps if step.get("id") == "prior")
+        push_script = next(step["run"] for step in steps if step.get("id") == "push")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            _, base_environment = self._sandbox_cas_stubs(temporary_path)
+
+            def run(
+                script: str, changes: dict[str, str] | None = None
+            ) -> subprocess.CompletedProcess[str]:
+                environment = base_environment.copy()
+                if changes:
+                    environment.update(changes)
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=temporary_path,
+                )
+                leftovers = list((temporary_path / "scratch").iterdir())
+                self.assertEqual(
+                    [], leftovers,
+                    f"sandbox tag inspection left temporary files: {leftovers}; {details(result)}",
+                )
+                return result
+
+            def details(result: subprocess.CompletedProcess[str]) -> str:
+                return f"returncode={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
+
+            def record_prior(tag_bytes: bytes | None) -> str:
+                tag_path = temporary_path / "tag"
+                if tag_bytes is None:
+                    tag_path.unlink(missing_ok=True)
+                else:
+                    tag_path.write_bytes(tag_bytes)
+                output_path = temporary_path / "github-output"
+                output_path.write_text("", encoding="utf-8")
+                result = run(prior_script)
+                self.assertEqual(0, result.returncode, details(result))
+                output = output_path.read_text(encoding="utf-8")
+                return next(
+                    line.removeprefix("digest=")
+                    for line in output.splitlines()
+                    if line.startswith("digest=")
+                )
+
+            def run_push(prior_digest: str) -> subprocess.CompletedProcess[str]:
+                return run(push_script, {"PRIOR_DIGEST": prior_digest})
+
+            # Unknown tags are recorded as absent, then the real push step publishes once.
+            (temporary_path / "calls.log").write_text("", encoding="utf-8")
+            prior_digest = record_prior(None)
+            unknown = run_push(prior_digest)
+            message = details(unknown)
+            self.assertEqual("absent", prior_digest, message)
+            self.assertEqual(0, unknown.returncode, message)
+            calls = (temporary_path / "calls.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(["push"], calls, message)
+
+            # An unchanged existing tag is accepted and the publisher advances it.
+            (temporary_path / "calls.log").write_text("", encoding="utf-8")
+            prior_digest = record_prior(b"old-list")
+            unchanged = run_push(prior_digest)
+            message = details(unchanged)
+            self.assertEqual(
+                "sha256:" + hashlib.sha256(b"old-list").hexdigest(), prior_digest, message
+            )
+            self.assertEqual(0, unchanged.returncode, message)
+            calls = (temporary_path / "calls.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(["push"], calls, message)
+
+            # A writer moves the tag after the snapshot; the CAS check must stop before push.
+            (temporary_path / "calls.log").write_text("", encoding="utf-8")
+            prior_digest = record_prior(b"old-list")
+            (temporary_path / "tag").write_bytes(b"someone-else")
+            moved = run_push(prior_digest)
+            message = details(moved)
+            self.assertNotEqual(0, moved.returncode, message)
+            self.assertIn("moved during this run", moved.stdout + moved.stderr, message)
+            self.assertIn(prior_digest, moved.stdout + moved.stderr, message)
+            moved_digest = "sha256:" + hashlib.sha256(b"someone-else").hexdigest()
+            self.assertIn(moved_digest, moved.stdout + moved.stderr, message)
+            calls = (temporary_path / "calls.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual([], calls, message)
+            self.assertEqual(b"someone-else", (temporary_path / "tag").read_bytes(), message)
+
+            # An authorization failure is not mistaken for an absent tag.
+            (temporary_path / "github-output").write_text("", encoding="utf-8")
+            denied = run(prior_script, {"STUB_INSPECT_ERROR": "1"})
+            message = details(denied)
+            self.assertNotEqual(0, denied.returncode, message)
+            self.assertIn("unauthorized: authentication required", denied.stderr, message)
+            output = (temporary_path / "github-output").read_text(encoding="utf-8")
+            self.assertNotIn("digest=", output, message)
+
+    def test_sandbox_image_tag_read_back_after_push(self) -> None:
+        if shutil.which("bash") is None or shutil.which("sha256sum") is None:
+            self.skipTest("bash and sha256sum are required for the sandbox image read-back rehearsal")
+        steps = read_workflow("sandbox-image.yml")["jobs"]["manifest"]["steps"]
+        verify = next(step for step in steps if step.get("id") == "verify")
+        verify_script = verify["run"]
+        amd64_digest = "sha256:" + "1" * 64
+        arm64_digest = "sha256:" + "2" * 64
+        manifest_bytes = json.dumps(
+            {
+                "manifests": [
+                    {"digest": amd64_digest, "platform": {"architecture": "amd64"}},
+                    {"digest": arm64_digest, "platform": {"architecture": "arm64"}},
+                ]
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        list_digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            _, environment = self._sandbox_cas_stubs(temporary_path)
+            (temporary_path / "pushed").write_bytes(manifest_bytes)
+            (temporary_path / "tag").write_bytes(manifest_bytes)
+            environment.update(
+                {
+                    "AMD64_DIGEST": amd64_digest,
+                    "ARM64_DIGEST": arm64_digest,
+                    "LIST_DIGEST": list_digest,
+                }
+            )
+            good = subprocess.run(
+                ["bash", "-c", verify_script],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=temporary_path,
+            )
+            good_message = f"returncode={good.returncode}\nstdout={good.stdout}\nstderr={good.stderr}"
+            self.assertEqual(0, good.returncode, good_message)
+
+            (temporary_path / "tag").write_bytes(b"other-list")
+            overwritten = subprocess.run(
+                ["bash", "-c", verify_script],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=temporary_path,
+            )
+            overwritten_message = (
+                f"returncode={overwritten.returncode}\nstdout={overwritten.stdout}\nstderr={overwritten.stderr}"
+            )
+            self.assertNotEqual(0, overwritten.returncode, overwritten_message)
+            self.assertIn(
+                "overwritten concurrently",
+                overwritten.stdout + overwritten.stderr,
+                overwritten_message,
+            )
+            self.assertIn(list_digest, overwritten.stdout + overwritten.stderr, overwritten_message)
+            tag_digest = "sha256:" + hashlib.sha256(b"other-list").hexdigest()
+            self.assertIn(tag_digest, overwritten.stdout + overwritten.stderr, overwritten_message)
+
     def test_release_build_enables_the_iroh_feature(self) -> None:
         steps = read_workflow("release.yml")["jobs"]["build"]["steps"]
         action = next(
