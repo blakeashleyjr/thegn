@@ -1180,7 +1180,7 @@ done
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+                thread.join().expect("drain fixture thread panicked");
             }
         }
     }
