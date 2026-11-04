@@ -1228,20 +1228,25 @@ impl KeyMap {
         {
             return None;
         }
-        let mut matcher = self.modes.get(&mode)?.clone();
-        matcher.reset();
-        match matcher.feed(key.clone()) {
-            MatchResult::Matched(
-                action @ (Action::Quit
-                | Action::Detach
-                | Action::QuitKill
-                | Action::OpenPalette
-                | Action::Help
-                | Action::PluginAppDrafts
-                | Action::PluginAppRequests),
-            ) => Some(action),
-            _ => None,
-        }
+        self.modes
+            .get(&mode)?
+            .entries()
+            .iter()
+            .find_map(|(keys, action)| {
+                (keys.len() == 1
+                    && keys[0] == *key
+                    && matches!(
+                        action,
+                        Action::Quit
+                            | Action::Detach
+                            | Action::QuitKill
+                            | Action::OpenPalette
+                            | Action::Help
+                            | Action::PluginAppDrafts
+                            | Action::PluginAppRequests
+                    ))
+                .then(|| action.clone())
+            })
     }
 
     pub(crate) fn dispatch_app(&mut self, mode: Mode, key: Key) -> MatchResult {
@@ -3276,5 +3281,17 @@ mod app_keys_tests {
             map.dispatch_app(Mode::Normal, Key::char('g')),
             MatchResult::None
         );
+    }
+
+    #[test]
+    fn unmatched_keys_are_not_claimed_by_app_action_catch_all() {
+        let mut map = KeyMap::new();
+        for key in [Key::char('a'), Key::char(' '), Key::ctrl('z')] {
+            assert_eq!(
+                map.dispatch_app(Mode::Normal, key),
+                MatchResult::None,
+                "unmatched input must continue to the focused app"
+            );
+        }
     }
 }

@@ -19209,7 +19209,7 @@ async fn event_loop<T: Terminal>(
                                 &mut app_host,
                                 &mut keymap,
                                 mode,
-                                crate::sequence::Key::modified(k.key.clone(), k.modifiers),
+                                crate::sequence::Key::modified(k.key, k.modifiers),
                             )
                         {
                             forced_palette_action = Some(action);
@@ -19217,14 +19217,14 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
-                    } else if !app_host.active_is_plugin() {
-                        if let crate::apps::ActiveApp::Tile(_) = app_host.active {
-                            if let Some(ev) = crate::apps::input::to_kit(&k.key, k.modifiers) {
-                                app_host.handle_active_input(ev);
-                            }
-                            dirty = true;
-                            continue;
+                    } else if !app_host.active_is_plugin()
+                        && let crate::apps::ActiveApp::Tile(_) = app_host.active
+                    {
+                        if let Some(ev) = crate::apps::input::to_kit(&k.key, k.modifiers) {
+                            app_host.handle_active_input(ev);
                         }
+                        dirty = true;
+                        continue;
                     }
                 }
                 // Seed for the Search & Replace surface when escalated from the

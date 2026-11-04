@@ -13,7 +13,7 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
     let widgets = ui.widgets();
     let focused = widgets.get(ui.focus).map(|w| w.id());
     if ui.view.is_none() {
-        Paragraph::new("Waiting for plugin…").render(ui.area, buf);
+        Paragraph::new(format!("Waiting for plugin{}", ui.glyphs.ellipsis)).render(ui.area, buf);
         return;
     }
     for w in &widgets {
@@ -219,7 +219,7 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
                         state.scroll,
                         &Line::styled(
                             if state.pending {
-                                "Saving… (typing is preserved)".into()
+                                format!("Saving{} (typing is preserved)", ui.glyphs.ellipsis)
                             } else {
                                 format!("Ctrl+Enter: {submit} | Tab: next | Esc: cancel")
                             },
@@ -245,7 +245,7 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
                 let progress = match (current, total) {
                     (Some(c), Some(t)) => format!("{label}: {c}/{t}"),
                     (Some(c), None) => format!("{label}: {c}"),
-                    _ => format!("{label}…"),
+                    _ => format!("{label}{}", ui.glyphs.ellipsis),
                 };
                 lines.push(Line::styled(progress, ui.theme.fg(Tok::Accent)));
                 for r in rows(w, selection) {
@@ -285,7 +285,7 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
                             format!(
                                 "{}{}",
                                 if selection.is_some_and(|s| s.column == i) {
-                                    "▾"
+                                    ui.glyphs.caret_open
                                 } else {
                                     " "
                                 },
@@ -306,7 +306,7 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
                 }
                 for (i, r) in rows.iter().enumerate().skip(start).take(available) {
                     let marker = if selection.is_some_and(|s| s.marked.contains(&r.id)) {
-                        "✓"
+                        ui.glyphs.check
                     } else if i == selected {
                         ">"
                     } else {
@@ -315,15 +315,15 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
                     let tree = if let Widget::Tree { items, .. } = w {
                         if items.iter().any(|i| i.parent.as_deref() == Some(&r.id)) {
                             if selection.is_some_and(|s| s.expanded.contains(&r.id)) {
-                                "▾ "
+                                format!("{} ", ui.glyphs.caret_open)
                             } else {
-                                "▸ "
+                                format!("{} ", ui.glyphs.caret_closed)
                             }
                         } else {
-                            "  "
+                            String::from("  ")
                         }
                     } else {
-                        ""
+                        String::new()
                     };
                     let text = if let Widget::Table { columns, rows, .. } = w {
                         let cells = rows
@@ -407,7 +407,10 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
     {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Choose · type to search · Esc closes")
+            .title(format!(
+                "Choose {} type to search {} Esc closes",
+                ui.glyphs.middot, ui.glyphs.middot
+            ))
             .border_style(ui.theme.fg(Tok::Accent));
         let inner = block.inner(area);
         clear(area, buf);
@@ -468,7 +471,12 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(
-                "Draft recovery · ←/→: records · ↑/↓: scroll · Ctrl+Delete: discard · Esc: close",
+                format!(
+                    "Draft recovery {} </{}: records {} {}/{}: scroll {} Ctrl+Delete: discard {} Esc: close",
+                    ui.glyphs.middot, ui.glyphs.arrow_right, ui.glyphs.middot,
+                    ui.glyphs.arrow_up, ui.glyphs.arrow_down, ui.glyphs.middot,
+                    ui.glyphs.middot,
+                ),
             )
             .border_style(ui.theme.fg(Tok::Amber));
         let inner = block.inner(area);
@@ -478,9 +486,12 @@ pub(super) fn paint(ui: &UiEngine, buf: &mut Buffer) {
         if let Some((scope, widget, instance)) = records.get(ui.recovery_index) {
             lines.push(Line::styled(
                 format!(
-                    "Record {}/{} · scope: {scope} · form: {widget} · instance: {instance}",
+                    "Record {}/{} {} scope: {scope} {} form: {widget} {} instance: {instance}",
                     ui.recovery_index + 1,
-                    records.len()
+                    records.len(),
+                    ui.glyphs.middot,
+                    ui.glyphs.middot,
+                    ui.glyphs.middot,
                 ),
                 ui.theme.fg(Tok::Amber),
             ));

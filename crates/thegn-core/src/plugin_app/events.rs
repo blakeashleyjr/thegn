@@ -174,7 +174,10 @@ impl AppEventParams {
             || self.session.chars().any(char::is_control)
             || self.state_scope.len() > 256
             || self.state_scope.chars().any(char::is_control)
-            || self.focus_ticket.as_ref().is_some_and(|s| s.len() > 256)
+            || self
+                .focus_ticket
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 256 || s.chars().any(char::is_control))
         {
             return Err("invalid event envelope".into());
         }

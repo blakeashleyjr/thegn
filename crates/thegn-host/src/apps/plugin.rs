@@ -570,12 +570,12 @@ impl AppTile for PluginTile {
                 .shared
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let mut deliveries = state.deliveries.drain(..).collect::<Vec<_>>();
+            let mut deliveries = std::mem::take(&mut state.deliveries);
             if deliveries.is_empty()
                 && (state.epoch != self.epoch || self.ui.view().is_none())
                 && let Some(view) = &state.view
             {
-                deliveries.push(Delivery::View(view.clone()));
+                deliveries.push_back(Delivery::View(view.clone()));
             }
             state.delivery_bytes = 0;
             (
@@ -763,6 +763,7 @@ impl AppTile for PluginTile {
         outcome.result
     }
     fn render(&mut self, _area: Rect, buffer: &mut Buffer) {
+        self.ui.set_glyphs(crate::caps::active_glyphs());
         self.ui.paint(buffer);
         if self.recovery_open {
             let state = self
