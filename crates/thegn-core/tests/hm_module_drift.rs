@@ -55,7 +55,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("toolchain", "toolchain policy is not exposed"),
     ("limits", "resource limits are not exposed"),
     ("disk", "disk and cache policy is not exposed"),
-    ("loc", "lines-of-code display is not exposed"),
     ("activity", "activity detection is not exposed"),
     ("drawer", "drawer behavior is not exposed"),
     ("notifications", "notifications are not exposed"),
@@ -71,7 +70,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("autopilot", "autopilot policy is not exposed"),
     ("pipeline", "pipeline definitions are not exposed"),
     ("skills", "skill configuration is not exposed"),
-    ("replay", "pane replay is not exposed"),
     ("recording", "session recording is not exposed"),
     ("media", "media controls are not exposed"),
     ("voice", "voice input is not exposed"),
@@ -559,6 +557,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
         "palette",
         "session",
         "clipboard",
+        "loc",
+        "replay",
         "monitor",
         "pr",
         "watch",
@@ -794,6 +794,29 @@ fn hm_session_and_clipboard_families_are_fully_rendered() {
     }
 }
 
+#[test]
+fn hm_loc_and_replay_families_are_fully_rendered() {
+    let rendered = rendered_paths(&module_src());
+    for table in ["loc", "replay"] {
+        let schema = schema_field(table);
+        let properties = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        let mut missing: Vec<String> = properties
+            .keys()
+            .filter_map(|key| {
+                let path = format!("{table}.{key}");
+                (!rendered.contains(&path)).then_some(path)
+            })
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "Home Manager must render every {table} scalar; missing: {missing:?}"
+        );
+    }
+}
+
 /// Every `config_enum!` in the schema: its accepted spellings (canonical +
 /// aliases), keyed by definition name.
 fn schema_enums() -> Vec<(String, BTreeSet<String>)> {
@@ -917,6 +940,17 @@ fn every_numeric_option_matches_its_destination_range() {
         ("sessionResidentPoolLimit", "session.resident_pool_limit"),
         ("clipboardMaxImageBytes", "clipboard.max_image_bytes"),
         ("clipboardKeepHours", "clipboard.keep_hours"),
+        ("locScanIntervalSecs", "loc.scan_interval_secs"),
+        ("locMaxScanPerRound", "loc.max_scan_per_round"),
+        ("locWatchInvalidateSecs", "loc.watch_invalidate_secs"),
+        ("replayMaxBytesPerPane", "replay.max_bytes_per_pane"),
+        ("replayMaxDurationSecs", "replay.max_duration_secs"),
+        ("replayKeyframeIntervalMs", "replay.keyframe_interval_ms"),
+        (
+            "replayKeyframeIntervalBytes",
+            "replay.keyframe_interval_bytes",
+        ),
+        ("replayIdleThresholdMs", "replay.idle_threshold_ms"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
