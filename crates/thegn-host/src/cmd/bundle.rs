@@ -440,4 +440,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
+
+    #[test]
+    fn bundle_config_masks_share_secrets() {
+        let cfg = Config {
+            share: thegn_core::config::ShareConfig {
+                bore: thegn_core::config::BoreConfig {
+                    secret: "tg-b84-bundle-bore-canary".into(),
+                    ..Default::default()
+                },
+                frp: thegn_core::config::FrpConfig {
+                    token: "tg-b84-bundle-frp-canary".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = redacted_config_toml(&cfg);
+
+        assert!(!out.starts_with("# (config serialization failed"));
+        assert!(!out.contains("tg-b84-bundle-bore-canary"));
+        assert!(!out.contains("tg-b84-bundle-frp-canary"));
+        let v: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            v["share"]["bore"]["secret"].as_str(),
+            Some("***redacted***")
+        );
+        assert_eq!(v["share"]["frp"]["token"].as_str(), Some("***redacted***"));
+    }
 }
