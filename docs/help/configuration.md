@@ -398,8 +398,23 @@ thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook
 thegn keys hints --zone sidebar   # what that zone's hint strip renders
 ```
 
-For GitLab CI, the `thegn doctor` probe reports whether a configured
-`[ci.gitlab]` token resolved, without printing the token value.
+For GitLab CI, the `thegn doctor` probe reports the credential mode of the
+`[ci.gitlab]` token without printing its value, and what each mode does for a
+local worktree and for an SSH or provider worktree:
+
+- CLI-managed (no token, or the default `env:GITLAB_TOKEN` is unset): a local
+  worktree uses the local `glab auth login`; an SSH or provider worktree
+  uses the remote host's own glab login.
+- `env:GITLAB_TOKEN` (the shipped default, set): the token is passed to the
+  local glab; an SSH or provider worktree
+  uses the remote host's own glab login.
+- A configured token that resolved: passed to the local glab; for an SSH or
+  provider worktree it is refused, never forwarded.
+- A configured token that cannot be resolved: every GitLab call is refused.
+
+On an SSH or provider worktree thegn pins glab to the origin's host with
+`--hostname`, and only `glab api` calls run there. A token is never placed in
+an argument list.
 
 `thegn config show`, `get` and `explain` mask secret-named values and calendar
 account URLs, usernames, environment values and command arguments after the
