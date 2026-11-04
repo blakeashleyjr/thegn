@@ -114,6 +114,18 @@ separate audit-file config is advertised.
 - **THEN** an audit event records the ref name, the backend that answered,
   `provider:fly` as consumer, and success — and contains no token bytes
 
+#### Scenario: A calendar token is brokered and listed value-free
+
+- **WHEN** a remote calendar account (`ics_url` or `caldav`) configures `token`
+  as a `keyring:`, `env:` or `file:` ref or as a bare literal
+- **THEN** the token resolves through the broker under consumer
+  `calendar:<account>`, emitting one value-free audit event; a configured ref
+  that cannot be resolved sends no request; `thegn secret list` and
+  `thegn secret audit` show the field as
+  `calendar.accounts[<account>].token` with its backend and presence only; and
+  `thegn secret migrate` moves a literal token into the broker and rewrites the
+  field exactly once
+
 ### Requirement: Managed SSH keys are scoped and rotatable
 
 thegn-managed SSH keys SHALL support per-provider-account scoping
