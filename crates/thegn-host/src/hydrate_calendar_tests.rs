@@ -1843,6 +1843,55 @@ fn calendar_token_reload_rebinds_audit_events_to_their_own_accounts() {
 }
 
 #[test]
+fn calendar_env_token_resolves_through_the_host_broker_with_its_own_audit_event() {
+    thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
+
+    let sentinel = "cal-env-sentinel-3d90";
+    let _env = thegn_core::testenv::EnvGuard::mutate_pairs(&[
+        ("TG_B86_CAL_ENV_TOKEN", Some(sentinel)),
+        ("TG_B86_CAL_ENV_UNSET", None),
+    ]);
+    let cfg = calendar_audit_config("env:TG_B86_CAL_ENV_TOKEN", "env:TG_B86_CAL_ENV_UNSET");
+    let (capture, subscriber) = calendar_audit_subscriber();
+
+    tracing::subscriber::with_default(subscriber, || {
+        drop(thegn_svc::calendar::CalendarRouter::from_config(&cfg));
+    });
+
+    let log = String::from_utf8(
+        capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .unwrap();
+    let lines = calendar_audit_lines(&log);
+    let alpha: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consumer=calendar:alpha"))
+        .collect();
+    let beta: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consumer=calendar:beta"))
+        .collect();
+    assert_eq!(alpha.len(), 1, "capture: {log}");
+    assert!(alpha[0].contains("backend=\"env\""), "capture: {log}");
+    assert!(alpha[0].contains("outcome=\"resolved\""), "capture: {log}");
+    assert!(
+        alpha[0].contains("env:TG_B86_CAL_ENV_TOKEN"),
+        "capture: {log}"
+    );
+    assert!(!beta.is_empty(), "capture: {log}");
+    assert!(
+        beta.iter().all(|line| {
+            line.contains("outcome=\"missing\"") && !line.contains("outcome=\"resolved\"")
+        }),
+        "capture: {log}"
+    );
+    assert!(!log.contains(sentinel), "capture: {log}");
+}
+
+#[test]
 fn zoned_weekly_occurrence_is_one_materialization_for_cache_month_and_reminders() {
     let t = TmpDb::new("zoned-weekly-occurrence");
     let zone = TzRef::new("America/New_York");
