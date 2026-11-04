@@ -298,7 +298,7 @@ pub enum Action {
     MediaSelectPlaylist,
     /// Open the picker to choose which player to control.
     MediaSelectPlayer,
-    /// Toggle command-backed voice capture for the focused pane.
+    /// Toggle voice dictation for the focused pane.
     VoiceToggle,
     /// Cancel voice capture or an in-flight transcription.
     VoiceCancel,

@@ -5430,7 +5430,7 @@ pub struct Config {
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
-    /// `[voice]` — opt-in experimental command-backed speech-to-text. No audio
+    /// `[voice]` — opt-in experimental command, embedded, or HTTP dictation. No audio
     /// worker or child process exists while this is disabled.
     pub voice: VoiceConfig,
     /// `[usage]` — the AI-account usage tracker overlay (`open-usage`). Opt-in,

@@ -1,0 +1,7 @@
+final-only: exactly one authoritative full-recording HTTP request
+live: serialized preview requests and authoritative final replacement
+stop: capture closes and final completes within its own deadline
+cancel/parent EOF: no final, HTTP request, or surviving worker
+worker crash: bounded isolated process teardown
+command adapter: bounded PCM16/mono/16 kHz WAV returned to parent
+preflight/disabled: missing model fails before capture; disabled refuses work
