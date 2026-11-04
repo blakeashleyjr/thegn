@@ -253,6 +253,8 @@ fn ingest_tip_with_expected(
 fn generation_ref(branch_loc: &GitLoc, branch: &str) -> Result<String> {
     let row = row_key(branch_loc, branch);
     let field = generation_field(current_ingest_claim_generation());
+    // A 32-bit nonce makes a same-row, same-generation collision about 1 in 4 billion
+    // while a prior ref is still live; the generation field separates different claims.
     let mut nonce = [0_u8; 4];
     getrandom::fill(&mut nonce).context("mint merge-queue ingest generation")?;
     Ok(format!(
@@ -305,6 +307,8 @@ fn prune_refs(target: &GitLoc, branch_loc: &GitLoc, branch: &str) -> Result<()> 
         if let Some(mine) = mine
             && ref_generation_field(&ref_name, &prefix).is_some_and(|theirs| theirs > mine)
         {
+            // A claim-generation reset can leave a higher-generation ref behind; a scoped
+            // drain preserves it, and the orphan sweep reaps it only after the row is gone.
             tracing::debug!(ref_name = %ref_name, "kept the merge-queue ingest ref of a newer claim generation");
             continue;
         }
@@ -1654,6 +1658,8 @@ mod tests {
         );
 
         drop(late);
+        // IngestRef::drop deletes by ref name and OID; both refs share this OID, so only
+        // `late.ref_name` disappears and the newer ref remains.
         assert_eq!(list_refs(&fixture.target), vec![newer.ref_name.clone()]);
         drop(newer);
         assert!(list_refs(&fixture.target).is_empty());
