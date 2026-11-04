@@ -5,6 +5,7 @@ members = [
   "crates/thegn-svc",
   "crates/thegn-metrics",
   "crates/thegn-media",
+  "crates/thegn-voice",
   "crates/thegn-proc",
   "crates/thegn-host",
   "crates/thegn-proxy",

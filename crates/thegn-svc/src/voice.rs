@@ -60,7 +60,11 @@ impl Probe for CommandVoiceProvider {
     fn probe(&self) -> ProbeReport {
         let capture = Self::availability(&self.cfg.capture_command, "capture command");
         let transcriber = Self::availability(&self.cfg.command, "transcriber command");
-        let availability = if capture.is_ready() && transcriber.is_ready() {
+        let availability = if self.cfg.capture_command.is_empty() && transcriber.is_ready() {
+            Availability::Degraded(
+                "native capture selected; verify host native build status".into(),
+            )
+        } else if capture.is_ready() && transcriber.is_ready() {
             Availability::Ready
         } else {
             let mut missing = Vec::new();
@@ -73,19 +77,33 @@ impl Probe for CommandVoiceProvider {
             Availability::Unavailable(missing.join("; "))
         };
         ProbeReport::new("voice", "command", availability)
-            .with_caps(&VoiceCaps::default())
-            .note("argv-only external capture and transcription; no bundled STT/audio")
+            .with_caps(&VoiceCaps {
+                cancellation: true,
+                ..VoiceCaps::default()
+            })
+            .note("argv-only command adapter; no bundled STT in this adapter; optional native capture in host builds")
     }
 }
 
 impl VoiceProvider for CommandVoiceProvider {
     fn caps(&self) -> VoiceCaps {
-        VoiceCaps::default()
+        VoiceCaps {
+            cancellation: true,
+            ..VoiceCaps::default()
+        }
     }
 
     fn transcribe_push_to_talk(&self, wav: &[u8]) -> Result<String, VoiceError> {
         let never_cancel = AtomicBool::new(false);
         self.transcribe_push_to_talk_cancellable(wav, &never_cancel)
+    }
+
+    fn transcribe_cancellable(
+        &self,
+        wav: &[u8],
+        cancelled: &AtomicBool,
+    ) -> Result<String, VoiceError> {
+        self.transcribe_push_to_talk_cancellable(wav, cancelled)
     }
 }
 
@@ -130,7 +148,7 @@ impl CommandVoiceProvider {
         }
         // Start the deadline before process setup/write so stdin cannot extend
         // the configured bound.
-        let deadline = Instant::now() + self.cfg.max_duration();
+        let deadline = Instant::now() + self.cfg.request_timeout();
         let mut command = Command::new(&argv[0]);
         crate::plugin::proc::set_process_group(&mut command);
         let mut child = command
@@ -544,6 +562,7 @@ mod tests {
     fn timeout_terminates_a_transcriber_that_never_reads_stdin() {
         let mut config = cfg(&["sh", "-c", "sleep 30"]);
         config.max_seconds = 1;
+        config.timeout_seconds = 1;
         let provider = CommandVoiceProvider::new(config);
         let start = Instant::now();
         let err = provider

@@ -17,6 +17,7 @@ fn every_configured_top_level_variant_parses_without_static_authority() {
         }};
     }
     case!(Command::Pr { .. }, ["pr", "status"]);
+    case!(Command::Voice { .. }, ["voice", "status"]);
     case!(Command::Issue { .. }, ["issue", "list"]);
     case!(Command::Kaneo { .. }, ["kaneo", "status"]);
     case!(Command::Dispatch { .. }, ["dispatch", "list"]);
