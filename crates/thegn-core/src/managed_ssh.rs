@@ -994,13 +994,10 @@ mod tests {
         let input = record();
         let mut value = serde_json::to_value(&input).unwrap();
         value.as_object_mut().unwrap().remove("generation");
-        let path = record_path(
-            temp.path(),
-            &input.provider,
-            &input.account,
-            &input.instance,
-        );
-        crate::fsperm::write_owner_only_atomic(&path, &serde_json::to_vec(&value).unwrap())
+        let name = record_file_name(&input.provider, &input.account, &input.instance);
+        crate::fsperm::open_private_dir(temp.path())
+            .unwrap()
+            .write_owner_only_atomic(&name, &serde_json::to_vec(&value).unwrap())
             .unwrap();
         let snapshot = read_at(
             temp.path(),
@@ -1336,19 +1333,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         crate::fsperm::restrict_dir_to_owner(temp.path()).unwrap();
         let existing = record();
-        let legacy = legacy_record_path(
-            temp.path(),
-            &existing.provider,
-            &existing.account,
-            &existing.instance,
-        );
+        let legacy_name =
+            legacy_file_name(&existing.provider, &existing.account, &existing.instance);
+        let legacy = temp.path().join(&legacy_name);
         let canonical = record_path(
             temp.path(),
             &existing.provider,
             &existing.account,
             &existing.instance,
         );
-        crate::fsperm::write_owner_only_atomic(&legacy, &serde_json::to_vec(&existing).unwrap())
+        crate::fsperm::open_private_dir(temp.path())
+            .unwrap()
+            .write_owner_only_atomic(&legacy_name, &serde_json::to_vec(&existing).unwrap())
             .unwrap();
 
         assert_eq!(
@@ -2141,8 +2137,11 @@ mod tests {
         let row = record();
         let mut body = serde_json::to_vec(&row).unwrap();
         body.extend(std::iter::repeat_n(b' ', MAX_CUSTODY_ROW_BYTES as usize));
-        let path = record_path(temp.path(), &row.provider, &row.account, &row.instance);
-        crate::fsperm::write_owner_only_atomic(&path, &body).unwrap();
+        let name = record_file_name(&row.provider, &row.account, &row.instance);
+        crate::fsperm::open_private_dir(temp.path())
+            .unwrap()
+            .write_owner_only_atomic(&name, &body)
+            .unwrap();
 
         let error = read_at(temp.path(), &row.provider, &row.account, &row.instance).unwrap_err();
         assert!(format!("{error:#}").contains("exceeds"));
