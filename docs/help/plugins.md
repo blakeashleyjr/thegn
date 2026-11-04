@@ -167,8 +167,8 @@ combinations fail `plugin check` with an actionable reason.
 A resident API 0.4 plugin can contribute an `AppTab` with a `surface` and the
 `surface:app` capability. The tab id is `plugin:<plugin>:<contribution>` and
 can be selected with `[apps] default_tab` or ordered with `tab_order`. App tabs
-are available on the dev channel only (`THEGN_CHANNEL=dev`; see
-[[release-channels]]).
+are available on both stable and dev channels. An app-tab plugin is resident
+third-party code; `background:sync` requires `trusted_native = true`.
 
 Inside a plugin app, your configured quit, detach, palette, and help chords
 remain available, as do the Alt tab-switch chords. Other input goes to the app.

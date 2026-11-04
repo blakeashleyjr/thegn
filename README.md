@@ -467,7 +467,6 @@ subsystems is compiled in but **clamped off** outside the dev channel:
 - remote worktrees over SSH and named environments over SSH or managed
   providers,
 - cloud execution providers and the managed pool,
-- the Observe dashboards,
 - the placement engine,
 - voice mode.
 
