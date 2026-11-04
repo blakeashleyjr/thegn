@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+const TEMP_PREFIX: &str = ".thegn-voice-model-";
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct Model {
     pub name: &'static str,
@@ -68,10 +69,31 @@ pub fn resolve(cfg: &thegn_core::config::VoiceConfig) -> Result<PathBuf> {
     path_in(&store_dir(), &cfg.model)
 }
 pub fn verify(path: &Path, artifact: &Model, cancel: &AtomicBool) -> Result<()> {
-    let mut file = std::fs::File::open(path)?;
-    if file.metadata()?.len() != artifact.bytes {
+    verify_with(path, artifact, cancel, || hash_file(path, cancel))
+}
+
+fn verify_with(
+    path: &Path,
+    artifact: &Model,
+    cancel: &AtomicBool,
+    hash: impl FnOnce() -> Result<String>,
+) -> Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() != artifact.bytes {
         bail!("model size mismatch; retry voice model pull");
     }
+    if read_marker(path).is_some_and(|marker| marker_matches(&marker, &metadata, artifact)) {
+        return Ok(());
+    }
+    if hash()? != artifact.sha256 {
+        bail!("model SHA-256 mismatch; retry voice model pull");
+    }
+    write_marker(path, artifact, &metadata)?;
+    Ok(())
+}
+
+fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
     let mut hash = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -84,8 +106,79 @@ pub fn verify(path: &Path, artifact: &Model, cancel: &AtomicBool) -> Result<()> 
         }
         hash.update(&buf[..n]);
     }
-    if format!("{:x}", hash.finalize()) != artifact.sha256 {
-        bail!("model SHA-256 mismatch; retry voice model pull");
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VerifiedMarker {
+    bytes: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    sha256: String,
+}
+
+fn marker_path(path: &Path) -> PathBuf {
+    path.with_extension("verified.json")
+}
+
+fn marker_metadata(metadata: &std::fs::Metadata) -> Option<(u64, u32)> {
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((modified.as_secs(), modified.subsec_nanos()))
+}
+
+fn read_marker(path: &Path) -> Option<VerifiedMarker> {
+    serde_json::from_slice(&std::fs::read(marker_path(path)).ok()?).ok()
+}
+
+fn marker_matches(marker: &VerifiedMarker, metadata: &std::fs::Metadata, artifact: &Model) -> bool {
+    marker_metadata(metadata).is_some_and(|(secs, nanos)| {
+        marker.bytes == metadata.len()
+            && marker.modified_secs == secs
+            && marker.modified_nanos == nanos
+            && marker.sha256 == artifact.sha256
+    })
+}
+
+fn write_marker(path: &Path, artifact: &Model, metadata: &std::fs::Metadata) -> Result<()> {
+    let Some((modified_secs, modified_nanos)) = marker_metadata(metadata) else {
+        bail!("model modification time unavailable");
+    };
+    let marker = VerifiedMarker {
+        bytes: metadata.len(),
+        modified_secs,
+        modified_nanos,
+        sha256: artifact.sha256.into(),
+    };
+    let parent = path.parent().context("model path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(parent)?;
+    serde_json::to_writer(&mut temp, &marker)?;
+    temp.as_file().sync_all()?;
+    temp.persist(marker_path(path))
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Remove abandoned downloads owned by this store before a new pull or rm.
+pub fn sweep_temps(dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX)
+            && entry.file_type()?.is_file()
+        {
+            std::fs::remove_file(entry.path())?;
+        }
     }
     Ok(())
 }
@@ -98,7 +191,9 @@ pub fn install(
     mut progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)?;
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0;
     loop {
@@ -116,10 +211,15 @@ pub fn install(
         temp.write_all(&buf[..n])?;
         progress(total, artifact.bytes);
     }
-    verify(temp.path(), artifact, cancel)?;
+    if temp.as_file().metadata()?.len() != artifact.bytes
+        || hash_file(temp.path(), cancel)? != artifact.sha256
+    {
+        bail!("model verification failed; retry voice model pull");
+    }
     temp.as_file().sync_all()?;
     let path = dir.join(format!("ggml-{}.bin", artifact.name));
     temp.persist(&path).map_err(|e| e.error)?;
+    write_marker(&path, artifact, &std::fs::metadata(&path)?)?;
     Ok(path)
 }
 
@@ -131,7 +231,10 @@ pub fn pull(
     mut progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    sweep_temps(dir)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)?;
     crate::voice_runtime::run(async {
         let operation = async {
             let client = reqwest::Client::builder()
@@ -168,15 +271,23 @@ pub fn pull(
             }
             tokio::select! {
                 result = &mut operation => return result,
-                _ = tokio::signal::ctrl_c() => bail!("model download cancelled"),
+                _ = tokio::signal::ctrl_c() => {
+                    cancel.store(true, Ordering::Release);
+                    bail!("model download cancelled")
+                },
                 _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
             }
         }
     })??;
-    verify(temp.path(), artifact, cancel)?;
+    if temp.as_file().metadata()?.len() != artifact.bytes
+        || hash_file(temp.path(), cancel)? != artifact.sha256
+    {
+        bail!("model verification failed; retry voice model pull");
+    }
     temp.as_file().sync_all()?;
     let path = path_in(dir, artifact.name)?;
     temp.persist(&path).map_err(|e| e.error)?;
+    write_marker(&path, artifact, &std::fs::metadata(&path)?)?;
     Ok(path)
 }
 #[cfg(test)]
@@ -198,7 +309,7 @@ mod tests {
         }
         cancelled.store(true, Ordering::Release);
         assert!(install(dir.path(), &m, &b"abc"[..], &cancelled, |_, _| {}).is_err());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
     #[test]
     fn catalog_rejects_path_traversal() {
@@ -224,12 +335,71 @@ mod tests {
             bytes: 3,
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         };
+        let model_path = install(dir.path(), &m, &b"abc"[..], &cancelled, |_, _| {}).unwrap();
         assert!(install(dir.path(), &m, Interrupted(false), &cancelled, |_, _| {}).is_err());
+        assert_eq!(std::fs::read(&model_path).unwrap(), b"abc");
         assert!(
             install(dir.path(), &m, &b"abc"[..], &cancelled, |_, _| cancelled
                 .store(true, Ordering::Release))
             .is_err()
         );
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&model_path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn unchanged_models_skip_hash_and_changed_models_are_reverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = Model {
+            name: "fixture",
+            bytes: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        let path = install(
+            dir.path(),
+            &artifact,
+            &b"abc"[..],
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        let hashes = std::cell::Cell::new(0);
+        verify_with(&path, &artifact, &AtomicBool::new(false), || {
+            hashes.set(hashes.get() + 1);
+            Ok(artifact.sha256.into())
+        })
+        .unwrap();
+        assert_eq!(hashes.get(), 0, "unchanged marker must skip SHA-256");
+        let metadata = std::fs::metadata(&path).unwrap();
+        let (modified_secs, modified_nanos) = marker_metadata(&metadata).unwrap();
+        let stale_marker = VerifiedMarker {
+            bytes: metadata.len(),
+            modified_secs: modified_secs.saturating_add(1),
+            modified_nanos,
+            sha256: artifact.sha256.into(),
+        };
+        std::fs::write(
+            marker_path(&path),
+            serde_json::to_vec(&stale_marker).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&path, b"xyz").unwrap();
+        let result = verify_with(&path, &artifact, &AtomicBool::new(false), || {
+            hashes.set(hashes.get() + 1);
+            Ok("bad".into())
+        });
+        assert!(result.is_err(), "changed file must be hashed and refused");
+        assert_eq!(hashes.get(), 1);
+    }
+
+    #[test]
+    fn stale_download_temp_files_are_removed_by_pull_preparation_and_rm_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(format!("{TEMP_PREFIX}leftover"));
+        std::fs::write(&stale, b"partial download").unwrap();
+        sweep_temps(dir.path()).unwrap();
+        assert!(
+            !stale.exists(),
+            "next pull sweep removes abandoned temp file"
+        );
     }
 }

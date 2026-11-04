@@ -18,6 +18,20 @@ fn should_insert_held(voice: &VoiceController, pane_id: u32, pane_live: bool) ->
         && voice.has_held_transcript()
 }
 
+fn paste_held(
+    voice: &mut VoiceController,
+    transcript: String,
+    paste: impl FnOnce(&str) -> Result<(), String>,
+) -> String {
+    match paste(&transcript) {
+        Ok(()) => "Voice transcript inserted".into(),
+        Err(error) => {
+            voice.hold_transcript(transcript);
+            format!("Voice transcript not inserted: {error}")
+        }
+    }
+}
+
 /// Toggle capture for the currently focused pane. Returns the status line to
 /// show immediately; the actual command starts only through a reducer effect.
 pub(crate) fn toggle(
@@ -39,13 +53,9 @@ pub(crate) fn toggle(
             voice.hold_transcript(transcript);
             return "Voice transcript not inserted: focused pane unavailable".into();
         };
-        return match crate::run::paste_text_into_pane(pane, &transcript) {
-            Ok(()) => "Voice transcript inserted".into(),
-            Err(error) => {
-                voice.hold_transcript(transcript);
-                format!("Voice transcript not inserted: {error}")
-            }
-        };
+        return paste_held(voice, transcript, |text| {
+            crate::run::paste_text_into_pane(pane, text).map_err(|error| error.to_string())
+        });
     }
     if !voice.config().enabled {
         return "Voice is off; run thegn voice setup (experimental channel required)".into();
@@ -119,7 +129,6 @@ pub(crate) fn drain(
 ) -> bool {
     let mut dirty = false;
     while let Ok(message) = voice.messages().try_recv() {
-        dirty = true;
         if let VoiceMessage::MaxDuration { generation, .. } = &message
             && *generation != voice.capture_generation()
         {
@@ -137,6 +146,12 @@ pub(crate) fn drain(
         {
             continue;
         }
+        if let VoiceMessage::Session { request_id, .. } = &message
+            && *request_id != voice.next_request_id
+        {
+            continue;
+        }
+        dirty = true;
         voice.record_lifecycle_message(&message);
         let event = match message {
             VoiceMessage::Session {
@@ -478,5 +493,97 @@ mod tests {
         // The rendering contract is that an idle voice controller contributes
         // no state or status change; mode-chip decoration is tested beside it.
         assert!(matches!(VoiceState::default(), VoiceState::Idle));
+    }
+
+    #[test]
+    fn paste_failure_keeps_held_text_for_a_successful_retry() {
+        let mut voice = voice();
+        let failed = paste_held(&mut voice, "retry me".into(), |_| Err("closed".into()));
+        assert!(failed.contains("closed"));
+        assert_eq!(voice.take_held_transcript().as_deref(), Some("retry me"));
+        let inserted = paste_held(&mut voice, "retry me".into(), |_| Ok(()));
+        assert_eq!(inserted, "Voice transcript inserted");
+        assert!(!voice.has_held_transcript());
+    }
+
+    #[test]
+    fn empty_final_reports_no_speech_and_stale_session_request_is_dropped() {
+        if !UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) = test_waker();
+        let mut voice = voice();
+        voice.capture_generation = 2;
+        voice.next_request_id = 4;
+        voice.state = VoiceState::Transcribing {
+            pane_id: 1,
+            request_id: 4,
+        };
+        let mut model = FrameModel::default();
+        apply_event(
+            &mut voice,
+            VoiceEvent::TranscriptSucceeded {
+                pane_id: 1,
+                request_id: 4,
+                transcript: String::new(),
+            },
+            &waker,
+            Some(&mut model),
+            None,
+            1,
+        );
+        assert_eq!(model.status, "Voice: no speech detected");
+
+        voice.state = VoiceState::Transcribing {
+            pane_id: 1,
+            request_id: 4,
+        };
+        voice
+            .tx
+            .send(VoiceMessage::Session {
+                pane_id: 1,
+                generation: 2,
+                request_id: 3,
+                event: crate::voice_worker::Event::Final("stale".into()),
+            })
+            .unwrap();
+        voice
+            .tx
+            .send(VoiceMessage::Session {
+                pane_id: 1,
+                generation: 1,
+                request_id: 4,
+                event: crate::voice_worker::Event::Final("old generation".into()),
+            })
+            .unwrap();
+        let (pane_tx, _pane_rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = Panes::new(pane_tx);
+        assert!(!drain(&mut voice, &mut panes, 1, &mut model, &waker));
+        assert!(matches!(
+            voice.state,
+            VoiceState::Transcribing { request_id: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn pane_closure_cancels_recording_session() {
+        if !UNIX {
+            return;
+        }
+        let (waker, _master, _terminal) = test_waker();
+        let mut voice = voice();
+        voice.capture_generation = 1;
+        voice.next_request_id = 1;
+        voice.state = VoiceState::Recording {
+            pane_id: 7,
+            started_at: 0,
+            request_id: 1,
+        };
+        let (pane_tx, _pane_rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = Panes::new(pane_tx);
+        let mut model = FrameModel::default();
+        assert!(drain(&mut voice, &mut panes, 0, &mut model, &waker));
+        assert!(matches!(voice.state, VoiceState::Idle));
+        assert_eq!(model.status, "Voice cancelled: pane closed");
     }
 }

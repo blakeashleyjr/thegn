@@ -53,6 +53,10 @@ rate-limit, timeout, malformed-response, and connection failures are displayed;
 Thegn never switches providers automatically. Provider-specific WebSockets and
 whisper-server native protocols require a command adapter.
 
+When a credential is configured, HTTP endpoints must use `https://` unless the
+host is loopback (`127.0.0.0/8`, `::1`, or `localhost`). Setup and runtime both
+refuse credentialed plain HTTP to other hosts and tell you to use HTTPS.
+
 The existing command configuration remains supported:
 
 ```toml
@@ -70,8 +74,9 @@ transcription reads WAV on stdin and writes UTF-8 text on stdout. Leaving
 produce a final transcript only. External capture may also feed the HTTP
 provider. Inspect configured commands: they may send audio elsewhere.
 
-`thegn voice status --json` and `thegn doctor` report build and configuration
-readiness without opening the microphone. `thegn voice model list --json`,
+`thegn voice status` (or `thegn voice status --json`) and `thegn doctor`
+report build and configuration readiness without opening the microphone.
+`thegn voice model list [--json]`,
 `pull NAME [--yes]`, and `rm NAME` manage pinned artifacts under
 `$XDG_DATA_HOME/thegn/voice/models` (default `~/.local/share/thegn/voice/models`).
 Pull verifies exact size and SHA-256 and installs atomically; Ctrl-C cancels,

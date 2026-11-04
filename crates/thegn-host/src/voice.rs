@@ -843,6 +843,31 @@ fn join_voice_workers(workers: Vec<thread::JoinHandle<()>>) -> bool {
     joined
 }
 
+fn read_worker_event(
+    reader: &mut impl std::io::BufRead,
+) -> Result<Option<crate::voice_worker::Event>, String> {
+    use crate::voice_worker::{Event, read_line};
+    match read_line(reader) {
+        Ok(Some(line)) => serde_json::from_str::<Event>(&line)
+            .map(Some)
+            .map_err(|_| "invalid voice worker event".into()),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn terminal_worker_event(event: &crate::voice_worker::Event) -> Option<Result<(), String>> {
+    match event {
+        crate::voice_worker::Event::Failed(reason) => Some(Err(reason.clone())),
+        crate::voice_worker::Event::Final(_) => Some(Ok(())),
+        _ => None,
+    }
+}
+
+fn worker_eof_before_final() -> String {
+    "voice worker exited without a final transcript".into()
+}
+
 fn kill_capture_child(child: &mut std::process::Child, group: &crate::platform::GroupHandle) {
     group.kill();
     if let Err(kill_error) = child.kill() {
@@ -980,13 +1005,16 @@ fn native_session(
     tx: &Sender<VoiceMessage>,
     waker: &TerminalWaker,
 ) -> Result<(), String> {
-    use crate::voice_worker::{Event, Request, read_line};
+    use crate::voice_worker::{Event, Request};
     use std::io::{BufReader, Write};
     if !cfg!(feature = "voice-native") {
         return Err("native capture is not compiled; use a voice-native/voice-metal build or configure capture_command".into());
     }
     if cancel.load(Ordering::Acquire) {
         return Ok(());
+    }
+    if cfg.kind == thegn_core::config::VoiceKind::Http {
+        cfg.validate_credential_transport()?;
     }
     let token = if cfg.kind == thegn_core::config::VoiceKind::Http {
         resolve_credential(cfg).map_err(|e| e.to_string())?
@@ -1038,11 +1066,10 @@ fn native_session(
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let mut output = BufReader::new(stdout);
                 loop {
-                    let event = match read_line(&mut output) {
-                        Ok(Some(line)) => serde_json::from_str::<Event>(&line)
-                            .map_err(|_| "invalid voice worker event".to_string()),
+                    let event = match read_worker_event(&mut output) {
+                        Ok(Some(event)) => Ok(event),
                         Ok(None) => break,
-                        Err(e) => Err(e.to_string()),
+                        Err(error) => Err(error),
                     };
                     let failed = event.is_err();
                     if event_tx.send(event).is_err() || failed {
@@ -1105,7 +1132,9 @@ fn native_session(
                 })) => {
                     tracing::info!(target: "thegn::voice", request_id, final_pass, decode_ms, audio_end_ms, "dictation timing");
                 }
-                Ok(Ok(Event::Failed(reason))) => break Err(reason),
+                Ok(Ok(event @ Event::Failed(_))) => {
+                    break terminal_worker_event(&event).unwrap_or(Ok(()));
+                }
                 Ok(Ok(event)) => {
                     let final_result = matches!(event, Event::Final(_));
                     send_capture(
@@ -1124,7 +1153,7 @@ fn native_session(
                 }
                 Ok(Err(reason)) => break Err(reason),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break Err("voice worker exited without a final transcript".into());
+                    break Err(worker_eof_before_final());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -1163,6 +1192,30 @@ mod tests {
         let recording = mode_chip(crate::keymap::Mode::Normal, false, true);
         assert!(recording.ends_with(" N"));
         assert!(!recording.is_empty());
+    }
+
+    #[test]
+    fn injected_worker_reader_covers_failed_eof_and_oversize_events() {
+        let mut failed = std::io::Cursor::new(b"{\"Failed\":\"model unavailable\"}\n".to_vec());
+        let event = read_worker_event(&mut failed).unwrap().unwrap();
+        assert!(
+            matches!(terminal_worker_event(&event), Some(Err(reason)) if reason == "model unavailable")
+        );
+
+        let mut eof = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(
+            read_worker_event(&mut eof).unwrap().is_none(),
+            "EOF before Final is observable"
+        );
+        assert!(worker_eof_before_final().contains("without a final transcript"));
+
+        let mut oversized =
+            std::io::Cursor::new(vec![b'x'; crate::voice_worker::MAX_EVENT as usize + 1]);
+        assert!(
+            read_worker_event(&mut oversized)
+                .unwrap_err()
+                .contains("protocol limit")
+        );
     }
 
     #[test]

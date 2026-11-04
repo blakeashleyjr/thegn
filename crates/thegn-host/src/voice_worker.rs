@@ -127,6 +127,8 @@ fn session(request: Request, mut input: impl BufRead + Send + 'static) -> Result
     };
     if cfg.kind == VoiceKind::Http {
         thegn_svc::voice_http::validate_endpoint(&cfg.endpoint)?;
+        cfg.validate_credential_transport()
+            .map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             !cfg.model.is_empty(),
             "HTTP model is missing; run thegn voice setup --kind http"
