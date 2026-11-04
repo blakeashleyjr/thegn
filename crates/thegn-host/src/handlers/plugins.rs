@@ -797,6 +797,9 @@ fn drain_with_responder(
                     send_activate(&entry);
                     let failed_resident_start =
                         entry.plugin.spec.mode == PluginMode::Resident && entry.writer.is_none();
+                    if let Some(dispatcher) = &state.dispatcher {
+                        dispatcher.discard_outcomes_for_plugin(&id);
+                    }
                     state.plugins.insert(id.clone(), entry);
                     if !removed_apps.is_empty() {
                         model.status = format!(
@@ -2115,6 +2118,13 @@ impl Dispatcher {
         )
     }
 
+    fn discard_outcomes_for_plugin(&self, plugin: &str) {
+        self.outcomes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|outcome| outcome.plugin != plugin);
+    }
+
     #[cfg(test)]
     fn disconnected() -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DispatchReq>(DISPATCH_QUEUE_CAPACITY);
@@ -2826,6 +2836,57 @@ mod tests {
                 .unwrap()
                 .take_outcomes()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_call_outcome_from_replaced_entry_does_not_touch_new_runtime() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        state.dispatcher = Some(Dispatcher::disconnected());
+        let (generation, seq) = {
+            let runtime = &mut state.plugins.get_mut("p").unwrap().runtime;
+            runtime.record_host_call_decision(
+                PluginId::new("p"),
+                "sessions.list",
+                AuditDecision::Granted,
+                None,
+            );
+            (runtime.generation(), runtime.last_audit_seq())
+        };
+        state
+            .dispatcher
+            .as_ref()
+            .unwrap()
+            .outcomes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(DispatchOutcome {
+                plugin: "p".into(),
+                audit: (generation, seq),
+                outcome: thegn_core::plugin_api::AuditOutcome::Succeeded,
+            });
+
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::Loaded(vec![loaded_state(seg_spec("p"))]),
+        );
+        let replacement = &mut state.plugins.get_mut("p").unwrap().runtime;
+        replacement.record_host_call_decision(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+        );
+        assert_eq!(replacement.audit_log()[0].outcome, None);
+
+        flush_alerts_with(&mut state, |_| {});
+
+        assert_eq!(
+            state.plugins.get("p").unwrap().runtime.audit_log()[0].outcome,
+            None,
+            "a pending outcome from the replaced runtime must not annotate a reused sequence"
         );
     }
 
