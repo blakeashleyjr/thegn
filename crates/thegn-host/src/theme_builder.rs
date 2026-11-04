@@ -1189,6 +1189,162 @@ mod tests {
         assert_eq!(b.draft.colors.bg0, format!("{original}f"));
     }
 
+    fn themed(name: &str, bg0: &str) -> UserTheme {
+        let cfg = thegn_core::config::Config::default();
+        let mut theme = UserTheme::from_palette(name, &cfg.palette());
+        theme.colors.bg0 = bg0.to_string();
+        theme
+    }
+
+    #[test]
+    fn theme_collision_fixtures_agree_across_catalog_cycle_and_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let builtin_filename = format!(
+            "{}.toml",
+            thegn_core::util::slugify(thegn_core::theme::PRESETS[0])
+        );
+        for (filename, theme) in [
+            ("aurora-borealis.toml", themed("Aurora Borealis", "#123456")),
+            ("night-sky.toml", themed("Night-Sky", "#222222")),
+            ("night_sky.toml", themed("night_sky", "#333333")),
+            ("shared.toml", themed("Shared", "#444444")),
+            ("shared-copy.toml", themed("Shared", "#555555")),
+        ] {
+            std::fs::write(dir.path().join(filename), theme.to_toml().unwrap()).unwrap();
+        }
+        std::fs::write(
+            dir.path().join(builtin_filename),
+            themed(thegn_core::theme::PRESETS[0], "#666666")
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let (users, warnings) = crate::theme_store::scan_dir(dir.path(), None);
+        let fixture_names = ["Night-Sky", "night_sky", "Shared"];
+        let user_names = users
+            .iter()
+            .map(|theme| theme.meta.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            user_names,
+            ["Aurora Borealis"],
+            "unexpected surviving fixture names: {user_names:?}; quarantined names: {fixture_names:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous user theme identity `Shared`")),
+            "missing exact-identity warning for fixture names {fixture_names:?}: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning
+                    .contains("ambiguous normalized user theme identity `night-sky`")),
+            "missing normalized-identity warning for fixture names {fixture_names:?}: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("conflicts with a built-in preset identity")),
+            "missing built-in conflict warning for fixture names {fixture_names:?}: {warnings:?}"
+        );
+
+        let cfg = thegn_core::config::Config::default();
+        let items = catalog(&cfg, &users);
+        let catalog_names = items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items.len(),
+            thegn_core::theme::PRESETS.len() + 1,
+            "unexpected catalog names for quarantined fixture names {fixture_names:?}: {catalog_names:?}"
+        );
+        let non_builtin_names = items
+            .iter()
+            .filter(|item| !item.builtin)
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            non_builtin_names,
+            ["Aurora Borealis".to_string()],
+            "unexpected non-built-in catalog names for quarantined fixture names {fixture_names:?}: {catalog_names:?}"
+        );
+        assert!(
+            fixture_names
+                .iter()
+                .all(|name| !catalog_names.iter().any(|item| item == name)),
+            "quarantined fixture names appeared in catalog: {fixture_names:?}; catalog: {catalog_names:?}"
+        );
+
+        let cycle_names = cycle_catalog(&cfg, &users)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cycle_names, catalog_names,
+            "cycle/catalog name order differs for quarantined fixture names {fixture_names:?}"
+        );
+
+        let resolved = cfg.palette_with_user_themes("Aurora Borealis", &users);
+        let unknown = cfg.palette_with_user_themes("definitely-not-a-theme", &users);
+        assert_ne!(
+            resolved.bg0, unknown.bg0,
+            "valid fixture theme resolved like unknown; quarantined names: {fixture_names:?}"
+        );
+        assert_eq!(
+            resolved.bg0,
+            users[0].palette().unwrap().bg0,
+            "valid fixture theme did not resolve to its own palette; quarantined names: {fixture_names:?}"
+        );
+        for name in fixture_names {
+            assert_eq!(
+                cfg.palette_with_user_themes(name, &users).bg0,
+                unknown.bg0,
+                "quarantined fixture name {name:?} did not resolve like unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_collision_builtin_named_file_never_changes_the_builtin_palette() {
+        let dir = tempfile::tempdir().unwrap();
+        let builtin_name = thegn_core::theme::PRESETS[0];
+        let filename = format!("{}.toml", thegn_core::util::slugify(builtin_name));
+        std::fs::write(
+            dir.path().join(filename),
+            themed(builtin_name, "#666666").to_toml().unwrap(),
+        )
+        .unwrap();
+        let colliding_theme =
+            UserTheme::from_toml(&themed(builtin_name, "#666666").to_toml().unwrap()).unwrap();
+
+        let (users, warnings) = crate::theme_store::scan_dir(dir.path(), None);
+        assert!(
+            users.is_empty(),
+            "built-in collision fixture survived with names {:?}; warnings: {warnings:?}",
+            users
+                .iter()
+                .map(|theme| theme.meta.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let cfg = thegn_core::config::Config::default();
+        assert_eq!(
+            cfg.palette_with_user_themes(builtin_name, &[colliding_theme])
+                .bg0,
+            cfg.palette_with_preset(builtin_name).bg0,
+            "built-in palette changed for collision fixture {builtin_name:?}"
+        );
+        let items = catalog(&cfg, &users);
+        assert_eq!(items[0].name, builtin_name);
+        assert!(
+            items[0].builtin,
+            "first catalog fixture {builtin_name:?} was not marked built-in"
+        );
+    }
+
     impl ThemeBuilder {
         fn input_value_for_test(&self) -> Option<&str> {
             self.input.as_ref().map(|(_, value)| value.as_str())
