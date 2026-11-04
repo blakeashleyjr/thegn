@@ -359,4 +359,59 @@ mod tests {
             Some(("Music", line.into()))
         );
     }
+
+    #[test]
+    fn decode_budget_oversized_record_admits_within_the_state_ceiling() {
+        use crate::budget::{MAX_STATE_BYTES, state_bytes};
+        use crate::model::MAX_FIELD_BYTES;
+
+        let big = "a".repeat(MAX_FIELD_BYTES * 3);
+        let record = encoded_record([
+            big.as_str(),
+            "playing",
+            big.as_str(),
+            big.as_str(),
+            big.as_str(),
+            "248.0",
+            "12.5",
+            "true",
+            "off",
+            "80",
+        ]);
+        let parsed = parse_line(&record).expect("an oversized record still decodes");
+        assert_eq!(parsed.title.len(), MAX_FIELD_BYTES * 3);
+
+        let admitted = parsed.admitted();
+        assert_eq!(admitted.player.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.title.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.artist.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.album.len(), MAX_FIELD_BYTES);
+        assert!(state_bytes(&admitted) <= MAX_STATE_BYTES);
+    }
+
+    #[test]
+    fn decode_budget_multibyte_record_is_clipped_on_a_char_boundary() {
+        use crate::budget::{MAX_STATE_BYTES, state_bytes};
+        use crate::model::MAX_FIELD_BYTES;
+
+        let big = "\u{e9}".repeat(MAX_FIELD_BYTES);
+        let record = encoded_record([
+            "p",
+            "playing",
+            big.as_str(),
+            big.as_str(),
+            big.as_str(),
+            "248.0",
+            "12.5",
+            "true",
+            "off",
+            "80",
+        ]);
+        let parsed = parse_line(&record).expect("a multibyte record still decodes");
+        let admitted = parsed.admitted();
+
+        assert_eq!(admitted.title.len(), MAX_FIELD_BYTES);
+        assert!(admitted.title.chars().all(|ch| ch == '\u{e9}'));
+        assert!(state_bytes(&admitted) <= MAX_STATE_BYTES);
+    }
 }
