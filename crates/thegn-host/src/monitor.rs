@@ -19,9 +19,10 @@
 //! # Live, but not a wake source
 //!
 //! [`MonitorOverlay::refresh`] rides the loop's existing stats drain, so an open
-//! monitor adds no timer and no thread. Pausing freezes the *view* only: the
-//! history rings keep filling underneath, so resuming shows a continuous
-//! timeline rather than a gap, and no snapshot is ever cloned.
+//! monitor adds no timer or wake source to the loop. The deep sampler thread
+//! exists only while the monitor is open and parks while paused or covered.
+//! Pausing freezes the *view* only: masthead history keeps filling underneath,
+//! so resuming shows a continuous timeline rather than a gap.
 
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::Surface;
@@ -660,7 +661,7 @@ impl MonitorOverlay {
                 board::ActiveView::Cpu(tabs::cpu::view::CpuView::with_cursor(&self.cpu, self.sel))
             }
             MonitorTab::Gpu if !self.gpu.has_engine_devices() => {
-                board::ActiveView::Legacy(board::LegacyTab)
+                board::ActiveView::SectionStack(board::SectionStackTab)
             }
             MonitorTab::Gpu => board::ActiveView::Gpu(tabs::gpu::view::GpuView(&self.gpu)),
             MonitorTab::Power => {
