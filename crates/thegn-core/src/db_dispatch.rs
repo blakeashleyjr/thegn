@@ -6610,6 +6610,217 @@ mod tests {
         }
     }
 
+    // Each round races two fresh connections to one file DB; no process,
+    // lease, or clock participates, and the barrier is the only start signal.
+    // Retry publication wins by changing Spawning to Running; abandonment
+    // wins by retiring Spawning first, so the status-only retry CAS then misses.
+    #[test]
+    fn interleave_retry_publish_vs_abandon_has_exactly_one_winner() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-R{round}"),
+                &format!("/wt/interleave-r{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+                .unwrap();
+            let before = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let barrier = std::sync::Barrier::new(2);
+
+            let (a, b) = std::thread::scope(|scope| {
+                let a_barrier = &barrier;
+                let b_barrier = &barrier;
+                let a_thread = scope.spawn(move || {
+                    a_barrier.wait();
+                    a_db.compare_and_set_dispatch_retry_run(
+                        id,
+                        AgentDispatchStatus::Spawning,
+                        "retry-session",
+                        "retry.md",
+                    )
+                });
+                let b_thread = scope.spawn(move || {
+                    b_barrier.wait();
+                    b_db.set_dispatch_status_checked(
+                        id,
+                        AgentDispatchStatus::Spawning,
+                        AgentDispatchStatus::Abandoned,
+                        None,
+                    )
+                });
+                (a_thread.join().unwrap(), b_thread.join().unwrap())
+            });
+            let a_won = a.unwrap();
+            let b_won = b.is_ok();
+            assert_ne!(a_won, b_won, "exactly one retry/abandon writer wins");
+            if !b_won {
+                assert!(matches!(
+                    b.unwrap_err().downcast_ref::<DispatchTransitionConflict>(),
+                    Some(DispatchTransitionConflict::Stale {
+                        id: stale_id,
+                        expected: AgentDispatchStatus::Spawning,
+                        actual: AgentDispatchStatus::Running,
+                    }) if *stale_id == id
+                ));
+            }
+
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            let final_run = check_db.dispatch_run_ref(id).unwrap().unwrap();
+            if a_won {
+                assert_eq!(final_row.status, AgentDispatchStatus::Running);
+                assert_eq!(final_row.session_id.as_deref(), Some("retry-session"));
+                assert_eq!(final_row.artifact_path.as_deref(), Some("retry.md"));
+                assert_eq!(final_run.run_gen, before.run_gen + 1);
+            } else {
+                assert_eq!(final_row.status, AgentDispatchStatus::Abandoned);
+                assert_eq!(final_row.session_id, None);
+                assert_eq!(final_run.run_gen, before.run_gen);
+            }
+        }
+    }
+
+    // Each round races two fresh connections to one file DB; no process,
+    // lease, or clock participates, and the barrier is the only start signal.
+    // The park CAS writes WaitingHuman and its note; Done wins by status CAS,
+    // while the run identity and generation remain unchanged in either order.
+    #[test]
+    fn interleave_retry_park_vs_set_status_has_exactly_one_winner() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-R{round}"),
+                &format!("/wt/interleave-r{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
+            a_db.stamp_dispatch_run(id, "park-session", "park.md")
+                .unwrap();
+            let run = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let barrier = std::sync::Barrier::new(2);
+
+            let (a, b) = std::thread::scope(|scope| {
+                let a_barrier = &barrier;
+                let b_barrier = &barrier;
+                let run_for_park = &run;
+                let a_thread = scope.spawn(move || {
+                    a_barrier.wait();
+                    a_db.compare_and_set_dispatch_retry_park_run(
+                        run_for_park,
+                        AgentDispatchStatus::Running,
+                        "transport parked",
+                    )
+                });
+                let b_thread = scope.spawn(move || {
+                    b_barrier.wait();
+                    b_db.set_dispatch_status_checked(
+                        id,
+                        AgentDispatchStatus::Running,
+                        AgentDispatchStatus::Done,
+                        None,
+                    )
+                });
+                (a_thread.join().unwrap(), b_thread.join().unwrap())
+            });
+            let a_won = a.unwrap();
+            let b_won = b.is_ok();
+            assert_ne!(a_won, b_won, "exactly one retry-park/status writer wins");
+            if !b_won {
+                assert!(matches!(
+                    b.unwrap_err().downcast_ref::<DispatchTransitionConflict>(),
+                    Some(DispatchTransitionConflict::Stale {
+                        id: stale_id,
+                        expected: AgentDispatchStatus::Running,
+                        actual: AgentDispatchStatus::WaitingHuman,
+                    }) if *stale_id == id
+                ));
+            }
+
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            let note = check_db
+                .conn()
+                .query_row(
+                    "SELECT note FROM agent_dispatches WHERE id=?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap();
+            if a_won {
+                assert_eq!(final_row.status, AgentDispatchStatus::WaitingHuman);
+                assert_eq!(note, Some("transport parked".to_string()));
+            } else {
+                assert_eq!(final_row.status, AgentDispatchStatus::Done);
+                assert_eq!(note, None);
+            }
+            assert_eq!(check_db.dispatch_run_ref(id).unwrap().unwrap(), run);
+        }
+    }
+
+    // Each round races two fresh connections to one file DB; no process,
+    // lease, or clock participates, and the barrier is the only start signal.
+    // The generation predicate plus the atomic retry_counted_gen update lets
+    // exactly one observation of a run consume its next retry attempt.
+    #[test]
+    fn interleave_duplicate_retry_counts_spend_exactly_one_attempt() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-R{round}"),
+                &format!("/wt/interleave-r{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
+            a_db.stamp_dispatch_run(id, "count-session", "count.md")
+                .unwrap();
+            let run = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let run_b = run.clone();
+            let barrier = std::sync::Barrier::new(2);
+
+            let (a, b) = std::thread::scope(|scope| {
+                let a_barrier = &barrier;
+                let b_barrier = &barrier;
+                let a_run = &run;
+                let a_thread = scope.spawn(move || {
+                    a_barrier.wait();
+                    a_db.count_dispatch_retry_attempt_run(a_run, "transport")
+                });
+                let b_thread = scope.spawn(move || {
+                    b_barrier.wait();
+                    b_db.count_dispatch_retry_attempt_run(&run_b, "transport")
+                });
+                (a_thread.join().unwrap(), b_thread.join().unwrap())
+            });
+            let results = [a.unwrap(), b.unwrap()];
+            assert_eq!(
+                results.iter().filter(|result| **result == Some(1)).count(),
+                1
+            );
+            assert_eq!(results.iter().filter(|result| result.is_none()).count(), 1);
+
+            let check_db = Db::open_at(&path).unwrap();
+            assert_eq!(check_db.dispatch_retry_attempt(id).unwrap(), Some(1));
+        }
+    }
+
     fn rows_in_every_status(db: &Db) -> Vec<(i64, &'static str)> {
         let statuses = [
             AgentDispatchStatus::Queued,
