@@ -2263,6 +2263,35 @@ pub(crate) fn verify_v103_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v104: index daemon rows by scope and heartbeat for bounded startup reads.
+pub(crate) fn migrate_v104(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_daemons_scope_heartbeat ON daemons(scope, heartbeat_at);",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_v104_schema(conn: &Connection) -> Result<()> {
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name='idx_daemons_scope_heartbeat'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table.as_deref() != Some("daemons") {
+        bail!("schema v104 migration did not add idx_daemons_scope_heartbeat to daemons");
+    }
+    let mut stmt = conn.prepare("PRAGMA index_info('idx_daemons_scope_heartbeat')")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().map(String::as_str).collect::<Vec<_>>() != ["scope", "heartbeat_at"] {
+        bail!("schema v104 index must contain only daemons.scope then daemons.heartbeat_at");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3978,7 +4007,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 103);
         let legacy = upgraded.get_ci_log("/wt/v102", "7", "9").unwrap().unwrap();
         assert_eq!(legacy.attempt, None);
         assert_eq!(legacy.redaction_changed, None);
@@ -3994,6 +4022,72 @@ mod tests {
         assert_eq!(stored.redaction_changed, Some(false));
         assert_eq!(upgraded.list_ci_logs("/wt/v102").unwrap().len(), 1);
         super::verify_v103_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v104_adds_the_daemons_scope_heartbeat_index_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v104_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE daemons (daemon_id TEXT PRIMARY KEY, scope TEXT NOT NULL, heartbeat_at INTEGER NOT NULL)",
+        )
+        .unwrap();
+        assert!(super::verify_v104_schema(&conn).is_err());
+        super::migrate_v104(&conn).unwrap();
+        super::migrate_v104(&conn).unwrap();
+        super::verify_v104_schema(&conn).unwrap();
+
+        let wrong = Connection::open_in_memory().unwrap();
+        wrong.execute_batch(
+            "CREATE TABLE daemons (daemon_id TEXT PRIMARY KEY, scope TEXT NOT NULL, heartbeat_at INTEGER NOT NULL);
+             CREATE INDEX idx_daemons_scope_heartbeat ON daemons(heartbeat_at);",
+        )
+        .unwrap();
+        assert!(super::verify_v104_schema(&wrong).is_err());
+    }
+
+    #[test]
+    fn v104_upgrades_a_real_v103_database() {
+        use crate::store::ControlStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v103.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            for (daemon_id, heartbeat_at) in [("older", 5), ("newer", 9)] {
+                db.put_daemon(&crate::store::DaemonRow {
+                    daemon_id: daemon_id.into(),
+                    pid: 1,
+                    scope: "/s".into(),
+                    endpoint: "/run/x.sock".into(),
+                    tcp_addr: None,
+                    control_origin: None,
+                    hostname: "h".into(),
+                    version: "0".into(),
+                    started_at: 1,
+                    heartbeat_at,
+                })
+                .unwrap();
+            }
+            db.conn()
+                .execute_batch("DROP INDEX idx_daemons_scope_heartbeat; PRAGMA user_version=103;")
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 104);
+        assert_eq!(upgraded.daemons().unwrap().len(), 2);
+        assert_eq!(
+            upgraded.daemons_in_scope_newest("/s", 1).unwrap()[0].daemon_id,
+            "newer"
+        );
+        super::verify_v104_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

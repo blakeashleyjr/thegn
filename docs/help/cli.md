@@ -50,7 +50,9 @@ control socket — a newly routed verb is callable with no CLI change.
 For example, `folders.assign` assigns or clears a worktree's repo-local sidebar
 folder (`folder` name, or `clear: true`) through `api call` (Git scope), HTTP,
 gRPC, MCP (`folders_assign`, needs `--scopes git`), or plugin `host.call`.
-`thegn plugin list|check` inspects the configured [[plugins]].
+`thegn plugin list|check` inspects the configured [[plugins]]; `thegn plugin
+preview` renders an app-tab fixture or recorded trace with no plugin process
+(see [[plugins]]).
 
 The `issues.list` capability (`thegn api call issues.list` or HTTP `GET
 /v1/issues`) returns `issues`, `complete` and `incomplete`. A partial or failed
@@ -60,6 +62,8 @@ answer fully, and the call fails only if every configured account fails.
 A GitHub listing or search that exceeds the 100-issue cap with no `limit` is
 reported as a partial account. A full Kaneo project page is also partial unless
 the requested limit was met; rows already seen are kept and `complete` is false.
+Linear and Jira listings and searches show an issue repeated on a later page
+once; repeats do not count toward the requested limit.
 The `issues.get`, `issues.update` and `issues.comment` control API operations
 also accept `account` (HTTP `?account=<name>`) to route an issue to the named
 `[[issues.issue_accounts]]` entry. With `account`, the id must be
@@ -84,6 +88,9 @@ forms "legacy, unverified" (`fingerprint_verified` in `--json`).
 Only one `thegn secret ssh rotate` runs per key at a time; a second is refused
 before changes, and a custody record changed mid-rotation stops further remote
 changes.
+The custody ledger refuses symlinked rows, rows with more than one hard link,
+rows larger than 64 KiB, inventories with more than 1024 rows, and custody
+directories that are not owner-only; the refusal names the problem.
 On the dev channel, provisioning an instance is refused while its managed SSH
 key rotation is unfinished. The message points to `thegn secret ssh rotate`;
 nothing is changed.
@@ -175,6 +182,14 @@ new path. `wt rm` runs `pre_destroy` before teardown, then `git worktree
 remove`, `post_destroy`, and DB cleanup. A failed blocking destroy hook leaves
 the worktree in place and names `--force`; that existing flag is also the
 explicit confirmation and skips the veto. Repo hooks are still warn-only.
+`thegn wt rm <target> --delete-branch` also force-deletes the worktree's branch
+with `git branch -D`, without checking whether it is merged. It refuses with
+the reason if that branch differs from the one recorded at creation, is the
+default branch or is checked out in the main worktree, or Git cannot verify
+those facts or read the live branch; a detached HEAD also refuses.
+
+`wt new` reports an empty base as having no commits yet and reports Git read
+failures as failures to verify the base.
 
 Close keeps a worktree's files and records that you closed it, so automatic
 discovery will not bring it back. Run `thegn wt reopen <path>` to clear that
@@ -274,12 +289,18 @@ bounded window of the cached job log (newest lines, or a window around the
 first failure). It reads the cache first and uses the daemon's blocking provider
 lane for a miss; `ci log` remains a compatibility alias.
 With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
-`truncated`, and `redacted` metadata.
+`truncated`, `redacted`, and `redaction_changed` metadata. The latter is true
+when redaction changed the text, false when no change was found in the text,
+and null for logs cached before schema v103; it does not prove every secret
+shape was recognized.
 `ci logs` reuses a cached log only when it has a recorded head commit; a log
 with an unknown head is printed but not cached. The CI panel's failed-job log
 windows and background log ingestion apply a stricter check: they reuse a
 cached window only for the run's current head and only if the job has not
-finished again since the log was fetched.
+finished again since the log was fetched. For providers with run attempts, such
+as GitHub, these paths reuse a cached log only for the same attempt, so a rerun
+of the same run id fetches the new attempt's log. A pre-v103 cached log has no
+attempt and is not reused when the provider reports one.
 When the current provider context is known, `ci logs` and the control API's
 `ci.logs` fetch again instead of reusing a cached log from another context.
 If the current context is unknown, the cached row is still used. The PR queue

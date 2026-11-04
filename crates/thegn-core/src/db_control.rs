@@ -95,6 +95,12 @@ fn daemon_row(r: &Row<'_>) -> rusqlite::Result<DaemonRow> {
 
 const DAEMON_COLS: &str = "daemon_id, pid, scope, endpoint, tcp_addr, control_origin, hostname, version, started_at, heartbeat_at";
 
+fn newest_in_scope_sql() -> String {
+    format!(
+        "SELECT {DAEMON_COLS} FROM daemons INDEXED BY idx_daemons_scope_heartbeat WHERE scope = ?1 ORDER BY heartbeat_at DESC, rowid DESC LIMIT ?2"
+    )
+}
+
 fn lease_row(r: &Row<'_>) -> rusqlite::Result<LeaseRow> {
     Ok(LeaseRow {
         lease_id: r.get(0)?,
@@ -163,6 +169,15 @@ impl ControlStore for Db {
             "SELECT {DAEMON_COLS} FROM daemons WHERE scope = ?1 ORDER BY started_at"
         ))?;
         let rows = stmt.query_map(params![scope], daemon_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn daemons_in_scope_newest(&self, scope: &str, limit: usize) -> Result<Vec<DaemonRow>> {
+        let mut stmt = self.conn().prepare(&newest_in_scope_sql())?;
+        let rows = stmt.query_map(
+            params![scope, i64::try_from(limit).unwrap_or(i64::MAX)],
+            daemon_row,
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -638,6 +653,55 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].daemon_id, "stale");
         assert_eq!(rows[0].heartbeat_at, 0);
+    }
+
+    #[test]
+    fn daemons_in_scope_newest_is_bounded_and_newest_first() {
+        let db = Db::open_memory().unwrap();
+        db.conn().execute_batch("BEGIN").unwrap();
+        for n in 0..5_000 {
+            db.put_daemon(&daemon(&format!("d{n:05}"), "/mine", 10_000 + n))
+                .unwrap();
+        }
+        for n in 0..1_000 {
+            db.put_daemon(&daemon(&format!("other{n:04}"), "/other", 99_999))
+                .unwrap();
+        }
+        db.conn().execute_batch("COMMIT").unwrap();
+
+        let ids = db
+            .daemons_in_scope_newest("/mine", 3)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.daemon_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["d04999", "d04998", "d04997"]);
+        assert!(db.daemons_in_scope_newest("/mine", 0).unwrap().is_empty());
+        assert!(db.daemons_in_scope_newest("/absent", 3).unwrap().is_empty());
+
+        db.put_daemon(&daemon("t1", "/tie", 50_000)).unwrap();
+        db.put_daemon(&daemon("t2", "/tie", 50_000)).unwrap();
+        let tied = db.daemons_in_scope_newest("/tie", 5).unwrap();
+        assert_eq!(tied[0].daemon_id, "t2");
+        assert_eq!(tied[1].daemon_id, "t1");
+    }
+
+    #[test]
+    fn daemons_in_scope_newest_reads_through_the_scope_heartbeat_index() {
+        let db = Db::open_memory().unwrap();
+        let sql = newest_in_scope_sql();
+        let mut stmt = db
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let details = stmt
+            .query_map(params!["/mine", 5_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(details.contains("idx_daemons_scope_heartbeat"), "{details}");
+        assert!(!details.contains("TEMP B-TREE"), "{details}");
     }
 
     #[test]

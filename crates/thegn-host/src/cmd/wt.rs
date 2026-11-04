@@ -801,6 +801,58 @@ fn folder(target: &str, name: Option<&str>, clear: bool) -> Result<()> {
     Ok(())
 }
 
+/// The result of probing every program member for the feature branch: readable
+/// members with their answer, and members Git could not answer for (repo name,
+/// reason). An unreadable member is a failure of that member, never "branch absent".
+struct MemberProbes {
+    states: Vec<thegn_core::project::MemberBranchState>,
+    unreadable: Vec<(String, String)>,
+}
+
+fn member_branch_states(members: &[(String, String)], branch: &str) -> MemberProbes {
+    let mut probes = MemberProbes {
+        states: Vec::new(),
+        unreadable: Vec::new(),
+    };
+    for (root, repo_name) in members {
+        match worktree::branch_exists_checked(std::path::Path::new(root), branch) {
+            Ok(has_branch) => probes.states.push(thegn_core::project::MemberBranchState {
+                repo_root: root.clone(),
+                repo_name: repo_name.clone(),
+                has_branch,
+            }),
+            Err(reason) => probes.unreadable.push((repo_name.clone(), reason)),
+        }
+    }
+    probes
+}
+
+fn plan_member_probes(
+    branch: &str,
+    probes: &MemberProbes,
+    repos_filter: Option<&[String]>,
+) -> (
+    thegn_core::project::BatchedCreatePlan,
+    Vec<(String, String)>,
+) {
+    let unreadable: Vec<(String, String)> = probes
+        .unreadable
+        .iter()
+        .filter(|(repo, _)| {
+            repos_filter.is_none_or(|filter| filter.iter().any(|name| name == repo))
+        })
+        .cloned()
+        .collect();
+    let mut plan = thegn_core::project::plan_batched_create(branch, &probes.states, repos_filter);
+    plan.unknown_repos.retain(|name| {
+        !probes
+            .unreadable
+            .iter()
+            .any(|(unreadable_repo, _)| unreadable_repo == name)
+    });
+    (plan, unreadable)
+}
+
 /// `wt new --program <p>` — batched cross-repo feature creation. Resolves ONE
 /// linked branch name (prefix + slug, applied once — per-repo prefix overrides
 /// are NOT re-applied, so identity is literal) and creates that exact branch +
@@ -822,7 +874,7 @@ fn new_batched(
     folder: Option<String>,
     json: bool,
 ) -> Result<()> {
-    use thegn_core::project::{self, MemberBranchState, MemberPlan};
+    use thegn_core::project::{self, MemberPlan};
     use thegn_core::store::ProjectStore;
 
     let Some(feature) = name.filter(|n| !n.trim().is_empty()) else {
@@ -868,14 +920,7 @@ fn new_batched(
     // probe each member for it (exact existence) to classify create vs attach.
     let branch = project::feature_branch_name(&feature, &cfg.branch_prefix)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let states: Vec<MemberBranchState> = members
-        .iter()
-        .map(|(root, repo_name)| MemberBranchState {
-            repo_root: root.clone(),
-            repo_name: repo_name.clone(),
-            has_branch: worktree::branch_exists(std::path::Path::new(root), &branch),
-        })
-        .collect();
+    let probes = member_branch_states(&members, &branch);
 
     let repos_filter: Option<Vec<String>> = repos.map(|s| {
         s.split(',')
@@ -883,7 +928,7 @@ fn new_batched(
             .filter(|r| !r.is_empty())
             .collect()
     });
-    let plan = project::plan_batched_create(&branch, &states, repos_filter.as_deref());
+    let (plan, unreadable) = plan_member_probes(&branch, &probes, repos_filter.as_deref());
 
     if let Some(name) = folder.as_deref() {
         preflight_new_folder_name(
@@ -906,7 +951,16 @@ fn new_batched(
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     }
-    let mut outcomes: Vec<MemberOutcome> = Vec::with_capacity(plan.members.len());
+    let mut outcomes: Vec<MemberOutcome> =
+        Vec::with_capacity(plan.members.len() + unreadable.len());
+    for (repo, error) in unreadable {
+        outcomes.push(MemberOutcome {
+            repo,
+            status: "failed",
+            path: None,
+            error: Some(error),
+        });
+    }
     for m in &plan.members {
         match m.plan {
             MemberPlan::Exists => outcomes.push(MemberOutcome {
@@ -2196,5 +2250,119 @@ mod folder_tests {
     #[test]
     fn reopen_parses_the_path_argument() {
         assert!(parse(&["thegn", "wt", "reopen", "/x"]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod member_probe_tests {
+    use super::{member_branch_states, plan_member_probes};
+
+    fn temp_repo(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let repo = parent.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "test@example.invalid"],
+            &["config", "user.name", "test"],
+            &["config", "commit.gpgsign", "false"],
+            &["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            assert!(thegn_core::util::git_ok(&repo, args));
+        }
+        repo
+    }
+
+    #[test]
+    fn member_branch_states_report_an_unreadable_member_instead_of_absent() {
+        let broken = tempfile::tempdir_in("/tmp").unwrap();
+        let members = vec![(
+            broken.path().to_string_lossy().into_owned(),
+            "broken".to_string(),
+        )];
+
+        let probes = member_branch_states(&members, "feat/x");
+
+        assert!(probes.states.is_empty());
+        assert_eq!(probes.unreadable.len(), 1);
+        assert_eq!(probes.unreadable[0].0, "broken");
+        assert!(
+            probes.unreadable[0]
+                .1
+                .contains("could not check branch feat/x")
+        );
+    }
+
+    #[test]
+    fn member_branch_states_classify_present_and_absent_branches() {
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = temp_repo(parent.path(), "repo");
+        let members = vec![(repo.to_string_lossy().into_owned(), "api".to_string())];
+
+        let present = member_branch_states(&members, "main");
+        assert_eq!(present.states.len(), 1);
+        assert!(present.states[0].has_branch);
+        assert!(present.unreadable.is_empty());
+
+        let absent = member_branch_states(&members, "feat/none");
+        assert_eq!(absent.states.len(), 1);
+        assert!(!absent.states[0].has_branch);
+        assert!(absent.unreadable.is_empty());
+    }
+
+    #[test]
+    fn member_branch_states_split_a_mixed_program() {
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = temp_repo(parent.path(), "repo");
+        let broken = parent.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        let members = vec![
+            (repo.to_string_lossy().into_owned(), "api".to_string()),
+            (broken.to_string_lossy().into_owned(), "broken".to_string()),
+        ];
+
+        let probes = member_branch_states(&members, "feat/x");
+
+        assert_eq!(probes.states.len(), 1);
+        assert_eq!(probes.states[0].repo_name, "api");
+        assert_eq!(probes.unreadable.len(), 1);
+        assert_eq!(probes.unreadable[0].0, "broken");
+    }
+
+    #[test]
+    fn plan_member_probes_keeps_selected_unreadable_member_without_calling_it_unknown() {
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let broken = parent.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        let members = vec![(broken.to_string_lossy().into_owned(), "broken".to_string())];
+        let probes = member_branch_states(&members, "feat/x");
+        let filter = vec!["broken".to_string()];
+
+        let (plan, unreadable) = plan_member_probes("feat/x", &probes, Some(&filter));
+
+        assert!(plan.members.is_empty());
+        assert!(plan.unknown_repos.is_empty());
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].0, "broken");
+    }
+
+    #[test]
+    fn plan_member_probes_excludes_unreadable_members_outside_filter() {
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = temp_repo(parent.path(), "api");
+        let broken = parent.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        let members = vec![
+            (repo.to_string_lossy().into_owned(), "api".to_string()),
+            (broken.to_string_lossy().into_owned(), "broken".to_string()),
+        ];
+        let probes = member_branch_states(&members, "feat/x");
+        let filter = vec!["api".to_string()];
+
+        let (plan, unreadable) = plan_member_probes("feat/x", &probes, Some(&filter));
+
+        assert_eq!(plan.members.len(), 1);
+        assert_eq!(plan.members[0].repo_name, "api");
+        assert!(plan.unknown_repos.is_empty());
+        assert!(unreadable.is_empty());
     }
 }
