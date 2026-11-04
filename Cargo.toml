@@ -40,6 +40,8 @@ repository = "https://github.com/blakeashleyjr/thegn"
 rust-version = "1.89"
 
 [workspace.dependencies]
+unicode-segmentation = "1"
+unicode-width = "0.2"
 # --- shared domain/runtime deps ---
 # `unstable-ext` gates `Arg::add`, which is how a value completer (an `ArgExt`)
 # attaches to an argument at `<TAB>` time. It is explicitly unstable and can

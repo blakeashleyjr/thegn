@@ -30,6 +30,24 @@ fn f2_is_not_interpreted_by_the_engine() {
 }
 
 #[test]
+fn ascii_glyph_set_reaches_the_painter() {
+    let mut ui = UiEngine::new(Theme::prism());
+    ui.set_glyphs(thegn_core::termcaps::glyphs(
+        thegn_core::termcaps::UnicodeLevel::Ascii,
+    ));
+    ui.prepare(Rect::new(0, 0, 40, 2));
+    let mut buffer = Buffer::empty(ui.area);
+    ui.paint(&mut buffer);
+    let rendered = buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("Waiting for plugin..."));
+    assert!(!rendered.contains('…'));
+}
+
+#[test]
 fn dirty_refresh_preserves_typing_and_clean_fields_refresh() {
     let mut ui = ui(form("a", "1", "base"));
     ui.input(InputEvent::key(Key::Char('!')));

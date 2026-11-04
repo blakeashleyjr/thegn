@@ -199,3 +199,23 @@ fn event_data_rejects_control_sequences_duplicates_and_oversized_edits() {
         assert!(params.validate().is_err());
     }
 }
+
+#[test]
+fn focus_tickets_reject_empty_controlled_and_oversized_values() {
+    let mut params = AppEventParams {
+        surface: "app.workspace".into(),
+        session: "session".into(),
+        state_scope: "account".into(),
+        revision: 1,
+        focus_ticket: Some(String::new()),
+        event: AppEvent::Focus { focused: true },
+    };
+    assert!(params.validate().is_err(), "empty focus ticket");
+    params.focus_ticket = Some("ticket\u{1b}".into());
+    assert!(
+        params.validate().is_err(),
+        "control character in focus ticket"
+    );
+    params.focus_ticket = Some("t".repeat(257));
+    assert!(params.validate().is_err(), "oversized focus ticket");
+}

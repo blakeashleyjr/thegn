@@ -102,6 +102,7 @@ pub struct UiEngine {
     external_records: usize,
     external_bytes: usize,
     scopes: VecDeque<String>,
+    glyphs: &'static thegn_core::termcaps::GlyphSet,
 }
 impl UiEngine {
     pub fn new(theme: Theme) -> Self {
@@ -124,6 +125,7 @@ impl UiEngine {
             external_records: 0,
             external_bytes: 0,
             scopes: VecDeque::new(),
+            glyphs: thegn_core::termcaps::glyphs(thegn_core::termcaps::UnicodeLevel::Full),
         }
     }
     pub fn view(&self) -> Option<&AppView> {
@@ -132,12 +134,16 @@ impl UiEngine {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
     }
+    pub fn set_glyphs(&mut self, glyphs: &'static thegn_core::termcaps::GlyphSet) {
+        self.glyphs = glyphs;
+    }
     pub fn status_line(&self) -> Option<String> {
         self.message.clone().or_else(|| {
             if self.recovery_count() > 0 {
                 Some(format!(
-                    "{} unsaved drafts · plugin-app-drafts action (F2 by default): inspect recovery",
-                    self.recovery_count()
+                    "{} unsaved drafts {} plugin-app-drafts action (F2 by default): inspect recovery",
+                    self.recovery_count(),
+                    self.glyphs.middot,
                 ))
             } else {
                 self.view.as_ref().map(|v| v.status.clone())

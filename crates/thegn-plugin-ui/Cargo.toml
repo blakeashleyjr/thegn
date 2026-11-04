@@ -14,5 +14,5 @@ thegn-core.workspace = true
 tg-kit.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-unicode-segmentation = "1"
-unicode-width = "0.2"
+unicode-segmentation.workspace = true
+unicode-width.workspace = true

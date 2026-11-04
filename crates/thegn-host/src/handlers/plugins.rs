@@ -1208,6 +1208,12 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
                     "app updates require a resident plugin",
                 ));
             }
+            if entry.session.is_none() {
+                return Err(RpcError::new(
+                    RpcErrorCode::Other,
+                    "app updates require a live resident session",
+                ));
+            }
             let surface = param_str(&msg.params, "surface")
                 .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "missing app surface"))?;
             let Some(contribution) = entry.contributions.iter().find(|contribution| {
@@ -4633,6 +4639,100 @@ pub(crate) mod app_tests {
     }
 
     #[test]
+    fn app_focus_rejects_wrong_surface_session_and_expired_tickets() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let navigation_epoch = state.navigation_epoch;
+        state.plugins.get_mut("p").unwrap().session = Some(7);
+        let app = state.plugins["p"].apps["app"].clone();
+        app.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session = Some(7);
+
+        let cases = [
+            ("wrong surface", "other/app", 7, false),
+            ("wrong session", "p/app", 6, false),
+            ("expired", "p/app", 7, true),
+        ];
+        for (index, (name, surface, session, expired)) in cases.into_iter().enumerate() {
+            let token = format!("7:{name}");
+            state.plugins["p"]
+                .focus_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    token.clone(),
+                    FocusTicket {
+                        surface: surface.into(),
+                        session,
+                        epoch: navigation_epoch,
+                        deadline: if expired {
+                            std::time::Instant::now() - std::time::Duration::from_secs(1)
+                        } else {
+                            std::time::Instant::now() + std::time::Duration::from_secs(5)
+                        },
+                    },
+                );
+            apply_message(
+                &mut state,
+                "p",
+                RpcMessage {
+                    id: None,
+                    method: "update".into(),
+                    params: serde_json::json!({
+                        "surface":"p/app", "app":app_view(index as u64 + 1,"view"),
+                        "focus":true, "focus_ticket":token
+                    }),
+                },
+            );
+            let app = app.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(!app.focus_requested, "{name} ticket must not focus the app");
+            drop(app);
+        }
+        drop(_guard);
+    }
+
+    #[test]
+    fn dead_resident_session_cannot_update_its_app_view() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let app = state.plugins["p"].apps["app"].clone();
+        app.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .apply_view(app_view(1, "before exit"))
+            .unwrap();
+        state.plugins.get_mut("p").unwrap().session = None;
+        {
+            let mut app = app.lock().unwrap_or_else(|error| error.into_inner());
+            app.session = None;
+            app.ready = false;
+        }
+
+        apply_message(
+            &mut state,
+            "p",
+            RpcMessage {
+                id: None,
+                method: "update".into(),
+                params: serde_json::json!({
+                    "surface":"p/app", "app":app_view(2,"late update")
+                }),
+            },
+        );
+
+        assert_eq!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .as_ref()
+                .unwrap()
+                .status,
+            "before exit"
+        );
+        drop(_guard);
+    }
+
+    #[test]
     fn palette_invoke_on_app_plugin_issues_one_ticket() {
         let _guard = channel_guard(Channel::Dev);
         let mut state = install_app("p");
@@ -4667,10 +4767,6 @@ pub(crate) mod app_tests {
         drop(_guard);
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the resident fixture child is the test executable"
-    )]
     pub(crate) fn test_session() -> (
         tokio::runtime::Runtime,
         thegn_svc::plugin::ResidentSupervisor,
