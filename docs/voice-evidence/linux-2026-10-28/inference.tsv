@@ -1,0 +1,25 @@
+model_load_ms	149
+pass	iteration	audio_ms	decode_ms	transcript
+preview	0	8000	2513	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	1	8000	2914	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	2	8000	2480	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	3	8000	3035	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	4	8000	2425	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	5	8000	2370	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	6	8000	2405	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	7	8000	2446	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	8	8000	2375	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	9	8000	2387	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	10	8000	2320	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	11	8000	2366	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	12	8000	2347	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	13	8000	2321	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	14	8000	2348	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	15	8000	2309	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	16	8000	2405	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	17	8000	2322	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	18	8000	2380	" Ask not what your country can do for you. Ask what you can do for your country."
+preview	19	8000	2345	" Ask not what your country can do for you. Ask what you can do for your country."
+final	0	11000	2378	" And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+pre_cancel_ms	0
+silence	passed

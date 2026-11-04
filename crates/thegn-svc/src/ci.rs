@@ -175,6 +175,7 @@ pub fn provider_for_cancellable(
 }
 
 /// Pick a cancellable provider and context from the same origin snapshot.
+/// GitLab, like GitHub, stays bound to that selection snapshot.
 pub fn provider_and_context_for_cancellable(
     loc: &GitLoc,
     cfg: &CiConfig,
@@ -199,6 +200,18 @@ pub fn provider_and_context_for_cancellable(
             }),
             context,
         ));
+    }
+    if system == CiSystem::GitlabCi {
+        let binding = match origin.as_deref() {
+            None => GitlabBinding::NoOrigin,
+            Some(raw) => match parse_gitlab_remote(raw) {
+                Some(remote) => GitlabBinding::Bound(remote),
+                None => GitlabBinding::Invalid,
+            },
+        };
+        let mut client = GitlabCi::from_config(cfg, cancel);
+        client.binding = binding;
+        return Some((Box::new(client), context));
     }
     client_for_system_with_config_and_cancel(system, cfg, cancel).map(|client| (client, context))
 }
@@ -1689,6 +1702,16 @@ pub struct GitlabCi {
     credential: GitlabCredential,
     host: Option<String>,
     cancel: Arc<AtomicBool>,
+    binding: GitlabBinding,
+}
+
+#[derive(Default)]
+enum GitlabBinding {
+    #[default]
+    Unbound,
+    Bound(GitlabRemote),
+    NoOrigin,
+    Invalid,
 }
 
 impl thegn_core::seam::Probe for GitlabCi {
@@ -1716,6 +1739,7 @@ impl GitlabCi {
             ),
             host: (!cfg.gitlab.host.trim().is_empty()).then(|| cfg.gitlab.host.trim().to_string()),
             cancel,
+            binding: GitlabBinding::Unbound,
         }
     }
 
@@ -1770,7 +1794,16 @@ impl GitlabCi {
     /// Resolve origin once for an operation. The resulting host and project
     /// are reused for both the credential-bearing command and its endpoint.
     fn remote(&self, loc: &GitLoc) -> Result<GitlabRemote, CiError> {
-        let remote = snapshot_gitlab_remote(|| origin_url(loc))?;
+        let remote = match &self.binding {
+            GitlabBinding::Unbound => snapshot_gitlab_remote(|| origin_url(loc))?,
+            GitlabBinding::Bound(remote) => remote.clone(),
+            GitlabBinding::NoOrigin => return Err(CiError::NotConfigured),
+            GitlabBinding::Invalid => {
+                return Err(CiError::Other(
+                    "invalid GitLab remote authority or project path".into(),
+                ));
+            }
+        };
         if let Some(configured_host) = &self.host
             && normalize_gitlab_host(configured_host).as_deref() != Some(remote.host.as_str())
         {
@@ -2063,7 +2096,7 @@ pub fn gitlab_project_path(url: &str) -> Option<String> {
     parse_gitlab_remote(url).map(|remote| remote.project)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GitlabRemote {
     host: String,
     project: String,
@@ -5037,6 +5070,212 @@ esac
         let result = client.runs(&loc, None, 10);
         circuit.record_success();
         assert!(matches!(result, Err(CiError::RateLimited)));
+    }
+
+    fn gitlab_bound_fixture(
+        origin: Option<&str>,
+    ) -> Option<(tempfile::TempDir, tempfile::TempDir, GitLoc)> {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            thegn_core::util::git_cmd(repo.path())
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        if let Some(origin) = origin {
+            assert!(
+                thegn_core::util::git_cmd(repo.path())
+                    .args(["remote", "add", "origin", origin])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let fake = tempfile::tempdir().unwrap();
+        let bin = fake.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let glab = bin.join("glab");
+        let log = fake.path().join("calls.log");
+        std::fs::write(
+            &glab,
+            format!("#!/bin/sh\nprintf '%s|%s|%s\\n' \"$GITLAB_HOST\" \"$GITLAB_TOKEN\" \"$*\" >> '{}'\nprintf '[]\\n'\n", log.display()),
+        ).unwrap();
+        if thegn_core::fsperm::make_executable_for_test(&glab).is_err() {
+            return None;
+        }
+        let loc = GitLoc::Local(repo.path().to_path_buf());
+        Some((repo, fake, loc))
+    }
+
+    fn install_gitlab_fake_path(fake: &tempfile::TempDir) -> thegn_core::testenv::EnvGuard {
+        let path = format!(
+            "{}:{}",
+            fake.path().join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        thegn_core::testenv::EnvGuard::mutate_pairs(&[("PATH", Some(&path))])
+    }
+
+    #[test]
+    fn gitlab_bound_client_keeps_the_selection_snapshot_after_the_origin_moves() {
+        let Some((repo, fake, loc)) =
+            gitlab_bound_fixture(Some("https://gitlab.example.test/group/repo.git"))
+        else {
+            return;
+        };
+        let _env = install_gitlab_fake_path(&fake);
+        let cfg = CiConfig {
+            provider: CiProviderKind::Gitlab,
+            ..CiConfig::default()
+        };
+        let (client, context) = provider_and_context_for(&loc, &cfg).unwrap();
+        assert_eq!(
+            context.as_deref(),
+            Some("gitlab:gitlab.example.test/group/repo")
+        );
+        assert!(
+            thegn_core::util::git_cmd(repo.path())
+                .args([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://gitlab.other.test/x/y.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        client.runs(&loc, None, 10).unwrap();
+        let calls = std::fs::read_to_string(fake.path().join("calls.log")).unwrap();
+        assert!(calls.contains("gitlab.example.test"));
+        assert!(calls.contains("group%2Frepo"));
+        assert!(!calls.contains("gitlab.other.test"));
+    }
+
+    #[test]
+    fn gitlab_bound_unbound_factory_still_reads_per_operation() {
+        let Some((repo, fake, loc)) =
+            gitlab_bound_fixture(Some("https://gitlab.example.test/group/repo.git"))
+        else {
+            return;
+        };
+        let _env = install_gitlab_fake_path(&fake);
+        let cfg = CiConfig {
+            provider: CiProviderKind::Gitlab,
+            ..CiConfig::default()
+        };
+        let client = client_for_system_with_config(CiSystem::GitlabCi, &cfg).unwrap();
+        assert!(
+            thegn_core::util::git_cmd(repo.path())
+                .args([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://gitlab.other.test/x/y.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        client.runs(&loc, None, 10).unwrap();
+        let calls = std::fs::read_to_string(fake.path().join("calls.log")).unwrap();
+        assert!(calls.contains("gitlab.other.test"));
+    }
+
+    #[test]
+    fn gitlab_bound_snapshot_without_origin_is_not_configured() {
+        let Some((repo, fake, loc)) = gitlab_bound_fixture(None) else {
+            return;
+        };
+        let _env = install_gitlab_fake_path(&fake);
+        let cfg = CiConfig {
+            provider: CiProviderKind::Gitlab,
+            ..CiConfig::default()
+        };
+        let (client, context) = provider_and_context_for(&loc, &cfg).unwrap();
+        assert!(context.is_none());
+        assert!(
+            thegn_core::util::git_cmd(repo.path())
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://gitlab.example.test/group/repo.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(matches!(
+            client.runs(&loc, None, 10),
+            Err(CiError::NotConfigured)
+        ));
+        assert!(!fake.path().join("calls.log").exists());
+    }
+
+    #[test]
+    fn gitlab_bound_invalid_selection_stays_refused_after_the_origin_is_fixed() {
+        let Some((repo, fake, loc)) = gitlab_bound_fixture(Some("https://gitlab.example.test/"))
+        else {
+            return;
+        };
+        let _env = install_gitlab_fake_path(&fake);
+        let cfg = CiConfig {
+            provider: CiProviderKind::Gitlab,
+            ..CiConfig::default()
+        };
+        let (client, context) = provider_and_context_for(&loc, &cfg).unwrap();
+        assert!(context.is_none());
+        assert!(
+            thegn_core::util::git_cmd(repo.path())
+                .args([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://gitlab.example.test/group/repo.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        match client.runs(&loc, None, 10) {
+            Err(CiError::Other(message)) => {
+                assert_eq!(message, "invalid GitLab remote authority or project path")
+            }
+            result => panic!("expected invalid GitLab remote refusal, got {result:?}"),
+        }
+        assert!(!fake.path().join("calls.log").exists());
+    }
+
+    #[test]
+    fn gitlab_bound_client_keeps_its_credential_across_a_config_reload() {
+        let Some((_repo, fake, loc)) =
+            gitlab_bound_fixture(Some("https://gitlab.example.test/group/repo.git"))
+        else {
+            return;
+        };
+        let _env = install_gitlab_fake_path(&fake);
+        let mut cfg_a = CiConfig {
+            provider: CiProviderKind::Gitlab,
+            ..CiConfig::default()
+        };
+        cfg_a.gitlab.token = "fixture-token-a".into();
+        let (client_a, _) = provider_and_context_for(&loc, &cfg_a).unwrap();
+        let mut cfg_b = cfg_a.clone();
+        cfg_b.gitlab.token = "fixture-token-b".into();
+        let _client_b = provider_and_context_for(&loc, &cfg_b).unwrap();
+        client_a.runs(&loc, None, 10).unwrap();
+        let calls = std::fs::read_to_string(fake.path().join("calls.log")).unwrap();
+        assert!(calls.contains("fixture-token-a"));
+        assert!(!calls.contains("fixture-token-b"));
+        assert!(
+            !calls
+                .split('|')
+                .nth(2)
+                .unwrap_or_default()
+                .contains("fixture-token-a")
+        );
     }
 }
 

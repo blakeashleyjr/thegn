@@ -1,0 +1,28 @@
+[package]
+name = "thegn-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Optional native microphone and embedded Whisper leaf for Thegn"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+native = ["dep:cpal", "dep:whisper-rs"]
+metal = ["native"]
+
+[dependencies]
+anyhow.workspace = true
+cpal = { version = "=0.18.2", optional = true }
+whisper-rs = { version = "=0.16.0", default-features = false, optional = true }
+
+# Compile Metal only for Apple builds, including `--all-features` on Linux.
+# The `metal` feature selects GPU use at runtime; CPU fallback stays available.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "=0.16.0", default-features = false, features = [
+  "metal",
+], optional = true }

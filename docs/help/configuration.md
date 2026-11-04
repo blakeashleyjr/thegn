@@ -510,7 +510,10 @@ values are illustrative and are not promised to equal code defaults.
 The home-manager module (`programs.thegn.*`) renders only options you set; unset
 options fall through to the binary's defaults. Its option names and value types
 are checked against the schema in CI, so it cannot offer a value the binary
-rejects.
+rejects. It also exposes `confirmDelete` and the scalar theme options
+`themePreset`, `themeFocusBorder`, `themePanePadding`, `themeUndercurl`,
+`themeColor`, `themeGlyphs`, `themeAgentGlyphs`, `themeMascot` and
+`themeMascotMotion`.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled

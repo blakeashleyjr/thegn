@@ -2307,7 +2307,7 @@ if command -v curl >/dev/null 2>&1; then
   # worktree from a branch — both real ControlApi paths, exercised end-to-end.
   curl -s --unix-socket "$DSOCK" -X POST http://d/v1/dispatches \
     -H 'content-type: application/json' \
-    -d '{"issue_id":"smoke:1","worktree_path":"/wt/smoke","agent_name":"claude"}' >/dev/null
+    -d "{\"issue_id\":\"smoke:1\",\"worktree_path\":\"$R\",\"agent_name\":\"claude\"}" >/dev/null
   disp_json="$(curl -s --unix-socket "$DSOCK" http://d/v1/dispatches)"
   check "dispatches.put + dispatches.list round-trip over HTTP" \
     "grep -q 'smoke:1' <<<'$disp_json' && grep -q '\"queued\"' <<<'$disp_json'"

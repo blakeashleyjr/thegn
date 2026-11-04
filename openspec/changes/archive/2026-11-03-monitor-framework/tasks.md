@@ -104,11 +104,24 @@ Re-owned to THE-1362 (batch 72): THE-829 is Done; that issue ticks the delivered
 - [x] X-2: Remove monitor from masthead live sampling (`wants_live_stats`).
       Superseded by the owner decision of 2026-10-19 ("X-2 masthead sampling: keep 1 Hz."):
       `monitor::wants_live_stats` (monitor.rs:1069) is kept; nothing is removed.
-- [ ] X-3: Remove legacy `LegacyTab`, `sections.rs`, and dead `build.rs`
+- [x] X-3: Remove legacy `LegacyTab`, `sections.rs`, and dead `build.rs`
       helpers.
-- [ ] SPEC-1: Sync the shipped contract and MODIFY "All system sampling runs
+      Superseded as written: `monitor/sections.rs` is gone, `monitor/build.rs`
+      carries no dead helper (`dead_code` is denied), and `LegacyTab` was the
+      live renderer of Processes, Notifications, and engine-less GPU, so it was
+      renamed `SectionStackTab` in `monitor/board.rs` instead of removed.
+      Per-tab board views for those tabs are not part of this change.
+- [x] SPEC-1: Sync the shipped contract and MODIFY "All system sampling runs
       off the event loop" to admit the `MonitorSampler`; archive this change when
       implementation is complete.
-- [ ] Rewrite the help pause paragraph when F4 lands to document parked deep
+      Synced: merged the shipped framework requirements, retained the existing
+      Overview landing contract, and documented `MonitorSampler`; archived in
+      batch 85.
+- [x] Rewrite the help pause paragraph when F4 lands to document parked deep
       sampling and continuous masthead Class-A history.
-- [ ] Run `just ci`.
+      Evidence: `docs/help/system-monitor.md` (the `Space` pauses paragraph);
+      `monitor_sampler_tests::hidden_and_paused_use_untimed_parks_then_open_samples`.
+- [x] Run `just ci`.
+      Superseded, not performed as a separate check: batch 85's single final
+      gate (`just ci`-equivalent stamped gate) covers it; the change is archived
+      in batch 85.
