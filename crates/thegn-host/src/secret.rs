@@ -30,6 +30,7 @@ const MAX_SECRET_BYTES: u64 = 64 * 1024;
 const MAX_ACCOUNT_BYTES: usize = 1024;
 const MAX_INDEX_BYTES: u64 = 64 * 1024;
 const MAX_INDEX_ENTRIES: usize = 4096;
+const MCP_INDEX_FILE: &str = "mcp-index.json";
 const SECRETS_LOCK: &str = "secrets.lock";
 // Bounded so a UI-loop caller can never hang on another process's lock, but long
 // enough that ordinary CLI/worker contention (each op is a short fsync'd write)
@@ -1458,8 +1459,12 @@ fn index_read() -> Result<Vec<String>, String> {
 }
 
 fn index_read_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
-    let path = dir.join("mcp-index.json");
-    let file = match thegn_core::fsperm::open_regular_file_nofollow(&path) {
+    let private = open_secrets_in(dir).map_err(|error| format!("{error:#}"))?;
+    index_read_held(&private)
+}
+
+fn index_read_held(private: &thegn_core::fsperm::PrivateDir) -> Result<Vec<String>, String> {
+    let file = match private.open_regular_nofollow(MCP_INDEX_FILE) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("read MCP secret index: {error}")),
@@ -1488,6 +1493,14 @@ fn index_read_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
 }
 
 fn index_write_in(dir: &std::path::Path, names: &[String]) -> Result<(), String> {
+    let private = open_secrets_in(dir).map_err(|error| format!("{error:#}"))?;
+    index_write_held(&private, names)
+}
+
+fn index_write_held(
+    private: &thegn_core::fsperm::PrivateDir,
+    names: &[String],
+) -> Result<(), String> {
     if names.len() > MAX_INDEX_ENTRIES
         || names
             .iter()
@@ -1499,9 +1512,10 @@ fn index_write_in(dir: &std::path::Path, names: &[String]) -> Result<(), String>
     if body.len() as u64 > MAX_INDEX_BYTES {
         return Err("MCP secret index exceeds size limit".into());
     }
-    let path = dir.join("mcp-index.json");
-    thegn_core::fsperm::write_owner_only_atomic(&path, &body).map_err(|e| e.to_string())?;
-    thegn_core::fsperm::sync_parent_dir(dir).map_err(|e| e.to_string())
+    private
+        .write_owner_only_atomic(MCP_INDEX_FILE, &body)
+        .map_err(|error| format!("write MCP secret index: {error}"))?;
+    Ok(())
 }
 
 fn open_dir_lock(
@@ -2583,10 +2597,46 @@ mod tests {
     #[test]
     fn mcp_index_corruption_is_preserved_and_reported() {
         let temp = private_temp();
-        let index = temp.path().join("mcp-index.json");
+        let index = temp.path().join(MCP_INDEX_FILE);
         std::fs::write(&index, b"not-json").unwrap();
         assert!(index_add_in(temp.path(), "new-name").is_err());
         assert_eq!(std::fs::read(index).unwrap(), b"not-json");
+    }
+
+    #[test]
+    fn mcp_index_write_lands_beneath_the_held_directory_when_the_path_is_swapped() {
+        let parent = private_temp();
+        let secrets = parent.path().join("secrets");
+        let moved = parent.path().join("secrets.moved");
+        thegn_core::fsperm::ensure_private_dir(&secrets).unwrap();
+        let private = open_secrets_in(&secrets).unwrap();
+
+        std::fs::rename(&secrets, &moved).unwrap();
+        thegn_core::fsperm::ensure_private_dir(&secrets).unwrap();
+
+        index_write_held(&private, &["acct".to_string()]).unwrap();
+
+        assert!(moved.join(MCP_INDEX_FILE).is_file());
+        assert_eq!(std::fs::read_dir(&secrets).unwrap().count(), 0);
+        assert_eq!(index_read_held(&private).unwrap(), vec!["acct"]);
+    }
+
+    #[test]
+    fn mcp_index_publish_is_owner_only_and_leaves_no_temporary() {
+        let temp = private_temp();
+        let private = open_secrets_in(temp.path()).unwrap();
+
+        index_write_held(&private, &["acct".to_string()]).unwrap();
+
+        let names = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![std::ffi::OsString::from(MCP_INDEX_FILE)]);
+        let index = temp.path().join(MCP_INDEX_FILE);
+        if let Ok(Some(mode)) = thegn_core::fsperm::mode_bits(&index) {
+            assert_eq!(mode & 0o077, 0);
+        }
     }
 
     type RecordingGate = Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>;
@@ -2690,7 +2740,7 @@ mod tests {
     #[test]
     fn mcp_set_refuses_a_corrupt_index_before_touching_the_keyring() {
         let temp = private_temp();
-        let index = temp.path().join("mcp-index.json");
+        let index = temp.path().join(MCP_INDEX_FILE);
         std::fs::write(&index, b"not-json").unwrap();
         let ops = Arc::new(Mutex::new(Vec::new()));
         let store = RecordingStore::new(Arc::clone(&ops));
@@ -2709,7 +2759,7 @@ mod tests {
 
         assert!(mcp_secret_set_in(temp.path(), &store, &account, "v").is_err());
         assert!(ops.lock().unwrap().is_empty());
-        assert!(!temp.path().join("mcp-index.json").exists());
+        assert!(!temp.path().join(MCP_INDEX_FILE).exists());
     }
 
     #[test]

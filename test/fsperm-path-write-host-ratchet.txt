@@ -3,7 +3,5 @@
 # Blind spot: crates outside thegn-core, thegn-host, and thegn-svc are not scanned.
 # hook_run.rs: redacted hook run log; no credential.
 # managed_tool.rs: installer provenance record; no credential (also a test caller).
-# secret.rs: MCP secret NAMES index, no values; THE-523 bullet 7 replaces it.
 hook_run.rs
 managed_tool.rs
-secret.rs
