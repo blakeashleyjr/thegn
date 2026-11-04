@@ -120,8 +120,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
 # re-export). The host renders embedded apps' ratatui buffers through
-# `tg_kit::ratatui` so the Buffer type is identical to what the apps produce.
-tg-kit = { path = "../tg-kit", features = ["host-presets"] }
+# `tg_kit::ratatui` and drives `tg_kit::standalone::run` for `thegn plugin preview`.
+tg-kit = { path = "../tg-kit", features = ["host-presets", "standalone"] }
 thegn-plugin-ui.workspace = true
 # The embedded "Observe" observability app tile (gtui). Rendered through the
 # same `tg_kit::ratatui` Buffer as any other AppTile.
