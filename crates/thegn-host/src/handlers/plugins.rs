@@ -2736,9 +2736,8 @@ mod tests {
                     );
                 }
                 1 => {
-                    let old = state
-                        .plugins
-                        .insert("p".into(), build_entry(loaded_state(seg_spec("p"))));
+                    let (entry, _) = build_entry(loaded_state(seg_spec("p")));
+                    let old = state.plugins.insert("p".into(), entry);
                     drop(old);
                 }
                 2 => {
