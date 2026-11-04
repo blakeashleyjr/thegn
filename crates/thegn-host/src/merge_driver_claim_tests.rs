@@ -427,6 +427,42 @@ fn stale_folding_row_is_skipped_with_a_warning() {
 }
 
 #[test]
+fn attempt_runs_inside_the_claim_generation_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = Db::open_memory().unwrap();
+    let item = registered_row(&db, &root, "/worktrees/feature", "feature");
+    let seen = std::cell::Cell::new(None::<i64>);
+
+    drive_queue_with(
+        &registered_config(),
+        &Config::default(),
+        &root,
+        &db,
+        vec![item.clone()],
+        |_| {},
+        ready_actions(
+            |_, _, _| {
+                seen.set(crate::merge_remote::current_ingest_claim_generation());
+                Ok(AttemptOutcome::Ready { tip: "tip".into() })
+            },
+            unexpected_agent_handoff,
+            unused_agent_runner,
+        ),
+    );
+
+    let generation = db
+        .observe_merge_claim(&item.worktree)
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert!(generation >= 1);
+    assert_eq!(seen.get(), Some(generation));
+    assert_eq!(crate::merge_remote::current_ingest_claim_generation(), None);
+}
+
+#[test]
 fn expired_claim_target_filter_keeps_item_for_claim_recovery() {
     let expired = MergeClaimView {
         worktree: "/worktrees/feature".into(),
