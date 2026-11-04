@@ -9,6 +9,31 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.49] — 2026-11-04 (maintenance batch 87)
 
+### Changed
+
+- `thegn merge rm`, re-enqueueing with `thegn merge add`, and deleting a
+  worktree release a merge claim that expired on a row that already landed.
+- Landed-worktree cleanup keeps the entry with class `identity` when the
+  worktree was removed and re-created or now belongs to another repository
+  since the branch was queued.
+- The PR queue holds a merge as `needs_human` before requesting anything when
+  the forge cannot fence the merge to the reviewed head.
+- Configuration rejects `[ci] log_tail_lines` values above 100000.
+- CI log tails discard invalid UTF-8 and over-long lines and mark the result
+  truncated; CRLF endings are preserved.
+- The Home Manager module adds typed, null-default `programs.thegn.ui*` options
+  for display-only `[ui]` settings.
+
+### Fixed
+
+- Managed SSH key rotation separates a new key from an `authorized_keys` last
+  line without a trailing newline and verifies the published file after
+  authorizing or deauthorizing a key, failing instead of reporting success.
+- Sandbox TIMELINE rows in the System panel show the event's age instead of
+  `0s`.
+- The rebase status check reports an apply-backend rebase or an in-progress
+  `git am` as an error naming the marker instead of reporting no rebase.
+
 ## [0.1.0-alpha.48] — 2026-11-04 (maintenance batch 86)
 
 ### Added

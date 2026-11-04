@@ -94,7 +94,11 @@ verifies the new commits. Otherwise they refuse with the reason; use
   refuse and name the drain; `thegn merge retry` and `thegn merge land` refuse;
   `thegn merge clear` removes unclaimed rows, names kept claimed rows, and exits
   non-zero; deleting the worktree keeps its row. The control API answers
-  `conflict` for a local row's claimed-row refusal on add and clear.
+  `conflict` for a local row's claimed-row refusal on add and clear. A claim
+  that expired on a row already marked landed (for example, if a drain stopped
+  after recording the land) is released by `thegn merge rm`, re-enqueueing
+  with `thegn merge add`, and worktree deletion. Live claims and expired claims
+  on rows that have not landed remain subject to the existing refusal rules.
 - An unrecognised stored queue status is shown as such and has no land or
   retry key.
 - `thegn land` and `thegn integrate` can finish a land while an active drain
@@ -105,7 +109,13 @@ verifies the new commits. Otherwise they refuse with the reason; use
   `expire` sweep, and `thegn merge sweep`) skips a row another drain still
   holds: nothing is removed, and the sweep lists it as `merge_claimed` without
   starting the retry delay. The next sweep collects it after the drain releases
-  the row. An expired claim does not block cleanup.
+  the row. An expired claim does not block cleanup. Before automatic cleanup
+  removes a landed worktree, it compares the enqueue identity recorded for the
+  row (repository and Git worktree registration) with the live checkout.
+  If the worktree was removed and re-created or now belongs to another
+  repository, cleanup removes nothing and keeps the entry with class `identity`
+  and reason `worktree identity changed since the branch was queued (...); kept`.
+  A row without a recorded identity is cleaned as before.
 - Renaming a worktree that has a merge-queue row is refused, and nothing is
   renamed. While a drain holds the row the refusal names the drain; otherwise
   run `thegn merge rm` first. If the queue cannot be read, the rename is refused
