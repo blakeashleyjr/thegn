@@ -59,7 +59,7 @@ same-file.workspace = true
 gix.workspace = true
 # `blocking` on top of the workspace features: the usage tracker's live fetches
 # (Claude /api/oauth/usage, Antigravity quota) run on a blocking gather thread.
-reqwest = { workspace = true, features = ["blocking", "stream"] }
+reqwest = { workspace = true, features = ["blocking", "stream", "multipart"] }
 url.workspace = true
 tokio.workspace = true
 chrono.workspace = true

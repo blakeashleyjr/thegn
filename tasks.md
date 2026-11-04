@@ -220,7 +220,7 @@ over-weighted to P1; this is the cross-cutting priority):**
   multi-repo projects (THE-33), issue-autopilot (THE-56), tracker suite (THE-50),
   sidebar/rename UX (THE-9/10/64), packaging (THE-52/15), monitoring (THE-44),
   browser/IDE (THE-13/17), code map + debugger (THE-25/26), automations+chat
-  (THE-21/62), ambient (THE-42/46/35), voice (THE-59, a prior cut), localization
+  (THE-21/62), ambient (THE-42/46/35), voice (THE-148; THE-59 is historical), localization
   (THE-51), completions/config/docs (THE-36/38/4), dep hygiene (THE-61),
   GUI-lane record (THE-40).
 
@@ -440,7 +440,10 @@ The "magical" layer; mostly composition of what's built.
 
 ## Deliberate defers / cut candidates
 
-Cut: web dashboard (510), voice (499). Parked until there's a reason: marketplace/
+Cut: web dashboard (510). Voice (499) was a historical cut; the command adapter
+exists and first-party dictation is verification-gated under THE-1510 / THE-148 (see
+`openspec/changes/add-voice-mode/` and `docs/voice-verification.md`).
+Parked until there's a reason: marketplace/
 plugin-sharing (206, 210) until users; federation/team/pair (497, 498, 501) until
 single-node is excellent; recursion governors (436) only when MCP spawn (461) ships;
 Tor (444) and GPU passthrough (393) as niche opt-ins.

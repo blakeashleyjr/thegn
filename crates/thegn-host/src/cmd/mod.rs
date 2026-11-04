@@ -64,6 +64,7 @@ pub mod skills_doctor;
 pub mod supervise;
 pub mod target;
 pub mod theme;
+pub mod voice;
 pub mod wt;
 pub mod zone;
 

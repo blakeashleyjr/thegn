@@ -56,12 +56,34 @@ fn voice_probes(cfg: &Config) -> Vec<ProbeReport> {
         return vec![ProbeReport::reserved("voice", v.kind.as_str())];
     }
     match v.kind {
+        VoiceKind::Http => vec![crate::voice_http::HttpVoiceProvider::new(v.clone(), None).probe()
+            .note("credential readiness is reported without resolving secrets; capture uses the host build")],
         VoiceKind::Command => {
             let mut report = crate::voice::CommandVoiceProvider::new(v.clone()).probe();
             if !v.enabled {
                 report = report.note("[voice] enabled = false; explicit consent is off");
             }
             vec![report]
+        }
+        VoiceKind::Embedded => {
+            let available = {
+                crate::voice_models::resolve(v)
+                    .and_then(|path| {
+                        anyhow::ensure!(
+                            path.is_file(),
+                            "missing model; run thegn voice setup before recording"
+                        );
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())
+            };
+            let availability = match available {
+                Ok(()) => thegn_core::seam::Availability::Ready,
+                Err(reason) => thegn_core::seam::Availability::Unavailable(reason),
+            };
+            vec![ProbeReport::new("voice", v.kind.as_str(), availability)
+                .with_caps(&thegn_core::voice::VoiceCaps { transcribe: true, partials: v.live_preview, cancellation: true })
+                .note("native capture requires voice-native; model presence is not inference or microphone verification")]
         }
     }
 }
