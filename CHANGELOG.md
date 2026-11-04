@@ -16,12 +16,10 @@ All notable changes to **thegn** are documented here. The format follows
   (`plugin-app-drafts`/`plugin-app-requests`) open draft and request recovery.
   Plugin API is now 0.4.0; 0.3 plugins load unchanged.
 
-### Added
-
 - (dev channel) Experimental dictation adds `thegn voice setup`, which
   configures embedded, HTTP or command transcription, and `thegn voice status`
-  reports readiness without opening the microphone. `thegn voice model
-list|pull|rm` manages pinned, verified Whisper models in the user data
+  reports readiness without opening the microphone. `thegn voice model list|pull|rm`
+  manages pinned, verified Whisper models in the user data
   directory; setup and pull report download size and ask before downloading
   unless `--yes` is used. `thegn doctor` adds a Voice block. Release builds
   omit native capture; HTTP and command providers need an external
@@ -37,7 +35,7 @@ list|pull|rm` manages pinned, verified Whisper models in the user data
 
 ### Changed
 
-- The state database schema is now v101. Restart the host and daemon after
+- The state database schema is now v102. Restart the host and daemon after
   upgrading so they use the migrated database.
 - Daemon agent launches with rendered commands over 100 KiB are refused before
   launch, with the command size and limit, instead of failing at exec.
@@ -52,10 +50,11 @@ list|pull|rm` manages pinned, verified Whisper models in the user data
   from another known provider context. The PR queue quotes cached logs only
   for the current context.
 - GitHub issue listings and searches that exceed the 100-issue cap without a
-  limit, and full Kaneo project pages, are reported as partial instead of
-  complete.
+  limit are reported as partial instead of complete. A full Kaneo project page
+  is partial unless the requested limit was met.
 - The control API's `dispatches.put` normalizes issue ids and worktree paths
   like `thegn dispatch put`, and rejects an unusable worktree before writing.
+- Worktree issue links are bound to the account that produced them.
 
 ### Fixed
 
@@ -71,7 +70,7 @@ list|pull|rm` manages pinned, verified Whisper models in the user data
 - On Linux, `./install.sh` validates the generated desktop entry before
   publishing it and restores the previous installation if validation fails.
 - (dev channel) Cancelling a merge-queue drain also stops the consumer's
-  cross-host `git fetch`.
+  cross-host `git fetch` from the transferred bundle.
 - (dev channel) Opening a worktree against an existing provider sandbox
   verifies its non-empty network policy, reapplies drift, and refuses an
   unverifiable sandbox without destroying it.
@@ -83,8 +82,6 @@ list|pull|rm` manages pinned, verified Whisper models in the user data
 - (dev channel) Credentialed dictation HTTP endpoints require HTTPS unless
   their host is loopback. Setup and configuration validation reject
   credentialed plain HTTP; redirects are not followed.
-- Sandbox image publication refuses a destination tag that moved during the
-  run and checks for concurrent overwrite before attestation.
 
 ## [0.1.0-alpha.47] — 2026-11-03 (maintenance batch 84)
 

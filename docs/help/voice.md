@@ -19,8 +19,9 @@ Line breaks and control characters in a transcript are inserted as spaces.
 
 Run `thegn voice setup --language en` to configure a provider and model. Use
 `--kind embedded` (the default), `--kind http`, or `--kind command`; setup saves
-voice as enabled for that kind. Embedded setup also verifies the installed
-model's size and SHA-256, or offers to download it. Setup shows download size
+voice as enabled for that kind. For a catalogue model in the store, embedded
+setup verifies the installed model's size and SHA-256, or offers to download it.
+Setup shows download size
 and asks before downloading a missing Whisper model. Use
 `--language auto` for detection, `--model tiny.en` for speed, or `--model small.en`
 for accuracy. Non-English languages use multilingual `tiny`, `base`, or `small`.
@@ -65,7 +66,7 @@ sends multipart `file` (WAV), `model` and `response_format=json` fields, plus
 field, capped at 1 MiB; redirects are not followed. Endpoints must use HTTP(S)
 without user/password or a fragment. Loopback requests ignore proxy environment
 variables; status, timeout and connection failures are reported separately.
-The configured `timeout_seconds` must be between 1 and 300.
+Values outside `1..=300` for `timeout_seconds` are clamped to that range.
 
 When a credential is configured, HTTP endpoints must use `https://` unless the
 host is loopback (`127.0.0.0/8`, `::1`, or `localhost`). Setup and runtime both

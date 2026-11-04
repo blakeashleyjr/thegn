@@ -281,8 +281,8 @@ bundle transfer: its producer is stopped, no ref is published, and the row is
 reported as cancelled with `gate_error` for retry on the next drain. Fetching
 the bundle into the target store is bounded by the same
 subprocess deadline.
-The consumer's `git fetch` from that bundle also stops when the drain is
-cancelled instead of running until the deadline.
+On the dev channel, the consumer's `git fetch` from that bundle also stops
+when the drain is cancelled instead of running until the deadline.
 
 Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
