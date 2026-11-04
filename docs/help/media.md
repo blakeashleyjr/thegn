@@ -92,5 +92,19 @@ supports all three repeat modes.
 Visualization is intentionally absent because providers do not expose level
 samples; a synthetic meter would be misleading and add idle wake/process cost.
 
+Provider data limits are the same for every backend and apply as data
+arrives, before anything is stored or drawn:
+
+- Each text field (title, artist, album, player name) keeps at most 4096 bytes,
+  cut between characters. A longer artwork URL, or one with a control
+  character, is dropped.
+- A label shows at most 256 characters and ends in `...` when visible text
+  was cut. At most 30 combining accent marks are kept after one character.
+- A track, queue or playlist id over 1024 bytes, or one with a control
+  character, is rejected rather than shortened; a queue or playlist row
+  with such an id is left out.
+- The queue keeps at most 500 queue rows, the playlist picker 100 playlists
+  and the player list 64 players; each says when more were not shown.
+
 See the [[config-reference]] `[media]` section for player selection and
 options.
