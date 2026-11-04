@@ -73,8 +73,10 @@ impl Browser for OsBrowser {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|_| anyhow::anyhow!("cannot open authorization browser"))?;
-        // This short-lived helper belongs to the plugin process. It intentionally
-        // has no QoS class: qos::set_self is a thegn-host item, not an SDK API.
+        // Each open call starts a helper that waits for this opener to exit. A
+        // desktop opener that stays alive with the browser keeps that helper alive
+        // too. It intentionally has no QoS class: qos::set_self is a thegn-host
+        // item, not an SDK API.
         drop(thegn_core::thread_name::spawn_named(
             "thegn-sdk-reap",
             move || {
