@@ -307,10 +307,12 @@ fn legacy_file_name(provider: &str, account: &str, instance: &str) -> String {
     format!("{id}.json")
 }
 
+#[cfg(test)]
 fn record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> PathBuf {
     dir.join(record_file_name(provider, account, instance))
 }
 
+#[cfg(test)]
 fn legacy_record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> PathBuf {
     dir.join(legacy_file_name(provider, account, instance))
 }
@@ -348,13 +350,6 @@ fn read_row(
         "managed SSH custody record {} is owned by another user",
         path.display()
     );
-    if let Some(mode) = crate::fsperm::mode_bits_from_metadata(&metadata) {
-        anyhow::ensure!(
-            mode & 0o077 == 0,
-            "managed SSH custody record {} is not owner-only (mode {mode:o})",
-            path.display()
-        );
-    }
     crate::fsperm::ensure_single_link_regular_file(&metadata).with_context(|| {
         format!(
             "managed SSH custody record {} has extra hard links",
@@ -766,6 +761,7 @@ pub fn list_at(dir: &Path) -> Result<Vec<AuthorizedKeyRecord>> {
             row_names.push(text.to_string());
         }
     }
+    // Enforce the cap using the complete set of JSON names before opening any row.
     anyhow::ensure!(
         row_names.len() <= MAX_CUSTODY_ROWS,
         "managed SSH custody inventory has more than {MAX_CUSTODY_ROWS} rows"
@@ -2161,9 +2157,11 @@ mod tests {
         let path = record_path(temp.path(), &row.provider, &row.account, &row.instance);
         let alias = temp.path().join("alias.txt");
         std::fs::hard_link(&path, &alias).unwrap();
-        if crate::fsperm::extra_hard_links(&std::fs::metadata(&path).unwrap()) == 0 {
+        let extra_links = crate::fsperm::extra_hard_links(&std::fs::metadata(&path).unwrap());
+        if extra_links == 0 {
             return;
         }
+        assert_eq!(extra_links, 1, "one planted hard link adds one link name");
 
         let error = read_at(temp.path(), &row.provider, &row.account, &row.instance).unwrap_err();
         assert!(format!("{error:#}").contains("hard links"));
