@@ -2314,6 +2314,7 @@ impl ControlApi for DaemonService {
                 let fetched_at = entry.fetched_at;
                 let truncated = entry.truncated;
                 let redacted = entry.redacted;
+                let redaction_changed = entry.redaction_changed;
                 return Ok(thegn_svc::control::CiLogsReply {
                     worktree: path_string.clone(),
                     run_id: run_id_owned,
@@ -2323,6 +2324,7 @@ impl ControlApi for DaemonService {
                     fetched_at,
                     truncated,
                     redacted,
+                    redaction_changed,
                     warnings: Vec::new(),
                 });
             }
@@ -2400,6 +2402,7 @@ impl ControlApi for DaemonService {
             let fetched_at = entry.fetched_at;
             let truncated = entry.truncated;
             let redacted = entry.redacted;
+            let redaction_changed = entry.redaction_changed;
             Ok(thegn_svc::control::CiLogsReply {
                 worktree: path_string,
                 run_id: run_id_owned,
@@ -2409,6 +2412,7 @@ impl ControlApi for DaemonService {
                 fetched_at,
                 truncated,
                 redacted,
+                redaction_changed,
                 warnings,
             })
         })
@@ -4371,6 +4375,106 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ControlError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn ci_logs_reply_reports_whether_the_redactor_changed_the_cached_text() {
+        let worktree = tempfile::tempdir().unwrap();
+        let (service, _) = service(0);
+        let repo_path = worktree.path().display().to_string();
+        let worktree_path = repo_path.clone();
+        service
+            .with_db(move |db| {
+                use thegn_core::store::WorkspaceStore;
+                db.put_workspace(&repo_path, "repo", "repo")?;
+                db.put_worktree(
+                    "repo/feature",
+                    &repo_path,
+                    &worktree_path,
+                    "feature",
+                    None,
+                    None,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(worktree.path());
+        let mut changed = thegn_core::ci_log::CiLogEntry::new(
+            cache_key.clone(),
+            "1",
+            "2",
+            "job",
+            "token=SYNTHETIC_TOKEN\nordinary\n",
+            8,
+            4096,
+            10,
+        );
+        changed.head_sha = "known-head".into();
+        let mut unchanged = thegn_core::ci_log::CiLogEntry::new(
+            cache_key.clone(),
+            "1",
+            "3",
+            "job",
+            "ordinary\n",
+            8,
+            4096,
+            10,
+        );
+        unchanged.head_sha = "known-head".into();
+        service
+            .with_db(move |db| {
+                use thegn_core::store::CacheStore;
+                db.put_ci_log(&changed)?;
+                db.put_ci_log(&unchanged)
+            })
+            .await
+            .unwrap();
+
+        let reply = service
+            .ci_logs(worktree.path().to_str().unwrap(), "1", "2", None)
+            .await
+            .unwrap();
+        assert_eq!(reply.source, "cache");
+        assert_eq!(reply.redaction_changed, Some(true));
+        assert_eq!(reply.logs[0]["redaction_changed"], serde_json::json!(true));
+
+        let reply = service
+            .ci_logs(worktree.path().to_str().unwrap(), "1", "3", None)
+            .await
+            .unwrap();
+        assert_eq!(reply.source, "cache");
+        assert_eq!(reply.redaction_changed, Some(false));
+        assert_eq!(reply.logs[0]["redaction_changed"], serde_json::json!(false));
+
+        let mut legacy = thegn_core::ci_log::CiLogEntry::new(
+            cache_key,
+            "1",
+            "3",
+            "job",
+            "ordinary\n",
+            8,
+            4096,
+            10,
+        );
+        legacy.head_sha = "known-head".into();
+        legacy.redaction_changed = None;
+        service
+            .with_db(move |db| {
+                use thegn_core::store::CacheStore;
+                db.put_ci_log(&legacy)
+            })
+            .await
+            .unwrap();
+
+        let reply = service
+            .ci_logs(worktree.path().to_str().unwrap(), "1", "3", None)
+            .await
+            .unwrap();
+        assert_eq!(reply.source, "cache");
+        assert_eq!(reply.redaction_changed, None);
+        assert!(reply.logs[0]["redaction_changed"].is_null());
     }
 
     #[tokio::test]
