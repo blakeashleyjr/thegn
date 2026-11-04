@@ -633,6 +633,7 @@ where
     let mut all = Vec::new();
     let mut after: Option<String> = None;
     let mut seen_cursors = std::collections::HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
     for page in 0..MAX_LIST_PAGES {
         let first = if limit == 0 {
             MAX_PAGE_SIZE
@@ -654,12 +655,17 @@ where
             Err(error) => return Err(error),
         };
         let page_info = data.issues.page_info;
+        let nodes = data
+            .issues
+            .nodes
+            .into_iter()
+            .map(linear_issue_to_domain)
+            .collect::<Result<Vec<_>, _>>()?;
+        // First-seen wins: repeated rows neither appear twice nor consume the caller's limit.
         all.extend(
-            data.issues
-                .nodes
+            nodes
                 .into_iter()
-                .map(linear_issue_to_domain)
-                .collect::<Result<Vec<_>, _>>()?,
+                .filter(|issue| seen_ids.insert(issue.id.clone())),
         );
         if limit > 0 && all.len() >= limit {
             all.truncate(limit);
@@ -1052,6 +1058,63 @@ mod tests {
         (result, queries)
     }
 
+    async fn run_list(
+        limit: usize,
+        responses: Vec<serde_json::Value>,
+        budget: Arc<TrackerHttpBudget>,
+    ) -> (Result<Vec<Issue>, IssueError>, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route_queries = Arc::clone(&queries);
+        let responses = Arc::new(responses);
+        let route_responses = Arc::clone(&responses);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_queries = Arc::clone(&route_queries);
+                let route_responses = Arc::clone(&route_responses);
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let mut queries = route_queries.lock().unwrap();
+                    let index = queries.len();
+                    queries.push(request["query"].as_str().unwrap().to_string());
+                    drop(queries);
+                    let payload = route_responses
+                        .get(index)
+                        .or_else(|| route_responses.last())
+                        .expect("at least one Linear fixture response");
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            budget,
+            &format!("http://{address}"),
+        );
+        let result = backend
+            .list_issues(&IssueFilter {
+                limit,
+                ..Default::default()
+            })
+            .await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let queries = queries.lock().unwrap().clone();
+        (result, queries)
+    }
+
     async fn update_with_echoed_issue(issue: serde_json::Value) -> Result<Issue, IssueError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1254,6 +1317,76 @@ mod tests {
         assert_eq!(result.unwrap().len(), 1);
         assert_eq!(queries.len(), 1);
         assert!(queries[0].contains("first: 250"), "{}", queries[0]);
+    }
+
+    #[tokio::test]
+    async fn search_dedupes_an_issue_repeated_on_a_later_page() {
+        let responses = vec![
+            json!({"data":{"issues":{"nodes":[list_item(1),list_item(2)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(2),list_item(3)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+        ];
+        let (result, _) =
+            run_search(0, responses, Arc::new(TrackerHttpBudget::with_permits(1))).await;
+        let numbers = result
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["ABC-1", "ABC-2", "ABC-3"]);
+    }
+
+    #[tokio::test]
+    async fn search_dedupes_before_counting_the_limit() {
+        let responses = vec![
+            json!({"data":{"issues":{"nodes":[list_item(1),list_item(2)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(2),list_item(3)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-2"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(4)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+        ];
+        let (result, queries) =
+            run_search(3, responses, Arc::new(TrackerHttpBudget::with_permits(1))).await;
+        let numbers = result
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["ABC-1", "ABC-2", "ABC-3"]);
+        assert_eq!(queries.len(), 2);
+        assert!(queries[1].contains("first: 1,"), "{}", queries[1]);
+    }
+
+    #[tokio::test]
+    async fn list_dedupes_before_counting_the_limit() {
+        let responses = vec![
+            json!({"data":{"issues":{"nodes":[list_item(1),list_item(2)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(2),list_item(3)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-2"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(4)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+        ];
+        let (result, queries) =
+            run_list(3, responses, Arc::new(TrackerHttpBudget::with_permits(1))).await;
+        let numbers = result
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["ABC-1", "ABC-2", "ABC-3"]);
+        assert_eq!(queries.len(), 2);
+        assert!(queries[1].contains("first: 1,"), "{}", queries[1]);
+    }
+
+    #[tokio::test]
+    async fn search_deduping_keeps_distinct_pages_in_order() {
+        let responses = vec![
+            json!({"data":{"issues":{"nodes":[list_item(1),list_item(2)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(3),list_item(4)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+        ];
+        let (result, _) =
+            run_search(0, responses, Arc::new(TrackerHttpBudget::with_permits(1))).await;
+        let numbers = result
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["ABC-1", "ABC-2", "ABC-3", "ABC-4"]);
     }
 
     #[tokio::test]
