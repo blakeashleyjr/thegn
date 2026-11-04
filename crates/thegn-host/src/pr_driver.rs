@@ -469,7 +469,7 @@ pub(crate) fn drive_queue(
                 let direct = matches!(action, QueueAction::Merge);
                 let method = merge_method(cfg.merge_method);
                 if !forge.caps().merge_expected_head {
-                    let detail = "this forge cannot fence a merge to the reviewed head; merge it yourself or enable a forge that can".to_string();
+                    let detail = "this forge cannot fence a merge to the reviewed head (`merge_expected_head`); merge it yourself or enable a forge that can".to_string();
                     if let Err(error) = db.update_pr_status(
                         &item.key,
                         PrqStatus::NeedsHuman.as_str(),
@@ -3781,6 +3781,14 @@ mod tests {
             out.warnings
                 .iter()
                 .any(|warning| warning.contains("cannot fence a merge"))
+        );
+        let persisted = db.list_pr_queue().unwrap().remove(0);
+        assert_eq!(persisted.status, PrqStatus::NeedsHuman.as_str());
+        assert_eq!(
+            persisted.detail.as_deref(),
+            Some(
+                "this forge cannot fence a merge to the reviewed head (`merge_expected_head`); merge it yourself or enable a forge that can"
+            )
         );
     }
 
