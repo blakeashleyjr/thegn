@@ -226,4 +226,49 @@ mod tests {
         let random = to_state(&pairs(&["random: x"]), &[]);
         assert_eq!(random.shuffle, None);
     }
+
+    #[test]
+    fn decode_budget_oversized_fields_admit_within_the_state_ceiling() {
+        use crate::budget::{MAX_STATE_BYTES, state_bytes};
+        use crate::model::MAX_FIELD_BYTES;
+
+        let big = "a".repeat(MAX_FIELD_BYTES * 3);
+        let lines = vec![
+            format!("Title: {big}"),
+            format!("Artist: {big}"),
+            format!("Album: {big}"),
+            "file: http://host/clip.mp4".to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let song = pairs(&refs);
+        let status = pairs(&["state: play", "songid: 42"]);
+        let admitted = to_state(&status, &song).admitted();
+
+        assert_eq!(admitted.title.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.artist.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.album.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.player, "mpd");
+        assert_eq!(admitted.track_id.as_deref(), Some("42"));
+        assert!(state_bytes(&admitted) <= MAX_STATE_BYTES);
+    }
+
+    #[test]
+    fn decode_budget_oversized_songid_is_dropped_never_truncated() {
+        use crate::model::MAX_ID_BYTES;
+
+        let exact_id = "9".repeat(MAX_ID_BYTES);
+        let exact_line = format!("songid: {exact_id}");
+        let exact_refs = [exact_line.as_str()];
+        let exact_status = pairs(&exact_refs);
+        let exact = to_state(&exact_status, &[]).admitted();
+        assert_eq!(exact.track_id.as_deref().map(str::len), Some(MAX_ID_BYTES));
+        assert_eq!(exact.track_id.as_deref(), Some(exact_id.as_str()));
+
+        let too_long_id = "9".repeat(MAX_ID_BYTES + 1);
+        let too_long_line = format!("songid: {too_long_id}");
+        let too_long_refs = [too_long_line.as_str()];
+        let too_long_status = pairs(&too_long_refs);
+        let too_long = to_state(&too_long_status, &[]).admitted();
+        assert!(too_long.track_id.is_none());
+    }
 }
