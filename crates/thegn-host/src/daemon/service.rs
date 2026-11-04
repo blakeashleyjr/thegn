@@ -5663,6 +5663,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_set_status_door_matches_the_transition_table_for_every_pair() {
+        use thegn_core::issue::AgentDispatchStatus as St;
+
+        let (svc, _rx) = service(0);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("dispatch-door.sqlite");
+        svc.db = Arc::new(Mutex::new(Db::open_at(&db_path).unwrap()));
+        let stored = [
+            St::Queued,
+            St::Spawning,
+            St::Running,
+            St::WaitingHuman,
+            St::PrOpen,
+            St::Merged,
+            St::Abandoned,
+            St::Done,
+            St::Failed,
+            St::Unknown,
+        ];
+        let targets = stored;
+        let mut pair: usize = 0;
+
+        for (index, from) in stored.iter().copied().enumerate() {
+            for to in targets {
+                let pair_index = pair;
+                pair += 1;
+                let db_path = db_path.clone();
+                let id = svc
+                    .with_db(move |db| {
+                        use thegn_core::store::NotificationStore;
+
+                        let issue_id = format!("linear:DOOR-{index}-{pair_index}");
+                        let worktree_path = format!("/wt/door-{index}-{pair_index}");
+                        let id = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
+                            &issue_id,
+                            &worktree_path,
+                            "claude",
+                        ))?;
+                        if from == St::Unknown {
+                            rusqlite::Connection::open(db_path)?.execute(
+                                "UPDATE agent_dispatches SET status='zombie' WHERE id=?1",
+                                [id],
+                            )?;
+                        } else {
+                            db.update_dispatch_status(id, from)?;
+                        }
+                        Ok(id)
+                    })
+                    .await
+                    .unwrap();
+
+                let result = svc.dispatch_set_status(id, to).await;
+                let allowed = thegn_core::db::set_status_transition_allowed(from, to);
+                let outcome_matches = if to == St::Unknown {
+                    matches!(&result, Err(ControlError::InvalidArgument(_)))
+                } else if allowed {
+                    result.is_ok()
+                } else {
+                    matches!(&result, Err(ControlError::FailedPrecondition(_)))
+                };
+                assert!(
+                    outcome_matches,
+                    "{} -> {}: {result:?}",
+                    from.as_str(),
+                    to.as_str()
+                );
+
+                let actual_status = svc
+                    .dispatches_list(None, Db::ROSTER_HISTORY_LIMIT)
+                    .await
+                    .unwrap()
+                    .dispatches
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .status;
+                let expected_status = if result.is_ok() { to } else { from };
+                assert_eq!(
+                    actual_status,
+                    expected_status,
+                    "{} -> {}: refusal must leave the stored row unchanged",
+                    from.as_str(),
+                    to.as_str()
+                );
+            }
+        }
+
+        assert!(matches!(
+            svc.dispatch_set_status(9_999_999, St::Running).await,
+            Err(ControlError::NotFound(_))
+        ));
+
+        let codes = [
+            ControlError::NotFound(String::new()).code(),
+            ControlError::InvalidArgument(String::new()).code(),
+            ControlError::FailedPrecondition(String::new()).code(),
+            ControlError::Conflict(String::new()).code(),
+        ];
+        assert!(
+            codes
+                .iter()
+                .enumerate()
+                .all(|(index, code)| !codes[..index].contains(code))
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_put_refuses_a_missing_parent_without_a_row() {
         let (svc, _rx) = service(0);
         let (_dir, wt) = git_worktree();
