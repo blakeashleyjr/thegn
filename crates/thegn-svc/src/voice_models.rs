@@ -414,12 +414,11 @@ mod tests {
         assert_eq!(hashes.get(), 0, "unchanged marker must skip SHA-256");
         let metadata = std::fs::metadata(&path).unwrap();
         let (modified_secs, modified_nanos) = marker_metadata(&metadata).unwrap();
-        let stale_marker = VerifiedMarker {
-            bytes: metadata.len(),
-            modified_secs: modified_secs.saturating_add(1),
-            modified_nanos,
-            sha256: artifact.sha256.into(),
-        };
+        let mut stale_marker: VerifiedMarker =
+            serde_json::from_slice(&std::fs::read(marker_path(&path)).unwrap()).unwrap();
+        assert_eq!(stale_marker.bytes, metadata.len());
+        assert_eq!(stale_marker.modified_nanos, modified_nanos);
+        stale_marker.modified_secs = modified_secs.saturating_add(1);
         std::fs::write(
             marker_path(&path),
             serde_json::to_vec(&stale_marker).unwrap(),
