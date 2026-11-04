@@ -2318,6 +2318,13 @@ pub(crate) fn migrate_v105(conn: &Connection) -> Result<()> {
          ALTER TABLE ci_autofix_dedupe_v105 RENAME TO ci_autofix_dedupe;",
     )?;
     tx.commit()?;
+    // Rebuilding the table releases its old pages. Reclaim them now so a
+    // fresh incremental-mode database does not start maintenance with
+    // migration-only freelist entries.
+    // `incremental_vacuum` frees one page per step: step it to completion.
+    let mut vacuum = conn.prepare("PRAGMA incremental_vacuum")?;
+    let mut freed = vacuum.query([])?;
+    while freed.next()?.is_some() {}
     Ok(())
 }
 
@@ -4145,7 +4152,9 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE ci_autofix_dedupe (
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             VACUUM;
+             CREATE TABLE ci_autofix_dedupe (
                  worktree TEXT NOT NULL,
                  run_id TEXT NOT NULL,
                  job_id TEXT NOT NULL,
@@ -4163,6 +4172,10 @@ mod tests {
         super::migrate_v105(&conn).unwrap();
         super::migrate_v105(&conn).unwrap();
         super::verify_v105_schema(&conn).unwrap();
+        let freelist_count: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(freelist_count, 0, "v105 migration leaves no rebuild pages");
         let attempt: i64 = conn
             .query_row(
                 "SELECT attempt FROM ci_autofix_dedupe WHERE worktree='/wt/legacy'",
