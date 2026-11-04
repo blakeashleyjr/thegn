@@ -4788,6 +4788,7 @@ model = "base.en"
 # Complete multipart WAV endpoint returning JSON {"text":"..."}.
 endpoint = ""
 # Optional secret broker reference; no token in config or process arguments.
+# A credential requires https unless the endpoint host is loopback.
 # credential = "env:STT_TOKEN"
 # Embedded/HTTP rolling previews. HTTP repeats overlapping audio and may bill
 # each request; false sends only the final recording. Commands are final-only.

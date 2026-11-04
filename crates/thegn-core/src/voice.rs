@@ -514,6 +514,165 @@ mod tests {
     }
 
     #[test]
+    fn every_voice_error_display_and_classification_arm_is_covered() {
+        for (error, class, display) in [
+            (
+                VoiceError::NotConfigured,
+                ErrorClass::NotConfigured,
+                "voice is not configured",
+            ),
+            (
+                VoiceError::NotInstalled("mic".into()),
+                ErrorClass::NotInstalled,
+                "mic",
+            ),
+            (
+                VoiceError::InvalidInput("wav".into()),
+                ErrorClass::Other,
+                "invalid voice input",
+            ),
+            (
+                VoiceError::Failed("decode".into()),
+                ErrorClass::Other,
+                "voice transcription failed",
+            ),
+            (
+                VoiceError::HttpStatus(400),
+                ErrorClass::Other,
+                "HTTP transcription rejected",
+            ),
+            (
+                VoiceError::UnresolvedProcess("pid".into()),
+                ErrorClass::Other,
+                "shutdown could not be proven",
+            ),
+            (
+                VoiceError::Unsupported("preview"),
+                ErrorClass::Unsupported,
+                "not supported",
+            ),
+        ] {
+            assert_eq!(error.class(), class);
+            assert!(error.to_string().contains(display), "{error}");
+        }
+        assert!(
+            VoiceError::HttpStatus(401)
+                .to_string()
+                .contains("authentication")
+        );
+        assert!(
+            VoiceError::HttpStatus(429)
+                .to_string()
+                .contains("rate limit")
+        );
+        assert!(VoiceError::Timeout.to_string().contains("timed out"));
+        assert!(
+            VoiceError::Connection
+                .to_string()
+                .contains("connection failed")
+        );
+    }
+
+    #[test]
+    fn partial_stopped_and_stale_request_events_follow_reducer_contract() {
+        let mut id = 0;
+        let recording = reduce(
+            &VoiceState::Idle,
+            &mut id,
+            VoiceEvent::Start {
+                pane_id: 3,
+                now_ms: 10,
+            },
+        )
+        .state;
+        assert_eq!(
+            reduce(
+                &recording,
+                &mut id,
+                VoiceEvent::Partial {
+                    pane_id: 3,
+                    request_id: 1,
+                    transcript: "one\ntwo".into()
+                }
+            )
+            .effects,
+            vec![VoiceEffect::Preview("one two".into())]
+        );
+        assert!(
+            reduce(
+                &recording,
+                &mut id,
+                VoiceEvent::Partial {
+                    pane_id: 3,
+                    request_id: 0,
+                    transcript: "stale".into()
+                }
+            )
+            .effects
+            .is_empty()
+        );
+        assert_eq!(
+            reduce(
+                &recording,
+                &mut id,
+                VoiceEvent::CaptureStopped {
+                    pane_id: 3,
+                    request_id: 0
+                }
+            )
+            .state,
+            recording
+        );
+        let stopped = reduce(
+            &recording,
+            &mut id,
+            VoiceEvent::CaptureStopped {
+                pane_id: 3,
+                request_id: 1,
+            },
+        )
+        .state;
+        assert!(matches!(
+            &stopped,
+            VoiceState::Transcribing { request_id: 1, .. }
+        ));
+        assert_eq!(
+            reduce(
+                &stopped,
+                &mut id,
+                VoiceEvent::TranscriptSucceeded {
+                    pane_id: 3,
+                    request_id: 0,
+                    transcript: "stale final".into()
+                }
+            )
+            .state,
+            stopped
+        );
+    }
+
+    #[test]
+    fn empty_success_is_the_no_speech_transition() {
+        let recording = VoiceState::Recording {
+            pane_id: 5,
+            started_at: 0,
+            request_id: 1,
+        };
+        let mut id = 1;
+        let transition = reduce(
+            &recording,
+            &mut id,
+            VoiceEvent::TranscriptSucceeded {
+                pane_id: 5,
+                request_id: 1,
+                transcript: " \n ".into(),
+            },
+        );
+        assert_eq!(transition.state, VoiceState::Idle);
+        assert!(transition.effects.is_empty());
+    }
+
+    #[test]
     fn every_happy_path_transition_is_explicit() {
         let mut id = 0;
         let idle = VoiceState::Idle;

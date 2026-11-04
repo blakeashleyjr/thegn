@@ -79,6 +79,44 @@ pub fn status(cfg: &VoiceConfig) -> serde_json::Value {
     })
 }
 
+fn validate_language(language: &str) -> Result<()> {
+    anyhow::ensure!(
+        !language.is_empty()
+            && language.len() <= 32
+            && language
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == '-'),
+        "use a language code or auto"
+    );
+    Ok(())
+}
+
+fn validate_credential_reference(reference: &str) -> Result<()> {
+    anyhow::ensure!(
+        ["env:", "file:", "keyring:"]
+            .iter()
+            .any(|prefix| reference.starts_with(prefix)),
+        "credential must be an env:, file:, or keyring: reference"
+    );
+    Ok(())
+}
+
+fn remove_model(dir: &std::path::Path, name: &str) -> Result<()> {
+    models::sweep_temps(dir)?;
+    let path = models::path_in(dir, name)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let marker = dir.join(format!("ggml-{name}.verified.json"));
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
     match action {
         Action::Status { json } => {
@@ -131,14 +169,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                 pull(&name, yes)?;
                 Ok(())
             }
-            ModelAction::Rm { name } => {
-                let path = models::path_in(&models::store_dir(), &name)?;
-                match std::fs::remove_file(path) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e.into()),
-                }
-            }
+            ModelAction::Rm { name } => remove_model(&models::store_dir(), &name),
         },
         Action::Setup {
             language,
@@ -154,14 +185,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                 Some(v) => v,
                 None => prompt("Language code (en, fr, …; auto for detection)", "en")?,
             };
-            anyhow::ensure!(
-                !language.is_empty()
-                    && language.len() <= 32
-                    && language
-                        .chars()
-                        .all(|c| c.is_ascii_alphabetic() || c == '-'),
-                "use a language code or auto"
-            );
+            validate_language(&language)?;
             let recommended = if language == "en" { "base.en" } else { "base" };
             let selected = match model {
                 Some(v) => v,
@@ -187,12 +211,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                 voice.endpoint = endpoint;
             }
             if let Some(reference) = credential {
-                anyhow::ensure!(
-                    ["env:", "file:", "keyring:"]
-                        .iter()
-                        .any(|p| reference.starts_with(p)),
-                    "credential must be an env:, file:, or keyring: reference"
-                );
+                validate_credential_reference(&reference)?;
                 voice.credential = Some(reference);
             }
             match provider {
@@ -224,6 +243,9 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                         )?;
                     }
                     thegn_svc::voice_http::validate_endpoint(&voice.endpoint)?;
+                    voice
+                        .validate_credential_transport()
+                        .map_err(anyhow::Error::msg)?;
                     if voice.live_preview {
                         msg::warn(
                             "Live HTTP previews repeatedly send overlapping audio and may incur repeated billing. Use --final-only to send just the final recording.",
@@ -299,4 +321,54 @@ fn pull(name: &str, yes: bool) -> Result<PathBuf> {
     .context("model download failed; run voice model pull again to retry")?;
     eprintln!("\nInstalled {}", path.display());
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_arguments_validate_language_credential_reference_and_endpoint() {
+        assert!(validate_language("auto").is_ok());
+        assert!(validate_language("en-US").is_ok());
+        assert!(validate_language("bad/locale").is_err());
+        assert!(validate_credential_reference("env:STT_TOKEN").is_ok());
+        assert!(validate_credential_reference("file:/tmp/token").is_ok());
+        assert!(validate_credential_reference("literal-token").is_err());
+        assert!(thegn_svc::voice_http::validate_endpoint("http://127.0.0.1:8000/stt").is_ok());
+        assert!(thegn_svc::voice_http::validate_endpoint("file:///tmp/audio").is_err());
+    }
+
+    #[test]
+    fn status_json_has_the_documented_readiness_shape() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let report = status(&VoiceConfig::default());
+        for key in [
+            "enabled",
+            "kind",
+            "language",
+            "model",
+            "model_path",
+            "model_error",
+            "model_present",
+            "native_compiled",
+            "metal_compiled",
+            "live_preview",
+            "credential_configured",
+            "timeout_seconds",
+            "setup",
+        ] {
+            assert!(report.get(key).is_some(), "missing status key {key}");
+        }
+        assert_eq!(report["enabled"], false);
+        assert_eq!(report["kind"], "command");
+    }
+
+    #[test]
+    fn model_remove_is_idempotent() {
+        let state = thegn_core::testenv::IsolatedState::new();
+        let dir = state.root().join("models");
+        assert!(remove_model(&dir, "tiny").is_ok());
+        assert!(remove_model(&dir, "tiny").is_ok());
+    }
 }

@@ -87,6 +87,34 @@ impl VoiceConfig {
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_seconds.clamp(1, 300))
     }
+
+    /// A configured bearer credential may only travel over TLS, except to a
+    /// loopback HTTP endpoint used by a local transcription service.
+    pub fn validate_credential_transport(&self) -> Result<(), String> {
+        if self.credential.is_none() {
+            return Ok(());
+        }
+        let endpoint = url::Url::parse(&self.endpoint).map_err(|_| {
+            "voice endpoint must use https when a credential is configured".to_owned()
+        })?;
+        let loopback = endpoint.host_str().is_some_and(|host| {
+            let ip = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host.eq_ignore_ascii_case("localhost")
+                || ip
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+        if endpoint.scheme() == "http" && !loopback {
+            return Err(
+                "voice credentials require https unless the endpoint host is loopback; use https"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +158,33 @@ max_seconds = 17
         assert_eq!(cfg.capture_command, ["mic", "--wav"]);
         assert_eq!(cfg.command, ["stt", "--stdin"]);
         assert_eq!(cfg.max_seconds, 17);
+    }
+
+    #[test]
+    fn defaults_and_request_deadline_are_bounded() {
+        let cfg = VoiceConfig::default();
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.model, "base.en");
+        assert_eq!(cfg.endpoint, "");
+        assert_eq!(cfg.credential, None);
+        assert!(cfg.live_preview);
+        assert_eq!(cfg.timeout_seconds, 60);
+        assert_eq!(cfg.request_timeout(), Duration::from_secs(60));
+        assert_eq!(
+            VoiceConfig {
+                timeout_seconds: 0,
+                ..cfg.clone()
+            }
+            .request_timeout(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            VoiceConfig {
+                timeout_seconds: u64::MAX,
+                ..cfg
+            }
+            .request_timeout(),
+            Duration::from_secs(300)
+        );
     }
 }

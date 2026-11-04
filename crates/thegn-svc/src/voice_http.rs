@@ -64,6 +64,17 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), VoiceError> {
     Ok(())
 }
 
+fn validate_transport(endpoint: &str, credential: Option<&str>) -> Result<(), VoiceError> {
+    validate_endpoint(endpoint)?;
+    let cfg = VoiceConfig {
+        endpoint: endpoint.into(),
+        credential: credential.map(str::to_owned),
+        ..Default::default()
+    };
+    cfg.validate_credential_transport()
+        .map_err(VoiceError::InvalidInput)
+}
+
 /// Drops the HTTP future on cancellation or the total deadline. Response bodies
 /// and reqwest errors are never included in diagnostics (may contain credentials).
 pub fn transcribe(
@@ -72,7 +83,7 @@ pub fn transcribe(
     wav: &[u8],
     cancel: &AtomicBool,
 ) -> Result<String, VoiceError> {
-    validate_endpoint(&cfg.endpoint)?;
+    validate_transport(&cfg.endpoint, credential)?;
     if cfg.model.is_empty() {
         return Err(VoiceError::NotConfigured);
     }
@@ -209,6 +220,44 @@ mod tests {
             assert!(validate_endpoint(endpoint).is_err());
         }
         assert!(validate_endpoint("http://127.0.0.1:8000/v1/audio/transcriptions").is_ok());
+    }
+
+    #[test]
+    fn credential_transport_allows_loopback_https_and_no_credential_only() {
+        for endpoint in [
+            "http://127.9.8.7:8000/stt",
+            "http://[::1]:8000/stt",
+            "http://localhost:8000/stt",
+            "https://stt.example/stt",
+        ] {
+            assert!(
+                validate_transport(endpoint, Some("token")).is_ok(),
+                "{endpoint}"
+            );
+        }
+        let error = validate_transport("http://stt.example/stt", Some("token"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("use https"));
+        assert!(validate_transport("http://stt.example/stt", None).is_ok());
+    }
+
+    #[test]
+    fn request_refuses_plaintext_non_loopback_before_network_io() {
+        let cfg = VoiceConfig {
+            endpoint: "http://stt.example/transcribe".into(),
+            model: "fixture".into(),
+            ..Default::default()
+        };
+        let error = transcribe(
+            &cfg,
+            Some("token"),
+            b"RIFF0000WAVE",
+            &AtomicBool::new(false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("use https"));
     }
 }
 
