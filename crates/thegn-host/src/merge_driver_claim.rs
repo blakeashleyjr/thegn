@@ -258,6 +258,14 @@ impl RowClaim {
         self.lost.load(Ordering::Acquire)
     }
 
+    /// The claim generation this drain holds; constant for the life of the claim (status writes keep it).
+    pub(super) fn generation(&self) -> i64 {
+        self.claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
     pub(super) fn finish(mut self, db: &Db) -> anyhow::Result<()> {
         self.stop_heartbeat();
         if self.lost() {
