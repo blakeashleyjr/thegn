@@ -772,6 +772,52 @@ fn valid_slug(name: &str) -> Result<String, String> {
     Ok(slug)
 }
 
+/// Refuse a save whose identity another theme file already claims (THE-511): a file other than `destination`
+/// whose embedded name equals `name` exactly, or slugs to `slug`, would make the next catalog scan drop both.
+fn ensure_identity_unclaimed(
+    dir: &Path,
+    destination: &Path,
+    name: &str,
+    slug: &str,
+) -> Result<(), String> {
+    let mut warnings = Vec::new();
+    let paths = bounded_theme_paths(
+        dir,
+        destination.file_name().and_then(|name| name.to_str()),
+        &mut warnings,
+    );
+    if let Some(warning) = warnings
+        .iter()
+        .find(|warning| warning.starts_with("theme directory could not be read"))
+    {
+        return Err(format!(
+            "cannot verify theme identities in {}: {warning}; nothing was written",
+            dir.display()
+        ));
+    }
+    for path in paths {
+        if path == destination {
+            continue;
+        }
+        let Ok(bytes) = read_bounded(&path) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(other) = UserTheme::from_toml(text) else {
+            continue;
+        };
+        if other.meta.name == name || thegn_core::util::slugify(&other.meta.name) == slug {
+            return Err(format!(
+                "theme name `{name}` is already claimed by `{}`; rename or remove that file first (nothing was written)",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn write_theme(dir: &Path, theme: &UserTheme) -> Result<(), String> {
     write_theme_expect(dir, theme, SaveExpect::New).map(|_| ())
 }
@@ -793,6 +839,7 @@ pub(crate) fn write_theme_expect(
     let slug = valid_slug(&theme.meta.name)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let destination = dir.join(format!("{slug}.toml"));
+    ensure_identity_unclaimed(dir, &destination, &theme.meta.name, &slug)?;
     match read_bounded(&destination) {
         Ok(bytes) => {
             let existing = UserTheme::from_toml(
@@ -1813,5 +1860,125 @@ mod tests {
             std::fs::read(temp.path().join("themes/tracked.toml")).unwrap(),
             external_bytes.as_bytes()
         );
+    }
+
+    #[test]
+    fn save_refuses_a_name_claimed_by_a_mismatched_file() {
+        let dir = temp_dir("claimed-exact");
+        let claimant = dir.join("other.toml");
+        let bytes = theme("Dusk").to_toml().unwrap();
+        std::fs::write(&claimant, bytes.as_bytes()).unwrap();
+        let before = std::fs::read(&claimant).unwrap();
+
+        let error = write_theme(&dir, &theme("Dusk")).unwrap_err();
+
+        assert!(error.contains("already claimed"), "{error}");
+        assert!(error.contains("other.toml"), "{error}");
+        assert!(!dir.join("dusk.toml").exists());
+        assert_eq!(std::fs::read(&claimant).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_refuses_a_slug_claimed_by_a_mismatched_file() {
+        let dir = temp_dir("claimed-slug");
+        let claimant = dir.join("other.toml");
+        let bytes = theme("Night Sky").to_toml().unwrap();
+        std::fs::write(&claimant, bytes.as_bytes()).unwrap();
+
+        let error = write_theme(&dir, &theme("night-sky")).unwrap_err();
+
+        assert!(error.contains("already claimed"), "{error}");
+        assert!(error.contains("other.toml"), "{error}");
+        assert!(!dir.join("night-sky.toml").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_never_hides_the_saved_theme_from_the_catalog() {
+        let dir = temp_dir("catalog-claim");
+        let claimant = dir.join("other.toml");
+        std::fs::write(&claimant, theme("Dusk").to_toml().unwrap()).unwrap();
+        let (before_themes, before_warnings) = scan_dir(&dir, None);
+
+        let error = write_theme(&dir, &theme("Dusk")).unwrap_err();
+        assert!(error.contains("already claimed"), "{error}");
+        let (after_themes, after_warnings) = scan_dir(&dir, None);
+        assert_eq!(
+            after_themes
+                .iter()
+                .map(|candidate| candidate.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            before_themes
+                .iter()
+                .map(|candidate| candidate.meta.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(after_warnings, before_warnings);
+
+        std::fs::remove_file(&claimant).unwrap();
+        write_theme(&dir, &theme("Dusk")).unwrap();
+        let (themes, warnings) = scan_dir(&dir, None);
+        assert!(themes.iter().any(|candidate| candidate.meta.name == "Dusk"));
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous user theme identity"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refused_replace_keeps_both_files() {
+        let dir = temp_dir("replace-claim");
+        let destination = dir.join("dusk.toml");
+        write_theme(&dir, &theme("Dusk")).unwrap();
+        let destination_before = std::fs::read(&destination).unwrap();
+        let hash: [u8; 32] = Sha256::digest(&destination_before).into();
+        let claimant = dir.join("other.toml");
+        let claimant_bytes = theme("Dusk").to_toml().unwrap();
+        std::fs::write(&claimant, claimant_bytes.as_bytes()).unwrap();
+        let claimant_before = std::fs::read(&claimant).unwrap();
+        let mut modified = theme("Dusk");
+        modified.colors.text = "#555555".into();
+
+        let error = write_theme_expect(&dir, &modified, SaveExpect::Replace(hash)).unwrap_err();
+
+        assert!(error.contains("already claimed"), "{error}");
+        assert!(error.contains("other.toml"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), destination_before);
+        assert_eq!(std::fs::read(&claimant).unwrap(), claimant_before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_ignores_unparseable_toml_files() {
+        let dir = temp_dir("unparseable-claim");
+        std::fs::write(dir.join("junk.toml"), b"not = [valid").unwrap();
+
+        write_theme(&dir, &theme("Dawn")).unwrap();
+
+        assert!(dir.join("dawn.toml").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_legacy_scan_preserves_every_source_file() {
+        let dir = temp_dir("ambiguous-preserve");
+        let twin = theme("Twin").to_toml().unwrap();
+        let first = dir.join("a.toml");
+        let second = dir.join("b.toml");
+        std::fs::write(&first, twin.as_bytes()).unwrap();
+        std::fs::write(&second, twin.as_bytes()).unwrap();
+        let first_before = std::fs::read(&first).unwrap();
+        let second_before = std::fs::read(&second).unwrap();
+
+        let (_, first_warnings) = scan_dir(&dir, None);
+        let (_, second_warnings) = scan_dir(&dir, None);
+
+        assert_eq!(first_warnings, second_warnings);
+        assert_eq!(std::fs::read(&first).unwrap(), first_before);
+        assert_eq!(std::fs::read(&second).unwrap(), second_before);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

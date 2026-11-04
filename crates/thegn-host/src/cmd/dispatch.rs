@@ -117,6 +117,9 @@ pub enum Action {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
+        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
+        lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why`.
         #[arg(long, requires = "why")]
         admin: bool,
@@ -192,6 +195,9 @@ pub enum Action {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
+        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
+        lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why` on the row.
         #[arg(long, requires = "why")]
         admin: bool,
@@ -204,13 +210,20 @@ pub enum Action {
     },
     /// Take, renew, release or inspect the pipeline monitor lease — the guard
     /// that stops two Leads driving one pipeline and filling the same slots.
+    ///
+    /// Acquire contention exits 2 with JSON `acquired: false` and a holder;
+    /// CLI argument errors also exit 2 but have no JSON. Invalid name/owner or
+    /// storage errors exit 1. Renew exits 1 for missing, replaced or expired
+    /// leases. Release always exits 0 and reports released, missing, replaced
+    /// or expired; show reports free, live or expired. Acquire prints a
+    /// generation to pass as `--lease-gen` on fenced Lead mutations.
     Lease {
         /// What to do: `acquire` | `renew` | `release` | `show`.
         action: String,
         /// Who is asking (a stable id for this monitor process).
         #[arg(long)]
         owner: Option<String>,
-        /// Lease lifetime in seconds (5–86400); renew before it lapses.
+        /// Lease lifetime in seconds (5–86400); renew before it lapses. Out-of-range values are refused before any write.
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(i64).range(thegn_core::db::MIN_LEASE_TTL_SECS..=thegn_core::db::MAX_LEASE_TTL_SECS))]
         ttl: i64,
         /// The lease name — one pipeline per name.
@@ -254,6 +267,9 @@ pub enum Action {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
+        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
+        lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why` on the row.
         #[arg(long, requires = "why", conflicts_with = "lease")]
         admin: bool,
@@ -498,6 +514,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             allow_scope_overlap,
             lease,
             owner,
+            lease_gen,
             admin,
             why,
             json,
@@ -514,7 +531,13 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                 chunk.as_deref(),
                 allow_duplicate.as_deref(),
                 allow_scope_overlap.as_deref(),
-                lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
+                lead_proof(
+                    lease.as_deref(),
+                    owner.as_deref(),
+                    admin,
+                    why.as_deref(),
+                    lease_gen,
+                ),
                 json,
             )
         }
@@ -538,13 +561,20 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             force_reason,
             lease,
             owner,
+            lease_gen,
             admin,
             why,
             json,
         } => {
             let (issue_id, worktree_path) = dispatch_identity(&issue_id, &worktree_path)?;
             let db = Db::open()?;
-            let proof = lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref());
+            let proof = lead_proof(
+                lease.as_deref(),
+                owner.as_deref(),
+                admin,
+                why.as_deref(),
+                lease_gen,
+            );
             if let Some(chunk_path) = chunk.as_deref() {
                 if force && force_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
                     anyhow::bail!("dispatch put --chunk --force requires --force-reason <reason>");
@@ -655,6 +685,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             why,
             lease,
             owner,
+            lease_gen,
             admin,
             json,
         } => set_status(
@@ -662,7 +693,13 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             &status,
             force,
             why.as_deref(),
-            lead_proof(lease.as_deref(), owner.as_deref(), admin, why.as_deref()),
+            lead_proof(
+                lease.as_deref(),
+                owner.as_deref(),
+                admin,
+                why.as_deref(),
+                lease_gen,
+            ),
             json,
         ),
         Action::Verify { id, json } => verify(id, json),
@@ -954,13 +991,21 @@ fn lead_proof<'a>(
     owner: Option<&'a str>,
     admin: bool,
     why: Option<&'a str>,
+    lease_gen: Option<i64>,
 ) -> LeadProof<'a> {
     if admin {
         LeadProof::Admin {
             why: why.unwrap_or(""),
         }
     } else if let (Some(name), Some(owner)) = (lease, owner) {
-        LeadProof::Lease { name, owner }
+        match lease_gen {
+            Some(generation) => LeadProof::Fenced {
+                name,
+                owner,
+                generation,
+            },
+            None => LeadProof::Lease { name, owner },
+        }
     } else {
         LeadProof::Unbound
     }
@@ -5142,6 +5187,7 @@ mod tests {
                     allow_scope_overlap: None,
                     lease: None,
                     owner: None,
+                    lease_gen: None,
                     admin: false,
                     why: None,
                     json: false,
@@ -5162,6 +5208,7 @@ mod tests {
                     force_reason: None,
                     lease: None,
                     owner: None,
+                    lease_gen: None,
                     admin: false,
                     why: None,
                     json: false,
@@ -5176,6 +5223,7 @@ mod tests {
                     why: None,
                     lease: None,
                     owner: None,
+                    lease_gen: None,
                     admin: false,
                     json: false,
                 },
@@ -5840,6 +5888,130 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn lease_gen_cli_requires_a_lease_and_a_positive_generation() {
+        use clap::Parser as _;
+
+        let commands = [
+            vec!["thegn", "dispatch", "put", "linear:X", "/w", "a"],
+            vec![
+                "thegn", "dispatch", "claim", "linear:X", "/w", "a", "--stage", "s",
+            ],
+            vec!["thegn", "dispatch", "set-status", "1", "done"],
+        ];
+        for base_argv in commands {
+            let mut valid = base_argv.clone();
+            valid.extend(["--lease", "l", "--owner", "o", "--lease-gen", "3"]);
+            assert!(
+                crate::Cli::try_parse_from(&valid).is_ok(),
+                "{}",
+                valid.join(" ")
+            );
+
+            let mut missing_lease = base_argv.clone();
+            missing_lease.extend(["--lease-gen", "3"]);
+            assert!(
+                crate::Cli::try_parse_from(&missing_lease).is_err(),
+                "{}",
+                missing_lease.join(" ")
+            );
+
+            let mut zero = base_argv.clone();
+            zero.extend(["--lease", "l", "--owner", "o", "--lease-gen", "0"]);
+            let zero_error = match crate::Cli::try_parse_from(&zero) {
+                Err(error) => error,
+                Ok(_) => panic!("zero lease generation was accepted: {}", zero.join(" ")),
+            };
+            assert_eq!(
+                zero_error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{}",
+                zero.join(" ")
+            );
+
+            let mut negative = base_argv;
+            negative.extend(["--lease", "l", "--owner", "o", "--lease-gen=-1"]);
+            assert!(
+                crate::Cli::try_parse_from(&negative).is_err(),
+                "{}",
+                negative.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn lease_gen_builds_a_fenced_proof() {
+        assert_eq!(
+            lead_proof(Some("l"), Some("o"), false, None, Some(7)),
+            LeadProof::Fenced {
+                name: "l",
+                owner: "o",
+                generation: 7,
+            }
+        );
+        assert_eq!(
+            lead_proof(Some("l"), Some("o"), false, None, None),
+            LeadProof::Lease {
+                name: "l",
+                owner: "o",
+            }
+        );
+        assert_eq!(
+            lead_proof(Some("l"), Some("o"), true, Some("manual"), Some(7)),
+            LeadProof::Admin { why: "manual" }
+        );
+    }
+
+    #[test]
+    fn lease_gen_stale_generation_refuses_a_claim_and_writes_nothing() {
+        let db = Db::open_memory().unwrap();
+        let lease = "repo:linear:X";
+        let g1 = db
+            .acquire_pipeline_lease_fenced(lease, "lead-a", thegn_core::db::MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        db.release_pipeline_lease_row(lease, "lead-a").unwrap();
+        let g2 = db
+            .acquire_pipeline_lease_fenced(lease, "lead-a", thegn_core::db::MIN_LEASE_TTL_SECS)
+            .unwrap()
+            .unwrap();
+        assert!(g2 > g1);
+
+        let stale = match db.claim_dispatch_admitted_led(
+            NewDispatch::new("linear:X", "/wt/a", "coder"),
+            2,
+            None,
+            None,
+            None,
+            lead_proof(Some(lease), Some("lead-a"), false, None, Some(g1)),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("stale generation unexpectedly admitted the claim"),
+        };
+        assert!(matches!(
+            stale.downcast_ref::<thegn_core::db::LeadLeaseConflict>(),
+            Some(thegn_core::db::LeadLeaseConflict::StaleGeneration {
+                presented,
+                current,
+                ..
+            }) if *presented == g1 && *current == g2
+        ));
+        assert_eq!(set_status_error_kind(&stale), Some("lead_lease"));
+        assert!(db.list_dispatches().unwrap().is_empty());
+
+        let current = db
+            .claim_dispatch_admitted_led(
+                NewDispatch::new("linear:X", "/wt/a", "coder"),
+                2,
+                None,
+                None,
+                None,
+                lead_proof(Some(lease), Some("lead-a"), false, None, Some(g2)),
+            )
+            .unwrap();
+        assert!(current.is_ok());
     }
 
     #[test]
