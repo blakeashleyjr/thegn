@@ -329,6 +329,22 @@ agent_on_floor_miss = "fail"
         cmd
     }
     fn run(&mut self, cmd: Command) -> custody::Output {
+        let argv = std::iter::once(cmd.get_program())
+            .chain(cmd.get_args())
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let out = self.run_any(cmd);
+        assert!(
+            out.status.success(),
+            "private argv {argv:?}: {:?}\n{}\n{}",
+            out.status,
+            out.stdout,
+            out.stderr
+        );
+        out
+    }
+
+    fn run_any(&mut self, cmd: Command) -> custody::Output {
         self.serial += 1;
         let argv = std::iter::once(cmd.get_program())
             .chain(cmd.get_args())
@@ -358,13 +374,6 @@ agent_on_floor_miss = "fail"
         assert_eq!(cleanup["retained"], false);
         assert_eq!(cleanup["identity_lost"], false);
         fs::write(self.root.path().join(format!("receipts/{}.json", self.serial)), serde_json::to_vec_pretty(&json!({"sequence":self.serial,"argv":argv,"environment":environment,"thegn_binary_sha256":self.binary_hash,"exit_code":out.status.code(),"elapsed_ms":out.elapsed_ms,"stdout":out.stdout,"stderr":out.stderr,"cleanup":cleanup})).unwrap()).unwrap();
-        assert!(
-            out.status.success(),
-            "private argv {argv:?}: {:?}\n{}\n{}",
-            out.status,
-            out.stdout,
-            out.stderr
-        );
         out
     }
 
@@ -434,6 +443,19 @@ agent_on_floor_miss = "fail"
         argv.extend_from_slice(args);
         let command = self.command(Path::new(env!("CARGO_BIN_EXE_thegn")), &self.repo, &argv);
         self.run(command)
+    }
+    fn cli_failing(&mut self, args: &[&str]) -> custody::Output {
+        let mut argv = vec!["--config", self.config.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        let command = self.command(Path::new(env!("CARGO_BIN_EXE_thegn")), &self.repo, &argv);
+        let out = self.run_any(command);
+        assert!(
+            !out.status.success(),
+            "expected a refusal: {args:?}\n{}\n{}",
+            out.stdout,
+            out.stderr
+        );
+        out
     }
     fn json(&mut self, args: &[&str]) -> Value {
         serde_json::from_str(&self.cli(args).stdout).expect("exactly one CLI JSON document")
@@ -738,6 +760,7 @@ fn agent_row_fixture() -> Fixture {
     fixture
 }
 
+#[derive(Debug, PartialEq)]
 struct RowState {
     status: String,
     agent_attempts: i64,
@@ -762,6 +785,18 @@ fn row_state(fixture: &Fixture) -> RowState {
                 })
             },
         )
+        .unwrap()
+}
+
+fn event_rows(fixture: &Fixture, operation: &str) -> Vec<String> {
+    let connection = Connection::open(fixture.db_path()).unwrap();
+    let mut statement = connection
+        .prepare("SELECT outcome FROM merge_queue_events WHERE operation=?1 ORDER BY id")
+        .unwrap();
+    statement
+        .query_map([operation], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap()
 }
 
@@ -1250,6 +1285,88 @@ fn race_two_cli_drains_have_one_owner() {
     assert_eq!(row_state(&f).phase, "unclaimed");
     assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
     assert_eq!(f.git(&repo, &["rev-parse", "refs/heads/main"]), before_ref);
+    gate_release.disarm();
+    f.close();
+}
+
+// The owner drain holds its FIFO-blocked gate in a separate process group
+// after claiming the row. The rm, retry, and clear commands are fresh custody-
+// owned CLI groups; each must observe that live claim without changing the row.
+// Releasing the gate lets the original owner write ready and release its claim.
+// The lease clock is not simulated, so no recovery path can admit a second
+// owner; the single gate start and unchanged target ref prove no duplicate fold.
+#[test]
+fn race_operator_verbs_are_refused_while_a_drain_holds_the_row() {
+    let mut f = one_row_fixture(FixtureOpts {
+        gate: String::new(),
+        auto_land: false,
+        agent: AgentMode::HeldAtFloor,
+    });
+    let repo = f.repo.clone();
+    let root = f.root.path().to_path_buf();
+    let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    make_gate_fifo(&root, "gate-hold");
+    let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    wait_gate_count(&root, "gate-runs", "start ", 1);
+    let held = row_state(&f);
+    assert_eq!(held.phase, "claimed_no_child");
+    assert!(held.generation >= 1);
+    let wt = f.held.to_str().unwrap().to_owned();
+
+    let rm = f.cli_failing(&["merge", "rm", "--worktree", &wt]);
+    assert!(
+        format!("{}{}", rm.stdout, rm.stderr)
+            .contains("is being worked by a drain; remove it after the drain finishes")
+    );
+    assert_eq!(row_state(&f), held);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+
+    let retry = f.cli_failing(&["merge", "retry", "--worktree", &wt]);
+    assert!(
+        format!("{}{}", retry.stdout, retry.stderr)
+            .contains("is being worked by a drain; retry it after the drain finishes")
+    );
+    assert_eq!(row_state(&f), held);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+
+    let clear = f.cli_failing(&["merge", "clear"]);
+    assert!(format!("{}{}", clear.stdout, clear.stderr).contains("claimed by an active drain"));
+    assert_eq!(row_state(&f), held);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+
+    assert_eq!(
+        event_rows(&f, "retry")
+            .iter()
+            .filter(|outcome| outcome.as_str() == "claimed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        event_rows(&f, "remove")
+            .iter()
+            .filter(|outcome| outcome.as_str() == "claimed")
+            .count(),
+        2,
+        "rm and clear each record the claimed refusal as a remove event"
+    );
+
+    release_gate(&root, "gate-hold", "gate-open");
+    let winner = f.finish_cli(owner);
+    assert!(winner.status.success());
+    let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
+    assert_eq!(winner_json["ready"], json!(["feature"]));
+    let after_drain = row_state(&f);
+    assert_eq!(after_drain.status, "ready");
+    assert_eq!(after_drain.phase, "unclaimed");
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before
+    );
+
+    f.cli(&["merge", "rm", "--worktree", &wt]);
+    assert!(f.rows().is_empty());
     gate_release.disarm();
     f.close();
 }
