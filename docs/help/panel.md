@@ -302,6 +302,11 @@ unknown current context keeps the cached failure.
 It also skips runs cached for another branch, or with no recorded branch, in
 the sidebar and **across**; when the current branch is unknown, cached runs
 still count.
+Background log ingestion reuses a cached job log as evidence only when it
+was fetched for the worktree's current provider context
+(`<system>:<host>/<project>`). CI autofix records that context with each claim,
+so a failure under another project is a new candidate; claims without a
+recorded context never re-fire.
 
 #### CI log retention and privacy
 
@@ -415,6 +420,10 @@ switching worktree cancels outline, references and hover lookups.
 A language-server binary that is world-writable, or owned by a user other than
 you or root, is refused on Unix. For languages with a tree-sitter grammar, the
 outline falls back to the tree-sitter parse when the server cannot start.
+The server executable is checked again just before it starts; if it was
+replaced, retargeted or had its mode changed, it is refused. Paths that are not
+valid UTF-8 are refused rather than sent as lossy names to a language server;
+with a tree-sitter grammar, the outline falls back to that parse.
 
 {{keys:symbols}}
 
