@@ -2002,3 +2002,209 @@ fn zoned_weekly_occurrence_is_one_materialization_for_cache_month_and_reminders(
     );
     assert_eq!(due.reminders[0].occurrence_start_ms, start_ms);
 }
+
+#[test]
+fn fast_account_is_persisted_while_a_hung_sibling_is_still_running() {
+    if !crate::platform::sound_process::test_support::UNIX {
+        return;
+    }
+
+    use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
+
+    let fixture = tempfile::tempdir_in("/tmp").unwrap();
+    crate::platform::set_owner_executable(fixture.path()).unwrap();
+    let fast_ics = fixture.path().join("fast.ics");
+    std::fs::write(
+        &fast_ics,
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//thegn//test//EN\r\nBEGIN:VEVENT\r\nUID:indep-fast-1@example.test\r\nDTSTAMP:20261001T000000Z\r\nDTSTART:20261015T090000Z\r\nDTEND:20261015T100000Z\r\nSUMMARY:Fast\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    )
+    .unwrap();
+
+    let script = fixture.path().join("hung.sh");
+    let go = fixture.path().join("go");
+    let released = fixture.path().join("released");
+    let timedout = fixture.path().join("timedout");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ni=0\nwhile [ ! -e \"$1\" ] && [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.1; done\nif [ -e \"$1\" ]; then : > \"$2\"; else : > \"$3\"; fi\nexit 3\n",
+    )
+    .unwrap();
+    crate::platform::set_owner_executable(&script).unwrap();
+
+    let cfg = CalendarConfig {
+        accounts: vec![
+            CalendarAccount {
+                name: "indep-hung".into(),
+                provider: CalendarProviderKind::Command,
+                command: vec![
+                    script.display().to_string(),
+                    go.display().to_string(),
+                    released.display().to_string(),
+                    timedout.display().to_string(),
+                ],
+                timeout_secs: 30,
+                ..CalendarAccount::default()
+            },
+            CalendarAccount {
+                name: "indep-fast".into(),
+                provider: CalendarProviderKind::Ics,
+                path: fast_ics.display().to_string(),
+                ..CalendarAccount::default()
+            },
+        ],
+        ..CalendarConfig::default()
+    };
+    let t = TmpDb::new("calendar-independence");
+    let db_path = t.dir.join("thegn.db");
+    let watcher_go = go.clone();
+    // The command sleeps in 100 ms intervals for at most ten seconds. The watcher
+    // uses a separate WAL-aware connection and releases it only after both fast
+    // account records are visible, so the sink's completion-order apply is proved.
+    let watcher = std::thread::spawn(move || {
+        let db = Db::open_at(&db_path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            let sync_seen = db
+                .get_calendar_sync("indep-fast")
+                .is_ok_and(|sync| sync.is_some());
+            let events_seen = db.has_calendar_events("indep-fast").unwrap_or(false);
+            if sync_seen && events_seen {
+                std::fs::write(&watcher_go, b"").unwrap();
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        false
+    });
+
+    sync_accounts(
+        &t.db,
+        &cfg,
+        d(2026, 10, 1),
+        d(2026, 10, 31),
+        true,
+        &mut |_| {},
+    );
+    let saw_fast_first = watcher.join().expect("watcher thread");
+
+    assert!(
+        saw_fast_first,
+        "fast account was not persisted before release"
+    );
+    assert!(
+        released.exists(),
+        "hung command did not observe the release file"
+    );
+    assert!(
+        !timedout.exists(),
+        "hung command timed out before the watcher released it"
+    );
+    let hung_sync =
+        t.db.get_calendar_sync("indep-hung")
+            .unwrap()
+            .expect("failed hung account has a sync row");
+    assert!(
+        !hung_sync.last_error.is_empty(),
+        "command failure was not recorded"
+    );
+    assert!(!t.db.has_calendar_events("indep-hung").unwrap());
+    let fast_sync =
+        t.db.get_calendar_sync("indep-fast")
+            .unwrap()
+            .expect("fast account has a sync row");
+    assert!(fast_sync.last_error.is_empty());
+}
+
+#[test]
+fn cache_contents_do_not_depend_on_account_completion_order() {
+    let (from, to) = window();
+    let alpha_page = || {
+        let mut shared = event("shared");
+        shared.source = thegn_core::calendar::SourceId("ics:alpha".into());
+        let mut alpha_only = event("alpha-only");
+        alpha_only.source = thegn_core::calendar::SourceId("ics:alpha".into());
+        page(vec![shared, alpha_only], vec![], "")
+    };
+    let beta_page = || {
+        let mut shared = event("shared");
+        shared.source = thegn_core::calendar::SourceId("ics_url:beta".into());
+        page(vec![shared], vec![], "")
+    };
+
+    let alpha_then_beta = TmpDb::new("order-ab");
+    assert!(apply_page(
+        &alpha_then_beta.db,
+        "alpha",
+        "ics",
+        &alpha_page(),
+        from,
+        to,
+    ));
+    assert!(apply_page(
+        &alpha_then_beta.db,
+        "beta",
+        "ics_url",
+        &beta_page(),
+        from,
+        to,
+    ));
+
+    let beta_then_alpha = TmpDb::new("order-ba");
+    assert!(apply_page(
+        &beta_then_alpha.db,
+        "beta",
+        "ics_url",
+        &beta_page(),
+        from,
+        to,
+    ));
+    assert!(apply_page(
+        &beta_then_alpha.db,
+        "alpha",
+        "ics",
+        &alpha_page(),
+        from,
+        to,
+    ));
+
+    let cached_rows = |db: &Db| {
+        let mut rows: Vec<String> = load_cached(db, from, to)
+            .unwrap()
+            .events
+            .into_iter()
+            .map(|event| format!("{:?}|{}|{}", event.source, event.uid, event.title))
+            .collect();
+        rows.sort();
+        rows
+    };
+    let first = cached_rows(&alpha_then_beta.db);
+    let second = cached_rows(&beta_then_alpha.db);
+    assert_eq!(first, second);
+    assert_eq!(
+        first.len(),
+        3,
+        "same uid from separate accounts must remain distinct"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|row| row == "SourceId(\"ics:alpha\")|shared|shared")
+    );
+    assert!(
+        first
+            .iter()
+            .any(|row| row == "SourceId(\"ics:alpha\")|alpha-only|alpha-only")
+    );
+    assert!(
+        first
+            .iter()
+            .any(|row| row == "SourceId(\"ics_url:beta\")|shared|shared")
+    );
+
+    for db in [&alpha_then_beta.db, &beta_then_alpha.db] {
+        let alpha_sync = db.get_calendar_sync("alpha").unwrap().unwrap();
+        let beta_sync = db.get_calendar_sync("beta").unwrap().unwrap();
+        assert_eq!(alpha_sync.provider, "ics");
+        assert_eq!(beta_sync.provider, "ics_url");
+    }
+}
