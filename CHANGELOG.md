@@ -11,14 +11,12 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Added
 
-- `thegn plugin preview` renders an app-tab fixture (`--fixture <file>` or
-  the bundled `gallery`) or a recorded trace (`--replay`) with the shared app
+- `thegn plugin preview` (dev channel) renders an app-tab fixture
+  (`--fixture <file>` or the bundled `gallery`) or a recorded trace (`--replay`)
+  with the shared app
   renderer, without starting a plugin process. `--headless` prints a JSON
   screen snapshot, `--size COLSxROWS` sets the geometry, and `--record` writes
   a new owner-only trace.
-- The source tree adds `thegn-plugin-sdk` for native plugin processes, with
-  NDJSON framing, session and request correlation, private state, an OS
-  credential store and an HTTPS-only browser opener.
 - The Problems list shows a warning row for a language server that failed to
   start and is backing off, with its failure count and retry time.
 
@@ -44,7 +42,6 @@ All notable changes to **thegn** are documented here. The format follows
 - `thegn wt rm --delete-branch` refuses failed or detached branch reads, and
   `wt new` reports that an empty base has no commits yet and distinguishes it
   from a Git read failure.
-  Git safety reads use bounded typed operations.
 
 ### Fixed
 
