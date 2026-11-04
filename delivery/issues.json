@@ -340,6 +340,55 @@
       "project": "Alpha Reliability & State Compatibility",
       "changes": [],
       "no_spec_rationale": "Phase 1 (classify, approve, plan) archived as add-pipeline-supervisor-policy. Phases 2-4 of the supervisor policy layer are still open and have no proposal yet."
+    },
+    {
+      "issue": "THE-1362",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "monitor-framework"
+      ]
+    },
+    {
+      "issue": "THE-1510",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-voice-mode"
+      ]
+    },
+    {
+      "issue": "THE-1511",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-voice-mode"
+      ]
+    },
+    {
+      "issue": "THE-1512",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-voice-mode"
+      ]
+    },
+    {
+      "issue": "THE-1513",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-voice-mode"
+      ]
+    },
+    {
+      "issue": "THE-1514",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-voice-mode"
+      ]
+    },
+    {
+      "issue": "THE-1515",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-voice-mode"
+      ]
     }
   ]
 }

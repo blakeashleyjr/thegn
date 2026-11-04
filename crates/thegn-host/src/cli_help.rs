@@ -73,6 +73,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     (
         "Meta",
         &[
+            "voice",
             "config",
             "secret",
             "keys",

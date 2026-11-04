@@ -1,6 +1,7 @@
 # Duplicate crate names and their version counts in Cargo.lock.
 # Entries come from Cargo.lock across ALL targets; cargo-deny's per-target graph can report fewer.
 # Shrink-only: add an entry only with a reason in the THE-196 follow-up.
+# shlex has a 1.3/2.0 split through optional voice-native -> whisper-rs-sys -> bindgen.
 # Regenerate with just ratchet-update.
 base64 2 0.22.1 0.23.1
 bit-set 2 0.5.3 0.8.0
@@ -33,6 +34,7 @@ reqwest 2 0.12.28 0.13.4
 security-framework 2 2.11.1 3.7.0
 serde_spanned 2 0.6.9 1.1.1
 sha2 2 0.10.9 0.11.0
+shlex 2 1.3.0 2.0.1
 signal-hook 2 0.3.18 0.4.4
 socket2 2 0.5.10 0.6.5
 spin 2 0.10.1 0.9.9

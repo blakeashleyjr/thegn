@@ -4767,27 +4767,34 @@ poll_interval_secs = 3
 # password = "file:~/.config/thegn/secrets/media-mpd.token" # keyring:, env:, file: refs; bare literals remain supported but are warned/migratable
 
 # ── Experimental voice mode ─────────────────────────────────────────────────
-# Toggle-to-talk speech-to-text through two user-supplied commands. Thegn ships
-# no microphone, audio, speech model, or STT implementation. The capture
-# command writes one complete 16-bit PCM WAV to stdout; when stopped, that WAV
-# is sent to the transcription command on stdin and its UTF-8 stdout is pasted
-# into the focused pane without a newline or auto-submit. Commands are argv
-# arrays and are never run through a shell.
-#
-# This is disabled by default and remains disabled in the stable channel. An
-# arbitrary command can send audio elsewhere, so inspect both commands before
-# enabling this feature. `thegn doctor` reports missing commands and explains
-# the repair.
+# Alt v records/stops; Esc cancels. Final text is pasted without submission.
+# Run `thegn voice setup --language en` before native capture. Downloads require
+# size confirmation and finish before the microphone opens. Stable clamps off.
 [voice]
 enabled = false
-# command is the only implemented provider kind in this first slice.
+# command (legacy WAV-in/text-out), embedded (Whisper), or http (multipart JSON).
 kind = "command"
-# Example: capture_command = ["my-recorder", "--wav-to-stdout"]
+# Empty selects native capture (voice-native build); command arrays are argv,
+# never shell strings. External capture is final-only. Embedded uses native capture.
 capture_command = []
-# Example: command = ["my-transcriber", "--stdin-wav"]
 command = []
-# Hard capture limit in seconds; runtime clamps this to 1..=300.
+# Recording bound, clamped to 1..=300 seconds. Audio stays in memory.
 max_seconds = 30
+# Whisper language code, or auto for detection. base.en for en; base otherwise.
+language = "en"
+model = "base.en"
+# Explicit GGML file overrides the managed model store.
+# model_path = "/path/to/ggml-base.en.bin"
+# Complete multipart WAV endpoint returning JSON {"text":"..."}.
+endpoint = ""
+# Optional secret broker reference; no token in config or process arguments.
+# A credential requires https unless the endpoint host is loopback.
+# credential = "env:STT_TOKEN"
+# Embedded/HTTP rolling previews. HTTP repeats overlapping audio and may bill
+# each request; false sends only the final recording. Commands are final-only.
+live_preview = true
+# Separate total deadline for each inference/HTTP request, clamped 1..=300.
+timeout_seconds = 60
 
 [usage]
 # AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,
