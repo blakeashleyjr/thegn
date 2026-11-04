@@ -39,7 +39,8 @@ impl Probe for Ladder<dyn Forge> {
             .last()
             .map(|r| r.availability.clone())
             .unwrap_or(Availability::Unavailable("empty ladder".into()));
-        let mut out = ProbeReport::new("forge", self.id, availability).with_caps(&self.caps());
+        let caps = self.caps();
+        let mut out = ProbeReport::new("forge", self.id, availability).with_caps(&caps);
         for r in reports {
             let state = match &r.availability {
                 Availability::Ready => "ready".to_string(),
@@ -47,6 +48,9 @@ impl Probe for Ladder<dyn Forge> {
                 Availability::Unavailable(w) => format!("unavailable — {w}"),
             };
             out = out.note(format!("{}: {state}", r.id));
+        }
+        if caps.merge && !caps.merge_expected_head {
+            out = out.note("merge: cannot be fenced to the reviewed head (`merge_expected_head` off) - the PR queue holds merges for this forge; merge it yourself");
         }
         out
     }
@@ -514,7 +518,7 @@ mod tests {
         fn caps(&self) -> ForgeCaps {
             ForgeCaps {
                 pr_status: true,
-                merge: self.id == "cli",
+                merge: self.id == "cli" || self.id == "unfenced",
                 merge_expected_head: self.id == "cli",
                 resolve_review_thread: self.id == "cli",
                 pr_authorship: self.id == "cli",
@@ -687,6 +691,52 @@ mod tests {
             }) as Box<dyn Forge>],
         );
         assert!(!native_only.caps().merge_expected_head);
+    }
+
+    #[test]
+    fn ladder_probe_notes_a_merge_that_cannot_be_head_fenced() {
+        let ladder = Ladder::new(
+            "t",
+            vec![Box::new(Layer {
+                id: "unfenced",
+                status: Ok(1),
+                calls: Default::default(),
+            }) as Box<dyn Forge>],
+        );
+
+        let p = ladder.probe();
+
+        assert!(
+            p.notes
+                .iter()
+                .any(|note| note.contains("cannot be fenced to the reviewed head"))
+        );
+        assert_eq!(p.caps["merge"], serde_json::json!(true));
+        assert_eq!(p.caps["merge_expected_head"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn ladder_probe_has_no_fence_note_when_a_layer_fences_the_head() {
+        let p = ladder(Ok(7)).probe();
+
+        assert!(!p.notes.iter().any(|note| note.contains("cannot be fenced")));
+        assert_eq!(p.caps["merge_expected_head"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn ladder_probe_has_no_fence_note_for_a_forge_that_cannot_merge() {
+        let ladder = Ladder::new(
+            "t",
+            vec![Box::new(Layer {
+                id: "native",
+                status: Ok(1),
+                calls: Default::default(),
+            }) as Box<dyn Forge>],
+        );
+
+        let p = ladder.probe();
+
+        assert!(!p.notes.iter().any(|note| note.contains("cannot be fenced")));
     }
 
     #[test]
