@@ -63,7 +63,7 @@ fn loop_block(ctx: &SectionCtx) -> Vec<PanelRow> {
         seg(g(), "  "),
         seg(t(), format!("{:.0} rend/s", s.renders_per_s)),
         seg(g(), "  "),
-        seg(d(), format!("p99 {:.1}ms", s.render_p99_us as f64 / 1000.0)),
+        seg(d(), loop_render_tail(s)),
     ])));
     rows.push(PanelRow::plain(Line::split(
         vec![sp(1), seg(g(), "hot "), seg(ac(), s.hot_source)],
@@ -79,6 +79,27 @@ fn loop_block(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }
     rows
+}
+
+/// The LOOP row's render tail. Reads the window's sample count, never a zero percentile (zero is also the
+/// histogram's 0–1 µs bucket): `no samples`, the count and `(sparse)` below `TAIL_MIN_SAMPLES`, else p95 and p99.
+fn loop_render_tail(s: &crate::perf::PerfSnapshot) -> String {
+    let ms = |us: u64| us as f64 / 1000.0;
+    if s.frame_samples == 0 {
+        "no samples".into()
+    } else if s.frame_samples < crate::perf::TAIL_MIN_SAMPLES {
+        format!(
+            "p99 {:.1}ms · n={} (sparse)",
+            ms(s.render_p99_us),
+            s.frame_samples
+        )
+    } else {
+        format!(
+            "p95 {:.1}ms · p99 {:.1}ms",
+            ms(s.render_p95_us),
+            ms(s.render_p99_us)
+        )
+    }
 }
 
 /// Normal: one labelled meter row per metric.
@@ -726,5 +747,46 @@ mod tests {
         // format!("{} ", ...) call site — proving downstream clusters stay aligned.
         let full = format!("{out} ");
         assert_eq!(UnicodeWidthStr::width(full.as_str()), 11);
+    }
+
+    fn loop_rows(snap: crate::perf::PerfSnapshot) -> String {
+        let (model, mut ui) = fixture(0);
+        ui.docs.loop_perf.push(&snap);
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 80,
+            rows: 30,
+        };
+        text(&content(&ctx))
+    }
+
+    #[test]
+    fn loop_row_says_no_samples_for_an_empty_window() {
+        let rendered = loop_rows(crate::perf::PerfSnapshot::default());
+        assert!(rendered.contains("no samples"), "{rendered}");
+        assert!(!rendered.contains("0.0ms"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_row_marks_a_sparse_window_with_its_count() {
+        let rendered = loop_rows(crate::perf::PerfSnapshot {
+            frame_samples: 3,
+            render_p99_us: 8192,
+            ..Default::default()
+        });
+        assert!(rendered.contains("n=3 (sparse)"), "{rendered}");
+        assert!(!rendered.contains("p95"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_row_shows_p95_and_p99_for_a_full_window() {
+        let rendered = loop_rows(crate::perf::PerfSnapshot {
+            frame_samples: 40,
+            render_p95_us: 1024,
+            render_p99_us: 8192,
+            ..Default::default()
+        });
+        assert!(rendered.contains("p95 1.0ms · p99 8.2ms"), "{rendered}");
     }
 }
