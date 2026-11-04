@@ -109,10 +109,21 @@ pub fn dir() -> PathBuf {
 }
 
 const GENERATION_FILE: &str = ".custody.generation";
+const MAX_CUSTODY_ROW_BYTES: u64 = 64 * 1024;
+const MAX_CUSTODY_ROWS: usize = 1024;
 
-fn read_generation_high_water(dir: &Path) -> Result<u64> {
-    let path = dir.join(GENERATION_FILE);
-    let mut file = match crate::fsperm::open_regular_file_nofollow(&path) {
+fn open_ledger_dir(dir: &Path) -> Result<Option<crate::fsperm::PrivateDir>> {
+    match crate::fsperm::open_private_dir(dir) {
+        Ok(private) => Ok(Some(private)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("open managed SSH custody directory {}", dir.display())),
+    }
+}
+
+fn read_generation_high_water(private: &crate::fsperm::PrivateDir) -> Result<u64> {
+    let path = private.path().join(GENERATION_FILE);
+    let mut file = match private.open_regular_nofollow(GENERATION_FILE) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => {
@@ -147,20 +158,20 @@ fn read_generation_high_water(dir: &Path) -> Result<u64> {
     })
 }
 
-fn next_generation(dir: &Path, floor: u64) -> Result<u64> {
-    let path = dir.join(GENERATION_FILE);
-    let next = read_generation_high_water(dir)?
+fn next_generation(private: &crate::fsperm::PrivateDir, floor: u64) -> Result<u64> {
+    let path = private.path().join(GENERATION_FILE);
+    let next = read_generation_high_water(private)?
         .max(floor)
         .checked_add(1)
         .context("managed SSH custody generation counter is exhausted")?;
-    crate::fsperm::write_owner_only_atomic(&path, format!("{next}\n").as_bytes()).with_context(
-        || {
+    private
+        .write_owner_only_atomic(GENERATION_FILE, format!("{next}\n").as_bytes())
+        .with_context(|| {
             format!(
                 "publish managed SSH custody generation counter {}",
                 path.display()
             )
-        },
-    )?;
+        })?;
     Ok(next)
 }
 
@@ -281,19 +292,27 @@ pub fn account_label(key_path: &Path) -> String {
     }
 }
 
-fn record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> PathBuf {
+fn record_file_name(provider: &str, account: &str, instance: &str) -> String {
     let mut tuple = Vec::new();
     for part in [provider.as_bytes(), account.as_bytes(), instance.as_bytes()] {
         tuple.extend_from_slice(&(part.len() as u64).to_be_bytes());
         tuple.extend_from_slice(part);
     }
     let digest = Sha256::digest(&tuple);
-    dir.join(format!("{}.json", hex_prefix(&digest, 64)))
+    format!("{}.json", hex_prefix(&digest, 64))
+}
+
+fn legacy_file_name(provider: &str, account: &str, instance: &str) -> String {
+    let id = crate::util::short_hash(&format!("{provider}\0{account}\0{instance}"), 24);
+    format!("{id}.json")
+}
+
+fn record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> PathBuf {
+    dir.join(record_file_name(provider, account, instance))
 }
 
 fn legacy_record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> PathBuf {
-    let id = crate::util::short_hash(&format!("{provider}\0{account}\0{instance}"), 24);
-    dir.join(format!("{id}.json"))
+    dir.join(legacy_file_name(provider, account, instance))
 }
 
 fn check_tuple(
@@ -311,12 +330,46 @@ fn check_tuple(
     Ok(())
 }
 
-fn read_record(path: &Path) -> Result<Option<AuthorizedKeyRecord>> {
-    let body = match std::fs::read(path) {
-        Ok(body) => body,
+fn read_row(
+    private: &crate::fsperm::PrivateDir,
+    name: &str,
+) -> Result<Option<AuthorizedKeyRecord>> {
+    let path = private.path().join(name);
+    let file = match private.open_regular_nofollow(name) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("read {}", path.display()))?;
+    anyhow::ensure!(
+        crate::fsperm::owned_by_current_user(&metadata),
+        "managed SSH custody record {} is owned by another user",
+        path.display()
+    );
+    if let Some(mode) = crate::fsperm::mode_bits_from_metadata(&metadata) {
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "managed SSH custody record {} is not owner-only (mode {mode:o})",
+            path.display()
+        );
+    }
+    crate::fsperm::ensure_single_link_regular_file(&metadata).with_context(|| {
+        format!(
+            "managed SSH custody record {} has extra hard links",
+            path.display()
+        )
+    })?;
+    let mut body = Vec::new();
+    std::io::Read::take(file, MAX_CUSTODY_ROW_BYTES + 1)
+        .read_to_end(&mut body)
+        .with_context(|| format!("read {}", path.display()))?;
+    anyhow::ensure!(
+        body.len() as u64 <= MAX_CUSTODY_ROW_BYTES,
+        "managed SSH custody record {} exceeds {MAX_CUSTODY_ROW_BYTES} bytes",
+        path.display()
+    );
     serde_json::from_slice(&body)
         .with_context(|| format!("decode managed SSH custody record {}", path.display()))
         .map(Some)
@@ -401,8 +454,8 @@ fn record_authorized_with_proxy_worktree_at(
         public_key,
         proxy_worktree,
     )?;
-    let _ledger = lock_ledger(dir)?;
-    if let Some(existing) = read_at(dir, provider, account, instance)?
+    let ledger = lock_ledger(dir)?;
+    if let Some(existing) = read_at_in(&ledger.dir, provider, account, instance)?
         && existing.rotation_recovery.is_some()
     {
         return Err(RotationRecoveryPending {
@@ -411,7 +464,7 @@ fn record_authorized_with_proxy_worktree_at(
         }
         .into());
     }
-    let published = publish_locked(dir, &record)?;
+    let published = publish_locked(&ledger.dir, &record)?;
     Ok(published.key_fingerprint)
 }
 
@@ -458,51 +511,49 @@ pub fn record_authorized_at(
     dir: &Path,
     record: &AuthorizedKeyRecord,
 ) -> Result<AuthorizedKeyRecord> {
-    let _ledger = lock_ledger(dir)?;
-    publish_locked(dir, record)
+    let ledger = lock_ledger(dir)?;
+    publish_locked(&ledger.dir, record)
+}
+
+struct LockedLedger {
+    dir: crate::fsperm::PrivateDir,
+    _lock: std::fs::File,
 }
 
 /// Acquire the process-shared custody ledger lock. Hold it only around local
 /// file operations, never across remote calls; never acquire it twice in one
 /// call chain because a second flock descriptor deadlocks.
-fn lock_ledger(dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    crate::fsperm::restrict_dir_to_owner(dir)
-        .with_context(|| format!("restrict {}", dir.display()))?;
-    let path = dir.join(".custody.lock");
-    let file = loop {
-        match crate::fsperm::open_regular_file_nofollow(&path) {
-            Ok(file) => break file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match crate::fsperm::create_owner_only_exclusive(&path) {
-                    Ok(file) => break file,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("open managed SSH custody ledger lock {}", path.display())
-                        });
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("open managed SSH custody ledger lock {}", path.display())
-                });
-            }
-        }
-    };
+fn lock_ledger(dir: &Path) -> Result<LockedLedger> {
+    crate::fsperm::ensure_private_dir(dir).with_context(|| format!("create {}", dir.display()))?;
+    let held = crate::fsperm::open_private_dir(dir)
+        .with_context(|| format!("open managed SSH custody directory {}", dir.display()))?;
+    let path = held.path().join(".custody.lock");
+    let file = held
+        .open_or_create_regular_nofollow(".custody.lock")
+        .with_context(|| format!("open managed SSH custody ledger lock {}", path.display()))?;
     file.lock()
         .with_context(|| format!("lock managed SSH custody ledger {}", path.display()))?;
-    Ok(file)
+    Ok(LockedLedger {
+        dir: held,
+        _lock: file,
+    })
 }
 
-fn publish_locked(dir: &Path, record: &AuthorizedKeyRecord) -> Result<AuthorizedKeyRecord> {
-    let path = record_path(dir, &record.provider, &record.account, &record.instance);
-    let legacy = legacy_record_path(dir, &record.provider, &record.account, &record.instance);
+fn publish_locked(
+    private: &crate::fsperm::PrivateDir,
+    record: &AuthorizedKeyRecord,
+) -> Result<AuthorizedKeyRecord> {
+    let name = record_file_name(&record.provider, &record.account, &record.instance);
+    let path = private.path().join(&name);
+    let legacy_name = legacy_file_name(&record.provider, &record.account, &record.instance);
+    let legacy = private.path().join(&legacy_name);
     let mut floor = 0;
-    for candidate in [&path, &legacy] {
-        if let Some(existing) = read_record(candidate).with_context(|| {
-            format!("publish managed SSH custody record {}", candidate.display())
+    for (candidate_name, candidate_path) in [(&name, &path), (&legacy_name, &legacy)] {
+        if let Some(existing) = read_row(private, candidate_name).with_context(|| {
+            format!(
+                "publish managed SSH custody record {}",
+                candidate_path.display()
+            )
         })? {
             floor = floor.max(existing.generation);
             check_tuple(
@@ -510,16 +561,22 @@ fn publish_locked(dir: &Path, record: &AuthorizedKeyRecord) -> Result<Authorized
                 &record.provider,
                 &record.account,
                 &record.instance,
-                candidate,
+                candidate_path,
             )?;
         }
     }
     let mut stamped = record.clone();
-    stamped.generation = next_generation(dir, floor)?;
-    crate::fsperm::write_owner_only_atomic(&path, &serde_json::to_vec_pretty(&stamped)?)
+    stamped.generation = next_generation(private, floor)?;
+    private
+        .write_owner_only_atomic(&name, &serde_json::to_vec_pretty(&stamped)?)
         .with_context(|| format!("publish managed SSH custody record {}", path.display()))?;
-    if legacy != path {
-        remove_if_exists(&legacy)?;
+    if legacy_name != name {
+        private
+            .remove_file(&legacy_name)
+            .with_context(|| format!("remove {}", legacy.display()))?;
+        private
+            .sync()
+            .context("sync managed SSH custody directory")?;
     }
     Ok(stamped)
 }
@@ -535,9 +592,9 @@ pub fn publish_if_unchanged_at(
             && next.instance == expected.instance,
         "custody compare-and-swap cannot change the row identity"
     );
-    let _ledger = lock_ledger(dir)?;
-    let actual = read_at(
-        dir,
+    let ledger = lock_ledger(dir)?;
+    let actual = read_at_in(
+        &ledger.dir,
         &expected.provider,
         &expected.account,
         &expected.instance,
@@ -549,15 +606,7 @@ pub fn publish_if_unchanged_at(
         }
         .into());
     }
-    publish_locked(dir, next)
-}
-
-fn remove_if_exists(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
-    }
+    publish_locked(&ledger.dir, next)
 }
 
 pub fn record_revoked(provider: &str, account: &str, instance: &str) -> Result<()> {
@@ -593,28 +642,40 @@ fn revoke_at(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("inspect {}", dir.display())),
     }
-    let _ledger = lock_ledger(dir)?;
+    let ledger = lock_ledger(dir)?;
     // Parse before delete. An unreadable or corrupt row may be the only local
     // evidence of a remotely authorized key and must never be collapsed into
     // "missing" by a mutation path.
-    let existing = read_at(dir, provider, account, instance)?;
-    remove_record_path(dir, provider, account, instance)?;
+    let existing = read_at_in(&ledger.dir, provider, account, instance)?;
+    remove_record_path(&ledger.dir, provider, account, instance)?;
     Ok(existing)
 }
 
-fn remove_record_path(dir: &Path, provider: &str, account: &str, instance: &str) -> Result<()> {
-    let canonical = record_path(dir, provider, account, instance);
-    let legacy = legacy_record_path(dir, provider, account, instance);
-    for path in [&canonical, &legacy] {
-        if let Some(record) = read_record(path)
+fn remove_record_path(
+    private: &crate::fsperm::PrivateDir,
+    provider: &str,
+    account: &str,
+    instance: &str,
+) -> Result<()> {
+    let canonical_name = record_file_name(provider, account, instance);
+    let canonical = private.path().join(&canonical_name);
+    let legacy_name = legacy_file_name(provider, account, instance);
+    let legacy = private.path().join(&legacy_name);
+    for (name, path) in [(&canonical_name, &canonical), (&legacy_name, &legacy)] {
+        if let Some(record) = read_row(private, name)
             .with_context(|| format!("remove managed SSH custody record {}", path.display()))?
         {
             check_tuple(&record, provider, account, instance, path)?;
         }
     }
-    for path in [&canonical, &legacy] {
-        remove_if_exists(path)?;
+    for (name, path) in [(&canonical_name, &canonical), (&legacy_name, &legacy)] {
+        private
+            .remove_file(name)
+            .with_context(|| format!("remove {}", path.display()))?;
     }
+    private
+        .sync()
+        .context("sync managed SSH custody directory")?;
     Ok(())
 }
 
@@ -628,11 +689,25 @@ pub fn read_at(
     account: &str,
     instance: &str,
 ) -> Result<Option<AuthorizedKeyRecord>> {
-    let canonical = record_path(dir, provider, account, instance);
-    let legacy = legacy_record_path(dir, provider, account, instance);
-    let (path, record) = if let Some(record) = read_record(&canonical)? {
+    let Some(private) = open_ledger_dir(dir)? else {
+        return Ok(None);
+    };
+    read_at_in(&private, provider, account, instance)
+}
+
+fn read_at_in(
+    private: &crate::fsperm::PrivateDir,
+    provider: &str,
+    account: &str,
+    instance: &str,
+) -> Result<Option<AuthorizedKeyRecord>> {
+    let canonical_name = record_file_name(provider, account, instance);
+    let canonical = private.path().join(&canonical_name);
+    let legacy_name = legacy_file_name(provider, account, instance);
+    let legacy = private.path().join(&legacy_name);
+    let (path, record) = if let Some(record) = read_row(private, &canonical_name)? {
         (&canonical, record)
-    } else if let Some(record) = read_record(&legacy)? {
+    } else if let Some(record) = read_row(private, &legacy_name)? {
         (&legacy, record)
     } else {
         return Ok(None);
@@ -673,44 +748,54 @@ pub fn list() -> Result<Vec<AuthorizedKeyRecord>> {
 }
 
 pub fn list_at(dir: &Path) -> Result<Vec<AuthorizedKeyRecord>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("read directory {}", dir.display()));
-        }
+    let Some(private) =
+        open_ledger_dir(dir).with_context(|| format!("read directory {}", dir.display()))?
+    else {
+        return Ok(Vec::new());
     };
+    let names = private
+        .file_names()
+        .with_context(|| format!("read directory {}", dir.display()))?;
+    let mut row_names = Vec::new();
+    for name in names {
+        if let Some(text) = name.to_str()
+            && Path::new(text)
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        {
+            row_names.push(text.to_string());
+        }
+    }
+    anyhow::ensure!(
+        row_names.len() <= MAX_CUSTODY_ROWS,
+        "managed SSH custody inventory has more than {MAX_CUSTODY_ROWS} rows"
+    );
     let mut records = Vec::new();
     let mut tuples = std::collections::HashMap::new();
-    for entry in entries {
-        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
-        let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "json") {
-            continue;
-        }
-        let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let record: AuthorizedKeyRecord = serde_json::from_slice(&body)
-            .with_context(|| format!("decode managed SSH custody record {}", path.display()))?;
-        let canonical = record_path(dir, &record.provider, &record.account, &record.instance);
-        let legacy = legacy_record_path(dir, &record.provider, &record.account, &record.instance);
-        anyhow::ensure!(
-            path == canonical || path == legacy,
-            "custody filename does not match embedded tuple at {}",
-            path.display()
-        );
-        let tuple = (
-            record.provider.clone(),
-            record.account.clone(),
-            record.instance.clone(),
-        );
-        if let Some(previous) = tuples.insert(tuple, path.clone()) {
-            anyhow::bail!(
-                "duplicate managed SSH custody tuple at {} and {}",
-                previous.display(),
+    for name in row_names {
+        let path = private.path().join(&name);
+        if let Some(record) = read_row(&private, &name)? {
+            let canonical = record_file_name(&record.provider, &record.account, &record.instance);
+            let legacy = legacy_file_name(&record.provider, &record.account, &record.instance);
+            anyhow::ensure!(
+                name == canonical || name == legacy,
+                "custody filename does not match embedded tuple at {}",
                 path.display()
             );
+            let tuple = (
+                record.provider.clone(),
+                record.account.clone(),
+                record.instance.clone(),
+            );
+            if let Some(previous) = tuples.insert(tuple, path.clone()) {
+                anyhow::bail!(
+                    "duplicate managed SSH custody tuple at {} and {}",
+                    previous.display(),
+                    path.display()
+                );
+            }
+            records.push(record);
         }
-        records.push(record);
     }
     records.sort_by(|a: &AuthorizedKeyRecord, b| {
         (&a.provider, &a.account, &a.instance).cmp(&(&b.provider, &b.account, &b.instance))
@@ -1597,6 +1682,7 @@ mod tests {
 
         let ledger = temp.path().join("ledger");
         std::fs::create_dir(&ledger).unwrap();
+        crate::fsperm::restrict_dir_to_owner(&ledger).unwrap();
         let path = record_path(&ledger, &record.provider, &record.account, &record.instance);
         std::fs::create_dir(&path).unwrap();
         let read_error =
@@ -1604,9 +1690,13 @@ mod tests {
         assert!(format!("{read_error:#}").contains("read"));
         let publish_error = record_authorized_at(&ledger, &record).unwrap_err();
         assert!(format!("{publish_error:#}").contains("publish managed SSH custody record"));
-        let remove_error =
-            remove_record_path(&ledger, &record.provider, &record.account, &record.instance)
-                .unwrap_err();
+        let remove_error = remove_record_path(
+            &crate::fsperm::open_private_dir(&ledger).unwrap(),
+            &record.provider,
+            &record.account,
+            &record.instance,
+        )
+        .unwrap_err();
         assert!(format!("{remove_error:#}").contains("remove"));
         assert!(
             path.is_dir(),
@@ -1921,7 +2011,7 @@ mod tests {
             receiver.recv_timeout(std::time::Duration::from_millis(150)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
-        publish_locked(&dir, &recovering).unwrap();
+        publish_locked(&crate::fsperm::open_private_dir(&dir).unwrap(), &recovering).unwrap();
         drop(held);
 
         let result = receiver.recv().unwrap();
@@ -2017,5 +2107,117 @@ mod tests {
         assert!(result.is_err());
         assert!(!target.exists());
         assert!(list_at(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn custody_row_symlink_is_refused_not_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("ledger");
+        std::fs::create_dir(&ledger).unwrap();
+        crate::fsperm::restrict_dir_to_owner(&ledger).unwrap();
+        let row = record();
+        let target = temp.path().join("canary.json.txt");
+        let canary = serde_json::to_vec(&row).unwrap();
+        std::fs::write(&target, &canary).unwrap();
+        let link = record_path(&ledger, &row.provider, &row.account, &row.instance);
+        if let Err(error) = crate::fsperm::create_symlink(&target, &link, false) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ),
+                "unexpected symlink fixture error: {error}"
+            );
+            return;
+        }
+
+        assert!(read_at(&ledger, &row.provider, &row.account, &row.instance).is_err());
+        assert!(list_at(&ledger).is_err());
+        assert!(record_revoked_at(&ledger, &row.provider, &row.account, &row.instance).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), canary);
+    }
+
+    #[test]
+    fn oversized_custody_row_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let row = record();
+        let mut body = serde_json::to_vec(&row).unwrap();
+        body.extend(std::iter::repeat_n(b' ', MAX_CUSTODY_ROW_BYTES as usize));
+        std::fs::write(
+            record_path(temp.path(), &row.provider, &row.account, &row.instance),
+            body,
+        )
+        .unwrap();
+
+        let error = read_at(temp.path(), &row.provider, &row.account, &row.instance).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds"));
+        assert!(list_at(temp.path()).is_err());
+    }
+
+    #[test]
+    fn hard_linked_custody_row_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let row = record_authorized_at(temp.path(), &record()).unwrap();
+        let path = record_path(temp.path(), &row.provider, &row.account, &row.instance);
+        let alias = temp.path().join("alias.txt");
+        std::fs::hard_link(&path, &alias).unwrap();
+        if crate::fsperm::extra_hard_links(&std::fs::metadata(&path).unwrap()) == 0 {
+            return;
+        }
+
+        let error = read_at(temp.path(), &row.provider, &row.account, &row.instance).unwrap_err();
+        assert!(format!("{error:#}").contains("hard links"));
+    }
+
+    #[test]
+    fn custody_inventory_over_the_row_cap_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        for row in 0..=MAX_CUSTODY_ROWS {
+            std::fs::write(temp.path().join(format!("row-{row}.json")), []).unwrap();
+        }
+
+        let error = list_at(temp.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("more than"));
+    }
+
+    #[test]
+    fn custody_writes_stay_in_the_held_directory_when_the_path_is_swapped() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("ledger");
+        let moved = temp.path().join("ledger-moved");
+        let ledger = lock_ledger(&dir).unwrap();
+        std::fs::rename(&dir, &moved).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        crate::fsperm::restrict_dir_to_owner(&dir).unwrap();
+
+        publish_locked(&ledger.dir, &record()).unwrap();
+
+        let row_path = record_path(&moved, "fly", "env:FLY_WORK", "tg-project-feature");
+        assert!(row_path.exists());
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn custody_directory_that_is_not_owner_only_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let row = record();
+        record_authorized_at(temp.path(), &row).unwrap();
+        if let Err(error) = crate::fsperm::set_mode_for_test(temp.path(), 0o755) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ),
+                "unexpected mode fixture error: {error}"
+            );
+            return;
+        }
+
+        let read_error =
+            read_at(temp.path(), &row.provider, &row.account, &row.instance).unwrap_err();
+        assert!(format!("{read_error:#}").contains("custody directory"));
+        let list_error = list_at(temp.path()).unwrap_err();
+        assert!(format!("{list_error:#}").contains("custody directory"));
+        crate::fsperm::set_mode_for_test(temp.path(), 0o700).unwrap();
     }
 }
