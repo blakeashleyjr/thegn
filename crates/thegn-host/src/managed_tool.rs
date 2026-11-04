@@ -1131,7 +1131,10 @@ fn provenance_record(
 
 fn write_provenance(staging: &Path, record: &serde_json::Value) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(record).context("serialize installer provenance")?;
-    thegn_core::fsperm::write_owner_only_atomic(&staging.join(".thegn-provenance.json"), &bytes)
+    thegn_core::fsperm::ensure_private_dir(staging)
+        .context("secure managed-tool staging directory")?;
+    thegn_core::fsperm::open_private_dir(staging)
+        .and_then(|dir| dir.write_owner_only_atomic(".thegn-provenance.json", &bytes))
         .context("write managed-tool installer provenance")?;
     Ok(())
 }
@@ -3121,6 +3124,26 @@ mod tests {
         }
     }
 
+    // Positive control: checks owner-only permissions and parent-directory tightening.
+    #[test]
+    fn write_provenance_tightens_the_staging_directory_and_publishes_owner_only() {
+        let staging = tempfile::tempdir().unwrap();
+        if crate::platform::test_mode_bits_supported() {
+            crate::platform::test_set_mode(staging.path(), 0o755).unwrap();
+        }
+
+        write_provenance(staging.path(), &serde_json::json!({"schema": 1})).unwrap();
+
+        let record = staging.path().join(".thegn-provenance.json");
+        assert!(record.is_file());
+        if let Some(mode) = thegn_core::fsperm::mode_bits(staging.path()).unwrap() {
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        if let Some(mode) = thegn_core::fsperm::mode_bits(&record).unwrap() {
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
     fn promoted_provenance_fixture() -> (TempDir, PathBuf, ManagedTool, PathBuf) {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let managed = root.path().join("tool");
@@ -3277,11 +3300,11 @@ mod tests {
     #[test]
     fn provenance_check_refuses_an_unparsable_record() {
         let (_root, managed, tool, bin_rel) = promoted_provenance_fixture();
-        thegn_core::fsperm::write_owner_only_atomic(
-            &managed.join(".thegn-provenance.json"),
-            b"not json",
-        )
-        .unwrap();
+        thegn_core::fsperm::ensure_private_dir(&managed).unwrap();
+        thegn_core::fsperm::open_private_dir(&managed)
+            .unwrap()
+            .write_owner_only_atomic(".thegn-provenance.json", b"not json")
+            .unwrap();
         assert!(matches!(
             check_installed_provenance(&managed, &tool, "cargo", "pkg", &bin_rel),
             ProvenanceCheck::Mismatch(reason) if reason.contains("valid JSON")
