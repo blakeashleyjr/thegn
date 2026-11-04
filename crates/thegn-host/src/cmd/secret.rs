@@ -467,24 +467,32 @@ mod tests {
             .into_iter()
             .filter(|field| field.path.starts_with("calendar.accounts["))
             .collect();
-        let json = serde_json::to_string(&ref_rows_json(&refs, &|_| true)).unwrap();
+        let json = ref_rows_json(&refs, &|_| true);
         let text = ref_rows_text(&refs, &|_| true).join("\n");
 
-        assert!(!json.contains("cal-cli-sentinel-71aa"), "{json}");
+        assert!(
+            json.iter()
+                .all(|row| !row.to_string().contains("cal-cli-sentinel-71aa"))
+        );
         assert!(!text.contains("cal-cli-sentinel-71aa"), "{text}");
         for path in [
             "calendar.accounts[work].token",
             "calendar.accounts[dav].token",
         ] {
-            assert!(json.contains(path), "{json}");
+            assert!(json.iter().any(|row| row["path"] == path), "{json:?}");
             assert!(text.contains(path), "{text}");
         }
-        assert!(json.contains("\"consumer\":\"calendar:work\""), "{json}");
-        assert!(
-            json.contains("\"name\":\"literal:***redacted***\""),
-            "{json}"
-        );
-        assert!(json.contains("\"name\":\"env:TG_B86_CAL_CLI\""), "{json}");
+        let work = json
+            .iter()
+            .find(|row| row["path"] == "calendar.accounts[work].token")
+            .unwrap();
+        let dav = json
+            .iter()
+            .find(|row| row["path"] == "calendar.accounts[dav].token")
+            .unwrap();
+        assert_eq!(work["consumer"], "calendar:work");
+        assert_eq!(work["name"], "literal:***redacted***");
+        assert_eq!(dav["name"], "env:TG_B86_CAL_CLI");
         assert!(text.contains("literal:***redacted***"), "{text}");
     }
 
