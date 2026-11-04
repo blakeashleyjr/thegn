@@ -1175,8 +1175,9 @@ async fn run(
     let legacy_scope = state_dir.to_str();
     {
         let db = db.lock().expect("daemon db lock");
-        let registry = scoped_registry_rows(&*db, &scope, legacy_scope)?;
-        if let Some(reason) = startup_registry_block(&registry, legacy_scope, pid_alive) {
+        if let Some(reason) =
+            startup_registry_block_after_sweep(&*db, &scope, legacy_scope, pid_alive)?
+        {
             anyhow::bail!(reason);
         }
     }
@@ -1645,11 +1646,33 @@ fn startup_registry_block(
         )
     } else if registry.legacy_truncated {
         Some(
-            "the daemon registry holds more legacy rows for this state directory than a start can check; remove stale rows or stop old daemons with `thegn daemon stop`, then retry",
+            "the daemon registry still has more legacy rows for this state directory than a start can check; retry startup to sweep the next batch of stale rows, and stop any old daemon that is still running",
         )
     } else {
         None
     }
+}
+
+fn startup_registry_block_after_sweep(
+    store: &dyn ControlStore,
+    scope: &str,
+    legacy_scope: Option<&str>,
+    pid_alive: impl Fn(i64) -> bool,
+) -> anyhow::Result<Option<&'static str>> {
+    let registry = scoped_registry_rows(store, scope, legacy_scope)?;
+    if registry.legacy_truncated {
+        for stale in boot_sweep_targets(&registry.rows, scope, legacy_scope, &pid_alive) {
+            if let Err(error) = store.clear_daemon_leases(&stale) {
+                tracing::debug!(daemon_id = %stale, %error, "failed to clear leases for a stale daemon registry row");
+            }
+            if let Err(error) = store.del_daemon(&stale) {
+                tracing::debug!(daemon_id = %stale, %error, "failed to delete a stale daemon registry row");
+            }
+        }
+        let registry = scoped_registry_rows(store, scope, legacy_scope)?;
+        return Ok(startup_registry_block(&registry, legacy_scope, pid_alive));
+    }
+    Ok(startup_registry_block(&registry, legacy_scope, pid_alive))
 }
 
 fn live_legacy_scope_daemon(
@@ -2533,6 +2556,35 @@ mod tests {
                 |pid| pid == 22
             ),
             None
+        );
+    }
+
+    #[test]
+    fn startup_registry_block_sweeps_a_bounded_batch_of_dead_legacy_rows() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=MAX_SCOPE_REGISTRY_ROWS + 10 {
+            let id = format!("legacy-{n:03}");
+            db.put_daemon(&DaemonRow {
+                heartbeat_at: n as i64,
+                ..row(&id, "/state/a", 11)
+            })
+            .unwrap();
+        }
+
+        let block =
+            startup_registry_block_after_sweep(&db, "v1-state-a", Some("/state/a"), |_| false)
+                .unwrap();
+
+        assert_eq!(
+            block, None,
+            "a truncated legacy scope containing only dead rows should sweep its newest window and allow startup once the remaining scope fits"
+        );
+        let remaining = db.daemons_in_scope("/state/a").unwrap();
+        assert_eq!(remaining.len(), 10);
+        assert!(
+            remaining
+                .iter()
+                .all(|row| row.daemon_id.starts_with("legacy-0"))
         );
     }
 
