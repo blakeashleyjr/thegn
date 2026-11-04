@@ -3826,6 +3826,74 @@ mod tests {
     }
 
     #[test]
+    fn merge_add_ambient_state_never_becomes_the_audited_target() {
+        let git = spec("p", Vec::new(), vec![Scope::Git]);
+        let (mut entry, _) = build_entry(loaded_state(git));
+
+        for params in [
+            serde_json::json!({ "cwd": "/ambient", "active": "wt-x", "branch": "main" }),
+            serde_json::json!({ "worktree": 7 }),
+            serde_json::json!({ "worktree": null }),
+            serde_json::json!({ "Worktree": "wt-a" }),
+            serde_json::json!(null),
+        ] {
+            authorize_host_call(&mut entry, "merge.add", &params).unwrap();
+            let audit = entry.runtime.audit_log().last().unwrap();
+            assert_eq!(audit.decision, AuditDecision::Granted);
+            assert_eq!(audit.target, None);
+        }
+    }
+
+    #[test]
+    fn merge_add_ambient_two_worktrees_audit_their_own_targets_in_order() {
+        let git = spec("p", Vec::new(), vec![Scope::Git]);
+        let (mut entry, _) = build_entry(loaded_state(git));
+
+        authorize_host_call(
+            &mut entry,
+            "merge.add",
+            &serde_json::json!({ "worktree": "wt-a", "cwd": "/wt-b" }),
+        )
+        .unwrap();
+        authorize_host_call(
+            &mut entry,
+            "merge.add",
+            &serde_json::json!({ "worktree": "wt-b", "cwd": "/wt-a" }),
+        )
+        .unwrap();
+
+        let log = entry.runtime.audit_log();
+        let n = log.len();
+        assert_eq!(log[n - 2].decision, AuditDecision::Granted);
+        assert_eq!(log[n - 1].decision, AuditDecision::Granted);
+        assert_eq!(log[n - 2].target.as_deref(), Some("wt-a"));
+        assert_eq!(log[n - 1].target.as_deref(), Some("wt-b"));
+        assert!(log[n - 2].seq < log[n - 1].seq);
+    }
+
+    #[test]
+    fn merge_add_ambient_route_forwards_the_plugin_params_unchanged() {
+        let (method, path, body) = crate::cmd::api::resolve_call(
+            "merge.add",
+            serde_json::json!({ "worktree": "wt-b", "cwd": "/ambient" }),
+        )
+        .unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/merge/add");
+        assert_eq!(
+            body,
+            Some(serde_json::json!({ "worktree": "wt-b", "cwd": "/ambient" }))
+        );
+
+        let (_, _, body) =
+            crate::cmd::api::resolve_call("merge.add", serde_json::json!({})).unwrap();
+        assert_eq!(body, Some(serde_json::json!({})));
+        assert!(
+            crate::cmd::api::resolve_call("merge.add", serde_json::json!("not an object")).is_err()
+        );
+    }
+
+    #[test]
     fn host_verb_modes_follow_the_canonical_support_matrix() {
         let resident = seg_spec("resident");
         let mut one_shot = seg_spec("one-shot");
