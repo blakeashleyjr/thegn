@@ -312,6 +312,10 @@ target:
   Each drain removes up to 64 leftover ingest refs under `refs/thegn/mq/` that
   no queued entry uses. If the queue or ref list cannot be read, it removes
   none.
+  An ingest ref carries the claim generation of the drain attempt that created
+  it. A pre-ingest prune keeps a ref from a newer claim generation, so a late
+  former owner cannot delete the current claimant's ref; the orphan sweep
+  removes it after the queue row is gone.
 - **`push`** folds and gates in the provider clone, advances its local target,
   and pushes that target to `origin`. It needs no inbound host control endpoint,
   but origin—not the host queue—is the convergence authority.
