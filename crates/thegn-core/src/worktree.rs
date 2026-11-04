@@ -27,6 +27,13 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    static WORKTREE_NEXT_BRANCH_PROBE_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+thread_local! {
     static WORKTREE_MUTATION_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> = const {
         std::cell::Cell::new(None)
     };
@@ -379,6 +386,13 @@ pub fn branch_exists(root: &Path, branch: &str) -> bool {
 /// Lifecycle code must use this checked form so an unverifiable ref is never
 /// mistaken for an absent branch.
 pub fn branch_exists_checked(root: &Path, branch: &str) -> Result<bool, String> {
+    #[cfg(test)]
+    if WORKTREE_NEXT_BRANCH_PROBE_FAILURE.replace(false) {
+        return Err(format!(
+            "could not check branch {branch}: Git command timed out"
+        ));
+    }
+
     let cancel = std::sync::atomic::AtomicBool::new(false);
     match crate::git_run::git_run(
         root,
@@ -679,6 +693,9 @@ pub struct AddError {
     /// A leftover rename intent journal could not be reconciled; the add was
     /// refused before Git ran and no rollback may run.
     pub rename_journal_pending: bool,
+    /// The branch pre-existence probe could not be verified, so the add was
+    /// refused before Git ran. Nothing was mutated and no rollback may run.
+    pub branch_probe_failed: bool,
 }
 
 /// [`add`] with the failure reason returned instead of warned, for callers
@@ -736,6 +753,7 @@ pub fn add_checked_with_state(
                 destination_preexisted: false,
                 lock_unavailable: true,
                 rename_journal_pending: false,
+                branch_probe_failed: false,
             });
         }
     };
@@ -753,6 +771,7 @@ pub fn add_checked_with_state(
                 destination_preexisted: false,
                 lock_unavailable: false,
                 rename_journal_pending: true,
+                branch_probe_failed: false,
             });
         }
     }
@@ -774,9 +793,22 @@ pub fn add_checked_with_state(
             destination_preexisted: true,
             lock_unavailable: false,
             rename_journal_pending: false,
+            branch_probe_failed: false,
         });
     }
-    let branch_preexisted = branch_exists(root, branch);
+    let branch_preexisted = match branch_exists_checked(root, branch) {
+        Ok(exists) => exists,
+        Err(reason) => {
+            return Err(AddError {
+                message: format!("refusing to create worktree for {branch}: {reason}"),
+                branch_created: false,
+                destination_preexisted: false,
+                lock_unavailable: false,
+                rename_journal_pending: false,
+                branch_probe_failed: true,
+            });
+        }
+    };
     let out = util::git_cmd(root)
         // Worktree creation runs on a worker, but Git must still fail fast if
         // a remote credential helper would otherwise prompt for input.
@@ -795,18 +827,21 @@ pub fn add_checked_with_state(
                     "git worktree add failed (branch={branch} base={base}): {}",
                     stderr.trim()
                 ),
-                branch_created: !branch_preexisted && branch_exists(root, branch),
+                branch_created: !branch_preexisted
+                    && branch_exists_checked(root, branch) == Ok(true),
                 destination_preexisted: false,
                 lock_unavailable: false,
                 rename_journal_pending: false,
+                branch_probe_failed: false,
             })
         }
         Err(e) => Err(AddError {
             message: format!("could not run git worktree add: {e}"),
-            branch_created: !branch_preexisted && branch_exists(root, branch),
+            branch_created: !branch_preexisted && branch_exists_checked(root, branch) == Ok(true),
             destination_preexisted: false,
             lock_unavailable: false,
             rename_journal_pending: false,
+            branch_probe_failed: false,
         }),
     }
 }
@@ -1237,10 +1272,12 @@ pub(crate) fn reconcile_rename_intent_locked(
         return Ok(Some(RenameRecovery::Completed));
     }
     if old_at_new && new_absent && !old_branch_exists {
-        if util::git_ok(
+        if git_destructive(
             root,
             &["branch", "-m", &intent.new_branch, &intent.old_branch],
-        ) {
+        )
+        .is_ok()
+        {
             clear_rename_intent(root)?;
             return Ok(Some(RenameRecovery::RolledBack));
         }
@@ -1344,36 +1381,35 @@ pub fn rename(
         new_path: new_path_exact.to_owned(),
     };
     write_rename_intent(root, &intent)?;
-    if !util::git_ok(root, &["branch", "-m", old_branch, new_branch]) {
+    if let Err(why) = git_destructive(root, &["branch", "-m", old_branch, new_branch]) {
         if let Err(error) = clear_rename_intent(root) {
             return Err(format!(
-                "could not rename branch {old_branch} → {new_branch}; {error}"
+                "could not rename branch {old_branch} → {new_branch}: {why}; {error}"
             ));
         }
         return Err(format!(
-            "could not rename branch {old_branch} → {new_branch}"
+            "could not rename branch {old_branch} → {new_branch}: {why}"
         ));
     }
-    let moved = util::git_cmd(root)
-        .args(["worktree", "move"])
-        .arg(&registered_old_path)
-        .arg(&new_path)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if moved {
-        if let Err(error) = clear_rename_intent(root) {
-            tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear completed rename intent");
+    let move_error = match git_destructive(
+        root,
+        &["worktree", "move", old_path_exact, new_path_exact],
+    ) {
+        Ok(()) => {
+            if let Err(error) = clear_rename_intent(root) {
+                tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear completed rename intent");
+            }
+            return Ok(new_path);
         }
-        return Ok(new_path);
-    }
-    if util::git_ok(root, &["branch", "-m", new_branch, old_branch]) {
+        Err(why) => why,
+    };
+    if git_destructive(root, &["branch", "-m", new_branch, old_branch]).is_ok() {
         if let Err(error) = clear_rename_intent(root) {
             tracing::warn!(target: "thegn::worktree", %error, path = %rename_intent_path(root).display(), "could not clear rolled-back rename intent");
         }
         return Err(format!(
-            "moving the worktree to {} failed; the branch rename was rolled back to {old_branch}",
-            new_path.display()
+            "moving the worktree to {} failed ({move_error}); the branch rename was rolled back to {old_branch}",
+            new_path.display(),
         ));
     }
     Err(format!(
@@ -2367,6 +2403,86 @@ mod tests {
             .arg(&path)
             .status();
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn add_refuses_when_the_branch_probe_cannot_be_verified() {
+        let repo = temp_repo("probe-refuse");
+        let cfg = scratch_cfg(&repo);
+        let path = allocate_worktree_path(&repo, "probe", &cfg).unwrap();
+        WORKTREE_NEXT_BRANCH_PROBE_FAILURE.with(|failure| failure.set(true));
+
+        let Err(error) = add_checked_with_state(&repo, "probe", "main", &path, &cfg) else {
+            panic!("an unverifiable branch probe must refuse the add");
+        };
+
+        assert!(error.branch_probe_failed);
+        assert!(!error.branch_created);
+        assert!(error.message.contains("could not check branch probe"));
+        assert!(!path.exists());
+        assert_eq!(branch_exists_checked(&repo, "probe"), Ok(false));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rename_reports_why_git_refused_the_branch_rename() {
+        let repo = temp_repo("rename-branch-exists");
+        let cfg = scratch_cfg(&repo);
+        let path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &path, &cfg).unwrap();
+        assert!(util::git_ok(&repo, &["branch", "taken"]));
+
+        let error = rename(&repo, &path, "old", "taken", &cfg).unwrap_err();
+
+        assert!(
+            error.contains("could not rename branch old → taken"),
+            "{error}"
+        );
+        assert!(error.contains("already exists"), "{error}");
+        assert!(branch_exists(&repo, "old"));
+        assert!(path.is_dir());
+        assert!(!rename_intent_path(&repo).exists());
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn rename_move_failure_reports_gits_reason() {
+        let repo = temp_repo("rename-move-reason");
+        let cfg = scratch_cfg(&repo);
+        let path = allocate_worktree_path(&repo, "old", &cfg).unwrap();
+        add_checked(&repo, "old", "main", &path, &cfg).unwrap();
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "lock"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = rename(&repo, &path, "old", "new", &cfg).unwrap_err();
+
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(error.contains("locked working tree"), "{error}");
+        assert!(branch_exists(&repo, "old"));
+        assert!(!branch_exists(&repo, "new"));
+        assert_eq!(
+            inspect_registered(&repo, &path)
+                .unwrap()
+                .branch()
+                .unwrap()
+                .raw(),
+            b"old"
+        );
+        assert!(
+            util::git_cmd(&repo)
+                .args(["worktree", "unlock"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     fn rename_intent_for(repo: &Path, old_path: &Path, cfg: &Config) -> RenameIntent {
