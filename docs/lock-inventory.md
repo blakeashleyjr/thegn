@@ -120,7 +120,7 @@ Other static declarations in these crates that are test-only are excluded. The
 
 ## Violations
 
-One concrete violation was established. The remaining unmeasured rows identify cardinality or contention questions that source alone cannot settle; they are not known violations.
+One concrete violation was established (the table below); it was repaired in batch 86: `collect_sidebar_status` now builds the keep set before taking the glyph cache lock and retains with an O(1) `HashSet` lookup (`retain_registered_glyphs`), so the row below is historical. The remaining unmeasured rows identify cardinality or contention questions that source alone cannot settle; they are not known violations.
 
 | File:line                                    | Work under guard and contending callers                                                                                                                                                                                                                                                                                                                                                                                                                | Owner issue |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- |
