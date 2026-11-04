@@ -1659,7 +1659,7 @@ impl GitlabCredential {
     fn mode_note(&self) -> &'static str {
         match self {
             Self::CliManaged => {
-                "credential: CLI-managed (`glab auth login`); [ci.gitlab] token unset or the default env:GITLAB_TOKEN is not set"
+                "credential: CLI-managed (`glab auth login`); [ci.gitlab] token unset or the default env:GITLAB_TOKEN is not set; remote/provider worktrees use the remote glab login"
             }
             Self::Configured {
                 explicit: false, ..
@@ -4723,6 +4723,42 @@ esac
             thegn_core::seam::Availability::Unavailable(ref reason)
                 if reason.contains("[ci.gitlab] token")
         ));
+    }
+
+    #[test]
+    fn gitlab_mode_notes_state_the_remote_rule_for_every_mode() {
+        let credentials = [
+            GitlabCredential::CliManaged,
+            GitlabCredential::Configured {
+                token: "t".into(),
+                explicit: false,
+            },
+            GitlabCredential::Configured {
+                token: "t".into(),
+                explicit: true,
+            },
+            GitlabCredential::Unavailable,
+        ];
+
+        let notes = credentials.map(|credential| credential.mode_note());
+        assert!(notes.iter().all(|note| note.starts_with("credential: ")));
+        assert!(notes[0].contains("remote/provider worktrees use the remote glab login"));
+        assert!(notes[1].contains("remote/provider worktrees use the remote glab login"));
+        assert!(notes[2].contains("refused for remote/provider worktrees"));
+        assert!(notes[3].contains("every GitLab CI call is refused"));
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.split_whitespace().any(|word| word == "t"))
+        );
+    }
+
+    #[test]
+    fn gitlab_mode_notes_are_pinned_in_the_configuration_help() {
+        let help = include_str!("../../../docs/help/configuration.md");
+        assert!(help.contains("the remote host's own glab login"));
+        assert!(help.contains("refused, never forwarded"));
+        assert!(help.contains("--hostname"));
     }
 
     #[test]
