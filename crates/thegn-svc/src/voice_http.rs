@@ -65,12 +65,13 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), VoiceError> {
 }
 
 fn bypass_proxy(url: &url::Url) -> bool {
-    url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    })
+    // `host()`, not `host_str()`: the string form keeps IPv6 brackets (`[::1]`).
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 fn http_client_with_proxy(

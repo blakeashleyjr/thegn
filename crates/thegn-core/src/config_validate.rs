@@ -1152,30 +1152,33 @@ mod tests {
     fn voice_credential_requires_tls_except_for_loopback_http() {
         for (body, accepted) in [
             (
-                "[voice]\ncredential = \"env:TOKEN\"\nendpoint = \"http://127.0.0.2/stt\"\n",
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://127.0.0.2/stt\"\n",
                 true,
             ),
             (
-                "[voice]\ncredential = \"env:TOKEN\"\nendpoint = \"http://[::1]/stt\"\n",
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://[::1]/stt\"\n",
                 true,
             ),
             (
-                "[voice]\ncredential = \"env:TOKEN\"\nendpoint = \"http://localhost/stt\"\n",
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://localhost/stt\"\n",
                 true,
             ),
             (
-                "[voice]\ncredential = \"env:TOKEN\"\nendpoint = \"https://stt.example/stt\"\n",
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"https://stt.example/stt\"\n",
                 true,
             ),
             (
-                "[voice]\ncredential = \"env:TOKEN\"\nendpoint = \"http://stt.example/stt\"\n",
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://stt.example/stt\"\n",
                 false,
             ),
             (
-                "[voice]\ncredential = \"env:TOKEN\"\nendpoint = \"not a URL\"\n",
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"not a URL\"\n",
                 false,
             ),
-            ("[voice]\nendpoint = \"http://stt.example/stt\"\n", true),
+            (
+                "[voice]\nkind = \"http\"\nendpoint = \"http://stt.example/stt\"\n",
+                true,
+            ),
             (
                 "[voice]\nkind = \"command\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://stt.example/stt\"\n",
                 true,
