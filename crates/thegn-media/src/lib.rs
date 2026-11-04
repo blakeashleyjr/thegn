@@ -36,6 +36,7 @@ mod admit;
 pub mod aggregate;
 #[cfg(target_os = "macos")]
 pub mod applescript;
+pub mod budget;
 #[cfg(target_os = "macos")]
 pub mod mediaremote;
 pub mod mpd;
