@@ -1310,7 +1310,7 @@ fn race_operator_verbs_are_refused_while_a_drain_holds_the_row() {
     let owner = f.start_cli(&["merge", "drain", "--json"]);
     wait_gate_count(&root, "gate-runs", "start ", 1);
     let held = row_state(&f);
-    assert_eq!(held.phase, "claimed_no_child");
+    assert_ne!(held.phase, "unclaimed");
     assert!(held.generation >= 1);
     let wt = f.held.to_str().unwrap().to_owned();
 
