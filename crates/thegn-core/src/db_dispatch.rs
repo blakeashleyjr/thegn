@@ -6821,6 +6821,207 @@ mod tests {
         }
     }
 
+    // Each round races two fresh connections to one file DB; no process or
+    // lease participates, and the barrier is the only start signal. The DB
+    // timestamp is asserted only for presence, never for an exact value.
+    // The exit CAS has one winner, so an observer cannot overwrite the code
+    // or timestamp recorded by the other observer.
+    #[test]
+    fn interleave_exit_duplicate_stamps_record_exactly_once() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-X{round}"),
+                &format!("/wt/interleave-x{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
+            a_db.stamp_dispatch_run(id, "exit-session", "exit.md")
+                .unwrap();
+            let run = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let run_b = run.clone();
+            let barrier = std::sync::Barrier::new(2);
+
+            let (a, b) = std::thread::scope(|scope| {
+                let a_barrier = &barrier;
+                let b_barrier = &barrier;
+                let a_run = &run;
+                let a_thread = scope.spawn(move || {
+                    a_barrier.wait();
+                    a_db.stamp_dispatch_exit(a_run, Some(1))
+                });
+                let b_thread = scope.spawn(move || {
+                    b_barrier.wait();
+                    b_db.stamp_dispatch_exit(&run_b, Some(2))
+                });
+                (a_thread.join().unwrap(), b_thread.join().unwrap())
+            });
+            let results = [a.unwrap(), b.unwrap()];
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| **result == ExitStamp::Stamped)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| **result == ExitStamp::AlreadyStamped)
+                    .count(),
+                1
+            );
+
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            let expected_exit_code = if results[0] == ExitStamp::Stamped {
+                Some(1)
+            } else {
+                Some(2)
+            };
+            assert_eq!(final_row.exit_code, expected_exit_code);
+            assert!(final_row.exited_at_ms.is_some());
+            assert_eq!(check_db.dispatch_run_ref(id).unwrap().unwrap(), run);
+        }
+    }
+
+    // Each round races two fresh connections to one file DB; the reservation
+    // keeps the old run identity while publication atomically replaces it.
+    // If the old exit stamps first, publication clears that stamp; if
+    // publication wins first, the exit is stale. The barrier is the only
+    // start signal and the final generation must identify the new run.
+    #[test]
+    fn interleave_exit_late_stamp_vs_retry_publication_never_closes_the_new_run() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-X{round}"),
+                &format!("/wt/interleave-x{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
+            a_db.stamp_dispatch_run(id, "old-session", "old.md")
+                .unwrap();
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Spawning)
+                .unwrap();
+            let old_run = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let old_run_for_exit = old_run.clone();
+            let barrier = std::sync::Barrier::new(2);
+
+            let (a, b) = std::thread::scope(|scope| {
+                let a_barrier = &barrier;
+                let b_barrier = &barrier;
+                let a_thread = scope.spawn(move || {
+                    a_barrier.wait();
+                    a_db.compare_and_set_dispatch_retry_run(
+                        id,
+                        AgentDispatchStatus::Spawning,
+                        "new-session",
+                        "new.md",
+                    )
+                });
+                let b_thread = scope.spawn(move || {
+                    b_barrier.wait();
+                    b_db.stamp_dispatch_exit(&old_run_for_exit, Some(1))
+                });
+                (a_thread.join().unwrap(), b_thread.join().unwrap())
+            });
+            assert!(a.unwrap());
+            let exit_result = b.unwrap();
+            assert!(matches!(exit_result, ExitStamp::Stamped | ExitStamp::Stale));
+
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            let final_run = check_db.dispatch_run_ref(id).unwrap().unwrap();
+            assert_eq!(final_row.status, AgentDispatchStatus::Running);
+            assert_eq!(final_row.session_id.as_deref(), Some("new-session"));
+            assert_eq!(final_row.exit_code, None);
+            assert_eq!(final_row.exited_at_ms, None);
+            assert_eq!(final_run.run_gen, old_run.run_gen + 1);
+        }
+    }
+
+    // Each round races a run-fenced park and status-only retry publication
+    // through two fresh connections to one file DB. If park wins, the changed
+    // status rejects publication; if publication wins, its generation bump
+    // rejects the stale park, so the replacement remains live.
+    #[test]
+    fn interleave_exit_stale_park_vs_retry_publication_has_exactly_one_winner() {
+        let (seed_db, dir) = temp_db();
+        drop(seed_db);
+        let path = dir.path().join("thegn.db");
+
+        for round in 0..20_u32 {
+            let a_db = Db::open_at(&path).unwrap();
+            let b_db = Db::open_at(&path).unwrap();
+            let id = put_row(
+                &a_db,
+                &format!("linear:INTERLEAVE-X{round}"),
+                &format!("/wt/interleave-x{round}"),
+            );
+            a_db.update_dispatch_status(id, AgentDispatchStatus::Running)
+                .unwrap();
+            a_db.stamp_dispatch_run(id, "park-session", "park.md")
+                .unwrap();
+            let run = a_db.dispatch_run_ref(id).unwrap().unwrap();
+            let barrier = std::sync::Barrier::new(2);
+
+            let (a, b) = std::thread::scope(|scope| {
+                let a_barrier = &barrier;
+                let b_barrier = &barrier;
+                let a_run = &run;
+                let a_thread = scope.spawn(move || {
+                    a_barrier.wait();
+                    a_db.compare_and_set_dispatch_retry_park_run(
+                        a_run,
+                        AgentDispatchStatus::Running,
+                        "transport parked",
+                    )
+                });
+                let b_thread = scope.spawn(move || {
+                    b_barrier.wait();
+                    b_db.compare_and_set_dispatch_retry_run(
+                        id,
+                        AgentDispatchStatus::Running,
+                        "relaunch-session",
+                        "relaunch.md",
+                    )
+                });
+                (a_thread.join().unwrap(), b_thread.join().unwrap())
+            });
+            let a_won = a.unwrap();
+            let b_won = b.unwrap();
+            assert_ne!(a_won, b_won, "exactly one run-fenced park/retry wins");
+
+            let check_db = Db::open_at(&path).unwrap();
+            let final_row = check_db.get_dispatch(id).unwrap().unwrap();
+            let final_run = check_db.dispatch_run_ref(id).unwrap().unwrap();
+            if a_won {
+                assert_eq!(final_row.status, AgentDispatchStatus::WaitingHuman);
+                assert_eq!(final_row.session_id.as_deref(), Some("park-session"));
+                assert_eq!(final_row.note, Some("transport parked".to_string()));
+                assert_eq!(final_run.run_gen, run.run_gen);
+            } else {
+                assert_eq!(final_row.status, AgentDispatchStatus::Running);
+                assert_eq!(final_row.session_id.as_deref(), Some("relaunch-session"));
+                assert_eq!(final_row.note, None);
+                assert_eq!(final_run.run_gen, run.run_gen + 1);
+            }
+        }
+    }
+
     fn rows_in_every_status(db: &Db) -> Vec<(i64, &'static str)> {
         let statuses = [
             AgentDispatchStatus::Queued,
