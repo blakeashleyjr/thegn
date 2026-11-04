@@ -651,6 +651,29 @@ pub(crate) fn remove_landed_with_config(
             };
         }
     };
+    match db.merge_enqueue_identity(worktree) {
+        Ok(Some(recorded)) => {
+            if let Err(reason) = crate::merge_driver::recorded_identity_drift(
+                &recorded,
+                Path::new(worktree),
+                repo_root,
+            ) {
+                return CleanupOutcome::Refused {
+                    class: CleanupRefusal::Identity,
+                    reason: format!(
+                        "worktree identity changed since the branch was queued ({reason}); kept"
+                    ),
+                };
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return CleanupOutcome::Refused {
+                class: CleanupRefusal::Database,
+                reason: format!("enqueue identity unavailable: {error}"),
+            };
+        }
+    }
     let queue_before = match db.list_merge_queue() {
         Ok(rows) => rows.into_iter().find(|r| r.worktree == worktree),
         Err(error) => {
@@ -1340,6 +1363,115 @@ mod tests {
         db.update_merge_status(worktree, "landed", Some(&commit), None, None)
             .unwrap();
         commit
+    }
+
+    #[expect(clippy::disallowed_methods)]
+    fn record_private_land_with_identity(
+        db: &Db,
+        root: &Path,
+        worktree: &str,
+        branch: &str,
+        identity: &thegn_core::store::MergeEnqueueIdentity,
+    ) -> String {
+        let output = cleanup::test_git(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let commit = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        db.enqueue_merge_candidate_with_identity(
+            worktree,
+            branch,
+            "main",
+            &thegn_core::store::MergeCandidate {
+                branch_ref: format!("refs/heads/{branch}"),
+                candidate_oid: commit.clone(),
+            },
+            identity,
+        )
+        .unwrap();
+        db.update_merge_status(worktree, "landed", Some(&commit), None, None)
+            .unwrap();
+        commit
+    }
+
+    #[test]
+    fn landed_remove_identity_refuses_a_recreated_worktree() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-identity-recreated");
+        let feat_s = feat.to_string_lossy().to_string();
+        let real = crate::merge_ops::local_enqueue_identity(&feat).unwrap();
+        let identity = thegn_core::store::MergeEnqueueIdentity {
+            common_dir: real.common_dir.clone(),
+            admin_dir: "/not/the/original/registration".into(),
+        };
+        let commit = record_private_land_with_identity(&db, &root, &feat_s, "feat", &identity);
+        let before = db.list_merge_queue().unwrap();
+
+        let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+
+        assert!(matches!(
+            outcome,
+            CleanupOutcome::Refused {
+                class: CleanupRefusal::Identity,
+                ref reason,
+            } if reason.contains("registration changed since enqueue")
+        ));
+        assert!(feat.is_dir(), "worktree dir must be kept");
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+        assert!(util::git_ok(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&feat).unwrap();
+    }
+
+    #[test]
+    fn landed_remove_identity_refuses_another_repository() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-identity-repository");
+        let feat_s = feat.to_string_lossy().to_string();
+        let real = crate::merge_ops::local_enqueue_identity(&feat).unwrap();
+        let identity = thegn_core::store::MergeEnqueueIdentity {
+            common_dir: "/elsewhere/.git".into(),
+            admin_dir: real.admin_dir,
+        };
+        let commit = record_private_land_with_identity(&db, &root, &feat_s, "feat", &identity);
+
+        let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+
+        assert!(matches!(
+            outcome,
+            CleanupOutcome::Refused {
+                class: CleanupRefusal::Identity,
+                ref reason,
+            } if reason.contains("different repository")
+        ));
+        assert!(feat.is_dir(), "worktree dir must be kept");
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&feat).unwrap();
+    }
+
+    #[test]
+    fn landed_remove_proceeds_when_the_recorded_identity_matches() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-identity-matches");
+        let feat_s = feat.to_string_lossy().to_string();
+        let identity = crate::merge_ops::local_enqueue_identity(&feat).unwrap();
+        let commit = record_private_land_with_identity(&db, &root, &feat_s, "feat", &identity);
+
+        let outcome = remove_landed(&db, &root, &feat_s, "feat", "main", Some(&commit), true);
+
+        assert!(matches!(outcome, CleanupOutcome::Removed { .. }));
+        assert!(
+            !feat.is_dir(),
+            "matching worktree identity should be removed"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The folder name a worktree is currently filed under, if any.
