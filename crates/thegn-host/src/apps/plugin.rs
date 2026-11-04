@@ -66,7 +66,6 @@ pub(crate) struct AppState {
     pub timeout: Duration,
     pub session: Option<crate::plugins::SessionGen>,
     pub epoch: u64,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read in L6"))]
     pub focus_requested: bool,
     pub ready: bool,
     pub requests: Arc<Mutex<RequestLedger>>,
@@ -76,7 +75,6 @@ pub(crate) struct AppState {
     error: Option<String>,
 }
 impl AppState {
-    #[cfg_attr(not(test), expect(dead_code, reason = "constructed in L6"))]
     pub(crate) fn new(background: bool) -> Self {
         Self {
             view: None,
@@ -95,7 +93,6 @@ impl AppState {
         }
     }
     /// Accepted frames and responses retain their originating wire order.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called in L6"))]
     pub(crate) fn apply_view(&mut self, view: AppView) -> Result<(), String> {
         view.validate()?;
         if self
@@ -132,7 +129,6 @@ impl AppState {
         self.deliveries.push_back(Delivery::View(view));
         Ok(())
     }
-    #[cfg_attr(not(test), expect(dead_code, reason = "called in L6"))]
     pub(crate) fn push_response(
         &mut self,
         session: crate::plugins::SessionGen,
@@ -162,6 +158,15 @@ impl AppState {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .next_deadline()
+    }
+    #[cfg(test)]
+    pub(crate) fn response_queued(&self, session: crate::plugins::SessionGen, id: u64) -> bool {
+        self.deliveries.iter().any(|delivery| {
+            matches!(delivery,
+                Delivery::Response { session: queued_session, response }
+                    if *queued_session == session && response.id == id
+            )
+        })
     }
     pub(crate) fn request_event(&mut self, event: AppEventParams) -> Result<u64, String> {
         event.validate()?;

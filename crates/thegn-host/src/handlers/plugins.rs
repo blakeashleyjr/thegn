@@ -10,7 +10,7 @@
 //! through [`crate::plugins::PluginsHost::respawn`].
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use thegn_core::plugin_api::{
     API_VERSION, Alert, AuditDecision, Capability, Contribution, Event, EventKind, ExtensionPoint,
@@ -48,8 +48,10 @@ pub(crate) struct FeedBridge {
 
 /// One live (or dead-but-remembered) plugin on the loop side.
 pub(crate) struct PluginEntry {
+    pub apps: BTreeMap<String, crate::apps::plugin::SharedApp>,
     pub plugin: LoadedPlugin,
     pub runtime: PluginRuntime,
+    grants: std::collections::HashSet<Capability>,
     /// Generation of the resident process whose writer and events are live.
     pub session: Option<SessionGen>,
     /// Highest generation whose exit or replacement has been observed.
@@ -71,15 +73,25 @@ pub(crate) struct PluginEntry {
     /// Live `provider.call` correlation for resident plugins with provider
     /// contributions (`ExtensionPoint::IssueProvider`); `None` otherwise.
     pub bridge: Option<std::sync::Arc<thegn_svc::plugin::ProviderBridge>>,
+    focus_tickets: Mutex<BTreeMap<String, FocusTicket>>,
     /// Status text of the last reported one-shot failure; cleared by a
     /// successful run so a recurring scheduled failure is reported once.
     last_one_shot_failure: Option<String>,
+}
+
+struct FocusTicket {
+    surface: String,
+    session: SessionGen,
+    epoch: u64,
+    deadline: std::time::Instant,
 }
 
 /// Loop-side plugin state: entries by plugin id (BTreeMap ⇒ stable statusbar
 /// order) plus the outboxes the loop flushes off-thread after each drain.
 pub(crate) struct PluginsState {
     pub plugins: BTreeMap<String, PluginEntry>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read in L7"))]
+    pub(crate) loading: bool,
     /// Notifications raised via the `notify` verb this drain, recorded to the
     /// inbox off-loop by [`flush_alerts`]. `(plugin id, alert)`.
     pub pending_alerts: Vec<(String, Alert)>,
@@ -91,18 +103,96 @@ pub(crate) struct PluginsState {
     dispatcher: Option<Dispatcher>,
     /// Shared config for the dispatcher's daemon discovery and feed bridges.
     cfg: Arc<thegn_core::config::Config>,
+    navigation_epoch: u64,
+    active_app: String,
+    modal_owns_input: bool,
 }
 
 impl PluginsState {
     pub(crate) fn new(cfg: thegn_core::config::Config) -> Self {
         Self {
             plugins: BTreeMap::new(),
+            loading: true,
             pending_alerts: Vec::new(),
             pending_alert_drops: BTreeMap::new(),
             inbox: None,
             dispatcher: None,
             cfg: Arc::new(cfg),
+            navigation_epoch: 0,
+            active_app: String::new(),
+            modal_owns_input: false,
         }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
+    pub(crate) fn user_input(&mut self) {
+        self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
+    pub(crate) fn update_app_context(&mut self, active_app: &str, modal_owns_input: bool) {
+        if self.active_app != active_app {
+            self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
+            self.active_app = active_app.to_owned();
+        }
+        self.modal_owns_input = modal_owns_input;
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
+    pub(crate) fn next_app_deadline(&self) -> Option<std::time::Instant> {
+        self.plugins
+            .values()
+            .flat_map(|entry| entry.apps.values())
+            .filter_map(|app| {
+                app.lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .next_deadline()
+            })
+            .min()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
+    pub(crate) fn app_tabs(&self) -> Vec<crate::apps::plugin::AppTabDescriptor> {
+        let mut tabs = Vec::new();
+        for (plugin, entry) in &self.plugins {
+            for contribution in &entry.contributions {
+                if contribution.extension_point != ExtensionPoint::AppTab {
+                    continue;
+                }
+                let Some(surface) = contribution.surface.as_ref() else {
+                    continue;
+                };
+                let Some(shared) = entry.apps.get(contribution.id.as_str()) else {
+                    continue;
+                };
+                tabs.push(crate::apps::plugin::AppTabDescriptor {
+                    id: format!("plugin:{plugin}:{}", contribution.id.as_str()),
+                    label: contribution.label.clone(),
+                    surface: surface.as_str().to_owned(),
+                    shared: shared.clone(),
+                });
+            }
+        }
+        tabs
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "called in L7"))]
+    pub(crate) fn take_focus_request(&mut self) -> Option<String> {
+        for (plugin, entry) in &self.plugins {
+            for contribution in &entry.contributions {
+                if contribution.extension_point != ExtensionPoint::AppTab {
+                    continue;
+                }
+                if let Some(app) = entry.apps.get(contribution.id.as_str()) {
+                    let mut app = app.lock().unwrap_or_else(|error| error.into_inner());
+                    if app.focus_requested {
+                        app.focus_requested = false;
+                        return Some(format!("plugin:{plugin}:{}", contribution.id.as_str()));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Lazily start the host.call dispatcher, sharing the config without
@@ -247,6 +337,9 @@ pub(crate) fn effective_grants(
     let mut notification_source = false;
     for c in &neg.accepted_contributions {
         match c.extension_point {
+            ExtensionPoint::AppTab => {
+                grants.insert(Capability::new("surface", "app"));
+            }
             ExtensionPoint::StatusBarSegment => {
                 grants.insert(Capability::new("surface", "statusbar"));
             }
@@ -268,11 +361,33 @@ pub(crate) fn effective_grants(
     grants
 }
 
+fn gate_app_tabs(contributions: &mut Vec<Contribution>, allowed: bool) -> Vec<Contribution> {
+    if allowed {
+        return Vec::new();
+    }
+    let mut removed = Vec::new();
+    contributions.retain(|contribution| {
+        if contribution.extension_point == ExtensionPoint::AppTab {
+            removed.push(contribution.clone());
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
 /// Build one loop-side entry from a discovery result.
-fn build_entry(st: LoadedState) -> PluginEntry {
+fn build_entry(st: LoadedState) -> (PluginEntry, Vec<Contribution>) {
     let mut negotiated = st.negotiated;
+    let mut contributions = negotiated.accepted_contributions.clone();
+    let removed = gate_app_tabs(
+        &mut contributions,
+        crate::channel_state::allows(thegn_core::channel::Feature::PluginApps),
+    );
+    negotiated.accepted_contributions = contributions.clone();
     negotiated.granted = effective_grants(&negotiated, &st.plugin.spec);
-    let contributions = negotiated.accepted_contributions.clone();
+    let grants = negotiated.granted.clone();
     let bridge = st.writer.as_ref().and_then(|w| {
         contributions
             .iter()
@@ -281,20 +396,53 @@ fn build_entry(st: LoadedState) -> PluginEntry {
                 thegn_svc::plugin::ProviderBridge::new(w.clone(), st.plugin.spec.run_timeout())
             })
     });
-    PluginEntry {
-        runtime: PluginRuntime::new(negotiated),
-        plugin: st.plugin,
-        session: st.session,
-        retired: None,
-        pending_exit: None,
-        writer: st.writer,
-        feed_bridge: None,
-        contributions,
-        restarts: 0,
-        disabled: false,
-        bridge,
-        last_one_shot_failure: None,
-    }
+    let requests = Arc::new(Mutex::new(crate::apps::plugin::RequestLedger::default()));
+    let app_background = st.plugin.spec.background
+        && st.plugin.spec.mode == PluginMode::Resident
+        && st
+            .plugin
+            .spec
+            .manifest
+            .capabilities
+            .iter()
+            .any(|c| c.as_str() == "background:sync");
+    let apps = contributions
+        .iter()
+        .filter(|contribution| {
+            contribution.extension_point == ExtensionPoint::AppTab && contribution.surface.is_some()
+        })
+        .map(|contribution| {
+            let mut app = crate::apps::plugin::AppState::new(app_background);
+            app.writer = st.writer.clone();
+            app.session = st.session;
+            app.timeout = st.plugin.spec.run_timeout();
+            app.requests = requests.clone();
+            (
+                contribution.id.as_str().to_owned(),
+                Arc::new(Mutex::new(app)),
+            )
+        })
+        .collect();
+    (
+        PluginEntry {
+            apps,
+            runtime: PluginRuntime::new(negotiated),
+            grants,
+            plugin: st.plugin,
+            session: st.session,
+            retired: None,
+            pending_exit: None,
+            writer: st.writer,
+            feed_bridge: None,
+            contributions,
+            restarts: 0,
+            disabled: false,
+            bridge,
+            focus_tickets: Mutex::new(BTreeMap::new()),
+            last_one_shot_failure: None,
+        },
+        removed,
+    )
 }
 
 /// Publish the live issue-provider bridges to the process-global registry
@@ -346,23 +494,26 @@ fn send_activate(entry: &PluginEntry) {
     granted.sort();
     // best-effort: a session that died between spawn and activate surfaces
     // via its Exit event.
-    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-    let _ = writer.notify(
+    let background = entry.plugin.spec.background
+        && entry.plugin.spec.mode == PluginMode::Resident
+        && entry
+            .plugin
+            .spec
+            .manifest
+            .capabilities
+            .iter()
+            .any(|c| c.as_str() == "background:sync");
+    if let Err(error) = writer.notify_control(
         thegn_core::plugin_api::PluginCallback::Activate,
-        serde_json::json!({ "api": API_VERSION, "granted": granted }),
-    );
+        serde_json::json!({ "api": API_VERSION, "session": writer.session_token(), "granted": granted, "background": background }),
+    ) {
+        tracing::debug!(target: "thegn::plugin", %error, "activate not admitted; Exit handles it");
+    }
 }
 
-/// Recompute the grant set for activation params (the runtime keeps its copy
-/// private, so re-derive from the same pure policy).
+/// Keep activation grants identical to the negotiated runtime grant set.
 fn effective_grants_of(entry: &PluginEntry) -> std::collections::HashSet<Capability> {
-    // Reconstruct a minimal NegotiatedManifest view: accepted contributions
-    // are what the grant policy reads.
-    let neg = NegotiatedManifest {
-        accepted_contributions: entry.contributions.clone(),
-        ..Default::default()
-    };
-    effective_grants(&neg, &entry.plugin.spec)
+    entry.grants.clone()
 }
 
 /// The statusbar segments to render: `(label, cached view)` for every
@@ -441,6 +592,60 @@ pub(crate) fn invoke_palette_action(
     match entry.plugin.spec.mode {
         PluginMode::Resident => match &entry.writer {
             Some(writer) => {
+                if let Some((surface, app)) = entry.contributions.iter().find_map(|item| {
+                    (item.extension_point == ExtensionPoint::AppTab)
+                        .then(|| {
+                            Some((
+                                item.surface.as_ref()?.as_str().to_owned(),
+                                entry.apps.get(item.id.as_str())?.clone(),
+                            ))
+                        })
+                        .flatten()
+                }) {
+                    let Some(session) = entry.session else {
+                        return Some(format!("Plugin {plugin} is not running (restarting)"));
+                    };
+                    let Ok(ticket_id) = writer.next_request_id() else {
+                        return Some(format!("Plugin {plugin} is not running (restarting)"));
+                    };
+                    let token = format!("{session}:{ticket_id}");
+                    let mut app = app.lock().unwrap_or_else(|error| error.into_inner());
+                    let event = thegn_core::plugin_app::AppEventParams {
+                        surface: surface.clone(),
+                        session: writer.session_token().to_owned(),
+                        state_scope: app
+                            .view
+                            .as_ref()
+                            .map_or_else(String::new, |view| view.state_scope.clone()),
+                        revision: app.view.as_ref().map_or(0, |view| view.revision),
+                        focus_ticket: Some(token.clone()),
+                        event: thegn_core::plugin_app::AppEvent::Invoke {
+                            id: contribution.to_owned(),
+                        },
+                    };
+                    if let Err(error) = app.request_event(event) {
+                        return Some(format!("Plugin {plugin}: {error}"));
+                    }
+                    drop(app);
+                    let now = std::time::Instant::now();
+                    let mut tickets = entry
+                        .focus_tickets
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    tickets.retain(|_, ticket| ticket.deadline > now);
+                    if tickets.len() < 8 {
+                        tickets.insert(
+                            token,
+                            FocusTicket {
+                                surface,
+                                session,
+                                epoch: state.navigation_epoch,
+                                deadline: now + std::time::Duration::from_secs(5),
+                            },
+                        );
+                    }
+                    return Some(format!("Plugin {plugin}: {contribution}"));
+                }
                 if let Err(e) = writer.notify(
                     thegn_core::plugin_api::PluginCallback::OnEvent,
                     serde_json::to_value(&event).unwrap_or_default(),
@@ -577,13 +782,19 @@ fn drain_with_responder(
         });
         match msg {
             PluginMsg::Loaded(list) => {
+                state.loading = false;
                 for st in list {
                     let id = st.plugin.spec.manifest.id.as_str().to_string();
-                    let entry = build_entry(st);
+                    let (entry, removed_apps) = build_entry(st);
                     send_activate(&entry);
                     let failed_resident_start =
                         entry.plugin.spec.mode == PluginMode::Resident && entry.writer.is_none();
                     state.plugins.insert(id.clone(), entry);
+                    if !removed_apps.is_empty() {
+                        model.status = format!(
+                            "Plugin {id}: app tabs are dev-channel only; set THEGN_CHANNEL=dev"
+                        );
+                    }
                     if failed_resident_start {
                         damage.merge(handle_exit(state, model, host, &id, None, false));
                     }
@@ -631,10 +842,17 @@ fn drain_with_responder(
                 match event {
                     SessionEvent::Message(m) => damage.merge(apply_message(state, &plugin, m)),
                     SessionEvent::Response(r) => {
-                        // Provider replies are resolved by the owning session before
-                        // enqueueing host events. Never route an old session's id
-                        // against a replacement bridge with the same plugin name.
-                        tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "unroutable response from originating plugin session");
+                        let accepted = is_current
+                            && state.plugins.get(&plugin).is_some_and(|entry| {
+                                entry.apps.values().any(|app| {
+                                    app.lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .push_response(session, r.clone())
+                                })
+                            });
+                        if !accepted {
+                            tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "unroutable response from originating plugin session");
+                        }
                     }
                     SessionEvent::Junk(line) => {
                         tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
@@ -731,6 +949,22 @@ fn drain_with_responder(
                         entry.writer = Some(w);
                         entry.session = Some(session);
                         entry.pending_exit = None;
+                        entry
+                            .focus_tickets
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clear();
+                        for app in entry.apps.values() {
+                            let mut app = app.lock().unwrap_or_else(|error| error.into_inner());
+                            app.writer = entry.writer.clone();
+                            app.session = Some(session);
+                            app.ready = false;
+                            app.epoch = app.epoch.wrapping_add(1);
+                            if let Some(view) = &mut app.view {
+                                view.revision = 0;
+                                view.status = "Plugin restarting…".into();
+                            }
+                        }
                         send_activate(entry);
                         sync_provider_registry(state);
                         damage.merge(PluginDamage::Structural);
@@ -817,12 +1051,27 @@ fn handle_exit(
         return PluginDamage::None;
     };
     entry.writer = None;
+    entry
+        .focus_tickets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
     if let Some(session) = entry.session.take() {
         entry.retired = Some(
             entry
                 .retired
                 .map_or(session, |retired| retired.max(session)),
         );
+    }
+    for app in entry.apps.values() {
+        let mut app = app.lock().unwrap_or_else(|error| error.into_inner());
+        app.writer = None;
+        app.session = None;
+        app.ready = false;
+        app.epoch = app.epoch.wrapping_add(1);
+        if let Some(view) = &mut app.view {
+            view.status = "Plugin unavailable; waiting for restart".into();
+        }
     }
     entry.feed_bridge = None;
     entry.bridge = None;
@@ -939,11 +1188,93 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
     if verb == HostVerb::HostCall {
         return apply_host_call(state, plugin, msg);
     }
+    let pid = PluginId::new(plugin);
+    if verb == HostVerb::Update && params_has_app(&msg.params) {
+        let navigation_epoch = state.navigation_epoch;
+        let modal_owns_input = state.modal_owns_input;
+        let Some(entry) = state.plugins.get_mut(plugin) else {
+            return PluginDamage::None;
+        };
+        let focus_ticket = msg
+            .params
+            .get("focus_ticket")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|token| {
+                entry
+                    .focus_tickets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(token)
+            });
+        let id = msg.id;
+        let result = (|| {
+            if entry.plugin.spec.mode != PluginMode::Resident {
+                return Err(RpcError::new(
+                    RpcErrorCode::Invalid,
+                    "app updates require a resident plugin",
+                ));
+            }
+            let surface = param_str(&msg.params, "surface")
+                .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "missing app surface"))?;
+            let Some(contribution) = entry.contributions.iter().find(|contribution| {
+                contribution.extension_point == ExtensionPoint::AppTab
+                    && contribution
+                        .surface
+                        .as_ref()
+                        .is_some_and(|owned| owned.as_str() == surface)
+            }) else {
+                return Err(RpcError::new(
+                    RpcErrorCode::Invalid,
+                    "app surface is not declared by this plugin",
+                ));
+            };
+            let Some(shared) = entry.apps.get(contribution.id.as_str()).cloned() else {
+                return Err(RpcError::new(
+                    RpcErrorCode::Invalid,
+                    "app surface is unavailable",
+                ));
+            };
+            let view = msg
+                .params
+                .get("app")
+                .cloned()
+                .ok_or_else(|| RpcError::new(RpcErrorCode::Invalid, "missing app view"))?;
+            let view = serde_json::from_value::<thegn_core::plugin_app::AppView>(view)
+                .map_err(|error| RpcError::new(RpcErrorCode::Invalid, error.to_string()))?;
+            view.validate()
+                .map_err(|error| RpcError::new(RpcErrorCode::Invalid, error))?;
+            entry
+                .runtime
+                .authorize_app_update(pid.clone(), &SurfaceId::new(surface.clone()))
+                .map_err(rpc_error_of)?;
+            let mut app = shared.lock().unwrap_or_else(|error| error.into_inner());
+            app.apply_view(view)
+                .map_err(|error| RpcError::new(RpcErrorCode::Invalid, error))?;
+            if msg.params.get("focus").and_then(serde_json::Value::as_bool) == Some(true)
+                && let Some(ticket) = focus_ticket
+                && ticket.surface == surface
+                && Some(ticket.session) == entry.session
+                && ticket.epoch == navigation_epoch
+                && !modal_owns_input
+                && ticket.deadline > std::time::Instant::now()
+            {
+                app.focus_requested = true;
+            }
+            Ok(serde_json::Value::Null)
+        })();
+        if let Some(id) = id {
+            let response = match result {
+                Ok(value) => RpcResponse::ok(id, value),
+                Err(error) => RpcResponse::err(id, error),
+            };
+            respond(entry, response);
+        }
+        return PluginDamage::None;
+    }
     let entry = state
         .plugins
         .get_mut(plugin)
         .expect("plugin existence checked before verb dispatch");
-    let pid = PluginId::new(plugin);
     let params = msg.params;
     // The verb's effect, plus the value (if any) an id-bearing request gets
     // back. Invalid params short-circuit to an Invalid error response.
@@ -1098,6 +1429,10 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> Plu
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, verb = verb.method_name(), error = %e.message, "verb failed");
     }
     damage
+}
+
+fn params_has_app(params: &serde_json::Value) -> bool {
+    params.get("app").is_some()
 }
 
 fn subscribe_kinds(
@@ -2163,7 +2498,12 @@ mod tests {
         );
     }
 
-    fn contribution(id: &str, ep: ExtensionPoint, surface: &str, label: &str) -> Contribution {
+    pub(super) fn contribution(
+        id: &str,
+        ep: ExtensionPoint,
+        surface: &str,
+        label: &str,
+    ) -> Contribution {
         Contribution {
             id: ContributionId::new(id),
             extension_point: ep,
@@ -2176,7 +2516,11 @@ mod tests {
         }
     }
 
-    fn spec(id: &str, contributions: Vec<Contribution>, scopes: Vec<Scope>) -> PluginSpec {
+    pub(super) fn spec(
+        id: &str,
+        contributions: Vec<Contribution>,
+        scopes: Vec<Scope>,
+    ) -> PluginSpec {
         let mut capabilities = contributions
             .iter()
             .filter_map(|contribution| {
@@ -2209,7 +2553,7 @@ mod tests {
         }
     }
 
-    fn loaded_state(spec: PluginSpec) -> LoadedState {
+    pub(super) fn loaded_state(spec: PluginSpec) -> LoadedState {
         let negotiated = thegn_svc::plugin::loader::negotiate(&spec).expect("negotiates");
         LoadedState {
             plugin: LoadedPlugin {
@@ -2223,13 +2567,19 @@ mod tests {
         }
     }
 
-    fn state_with(specs: Vec<PluginSpec>) -> PluginsState {
+    pub(super) fn state_with(specs: Vec<PluginSpec>) -> PluginsState {
         let mut state = PluginsState::new(thegn_core::config::Config::default());
+        state.loading = false;
         for s in specs {
             let id = s.manifest.id.as_str().to_string();
-            let mut entry = build_entry(loaded_state(s));
+            let (mut entry, _) = build_entry(loaded_state(s));
             // Test fixtures model an already-live resident without spawning a process.
             entry.session = (entry.plugin.spec.mode == PluginMode::Resident).then_some(1);
+            for app in entry.apps.values() {
+                app.lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .session = entry.session;
+            }
             state.plugins.insert(id, entry);
         }
         state
@@ -2250,7 +2600,7 @@ mod tests {
 
     #[test]
     fn feed_bridge_claim_is_limited_to_one_per_entry() {
-        let mut entry = build_entry(loaded_state(seg_spec("p")));
+        let (mut entry, _) = build_entry(loaded_state(seg_spec("p")));
         entry.feed_bridge = spawn_cancellable_bridge("thegn-feedclaim", async {
             std::future::pending::<()>().await;
         });
@@ -2477,11 +2827,15 @@ mod tests {
         assert_eq!(model.status, "before");
     }
 
-    fn drain_one(state: &mut PluginsState, model: &mut FrameModel, m: PluginMsg) -> PluginDamage {
+    pub(super) fn drain_one(
+        state: &mut PluginsState,
+        model: &mut FrameModel,
+        m: PluginMsg,
+    ) -> PluginDamage {
         drain_messages(state, model, [m])
     }
 
-    fn event(plugin: &str, session: u64, event: SessionEvent) -> PluginMsg {
+    pub(super) fn event(plugin: &str, session: u64, event: SessionEvent) -> PluginMsg {
         PluginMsg::Event {
             plugin: plugin.into(),
             session,
@@ -3246,7 +3600,7 @@ mod tests {
         let bare = seg_spec("p");
         let err = host_call_check(&bare, "sessions.list").unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Denied);
-        let mut entry = build_entry(loaded_state(bare.clone()));
+        let (mut entry, _) = build_entry(loaded_state(bare.clone()));
         let err =
             authorize_host_call(&mut entry, "sessions.list", &serde_json::Value::Null).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Denied);
@@ -3298,21 +3652,21 @@ mod tests {
     fn merge_add_audit_records_only_its_worktree_target_for_allowed_and_denied_calls() {
         let target = serde_json::json!({ "worktree": "wt-a" });
         let git = spec("p", Vec::new(), vec![Scope::Git]);
-        let mut allowed = build_entry(loaded_state(git));
+        let (mut allowed, _) = build_entry(loaded_state(git));
         authorize_host_call(&mut allowed, "merge.add", &target).unwrap();
         let audit = allowed.runtime.audit_log().last().unwrap();
         assert_eq!(audit.decision, AuditDecision::Granted);
         assert_eq!(audit.target.as_deref(), Some("wt-a"));
 
         let bare = seg_spec("p");
-        let mut denied = build_entry(loaded_state(bare));
+        let (mut denied, _) = build_entry(loaded_state(bare));
         assert!(authorize_host_call(&mut denied, "merge.add", &target).is_err());
         let audit = denied.runtime.audit_log().last().unwrap();
         assert_eq!(audit.decision, AuditDecision::Denied);
         assert_eq!(audit.target.as_deref(), Some("wt-a"));
 
         let read = spec("p", Vec::new(), vec![Scope::Read]);
-        let mut unrelated = build_entry(loaded_state(read));
+        let (mut unrelated, _) = build_entry(loaded_state(read));
         authorize_host_call(
             &mut unrelated,
             "sessions.list",
@@ -3756,5 +4110,616 @@ mod tests {
         assert!(model.status.contains("trusted_native = true"));
         assert!(model.status.contains("(+1 more; see thegn plugin check)"));
         assert_ne!(damage, PluginDamage::None);
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::tests::{contribution, drain_one, event, loaded_state, spec, state_with};
+    use super::*;
+    use std::sync::MutexGuard;
+    use thegn_core::channel::Channel;
+    use thegn_core::plugin_api::{ExtensionPoint, Span, StyleRole};
+
+    static CHANNEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestChannel {
+        _lock: MutexGuard<'static, ()>,
+        original: Channel,
+    }
+
+    impl Drop for TestChannel {
+        fn drop(&mut self) {
+            crate::channel_state::install(self.original);
+        }
+    }
+
+    fn channel_guard(channel: Channel) -> TestChannel {
+        let lock = CHANNEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let original = crate::channel_state::current();
+        crate::channel_state::install(channel);
+        TestChannel {
+            _lock: lock,
+            original,
+        }
+    }
+
+    fn app_spec(plugin: &str) -> PluginSpec {
+        spec(
+            plugin,
+            vec![
+                contribution(
+                    "app",
+                    ExtensionPoint::AppTab,
+                    &format!("{plugin}/app"),
+                    "App",
+                ),
+                contribution(
+                    "action",
+                    ExtensionPoint::PaletteAction,
+                    &format!("{plugin}/palette"),
+                    "Open app",
+                ),
+                contribution(
+                    "segment",
+                    ExtensionPoint::StatusBarSegment,
+                    &format!("{plugin}/status"),
+                    "Status",
+                ),
+            ],
+            Vec::new(),
+        )
+    }
+
+    fn install_app(plugin: &str) -> PluginsState {
+        state_with(vec![app_spec(plugin)])
+    }
+
+    fn app_view(revision: u64, status: &str) -> thegn_core::plugin_app::AppView {
+        thegn_core::plugin_app::AppView {
+            state_scope: "default".into(),
+            revision,
+            root: thegn_core::plugin_app::Widget::Text {
+                id: "root".into(),
+                title: "Title".into(),
+                text: "body".into(),
+            },
+            status: status.into(),
+        }
+    }
+
+    #[test]
+    fn gate_app_tabs_removes_only_app_contributions_when_disallowed() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut rows = vec![
+            contribution("app", ExtensionPoint::AppTab, "p/app", "App"),
+            contribution(
+                "segment",
+                ExtensionPoint::StatusBarSegment,
+                "p/segment",
+                "Segment",
+            ),
+        ];
+        let removed = gate_app_tabs(&mut rows, false);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id.as_str(), "app");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].extension_point, ExtensionPoint::StatusBarSegment);
+
+        let mut allowed = vec![contribution("app", ExtensionPoint::AppTab, "p/app", "App")];
+        assert!(gate_app_tabs(&mut allowed, true).is_empty());
+        assert_eq!(allowed.len(), 1);
+    }
+
+    #[test]
+    fn app_grants_include_declared_background_sync_only_when_enabled() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut enabled = app_spec("enabled");
+        enabled.background = true;
+        enabled
+            .manifest
+            .capabilities
+            .push(Capability::new("background", "sync"));
+        let neg = thegn_svc::plugin::loader::negotiate(&enabled).expect("manifest negotiates");
+        assert!(effective_grants(&neg, &enabled).contains(&Capability::new("surface", "app")));
+        assert!(effective_grants(&neg, &enabled).contains(&Capability::new("background", "sync")));
+
+        let mut disabled = enabled;
+        disabled.background = false;
+        let neg = thegn_svc::plugin::loader::negotiate(&disabled).expect("manifest negotiates");
+        assert!(
+            !effective_grants(&neg, &disabled).contains(&Capability::new("background", "sync"))
+        );
+    }
+
+    #[test]
+    fn next_app_deadline_is_none_for_idle_apps() {
+        let _guard = channel_guard(Channel::Dev);
+        let state = install_app("p");
+        assert_eq!(state.next_app_deadline(), None);
+    }
+
+    #[test]
+    fn exit_marks_apps_unavailable_and_bumps_epoch() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let app = state.plugins["p"].apps["app"].clone();
+        app.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .apply_view(app_view(1, "ready"))
+            .unwrap();
+        let old_epoch = app.lock().unwrap_or_else(|error| error.into_inner()).epoch;
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            event("p", 1, SessionEvent::Exit { code: Some(1) }),
+        );
+        let app = app.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(app.session, None);
+        assert!(!app.ready);
+        assert_eq!(app.epoch, old_epoch + 1);
+        assert_eq!(
+            app.view.as_ref().unwrap().status,
+            "Plugin unavailable; waiting for restart"
+        );
+    }
+
+    #[test]
+    fn respawn_rebinds_apps_to_the_new_generation_and_resets_revision() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let app = state.plugins["p"].apps["app"].clone();
+        app.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .apply_view(app_view(9, "ready"))
+            .unwrap();
+        let (runtime, session) = test_session();
+        let writer = session.writer();
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::Respawned {
+                plugin: "p".into(),
+                session: Some(2),
+                writer: Some(writer.clone()),
+            },
+        );
+        let entry = &state.plugins["p"];
+        assert_eq!(entry.session, Some(2));
+        assert!(
+            entry
+                .focus_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        let app = app.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(app.session, Some(2));
+        assert_eq!(
+            app.writer.as_ref().map(SessionWriter::session_token),
+            Some(writer.session_token())
+        );
+        assert!(!app.ready);
+        assert_eq!(app.view.as_ref().unwrap().revision, 0);
+        assert_eq!(app.view.as_ref().unwrap().status, "Plugin restarting…");
+        drop(app);
+        stop_test_session(&runtime, session);
+    }
+
+    #[test]
+    fn response_from_a_retired_generation_is_not_routed() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        state.plugins.get_mut("p").unwrap().session = Some(8);
+        let app = state.plugins["p"].apps["app"].clone();
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "p",
+                7,
+                SessionEvent::Response(RpcResponse::ok(42, serde_json::Value::Null)),
+            ),
+        );
+        assert!(
+            !app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .response_queued(7, 42)
+        );
+    }
+
+    #[test]
+    fn stable_channel_strips_app_tabs_with_a_status_line() {
+        let _guard = channel_guard(Channel::Stable);
+        let mut contributions = vec![contribution("app", ExtensionPoint::AppTab, "p/app", "App")];
+        assert_eq!(gate_app_tabs(&mut contributions, false).len(), 1);
+        let mut state = PluginsState::new(thegn_core::config::Config::default());
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            PluginMsg::Loaded(vec![loaded_state(app_spec("p"))]),
+        );
+        assert!(
+            !state.loading,
+            "the first Loaded message ends the discovery loading state"
+        );
+        assert_eq!(state.plugins["p"].apps.len(), 0);
+        assert_eq!(
+            model.status,
+            "Plugin p: app tabs are dev-channel only; set THEGN_CHANNEL=dev"
+        );
+    }
+
+    #[test]
+    fn app_update_with_stale_revision_is_rejected() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let app = state.plugins["p"].apps["app"].clone();
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "p",
+                1,
+                SessionEvent::Message(RpcMessage {
+                    id: None,
+                    method: "update".into(),
+                    params: serde_json::json!({"surface":"p/app", "app": app_view(2, "current")}),
+                }),
+            ),
+        );
+        assert_eq!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .as_ref()
+                .unwrap()
+                .status,
+            "current"
+        );
+        drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "p",
+                1,
+                SessionEvent::Message(RpcMessage {
+                    id: None,
+                    method: "update".into(),
+                    params: serde_json::json!({"surface":"p/app", "app": app_view(2, "stale")}),
+                }),
+            ),
+        );
+        assert_eq!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .as_ref()
+                .unwrap()
+                .status,
+            "current"
+        );
+    }
+
+    #[test]
+    fn app_update_for_undeclared_surface_or_other_plugin_is_rejected() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let (other, _) = build_entry(loaded_state(spec("q", Vec::new(), Vec::new())));
+        state.plugins.insert("q".into(), other);
+        let app = state.plugins["p"].apps["app"].clone();
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "p",
+                1,
+                SessionEvent::Message(RpcMessage {
+                    id: None,
+                    method: "update".into(),
+                    params: serde_json::json!({
+                        "surface":"p/status", "app": app_view(1, "wrong"),
+                        "view": View::line([Span::styled("wrong", StyleRole::Default)])
+                    }),
+                }),
+            ),
+        );
+        assert!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .is_none()
+        );
+        assert!(
+            statusbar_views(&state).is_empty(),
+            "an AppTab payload on a non-AppTab surface must not update the statusbar"
+        );
+        drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "q",
+                1,
+                SessionEvent::Message(RpcMessage {
+                    id: None,
+                    method: "update".into(),
+                    params: serde_json::json!({"surface":"p/app", "app": app_view(1, "cross-plugin")}),
+                }),
+            ),
+        );
+        assert!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .view
+                .is_none(),
+            "another plugin cannot write the declared app surface"
+        );
+    }
+
+    #[test]
+    fn app_focus_requires_current_causal_one_use_ticket() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let navigation_epoch = state.navigation_epoch;
+        let entry = state.plugins.get_mut("p").unwrap();
+        entry.session = Some(7);
+        let app = entry.apps["app"].clone();
+        let token = "7:ticket".to_owned();
+        entry
+            .focus_tickets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                token.clone(),
+                FocusTicket {
+                    surface: "p/app".into(),
+                    session: 7,
+                    epoch: navigation_epoch.wrapping_add(1),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                },
+            );
+        let msg = RpcMessage {
+            id: None,
+            method: "update".into(),
+            params: serde_json::json!({
+                "surface":"p/app", "app":app_view(1,"ready"), "focus":true, "focus_ticket":token
+            }),
+        };
+        apply_message(&mut state, "p", msg);
+        assert!(
+            !app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .focus_requested,
+            "a ticket from an earlier navigation epoch is refused"
+        );
+        assert!(
+            state.plugins["p"]
+                .focus_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "refused tickets are consumed"
+        );
+
+        state.modal_owns_input = true;
+        state.plugins["p"]
+            .focus_tickets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                "7:modal".into(),
+                FocusTicket {
+                    surface: "p/app".into(),
+                    session: 7,
+                    epoch: navigation_epoch,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                },
+            );
+        apply_message(
+            &mut state,
+            "p",
+            RpcMessage {
+                id: None,
+                method: "update".into(),
+                params: serde_json::json!({
+                    "surface":"p/app", "app":app_view(2,"modal"), "focus":true, "focus_ticket":"7:modal"
+                }),
+            },
+        );
+        assert!(
+            !app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .focus_requested,
+            "a modal that owns input refuses focus"
+        );
+        state.modal_owns_input = false;
+        state.plugins["p"]
+            .focus_tickets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                "7:ticket".into(),
+                FocusTicket {
+                    surface: "p/app".into(),
+                    session: 7,
+                    epoch: navigation_epoch,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                },
+            );
+        apply_message(
+            &mut state,
+            "p",
+            RpcMessage {
+                id: None,
+                method: "update".into(),
+                params: serde_json::json!({
+                    "surface":"p/app", "app":app_view(3,"ready"), "focus":true, "focus_ticket":"7:ticket"
+                }),
+            },
+        );
+        assert!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .focus_requested
+        );
+        assert!(
+            state.plugins["p"]
+                .focus_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        let mut shared = app.lock().unwrap_or_else(|error| error.into_inner());
+        shared.focus_requested = false;
+        drop(shared);
+        apply_message(
+            &mut state,
+            "p",
+            RpcMessage {
+                id: None,
+                method: "update".into(),
+                params: serde_json::json!({
+                    "surface":"p/app", "app":app_view(4,"again"), "focus":true, "focus_ticket":"7:ticket"
+                }),
+            },
+        );
+        assert!(
+            !app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .focus_requested,
+            "a used ticket cannot focus twice"
+        );
+    }
+
+    #[test]
+    fn palette_invoke_on_app_plugin_issues_one_ticket() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let (runtime, session) = test_session();
+        let writer = session.writer();
+        let entry = state.plugins.get_mut("p").unwrap();
+        entry.session = Some(7);
+        entry.writer = Some(writer.clone());
+        let app = entry.apps["app"].clone();
+        {
+            let mut app = app.lock().unwrap_or_else(|error| error.into_inner());
+            app.session = Some(7);
+            app.writer = Some(writer);
+        }
+        assert!(invoke_palette_action(&state, None, "plugin:p:action").is_some());
+        let entry = &state.plugins["p"];
+        assert_eq!(
+            entry
+                .focus_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+        assert!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .next_deadline()
+                .is_some()
+        );
+        stop_test_session(&runtime, session);
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the resident fixture child is the test executable"
+    )]
+    fn test_session() -> (tokio::runtime::Runtime, thegn_svc::plugin::ResidentSession) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let supervisor = thegn_svc::plugin::ResidentSupervisor::new(runtime.handle().clone());
+        let executable = std::env::current_exe().expect("test executable");
+        let mut env = BTreeMap::new();
+        env.insert("THEGN_PLUGIN_TEST_HOLD".to_owned(), "1".to_owned());
+        let args = vec![
+            "--exact".to_owned(),
+            "handlers::plugins::tests::resident_fixture_child".to_owned(),
+        ];
+        let argv = std::iter::once(executable.to_string_lossy().into_owned())
+            .chain(args)
+            .collect::<Vec<_>>();
+        let session = thegn_svc::plugin::ResidentSession::spawn(
+            &supervisor,
+            "app-routing-fixture",
+            &argv,
+            &env,
+            None,
+            |_| {},
+        )
+        .expect("resident fixture starts");
+        (runtime, session)
+    }
+
+    fn stop_test_session(
+        runtime: &tokio::runtime::Runtime,
+        session: thegn_svc::plugin::ResidentSession,
+    ) {
+        session.kill();
+        let mut completion = session.completion();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while completion.borrow().is_none() {
+                    completion.changed().await.expect("completion channel");
+                }
+            })
+            .await
+            .expect("resident fixture terminates");
+        });
+    }
+
+    #[test]
+    fn response_for_current_generation_reaches_the_pending_app_request() {
+        let _guard = channel_guard(Channel::Dev);
+        let mut state = install_app("p");
+        let (runtime, session) = test_session();
+        let writer = session.writer();
+        let app = state.plugins["p"].apps["app"].clone();
+        let pending = {
+            let mut app = app.lock().unwrap_or_else(|error| error.into_inner());
+            app.session = Some(7);
+            app.writer = Some(writer);
+            app.request_event(thegn_core::plugin_app::AppEventParams {
+                surface: "p/app".into(),
+                session: session.writer().session_token().into(),
+                state_scope: "default".into(),
+                revision: 0,
+                focus_ticket: None,
+                event: thegn_core::plugin_app::AppEvent::Invoke { id: "app".into() },
+            })
+            .expect("event admitted")
+        };
+        state.plugins.get_mut("p").unwrap().session = Some(7);
+        state.plugins.get_mut("p").unwrap().writer = Some(session.writer());
+        let mut model = FrameModel::default();
+        drain_one(
+            &mut state,
+            &mut model,
+            event(
+                "p",
+                7,
+                SessionEvent::Response(RpcResponse::ok(pending, serde_json::Value::Null)),
+            ),
+        );
+        assert!(
+            app.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .response_queued(7, pending)
+        );
+        stop_test_session(&runtime, session);
     }
 }

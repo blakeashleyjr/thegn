@@ -36,10 +36,10 @@
 
 ## 6. Plugin handler routing
 
-- [ ] 6.1 Entry apps + grants + activate params.
-- [ ] 6.2 App update routing + focus tickets.
-- [ ] 6.3 Response routing + SessionGen exit/respawn.
-- [ ] 6.4 Experimental gate at build.
+- [x] 6.1 Entry apps + grants + activate params — `handlers/plugins.rs::build_entry`.
+- [x] 6.2 App update routing + focus tickets — `app_focus_requires_current_causal_one_use_ticket`.
+- [x] 6.3 Response routing + SessionGen exit/respawn — `response_for_current_generation_reaches_the_pending_app_request`.
+- [x] 6.4 Experimental gate at build — `stable_channel_strips_app_tabs_with_a_status_line`.
 
 ## 7. Keymap + run loop + help + idle proof
 
