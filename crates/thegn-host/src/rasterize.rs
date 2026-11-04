@@ -1747,9 +1747,9 @@ mod tests {
         let stage = RenderStage::new().unwrap();
         let absent = dir.path().join("absent.pdf");
 
-        assert!(stage_input(&stage, dir.path(), "input-directory.pdf", 64).is_err());
+        assert!(stage_input(&stage, dir.path(), "input.pdf", 64).is_err());
         assert!(stage_has_no_input(&stage));
-        assert!(stage_input(&stage, &absent, "input-missing.pdf", 64).is_err());
+        assert!(stage_input(&stage, &absent, "input.pdf", 64).is_err());
         assert!(stage_has_no_input(&stage));
     }
 
