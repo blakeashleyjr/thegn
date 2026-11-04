@@ -9,6 +9,57 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [0.1.0-alpha.47] — 2026-11-03 (maintenance batch 84)
 
+### Added
+
+- `thegn doctor` reports stored problem counts for configured calendar
+  accounts, from each account's last applied page, in text and `--json`,
+  without creating the state database.
+- `--lease-gen` on dispatch claim, put and set-status and on `session open`
+  fences Lead mutations to the acquired lease generation; stale generations are
+  refused before writing.
+- `thegn api coverage` reports a disposition and any review trigger for each
+  excused control-surface gap, in text and `--json`.
+- The Home Manager module exposes `confirmDelete` and scalar `[theme]` options
+  for preset, focus border, pane padding, undercurl, color, glyphs, agent glyphs,
+  mascot and mascot motion.
+
+### Changed
+
+- The state database schema is now v100. Restart the host and daemon after
+  upgrading so they use the migrated database.
+- `thegn merge history` records a refused queue-aware `thegn merge land` as a
+  `land` event with its refusal outcome when a matching queue row exists; the
+  queue row remains unchanged.
+- Theme save and import refuse before writing when another theme file claims
+  the same exact name or slug.
+- PR review-task refreshes cannot add or reactivate a task when the active
+  roster has reached its 4,096-row limit; revising an active task remains
+  allowed.
+
+### Fixed
+
+- Oversized agent prompts are shortened to fit the command line and prompt
+  environment variables, with an omission marker, so they do not prevent the
+  agent from starting.
+- Worktree creation is refused without changes when Git cannot verify whether
+  the branch already exists; failed branch renames and worktree moves include
+  Git's reason.
+- Quitting during a scheduled calendar refresh starts no further account
+  fetches; fetches already in flight may finish.
+- Orphan detection keeps a live worktree's main container when its slug ends in
+  `-tgvpn` or `-tgagent`.
+- (dev channel) The x86_64 Linux `.#dev` package sets `THEGN_BRIDGE_BINARY` to
+  its bundled static provider bridge unless the variable is already set.
+
+### Security
+
+- (dev channel) SSH data projections (sshfs or sync) with different SSH extra
+  arguments have different identities; a mismatch is refused before any mount,
+  pull or push. Existing SSH projections with non-empty extra arguments may
+  need to be recreated after upgrading.
+- (dev channel) Managed SSH custody records use a monotonic generation, so a
+  revoked and republished key cannot match a stale rotation snapshot.
+
 ## [0.1.0-alpha.46] — 2026-11-03 (maintenance batch 83)
 
 ### Added
