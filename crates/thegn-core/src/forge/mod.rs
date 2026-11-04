@@ -713,14 +713,16 @@ mod tests {
         );
         let all = ForgeCaps::ALL;
         let none = ForgeCaps::default();
-        assert!(all.whoami && all.line_comments && all.resolve_review_thread);
+        assert!(
+            all.whoami && all.line_comments && all.resolve_review_thread && all.merge_expected_head
+        );
         assert!(!none.pr_status);
         assert_ne!(all, none);
     }
 
     #[test]
     fn forge_caps_merge_expected_head_is_in_all_and_off_by_default() {
-        assert!(ForgeCaps::ALL.merge_expected_head);
+        assert!(std::hint::black_box(ForgeCaps::ALL).merge_expected_head);
         assert!(!ForgeCaps::default().merge_expected_head);
     }
 
