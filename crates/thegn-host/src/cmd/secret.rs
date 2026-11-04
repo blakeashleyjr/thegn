@@ -135,13 +135,13 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
     let refs = secret_scan::secret_refs(cfg);
     if json {
         // The `--json` convention: one compact document via `emit_json`.
-        return crate::cmd::emit_json(&ref_rows_json(&refs, &|r| secret::present(r)));
+        return crate::cmd::emit_json(&ref_rows_json(&refs, &secret::present));
     }
     if refs.is_empty() {
         outln!("no secret refs configured");
         return Ok(());
     }
-    for line in ref_rows_text(&refs, &|r| secret::present(r)) {
+    for line in ref_rows_text(&refs, &secret::present) {
         outln!("{line}");
     }
     Ok(())
@@ -193,7 +193,7 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
     let managed =
         thegn_core::managed_ssh::list().context("read complete managed SSH custody inventory")?;
     if json {
-        let secret_rows = ref_rows_json(&refs, &|r| secret::present(r));
+        let secret_rows = ref_rows_json(&refs, &secret::present);
         let key_rows: Vec<_> = managed
             .iter()
             .map(|record| {
