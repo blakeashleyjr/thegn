@@ -4,4 +4,3 @@
 
 db.rs
 dns_filter.rs
-util.rs
