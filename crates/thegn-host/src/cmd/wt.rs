@@ -253,7 +253,7 @@ fn new(
         Some(base) => base,
         None => worktree::resolve_base_checked(&root, cfg).map_err(anyhow::Error::msg)?,
     };
-    if util::git_out(&root, &["rev-parse", "--verify", "--quiet", &base]).is_none() {
+    if !base_has_commits(&root, &base)? {
         anyhow::bail!("'{base}' has no commits yet — make an initial commit first");
     }
 
@@ -932,16 +932,26 @@ fn new_batched(
                         }
                     },
                 };
-                if util::git_out(&root, &["rev-parse", "--verify", "--quiet", &resolved_base])
-                    .is_none()
-                {
-                    outcomes.push(MemberOutcome {
-                        repo: m.repo_name.clone(),
-                        status: "failed",
-                        path: None,
-                        error: Some(format!("base '{resolved_base}' has no commits")),
-                    });
-                    continue;
+                match base_has_commits(&root, &resolved_base) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        outcomes.push(MemberOutcome {
+                            repo: m.repo_name.clone(),
+                            status: "failed",
+                            path: None,
+                            error: Some(format!("base '{resolved_base}' has no commits")),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        outcomes.push(MemberOutcome {
+                            repo: m.repo_name.clone(),
+                            status: "failed",
+                            path: None,
+                            error: Some(error.to_string()),
+                        });
+                        continue;
+                    }
                 }
                 match create_and_register(
                     cfg,
@@ -1140,6 +1150,64 @@ fn check_branch_deletable(
     Ok(())
 }
 
+/// The two Git answers `--delete-branch` is checked against: the default branch and the branch the main
+/// worktree has checked out (`None` = detached). A read that fails is a refusal, never "not protected".
+fn delete_branch_guard_inputs(root: &std::path::Path) -> Result<(String, Option<String>)> {
+    let default_branch = worktree::default_branch_checked(root)
+        .map_err(|reason| anyhow::anyhow!("refusing --delete-branch: {reason}"))?;
+    let main_checked_out = crate::merge_ops::branch_of(root).map_err(|reason| {
+        anyhow::anyhow!(
+            "refusing --delete-branch: could not read the branch checked out in {}: {reason}",
+            root.display()
+        )
+    })?;
+    Ok((default_branch, main_checked_out))
+}
+
+/// Whether `base` names a commit in `root`. `git rev-parse --verify --quiet` exits 1 (empty stderr) when it
+/// does not; any other failure is an error, not "no commits".
+fn base_has_commits(root: &std::path::Path, base: &str) -> Result<bool> {
+    let loc = thegn_core::remote::GitLoc::Local(root.to_path_buf());
+    match loc.git_text(&["rev-parse", "--verify", "--quiet", base]) {
+        Ok(_) => Ok(true),
+        Err(error) if base_is_absent(&error) => Ok(false),
+        Err(error) => Err(anyhow::anyhow!(
+            "could not verify base '{base}' in {}: {error}",
+            root.display()
+        )),
+    }
+}
+
+fn base_is_absent(error: &thegn_core::git_run::GitTextError) -> bool {
+    matches!(
+        error,
+        thegn_core::git_run::GitTextError::Failed(
+            thegn_core::git_run::GitOutcome::Exit {
+                code: Some(1),
+                stderr_tail,
+            }
+        ) if stderr_tail.is_empty()
+    )
+}
+
+/// The live branch of an unregistered linked worktree addressed by path. Without `--delete-branch` the
+/// branch is only a label (an unreadable or detached HEAD stays an empty label, as before); with it, the
+/// branch decides what gets force-deleted, so an unreadable or detached HEAD refuses.
+fn unregistered_live_branch(worktree: &std::path::Path, delete_branch: bool) -> Result<String> {
+    match crate::merge_ops::branch_of(worktree) {
+        Ok(Some(branch)) => Ok(branch),
+        Ok(None) if delete_branch => anyhow::bail!(
+            "cannot delete branch for {}: Git did not provide a live branch (detached HEAD)",
+            worktree.display()
+        ),
+        Err(reason) if delete_branch => anyhow::bail!(
+            "cannot delete branch for {}: could not read the live branch: {reason}",
+            worktree.display()
+        ),
+        Ok(None) | Err(_) => Ok(String::new()),
+    }
+}
+
 /// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →
 /// confirm → provider/sandbox teardown → `git worktree remove` → DB cleanup.
 fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()> {
@@ -1253,8 +1321,7 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
             let p = std::path::Path::new(&target_path);
             match thegn_core::repo::main_worktree(p) {
                 Some(r) if p.is_dir() && p.join(".git").is_file() => {
-                    let b = util::git_out(p, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-                        .unwrap_or_default();
+                    let b = unregistered_live_branch(p, delete_branch)?;
                     (
                         target_path.clone(),
                         b,
@@ -1291,10 +1358,10 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
             .map(std::path::PathBuf::from)
             .or_else(|| thegn_core::repo::main_worktree(std::path::Path::new(&path)));
         let (default_branch, main_checked_out) = match &root_path {
-            Some(root) => (
-                Some(worktree::default_branch(root)),
-                util::git_out(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
-            ),
+            Some(root) => {
+                let (default_branch, main_checked_out) = delete_branch_guard_inputs(root)?;
+                (Some(default_branch), main_checked_out)
+            }
             None => (None, None),
         };
         check_branch_deletable(
@@ -1392,6 +1459,99 @@ mod rm_tests {
         assert!(check_branch_deletable("trunk", None, Some("main"), Some("trunk")).is_err());
         assert!(check_branch_deletable("tg/x", Some("tg/x"), Some("main"), Some("main")).is_ok());
         assert!(check_branch_deletable("tg/x", None, None, None).is_ok());
+    }
+
+    fn guard_repo(dir: &std::path::Path) {
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "test@example.invalid"],
+            &["config", "user.name", "test"],
+            &["config", "commit.gpgsign", "false"],
+            &["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            assert!(thegn_core::util::git_ok(dir, args));
+        }
+    }
+
+    #[test]
+    fn delete_branch_guard_inputs_refuse_when_git_cannot_answer() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let err = delete_branch_guard_inputs(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing --delete-branch"), "{err}");
+    }
+
+    #[test]
+    fn delete_branch_guard_inputs_report_default_and_main_checkout() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        guard_repo(dir.path());
+        assert_eq!(
+            delete_branch_guard_inputs(dir.path()).unwrap(),
+            ("main".to_string(), Some("main".to_string()))
+        );
+        assert!(thegn_core::util::git_ok(
+            dir.path(),
+            &["checkout", "-q", "--detach", "HEAD"]
+        ));
+        assert_eq!(
+            delete_branch_guard_inputs(dir.path()).unwrap().1,
+            None,
+            "a detached main worktree has no checked-out branch"
+        );
+    }
+
+    #[test]
+    fn base_has_commits_tells_missing_from_unreadable() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        guard_repo(dir.path());
+        assert!(base_has_commits(dir.path(), "main").unwrap());
+        assert!(!base_has_commits(dir.path(), "no-such-branch").unwrap());
+
+        let plain = tempfile::tempdir_in("/tmp").unwrap();
+        let err = base_has_commits(plain.path(), "main")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not verify base 'main'"), "{err}");
+    }
+
+    #[test]
+    fn base_has_commits_requires_empty_stderr_for_missing_base() {
+        use thegn_core::git_run::{GitOutcome, GitTextError};
+
+        assert!(base_is_absent(&GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail: String::new(),
+        })));
+        assert!(!base_is_absent(&GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail: "repository error".to_string(),
+        })));
+    }
+
+    #[test]
+    fn unregistered_live_branch_refuses_delete_when_the_branch_is_unreadable_or_detached() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        guard_repo(dir.path());
+        assert_eq!(unregistered_live_branch(dir.path(), true).unwrap(), "main");
+        assert_eq!(unregistered_live_branch(dir.path(), false).unwrap(), "main");
+
+        assert!(thegn_core::util::git_ok(
+            dir.path(),
+            &["checkout", "-q", "--detach", "HEAD"]
+        ));
+        let err = unregistered_live_branch(dir.path(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("detached HEAD"), "{err}");
+        assert_eq!(unregistered_live_branch(dir.path(), false).unwrap(), "");
+
+        let plain = tempfile::tempdir_in("/tmp").unwrap();
+        let err = unregistered_live_branch(plain.path(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not read the live branch"), "{err}");
+        assert_eq!(unregistered_live_branch(plain.path(), false).unwrap(), "");
     }
 
     #[test]

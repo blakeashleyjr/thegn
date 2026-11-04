@@ -1120,7 +1120,15 @@ fn drive_queue_with(
                 break;
             }
             let held = drain_attempt_is_held(&fresh.status);
-            let attempt = match (actions.attempt)(&item.branch, &branch_loc, held) {
+            let attempt_result = {
+                // The ingest ref of a cross-host attempt carries this claim's generation (THE-401b).
+                let _ingest_scope = claim
+                    .borrow()
+                    .as_ref()
+                    .map(|claim| crate::merge_remote::IngestClaimScope::enter(claim.generation()));
+                (actions.attempt)(&item.branch, &branch_loc, held)
+            };
+            let attempt = match attempt_result {
                 Ok(a) => a,
                 Err(e) => {
                     if let Some(drift) = e.downcast_ref::<CandidateDrift>() {

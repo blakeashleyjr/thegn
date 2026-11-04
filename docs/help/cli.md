@@ -289,7 +289,12 @@ the log without a job name or head, warns, and does not cache it. With `--json`,
 the warnings are in a `warnings` array (empty for a cached log); the control
 API's `ci.logs` reply carries the same field.
 The daemon/API `ci.logs` `tail_lines` argument can narrow `[ci] log_tail_lines`,
-but a larger value is clamped to that setting. A value of `0` is refused.
+but a larger value is clamped to that setting. A value of `0` is refused. The
+`[ci] log_tail_lines` setting must be between 1 and 100000; configuration
+validation reports `ci.log_tail_lines: must be greater than zero` or
+`ci.log_tail_lines: must not exceed 100000`. Invalid UTF-8 lines are dropped
+from the retained tail and mark it truncated; CRLF endings are preserved, and
+an over-long line is discarded.
 
 When a GitLab job list reaches its page, row, byte or time budget (one minute
 for the whole run detail), `thegn ci view` and `ci logs` warn that the list is
@@ -466,13 +471,11 @@ With `--json`, a classified refusal prints `{"error": ..., "id": ..., "message":
 ...}` with an error kind of `illegal_transition`, `stale`, `missing_evidence` or
 `missing_row` before the command fails.
 
-`dispatch claim`, `dispatch put`, `session open --stage --issue`, `session open --resume-work` and `dispatch set-status` take `--lease <name> --owner <id>` where applicable. A claim, put or resume binds its row to that lease; further mutations for that issue require the same live lease. `--admin --why '<reason>'` on claim, put or set-status is the manual override and is recorded on the row. Rows created without a lease behave as before.
+`dispatch claim`, `dispatch put`, `session open --stage --issue`, `session open --resume-work` and `dispatch set-status` take `--lease <name>` only with both `--owner <id>` and `--lease-gen <GEN>`. A claim, put or resume binds its row to that lease; further mutations for that issue require the same live lease. `--admin --why '<reason>'` on claim, put or set-status is the audited manual override and is recorded on the row. Rows created without a lease behave as before.
 `session open --resume-work` also checks any resumed row's parent other than the
 resume source in the same transaction. A missing parent, one from another issue,
 or one that is failed, abandoned or unknown is refused.
-`dispatch claim`, `dispatch put`, `dispatch set-status` and `session open` also
-take `--lease-gen <GEN>` with `--lease` and `--owner`; pass the generation
-printed by `thegn dispatch lease acquire`. It must be positive; a stale
+Pass the positive generation printed by `thegn dispatch lease acquire`; a stale
 generation is refused before anything is written.
 
 The `[pipeline.transport_retry]` budget is stored on each dispatch row and

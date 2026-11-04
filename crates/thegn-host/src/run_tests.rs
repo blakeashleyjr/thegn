@@ -18,6 +18,81 @@ fn submodule_scan_coalesces_refreshes_and_ignores_completion_after_reset() {
 }
 
 #[test]
+fn submodule_scan_cancel_reset_raises_the_old_flag_and_installs_a_fresh_one() {
+    let mut scans = ScanCoalescer::default();
+    let old = scans.cancel_flag();
+    assert!(!old.load(std::sync::atomic::Ordering::Acquire));
+
+    scans.reset();
+
+    assert!(old.load(std::sync::atomic::Ordering::Acquire));
+    let fresh = scans.cancel_flag();
+    assert!(!fresh.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!std::sync::Arc::ptr_eq(&old, &fresh));
+    assert!(scans.request().is_some());
+    assert!(!fresh.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn submodule_scan_cancel_skips_the_remaining_read_and_the_result() {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let second_ran = std::cell::Cell::new(false);
+    let out = read_submodule_scan(
+        &cancel,
+        || {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+            Some(1_u8)
+        },
+        || {
+            second_ran.set(true);
+            Some(2_u8)
+        },
+    );
+    assert!(out.is_none());
+    assert!(!second_ran.get());
+
+    let already_cancelled = std::sync::atomic::AtomicBool::new(true);
+    let reads = std::cell::Cell::new(0);
+    let out = read_submodule_scan(
+        &already_cancelled,
+        || {
+            reads.set(reads.get() + 1);
+            Some(1_u8)
+        },
+        || {
+            reads.set(reads.get() + 1);
+            Some(2_u8)
+        },
+    );
+    assert!(out.is_none());
+    assert_eq!(reads.get(), 0);
+
+    let cancel_in_second_read = std::sync::atomic::AtomicBool::new(false);
+    let out = read_submodule_scan(
+        &cancel_in_second_read,
+        || Some(1_u8),
+        || {
+            cancel_in_second_read.store(true, std::sync::atomic::Ordering::Release);
+            Some(2_u8)
+        },
+    );
+    assert!(out.is_none());
+}
+
+#[test]
+fn submodule_scan_cancel_runs_both_reads_when_not_cancelled() {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        read_submodule_scan(&cancel, || Some(1_u8), || Some(2_u8)),
+        Some((Some(1_u8), Some(2_u8)))
+    );
+    assert_eq!(
+        read_submodule_scan(&cancel, || None::<u8>, || Some(2_u8)),
+        Some((None, Some(2_u8)))
+    );
+}
+
+#[test]
 fn submodule_scan_skipped_while_print_unchanged_for_the_merged_worktree() {
     let seen = crate::diff_watch::Seen::new();
     let active = std::path::Path::new("/wt/active");

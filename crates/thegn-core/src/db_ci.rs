@@ -23,7 +23,7 @@ impl Db {
         let row = self
             .conn()
             .query_row(
-                "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context
+                "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context, attempt, redaction_changed
                  FROM ci_log_cache WHERE worktree=?1 AND run_id=?2 AND job_id=?3",
                 params![worktree, run_id, job_id],
                 |r| {
@@ -40,6 +40,8 @@ impl Db {
                         policy_version: u32::try_from(version).unwrap_or(0),
                         fetched_at: r.get(8)?,
                         context: r.get(9)?,
+                        attempt: r.get::<_, Option<i64>>(10)?.and_then(|n| u64::try_from(n).ok()),
+                        redaction_changed: r.get::<_, Option<i64>>(11)?.map(|n| n != 0),
                     }
                     .revalidated())
                 },
@@ -50,7 +52,7 @@ impl Db {
 
     pub(crate) fn list_ci_log_entries(&self, worktree: &str) -> Result<Vec<CiLogEntry>> {
         let mut stmt = self.conn().prepare(
-            "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context
+            "SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context, attempt, redaction_changed
              FROM ci_log_cache WHERE worktree=?1 ORDER BY fetched_at DESC, run_id, job_id",
         )?;
         let rows = stmt.query_map(params![worktree], |r| {
@@ -67,6 +69,10 @@ impl Db {
                 policy_version: u32::try_from(version).unwrap_or(0),
                 fetched_at: r.get(8)?,
                 context: r.get(9)?,
+                attempt: r
+                    .get::<_, Option<i64>>(10)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                redaction_changed: r.get::<_, Option<i64>>(11)?.map(|n| n != 0),
             })
         })?;
         Ok(rows
@@ -79,14 +85,19 @@ impl Db {
         // use CiLogEntry::new: public text is redacted and hard-capped before it
         // reaches SQLite.
         let redacted = crate::ci_log::redact(&entry.text);
+        let changed = if redacted != entry.text {
+            Some(true)
+        } else {
+            entry.redaction_changed
+        };
         let (text, hard_truncated) =
             crate::ci_log::bounded_tail(&redacted, HARD_MAX_LOG_LINES, HARD_MAX_LOG_BYTES);
         self.conn().execute(
             "INSERT INTO ci_log_cache
-             (worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             (worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at, context, attempt, redaction_changed)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
              ON CONFLICT(worktree, run_id, job_id) DO UPDATE SET
-               job_name=?4, head_sha=?5, text=?6, truncated=?7, redacted=?8, fetched_at=?9, context=?10",
+               job_name=?4, head_sha=?5, text=?6, truncated=?7, redacted=?8, fetched_at=?9, context=?10, attempt=?11, redaction_changed=?12",
             params![
                 entry.worktree,
                 entry.run_id,
@@ -101,7 +112,9 @@ impl Db {
                 } else {
                     entry.fetched_at
                 },
-                entry.context
+                entry.context,
+                entry.attempt.and_then(|n| i64::try_from(n).ok()),
+                changed.map(i64::from)
             ],
         )?;
         Ok(())
@@ -370,5 +383,72 @@ mod tests {
                 .context,
             entry.context
         );
+    }
+
+    #[test]
+    fn ci_log_cache_round_trips_attempt_and_redaction_changed() {
+        let db = Db::open_memory().unwrap();
+        let mut entry = CiLogEntry::new(
+            "/wt/attempt",
+            "run",
+            "job",
+            "tests",
+            "ordinary\n",
+            10,
+            1024,
+            1,
+        );
+        entry.attempt = Some(3);
+        entry.redaction_changed = Some(false);
+        db.put_ci_log(&entry).unwrap();
+        let got = db.get_ci_log("/wt/attempt", "run", "job").unwrap().unwrap();
+        assert_eq!(got.attempt, Some(3));
+        assert_eq!(got.redaction_changed, Some(false));
+        let listed = db.list_ci_logs("/wt/attempt").unwrap();
+        assert_eq!(listed[0].attempt, Some(3));
+        assert_eq!(listed[0].redaction_changed, Some(false));
+
+        entry.attempt = Some(4);
+        db.put_ci_log(&entry).unwrap();
+        let listed = db.list_ci_logs("/wt/attempt").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].attempt, Some(4));
+
+        entry.attempt = None;
+        entry.run_id = "unknown".into();
+        db.put_ci_log(&entry).unwrap();
+        assert_eq!(
+            db.get_ci_log("/wt/attempt", "unknown", "job")
+                .unwrap()
+                .unwrap()
+                .attempt,
+            None
+        );
+        db.conn()
+            .execute(
+                "UPDATE ci_log_cache SET attempt=-1 WHERE worktree=?1 AND run_id=?2 AND job_id=?3",
+                rusqlite::params!["/wt/attempt", "unknown", "job"],
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_ci_log("/wt/attempt", "unknown", "job")
+                .unwrap()
+                .unwrap()
+                .attempt,
+            None
+        );
+    }
+
+    #[test]
+    fn ci_log_put_marks_a_raw_secret_row_as_redaction_changed() {
+        let db = Db::open_memory().unwrap();
+        let mut entry =
+            CiLogEntry::new("/wt/raw", "run", "job", "tests", "ordinary\n", 10, 1024, 1);
+        entry.text = "token=SYNTHETIC\nordinary\n".into();
+        entry.redaction_changed = Some(false);
+        db.put_ci_log(&entry).unwrap();
+        let stored = db.get_ci_log("/wt/raw", "run", "job").unwrap().unwrap();
+        assert_eq!(stored.redaction_changed, Some(true));
+        assert!(!stored.text.contains("SYNTHETIC"));
     }
 }

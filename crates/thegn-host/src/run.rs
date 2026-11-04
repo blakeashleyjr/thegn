@@ -2885,6 +2885,7 @@ struct ScanCoalescer {
     inflight: Option<u64>,
     pending: bool,
     next: u64,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ScanCoalescer {
@@ -2909,8 +2910,17 @@ impl ScanCoalescer {
     }
 
     fn reset(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.inflight = None;
         self.pending = false;
+    }
+
+    /// The flag the currently owned scan polls; raised (and replaced) by
+    /// [`ScanCoalescer::reset`].
+    fn cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.cancel)
     }
 }
 
@@ -2930,6 +2940,30 @@ fn submodule_scan_due(
     has_gitlink_rows || !(merged_for == Some(active) && seen.matches(active, print))
 }
 
+/// Run the two gitlink reads of one scan. `cancel` is checked before each read
+/// and once more before returning, so a scan superseded by a worktree switch
+/// skips its remaining read and its result. `None` means cancelled: the caller
+/// sends nothing.
+fn read_submodule_scan<D, S>(
+    cancel: &std::sync::atomic::AtomicBool,
+    diffs: impl FnOnce() -> Option<D>,
+    states: impl FnOnce() -> Option<S>,
+) -> Option<(Option<D>, Option<S>)> {
+    use std::sync::atomic::Ordering;
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let diffs = diffs();
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    let states = states();
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
+    Some((diffs, states))
+}
+
 /// Enrich hydrated change rows with gitlink data without putting git reads on
 /// either hydration's ordinary-file path or the event loop. Each read remains
 /// independently degradable (`None` retains the last-known field).
@@ -2940,6 +2974,7 @@ fn spawn_submodule_scan(
     print: Option<crate::diff_watch::WatchPrint>,
     tx: &tokio_mpsc::UnboundedSender<SubmoduleScanMsg>,
     waker: &TerminalWaker,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let wt = active_tab_path(session);
     let tx = tx.clone();
@@ -2948,8 +2983,14 @@ fn spawn_submodule_scan(
         use thegn_svc::git::GitBackend;
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let git = thegn_svc::git::CliGit;
-        let diffs = git.submodule_diffs(&loc, "HEAD").ok();
-        let states = git.submodule_states(&loc).ok();
+        let Some((diffs, states)) = read_submodule_scan(
+            &cancel,
+            || git.submodule_diffs(&loc, "HEAD").ok(),
+            || git.submodule_states(&loc).ok(),
+        ) else {
+            tracing::debug!(target: "thegn::git", "submodule scan cancelled by a worktree switch");
+            return;
+        };
         if tx
             .send((generation, token, wt, print, diffs, states))
             .is_ok()
@@ -11648,6 +11689,7 @@ async fn event_loop<T: Terminal>(
                         print,
                         &submodule_scan_tx,
                         &waker,
+                        submodule_scans.cancel_flag(),
                     );
                 }
             }
@@ -12512,6 +12554,7 @@ async fn event_loop<T: Terminal>(
                     print,
                     &submodule_scan_tx,
                     &waker,
+                    submodule_scans.cancel_flag(),
                 );
             }
             // The tab strip is LOOP-owned: `build_model` derived it from the
@@ -12634,6 +12677,10 @@ async fn event_loop<T: Terminal>(
                 });
             }
             let swapped_root = active_tab_path(&session);
+            // A busy map lock keeps the last-shown backing-off list (never block the loop here).
+            if let Some(failed) = lsp_supervisor.handle().failed_servers(&swapped_root) {
+                lsp_diags.set_failed_servers(&swapped_root, failed);
+            }
             lsp_diags.merge_into(&swapped_root, &mut model.panel.diagnostics);
             lsp_visible.rebuilt(&swapped_root);
             // Shares live on the supervisor (loop-local), not in hydration; a

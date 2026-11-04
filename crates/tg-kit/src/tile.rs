@@ -47,6 +47,13 @@ pub trait AppTile {
     /// [`render`]: AppTile::render
     fn wants_redraw(&self) -> bool;
 
+    /// Earliest outstanding operation deadline. `None` keeps the host asleep.
+    /// When `pump()` handles an expired deadline, it must clear or advance it
+    /// so the host does not wake repeatedly on the same deadline.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
     /// Handle one input event. Never blocks or awaits — kick async work onto a
     /// task that reports back through the [`ChangeHook`].
     fn handle_input(&mut self, ev: InputEvent) -> InputResult;
@@ -134,5 +141,11 @@ mod tests {
     fn command_defaults_to_unhandled() {
         let mut tile = MinimalTile;
         assert!(!tile.command("unknown"));
+    }
+
+    #[test]
+    fn next_deadline_defaults_to_none() {
+        let tile = MinimalTile;
+        assert_eq!(tile.next_deadline(), None);
     }
 }

@@ -109,6 +109,9 @@ pub struct CiRun {
     pub url: String,
     #[serde(default)]
     pub run_number: Option<u64>,
+    /// Provider run attempt (GitHub `attempt`, 1 for the first run); None when the provider reports none.
+    #[serde(default)]
+    pub attempt: Option<u64>,
     /// RFC3339 timestamps.
     #[serde(default)]
     pub started_at: Option<String>,

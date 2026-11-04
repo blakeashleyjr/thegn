@@ -130,13 +130,14 @@ pub enum SessionAction {
         /// `dispatch put --chunk … --force`.
         #[arg(long, requires = "stage", conflicts_with = "resume_work")]
         chunk: Option<String>,
-        /// The Lead lease this stage dispatch is made under.
-        #[arg(long, value_name = "NAME", requires = "owner")]
+        /// The Lead lease this stage dispatch is made under. Requires `--owner`
+        /// and `--lease-gen`.
+        #[arg(long, value_name = "NAME", requires_all = ["owner", "lease_gen"])]
         lease: Option<String>,
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Resume an eligible unfinished pipeline roster row (THE-86): an

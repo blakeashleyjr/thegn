@@ -370,6 +370,7 @@ fn log_json(
         "fetched_at": entry.fetched_at,
         "truncated": entry.truncated,
         "redacted": entry.redacted,
+        "redaction_changed": entry.redaction_changed,
         "warnings": warnings,
     })
 }

@@ -540,6 +540,31 @@ fn probe_unix_listener(sock: &Path) -> io::Result<()> {
     }
 }
 
+/// Decide what to do with an existing control socket: `Ok(true)` when a live daemon owns it (the caller must not
+/// replace it), `Ok(false)` when the path is free to bind (it never existed, or a stale socket was removed).
+/// Only a refused probe proves staleness; `remove` runs only then, and any removal failure other than NotFound is
+/// a startup error carrying the path.
+#[cfg(unix)]
+fn settle_existing_socket(
+    probe: io::Result<()>,
+    sock: &Path,
+    remove: impl FnOnce() -> io::Result<()>,
+) -> io::Result<bool> {
+    match classify_unix_probe(probe, sock)? {
+        UnixProbe::Live => Ok(true),
+        UnixProbe::Gone => Ok(false),
+        UnixProbe::Stale => match remove() {
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error_with_path_context(
+                error,
+                "remove stale control socket",
+                sock,
+            )),
+        },
+    }
+}
+
 /// Outcome of [`IpcListener::bind_exclusive`]: the caller either *is* the
 /// daemon or found a live one.
 pub enum BindOutcome {
@@ -632,20 +657,10 @@ impl IpcListener {
                                     &sock,
                                 ));
                             }
-                            match classify_unix_probe(probe_unix_listener(&sock), &sock)? {
-                                UnixProbe::Live => return Ok(UnixBind::AlreadyRunning),
-                                UnixProbe::Gone => {}
-                                UnixProbe::Stale => match std::fs::remove_file(&sock) {
-                                    Ok(()) => {}
-                                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                                    Err(error) => {
-                                        return Err(io_error_with_path_context(
-                                            error,
-                                            "remove stale control socket",
-                                            &sock,
-                                        ));
-                                    }
-                                }
+                            if settle_existing_socket(probe_unix_listener(&sock), &sock, || {
+                                std::fs::remove_file(&sock)
+                            })? {
+                                return Ok(UnixBind::AlreadyRunning);
                             }
                         }
                         match std::os::unix::net::UnixListener::bind(&sock) {
@@ -1014,6 +1029,7 @@ mod tests {
         }
     }
 
+    /// The deterministic decision is covered by `settle_existing_socket_*`; this is the real-kernel confirmation.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bind_probe_treats_a_full_backlog_as_a_live_daemon() {
@@ -1364,6 +1380,7 @@ mod tests {
         ));
     }
 
+    /// The deterministic decision is covered by `settle_existing_socket_*`; this is the real-kernel confirmation.
     #[cfg(unix)]
     #[tokio::test]
     #[allow(
@@ -1420,6 +1437,120 @@ mod tests {
         let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
         permissions.set_readonly(false);
         std::fs::set_permissions(dir.path(), permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_existing_socket_full_backlog_is_live_and_never_removes() {
+        use std::cell::Cell;
+
+        let sock = Path::new("/run/thegn-test/control.sock");
+        let calls = Cell::new(0_u32);
+        for probe in [Err(io::Error::from(io::ErrorKind::WouldBlock)), Ok(())] {
+            let result = settle_existing_socket(probe, sock, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+            assert!(matches!(result, Ok(true)));
+        }
+        assert_eq!(calls.get(), 0, "a live endpoint must never be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_existing_socket_stale_removal_denied_is_a_contextual_startup_error() {
+        use std::cell::Cell;
+
+        let sock = Path::new("/run/thegn-test/control.sock");
+        let calls = Cell::new(0_u32);
+        let result = settle_existing_socket(
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            sock,
+            || {
+                calls.set(calls.get() + 1);
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a denied stale-socket removal must fail startup"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("remove stale control socket"));
+        assert!(error.to_string().contains(&sock.display().to_string()));
+        let context = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<IoPathContext>())
+            .expect("removal error keeps its path context");
+        assert_eq!(context.source.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls.get(), 1, "stale sockets invoke the remover once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_existing_socket_stale_or_gone_path_is_free_to_bind() {
+        use std::cell::Cell;
+
+        let sock = Path::new("/run/thegn-test/control.sock");
+        let removed_calls = Cell::new(0_u32);
+        let removed = settle_existing_socket(
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            sock,
+            || {
+                removed_calls.set(removed_calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(removed, Ok(false)));
+        assert_eq!(removed_calls.get(), 1);
+
+        let not_found_calls = Cell::new(0_u32);
+        let not_found = settle_existing_socket(
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            sock,
+            || {
+                not_found_calls.set(not_found_calls.get() + 1);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            },
+        );
+        assert!(matches!(not_found, Ok(false)));
+        assert_eq!(not_found_calls.get(), 1);
+
+        let gone_calls = Cell::new(0_u32);
+        let gone =
+            settle_existing_socket(Err(io::Error::from(io::ErrorKind::NotFound)), sock, || {
+                gone_calls.set(gone_calls.get() + 1);
+                Ok(())
+            });
+        assert!(matches!(gone, Ok(false)));
+        assert_eq!(gone_calls.get(), 0, "a gone path must not be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_existing_socket_unclassified_probe_error_never_removes() {
+        use std::cell::Cell;
+
+        let sock = Path::new("/run/thegn-test/control.sock");
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            let calls = Cell::new(0_u32);
+            let result =
+                settle_existing_socket(Err(io::Error::new(kind, "probe failure")), sock, || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                });
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("unclassified probe failures must fail closed"),
+            };
+            assert!(error.to_string().contains("probe existing control socket"));
+            assert!(error.to_string().contains(&sock.display().to_string()));
+            assert_eq!(calls.get(), 0, "{kind:?} probe errors must not unlink");
+        }
     }
 
     #[test]

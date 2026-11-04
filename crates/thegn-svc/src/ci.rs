@@ -1287,7 +1287,7 @@ fn parse_provider_row<T>(
 const GH_RUN_FIELDS: &str = "databaseId,name,displayTitle,headBranch,headSha,event,\
                              status,conclusion,number,createdAt,updatedAt,url,workflowName";
 const GH_DETAIL_FIELDS: &str = "databaseId,name,displayTitle,headBranch,headSha,event,\
-                                status,conclusion,number,createdAt,updatedAt,url,workflowName,jobs";
+                                status,conclusion,number,createdAt,updatedAt,url,workflowName,jobs,attempt";
 
 /// GitHub Actions via the `gh` CLI — reuses the user's existing `gh` auth
 /// (keyring, enterprise hosts) instead of threading a token.
@@ -1527,6 +1527,10 @@ fn gh_run_from_value(v: &serde_json::Value) -> Option<CiRun> {
         conclusion_raw: conclusion,
         url: nonempty(v, "url").unwrap_or_default(),
         run_number: v.get("number").and_then(serde_json::Value::as_u64),
+        attempt: v
+            .get("attempt")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|n| *n > 0),
         started_at: nonempty(v, "createdAt"),
         finished_at: completed.then(|| nonempty(v, "updatedAt")).flatten(),
         jobs: gh_jobs_with_discarded(v.get("jobs")).0,
@@ -2294,6 +2298,7 @@ fn gitlab_pipeline_from_value(v: &serde_json::Value) -> Option<CiRun> {
         conclusion_raw: None,
         url: nonempty(v, "web_url").unwrap_or_default(),
         run_number: v.get("iid").and_then(serde_json::Value::as_u64),
+        attempt: None,
         started_at: nonempty(v, "created_at"),
         finished_at: terminal.then(|| nonempty(v, "updated_at")).flatten(),
         jobs: Vec::new(),
@@ -3148,6 +3153,39 @@ mod tests {
     }
 
     #[test]
+    fn gh_run_detail_parses_the_attempt() {
+        let detail = parse_gh_run_detail(
+            r#"{"databaseId":5,"workflowName":"CI","status":"completed","conclusion":"failure","attempt":3,"jobs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(detail.attempt, Some(3));
+        let zero = parse_gh_run_detail(
+            r#"{"databaseId":5,"workflowName":"CI","status":"completed","conclusion":"failure","attempt":0,"jobs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(zero.attempt, None);
+        let missing = parse_gh_run_detail(
+            r#"{"databaseId":5,"workflowName":"CI","status":"completed","conclusion":"failure","jobs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(missing.attempt, None);
+        let (runs, discarded) = parse_gh_runs_with_discarded(
+            r#"[{"databaseId":5,"workflowName":"CI","status":"completed","conclusion":"failure"}]"#,
+        )
+        .unwrap();
+        assert_eq!(discarded, 0);
+        assert_eq!(runs[0].attempt, None);
+    }
+
+    #[test]
+    fn gitlab_pipeline_has_no_attempt() {
+        let (runs, discarded) =
+            parse_gitlab_pipelines_with_discarded(r#"[{"id":9,"status":"success"}]"#).unwrap();
+        assert_eq!(discarded, 0);
+        assert_eq!(runs[0].attempt, None);
+    }
+
+    #[test]
     fn gitlab_detail_paginates_and_rejects_incomplete_or_duplicate_pages() {
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");
@@ -3870,6 +3908,7 @@ esac
                     conclusion_raw: Some("success".into()),
                     url: "https://github.com/owner/repo/actions/runs/11234567890".into(),
                     run_number: Some(341),
+                    attempt: None,
                     started_at: Some("2026-10-01T12:00:00Z".into()),
                     finished_at: Some("2026-10-01T12:04:12Z".into()),
                     jobs: vec![],
@@ -3886,6 +3925,7 @@ esac
                     conclusion_raw: Some("failure".into()),
                     url: "https://github.com/owner/repo/actions/runs/22345678901".into(),
                     run_number: Some(342),
+                    attempt: None,
                     started_at: Some("2026-10-01T13:00:00Z".into()),
                     finished_at: Some("2026-10-01T13:07:45Z".into()),
                     jobs: vec![],
@@ -3902,6 +3942,7 @@ esac
                     conclusion_raw: None,
                     url: "https://github.com/owner/repo/actions/runs/32345678901".into(),
                     run_number: Some(343),
+                    attempt: None,
                     started_at: Some("2026-10-01T14:00:00Z".into()),
                     finished_at: None,
                     jobs: vec![],
@@ -3918,6 +3959,7 @@ esac
                     conclusion_raw: None,
                     url: "https://github.com/owner/repo/actions/runs/42345678901".into(),
                     run_number: Some(344),
+                    attempt: None,
                     started_at: Some("2026-10-01T15:00:00Z".into()),
                     finished_at: None,
                     jobs: vec![],
@@ -3934,6 +3976,7 @@ esac
                     conclusion_raw: Some("cancelled".into()),
                     url: "https://github.com/owner/repo/actions/runs/52345678901".into(),
                     run_number: Some(345),
+                    attempt: None,
                     started_at: Some("2026-10-01T16:00:00Z".into()),
                     finished_at: Some("2026-10-01T16:01:05Z".into()),
                     jobs: vec![],
@@ -3972,6 +4015,7 @@ esac
                 conclusion_raw: Some("failure".into()),
                 url: "https://github.com/owner/repo/actions/runs/22345678901".into(),
                 run_number: Some(342),
+                attempt: None,
                 started_at: Some("2026-10-01T13:00:00Z".into()),
                 finished_at: Some("2026-10-01T13:07:45Z".into()),
                 jobs: vec![
@@ -4064,6 +4108,7 @@ esac
                     conclusion_raw: None,
                     url: "https://gitlab.com/group/repo/-/pipelines/801234567".into(),
                     run_number: Some(41),
+                    attempt: None,
                     started_at: Some("2026-10-02T09:00:00.000Z".into()),
                     finished_at: Some("2026-10-02T09:04:12.000Z".into()),
                     jobs: vec![]
@@ -4080,6 +4125,7 @@ esac
                     conclusion_raw: None,
                     url: "https://gitlab.com/group/repo/-/pipelines/801234568".into(),
                     run_number: Some(42),
+                    attempt: None,
                     started_at: Some("2026-10-02T10:00:00.000Z".into()),
                     finished_at: Some("2026-10-02T10:07:45.000Z".into()),
                     jobs: vec![]
@@ -4096,6 +4142,7 @@ esac
                     conclusion_raw: None,
                     url: "https://gitlab.com/group/repo/-/pipelines/801234569".into(),
                     run_number: Some(43),
+                    attempt: None,
                     started_at: Some("2026-10-02T11:00:00.000Z".into()),
                     finished_at: None,
                     jobs: vec![]
@@ -4112,6 +4159,7 @@ esac
                     conclusion_raw: None,
                     url: "https://gitlab.com/group/repo/-/pipelines/801234570".into(),
                     run_number: Some(44),
+                    attempt: None,
                     started_at: Some("2026-10-02T12:00:00.000Z".into()),
                     finished_at: Some("2026-10-02T12:01:05.000Z".into()),
                     jobs: vec![]
@@ -4146,6 +4194,7 @@ esac
                 conclusion_raw: None,
                 url: "https://gitlab.com/group/repo/-/pipelines/801234568".into(),
                 run_number: Some(42),
+                attempt: None,
                 started_at: Some("2026-10-02T10:00:00.000Z".into()),
                 finished_at: Some("2026-10-02T10:07:45.000Z".into()),
                 jobs: vec![
