@@ -693,6 +693,20 @@ fn persist_alert_batch(db: &thegn_core::db::Db, alerts: Vec<(String, Alert)>) {
 }
 
 fn flush_alerts_with(state: &mut PluginsState, submit: impl FnOnce(Vec<(String, Alert)>)) {
+    let finished = if let Some(dispatcher) = &state.dispatcher {
+        dispatcher.take_outcomes()
+    } else {
+        Vec::new()
+    };
+    for finished in finished {
+        if let Some(entry) = state.plugins.get_mut(finished.plugin.as_str()) {
+            entry.runtime.record_host_call_outcome(
+                finished.audit.0,
+                finished.audit.1,
+                finished.outcome,
+            );
+        }
+    }
     if let Some(dispatcher) = &state.dispatcher {
         for (plugin, counts) in dispatcher.take_diagnostics() {
             if counts.rejected > 0
@@ -1498,6 +1512,7 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
         respond(entry, RpcResponse::err(id, e));
         return PluginDamage::None;
     }
+    let audit = (entry.runtime.generation(), entry.runtime.last_audit_seq());
     // The event feed is a stream, not a request/response: `events.subscribe`
     // starts an off-loop bridge that forwards feed frames as `on_event`
     // notifications, and the host.call itself is acknowledged immediately.
@@ -1535,7 +1550,7 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> P
         return PluginDamage::None;
     }
     let dispatcher = state.dispatcher();
-    dispatcher.dispatch(plugin, writer, id, cap, params);
+    dispatcher.dispatch_audited(plugin, writer, id, audit, cap, params);
     PluginDamage::None
 }
 
@@ -1695,7 +1710,39 @@ struct DispatchReq {
     /// Parameters for the capability (path placeholders + body/query), resolved
     /// against the `API_CALLS` route spine.
     params: serde_json::Value,
+    audit: Option<AuditRef>,
     _permit: DispatchPermit,
+}
+
+/// Audit identity of one granted host.call: (runtime generation, audit sequence number).
+type AuditRef = (u64, u64);
+
+/// One finished host.call, journaled by the dispatcher thread and applied to the plugin's audit entry on the loop.
+struct DispatchOutcome {
+    plugin: String,
+    audit: AuditRef,
+    outcome: thegn_core::plugin_api::AuditOutcome,
+}
+
+/// Outcomes held between loop drains. Over it the NEW outcome is dropped (the entry keeps `outcome: None`): the journal never grows.
+const MAX_PENDING_DISPATCH_OUTCOMES: usize = 256;
+
+/// Push one outcome onto the journal when the call was audited and the journal has room.
+fn journal_outcome(
+    journal: &std::sync::Mutex<Vec<DispatchOutcome>>,
+    plugin: &str,
+    audit: Option<AuditRef>,
+    outcome: thegn_core::plugin_api::AuditOutcome,
+) {
+    let Some(audit) = audit else { return };
+    let mut journal = journal.lock().unwrap_or_else(|error| error.into_inner());
+    if journal.len() < MAX_PENDING_DISPATCH_OUTCOMES {
+        journal.push(DispatchOutcome {
+            plugin: plugin.to_owned(),
+            audit,
+            outcome,
+        });
+    }
 }
 
 type DispatchRespond = dyn Fn(&RpcResponse) -> Result<(), SessionFailure> + Send;
@@ -1801,6 +1848,7 @@ pub(crate) struct Dispatcher {
     tx: std::sync::mpsc::SyncSender<DispatchReq>,
     load: Arc<std::sync::Mutex<DispatchLoad>>,
     diagnostics: Arc<std::sync::Mutex<DispatchDiagnosticsByPlugin>>,
+    outcomes: Arc<std::sync::Mutex<Vec<DispatchOutcome>>>,
 }
 
 impl Dispatcher {
@@ -1819,6 +1867,8 @@ impl Dispatcher {
         let load = Arc::new(std::sync::Mutex::new(DispatchLoad::default()));
         let diagnostics = Arc::new(std::sync::Mutex::new(DispatchDiagnosticsByPlugin::default()));
         let worker_diagnostics = Arc::clone(&diagnostics);
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_outcomes = Arc::clone(&outcomes);
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1830,6 +1880,7 @@ impl Dispatcher {
                     tx,
                     load,
                     diagnostics,
+                    outcomes,
                 };
             }
         };
@@ -1843,6 +1894,7 @@ impl Dispatcher {
                     id,
                     cap,
                     params,
+                    audit,
                     _permit,
                 } = req;
                 if reply.is_closed() {
@@ -1850,6 +1902,12 @@ impl Dispatcher {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .record(&plugin, |counts| counts.abandoned += 1);
+                    journal_outcome(
+                        &worker_outcomes,
+                        &plugin,
+                        audit,
+                        thegn_core::plugin_api::AuditOutcome::Abandoned,
+                    );
                     drop(_permit);
                     continue;
                 }
@@ -1871,6 +1929,11 @@ impl Dispatcher {
                         )
                     }
                 };
+                let outcome = match &response.error {
+                    None => thegn_core::plugin_api::AuditOutcome::Succeeded,
+                    Some(error) => thegn_core::plugin_api::AuditOutcome::Failed(error.code),
+                };
+                journal_outcome(&worker_outcomes, &plugin, audit, outcome);
                 drop(_permit);
                 // best-effort: the session may have died mid-dispatch.
                 if let Err(error) = reply.respond(&response) {
@@ -1893,30 +1956,45 @@ impl Dispatcher {
             tx,
             load,
             diagnostics,
+            outcomes,
         }
     }
 
-    fn dispatch(
+    fn dispatch_audited(
         &self,
         plugin: &str,
         writer: SessionWriter,
         id: u64,
+        audit: AuditRef,
         cap: String,
         params: serde_json::Value,
     ) {
-        self.dispatch_with_reply(plugin, DispatchReply::writer(writer), id, cap, params);
+        self.dispatch_inner(
+            plugin,
+            DispatchReply::writer(writer),
+            id,
+            Some(audit),
+            cap,
+            params,
+        );
     }
 
-    fn dispatch_with_reply(
+    fn dispatch_inner(
         &self,
         plugin: &str,
         reply: DispatchReply,
         id: u64,
+        audit: Option<AuditRef>,
         cap: String,
         params: serde_json::Value,
     ) {
         let Some(permit) = acquire_dispatch_permit(&self.load, plugin) else {
             self.record(plugin, |counts| counts.rejected += 1);
+            self.journal(
+                plugin,
+                audit,
+                thegn_core::plugin_api::AuditOutcome::Failed(RpcErrorCode::RateLimited),
+            );
             self.answer_error(
                 plugin,
                 &reply,
@@ -1932,12 +2010,18 @@ impl Dispatcher {
             id,
             cap,
             params,
+            audit,
             _permit: permit,
         };
         match self.tx.try_send(req) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(req)) => {
                 self.record(&req.plugin, |counts| counts.rejected += 1);
+                self.journal(
+                    &req.plugin,
+                    req.audit,
+                    thegn_core::plugin_api::AuditOutcome::Failed(RpcErrorCode::RateLimited),
+                );
                 self.answer_error(
                     &req.plugin,
                     &req.reply,
@@ -1949,6 +2033,11 @@ impl Dispatcher {
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
                 self.record(&req.plugin, |counts| counts.unavailable += 1);
+                self.journal(
+                    &req.plugin,
+                    req.audit,
+                    thegn_core::plugin_api::AuditOutcome::Failed(RpcErrorCode::Other),
+                );
                 self.answer_error(
                     &req.plugin,
                     &req.reply,
@@ -1959,6 +2048,27 @@ impl Dispatcher {
                 drop(req);
             }
         }
+    }
+
+    #[cfg(test)]
+    fn dispatch_with_reply(
+        &self,
+        plugin: &str,
+        reply: DispatchReply,
+        id: u64,
+        cap: String,
+        params: serde_json::Value,
+    ) {
+        self.dispatch_inner(plugin, reply, id, None, cap, params);
+    }
+
+    fn journal(
+        &self,
+        plugin: &str,
+        audit: Option<AuditRef>,
+        outcome: thegn_core::plugin_api::AuditOutcome,
+    ) {
+        journal_outcome(&self.outcomes, plugin, audit, outcome);
     }
 
     fn record(&self, plugin: &str, update: impl FnOnce(&mut DispatchDiagnostics)) {
@@ -1996,6 +2106,15 @@ impl Dispatcher {
             .take()
     }
 
+    fn take_outcomes(&self) -> Vec<DispatchOutcome> {
+        std::mem::take(
+            &mut *self
+                .outcomes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+
     #[cfg(test)]
     fn disconnected() -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DispatchReq>(DISPATCH_QUEUE_CAPACITY);
@@ -2004,6 +2123,7 @@ impl Dispatcher {
             tx,
             load: Arc::new(std::sync::Mutex::new(DispatchLoad::default())),
             diagnostics: Arc::new(std::sync::Mutex::new(DispatchDiagnosticsByPlugin::default())),
+            outcomes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -2495,6 +2615,217 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .total,
             0
+        );
+    }
+
+    #[test]
+    fn host_call_outcome_journal_records_success_error_timeout_and_unavailable() {
+        let success = Dispatcher::spawn_with(std::time::Duration::from_secs(2), |_, _| {
+            Box::pin(async { Ok::<_, RpcError>(serde_json::Value::Null) })
+        });
+        let (reply, response) = test_reply();
+        success.dispatch_inner(
+            "plugin-a",
+            reply,
+            1,
+            Some((0, 7)),
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        response
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("success reply");
+        let outcomes = success.take_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].plugin, "plugin-a");
+        assert_eq!(outcomes[0].audit, (0, 7));
+        assert_eq!(
+            outcomes[0].outcome,
+            thegn_core::plugin_api::AuditOutcome::Succeeded
+        );
+
+        let failure = Dispatcher::spawn_with(std::time::Duration::from_secs(2), |_, _| {
+            Box::pin(async {
+                Err::<serde_json::Value, RpcError>(RpcError::new(RpcErrorCode::NotFound, "x"))
+            })
+        });
+        let (reply, response) = test_reply();
+        failure.dispatch_inner(
+            "plugin-a",
+            reply,
+            1,
+            Some((0, 7)),
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        response
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("error reply");
+        assert_eq!(
+            failure.take_outcomes()[0].outcome,
+            thegn_core::plugin_api::AuditOutcome::Failed(RpcErrorCode::NotFound)
+        );
+
+        let timeout = Dispatcher::spawn_with(std::time::Duration::from_millis(50), never_dispatch);
+        let (reply, response) = test_reply();
+        timeout.dispatch_inner(
+            "plugin-a",
+            reply,
+            1,
+            Some((0, 7)),
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        response
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timeout reply");
+        assert_eq!(
+            timeout.take_outcomes()[0].outcome,
+            thegn_core::plugin_api::AuditOutcome::Failed(RpcErrorCode::Timeout)
+        );
+
+        let unavailable = Dispatcher::disconnected();
+        let (reply, response) = test_reply();
+        unavailable.dispatch_inner(
+            "plugin-a",
+            reply,
+            1,
+            Some((0, 7)),
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        response
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("unavailable reply");
+        assert_eq!(
+            unavailable.take_outcomes()[0].outcome,
+            thegn_core::plugin_api::AuditOutcome::Failed(RpcErrorCode::Other)
+        );
+    }
+
+    #[test]
+    fn host_call_outcome_journal_records_abandoned_and_skips_unaudited_calls() {
+        let dispatcher = Dispatcher::spawn_with(std::time::Duration::from_secs(2), |_, _| {
+            Box::pin(async { Ok::<_, RpcError>(serde_json::Value::Null) })
+        });
+        let closed = DispatchReply {
+            respond: Box::new(|_| Err(SessionFailure::Closed)),
+            is_closed: Box::new(|| true),
+        };
+        dispatcher.dispatch_inner(
+            "plugin-a",
+            closed,
+            1,
+            Some((0, 8)),
+            "test.cap".into(),
+            serde_json::Value::Null,
+        );
+        dispatch_request(&dispatcher, "plugin-c", 3)
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("FIFO barrier completes after abandoned request");
+        let outcomes = dispatcher.take_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].plugin, "plugin-a");
+        assert_eq!(outcomes[0].audit, (0, 8));
+        assert_eq!(
+            outcomes[0].outcome,
+            thegn_core::plugin_api::AuditOutcome::Abandoned
+        );
+    }
+
+    #[test]
+    fn host_call_outcome_journal_is_bounded() {
+        let outcomes = std::sync::Mutex::new(Vec::new());
+        for seq in 0..(MAX_PENDING_DISPATCH_OUTCOMES + 44) as u64 {
+            journal_outcome(
+                &outcomes,
+                "p",
+                Some((0, seq)),
+                thegn_core::plugin_api::AuditOutcome::Succeeded,
+            );
+        }
+        {
+            let outcomes = outcomes.lock().unwrap_or_else(|error| error.into_inner());
+            assert_eq!(outcomes.len(), MAX_PENDING_DISPATCH_OUTCOMES);
+            assert_eq!(outcomes[0].audit, (0, 0));
+        }
+        journal_outcome(
+            &outcomes,
+            "p",
+            None,
+            thegn_core::plugin_api::AuditOutcome::Succeeded,
+        );
+        assert_eq!(
+            outcomes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            MAX_PENDING_DISPATCH_OUTCOMES
+        );
+    }
+
+    #[test]
+    fn host_call_outcome_is_applied_to_the_audit_entry_on_flush() {
+        let mut state = state_with(vec![seg_spec("p")]);
+        state.dispatcher = Some(Dispatcher::disconnected());
+        let (audit, seq) = {
+            let runtime = &mut state.plugins.get_mut("p").unwrap().runtime;
+            runtime.record_host_call_decision(
+                PluginId::new("p"),
+                "sessions.list",
+                AuditDecision::Granted,
+                None,
+            );
+            (runtime.generation(), runtime.last_audit_seq())
+        };
+        state
+            .dispatcher
+            .as_ref()
+            .unwrap()
+            .outcomes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(DispatchOutcome {
+                plugin: "p".into(),
+                audit: (audit, seq),
+                outcome: thegn_core::plugin_api::AuditOutcome::Failed(RpcErrorCode::Timeout),
+            });
+        flush_alerts_with(&mut state, |_| {});
+        assert_eq!(
+            state.plugins.get("p").unwrap().runtime.audit_log()[0].outcome,
+            Some(thegn_core::plugin_api::AuditOutcome::Failed(
+                RpcErrorCode::Timeout
+            ))
+        );
+        assert!(
+            state
+                .dispatcher
+                .as_ref()
+                .unwrap()
+                .take_outcomes()
+                .is_empty()
+        );
+
+        state
+            .dispatcher
+            .as_ref()
+            .unwrap()
+            .outcomes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(DispatchOutcome {
+                plugin: "ghost".into(),
+                audit: (audit, seq),
+                outcome: thegn_core::plugin_api::AuditOutcome::Succeeded,
+            });
+        flush_alerts_with(&mut state, |_| {});
+        assert!(
+            state
+                .dispatcher
+                .as_ref()
+                .unwrap()
+                .take_outcomes()
+                .is_empty()
         );
     }
 

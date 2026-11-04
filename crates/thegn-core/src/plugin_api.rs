@@ -783,6 +783,17 @@ pub enum AuditDecision {
     Denied,
 }
 
+/// How a granted `host.call` ended, recorded on its audit entry after dispatch. `None` on the entry until reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// The control API answered with a result.
+    Succeeded,
+    /// The call ended in a typed error: a dispatch error, a timeout, a rate limit, or the dispatcher being down.
+    Failed(RpcErrorCode),
+    /// The plugin's session closed before the call ran.
+    Abandoned,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditTargetClass {
     Surface,
@@ -954,6 +965,8 @@ pub struct AuditLogEntry {
     pub generation: u64,
     pub target_class: AuditTargetClass,
     pub target: Option<String>,
+    /// Dispatch outcome of a granted `host.call`; `None` for every other entry and until the outcome is reported.
+    pub outcome: Option<AuditOutcome>,
 }
 
 fn bound_audit_string(value: &str) -> String {
@@ -1601,6 +1614,7 @@ impl PluginRuntime {
             seq: self.next_audit_seq,
             generation: self.generation,
             target: target.map(bound_audit_string),
+            outcome: None,
         });
     }
 
@@ -1623,6 +1637,36 @@ impl PluginRuntime {
             decision,
             target,
         );
+    }
+
+    /// Sequence number of the most recently pushed audit entry (0 before any). Read it right after `record_host_call_decision`
+    /// to name that entry in a later `record_host_call_outcome`.
+    pub fn last_audit_seq(&self) -> u64 {
+        self.next_audit_seq
+    }
+
+    /// Attach the dispatch outcome to the granted `host.call` entry `(generation, seq)`. Returns whether it was applied. Refused
+    /// (false, nothing changes) when the entry is gone (expired or evicted), is not a granted `host.call`, belongs to another
+    /// generation, or already has an outcome: an outcome is set exactly once and never rewritten.
+    pub fn record_host_call_outcome(
+        &mut self,
+        generation: u64,
+        seq: u64,
+        outcome: AuditOutcome,
+    ) -> bool {
+        let Ok(index) = self.audit.binary_search_by_key(&seq, |entry| entry.seq) else {
+            return false;
+        };
+        let entry = &mut self.audit[index];
+        if entry.generation != generation
+            || entry.operation != "host.call"
+            || entry.decision != AuditDecision::Granted
+            || entry.outcome.is_some()
+        {
+            return false;
+        }
+        entry.outcome = Some(outcome);
+        true
     }
 }
 
@@ -3426,6 +3470,109 @@ timeout_secs = 5
             assert!(entry.timestamp_ms <= u64::try_from(after).unwrap());
         }
         assert!(audit[0].seq < audit[1].seq);
+    }
+
+    #[test]
+    fn audit_outcome_attaches_to_the_granted_host_call_entry_once() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        runtime.record_host_call_decision(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+        );
+        let (generation, seq) = (runtime.generation(), runtime.last_audit_seq());
+        assert_eq!(runtime.audit_log()[0].outcome, None);
+
+        assert!(runtime.record_host_call_outcome(generation, seq, AuditOutcome::Succeeded));
+        assert_eq!(
+            runtime.audit_log()[0].outcome,
+            Some(AuditOutcome::Succeeded)
+        );
+        assert!(!runtime.record_host_call_outcome(
+            generation,
+            seq,
+            AuditOutcome::Failed(RpcErrorCode::Other),
+        ));
+        assert_eq!(
+            runtime.audit_log()[0].outcome,
+            Some(AuditOutcome::Succeeded)
+        );
+    }
+
+    #[test]
+    fn audit_outcome_refuses_denied_foreign_stale_and_evicted_entries() {
+        let mut denied = PluginRuntime::new(NegotiatedManifest::default());
+        denied.record_host_call_decision(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Denied,
+            None,
+        );
+        let denied_seq = denied.last_audit_seq();
+        assert!(!denied.record_host_call_outcome(0, denied_seq, AuditOutcome::Succeeded));
+        assert_eq!(denied.audit_log()[0].outcome, None);
+
+        let plugin = PluginId::new("p");
+        let manifest = NegotiatedManifest {
+            granted: [Capability::new("state", plugin.as_str())]
+                .into_iter()
+                .collect(),
+            ..NegotiatedManifest::default()
+        };
+        let mut foreign = PluginRuntime::new(manifest);
+        foreign
+            .state_set(plugin.clone(), "key", serde_json::Value::Null)
+            .unwrap();
+        let foreign_seq = foreign.last_audit_seq();
+        assert!(!foreign.record_host_call_outcome(0, foreign_seq, AuditOutcome::Succeeded));
+        assert_eq!(foreign.audit_log()[0].outcome, None);
+
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        runtime.record_host_call_decision(
+            plugin.clone(),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+        );
+        let seq = runtime.last_audit_seq();
+        assert!(!runtime.record_host_call_outcome(1, seq, AuditOutcome::Succeeded));
+        assert!(!runtime.record_host_call_outcome(0, seq + 1000, AuditOutcome::Succeeded));
+
+        for _ in 0..MAX_AUDIT_ENTRIES {
+            runtime.record_host_call_decision(
+                plugin.clone(),
+                "sessions.list",
+                AuditDecision::Granted,
+                None,
+            );
+        }
+        assert!(!runtime.record_host_call_outcome(0, seq, AuditOutcome::Succeeded));
+    }
+
+    #[test]
+    fn audit_outcome_follows_the_entry_generation_not_the_current_one() {
+        let mut runtime = PluginRuntime::new(NegotiatedManifest::default());
+        runtime.record_host_call_decision(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+        );
+        let seq = runtime.last_audit_seq();
+        assert_eq!(runtime.generation(), 0);
+        assert_eq!(runtime.begin_generation(), 1);
+
+        assert!(runtime.record_host_call_outcome(0, seq, AuditOutcome::Succeeded));
+        runtime.record_host_call_decision(
+            PluginId::new("p"),
+            "sessions.list",
+            AuditDecision::Granted,
+            None,
+        );
+        let next_seq = runtime.last_audit_seq();
+        assert!(!runtime.record_host_call_outcome(0, next_seq, AuditOutcome::Succeeded));
+        assert!(runtime.record_host_call_outcome(1, next_seq, AuditOutcome::Succeeded));
     }
 
     #[test]
