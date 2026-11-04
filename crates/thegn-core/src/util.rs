@@ -410,9 +410,13 @@ fn identity_outcome(run: thegn_proc::Run) -> (Result<Vec<u8>, String>, bool) {
         End::LeaderExited => match leader {
             Leader::Reaped(status) if !status.success() => Err(format!("git exited with {status}")),
             Leader::Reaped(_) if group == GroupState::Drained && stdout.eof => Ok(stdout.bytes),
-            Leader::Reaped(_) => {
-                Err("git identity probe left descendants or an open pipe behind".to_string())
+            Leader::Reaped(_) if group == GroupState::Drained && !stdout.eof => {
+                Err("git identity probe left an open pipe behind".to_string())
             }
+            Leader::Reaped(_) => Err(
+                "git identity probe stdout reader exceeded its time bound; descendants remained"
+                    .to_string(),
+            ),
             _ => Err("git identity probe leader was not reaped".to_string()),
         },
     };
