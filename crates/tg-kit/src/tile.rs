@@ -48,6 +48,8 @@ pub trait AppTile {
     fn wants_redraw(&self) -> bool;
 
     /// Earliest outstanding operation deadline. `None` keeps the host asleep.
+    /// When `pump()` handles an expired deadline, it must clear or advance it
+    /// so the host does not wake repeatedly on the same deadline.
     fn next_deadline(&self) -> Option<std::time::Instant> {
         None
     }
