@@ -1294,4 +1294,85 @@ if (("${#uninstall_after_downgrade_leftovers[@]}" > 0)); then
   exit 1
 fi
 
+# dry-run-parity: the fresh install plan and installed manifest describe the same artifacts.
+parity_home="$tmp/parity-home"
+parity_config="$tmp/parity-config"
+parity_data="$tmp/parity-data"
+parity_bin="$tmp/parity-bin"
+parity_manifest="$parity_data/thegn/install-manifest"
+mkdir -p "$parity_home"
+parity_env() {
+  PATH="$fakebin:$TG_REAL_PATH" HOME="$parity_home" XDG_CONFIG_HOME="$parity_config" XDG_DATA_HOME="$parity_data" "$@"
+}
+
+parity_plan="$(parity_env "$install_repo/install.sh" --dry-run "$parity_bin")"
+[[ ! -e $parity_bin && ! -L $parity_bin && ! -e $parity_config && ! -L $parity_config &&
+  ! -e $parity_data && ! -L $parity_data ]] || {
+  echo "fresh-tree dry-run-parity created an install directory" >&2
+  exit 1
+}
+
+parity_env "$install_repo/install.sh" "$parity_bin" >"$tmp/parity-install.out"
+mapfile -t parity_manifest_paths < <(tail -n +2 "$parity_manifest" | cut -f2)
+parity_expected_count=3
+if ((freedesktop)); then
+  parity_expected_count=5
+fi
+[[ ${#parity_manifest_paths[@]} == "$parity_expected_count" ]] || {
+  echo "dry-run-parity manifest had ${#parity_manifest_paths[@]} paths; expected $parity_expected_count" >&2
+  cat "$parity_manifest" >&2
+  exit 1
+}
+
+while IFS= read -r parity_path; do
+  parity_announced=0
+  while IFS= read -r parity_line; do
+    if [[ $parity_line == "$parity_path "* ]]; then
+      parity_announced=1
+      break
+    fi
+  done < <(printf '%s\n' "$parity_plan")
+  [[ $parity_announced == 1 ]] || {
+    echo "dry-run-parity manifest path was not announced by the fresh dry-run plan: $parity_path" >&2
+    printf '%s\n' "$parity_plan" >&2
+    exit 1
+  }
+done < <(printf '%s\n' "${parity_manifest_paths[@]}")
+
+while IFS= read -r parity_line; do
+  parity_token="${parity_line%% *}"
+  if [[ $parity_token == "$parity_bin/"* || $parity_token == "$parity_data/"* ]]; then
+    parity_recorded=0
+    for parity_path in "${parity_manifest_paths[@]}"; do
+      if [[ $parity_token == "$parity_path" ]]; then
+        parity_recorded=1
+        break
+      fi
+    done
+    [[ $parity_recorded == 1 ]] || {
+      echo "dry-run-parity plan announced an artifact absent from the manifest: $parity_token" >&2
+      printf '%s\n' "$parity_plan" >&2
+      cat "$parity_manifest" >&2
+      exit 1
+    }
+  fi
+done < <(printf '%s\n' "$parity_plan")
+
+parity_before="$(tree_snapshot "$parity_bin" "$parity_config" "$parity_data")"
+parity_replan="$(parity_env "$install_repo/install.sh" --dry-run "$parity_bin")"
+parity_after="$(tree_snapshot "$parity_bin" "$parity_config" "$parity_data")"
+[[ $parity_before == "$parity_after" ]] || {
+  echo "installed-tree dry-run-parity changed files or left transaction artifacts" >&2
+  printf '%s\n' "before:" "$parity_before" "after:" "$parity_after" >&2
+  printf '%s\n' "fresh plan:" "$parity_plan" "installed-tree plan:" "$parity_replan" >&2
+  exit 1
+}
+parity_plan_tokens="$(printf '%s\n' "$parity_plan" | awk '{print $1}' | LC_ALL=C sort)"
+parity_replan_tokens="$(printf '%s\n' "$parity_replan" | awk '{print $1}' | LC_ALL=C sort)"
+[[ $parity_plan_tokens == "$parity_replan_tokens" ]] || {
+  echo "installed-tree dry-run-parity planned a different artifact set" >&2
+  printf '%s\n' "fresh plan:" "$parity_plan" "installed-tree plan:" "$parity_replan" >&2
+  exit 1
+}
+
 echo "install plan checks passed"
