@@ -59,8 +59,9 @@ from a partial account are kept. `complete` is true only when all accounts
 answer fully, and the call fails only if every configured account fails.
 The `issues.get`, `issues.update` and `issues.comment` control API operations
 also accept `account` (HTTP `?account=<name>`) to route an issue to the named
-`[[issues.issue_accounts]]` entry. The id must be `<provider>:<key>`; an
-unknown or invalid account is rejected before any tracker call.
+`[[issues.issue_accounts]]` entry. With `account`, the id must be
+`<provider>:<key>`; without it, existing prefix routing applies. An unknown or
+invalid account is rejected before any tracker call.
 
 The multi-repo group commands use the canonical `thegn program` namespace.
 `thegn project` remains a deprecated, behavior-identical alias for three

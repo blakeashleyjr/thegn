@@ -269,7 +269,8 @@ timeout, producer, storage, or validation failure defers the row with the reason
 On the dev channel, Ctrl-C or SIGTERM during a drain also cancels an in-progress
 bundle transfer: its producer is stopped, no ref is published, and the row is
 reported as cancelled with `gate_error` for retry on the next drain. Fetching
-the bundle into the target store shares the drain deadline.
+the bundle into the target store is bounded by the same
+subprocess deadline.
 
 Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run

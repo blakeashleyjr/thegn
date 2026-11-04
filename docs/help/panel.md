@@ -302,10 +302,11 @@ unknown current context keeps the cached failure.
 It also skips runs cached for another branch, or with no recorded branch, in
 the sidebar and **across**; when the current branch is unknown, cached runs
 still count.
-Background log ingestion reuses a cached job log as evidence only when it was
-fetched for the worktree’s current provider context (`<system>:<host>/<project>`).
-CI autofix records that context with each claim, so a failure under another
-project is a new candidate; claims without a recorded context never re-fire.
+Background log ingestion reuses a cached job log as evidence only when it
+was fetched for the worktree's current provider context
+(`<system>:<host>/<project>`). CI autofix records that context with each claim,
+so a failure under another project is a new candidate; claims without a
+recorded context never re-fire.
 
 #### CI log retention and privacy
 

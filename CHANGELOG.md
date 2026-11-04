@@ -26,11 +26,11 @@ All notable changes to **thegn** are documented here. The format follows
 
 ### Fixed
 
-- Rebase, move and retag refuse a shallow-clone boundary with a hint to fetch
-  more history, instead of rewriting it as a root commit.
+- Rebase, move, retag, reword and amend refuse a shallow-clone boundary with a
+  hint to fetch more history, instead of rewriting it as a root commit.
 - (dev channel) Cancelling a merge-queue drain stops an active cross-host bundle
   transfer and reports cancellation as `gate_error`, rather than unreachable;
-  fetching the bundle shares the drain deadline.
+  fetching the bundle is bounded by the same subprocess deadline.
 
 ### Security
 
@@ -38,7 +38,8 @@ All notable changes to **thegn** are documented here. The format follows
   with only private scratch writable; otherwise they run as before.
 - The `devcontainer` CLI provider re-checks the selected config before
   snapshotting and starting, and refuses a file that is no longer regular and
-  inside the worktree.
+  inside the worktree. If the later check refuses the CLI provider, thegn warns
+  and uses its native OCI path for the supported approved subset.
 - A language-server executable is re-checked before start; changed binaries and
   paths that are not valid UTF-8 are refused.
 - (dev channel) Warm-pool claims verify the worktree's network egress policy on

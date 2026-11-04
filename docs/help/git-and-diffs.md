@@ -72,8 +72,9 @@ re-mark). Without a mark, `i` plans from the selected commit.
 Interactive rebase plans, reword, amend, retag and move hold the repository
 mutation lock for the whole operation, so another thegn git action on that
 repository waits or is refused while the rewrite is in progress.
-A rebase, move or retag whose oldest commit is the shallow-clone boundary is
-refused with a hint to fetch more history first; it is not rewritten as a root.
+A rebase, move, retag, reword or amend whose oldest commit is the shallow-clone
+boundary is refused with a hint to fetch more history first; it is not rewritten
+as a root.
 
 ### branches
 
