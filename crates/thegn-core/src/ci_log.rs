@@ -65,6 +65,9 @@ pub struct CiLogCandidate {
     pub head_sha: String,
     #[serde(default)]
     pub context: String,
+    /// Provider run attempt the claim belongs to; None when unknown or the provider has no attempts.
+    #[serde(default)]
+    pub attempt: Option<u64>,
 }
 
 impl CiLogEntry {
@@ -124,6 +127,7 @@ impl CiLogEntry {
             job_id: self.job_id.clone(),
             head_sha: self.head_sha.clone(),
             context: self.context.clone(),
+            attempt: self.attempt,
         }
     }
 }
@@ -1236,6 +1240,7 @@ mod tests {
             job_id: "j".into(),
             head_sha: "a".into(),
             context: String::new(),
+            attempt: None,
         };
         let mut b = a.clone();
         b.head_sha = "b".into();

@@ -521,6 +521,7 @@ mod tests {
                 job_id: "job-1".into(),
                 head_sha: "abc".into(),
                 context: String::new(),
+                attempt: None,
             })
             .unwrap()
         );

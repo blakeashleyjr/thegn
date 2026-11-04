@@ -9,9 +9,17 @@ use crate::ci_log::{
 use crate::db::Db;
 use crate::util;
 
-/// Claim a candidate once per known provider-context identity. Empty legacy or
-/// unknown contexts never replace or reclaim an existing dedupe row.
-pub(crate) const CLAIM_CI_AUTOFIX_SQL: &str = "INSERT INTO ci_autofix_dedupe (worktree, run_id, job_id, head_sha, claimed_at, context) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(worktree, run_id, job_id, head_sha) DO UPDATE SET context=excluded.context, claimed_at=excluded.claimed_at WHERE ci_autofix_dedupe.context <> '' AND excluded.context <> '' AND ci_autofix_dedupe.context <> excluded.context";
+/// Claim a candidate once per (worktree, run, job, head, attempt). Empty legacy or
+/// unknown contexts never replace or reclaim an existing dedupe row; unknown attempt = -1.
+pub(crate) const CLAIM_CI_AUTOFIX_SQL: &str = "INSERT INTO ci_autofix_dedupe (worktree, run_id, job_id, head_sha, claimed_at, context, attempt) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(worktree, run_id, job_id, head_sha, attempt) DO UPDATE SET context=excluded.context, claimed_at=excluded.claimed_at WHERE ci_autofix_dedupe.context <> '' AND excluded.context <> '' AND ci_autofix_dedupe.context <> excluded.context";
+
+/// The stored attempt key of a candidate: the known provider run attempt, or -1 when unknown.
+pub(crate) fn ci_autofix_attempt_key(candidate: &CiLogCandidate) -> i64 {
+    candidate
+        .attempt
+        .and_then(|attempt| i64::try_from(attempt).ok())
+        .unwrap_or(-1)
+}
 
 impl Db {
     pub(crate) fn get_ci_log_entry(
@@ -150,7 +158,8 @@ impl Db {
                 candidate.job_id,
                 candidate.head_sha,
                 util::now(),
-                candidate.context
+                candidate.context,
+                ci_autofix_attempt_key(candidate)
             ],
         )?;
         Ok(inserted == 1)
@@ -311,6 +320,7 @@ mod tests {
     }
 
     #[test]
+    // Positive control: context changes still retain their established dedupe behavior.
     fn ci_autofix_claim_is_keyed_by_provider_context() {
         let db = Db::open_memory().unwrap();
         let a = CiLogCandidate {
@@ -319,6 +329,7 @@ mod tests {
             job_id: "j".into(),
             head_sha: "sha".into(),
             context: "github:github.com/o/a".into(),
+            attempt: None,
         };
         assert!(db.claim_ci_autofix(&a).unwrap());
         assert!(!db.claim_ci_autofix(&a).unwrap());
@@ -331,6 +342,7 @@ mod tests {
     }
 
     #[test]
+    // Positive control: unknown provider contexts still cannot reclaim the same attempt key.
     fn ci_autofix_claim_never_reclaims_an_unknown_context() {
         let db = Db::open_memory().unwrap();
         let unknown = CiLogCandidate {
@@ -339,6 +351,7 @@ mod tests {
             job_id: "j".into(),
             head_sha: "sha".into(),
             context: String::new(),
+            attempt: None,
         };
         assert!(db.claim_ci_autofix(&unknown).unwrap());
         let known = CiLogCandidate {
@@ -357,6 +370,65 @@ mod tests {
             ..known_first
         };
         assert!(!db.claim_ci_autofix(&unknown_second).unwrap());
+    }
+
+    #[test]
+    fn ci_autofix_claim_is_keyed_by_run_attempt() {
+        let db = Db::open_memory().unwrap();
+        let a = CiLogCandidate {
+            worktree: "/wt/a".into(),
+            run_id: "r".into(),
+            job_id: "j".into(),
+            head_sha: "sha".into(),
+            context: "github:github.com/o/a".into(),
+            attempt: Some(1),
+        };
+        assert!(db.claim_ci_autofix(&a).unwrap());
+        assert!(!db.claim_ci_autofix(&a).unwrap());
+        let next = CiLogCandidate {
+            attempt: Some(2),
+            ..a.clone()
+        };
+        assert!(db.claim_ci_autofix(&next).unwrap());
+        assert!(!db.claim_ci_autofix(&next).unwrap());
+        assert!(!db.claim_ci_autofix(&a).unwrap());
+    }
+
+    #[test]
+    fn ci_autofix_unknown_attempt_is_a_separate_key_from_a_known_attempt() {
+        let db = Db::open_memory().unwrap();
+        let unknown = CiLogCandidate {
+            worktree: "/wt/a".into(),
+            run_id: "r".into(),
+            job_id: "j".into(),
+            head_sha: "sha".into(),
+            context: "github:github.com/o/a".into(),
+            attempt: None,
+        };
+        assert!(db.claim_ci_autofix(&unknown).unwrap());
+        assert!(!db.claim_ci_autofix(&unknown).unwrap());
+        let known = CiLogCandidate {
+            attempt: Some(1),
+            ..unknown.clone()
+        };
+        assert!(db.claim_ci_autofix(&known).unwrap());
+        assert!(!db.claim_ci_autofix(&known).unwrap());
+        assert!(!db.claim_ci_autofix(&unknown).unwrap());
+        assert_eq!(ci_autofix_attempt_key(&unknown), -1);
+        assert_eq!(
+            ci_autofix_attempt_key(&CiLogCandidate {
+                attempt: Some(7),
+                ..unknown.clone()
+            }),
+            7
+        );
+        assert_eq!(
+            ci_autofix_attempt_key(&CiLogCandidate {
+                attempt: Some(u64::MAX),
+                ..unknown
+            }),
+            -1
+        );
     }
 
     #[test]
