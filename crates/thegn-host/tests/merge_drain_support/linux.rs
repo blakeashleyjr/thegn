@@ -1385,9 +1385,10 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
         agent: AgentMode::HeldAtFloor,
     });
     let repo = f.repo.clone();
+    let worktree = f.held.clone();
     let root = f.root.path().to_path_buf();
     let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
-    let worktree_tip_before = f.git(&f.held, &["rev-parse", "HEAD"]);
+    let worktree_tip_before = f.git(&worktree, &["rev-parse", "HEAD"]);
     make_gate_fifo(&root, "gate-hold");
     let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
     let owner = f.start_cli(&["merge", "drain", "--json"]);
@@ -1397,7 +1398,7 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
     assert_eq!(held.status, "folding");
     assert!(held.generation >= 1);
 
-    let wt = f.held.to_str().unwrap().to_owned();
+    let wt = worktree.to_str().unwrap().to_owned();
     let land = f.cli_failing(&["merge", "land", "--worktree", &wt]);
     assert!(
         format!("{}{}", land.stdout, land.stderr).contains("merge-queue row is folding, not ready")
@@ -1408,7 +1409,10 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
         target_before
     );
-    assert_eq!(f.git(&f.held, &["rev-parse", "HEAD"]), worktree_tip_before);
+    assert_eq!(
+        f.git(&worktree, &["rev-parse", "HEAD"]),
+        worktree_tip_before
+    );
     assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
 
     release_gate(&root, "gate-hold", "gate-open");
@@ -1424,7 +1428,10 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
         target_before
     );
-    assert_eq!(f.git(&f.held, &["rev-parse", "HEAD"]), worktree_tip_before);
+    assert_eq!(
+        f.git(&worktree, &["rev-parse", "HEAD"]),
+        worktree_tip_before
+    );
     assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
 
     f.cli(&["merge", "rm", "--worktree", &wt]);
