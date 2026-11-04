@@ -79,6 +79,62 @@ fn spawn_failure_line(err: &anyhow::Error) -> String {
     thegn_core::log_redact::redact_text_line(&format!("{err:#}"))
 }
 
+/// Which pane-daemon fallback a notice describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonFallback {
+    /// A new pane could not be daemon-backed and runs as an in-process PTY.
+    Spawn,
+    /// A saved daemon session could not be reattached; the pane is a fresh shell.
+    Reattach,
+}
+
+impl DaemonFallback {
+    const fn slot(self) -> usize {
+        match self {
+            DaemonFallback::Spawn => 0,
+            DaemonFallback::Reattach => 1,
+        }
+    }
+}
+
+/// At most one notice per fallback kind per process: a burst of N panes must not raise N notifications.
+static DAEMON_FALLBACK_NOTED: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+/// True the first time `kind` is claimed on `flags`.
+fn claim_daemon_fallback_notice(
+    flags: &[std::sync::atomic::AtomicBool; 2],
+    kind: DaemonFallback,
+) -> bool {
+    !flags[kind.slot()].swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The user-facing text; `line` is ALREADY redacted (`spawn_failure_line`).
+fn daemon_fallback_notice(kind: DaemonFallback, line: &str) -> String {
+    match kind {
+        DaemonFallback::Spawn => format!(
+            "pane daemon unavailable: {line}; this pane runs in-process and will not survive closing thegn"
+        ),
+        DaemonFallback::Reattach => format!(
+            "could not reattach a saved pane session: {line}; opened a fresh pane instead (its previous process and scrollback are not restored)"
+        ),
+    }
+}
+
+/// Post the notice once per kind. A no-op without the compositor (CLI paths) and non-blocking (launch_notice::post hands the DB write to a Background thread).
+fn note_daemon_fallback(kind: DaemonFallback, worktree: &str, error: &anyhow::Error) {
+    if !thegn_core::msg::tui_active() || !claim_daemon_fallback_notice(&DAEMON_FALLBACK_NOTED, kind)
+    {
+        return;
+    }
+    crate::launch_notice::post(
+        worktree,
+        &daemon_fallback_notice(kind, &spawn_failure_line(error)),
+    );
+}
+
 fn materialize_fallback_cwd(
     worktree: &str,
     current: Option<std::path::PathBuf>,
@@ -739,6 +795,12 @@ impl Panes {
                         target: "thegn::daemon",
                         "daemon-backed spawn unavailable; using in-process PTY: {line}"
                     );
+                    let worktree = root.or(cwd).map(|path| path.to_string_lossy().into_owned());
+                    note_daemon_fallback(
+                        DaemonFallback::Spawn,
+                        worktree.as_deref().unwrap_or(""),
+                        &e,
+                    );
                 }
             }
         }
@@ -1154,7 +1216,12 @@ impl Panes {
                             continue;
                         }
                         Err(e) => {
-                            tracing::warn!(target: "thegn::startup", "daemon reattach failed, falling back: {e}");
+                            tracing::warn!(
+                                target: "thegn::startup",
+                                "daemon reattach failed, falling back: {}",
+                                spawn_failure_line(&e)
+                            );
+                            note_daemon_fallback(DaemonFallback::Reattach, worktree, &e);
                         }
                     }
                 }
@@ -2102,6 +2169,38 @@ mod tests {
         let line = spawn_failure_line(&err);
         assert!(!line.contains("ghp_secret"));
         assert!(line.contains("spawn child"));
+    }
+
+    #[test]
+    fn daemon_fallback_notice_names_the_degradation_and_never_carries_secrets() {
+        let err = anyhow::anyhow!("connect refused").context("GH_TOKEN=ghp_secret exec failed");
+        let line = spawn_failure_line(&err);
+
+        let spawn = daemon_fallback_notice(DaemonFallback::Spawn, &line);
+        assert!(spawn.contains("in-process"));
+        assert!(spawn.contains("connect refused"));
+        assert!(!spawn.contains("ghp_secret"));
+
+        let reattach = daemon_fallback_notice(DaemonFallback::Reattach, &line);
+        assert!(reattach.contains("fresh pane"));
+        assert!(!reattach.contains("ghp_secret"));
+    }
+
+    #[test]
+    fn daemon_fallback_notice_is_claimed_once_per_kind() {
+        use std::sync::atomic::AtomicBool;
+
+        let flags = [AtomicBool::new(false), AtomicBool::new(false)];
+        assert!(claim_daemon_fallback_notice(&flags, DaemonFallback::Spawn));
+        assert!(!claim_daemon_fallback_notice(&flags, DaemonFallback::Spawn));
+        assert!(claim_daemon_fallback_notice(
+            &flags,
+            DaemonFallback::Reattach
+        ));
+        assert!(!claim_daemon_fallback_notice(
+            &flags,
+            DaemonFallback::Reattach
+        ));
     }
 
     #[test]
