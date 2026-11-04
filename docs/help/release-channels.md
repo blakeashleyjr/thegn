@@ -21,13 +21,14 @@ every gated feature. Set `THEGN_CHANNEL=dev` to switch for one run.
 If you read about one of these elsewhere in this help and cannot find it,
 this is why:
 
-| Feature     | Covers                                                                     | Config                                          |
-| ----------- | -------------------------------------------------------------------------- | ----------------------------------------------- |
-| `remote`    | worktrees on another machine over SSH/mosh                                 | `[sandbox.remote]`, `[env.*] placement = "ssh"` |
-| `providers` | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs             |
-| `observe`   | the Observe dashboards and fleet-view tab                                  | `[observe]`                                     |
-| `placement` | the multi-host placement engine                                            | `[placement]`                                   |
-| `voice`     | command-backed voice mode                                                  | `[voice]`                                       |
+| Feature       | Covers                                                                     | Config                                                  |
+| ------------- | -------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `remote`      | worktrees on another machine over SSH/mosh                                 | `[sandbox.remote]`, `[env.*] placement = "ssh"`         |
+| `providers`   | cloud execution (Fly / DO / VPS / Machine0 / Daytona) and the managed pool | `[host.*]`, `[env.*]` provider envs                     |
+| `observe`     | the Observe dashboards and fleet-view tab                                  | `[observe]`                                             |
+| `placement`   | the multi-host placement engine                                            | `[placement]`                                           |
+| `voice`       | command-backed voice mode                                                  | `[voice]`                                               |
+| `plugin_apps` | plugin app tabs (`AppTab` contributions)                                   | `[apps]` plugin ids, `[[plugins]]` AppTab contributions |
 
 On the stable channel, SSH and provider `[env.*]` environments are removed
 when the config loads. If a worktree's `[sandbox] default_env` or selection

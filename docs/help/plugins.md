@@ -2,7 +2,7 @@
 id: plugins
 title: Plugins
 order: 32
-actions: []
+actions: [plugin-app-drafts, plugin-app-requests]
 ---
 
 # Plugins
@@ -17,7 +17,7 @@ statusbar segment.
 Two equivalent homes:
 
 - A `[[plugins]]` entry in your config (the full spec: id, name, version,
-  `api = "0.3.0"`, `command = ["…"]`, contributions).
+  `api = "0.4.0"`, `command = ["…"]`, contributions).
 - A directory: `<config dir>/plugins/<name>/plugin.toml` with the same
   fields. Its `cwd` defaults to that directory.
 
@@ -149,7 +149,7 @@ Plugin themes will be data-only palettes, and plugin keys will be
 surface-local actions.
 
 The machine-readable source for this classification is embedded in
-`docs/api/plugin-api-0.3.json` as `x-thegn-extension-support`; its companion
+`docs/api/plugin-api-0.4.json` as `x-thegn-extension-support`; its companion
 `x-thegn-host-verb-support` table names verb authority and permitted modes, and
 the API version each verb needs (a verb newer than the plugin's declared `api`
 is refused as unsupported). `x-thegn-host-call-capabilities` is the exact set
@@ -161,6 +161,24 @@ or resident plugins. `IssueProvider` is resident-only because provider calls
 need a reply channel. Palette actions and providers are on-demand; status and
 notification contributions may also use an interval. Other cadence/mode
 combinations fail `plugin check` with an actionable reason.
+
+## App tabs
+
+A resident API 0.4 plugin can contribute an `AppTab` with a `surface` and the
+`surface:app` capability. The tab id is `plugin:<plugin>:<contribution>` and
+can be selected with `[apps] default_tab` or ordered with `tab_order`. App tabs
+are available on the dev channel only (`THEGN_CHANNEL=dev`; see
+[[release-channels]]).
+
+Inside a plugin app, your configured quit, detach, palette, and help chords
+remain available, as do the Alt tab-switch chords. Other input goes to the app.
+F2 (`plugin-app-drafts`) opens draft recovery and F3
+(`plugin-app-requests`) opens request recovery for submissions whose outcome is
+unknown. Both actions are rebindable. F2 and F3 pass through to terminal
+programs in the Work tab.
+
+Set `background = true` together with the `background:sync` capability to let
+a hidden app keep syncing. This requires `trusted_native = true`.
 
 ## Provider plugins
 

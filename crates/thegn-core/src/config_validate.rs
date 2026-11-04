@@ -1559,19 +1559,35 @@ pre_create = [
     fn app_tabs_are_schema_listed_and_unknown_ids_are_actionable() {
         let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
         let apps = &schema["definitions"]["AppsConfig"];
-        assert_eq!(
-            apps["properties"]["default_tab"]["enum"],
-            serde_json::json!(["work", "observe"])
-        );
-        assert_eq!(
-            apps["properties"]["tab_order"]["items"]["enum"],
-            serde_json::json!(["work", "observe"])
-        );
+        for id_schema in [
+            &apps["properties"]["default_tab"],
+            &apps["properties"]["tab_order"]["items"],
+        ] {
+            assert_eq!(id_schema["type"], "string");
+            assert_eq!(
+                id_schema["anyOf"][0]["enum"],
+                serde_json::json!(["work", "observe"])
+            );
+            assert_eq!(
+                id_schema["anyOf"][1]["pattern"],
+                "^plugin:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$"
+            );
+        }
+        assert!(validate_str("[apps]\ndefault_tab = \"plugin:todoist:workspace\"\ntab_order = [\"work\", \"plugin:todoist:workspace\"]\n").is_empty());
+        for invalid in [
+            "plugin:todoist",
+            "plugin::workspace",
+            "plugin:todoist:bad/name",
+        ] {
+            assert!(!validate_str(&format!("[apps]\ndefault_tab = {invalid:?}\n")).is_empty());
+        }
 
         let errors = validate_str("[apps]\ntab_order = [\"work\", \"observe-2\"]\n");
         assert!(
             errors.iter().any(|error| {
-                error.contains("observe-2") && error.contains("known tabs are work, observe")
+                error.contains("observe-2")
+                    && error
+                        .contains("known tabs are work, observe or plugin:<plugin>:<contribution>")
             }),
             "{errors:#?}"
         );
