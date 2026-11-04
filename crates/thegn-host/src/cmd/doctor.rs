@@ -2552,6 +2552,7 @@ fn doctor_json_with_health_and_overrides_and_legacy(
             "reason": reason,
         })).collect::<Vec<_>>(),
         "host_execution": thegn_core::gate::host_execution_json(),
+        "resident_bridge": crate::bridge_sup::LocalBridgeReport::probe().json(),
         "managed_tools": managed_tools_json(cfg),
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
@@ -3152,6 +3153,11 @@ pub fn run(
 
     outln!("");
     warm_pool_report(cfg);
+
+    outln!("");
+    for line in crate::bridge_sup::LocalBridgeReport::probe().lines() {
+        outln!("{line}");
+    }
 
     outln!("");
     home_layer_report(cfg);
@@ -5692,6 +5698,17 @@ mod tests {
         assert!(report.is_object());
         assert_eq!(report["state_db"], "no database yet");
         assert!(report["spares"].is_array());
+    }
+
+    #[test]
+    fn resident_bridge_json_is_always_present_with_a_state() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let report = doctor_json(&Config::default())["resident_bridge"].clone();
+        assert!(report.is_object());
+        assert!(matches!(
+            report["state"].as_str(),
+            Some("absent" | "unreadable" | "present")
+        ));
     }
 
     #[test]
