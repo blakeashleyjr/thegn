@@ -62,7 +62,10 @@ pub fn classify_worker(facts: &WorkerFacts<'_>) -> WorkerReadiness {
     if facts.backend == Backend::None {
         return WorkerReadiness::ContainmentAbsent;
     }
-    if facts.backend != Backend::Bwrap && !facts.backend.is_oci() {
+    if !matches!(
+        facts.backend,
+        Backend::Bwrap | Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol
+    ) {
         return WorkerReadiness::UnsupportedBackend;
     }
     if !writable(facts.mounts, facts.worktree) {
