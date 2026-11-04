@@ -8,6 +8,8 @@ use super::SessionGen;
 
 pub(crate) const MAX_QUEUED_EVENTS_PER_PLUGIN: usize = 1024;
 pub(crate) const MAX_QUEUED_EVENTS_TOTAL: usize = 8192;
+pub(crate) const MAX_QUEUED_BYTES_PER_PLUGIN: usize = 8 << 20;
+pub(crate) const MAX_QUEUED_BYTES_TOTAL: usize = 32 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PushOutcome {
@@ -45,12 +47,15 @@ struct QueuedEvent {
     event: SessionEvent,
     sequence: u64,
     key: Option<CoalesceKey>,
+    bytes: usize,
 }
 
 #[derive(Default)]
 struct InboxState {
     queue: VecDeque<QueuedEvent>,
     plugin_counts: HashMap<String, usize>,
+    plugin_bytes: HashMap<String, usize>,
+    total_bytes: usize,
     coalesced: HashMap<CoalesceKey, u64>,
     rejected: VecDeque<RejectedRequest>,
     rejected_plugin_counts: HashMap<String, usize>,
@@ -82,26 +87,37 @@ impl PluginInbox {
         let mut state = lock(&self.state);
         let was_empty = state.plugin_counts.get(&plugin).copied().unwrap_or(0) == 0;
         let key = coalesce_key(&plugin, session, &event);
+        let bytes = event_bytes(&event);
         let mut replaced = false;
+        let mut replacement = None;
         if let Some(key) = &key
-            && let Some(sequence) = state.coalesced.remove(key)
+            && let Some(sequence) = state.coalesced.get(key).copied()
             && let Some(position) = state
                 .queue
                 .iter()
                 .position(|queued| queued.sequence == sequence)
         {
-            state.queue.remove(position);
-            decrement(&mut state.plugin_counts, &plugin);
-            bump(&mut state.diagnostics, &plugin, |counts| {
-                counts.coalesced += 1
+            let barrier = state.queue.iter().skip(position + 1).any(|queued| {
+                queued.plugin == plugin && queued.session == session && is_barrier(&queued.event)
             });
-            replaced = true;
+            if !barrier {
+                replacement = Some(position);
+                replaced = true;
+            }
         }
 
         let is_exit = matches!(event, SessionEvent::Exit { .. });
-        let at_cap = state.plugin_counts.get(&plugin).copied().unwrap_or(0)
-            >= MAX_QUEUED_EVENTS_PER_PLUGIN
-            || state.queue.len() >= MAX_QUEUED_EVENTS_TOTAL;
+        let replaced_bytes = replacement.map_or(0, |position| state.queue[position].bytes);
+        let plugin_count = state.plugin_counts.get(&plugin).copied().unwrap_or(0)
+            - usize::from(replacement.is_some());
+        let total_count = state.queue.len() - usize::from(replacement.is_some());
+        let plugin_bytes = state.plugin_bytes.get(&plugin).copied().unwrap_or(0);
+        let projected_plugin_bytes = plugin_bytes - replaced_bytes;
+        let projected_total_bytes = state.total_bytes - replaced_bytes;
+        let at_cap = plugin_count >= MAX_QUEUED_EVENTS_PER_PLUGIN
+            || total_count >= MAX_QUEUED_EVENTS_TOTAL
+            || bytes > MAX_QUEUED_BYTES_PER_PLUGIN.saturating_sub(projected_plugin_bytes)
+            || bytes > MAX_QUEUED_BYTES_TOTAL.saturating_sub(projected_total_bytes);
         if at_cap && !is_exit {
             if let Some(id) = match &event {
                 SessionEvent::Message(RpcMessage { id: Some(id), .. }) => Some(*id),
@@ -140,6 +156,14 @@ impl PluginInbox {
             return (PushOutcome::Dropped, false);
         }
 
+        if let Some(position) = replacement {
+            let queued = state.queue.remove(position).expect("replacement position");
+            remove_accounting(&mut state, &queued);
+            bump(&mut state.diagnostics, &plugin, |counts| {
+                counts.coalesced += 1
+            });
+        }
+
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.wrapping_add(1);
         if let Some(key) = key.clone() {
@@ -151,8 +175,11 @@ impl PluginInbox {
             event,
             sequence,
             key,
+            bytes,
         });
-        *state.plugin_counts.entry(plugin).or_default() += 1;
+        *state.plugin_counts.entry(plugin.clone()).or_default() += 1;
+        *state.plugin_bytes.entry(plugin.clone()).or_default() += bytes;
+        state.total_bytes += bytes;
         (
             if replaced {
                 PushOutcome::Coalesced
@@ -166,12 +193,7 @@ impl PluginInbox {
     pub(crate) fn pop(&self) -> Option<(String, SessionGen, SessionEvent)> {
         let mut state = lock(&self.state);
         let queued = state.queue.pop_front()?;
-        decrement(&mut state.plugin_counts, &queued.plugin);
-        if let Some(key) = queued.key
-            && state.coalesced.get(&key) == Some(&queued.sequence)
-        {
-            state.coalesced.remove(&key);
-        }
+        remove_accounting(&mut state, &queued);
         Some((queued.plugin, queued.session, queued.event))
     }
 
@@ -185,12 +207,7 @@ impl PluginInbox {
             .iter()
             .position(|queued| matches!(&queued.event, SessionEvent::Exit { .. }))?;
         let queued = state.queue.remove(position)?;
-        decrement(&mut state.plugin_counts, &queued.plugin);
-        if let Some(key) = queued.key
-            && state.coalesced.get(&key) == Some(&queued.sequence)
-        {
-            state.coalesced.remove(&key);
-        }
+        remove_accounting(&mut state, &queued);
         Some((queued.plugin, queued.session, queued.event))
     }
 
@@ -223,6 +240,9 @@ fn coalesce_key(plugin: &str, session: SessionGen, event: &SessionEvent) -> Opti
     if message.id.is_some() {
         return None;
     }
+    if message.method == "update" && has_focus(&message.params) {
+        return None;
+    }
     let target = match message.method.as_str() {
         "update" | "invalidate" => message.params.get("surface")?.as_str()?,
         "state.set" => message.params.get("key")?.as_str()?,
@@ -234,6 +254,50 @@ fn coalesce_key(plugin: &str, session: SessionGen, event: &SessionEvent) -> Opti
         method: message.method.clone(),
         target: target.to_string(),
     })
+}
+
+fn has_focus(params: &serde_json::Value) -> bool {
+    params.get("focus").and_then(serde_json::Value::as_bool) == Some(true)
+        || params
+            .get("focus_ticket")
+            .is_some_and(|ticket| !ticket.is_null())
+}
+
+fn is_barrier(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::Message(message)
+        if message.id.is_some() || (message.method == "update" && has_focus(&message.params)))
+}
+
+fn event_bytes(event: &SessionEvent) -> usize {
+    match event {
+        SessionEvent::Message(message) => {
+            serde_json::to_vec(message).map_or(usize::MAX, |v| v.len())
+        }
+        SessionEvent::Response(response) => {
+            serde_json::to_vec(response).map_or(usize::MAX, |v| v.len())
+        }
+        SessionEvent::Junk(line) => line.len(),
+        SessionEvent::Exit { .. } => 0,
+    }
+}
+
+fn remove_accounting(state: &mut InboxState, queued: &QueuedEvent) {
+    decrement(&mut state.plugin_counts, &queued.plugin);
+    let remove_plugin_bytes = if let Some(bytes) = state.plugin_bytes.get_mut(&queued.plugin) {
+        *bytes -= queued.bytes;
+        *bytes == 0
+    } else {
+        false
+    };
+    if remove_plugin_bytes {
+        state.plugin_bytes.remove(&queued.plugin);
+    }
+    state.total_bytes -= queued.bytes;
+    if let Some(key) = &queued.key
+        && state.coalesced.get(key) == Some(&queued.sequence)
+    {
+        state.coalesced.remove(key);
+    }
 }
 
 fn decrement(counts: &mut HashMap<String, usize>, plugin: &str) {
@@ -279,6 +343,20 @@ mod tests {
             id: None,
             method: "register".into(),
             params: json!({}),
+        })
+    }
+
+    fn focused_update(ticket: Option<serde_json::Value>) -> SessionEvent {
+        let mut params = json!({"surface":"s", "view":{}});
+        if let Some(ticket) = ticket {
+            params["focus_ticket"] = ticket;
+        } else {
+            params["focus"] = json!(true);
+        }
+        SessionEvent::Message(RpcMessage {
+            id: None,
+            method: "update".into(),
+            params,
         })
     }
 
@@ -417,5 +495,89 @@ mod tests {
         assert!(
             matches!(event, SessionEvent::Message(RpcMessage { method, .. }) if method == "register")
         );
+    }
+
+    #[test]
+    fn focus_update_is_never_coalesced() {
+        let inbox = PluginInbox::default();
+        inbox.push("p".into(), 1, focused_update(None));
+        inbox.push("p".into(), 1, focused_update(Some(json!("ticket-1"))));
+        assert_eq!(inbox.len(), 2);
+    }
+
+    #[test]
+    fn update_does_not_coalesce_across_a_request_barrier() {
+        let inbox = PluginInbox::default();
+        inbox.push("p".into(), 1, update(Some("s"), "before", None));
+        inbox.push("p".into(), 1, update(Some("other"), "request", Some(7)));
+        inbox.push("p".into(), 1, update(Some("s"), "after", None));
+        assert_eq!(inbox.len(), 3);
+        assert!(
+            matches!(inbox.pop().unwrap().2, SessionEvent::Message(message)
+            if message.params["view"]["spans"][0]["text"] == "before")
+        );
+        assert!(
+            matches!(inbox.pop().unwrap().2, SessionEvent::Message(message)
+            if message.id == Some(7))
+        );
+        assert!(
+            matches!(inbox.pop().unwrap().2, SessionEvent::Message(message)
+            if message.params["view"]["spans"][0]["text"] == "after")
+        );
+    }
+
+    #[test]
+    fn update_does_not_coalesce_across_a_focus_barrier() {
+        let inbox = PluginInbox::default();
+        inbox.push("p".into(), 1, update(Some("s"), "before", None));
+        inbox.push("p".into(), 1, focused_update(Some(json!("focus-1"))));
+        inbox.push("p".into(), 1, update(Some("s"), "after", None));
+        assert_eq!(inbox.len(), 3);
+    }
+
+    #[test]
+    fn byte_cap_drops_notifications_and_rejects_requests_but_keeps_exit() {
+        let inbox = PluginInbox::default();
+        let payload = "x".repeat(1_000_000);
+        for index in 0..8 {
+            assert_eq!(
+                inbox.push(
+                    "p".into(),
+                    1,
+                    update(Some(&format!("s-{index}")), &payload, None)
+                ),
+                PushOutcome::Queued
+            );
+        }
+        assert_eq!(
+            inbox.push("p".into(), 1, update(Some("other"), &payload, None)),
+            PushOutcome::Dropped
+        );
+        assert_eq!(
+            inbox.push("p".into(), 1, update(Some("request"), &payload, Some(9))),
+            PushOutcome::Rejected
+        );
+        assert_eq!(inbox.pop_rejected().unwrap().id, 9);
+        assert_eq!(
+            inbox.push("p".into(), 1, SessionEvent::Exit { code: None }),
+            PushOutcome::Queued
+        );
+    }
+
+    #[test]
+    fn pop_releases_queued_bytes() {
+        let inbox = PluginInbox::default();
+        let event = update(Some("s"), "bytes", None);
+        let expected = event_bytes(&event);
+        inbox.push("p".into(), 1, event);
+        {
+            let state = lock(&inbox.state);
+            assert_eq!(state.total_bytes, expected);
+            assert_eq!(state.plugin_bytes.get("p"), Some(&expected));
+        }
+        inbox.pop().unwrap();
+        let state = lock(&inbox.state);
+        assert_eq!(state.total_bytes, 0);
+        assert!(!state.plugin_bytes.contains_key("p"));
     }
 }

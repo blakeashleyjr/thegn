@@ -24,10 +24,10 @@
 
 ## 4. Transport on main's runtime
 
-- [ ] 4.1 Shared request-id allocator + session token.
-- [ ] 4.2 Egress control reservation + replace coalescing + active-write accounting.
-- [ ] 4.3 ProviderBridge on the shared allocator.
-- [ ] 4.4 Inbox focus/request barriers + byte bounds.
+- [x] 4.1 Shared request-id allocator + session token — `admission.rs::reliability_tests::request_ids_are_shared_monotonic_and_checked`.
+- [x] 4.2 Egress control reservation + replace coalescing + active-write accounting — `admission.rs::reliability_tests::bytes_stay_counted_while_a_frame_is_being_written`.
+- [x] 4.3 ProviderBridge on the shared allocator — `provider.rs::tests::provider_and_app_requests_never_share_an_id`.
+- [x] 4.4 Inbox focus/request barriers + byte bounds — `inbox.rs::tests::byte_cap_drops_notifications_and_rejects_requests_but_keeps_exit`.
 
 ## 5. App tile + app host
 
