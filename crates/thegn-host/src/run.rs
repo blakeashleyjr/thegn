@@ -24746,7 +24746,6 @@ async fn event_loop<T: Terminal>(
                                 ) {
                                     model.status = "No plugin app tab is focused".into();
                                 }
-                                dirty = true;
                             }
                             Action::VoiceToggle => {
                                 model.status = crate::handlers::voice::toggle(

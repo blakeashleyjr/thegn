@@ -1765,7 +1765,7 @@ mod tests {
 
     #[test]
     fn app_host_preserves_draft_through_empty_reload_gap_until_loaded() {
-        let mut cfg = thegn_core::config::Config::default();
+        let cfg = thegn_core::config::Config::default();
         let shared = plugin_shared();
         {
             let mut app = shared.lock().unwrap_or_else(|error| error.into_inner());
@@ -1782,8 +1782,7 @@ mod tests {
             app.requests
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .local_usage
-                .insert("surface".into(), (1, 32));
+                .set_local_usage("surface".into(), (1, 32));
             app.ready = true;
         }
         let mut host = AppHost::from_config(&cfg);
@@ -1799,8 +1798,8 @@ mod tests {
                 app.requests
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .local_usage["surface"],
-                (1, 32),
+                    .local_usage("surface"),
+                Some((1, 32)),
                 "draft recovery accounting survives the empty discovery gap"
             );
             assert_eq!(host.slots[0].id, "plugin:demo:surface");
@@ -1893,6 +1892,15 @@ mod tests {
         }
         fn title(&self) -> String {
             self.id.into()
+        }
+        fn pump(&mut self) -> bool {
+            false
+        }
+        fn wants_redraw(&self) -> bool {
+            false
+        }
+        fn handle_input(&mut self, _event: tg_kit::InputEvent) -> tg_kit::InputResult {
+            tg_kit::InputResult::Ignored
         }
         fn command(&mut self, command: &str) -> bool {
             self.calls

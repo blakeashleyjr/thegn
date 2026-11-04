@@ -4113,11 +4113,11 @@ pub(crate) mod app_tests {
     use super::*;
     use std::sync::MutexGuard;
     use thegn_core::channel::Channel;
-    use thegn_core::plugin_api::{ExtensionPoint, Span, StyleRole};
+    use thegn_core::plugin_api::{ApiVersion, ExtensionPoint, Span, StyleRole};
 
     static CHANNEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    struct TestChannel {
+    pub(crate) struct TestChannel {
         _lock: MutexGuard<'static, ()>,
         original: Channel,
     }
@@ -4128,7 +4128,7 @@ pub(crate) mod app_tests {
         }
     }
 
-    fn channel_guard(channel: Channel) -> TestChannel {
+    pub(crate) fn channel_guard(channel: Channel) -> TestChannel {
         let lock = CHANNEL_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -4141,7 +4141,7 @@ pub(crate) mod app_tests {
     }
 
     fn app_spec(plugin: &str) -> PluginSpec {
-        spec(
+        let mut app_spec = spec(
             plugin,
             vec![
                 contribution(
@@ -4164,11 +4164,20 @@ pub(crate) mod app_tests {
                 ),
             ],
             Vec::new(),
-        )
+        );
+        app_spec.manifest.api = ApiVersion::new(0, 4, 0);
+        app_spec
     }
 
     fn install_app(plugin: &str) -> PluginsState {
-        state_with(vec![app_spec(plugin)])
+        crate::channel_state::install(Channel::Dev);
+        let state = state_with(vec![app_spec(plugin)]);
+        assert_eq!(
+            state.plugins[plugin].apps.len(),
+            1,
+            "install_app requires the dev channel while building the fixture"
+        );
+        state
     }
 
     fn app_view(revision: u64, status: &str) -> thegn_core::plugin_app::AppView {
@@ -4189,7 +4198,7 @@ pub(crate) mod app_tests {
         contribution_id: &str,
         surface: &str,
     ) -> PluginsState {
-        let _guard = channel_guard(Channel::Dev);
+        crate::channel_state::install(Channel::Dev);
         let mut plugin_spec = app_spec(plugin);
         let app_contribution = plugin_spec
             .manifest
@@ -4225,6 +4234,7 @@ pub(crate) mod app_tests {
         let mut allowed = vec![contribution("app", ExtensionPoint::AppTab, "p/app", "App")];
         assert!(gate_app_tabs(&mut allowed, true).is_empty());
         assert_eq!(allowed.len(), 1);
+        drop(_guard);
     }
 
     #[test]
@@ -4246,6 +4256,7 @@ pub(crate) mod app_tests {
         assert!(
             !effective_grants(&neg, &disabled).contains(&Capability::new("background", "sync"))
         );
+        drop(_guard);
     }
 
     #[test]
@@ -4253,6 +4264,7 @@ pub(crate) mod app_tests {
         let _guard = channel_guard(Channel::Dev);
         let state = install_app("p");
         assert_eq!(state.next_app_deadline(), None);
+        drop(_guard);
     }
 
     #[test]
@@ -4279,6 +4291,7 @@ pub(crate) mod app_tests {
             app.view.as_ref().unwrap().status,
             "Plugin unavailable; waiting for restart"
         );
+        drop(_guard);
     }
 
     #[test]
@@ -4290,7 +4303,7 @@ pub(crate) mod app_tests {
             .unwrap_or_else(|error| error.into_inner())
             .apply_view(app_view(9, "ready"))
             .unwrap();
-        let (runtime, session) = test_session();
+        let (runtime, supervisor, session) = test_session();
         let writer = session.writer();
         let mut model = FrameModel::default();
         drain_one(
@@ -4321,7 +4334,8 @@ pub(crate) mod app_tests {
         assert_eq!(app.view.as_ref().unwrap().revision, 0);
         assert_eq!(app.view.as_ref().unwrap().status, "Plugin restarting…");
         drop(app);
-        stop_test_session(&runtime, session);
+        stop_test_session(&runtime, &supervisor, session);
+        drop(_guard);
     }
 
     #[test]
@@ -4345,6 +4359,7 @@ pub(crate) mod app_tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .response_queued(7, 42)
         );
+        drop(_guard);
     }
 
     #[test]
@@ -4368,6 +4383,7 @@ pub(crate) mod app_tests {
             model.status,
             "Plugin p: app tabs are dev-channel only; set THEGN_CHANNEL=dev"
         );
+        drop(_guard);
     }
 
     #[test]
@@ -4398,6 +4414,7 @@ pub(crate) mod app_tests {
                 .status,
             "current"
         );
+        drop(_guard);
         drain_one(
             &mut state,
             &mut model,
@@ -4476,6 +4493,7 @@ pub(crate) mod app_tests {
                 .is_none(),
             "another plugin cannot write the declared app surface"
         );
+        drop(_guard);
     }
 
     #[test]
@@ -4611,13 +4629,14 @@ pub(crate) mod app_tests {
                 .focus_requested,
             "a used ticket cannot focus twice"
         );
+        drop(_guard);
     }
 
     #[test]
     fn palette_invoke_on_app_plugin_issues_one_ticket() {
         let _guard = channel_guard(Channel::Dev);
         let mut state = install_app("p");
-        let (runtime, session) = test_session();
+        let (runtime, supervisor, session) = test_session();
         let writer = session.writer();
         let entry = state.plugins.get_mut("p").unwrap();
         entry.session = Some(7);
@@ -4644,14 +4663,19 @@ pub(crate) mod app_tests {
                 .next_deadline()
                 .is_some()
         );
-        stop_test_session(&runtime, session);
+        stop_test_session(&runtime, &supervisor, session);
+        drop(_guard);
     }
 
     #[expect(
         clippy::disallowed_methods,
         reason = "the resident fixture child is the test executable"
     )]
-    pub(crate) fn test_session() -> (tokio::runtime::Runtime, thegn_svc::plugin::ResidentSession) {
+    pub(crate) fn test_session() -> (
+        tokio::runtime::Runtime,
+        thegn_svc::plugin::ResidentSupervisor,
+        thegn_svc::plugin::ResidentSession,
+    ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4676,11 +4700,12 @@ pub(crate) mod app_tests {
             |_| {},
         )
         .expect("resident fixture starts");
-        (runtime, session)
+        (runtime, supervisor, session)
     }
 
     pub(crate) fn stop_test_session(
         runtime: &tokio::runtime::Runtime,
+        _supervisor: &thegn_svc::plugin::ResidentSupervisor,
         session: thegn_svc::plugin::ResidentSession,
     ) {
         session.kill();
@@ -4700,7 +4725,7 @@ pub(crate) mod app_tests {
     fn response_for_current_generation_reaches_the_pending_app_request() {
         let _guard = channel_guard(Channel::Dev);
         let mut state = install_app("p");
-        let (runtime, session) = test_session();
+        let (runtime, supervisor, session) = test_session();
         let writer = session.writer();
         let app = state.plugins["p"].apps["app"].clone();
         let pending = {
@@ -4734,6 +4759,7 @@ pub(crate) mod app_tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .response_queued(7, pending)
         );
-        stop_test_session(&runtime, session);
+        stop_test_session(&runtime, &supervisor, session);
+        drop(_guard);
     }
 }

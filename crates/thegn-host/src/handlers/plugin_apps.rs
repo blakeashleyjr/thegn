@@ -1,7 +1,7 @@
 //! Glue between resident plugin app state, host tiles, and app input routing.
 
-use crate::keymap::{Action, KeyMap, MatchResult, Mode};
-use crate::sequence::Key;
+use crate::keymap::{Action, KeyMap, Mode};
+use crate::sequence::{Key, MatchResult};
 
 /// Visible host overlays that own input before a plugin app.
 #[derive(Clone, Copy, Default)]
@@ -179,6 +179,8 @@ mod tests {
     // request, and no background-sync capability: steady sync must not arm a timer.
     #[test]
     fn idle_plugin_app_adds_no_timer_and_no_wake() {
+        let _channel_guard =
+            crate::handlers::plugins::app_tests::channel_guard(thegn_core::channel::Channel::Dev);
         let cfg = thegn_core::config::Config::default();
         let mut plugins =
             crate::handlers::plugins::app_tests::test_state_with_app("idle", "app", "idle/app");
@@ -262,24 +264,19 @@ mod tests {
             );
         }
 
-        let (runtime, session) = crate::handlers::plugins::app_tests::test_session();
-        let writer = session.writer();
-        let token = writer.session_token().to_owned();
         {
             let mut app = shared.lock().unwrap_or_else(|error| error.into_inner());
             app.session = Some(1);
-            app.writer = Some(writer);
-            app.request_event(thegn_core::plugin_app::AppEventParams {
+            app.track_test_pending(thegn_core::plugin_app::AppEventParams {
                 surface: "idle/app".into(),
-                session: token,
+                session: "test-session".into(),
                 state_scope: "default".into(),
                 revision: 1,
                 focus_ticket: None,
                 event: thegn_core::plugin_app::AppEvent::Invoke {
                     id: "refresh".into(),
                 },
-            })
-            .expect("reliable event admitted");
+            });
         }
         let timeout = crate::idle_poll::fold_deadline(
             Some(Duration::from_secs(15)),
@@ -288,7 +285,7 @@ mod tests {
         );
         assert!(timeout.is_some_and(|remaining| remaining <= Duration::from_secs(15)));
         assert!(plugins.next_app_deadline().is_some());
-        crate::handlers::plugins::app_tests::stop_test_session(&runtime, session);
+        drop(_channel_guard);
     }
 
     #[test]
