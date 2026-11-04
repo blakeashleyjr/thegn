@@ -1234,13 +1234,14 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("ambiguous user theme identity")),
+                .any(|warning| warning.contains("ambiguous user theme identity `Shared`")),
             "missing exact-identity warning for fixture names {fixture_names:?}: {warnings:?}"
         );
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("ambiguous normalized user theme identity")),
+                .any(|warning| warning
+                    .contains("ambiguous normalized user theme identity `night-sky`")),
             "missing normalized-identity warning for fixture names {fixture_names:?}: {warnings:?}"
         );
         assert!(
@@ -1317,6 +1318,8 @@ mod tests {
             themed(builtin_name, "#666666").to_toml().unwrap(),
         )
         .unwrap();
+        let colliding_theme =
+            UserTheme::from_toml(&themed(builtin_name, "#666666").to_toml().unwrap()).unwrap();
 
         let (users, warnings) = crate::theme_store::scan_dir(dir.path(), None);
         assert!(
@@ -1329,7 +1332,8 @@ mod tests {
         );
         let cfg = thegn_core::config::Config::default();
         assert_eq!(
-            cfg.palette_with_user_themes(builtin_name, &users).bg0,
+            cfg.palette_with_user_themes(builtin_name, &[colliding_theme])
+                .bg0,
             cfg.palette_with_preset(builtin_name).bg0,
             "built-in palette changed for collision fixture {builtin_name:?}"
         );
