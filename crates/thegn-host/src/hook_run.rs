@@ -750,9 +750,13 @@ fn write_log(
     elapsed: Duration,
     output: HookLogOutput<'_>,
 ) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        thegn_core::fsperm::ensure_private_dir(parent)?;
-    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hook log path has no parent directory",
+        )
+    })?;
+    thegn_core::fsperm::ensure_private_dir(parent)?;
     let finished_unix_ms = unix_time_ms();
     let header = format!(
         "run_id={} event={} state={state:?} code={} started_unix_ms={} finished_unix_ms={finished_unix_ms} elapsed_ms={} worktree_digest={} command=[redacted]",
@@ -768,7 +772,17 @@ fn write_log(
         redact_output(output.stdout),
         redact_output(output.stderr),
     );
-    thegn_core::fsperm::write_owner_only_atomic(path, line.as_bytes())
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hook log path has no UTF-8 file name",
+            )
+        })?;
+    thegn_core::fsperm::open_private_dir(parent)?.write_owner_only_atomic(name, line.as_bytes())?;
+    Ok(())
 }
 
 fn redact_output(output: &str) -> String {
@@ -1237,6 +1251,33 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("command=[redacted]"));
         assert!(!contents.contains("do-not-write"));
+        crate::platform::test_assert_owner_only_permissions(&path, path.parent().unwrap());
+    }
+
+    // Positive control: checks publication behavior and leaves no staging file behind.
+    #[test]
+    fn hook_log_publishes_through_the_held_directory_and_leaves_no_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks").join("post-create.log");
+        write_log(
+            &path,
+            &context(),
+            &HookRunStamp::start(),
+            HookRunState::Succeeded,
+            Some(0),
+            Duration::from_millis(1),
+            HookLogOutput {
+                stdout: "completed",
+                stderr: "",
+            },
+        )
+        .unwrap();
+
+        assert!(path.is_file());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
         crate::platform::test_assert_owner_only_permissions(&path, path.parent().unwrap());
     }
 
