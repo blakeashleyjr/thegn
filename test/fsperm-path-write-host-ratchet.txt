@@ -1,7 +1,4 @@
 # THE-523 path-based writer caller ledger; this allowlist is SHRINK-ONLY.
 # Enforced by crates/thegn-core/tests/fsperm_path_write_ratchet.rs.
 # Blind spot: crates outside thegn-core, thegn-host, and thegn-svc are not scanned.
-# hook_run.rs: redacted hook run log; no credential.
-# managed_tool.rs: installer provenance record; no credential (also a test caller).
-hook_run.rs
-managed_tool.rs
+# RATCHET-EMPTY
