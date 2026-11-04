@@ -1,0 +1,14 @@
+# The manifest for examples/plugins/fixtures/fault.py: a synthetic resident app tab used by preview and transport tests.
+id = "fixture"
+name = "Synthetic plugin fixture"
+version = "0.1.0"
+api = "0.4.0"
+command = ["python3", "fault.py"]
+mode = "resident"
+capabilities = ["surface:app"]
+
+[[contributions]]
+id = "workspace"
+extension_point = "AppTab"
+label = "Fixture"
+surface = "fixture.workspace"
