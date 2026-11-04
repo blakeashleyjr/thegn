@@ -98,8 +98,8 @@ pub(crate) fn headless_settings_warnings(cfg: &thegn_core::config::Config) -> Ve
     warnings
 }
 
-#[cfg(any(unix, test))]
-const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
+/// Ceiling for any rendered agent command, queue or daemon launch.
+pub(crate) const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
 
 #[cfg(any(unix, test))]
 fn rendered_command_exceeds_limit(command: &str) -> bool {
