@@ -233,6 +233,28 @@ pub fn vendor_key_name(public_key: &str) -> Result<String> {
     ))
 }
 
+/// Provider-side name for thegn's managed public key scoped to one provider
+/// account: `thegn-managed-` + the first 32 hex characters of SHA-256 over
+/// the domain tag `thegn-vendor-key-v2\0`, the length-prefixed (u64 big endian)
+/// `provider` and `account`, then the decoded key blob. The same key in two
+/// accounts, or at two providers, gets distinct names; comments and whitespace
+/// never change the name; an unparsable key is refused. `account` may be empty
+/// (no credential reference configured).
+pub fn scoped_vendor_key_name(provider: &str, account: &str, public_key: &str) -> Result<String> {
+    let blob = decoded_key_blob(public_key)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"thegn-vendor-key-v2\0");
+    for part in [provider.as_bytes(), account.as_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.update(&blob);
+    Ok(format!(
+        "thegn-managed-{}",
+        hex_prefix(&hasher.finalize(), 32)
+    ))
+}
+
 /// Fingerprint text for custody audit output, identifying pre-SHA256 rows.
 pub fn fingerprint_audit_label(fingerprint: &str) -> String {
     if fingerprint_is_verified(fingerprint) {
@@ -1778,6 +1800,84 @@ mod tests {
             "ssh-ed25519",
         ] {
             assert!(vendor_key_name(key).is_err(), "accepted key: {key:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_vendor_key_name_pins_the_scoped_digest() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+
+        for (provider, account, expected) in [
+            (
+                "hetzner",
+                "",
+                "thegn-managed-2e1ad7181aa2e3d23c0e200ac43abb55",
+            ),
+            (
+                "hetzner",
+                "acct1",
+                "thegn-managed-0cd37b5f9e3d41a99dc5d165c47b8b57",
+            ),
+            (
+                "digitalocean",
+                "",
+                "thegn-managed-87157eb55a26d8acdc98fa4ab80b0ecc",
+            ),
+            (
+                "machine0",
+                "acct1",
+                "thegn-managed-98399c2b9c7c651a199554443debf70d",
+            ),
+        ] {
+            let name = scoped_vendor_key_name(provider, account, key).unwrap();
+            assert_eq!(name, expected);
+            assert_eq!(name.len(), 14 + 32);
+        }
+    }
+
+    #[test]
+    fn scoped_vendor_key_name_separates_provider_account_and_key() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+
+        assert_ne!(
+            scoped_vendor_key_name("hetzner", "acct1", key).unwrap(),
+            scoped_vendor_key_name("digitalocean", "acct1", key).unwrap()
+        );
+        assert_ne!(
+            scoped_vendor_key_name("hetzner", "acct1", key).unwrap(),
+            scoped_vendor_key_name("hetzner", "acct2", key).unwrap()
+        );
+        assert_ne!(
+            scoped_vendor_key_name("ab", "c", key).unwrap(),
+            scoped_vendor_key_name("a", "bc", key).unwrap()
+        );
+        assert_ne!(
+            scoped_vendor_key_name("hetzner", "acct1", key).unwrap(),
+            vendor_key_name(key).unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_vendor_key_name_ignores_comment_and_whitespace_and_refuses_unparsable_keys() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let same_key = "  ssh-ed25519\n\tAAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB   other comment ";
+
+        assert_eq!(
+            scoped_vendor_key_name("hetzner", "acct1", key).unwrap(),
+            scoped_vendor_key_name("hetzner", "acct1", same_key).unwrap()
+        );
+        for invalid_key in [
+            "",
+            "ssh-ed25519 AAAATEST x",
+            "ssh-ed25519 AAAA",
+            "ssh-ed25519 AAAABXNz",
+            "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB",
+            "ssh-ed25519",
+        ] {
+            assert!(
+                scoped_vendor_key_name("hetzner", "acct1", invalid_key).is_err(),
+                "accepted key: {invalid_key:?}"
+            );
         }
     }
 
