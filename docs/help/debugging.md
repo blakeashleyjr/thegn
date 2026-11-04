@@ -143,6 +143,8 @@ bounded read burst runs once per rollup. Other platforms log an empty census.
 The live-only view is the **LOOP** overlay in System → Telemetry. Opening that
 section enables accounting and rolls it up at its live cadence; it is not a
 snapshot that `doctor` or a bundle can reconstruct later.
+Its render tail reads the window's sample count: an empty window says `no samples`,
+and a window with fewer than 20 frames shows the count and `(sparse)` instead of a p95/p99.
 
 For a flame graph, use the feature-gated in-process profiler: build with the
 `profiling` feature, send `SIGUSR2` to the live process to start sampling, and
