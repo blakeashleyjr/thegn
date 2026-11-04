@@ -21,6 +21,12 @@ not a replay.
 - **Quit and kill** ends the sessions too — the explicit "I'm done"
   option.
 
+If a pane cannot use the daemon, it runs in-process and the launch notice
+names the redacted reason and says it will not survive closing thegn. If a
+saved pane session cannot be reattached, a fresh pane opens and the notice
+says its previous process and scrollback were not restored. Each kind of
+notice is posted once per run, while the compositor is active.
+
 `thegn daemon stop` stops every pane daemon this state directory knows about
 (registered current and pre-upgrade daemons, the configured socket, and a live
 legacy socket), skips sockets that belong to another state directory, waits
@@ -39,6 +45,12 @@ that budget expires, thegn does not start another daemon and names the
 unchecked endpoints, suggesting a retry or `thegn daemon stop`. A listener
 whose health check fails without proving the socket is gone is reported as
 unverified and prevents thegn from starting another daemon beside it.
+
+A starting daemon reads at most the 256 newest rows for its state directory
+and its pre-upgrade scope. If that older scope is larger, startup removes dead
+rows among the checked batch and checks again. If rows remain unchecked, it
+refuses to start and asks you to retry so the next batch can be swept; stop
+any old daemon that is still running.
 
 After starting a pane daemon, thegn waits up to 3 seconds for it to answer and
 reports an error if it does not. A daemon that cannot acquire its control-socket

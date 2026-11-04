@@ -105,6 +105,17 @@
           clipboardMaxImageBytes = 1048576;
           clipboardRemoteDir = "~/.cache/thegn/paste-hm";
           clipboardKeepHours = 12;
+          locEnabled = false;
+          locScanIntervalSecs = 1800;
+          locMaxScanPerRound = 4;
+          locWatchInvalidateSecs = 120;
+          replayEnabled = true;
+          replayMaxBytesPerPane = 4194304;
+          replayMaxDurationSecs = 300;
+          replayKeyframeIntervalMs = 2000;
+          replayKeyframeIntervalBytes = 65536;
+          replayIdleThresholdMs = 1500;
+          replayPersist = false;
           monitorSystem = "htop";
           monitorGpu = "nvtop";
           agents = [

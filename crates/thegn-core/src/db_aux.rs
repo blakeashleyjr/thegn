@@ -1969,7 +1969,8 @@ impl WorktreeAuxStore for Db {
                     candidate.job_id,
                     candidate.head_sha,
                     util::now(),
-                    candidate.context
+                    candidate.context,
+                    crate::db_ci::ci_autofix_attempt_key(candidate)
                 ],
             )?;
             if inserted == 0 {

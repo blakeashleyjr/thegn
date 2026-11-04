@@ -160,16 +160,7 @@ fn binding_for(cfg: &Config, name: &str) -> Result<thegn_core::host_config::Host
 fn age(now: i64, t: Option<i64>) -> String {
     match t {
         None => "never".into(),
-        Some(t) => {
-            let d = now.saturating_sub(t);
-            if d < 90 {
-                format!("{d}s ago")
-            } else if d < 5400 {
-                format!("{}m ago", d / 60)
-            } else {
-                format!("{}h ago", d / 3600)
-            }
-        }
+        Some(t) => thegn_core::util::age_ago_secs(now.saturating_sub(t), 0),
     }
 }
 
@@ -785,8 +776,35 @@ mod tests {
         );
         assert_eq!(age(100, None), "never");
         assert_eq!(age(100, Some(60)), "40s ago");
-        assert_eq!(age(4000, Some(100)), "65m ago");
-        assert_eq!(age(100_000, Some(100)), "27h ago");
+        assert_eq!(age(4000, Some(100)), "1h ago");
+        assert_eq!(age(100_000, Some(100)), "1d ago");
+    }
+
+    #[test]
+    fn age_uses_the_shared_bucket_boundaries() {
+        // Host ages use the shared seconds, minutes, hours, then days buckets.
+        let cases = [
+            (0, "0s ago"),
+            (59, "59s ago"),
+            (60, "1m ago"),
+            (89, "1m ago"),
+            (90, "1m ago"),
+            (3599, "59m ago"),
+            (3600, "1h ago"),
+            (86_399, "23h ago"),
+            (86_400, "1d ago"),
+            (172_800, "2d ago"),
+        ];
+        for (span, expected) in cases {
+            assert_eq!(
+                age(1_000_000, Some(1_000_000 - span)),
+                expected,
+                "unexpected age for a span of {span} seconds"
+            );
+        }
+
+        assert_eq!(age(100, Some(160)), "0s ago");
+        assert!(age(i64::MAX, Some(i64::MIN)).ends_with(" ago"));
     }
 
     #[test]

@@ -2292,6 +2292,60 @@ pub(crate) fn verify_v104_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v105: ci_autofix_dedupe.attempt joins the primary key (THE-543). -1 = unknown attempt; legacy rows keep -1.
+pub(crate) fn migrate_v105(conn: &Connection) -> Result<()> {
+    if has_column(conn, "ci_autofix_dedupe", "attempt") {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS ci_autofix_dedupe_v105;
+         CREATE TABLE ci_autofix_dedupe_v105 (
+             worktree TEXT NOT NULL,
+             run_id TEXT NOT NULL,
+             job_id TEXT NOT NULL,
+             head_sha TEXT NOT NULL,
+             claimed_at INTEGER NOT NULL,
+             context TEXT NOT NULL DEFAULT '',
+             attempt INTEGER NOT NULL DEFAULT -1,
+             PRIMARY KEY (worktree, run_id, job_id, head_sha, attempt)
+         );
+         INSERT INTO ci_autofix_dedupe_v105
+             (worktree, run_id, job_id, head_sha, claimed_at, context, attempt)
+         SELECT worktree, run_id, job_id, head_sha, claimed_at, context, -1
+         FROM ci_autofix_dedupe;
+         DROP TABLE ci_autofix_dedupe;
+         ALTER TABLE ci_autofix_dedupe_v105 RENAME TO ci_autofix_dedupe;",
+    )?;
+    tx.commit()?;
+    // Rebuilding the table releases its old pages. Reclaim them now so a
+    // fresh incremental-mode database does not start maintenance with
+    // migration-only freelist entries.
+    // `incremental_vacuum` frees one page per step: step it to completion.
+    let mut vacuum = conn.prepare("PRAGMA incremental_vacuum")?;
+    let mut freed = vacuum.query([])?;
+    while freed.next()?.is_some() {}
+    Ok(())
+}
+
+pub(crate) fn verify_v105_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "ci_autofix_dedupe", "attempt") {
+        bail!("schema v105 migration did not add ci_autofix_dedupe.attempt");
+    }
+    let mut statement = conn.prepare(
+        "SELECT name FROM pragma_table_info('ci_autofix_dedupe') WHERE pk > 0 ORDER BY pk",
+    )?;
+    let keys = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if keys.iter().map(String::as_str).collect::<Vec<_>>()
+        != ["worktree", "run_id", "job_id", "head_sha", "attempt"]
+    {
+        bail!("schema v105 primary key must be worktree, run_id, job_id, head_sha, attempt");
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3774,6 +3828,7 @@ mod tests {
                 job_id: "job".into(),
                 head_sha: "sha".into(),
                 context: String::new(),
+                attempt: None,
             };
             assert!(db.claim_ci_autofix(&candidate).unwrap());
             db.conn()
@@ -3804,6 +3859,7 @@ mod tests {
             job_id: "job".into(),
             head_sha: "sha".into(),
             context: "github:github.com/o/a".into(),
+            attempt: None,
         };
         assert!(!upgraded.claim_ci_autofix(&legacy).unwrap());
         super::verify_v99_schema(upgraded.conn()).unwrap();
@@ -4081,13 +4137,131 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 104);
         assert_eq!(upgraded.daemons().unwrap().len(), 2);
         assert_eq!(
             upgraded.daemons_in_scope_newest("/s", 1).unwrap()[0].daemon_id,
             "newer"
         );
         super::verify_v104_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v105_rebuilds_ci_autofix_dedupe_with_the_attempt_key_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v105_schema(fresh.conn()).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             VACUUM;
+             CREATE TABLE ci_autofix_dedupe (
+                 worktree TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
+                 job_id TEXT NOT NULL,
+                 head_sha TEXT NOT NULL,
+                 claimed_at INTEGER NOT NULL,
+                 context TEXT NOT NULL DEFAULT '',
+                 PRIMARY KEY (worktree, run_id, job_id, head_sha)
+             );
+             INSERT INTO ci_autofix_dedupe
+                 (worktree, run_id, job_id, head_sha, claimed_at, context)
+             VALUES ('/wt/legacy', 'run', 'job', 'sha', 5, 'github:github.com/o/a');",
+        )
+        .unwrap();
+        assert!(super::verify_v105_schema(&conn).is_err());
+        super::migrate_v105(&conn).unwrap();
+        super::migrate_v105(&conn).unwrap();
+        super::verify_v105_schema(&conn).unwrap();
+        let freelist_count: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(freelist_count, 0, "v105 migration leaves no rebuild pages");
+        let attempt: i64 = conn
+            .query_row(
+                "SELECT attempt FROM ci_autofix_dedupe WHERE worktree='/wt/legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt, -1);
+
+        let wrong = Connection::open_in_memory().unwrap();
+        wrong
+            .execute_batch(
+                "CREATE TABLE ci_autofix_dedupe (
+                 worktree TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
+                 job_id TEXT NOT NULL,
+                 head_sha TEXT NOT NULL,
+                 claimed_at INTEGER NOT NULL,
+                 context TEXT NOT NULL DEFAULT '',
+                 attempt INTEGER NOT NULL DEFAULT -1,
+                 PRIMARY KEY (worktree, run_id, job_id, head_sha)
+             );",
+            )
+            .unwrap();
+        assert!(super::verify_v105_schema(&wrong).is_err());
+    }
+
+    #[test]
+    fn v105_upgrades_a_real_v104_database() {
+        use crate::ci_log::CiLogCandidate;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v104.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.conn()
+                .execute_batch(
+                    "DROP TABLE ci_autofix_dedupe;
+                     CREATE TABLE ci_autofix_dedupe (
+                         worktree TEXT NOT NULL,
+                         run_id TEXT NOT NULL,
+                         job_id TEXT NOT NULL,
+                         head_sha TEXT NOT NULL,
+                         claimed_at INTEGER NOT NULL,
+                         context TEXT NOT NULL DEFAULT '',
+                         PRIMARY KEY (worktree, run_id, job_id, head_sha)
+                     );
+                     INSERT INTO ci_autofix_dedupe
+                         (worktree, run_id, job_id, head_sha, claimed_at, context)
+                     VALUES ('/wt/v104', 'run', 'job', 'sha', 5, 'github:github.com/o/a');
+                     PRAGMA user_version=104;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 105);
+        let legacy: (i64, String, i64) = upgraded
+            .conn()
+            .query_row(
+                "SELECT attempt, context, claimed_at FROM ci_autofix_dedupe WHERE worktree='/wt/v104'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (-1, "github:github.com/o/a".into(), 5));
+        let unknown = CiLogCandidate {
+            worktree: "/wt/v104".into(),
+            run_id: "run".into(),
+            job_id: "job".into(),
+            head_sha: "sha".into(),
+            context: "github:github.com/o/a".into(),
+            attempt: None,
+        };
+        assert!(!upgraded.claim_ci_autofix(&unknown).unwrap());
+        let known = CiLogCandidate {
+            attempt: Some(2),
+            ..unknown
+        };
+        assert!(upgraded.claim_ci_autofix(&known).unwrap());
+        assert!(!upgraded.claim_ci_autofix(&known).unwrap());
+        super::verify_v105_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

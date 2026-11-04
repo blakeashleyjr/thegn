@@ -58,6 +58,10 @@ fn candidate_ref_id(candidate: &thegn_core::ci_log::CiLogCandidate) -> String {
         "ci-autofix:{}:{}:{}:{}",
         candidate.worktree, candidate.run_id, candidate.job_id, candidate.head_sha
     );
+    if let Some(attempt) = candidate.attempt {
+        ref_id.push_str(":@");
+        ref_id.push_str(&attempt.to_string());
+    }
     if !candidate.context.is_empty() {
         ref_id.push(':');
         ref_id.push_str(&candidate.context);
@@ -126,7 +130,13 @@ pub(crate) fn candidate_from_notification(
     let run_id = fields.next()?.trim();
     let job_id = fields.next()?.trim();
     let head_sha = fields.next()?.trim();
-    let context = fields.next().unwrap_or("").trim();
+    let rest = fields.next().unwrap_or("").trim();
+    let (attempt, context) = if let Some(tail) = rest.strip_prefix('@') {
+        let (number, context) = tail.split_once(':').unwrap_or((tail, ""));
+        (Some(number.parse::<u64>().ok()?), context)
+    } else {
+        (None, rest)
+    };
     if run_id.is_empty() || job_id.is_empty() || head_sha.is_empty() {
         return None;
     }
@@ -136,6 +146,7 @@ pub(crate) fn candidate_from_notification(
         job_id: job_id.to_string(),
         head_sha: head_sha.to_string(),
         context: context.to_string(),
+        attempt,
     })
 }
 
@@ -1125,6 +1136,7 @@ mod tests {
     }
 
     #[test]
+    // Positive control: legacy notification references still preserve provider context.
     fn notification_candidate_keeps_the_provider_context() {
         let notification = thegn_core::notification::Notification {
             id: 1,
@@ -1371,6 +1383,7 @@ mod tests {
             job_id: "job-3".into(),
             head_sha: "abc123".into(),
             context: "github:github.com/o/r".into(),
+            attempt: None,
         };
         let mut notification = thegn_core::notification::Notification {
             id: 1,
@@ -1392,9 +1405,81 @@ mod tests {
             job_id: "job-3".into(),
             head_sha: "abc123".into(),
             context: String::new(),
+            attempt: None,
         };
         notification.source_ref = candidate_ref_id(&legacy);
         assert_eq!(candidate_from_notification(&notification).unwrap(), legacy);
+    }
+
+    #[test]
+    fn candidate_ref_id_round_trips_the_run_attempt() {
+        let candidates = [
+            thegn_core::ci_log::CiLogCandidate {
+                worktree: "/wt/repo".into(),
+                run_id: "run-7".into(),
+                job_id: "job-3".into(),
+                head_sha: "abc123".into(),
+                context: "github:github.com/o/r".into(),
+                attempt: Some(3),
+            },
+            thegn_core::ci_log::CiLogCandidate {
+                worktree: "/wt/repo".into(),
+                run_id: "run-7".into(),
+                job_id: "job-3".into(),
+                head_sha: "abc123".into(),
+                context: String::new(),
+                attempt: Some(3),
+            },
+            thegn_core::ci_log::CiLogCandidate {
+                worktree: "/wt/repo".into(),
+                run_id: "run-7".into(),
+                job_id: "job-3".into(),
+                head_sha: "abc123".into(),
+                context: "github:github.com/o/r".into(),
+                attempt: None,
+            },
+        ];
+        let expected = [
+            "ci-autofix:/wt/repo:run-7:job-3:abc123:@3:github:github.com/o/r",
+            "ci-autofix:/wt/repo:run-7:job-3:abc123:@3",
+            "ci-autofix:/wt/repo:run-7:job-3:abc123:github:github.com/o/r",
+        ];
+        for (candidate, expected_ref) in candidates.iter().zip(expected) {
+            let notification = thegn_core::notification::Notification {
+                id: 1,
+                kind: thegn_core::notification::NotificationKind::PrQueueNeedsHuman,
+                source_ref: candidate_ref_id(candidate),
+                message: "m".into(),
+                created_at_ms: 1,
+                read: false,
+                worktree_path: "/wt/repo".into(),
+            };
+            assert_eq!(notification.source_ref, expected_ref);
+            assert_eq!(
+                candidate_from_notification(&notification).unwrap(),
+                *candidate
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_from_notification_rejects_a_malformed_attempt() {
+        for source_ref in [
+            "ci-autofix:/wt/repo:run-7:job-3:abc123:@x:github:github.com/o/r",
+            "ci-autofix:/wt/repo:run-7:job-3:abc123:@:ctx",
+            "ci-autofix:/wt/repo:run-7:job-3:abc123:@-1",
+        ] {
+            let notification = thegn_core::notification::Notification {
+                id: 1,
+                kind: thegn_core::notification::NotificationKind::PrQueueNeedsHuman,
+                source_ref: source_ref.into(),
+                message: "m".into(),
+                created_at_ms: 1,
+                read: false,
+                worktree_path: "/wt/repo".into(),
+            };
+            assert!(candidate_from_notification(&notification).is_none());
+        }
     }
 
     #[test]
