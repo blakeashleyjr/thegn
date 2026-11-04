@@ -30,6 +30,10 @@ impl schemars::JsonSchema for ApiVersion {
 
 /// Current Plugin API contract version implemented by this crate.
 ///
+/// v0.4 (additive over v0.3): the [`ExtensionPoint::AppTab`] extension point with the
+/// [`crate::plugin_app`] AppView/AppEvent widget contract, and the [`PluginSpec::background`]
+/// permission for `background:sync`. A v0.3 manifest negotiates unchanged.
+///
 /// v0.3 (additive over v0.2): [`View`] gains optional multi-row `rows`, [`Span`]
 /// gains an optional theme-slot `slot` (with [`StyleRole`] as the fallback), and
 /// [`ExtensionPoint::PanelSection`] joins the vocabulary. Every addition
@@ -41,7 +45,7 @@ impl schemars::JsonSchema for ApiVersion {
 /// manifest projects. Older plugins keep negotiating; nothing was removed.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
-    minor: 3,
+    minor: 4,
     patch: 0,
 };
 
@@ -174,6 +178,7 @@ impl std::fmt::Display for Capability {
 
 fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
     let scope = match ep {
+        ExtensionPoint::AppTab => "app",
         ExtensionPoint::StatusBarSegment => "statusbar",
         ExtensionPoint::PanelSection => "panel",
         ExtensionPoint::SidebarTab => "sidebar",
@@ -196,6 +201,8 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
 /// The typed slots the host offers for plugins to fill.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum ExtensionPoint {
+    /// Resident application tab rendered from an [`crate::plugin_app::AppView`] (API 0.4).
+    AppTab,
     StatusBarSegment,
     /// Reserved v0.3 vocabulary for a plugin-contributed accordion section in
     /// the info panel. The wire shape and cached [`View`] model are stable, but
@@ -234,6 +241,7 @@ impl ExtensionPoint {
     /// Stable wire spelling used by contract inspection and diagnostics.
     pub fn wire_name(&self) -> &str {
         match self {
+            Self::AppTab => "AppTab",
             Self::StatusBarSegment => "StatusBarSegment",
             Self::PanelSection => "PanelSection",
             Self::SidebarTab => "SidebarTab",
@@ -380,6 +388,11 @@ pub struct PluginSpec {
     pub mode: PluginMode,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// User permission for declared `background:sync` work while the plugin's
+    /// app tab is hidden. Effective only for resident plugins that declare the
+    /// capability; declaring it still requires `trusted_native`.
+    #[serde(default)]
+    pub background: bool,
     /// Explicitly opts this plugin into running as unsandboxed native code
     /// with the user's full authority. Declared capabilities and scopes are
     /// protocol checks, not executable containment.
@@ -667,6 +680,9 @@ impl HostContract {
                     "extension point {} requires declared capability {required}",
                     contrib.extension_point.wire_name()
                 ))
+            } else if contrib.extension_point == ExtensionPoint::AppTab && contrib.surface.is_none()
+            {
+                Some("extension point AppTab requires a surface".into())
             } else if accepted_ids.contains(contrib.id.as_str()) {
                 Some(format!("duplicate contribution id {}", contrib.id.as_str()))
             } else if let Some(surface) = &contrib.surface
@@ -748,6 +764,14 @@ impl HostContract {
             } else {
                 neg.accepted_contributions.push(contribution);
             }
+        }
+        let background = Capability::new("background", "sync");
+        if spec.background
+            && spec.mode == PluginMode::Resident
+            && spec.manifest.capabilities.contains(&background)
+        {
+            neg.denied.remove(&background);
+            neg.granted.insert(background);
         }
         Ok(neg)
     }
@@ -1154,6 +1178,30 @@ impl PluginRuntime {
 
     pub fn subscriptions(&self) -> &std::collections::HashSet<(PluginId, EventKind)> {
         &self.subscriptions
+    }
+
+    /// Authorize an application view without mixing its widget tree into the
+    /// statusbar View cache. The host retains the last validated app frame.
+    pub fn authorize_app_update(
+        &mut self,
+        plugin: PluginId,
+        surface: &SurfaceId,
+    ) -> Result<(), PluginApiError> {
+        let surface_bytes = surface.as_str().len();
+        if surface_bytes > MAX_PLUGIN_IDENTIFIER_BYTES {
+            return Err(quota_error(
+                "surface identifier bytes",
+                surface_bytes,
+                MAX_PLUGIN_IDENTIFIER_BYTES,
+            ));
+        }
+        let cap = self
+            .surface_caps
+            .get(surface)
+            .filter(|c| c.as_str() == "surface:app")
+            .cloned()
+            .unwrap_or_else(|| Capability::new("surface", "unknown"));
+        self.audit(plugin, cap, "app.update")
     }
 
     pub fn update(
@@ -2130,6 +2178,16 @@ const PROVIDER_CALLBACKS: &[PluginCallback] =
 /// the wire enum independently.
 pub static HOST_EXTENSION_SUPPORT: &[ExtensionPointSupport] = &[
     ExtensionPointSupport {
+        extension_point: ExtensionPoint::AppTab,
+        since: ApiVersion::new(0, 4, 0),
+        state: SupportState::Wired,
+        required_capability: Some("surface:app"),
+        modes: RESIDENT_MODE,
+        cadences: ON_DEMAND,
+        callbacks: PALETTE_CALLBACKS,
+        owner: "plugin app runtime (dev channel)",
+    },
+    ExtensionPointSupport {
         extension_point: ExtensionPoint::StatusBarSegment,
         since: ApiVersion::new(0, 1, 0),
         state: SupportState::Wired,
@@ -2496,10 +2554,14 @@ mod wire_tests {
     }
 
     #[test]
-    fn v0_3_version_and_panel_section_capability() {
-        // The bump is 0.3.0, and the new rendering surface maps to a "panel"
+    fn current_version_and_panel_section_capability() {
+        // The bump is 0.4.0; app and panel rendering surfaces map to their capabilities.
         // surface capability beside statusbar — covering the new match arm.
-        assert_eq!(API_VERSION, ApiVersion::new(0, 3, 0));
+        assert_eq!(API_VERSION, ApiVersion::new(0, 4, 0));
+        assert_eq!(
+            surface_capability_for(&ExtensionPoint::AppTab),
+            Some(Capability::new("surface", "app"))
+        );
         assert_eq!(
             surface_capability_for(&ExtensionPoint::PanelSection),
             Some(Capability::new("surface", "panel"))
@@ -2527,6 +2589,7 @@ mod wire_tests {
         assert_eq!(parsed.to_string(), "network:api.example.com:443");
 
         for (point, target) in [
+            (ExtensionPoint::AppTab, Some("app")),
             (ExtensionPoint::StatusBarSegment, Some("statusbar")),
             (ExtensionPoint::PanelSection, Some("panel")),
             (ExtensionPoint::SidebarTab, Some("sidebar")),
@@ -3758,13 +3821,114 @@ timeout_secs = 5
             scopes: Vec::new(),
             mode,
             enabled: true,
+            background: false,
             trusted_native: false,
         }
     }
 
     #[test]
+    fn app_tabs_require_resident_mode_background_permission_and_surface() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::AppTab,
+            vec![
+                Capability::new("surface", "app"),
+                Capability::new("background", "sync"),
+            ],
+            PluginMode::OneShot,
+        );
+        spec.manifest.api = API_VERSION;
+        assert!(
+            host.negotiate_spec(&spec)
+                .unwrap()
+                .accepted_contributions
+                .is_empty()
+        );
+
+        spec.mode = PluginMode::Resident;
+        let denied = host.negotiate_spec(&spec).unwrap();
+        let background = Capability::new("background", "sync");
+        assert_eq!(denied.accepted_contributions.len(), 1);
+        assert!(denied.denied.contains(&background));
+        assert!(!denied.granted.contains(&background));
+
+        spec.background = true;
+        let permitted = host.negotiate_spec(&spec).unwrap();
+        assert!(permitted.granted.contains(&background));
+        assert!(!permitted.denied.contains(&background));
+
+        spec.manifest.api = ApiVersion::new(0, 3, 0);
+        let older = host.negotiate_spec(&spec).unwrap();
+        assert!(
+            older.rejected_contributions[0]
+                .reason
+                .contains("requires API 0.4.0")
+        );
+
+        spec.manifest.api = API_VERSION;
+        spec.manifest.contributions[0].surface = None;
+        let no_surface = host.negotiate_spec(&spec).unwrap();
+        assert!(
+            no_surface.rejected_contributions[0]
+                .reason
+                .contains("AppTab requires a surface")
+        );
+    }
+
+    #[test]
+    fn v0_3_manifest_still_negotiates_statusbar_contribution() {
+        let host = current_host_contract();
+        let mut spec = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            vec![Capability::new("surface", "statusbar")],
+            PluginMode::Resident,
+        );
+        spec.manifest.api = ApiVersion::new(0, 3, 0);
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        assert_eq!(
+            negotiated.accepted_contributions,
+            spec.manifest.contributions
+        );
+    }
+
+    #[test]
+    fn authorize_app_update_audits_app_capability_and_checks_surface_quota() {
+        let plugin = PluginId::new("app-update-test");
+        let spec = support_spec(
+            ExtensionPoint::AppTab,
+            vec![Capability::new("surface", "app")],
+            PluginMode::Resident,
+        );
+        let negotiated = current_host_contract().negotiate_spec(&spec).unwrap();
+        let contribution = spec.manifest.contributions[0].clone();
+        let mut runtime = PluginRuntime::new(negotiated);
+        runtime
+            .register(plugin.clone(), contribution.clone())
+            .unwrap();
+
+        assert!(
+            runtime
+                .authorize_app_update(plugin.clone(), contribution.surface.as_ref().unwrap())
+                .is_ok()
+        );
+        let audit = runtime.audit_log().last().unwrap();
+        assert_eq!(audit.capability, Capability::new("surface", "app"));
+        assert_eq!(audit.operation, "app.update");
+
+        let oversized = SurfaceId::new("s".repeat(MAX_PLUGIN_IDENTIFIER_BYTES + 1));
+        assert!(matches!(
+            runtime.authorize_app_update(plugin, &oversized),
+            Err(PluginApiError::QuotaExceeded {
+                what: "surface identifier bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn current_host_support_tables_are_complete_and_unique() {
         let expected_points = [
+            "AppTab",
             "StatusBarSegment",
             "PanelSection",
             "SidebarTab",
@@ -4035,7 +4199,10 @@ timeout_secs = 5
         let host = current_host_contract();
         assert_eq!(host.extension_support().len(), HOST_EXTENSION_SUPPORT.len());
 
-        for incompatible in [ApiVersion::new(1, 0, 0), ApiVersion::new(0, 4, 0)] {
+        for incompatible in [
+            ApiVersion::new(1, 0, 0),
+            ApiVersion::new(API_VERSION.major, API_VERSION.minor + 1, 0),
+        ] {
             let mut spec = support_spec(
                 ExtensionPoint::StatusBarSegment,
                 vec![Capability::new("surface", "statusbar")],
@@ -4197,6 +4364,18 @@ mod native_trust_tests {
         let spec: PluginSpec =
             toml::from_str(include_str!("../../../examples/plugins/hello/plugin.toml")).unwrap();
         assert!(matches!(spec.native_trust(), NativeTrust::Ungated));
+    }
+
+    #[test]
+    fn background_sync_still_requires_trusted_native() {
+        let mut spec = spec_with(&["background:sync"], Vec::new());
+        spec.background = true;
+        assert_eq!(
+            spec.native_trust(),
+            NativeTrust::Refused {
+                gated_by: vec!["background:sync".into()]
+            }
+        );
     }
 
     #[test]

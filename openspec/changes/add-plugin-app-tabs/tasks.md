@@ -9,12 +9,12 @@
 
 ## 2. Core contract 0.4
 
-- [ ] 2.1 `plugin_app` module.
-- [ ] 2.2 `AppTab` support row + `surface:app`.
-- [ ] 2.3 `PluginSpec.background` + `background:sync` grant.
-- [ ] 2.4 `authorize_app_update`.
+- [x] 2.1 `plugin_app` module — `crates/thegn-core/src/plugin_app.rs` and `tests/plugin_app.rs`.
+- [x] 2.2 `AppTab` support row + `surface:app` — `app_tabs_require_resident_mode_background_permission_and_surface`.
+- [x] 2.3 `PluginSpec.background` + `background:sync` grant — `app_tabs_require_resident_mode_background_permission_and_surface`.
+- [x] 2.4 `authorize_app_update` — `authorize_app_update_audits_app_capability_and_checks_surface_quota`.
 - [ ] 2.5 Schema snapshot 0.4 regenerated.
-- [ ] 2.6 Docs version markers.
+- [x] 2.6 Docs version markers — `docs/extending/plugin.md` and `docs/help/plugins.md`.
 
 ## 3. thegn-plugin-ui crate + tg-kit
 

@@ -328,6 +328,8 @@ placement.strictest_allowed_mode
 # to scalar coverage after its schema correction. There is no entry-addressable
 # ambient version override; keep it file-defined with the other manifest fields.
 plugins.api
+# plugins.background is per-plugin permission and must never be granted by an ambient environment variable.
+plugins.background
 plugins.capabilities
 plugins.command
 plugins.cwd

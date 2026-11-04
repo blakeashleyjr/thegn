@@ -2204,6 +2204,7 @@ mod tests {
             scopes,
             mode: PluginMode::Resident,
             enabled: true,
+            background: false,
             trusted_native: false,
         }
     }
