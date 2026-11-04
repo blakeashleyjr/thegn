@@ -130,8 +130,9 @@ pub enum SessionAction {
         /// `dispatch put --chunk … --force`.
         #[arg(long, requires = "stage", conflicts_with = "resume_work")]
         chunk: Option<String>,
-        /// The Lead lease this stage dispatch is made under.
-        #[arg(long, value_name = "NAME", requires = "owner")]
+        /// The Lead lease this stage dispatch is made under. Requires `--owner`
+        /// and `--lease-gen`.
+        #[arg(long, value_name = "NAME", requires_all = ["owner", "lease_gen"])]
         lease: Option<String>,
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
