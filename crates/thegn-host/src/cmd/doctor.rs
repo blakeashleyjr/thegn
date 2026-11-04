@@ -2952,6 +2952,7 @@ pub fn run(
     if json {
         let mut report = doctor_json_with_health_and_overrides(cfg, &health, cli_overrides);
         report["plugins"] = plugins_trust_json(cfg, &config_path);
+        report["voice"] = super::voice::status(&cfg.voice);
         report["batteries"] =
             super::batteries_doctor::json(&super::batteries_doctor::inspect_env());
         outln!("{}", serde_json::to_string_pretty(&report)?);
@@ -2971,6 +2972,22 @@ pub fn run(
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     identification_report(cfg);
+    let voice = super::voice::status(&cfg.voice);
+    outln!("Voice");
+    outln!(
+        "  state         {} ({})",
+        if cfg.voice.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cfg.voice.kind.as_str()
+    );
+    outln!("  language      {}", cfg.voice.language);
+    outln!("  model         {}", cfg.voice.model);
+    outln!("  native build  {}", voice["native_compiled"]);
+    outln!("  live preview  {}", voice["live_preview"]);
+    outln!("  credential    {}", voice["credential_configured"]);
     let gate_quarantines = crate::integrate::gate_quarantines();
     if gate_quarantines.is_empty() {
         outln!("Merge gate workspaces: none quarantined");

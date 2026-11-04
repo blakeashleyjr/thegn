@@ -18453,7 +18453,7 @@ async fn event_loop<T: Terminal>(
                 // Escape cancels an active utterance before any modal or pane
                 // sees it. While idle it remains available to every existing
                 // overlay, preserving their established behavior.
-                if voice.is_recording() && crate::input::is_escape_key(&k.key) {
+                if voice.is_active() && crate::input::is_escape_key(&k.key) {
                     model.status = crate::handlers::voice::cancel(&mut voice, &waker);
                     keymap.reset();
                     dirty = true;

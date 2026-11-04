@@ -29,6 +29,12 @@ pub(crate) fn platform_executable_identity_metadata(
     (None, None)
 }
 
+pub(crate) fn platform_voice_model_identity_metadata(
+    _metadata: &std::fs::Metadata,
+) -> (Option<u64>, Option<u64>, Option<i64>, Option<i64>) {
+    (None, None, None, None)
+}
+
 #[cfg(test)]
 pub(crate) fn platform_set_mode_for_test(_path: &std::path::Path, _mode: u32) -> io::Result<()> {
     Ok(())

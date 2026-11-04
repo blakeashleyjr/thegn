@@ -19,6 +19,7 @@ thegn-host  ── compositor: tokio runtime, portable-pty, termwiz Surface, chr
    │                        seam vocabulary, capability catalog, plugin wire,
    │                        forge/CI models + parsers
    ├─► thegn-media, thegn-metrics, thegn-proc ── per-OS leaf crates (core-free)
+   ├─► thegn-voice ── optional CPAL/Whisper leaf; handles owned by voice worker
    └─► tg-kit + gtui-* ── the embedded-app contract (AppTile) and the Observe app
 
 thegn-proxy ── OPT-IN model-proxy daemon (binary `tgproxy`): the axum I/O shell
@@ -36,6 +37,15 @@ plans that never landed.
 `thegn-core` may depend on the `thegn-proc` leaf for bounded process
 supervision; it has no core dependency. This is the one sanctioned core-to-leaf
 edge besides `thegn-media`, pinned in `crate_boundaries.rs`.
+
+Native dictation is an optional host edge (`voice-native`, `voice-metal`), never
+a core dependency. The same binary's private worker owns microphone/Whisper;
+the host supervises cancellation/deadlines off-loop and wakes the UI for scoped
+partial/final events. HTTP and pinned atomic model acquisition live in services.
+The legacy command adapter remains parent-owned, including after native capture,
+so killing a native worker cannot orphan its transcriber. Recordings stay in RAM.
+Desktop enablement and platform latency/permission evidence remain gated in
+[`voice-verification.md`](voice-verification.md); remote bridges omit native features.
 
 **Gate:** `crate_boundaries.rs` (`just test`), `cargo deny check bans`
 (`just deps-audit`).

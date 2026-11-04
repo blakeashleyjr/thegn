@@ -295,6 +295,14 @@ pub fn validate_diagnostics_with_policy(
         message,
     }));
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
+        if cfg.voice.kind == crate::config::VoiceKind::Http
+            && let Err(message) = cfg.voice.validate_credential_transport()
+        {
+            diagnostics.push(ValidationDiagnostic {
+                severity: ValidationSeverity::Error,
+                message,
+            });
+        }
         for (index, mount) in cfg.sandbox.mounts.iter().enumerate() {
             if let Err(error) = crate::sandbox_mounts::parse_mount_checked(mount) {
                 diagnostics.push(ValidationDiagnostic {
@@ -1139,6 +1147,50 @@ fn join_key(path: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_credential_requires_tls_except_for_loopback_http() {
+        for (body, accepted) in [
+            (
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://127.0.0.2/stt\"\n",
+                true,
+            ),
+            (
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://[::1]/stt\"\n",
+                true,
+            ),
+            (
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://localhost/stt\"\n",
+                true,
+            ),
+            (
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"https://stt.example/stt\"\n",
+                true,
+            ),
+            (
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://stt.example/stt\"\n",
+                false,
+            ),
+            (
+                "[voice]\nkind = \"http\"\ncredential = \"env:TOKEN\"\nendpoint = \"not a URL\"\n",
+                false,
+            ),
+            (
+                "[voice]\nkind = \"http\"\nendpoint = \"http://stt.example/stt\"\n",
+                true,
+            ),
+            (
+                "[voice]\nkind = \"command\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://stt.example/stt\"\n",
+                true,
+            ),
+        ] {
+            let errors = validate_str(body);
+            assert_eq!(errors.is_empty(), accepted, "{body}: {errors:?}");
+            if !accepted {
+                assert!(errors[0].contains("use https"), "{errors:?}");
+            }
+        }
+    }
 
     #[allow(dead_code)]
     #[derive(schemars::JsonSchema)]

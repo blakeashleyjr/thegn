@@ -1,0 +1,13 @@
+{
+  "capture": "default Linux input; RAM only; samples discarded; no transcription or network",
+  "requested_stop_after_ms": 250,
+  "elapsed_ms": 262,
+  "exit": 0,
+  "sample_rate": 16000,
+  "channels": 1,
+  "sample_width": 2,
+  "frames": 2560,
+  "audio_ms": 160,
+  "capture_succeeded": true,
+  "worker_reaped": true
+}
