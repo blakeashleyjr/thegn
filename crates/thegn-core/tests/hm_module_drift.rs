@@ -38,7 +38,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("git_commands", "custom git commands are not exposed"),
     ("plugins", "plugin configuration is not exposed"),
     ("forges", "forge connections are not exposed"),
-    ("ui", "UI behavior is not exposed"),
     ("git", "Git behavior is not exposed"),
     ("editor", "editor integration is not exposed"),
     ("stats", "resource sampling is not exposed"),
@@ -114,6 +113,14 @@ const OMITTED: &[(&str, &str)] = &[
     ),
     ("theme.colors", "surface palette overrides are not exposed"),
     ("theme.hues", "semantic hue overrides are not exposed"),
+    (
+        "ui.sidebar_width",
+        "sidebar width needs optional-number range pinning and is not exposed",
+    ),
+    (
+        "ui.sidebar_wide_ratio",
+        "sidebar wide-expand ratio needs optional-number range pinning and is not exposed",
+    ),
     (
         "monitor.window_ladder",
         "monitor graph windows are not exposed",
@@ -549,7 +556,15 @@ fn every_schema_key_is_rendered_or_dispositioned() {
     }
 
     let required = common::required();
-    for section in ["theme", "monitor", "pr", "watch", "log", "sandbox.remote"] {
+    for section in [
+        "theme",
+        "ui",
+        "monitor",
+        "pr",
+        "watch",
+        "log",
+        "sandbox.remote",
+    ] {
         for (schema_section, key) in &required.keys {
             let path = if schema_section.is_empty() {
                 key.clone()
@@ -628,6 +643,55 @@ fn hm_theme_enum_options_offer_only_canonical_spellings() {
         ("themeAgentGlyphs", "theme.agent_glyphs"),
         ("themeMascot", "theme.mascot"),
         ("themeMascotMotion", "theme.mascot_motion"),
+    ];
+    let enums = enum_lists(&module_src());
+    for (option, path) in expected {
+        let values = enums
+            .iter()
+            .find(|(name, _)| name == option)
+            .map(|(_, values)| values)
+            .unwrap_or_else(|| panic!("Home Manager enum option `{option}` is missing"));
+        let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+        let schema = schema_field(path);
+        let canonical: BTreeSet<&str> = schema["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("destination `{path}` has no enum"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            actual, canonical,
+            "Home Manager enum option `{option}` must expose exactly canonical values for `{path}`"
+        );
+    }
+}
+
+#[test]
+fn hm_ui_family_is_fully_rendered() {
+    let ui = schema_field("ui");
+    let properties = ui["properties"].as_object().expect("ui schema properties");
+    let rendered = rendered_paths(&module_src());
+    let mut missing: Vec<String> = properties
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "sidebar_width" | "sidebar_wide_ratio"))
+        .filter_map(|key| {
+            let path = format!("ui.{key}");
+            (!rendered.contains(&path)).then_some(path)
+        })
+        .collect();
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "Home Manager must render every exposed UI scalar; missing: {missing:?}"
+    );
+}
+
+#[test]
+fn hm_ui_enum_options_offer_only_canonical_spellings() {
+    let expected = [
+        ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
+        ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
+        ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
     ];
     let enums = enum_lists(&module_src());
     for (option, path) in expected {
@@ -846,6 +910,9 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("themeAgentGlyphs", "theme.agent_glyphs"),
         ("themeMascot", "theme.mascot"),
         ("themeMascotMotion", "theme.mascot_motion"),
+        ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
+        ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
+        ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();
