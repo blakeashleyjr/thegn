@@ -306,7 +306,11 @@ Background log ingestion reuses a cached job log as evidence only when it
 was fetched for the worktree's current provider context
 (`<system>:<host>/<project>`). CI autofix records that context with each claim,
 so a failure under another project is a new candidate; claims without a
-recorded context never re-fire.
+recorded context never re-fire. When a person authorizes a suggested CI fix,
+the worktree's current provider context is checked again before any claim or
+agent start. A mismatch starts nothing and records one `needs_human`
+notification per candidate; autofix mode `off` stays silent. An unknown
+current context matches only a cached log whose context is also unknown.
 
 #### CI log retention and privacy
 
@@ -378,6 +382,11 @@ Compiler/linter/test diagnostics, collected from two sources: parsed
 output of tasks you run in **jobs**, and language-server pushes for the
 files you touch. Only the active worktree's diagnostics are shown — other
 projects' problems never bleed in. `↵` opens the editor at file:line.
+The Problems list also shows a warning for each active-worktree language server
+backing off after a failed start: `LSP server <name> failed to start (N
+failure(s)); retrying in Ns` (`lsp:health`). Rows are bounded by the per-root
+server cap and refresh with the model swap; they clear when backoff ends and
+the server starts.
 
 {{keys:problems}}
 
