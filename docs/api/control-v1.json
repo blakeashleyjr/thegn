@@ -404,6 +404,13 @@
         "redacted": {
           "type": "boolean"
         },
+        "redaction_changed": {
+          "description": "Whether the redactor changed the served entry text: Some(true) when redactor output is present, Some(false) when it found nothing to change, null for a row cached before schema v103. Metadata only, not proof that every secret shape was recognised.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "run_id": {
           "type": "string"
         },
