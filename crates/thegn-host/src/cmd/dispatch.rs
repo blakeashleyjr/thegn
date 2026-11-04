@@ -118,7 +118,7 @@ pub enum Action {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why`.
@@ -197,7 +197,7 @@ pub enum Action {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why` on the row.
@@ -270,7 +270,7 @@ pub enum Action {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
-        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        /// Required with `--lease`; use the generation printed by `dispatch lease acquire`.
         #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
         lease_gen: Option<i64>,
         /// Manual roster administration: skip the lease check and record `--why` on the row.
