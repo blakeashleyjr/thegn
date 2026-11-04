@@ -300,6 +300,10 @@ pub enum Action {
     MediaSelectPlayer,
     /// Toggle command-backed voice capture for the focused pane.
     VoiceToggle,
+    /// Open recovery for unsent plugin app drafts.
+    PluginAppDrafts,
+    /// Open recovery for plugin app requests with unknown outcomes.
+    PluginAppRequests,
     /// Cancel voice capture or an in-flight transcription.
     VoiceCancel,
     /// Toggle do-not-disturb (quiet notifications) on/off (item 426).
@@ -538,6 +542,11 @@ pub fn chord_hint_for_mode(
 }
 
 impl Action {
+    /// Whether this action is only dispatched inside a plugin app tab.
+    pub(crate) fn is_app_scoped(&self) -> bool {
+        matches!(self, Action::PluginAppDrafts | Action::PluginAppRequests)
+    }
+
     /// Stable key (matches the palette item keys, so a palette selection and a
     /// keybinding resolve to the same dispatch). Exercised by tests; the unified
     /// dispatch table consumes it as palette actions are wired.
@@ -685,6 +694,8 @@ impl Action {
             Action::MediaSelectPlaylist => "media-select-playlist",
             Action::MediaSelectPlayer => "media-select-player",
             Action::VoiceToggle => "voice-toggle",
+            Action::PluginAppDrafts => crate::apps::plugin::PLUGIN_APP_DRAFTS,
+            Action::PluginAppRequests => crate::apps::plugin::PLUGIN_APP_REQUESTS,
             Action::VoiceCancel => "voice-cancel",
             Action::NotifyDndToggle => "notify-dnd-toggle",
             Action::NotifyModeCycle => "notify-mode-cycle",
@@ -840,6 +851,8 @@ impl Action {
             "media-select-playlist" | "media-playlist" => Action::MediaSelectPlaylist,
             "media-select-player" | "media-player" => Action::MediaSelectPlayer,
             "voice-toggle" | "voice" => Action::VoiceToggle,
+            "plugin-app-drafts" => Action::PluginAppDrafts,
+            "plugin-app-requests" => Action::PluginAppRequests,
             "voice-cancel" | "voice-stop" => Action::VoiceCancel,
             "notify-dnd-toggle" | "dnd" | "dnd-toggle" => Action::NotifyDndToggle,
             "notify-mode-cycle" | "notify-mode" => Action::NotifyModeCycle,
@@ -1075,6 +1088,9 @@ fn parse_composite(
 
 pub struct KeyMap {
     modes: std::collections::HashMap<Mode, SequenceMatcher>,
+    app_only: std::collections::HashMap<Mode, SequenceMatcher>,
+    app_modes: std::collections::HashMap<Mode, SequenceMatcher>,
+    app_context: Option<(Mode, String, bool)>,
     custom_actions: Vec<HostCustomAction>,
     config: thegn_core::config::Config,
     /// Per-program host-action overlay: `program → [(single chord, Action)]`.
@@ -1095,6 +1111,9 @@ impl KeyMap {
     pub fn with_config(config: thegn_core::config::Config) -> Self {
         Self {
             modes: std::collections::HashMap::new(),
+            app_only: std::collections::HashMap::new(),
+            app_modes: std::collections::HashMap::new(),
+            app_context: None,
             custom_actions: Vec::new(),
             config,
             program_overlays: std::collections::HashMap::new(),
@@ -1108,8 +1127,8 @@ impl KeyMap {
         self.program_overlays
             .get(program)?
             .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, a)| a.clone())
+            .find(|(k, action)| k == key && !action.is_app_scoped())
+            .map(|(_, action)| action.clone())
     }
 
     /// The keys a focused `program` remaps a single `key` to, if any
@@ -1134,8 +1153,13 @@ impl KeyMap {
 
     #[allow(clippy::unwrap_or_default)]
     pub fn insert_keys(&mut self, mode: Mode, keys: Vec<Key>, action: Action) {
-        self.modes
-            .entry(mode)
+        self.app_modes.remove(&mode);
+        let map = if action.is_app_scoped() {
+            &mut self.app_only
+        } else {
+            &mut self.modes
+        };
+        map.entry(mode)
             .or_insert_with(SequenceMatcher::new)
             .add_sequence(keys, action);
     }
@@ -1149,7 +1173,11 @@ impl KeyMap {
     }
 
     pub fn remove(&mut self, mode: Mode, action: &Action) {
+        self.app_modes.remove(&mode);
         if let Some(m) = self.modes.get_mut(&mode) {
+            m.remove_action(action);
+        }
+        if let Some(m) = self.app_only.get_mut(&mode) {
             m.remove_action(action);
         }
     }
@@ -1169,9 +1197,92 @@ impl KeyMap {
     }
 
     pub fn reset(&mut self) {
-        for matcher in self.modes.values_mut() {
+        for matcher in self
+            .modes
+            .values_mut()
+            .chain(self.app_only.values_mut())
+            .chain(self.app_modes.values_mut())
+        {
             matcher.reset();
         }
+    }
+
+    pub(crate) fn sync_app_context(&mut self, mode: Mode, id: &str, modal: bool) {
+        if self
+            .app_context
+            .as_ref()
+            .is_none_or(|(m, old_id, old_modal)| *m != mode || old_id != id || *old_modal != modal)
+        {
+            for matcher in self.app_modes.values_mut() {
+                matcher.reset();
+            }
+            self.app_context = Some((mode, id.to_owned(), modal));
+        }
+    }
+
+    fn app_action(&self, mode: Mode, key: &Key) -> Option<Action> {
+        if !key
+            .mods
+            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+            && !matches!(key.code, KeyCode::Function(_))
+        {
+            return None;
+        }
+        let mut matcher = self.modes.get(&mode)?.clone();
+        matcher.reset();
+        match matcher.feed(key.clone()) {
+            MatchResult::Matched(
+                action @ (Action::Quit
+                | Action::Detach
+                | Action::QuitKill
+                | Action::OpenPalette
+                | Action::Help
+                | Action::PluginAppDrafts
+                | Action::PluginAppRequests),
+            ) => Some(action),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn dispatch_app(&mut self, mode: Mode, key: Key) -> MatchResult {
+        if let Some(action) = self.app_action(mode, &key) {
+            for matcher in self.app_modes.values_mut() {
+                matcher.reset();
+            }
+            return MatchResult::Matched(action);
+        }
+        if !self.app_modes.contains_key(&mode) {
+            let mut matcher = self
+                .modes
+                .get(&mode)
+                .map_or_else(SequenceMatcher::new, |m| {
+                    m.filtered(|keys, action| {
+                        matches!(
+                            action,
+                            Action::Quit
+                                | Action::Detach
+                                | Action::QuitKill
+                                | Action::OpenPalette
+                                | Action::Help
+                        ) && keys.first().is_some_and(|first| {
+                            first
+                                .mods
+                                .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                                || matches!(first.code, KeyCode::Function(_))
+                        })
+                    })
+                });
+            if let Some(app_only) = self.app_only.get(&mode) {
+                for (keys, action) in app_only.entries() {
+                    matcher.add_sequence(keys.clone(), action.clone());
+                }
+            }
+            self.app_modes.insert(mode, matcher);
+        }
+        self.app_modes
+            .get_mut(&mode)
+            .expect("app matcher initialized")
+            .feed(key)
     }
 
     /// Next-key candidates for the pending prefix in `mode` (drives which-key).
@@ -1320,6 +1431,8 @@ pub fn default_keymap() -> KeyMap {
     // Global defaults: work in every host mode, so Vim/Emacs modes never trap
     // users away from workspace/pane management.
     map.insert_all("Ctrl q", Action::Quit).unwrap();
+    map.insert_all("F2", Action::PluginAppDrafts).unwrap();
+    map.insert_all("F3", Action::PluginAppRequests).unwrap();
     // Palette lives on Ctrl+Space (Ctrl+k is a focus move; see below).
     map.insert_all("Ctrl Space", Action::OpenPalette).unwrap();
     // The launch menu: presets + agents + tools + shell into the active worktree.
@@ -1735,6 +1848,9 @@ pub fn default_keymap_for(
                 ));
                 continue;
             };
+            if action.is_app_scoped() {
+                continue;
+            }
             match single_key(chord) {
                 Ok(key) => {
                     map.program_overlays
@@ -3069,5 +3185,96 @@ mod tests {
             }
             other => panic!("expected NewPane composite, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod app_keys_tests {
+    use super::*;
+    use termwiz::input::{KeyCode, Modifiers};
+
+    #[test]
+    fn app_scoped_actions_never_match_in_normal_dispatch() {
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::from_code(KeyCode::Function(2))),
+            MatchResult::None
+        );
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::from_code(KeyCode::Function(3))),
+            MatchResult::None
+        );
+    }
+
+    #[test]
+    fn app_scoped_actions_match_in_app_dispatch() {
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch_app(Mode::Normal, Key::from_code(KeyCode::Function(2))),
+            MatchResult::Matched(Action::PluginAppDrafts)
+        );
+        assert_eq!(
+            map.dispatch_app(Mode::Normal, Key::from_code(KeyCode::Function(3))),
+            MatchResult::Matched(Action::PluginAppRequests)
+        );
+    }
+
+    #[test]
+    fn rebinding_quit_moves_the_essential_chord() {
+        let mut map = KeyMap::new();
+        map.insert(Mode::Normal, "Ctrl x Ctrl c", Action::Quit)
+            .unwrap();
+        assert_eq!(
+            map.dispatch_app(Mode::Normal, Key::ctrl('q')),
+            MatchResult::None
+        );
+        assert_eq!(
+            map.dispatch_app(Mode::Normal, Key::ctrl('x')),
+            MatchResult::Pending
+        );
+        assert_eq!(
+            map.dispatch_app(Mode::Normal, Key::ctrl('c')),
+            MatchResult::Matched(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn unbound_ctrl_q_is_not_hard_coded() {
+        let mut map = KeyMap::new();
+        assert_eq!(
+            map.dispatch_app(Mode::Normal, Key::ctrl('q')),
+            MatchResult::None
+        );
+    }
+
+    #[test]
+    fn rebinding_drafts_to_alt_d_works() {
+        let mut map = KeyMap::new();
+        map.insert(Mode::Normal, "Alt d", Action::PluginAppDrafts)
+            .unwrap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('d'), Modifiers::ALT)
+            ),
+            MatchResult::None
+        );
+        assert_eq!(
+            map.dispatch_app(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('d'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::PluginAppDrafts)
+        );
+    }
+
+    #[test]
+    fn printable_prefixes_stay_with_the_app() {
+        let mut map = KeyMap::new();
+        map.insert(Mode::Normal, "g g", Action::Quit).unwrap();
+        assert_eq!(
+            map.dispatch_app(Mode::Normal, Key::char('g')),
+            MatchResult::None
+        );
     }
 }

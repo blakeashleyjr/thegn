@@ -220,6 +220,12 @@ the plugin runtime (`openspec/specs/plugin-runtime`): loader (`[[plugins]]`
   joins every `IssueRouter` beside configured accounts. Nothing plugin-side
   ever touches the idle loop (channel + waker, like every producer).
 
+Plugin app tabs use the adapter in `apps/plugin.rs` and loop glue in
+`handlers/plugin_apps.rs`. Reliable app requests are keyed by the resident
+`SessionGen`, so responses from an old process cannot complete a new session's
+request. Their deadlines are folded into the poll timeout only while a request
+is pending; an idle app adds no timer or wake source.
+
 Resident process ownership lives in `thegn-svc::plugin::session`; platform I/O
 and child identity operations are confined to `plugin/platform/`. That narrow
 service-owned seam is excluded from the platform-cfg ratchet because the host

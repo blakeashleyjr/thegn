@@ -43,8 +43,12 @@
 
 ## 7. Keymap + run loop + help + idle proof
 
-- [ ] 7.1 Actions `plugin-app-drafts` / `plugin-app-requests`.
-- [ ] 7.2 `handlers/plugin_apps.rs` glue + run.rs hooks.
-- [ ] 7.3 Help pages + CHANGELOG + ARCHITECTURE.
-- [ ] 7.4 Idle test.
+- [x] 7.1 Actions `plugin-app-drafts` / `plugin-app-requests`.
+      Evidence: `keymap::app_keys_tests::app_scoped_actions_match_in_app_dispatch`.
+- [x] 7.2 `handlers/plugin_apps.rs` glue + run.rs hooks.
+      Evidence: `handlers::plugin_apps::sync` and the `run.rs` poll hook.
+- [x] 7.3 Help pages + CHANGELOG + ARCHITECTURE.
+      Evidence: `docs/help/plugins.md` App tabs section.
+- [x] 7.4 Idle test.
+      Evidence: `handlers::plugin_apps::tests::idle_plugin_app_adds_no_timer_and_no_wake`.
 - [ ] 7.5 Final gates (`just ci` once, primary).
