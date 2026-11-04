@@ -158,6 +158,14 @@ impl ControlStore for Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    fn daemons_in_scope(&self, scope: &str) -> Result<Vec<DaemonRow>> {
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT {DAEMON_COLS} FROM daemons WHERE scope = ?1 ORDER BY started_at"
+        ))?;
+        let rows = stmt.query_map(params![scope], daemon_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn del_daemon(&self, daemon_id: &str) -> Result<()> {
         self.conn().execute(
             "DELETE FROM daemons WHERE daemon_id = ?1",
@@ -596,6 +604,40 @@ mod tests {
         db.revoke_pairing("tok-p", 10_000).unwrap();
         db.approve_pairing("tok-p", 11_000).unwrap();
         assert!(db.pairing_for_auth("tok-p", 12_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn daemons_in_scope_returns_only_that_scope_among_thousands() {
+        let db = Db::open_memory().unwrap();
+        db.conn().execute_batch("BEGIN").unwrap();
+        for n in 0..5_000 {
+            db.put_daemon(&daemon(&format!("o{n}"), &format!("/other/{n}"), 1))
+                .unwrap();
+        }
+        db.put_daemon(&daemon("a1", "/mine", 1)).unwrap();
+        db.put_daemon(&daemon("a2", "/mine", 2)).unwrap();
+        db.conn().execute_batch("COMMIT").unwrap();
+
+        let mut ids = db
+            .daemons_in_scope("/mine")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.daemon_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["a1".to_string(), "a2".to_string()]);
+        assert!(db.daemons_in_scope("/absent").unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemons_in_scope_includes_stale_heartbeats() {
+        let db = Db::open_memory().unwrap();
+        db.put_daemon(&daemon("stale", "/mine", 0)).unwrap();
+
+        let rows = db.daemons_in_scope("/mine").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].daemon_id, "stale");
+        assert_eq!(rows[0].heartbeat_at, 0);
     }
 
     #[test]
