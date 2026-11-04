@@ -559,6 +559,9 @@ pub struct CiLogsReply {
     pub fetched_at: i64,
     pub truncated: bool,
     pub redacted: bool,
+    /// Whether the redactor changed the served entry text: Some(true) when redactor output is present, Some(false) when it found nothing to change, null for a row cached before schema v103. Metadata only, not proof that every secret shape was recognised.
+    #[serde(default)]
+    pub redaction_changed: Option<bool>,
     /// Provider-fill problems with the run detail (unavailable, incomplete job list, unlisted job); empty on cache hits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
