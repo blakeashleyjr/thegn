@@ -5666,7 +5666,7 @@ mod tests {
     async fn dispatch_set_status_door_matches_the_transition_table_for_every_pair() {
         use thegn_core::issue::AgentDispatchStatus as St;
 
-        let (svc, _rx) = service(0);
+        let (mut svc, _rx) = service(0);
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("dispatch-door.sqlite");
         svc.db = Arc::new(Mutex::new(Db::open_at(&db_path).unwrap()));
