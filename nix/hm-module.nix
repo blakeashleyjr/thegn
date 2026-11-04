@@ -267,6 +267,14 @@ self: {
     palette.file_max_results = cfg.paletteFileMaxResults;
     palette.symbol_max_results = cfg.paletteSymbolMaxResults;
     palette.content_search_hidden = cfg.paletteContentSearchHidden;
+    session.scrollback_lines = cfg.sessionScrollbackLines;
+    session.restore_grace_secs = cfg.sessionRestoreGraceSecs;
+    session.focus_on_create = cfg.sessionFocusOnCreate;
+    session.resident_pool_limit = cfg.sessionResidentPoolLimit;
+    clipboard.image_paste = cfg.clipboardImagePaste;
+    clipboard.max_image_bytes = cfg.clipboardMaxImageBytes;
+    clipboard.remote_dir = cfg.clipboardRemoteDir;
+    clipboard.keep_hours = cfg.clipboardKeepHours;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -634,6 +642,55 @@ in {
       type = lib.types.nullOr (lib.types.bool);
       default = null;
       description = "Include hidden and ignored files in the file index. Unset (null) = the binary's default.";
+    };
+
+    sessionScrollbackLines = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.u32);
+      default = null;
+      description = "Maximum plain-text scrollback lines captured per pane on snapshot and repainted on restore; 0 disables capture. Unset (null) = the binary's default.";
+    };
+
+    sessionRestoreGraceSecs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 315360000);
+      default = null;
+      description = "Restore-time grace (seconds) after which a persisted active or running activity dot is downgraded to a settled state. Unset (null) = the binary's default.";
+    };
+
+    sessionFocusOnCreate = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether creating a worktree jumps to its new tab instead of opening it in the background. Unset (null) = the binary's default.";
+    };
+
+    sessionResidentPoolLimit = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum parked workspaces kept resident for instant switch-back; 0 reaps panes on every switch. Unset (null) = the binary's default.";
+    };
+
+    clipboardImagePaste = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Master switch for clipboard image paste; text paste is unaffected. Unset (null) = the binary's default.";
+    };
+
+    clipboardMaxImageBytes = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Refuse a clipboard image larger than this many bytes (0 restores the default). Unset (null) = the binary's default.";
+    };
+
+    clipboardRemoteDir = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      example = "~/.cache/thegn/paste";
+      description = "Remote drop directory for pasted images (a leading ~ is expanded through the remote $HOME). Unset (null) = the binary's default.";
+    };
+
+    clipboardKeepHours = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Age in hours past which a pasted-image drop file is swept on the next paste. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {
