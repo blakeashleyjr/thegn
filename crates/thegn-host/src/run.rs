@@ -12634,6 +12634,10 @@ async fn event_loop<T: Terminal>(
                 });
             }
             let swapped_root = active_tab_path(&session);
+            // A busy map lock keeps the last-shown backing-off list (never block the loop here).
+            if let Some(failed) = lsp_supervisor.handle().failed_servers(&swapped_root) {
+                lsp_diags.set_failed_servers(&swapped_root, failed);
+            }
             lsp_diags.merge_into(&swapped_root, &mut model.panel.diagnostics);
             lsp_visible.rebuilt(&swapped_root);
             // Shares live on the supervisor (loop-local), not in hydration; a
