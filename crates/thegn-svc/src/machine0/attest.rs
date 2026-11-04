@@ -85,7 +85,8 @@ pub fn store_in(root: &Path, record: &Attestation) -> anyhow::Result<()> {
     let dir = dir_in(root);
     thegn_core::fsperm::ensure_private_dir(&dir)?;
     let bytes = serde_json::to_vec(record)?;
-    thegn_core::fsperm::write_owner_only_atomic(&dir.join(format!("{name}.json")), &bytes)?;
+    thegn_core::fsperm::open_private_dir(&dir)?
+        .write_owner_only_atomic(&format!("{name}.json"), &bytes)?;
     Ok(())
 }
 
@@ -192,5 +193,28 @@ mod tests {
         remove_in(root.path(), "dev").unwrap();
         remove_in(root.path(), "dev").unwrap();
         assert!(load_in(root.path(), "dev").is_none());
+    }
+
+    #[test]
+    fn store_replaces_an_existing_record_and_leaves_no_temporary() {
+        // Positive control: this behavior also holds with the path writer at the base.
+        let root = tempfile::tempdir().unwrap();
+        let first = sample();
+        store_in(root.path(), &first).unwrap();
+        let mut second = first;
+        second.attested_at += 1;
+
+        store_in(root.path(), &second).unwrap();
+
+        assert_eq!(load_in(root.path(), "dev"), Some(second));
+        let dir = dir_in(root.path());
+        let mode = thegn_core::fsperm::mode_bits(&dir).unwrap();
+        assert!(mode.is_none_or(|bits| bits == 0o700));
+        let entries = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], std::ffi::OsString::from("dev.json"));
     }
 }
