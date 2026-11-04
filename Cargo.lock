@@ -3448,6 +3448,7 @@ dependencies = [
 name = "gtui-render"
 version = "0.1.0-alpha.49"
 dependencies = [
+ "criterion",
  "gtui-core",
  "ratatui",
 ]
