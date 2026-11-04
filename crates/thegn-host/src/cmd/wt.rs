@@ -1170,15 +1170,24 @@ fn base_has_commits(root: &std::path::Path, base: &str) -> Result<bool> {
     let loc = thegn_core::remote::GitLoc::Local(root.to_path_buf());
     match loc.git_text(&["rev-parse", "--verify", "--quiet", base]) {
         Ok(_) => Ok(true),
-        Err(thegn_core::git_run::GitTextError::Failed(thegn_core::git_run::GitOutcome::Exit {
-            code: Some(1),
-            ..
-        })) => Ok(false),
+        Err(error) if base_is_absent(&error) => Ok(false),
         Err(error) => Err(anyhow::anyhow!(
             "could not verify base '{base}' in {}: {error}",
             root.display()
         )),
     }
+}
+
+fn base_is_absent(error: &thegn_core::git_run::GitTextError) -> bool {
+    matches!(
+        error,
+        thegn_core::git_run::GitTextError::Failed(
+            thegn_core::git_run::GitOutcome::Exit {
+                code: Some(1),
+                stderr_tail,
+            }
+        ) if stderr_tail.is_empty()
+    )
 }
 
 /// The live branch of an unregistered linked worktree addressed by path. Without `--delete-branch` the
@@ -1504,6 +1513,20 @@ mod rm_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("could not verify base 'main'"), "{err}");
+    }
+
+    #[test]
+    fn base_has_commits_requires_empty_stderr_for_missing_base() {
+        use thegn_core::git_run::{GitOutcome, GitTextError};
+
+        assert!(base_is_absent(&GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail: String::new(),
+        })));
+        assert!(!base_is_absent(&GitTextError::Failed(GitOutcome::Exit {
+            code: Some(1),
+            stderr_tail: "repository error".to_string(),
+        })));
     }
 
     #[test]
