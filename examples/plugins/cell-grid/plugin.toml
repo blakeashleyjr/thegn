@@ -1,0 +1,15 @@
+# The manifest for examples/plugins/cell-grid/grid.py: a resident app tab whose body is one typed `grid` widget.
+# Copy this directory into `<config_dir>/plugins/` to try it; `thegn plugin list` should then show it.
+id = "cell-grid"
+name = "Plugin cell-grid example"
+version = "0.1.0"
+api = "0.4.0"
+command = ["python3", "grid.py"]
+mode = "resident"
+capabilities = ["surface:app"]
+
+[[contributions]]
+id = "demo"
+extension_point = "AppTab"
+label = "Cell grid"
+surface = "cell-grid.demo"
