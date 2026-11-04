@@ -803,7 +803,7 @@ fn refusal_is_identical_for_every_placement_and_builds_no_argv() {
         match &error {
             EnterError::Refused(refusal) => {
                 assert_eq!(refusal.class, RefusalClass::ComposePolicy);
-                assert_eq!(refusal.backend, "podman");
+                assert_eq!(refusal.backend, "podman-rootless");
                 assert!(refusal.path.is_none());
                 assert_eq!(error.to_string(), refusal.message);
                 messages.push(refusal.message.clone());
