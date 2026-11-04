@@ -168,6 +168,14 @@ a misconfigured value cannot poll a provider in a tight loop.
 - **WHEN** an account configures a refresh interval below the minimum
 - **THEN** the minimum is used
 
+#### Scenario: A configured credential cannot be resolved
+
+- **WHEN** an account configures a `token` reference that does not resolve
+  (unset environment variable, missing or unreadable file, unavailable keyring)
+- **THEN** that account fails with a redacted account error before any network
+  request, other accounts are unaffected, and an account with no `token` at all
+  still fetches without an `Authorization` header
+
 ### Requirement: Source admission is a bounded, all-or-nothing budget
 
 Every calendar backend SHALL be constructed with a typed, nonzero per-account

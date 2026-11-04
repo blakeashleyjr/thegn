@@ -134,40 +134,56 @@ fn set(name: &str) -> Result<()> {
 fn list(cfg: &Config, json: bool) -> Result<()> {
     let refs = secret_scan::secret_refs(cfg);
     if json {
-        let rows: Vec<_> = refs
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "path": f.path,
-                    "backend": f.reference.backend_kind(),
-                    "consumer": f.consumer,
-                    "name": f.reference.audit_name(),
-                    "present": secret::present(&f.reference),
-                })
-            })
-            .collect();
         // The `--json` convention: one compact document via `emit_json`.
-        return crate::cmd::emit_json(&rows);
+        return crate::cmd::emit_json(&ref_rows_json(&refs, &secret::present));
     }
     if refs.is_empty() {
         outln!("no secret refs configured");
         return Ok(());
     }
-    for f in &refs {
-        let present = if secret::present(&f.reference) {
-            "resolves"
-        } else {
-            "missing"
-        };
-        outln!(
-            "{:<48} {:<8} {:<10} {}",
-            f.path,
-            f.reference.backend_kind(),
-            present,
-            f.reference.audit_name()
-        );
+    for line in ref_rows_text(&refs, &secret::present) {
+        outln!("{line}");
     }
     Ok(())
+}
+
+fn ref_rows_json(
+    refs: &[secret_scan::SecretFieldRef],
+    present: &dyn Fn(&SecretRef) -> bool,
+) -> Vec<serde_json::Value> {
+    refs.iter()
+        .map(|field| {
+            serde_json::json!({
+                "path": field.path,
+                "backend": field.reference.backend_kind(),
+                "consumer": field.consumer,
+                "name": field.reference.audit_name(),
+                "present": present(&field.reference),
+            })
+        })
+        .collect()
+}
+
+fn ref_rows_text(
+    refs: &[secret_scan::SecretFieldRef],
+    present: &dyn Fn(&SecretRef) -> bool,
+) -> Vec<String> {
+    refs.iter()
+        .map(|field| {
+            let present_word = if present(&field.reference) {
+                "resolves"
+            } else {
+                "missing"
+            };
+            format!(
+                "{:<48} {:<8} {:<10} {}",
+                field.path,
+                field.reference.backend_kind(),
+                present_word,
+                field.reference.audit_name()
+            )
+        })
+        .collect()
 }
 
 /// Value-free audit view: configured refs plus the exact managed SSH key
@@ -177,18 +193,7 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
     let managed =
         thegn_core::managed_ssh::list().context("read complete managed SSH custody inventory")?;
     if json {
-        let secret_rows: Vec<_> = refs
-            .iter()
-            .map(|field| {
-                serde_json::json!({
-                    "path": field.path,
-                    "backend": field.reference.backend_kind(),
-                    "consumer": field.consumer,
-                    "name": field.reference.audit_name(),
-                    "present": secret::present(&field.reference),
-                })
-            })
-            .collect();
+        let secret_rows = ref_rows_json(&refs, &secret::present);
         let key_rows: Vec<_> = managed
             .iter()
             .map(|record| {
@@ -444,8 +449,86 @@ fn ssh_rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::migrate_calendar_tokens;
+    use super::{migrate_calendar_tokens, ref_rows_json, ref_rows_text};
     use thegn_core::config::Config;
+    use thegn_core::secret_scan;
+
+    fn calendar_config_with_literal_and_env_tokens() -> Config {
+        toml::from_str(
+            "[[calendar.accounts]]\nname = \"work\"\nprovider = \"ics_url\"\nurl = \"https://example.test/work.ics\"\ntoken = \"cal-cli-sentinel-71aa\"\n\n[[calendar.accounts]]\nname = \"dav\"\nprovider = \"ics_url\"\ntoken = \"env:TG_B86_CAL_CLI\"\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn secret_list_rows_never_carry_a_calendar_literal_token() {
+        let cfg = calendar_config_with_literal_and_env_tokens();
+        let refs: Vec<_> = secret_scan::secret_refs(&cfg)
+            .into_iter()
+            .filter(|field| field.path.starts_with("calendar.accounts["))
+            .collect();
+        let json = ref_rows_json(&refs, &|_| true);
+        let text = ref_rows_text(&refs, &|_| true).join("\n");
+
+        assert!(
+            json.iter()
+                .all(|row| !row.to_string().contains("cal-cli-sentinel-71aa"))
+        );
+        assert!(!text.contains("cal-cli-sentinel-71aa"), "{text}");
+        for path in [
+            "calendar.accounts[work].token",
+            "calendar.accounts[dav].token",
+        ] {
+            assert!(json.iter().any(|row| row["path"] == path), "{json:?}");
+            assert!(text.contains(path), "{text}");
+        }
+        let work = json
+            .iter()
+            .find(|row| row["path"] == "calendar.accounts[work].token")
+            .unwrap();
+        let dav = json
+            .iter()
+            .find(|row| row["path"] == "calendar.accounts[dav].token")
+            .unwrap();
+        assert_eq!(work["consumer"], "calendar:work");
+        assert_eq!(work["name"], "literal:***redacted***");
+        assert_eq!(dav["name"], "env:TG_B86_CAL_CLI");
+        assert!(text.contains("literal:***redacted***"), "{text}");
+    }
+
+    #[test]
+    fn secret_list_rows_report_presence_from_the_probe() {
+        let cfg = calendar_config_with_literal_and_env_tokens();
+        let refs: Vec<_> = secret_scan::secret_refs(&cfg)
+            .into_iter()
+            .filter(|field| field.path.starts_with("calendar.accounts["))
+            .collect();
+        let json = ref_rows_json(&refs, &|reference| reference.backend_kind() == "env");
+        let text = ref_rows_text(&refs, &|reference| reference.backend_kind() == "env");
+        let work = json
+            .iter()
+            .find(|row| row["path"] == "calendar.accounts[work].token")
+            .unwrap();
+        let dav = json
+            .iter()
+            .find(|row| row["path"] == "calendar.accounts[dav].token")
+            .unwrap();
+
+        assert!(!work["present"].as_bool().unwrap(), "{work}");
+        assert!(dav["present"].as_bool().unwrap(), "{dav}");
+        assert!(
+            text.iter().any(|line| {
+                line.contains("calendar.accounts[work].token") && line.contains("missing")
+            }),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|line| {
+                line.contains("calendar.accounts[dav].token") && line.contains("resolves")
+            }),
+            "{text:?}"
+        );
+    }
 
     #[test]
     fn calendar_migrate_moves_a_literal_once() {
