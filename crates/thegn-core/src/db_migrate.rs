@@ -2241,6 +2241,28 @@ pub(crate) fn verify_v102_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v103: record the provider attempt and redaction-change metadata for CI logs.
+pub(crate) fn migrate_v103(conn: &Connection) -> Result<()> {
+    for column in ["attempt", "redaction_changed"] {
+        if !has_column(conn, "ci_log_cache", column) {
+            conn.execute(
+                &format!("ALTER TABLE ci_log_cache ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v103_schema(conn: &Connection) -> Result<()> {
+    for column in ["attempt", "redaction_changed"] {
+        if !has_column(conn, "ci_log_cache", column) {
+            bail!("schema v103 migration did not add ci_log_cache.{column}");
+        }
+    }
+    Ok(())
+}
+
 /// Verify the v69 identity ledger before the schema version is stamped. A
 /// missing column/table must never look like a completed migration.
 pub(crate) fn verify_v69_schema(conn: &Connection) -> Result<()> {
@@ -3900,7 +3922,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::db::SCHEMA_VERSION);
-        assert_eq!(version, 102);
         assert_eq!(
             upgraded.linked_issue_refs("/wt/v101").unwrap(),
             vec![("linear:ENG-1".to_string(), None)]
@@ -3912,6 +3933,67 @@ mod tests {
             vec![("linear:ENG-1".to_string(), Some(issue_ref))]
         );
         super::verify_v102_schema(upgraded.conn()).unwrap();
+    }
+
+    #[test]
+    fn v103_adds_ci_log_attempt_and_redaction_changed_idempotently_and_verifies() {
+        let fresh = Db::open_memory().unwrap();
+        super::verify_v103_schema(fresh.conn()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ci_log_cache (worktree TEXT NOT NULL, run_id TEXT NOT NULL,
+             job_id TEXT NOT NULL, job_name TEXT NOT NULL, text TEXT NOT NULL,
+             fetched_at INTEGER NOT NULL, PRIMARY KEY (worktree, run_id, job_id))",
+        )
+        .unwrap();
+        assert!(super::verify_v103_schema(&conn).is_err());
+        super::migrate_v103(&conn).unwrap();
+        super::migrate_v103(&conn).unwrap();
+        super::verify_v103_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn v103_upgrades_a_real_v102_database() {
+        use crate::ci_log::CiLogEntry;
+        use crate::store::CacheStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v102.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            let mut entry = CiLogEntry::new("/wt/v102", "7", "9", "job", "ordinary\n", 20, 1024, 5);
+            entry.head_sha = "sha".into();
+            db.put_ci_log(&entry).unwrap();
+            db.conn()
+                .execute_batch(
+                    "ALTER TABLE ci_log_cache DROP COLUMN attempt;
+                     ALTER TABLE ci_log_cache DROP COLUMN redaction_changed;
+                     PRAGMA user_version=102;",
+                )
+                .unwrap();
+        }
+        let upgraded = Db::open_at(&path).unwrap();
+        let version: i64 = upgraded
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        assert_eq!(version, 103);
+        let legacy = upgraded.get_ci_log("/wt/v102", "7", "9").unwrap().unwrap();
+        assert_eq!(legacy.attempt, None);
+        assert_eq!(legacy.redaction_changed, None);
+        assert_eq!(legacy.text, "ordinary\n");
+        assert_eq!(legacy.head_sha, "sha");
+        let mut current = CiLogEntry::new("/wt/v102", "7", "9", "job", "ordinary\n", 20, 1024, 6);
+        current.head_sha = "sha".into();
+        current.attempt = Some(2);
+        current.redaction_changed = Some(false);
+        upgraded.put_ci_log(&current).unwrap();
+        let stored = upgraded.get_ci_log("/wt/v102", "7", "9").unwrap().unwrap();
+        assert_eq!(stored.attempt, Some(2));
+        assert_eq!(stored.redaction_changed, Some(false));
+        assert_eq!(upgraded.list_ci_logs("/wt/v102").unwrap().len(), 1);
+        super::verify_v103_schema(upgraded.conn()).unwrap();
     }
 
     #[test]

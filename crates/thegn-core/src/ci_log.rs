@@ -46,6 +46,14 @@ pub struct CiLogEntry {
     /// empty when unknown or written before schema v99.
     #[serde(default)]
     pub context: String,
+    /// Provider run attempt the log was captured for; None when unknown or the provider has no attempts.
+    #[serde(default)]
+    pub attempt: Option<u64>,
+    /// Some(true) when redactor output is present in the text, Some(false) when the redactor found
+    /// nothing to change in what it saw, None for rows written before schema v103; metadata only,
+    /// not proof that every secret shape was recognised.
+    #[serde(default)]
+    pub redaction_changed: Option<bool>,
 }
 
 /// The identity used to deduplicate an autofix handoff.
@@ -74,6 +82,7 @@ impl CiLogEntry {
     ) -> Self {
         let redacted_text = redact(text);
         let (bounded, truncated) = bounded_window(&redacted_text, max_lines, max_bytes);
+        let changed = redacted_text != text || text.contains(REDACTION_MARKER);
         Self {
             worktree: worktree.into(),
             run_id: run_id.into(),
@@ -86,6 +95,8 @@ impl CiLogEntry {
             fetched_at,
             head_sha: String::new(),
             context: String::new(),
+            attempt: None,
+            redaction_changed: Some(changed),
         }
     }
 
@@ -93,8 +104,11 @@ impl CiLogEntry {
     /// policy. Entries produced by a newer policy are preserved unchanged.
     pub fn revalidated(mut self) -> Self {
         if self.policy_version < REDACTION_POLICY_VERSION {
-            let (text, truncated) =
-                bounded_tail(&redact(&self.text), HARD_MAX_LOG_LINES, HARD_MAX_LOG_BYTES);
+            let redacted = redact(&self.text);
+            if redacted != self.text {
+                self.redaction_changed = Some(true);
+            }
+            let (text, truncated) = bounded_tail(&redacted, HARD_MAX_LOG_LINES, HARD_MAX_LOG_BYTES);
             self.text = text;
             self.truncated |= truncated;
             self.redacted = true;
@@ -243,6 +257,12 @@ pub fn redact(text: &str) -> String {
         .into_owned()
 }
 
+/// Whether redaction changed the supplied text, including text already
+/// redacted by a streaming provider collector.
+pub fn redaction_changed(raw: &str) -> bool {
+    redact(raw) != raw || raw.contains(REDACTION_MARKER)
+}
+
 /// Redact one complete provider line while preserving PEM framing state across
 /// lines. The caller must bound the line before calling this helper.
 pub fn redact_stream_line(line: &[u8], in_pem: &mut bool) -> String {
@@ -306,6 +326,13 @@ pub fn cached_log_is_evidence_for(
 /// only another unknown (empty) context.
 pub fn cached_log_context_matches(entry: &CiLogEntry, current: Option<&str>) -> bool {
     entry.context == current.unwrap_or("")
+}
+
+/// A log is evidence only for the attempt it was captured for. A provider
+/// attempt never matches an unknown/legacy log, and providers without attempts
+/// match only entries whose attempt is also unknown.
+pub fn cached_log_attempt_matches(entry: &CiLogEntry, run_attempt: Option<u64>) -> bool {
+    entry.attempt == run_attempt
 }
 
 /// Unknown-head log entries may be shown from a provider fetch, but never
@@ -671,6 +698,63 @@ fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_log_attempt_matches_requires_equal_attempts() {
+        let attempt_one = CiLogEntry {
+            attempt: Some(1),
+            ..CiLogEntry::default()
+        };
+        assert!(cached_log_attempt_matches(&attempt_one, Some(1)));
+        assert!(!cached_log_attempt_matches(&attempt_one, Some(2)));
+        assert!(!cached_log_attempt_matches(&attempt_one, None));
+        let unknown = CiLogEntry::default();
+        assert!(cached_log_attempt_matches(&unknown, None));
+        assert!(!cached_log_attempt_matches(&unknown, Some(1)));
+    }
+
+    #[test]
+    fn redaction_changed_reports_redactor_output() {
+        assert!(!redaction_changed("ordinary\n"));
+        assert!(redaction_changed(&format!("token={}\n", "SYNTHETIC")));
+        assert!(redaction_changed(&format!(
+            "{REDACTION_MARKER}\nordinary\n"
+        )));
+    }
+
+    #[test]
+    fn new_entry_records_redaction_changed() {
+        let ordinary = CiLogEntry::new("/wt", "1", "2", "job", "ordinary\n", 10, 1024, 1);
+        assert_eq!(ordinary.redaction_changed, Some(false));
+        assert_eq!(ordinary.attempt, None);
+        let secret = CiLogEntry::new("/wt", "1", "2", "job", "token=SYNTHETIC\n", 10, 1024, 1);
+        assert_eq!(secret.redaction_changed, Some(true));
+    }
+
+    #[test]
+    fn revalidated_marks_redaction_changed_only_when_the_text_changes() {
+        let secret = CiLogEntry {
+            text: "token=SYNTHETIC\n".into(),
+            policy_version: 1,
+            ..CiLogEntry::default()
+        }
+        .revalidated();
+        assert_eq!(secret.redaction_changed, Some(true));
+        let ordinary = CiLogEntry {
+            text: "ordinary\n".into(),
+            policy_version: 1,
+            redaction_changed: None,
+            ..CiLogEntry::default()
+        }
+        .revalidated();
+        assert_eq!(ordinary.redaction_changed, None);
+        let current = CiLogEntry {
+            text: "token=SYNTHETIC\n".into(),
+            policy_version: REDACTION_POLICY_VERSION,
+            ..CiLogEntry::default()
+        };
+        assert_eq!(current.clone().revalidated(), current);
+    }
 
     #[test]
     fn served_window_never_widens_past_the_configured_policy() {

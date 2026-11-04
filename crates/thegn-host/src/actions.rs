@@ -651,6 +651,7 @@ pub(crate) fn spawn_ci_detail(
                     &detail.sha,
                     job.finished_at.as_deref(),
                 ) && crate::ci_refresh::context_row_current(&e.context, context.as_deref())
+                    && thegn_core::ci_log::cached_log_attempt_matches(e, detail.attempt)
             }) {
                 cached
             } else {
@@ -670,6 +671,7 @@ pub(crate) fn spawn_ci_detail(
                     );
                     entry.truncated |= log.truncated;
                     entry.head_sha = detail.sha.clone();
+                    entry.attempt = detail.attempt;
                     entry.context = context.clone().unwrap_or_default();
                     if cfg.log_cache_runs > 0
                         && thegn_core::ci_log::cacheable_log_entry(&entry)
