@@ -324,10 +324,12 @@ from the retained tail and mark it truncated; CRLF endings are preserved, and
 an over-long line is discarded.
 
 Daemon/API `ci.logs` requests for the same worktree, run and job share one
-fetch: concurrent callers wait for the first request, then use its cached log
-instead of starting another provider call. A wait that reaches 120 seconds is
-refused as unavailable (HTTP 503 or gRPC `unavailable`) with a message asking
-you to retry shortly. Different jobs do not wait on one another.
+fetch when `[ci] log_cache_runs` is greater than zero: concurrent callers wait
+for the first request, then use its cached log instead of starting another
+provider call. With caching off, a waiting caller fetches after the first
+request finishes. A wait that reaches 120 seconds is refused as unavailable
+(HTTP 503 or gRPC `unavailable`) with a message asking you to retry shortly.
+Different jobs do not wait on one another.
 
 When a GitLab job list reaches its page, row, byte or time budget (one minute
 for the whole run detail), `thegn ci view` and `ci logs` warn that the list is

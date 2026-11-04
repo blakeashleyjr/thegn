@@ -26,8 +26,10 @@ All notable changes to **thegn** are documented here. The format follows
 - When a pane cannot be daemon-backed and runs in-process, or a saved pane
   session cannot be reattached, thegn posts one notice per kind per run with
   the redacted reason; the reattach log line is redacted too.
-- Daemon `ci.logs` requests for the same run and job share one provider fetch;
-  a request that waits 120 seconds is refused as unavailable.
+- Daemon `ci.logs` requests for the same run and job share one provider fetch
+  when log caching is enabled; with caching off, a waiting request fetches
+  after the first finishes. A request that waits 120 seconds is refused as
+  unavailable.
 - A starting pane daemon reads at most the 256 newest registry rows per state
   directory and sweeps a larger pre-upgrade registry in steps, refusing to
   start with a retry message until it can check all of it.
@@ -49,8 +51,6 @@ All notable changes to **thegn** are documented here. The format follows
 
 - The MCP secret-name index carries a generation checked at publish, so a
   concurrent update is refused instead of overwritten.
-- Hook run logs and managed-tool installer provenance records are written
-  through held, owner-only directory handles.
 
 ## [0.1.0-alpha.50] — 2026-11-04 (maintenance batch 88)
 
