@@ -24,9 +24,7 @@ fn skip() -> bool {
 
 fn force_rm(name: &str) {
     // best-effort: test scratch: best-effort by design
-    let _ = std::process::Command::new("podman")
-        .args(["rm", "-f", name])
-        .output();
+    let _ = bounded_run::output(std::process::Command::new("podman").args(["rm", "-f", name]));
 }
 
 fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {

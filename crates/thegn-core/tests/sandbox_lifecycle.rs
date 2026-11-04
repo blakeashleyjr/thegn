@@ -11,13 +11,19 @@ use thegn_core::sandbox::{
     teardown_by_path,
 };
 
+#[path = "support/bounded_run.rs"]
+mod bounded_run;
+
 fn container_running(name: &str) -> bool {
-    std::process::Command::new("podman")
-        .args(["inspect", "--format", "{{.State.Status}}", name])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "running")
-        .unwrap_or(false)
+    bounded_run::output(std::process::Command::new("podman").args([
+        "inspect",
+        "--format",
+        "{{.State.Status}}",
+        name,
+    ]))
+    .ok()
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "running")
+    .unwrap_or(false)
 }
 
 fn skip() -> bool {
@@ -29,9 +35,7 @@ fn skip() -> bool {
 
 fn force_rm(name: &str) {
     // best-effort: test scratch: best-effort by design
-    let _ = std::process::Command::new("podman")
-        .args(["rm", "-f", name])
-        .output();
+    let _ = bounded_run::output(std::process::Command::new("podman").args(["rm", "-f", name]));
 }
 
 fn alpine_spec(name: &str, worktree: &str) -> SandboxSpec {
