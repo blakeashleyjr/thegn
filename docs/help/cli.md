@@ -100,6 +100,12 @@ and nothing is written to a file instead. `thegn mcp secret set` and `rm`
 update the keyring and MCP secret index under one lock; a corrupt index is
 refused before the keyring is touched.
 
+The index records a generation and checks it again before publishing. If it
+changed concurrently, `set` or `rm` is refused with
+`MCP secret index changed concurrently` rather than overwriting the update.
+An operation that does not change the names leaves the generation alone; an
+older index without a generation is read as generation 0.
+
 The managed file store (the keyring fallback) refuses to read token files
 accessible to other users or with extra hard links. Its message names the file
 and tells you to run `chmod 600` on it, or remove the extra link and store the
@@ -316,6 +322,14 @@ validation reports `ci.log_tail_lines: must be greater than zero` or
 `ci.log_tail_lines: must not exceed 100000`. Invalid UTF-8 lines are dropped
 from the retained tail and mark it truncated; CRLF endings are preserved, and
 an over-long line is discarded.
+
+Daemon/API `ci.logs` requests for the same worktree, run and job share one
+fetch when `[ci] log_cache_runs` is greater than zero: concurrent callers wait
+for the first request, then use its cached log instead of starting another
+provider call. With caching off, a waiting caller fetches after the first
+request finishes. A wait that reaches 120 seconds is refused as unavailable
+(HTTP 503 or gRPC `unavailable`) with a message asking you to retry shortly.
+Different jobs do not wait on one another.
 
 When a GitLab job list reaches its page, row, byte or time budget (one minute
 for the whole run detail), `thegn ci view` and `ci logs` warn that the list is
