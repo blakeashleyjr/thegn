@@ -302,6 +302,9 @@ config is never removed, and a malformed or forged manifest is refused before
 removal. Dry-run prints what would be removed or kept. Pass
 the same bindir used for installation; uninstall cannot be combined with
 `--batteries`.
+On Linux, the installer checks the generated desktop entry's structure and
+runs `desktop-file-validate` when available before publishing it. A rejected
+entry stops installation and restores the previous installation.
 
 ### macOS app launcher
 
