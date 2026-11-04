@@ -719,7 +719,8 @@ fn hm_ui_enum_options_offer_only_canonical_spellings() {
 fn hm_search_and_palette_families_are_fully_rendered() {
     let rendered = rendered_paths(&module_src());
     for table in ["search", "palette"] {
-        let properties = schema_field(table)["properties"]
+        let schema = schema_field(table);
+        let properties = schema["properties"]
             .as_object()
             .unwrap_or_else(|| panic!("{table} schema properties"));
         let mut missing: Vec<String> = properties
