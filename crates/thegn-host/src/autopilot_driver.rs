@@ -120,11 +120,21 @@ fn drive_claim(
 
     let branch_seed =
         thegn_core::issue::issue_branch_seed(issue.branch_hint.as_deref(), &issue.number);
-    let branch = thegn_core::worktree::dedupe(
-        &branch_seed,
-        &thegn_core::worktree::BranchSet::load(repo_root),
-    );
-    let base = thegn_core::worktree::resolve_base(repo_root, cfg);
+    let taken = match thegn_core::worktree::BranchSet::load_checked(repo_root) {
+        Ok(taken) => taken,
+        Err(error) => {
+            fail(&format!("branch inventory unavailable: {error}"));
+            return;
+        }
+    };
+    let branch = thegn_core::worktree::dedupe(&branch_seed, &taken);
+    let base = match thegn_core::worktree::resolve_base_checked(repo_root, cfg) {
+        Ok(base) => base,
+        Err(error) => {
+            fail(&format!("base branch unavailable: {error}"));
+            return;
+        }
+    };
     if thegn_core::util::git_out(repo_root, &["rev-parse", "--verify", "--quiet", &base]).is_none()
     {
         fail("configured base branch has no commit");
