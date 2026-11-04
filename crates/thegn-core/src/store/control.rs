@@ -82,9 +82,11 @@ pub trait ControlStore {
     /// Register (or replace, keyed by `daemon_id`) a running daemon.
     fn put_daemon(&self, row: &DaemonRow) -> Result<()>;
     fn daemons(&self) -> Result<Vec<DaemonRow>>;
-    /// Every registry row whose `scope` equals `scope` (any heartbeat), oldest start first — the indexed
-    /// (`idx_daemons_scope`) read a starting daemon uses instead of loading every scope's rows (THE-295).
+    /// Every registry row whose `scope` equals `scope` (any heartbeat), oldest start first.
+    /// This read is unbounded; startup paths use [`Self::daemons_in_scope_newest`] (THE-295).
     fn daemons_in_scope(&self, scope: &str) -> Result<Vec<DaemonRow>>;
+    /// The newest `limit` registry rows of `scope` (largest heartbeat first, then newest insert), read through `idx_daemons_scope_heartbeat` with `LIMIT` so a flooded scope is never materialised (THE-295).
+    fn daemons_in_scope_newest(&self, scope: &str, limit: usize) -> Result<Vec<DaemonRow>>;
     fn del_daemon(&self, daemon_id: &str) -> Result<()>;
     fn touch_daemon_heartbeat(&self, daemon_id: &str, now_ms: i64) -> Result<()>;
     /// Daemons for `scope` whose heartbeat is within `ttl_ms` of `now_ms` — the

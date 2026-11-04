@@ -54,6 +54,9 @@ pub(crate) const SESSION_MIGRATION_FENCE_VERSION_SUFFIX: &str = "+session-migrat
 /// [`thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS`] as live.
 const HEARTBEAT_SECS: u64 = 15;
 
+/// Most registry rows a starting daemon reads per scope, newest heartbeat first (THE-295 slice f). The boot sweep deletes dead rows, so a healthy registry holds a handful per scope.
+const MAX_SCOPE_REGISTRY_ROWS: usize = 256;
+
 /// Local-only endpoint used to confirm that a Unix socket belongs to this
 /// state directory. This is intentionally absent from the TCP control API.
 pub(crate) const SCOPE_PATH: &str = "/daemon/scope";
@@ -1172,14 +1175,9 @@ async fn run(
     let legacy_scope = state_dir.to_str();
     {
         let db = db.lock().expect("daemon db lock");
-        if live_legacy_scope_daemon(
-            &scoped_registry_rows(&*db, &scope, legacy_scope)?,
-            legacy_scope,
-            pid_alive,
-        ) {
-            anyhow::bail!(
-                "a pre-upgrade daemon is still registered for this state directory (pid alive); stop it with `thegn daemon stop` before starting a new daemon"
-            );
+        let registry = scoped_registry_rows(&*db, &scope, legacy_scope)?;
+        if let Some(reason) = startup_registry_block(&registry, legacy_scope, pid_alive) {
+            anyhow::bail!(reason);
         }
     }
     let has_socket_override = socket_override.is_some();
@@ -1335,12 +1333,11 @@ async fn run(
     };
     {
         let db = db.lock().expect("daemon db lock");
-        for stale in boot_sweep_targets(
-            &scoped_registry_rows(&*db, &scope, legacy_scope).unwrap_or_default(),
-            &scope,
-            legacy_scope,
-            pid_alive,
-        ) {
+        // A capped boot sweep removes dead rows from the newest window; older rows are swept by a later start.
+        let rows = scoped_registry_rows(&*db, &scope, legacy_scope)
+            .map(|registry| registry.rows)
+            .unwrap_or_default();
+        for stale in boot_sweep_targets(&rows, &scope, legacy_scope, pid_alive) {
             let _ = db.clear_daemon_leases(&stale); // best-effort: cache write: the daemon row is bookkeeping; the sweep below derives from live state
             let _ = db.del_daemon(&stale); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
@@ -1610,17 +1607,49 @@ fn boot_sweep_targets(
         .collect()
 }
 
-/// The registry rows a starting daemon decides on: its own scope plus the legacy path scope (THE-295 slice d).
+/// The registry rows a starting daemon decides on: its own scope plus the legacy path scope (THE-295 slice f).
+struct ScopedRegistry {
+    rows: Vec<DaemonRow>,
+    legacy_truncated: bool,
+}
+
 fn scoped_registry_rows(
     store: &dyn ControlStore,
     scope: &str,
     legacy_scope: Option<&str>,
-) -> anyhow::Result<Vec<DaemonRow>> {
-    let mut rows = store.daemons_in_scope(scope)?;
+) -> anyhow::Result<ScopedRegistry> {
+    let mut current = store.daemons_in_scope_newest(scope, MAX_SCOPE_REGISTRY_ROWS + 1)?;
+    current.truncate(MAX_SCOPE_REGISTRY_ROWS);
+    let mut rows = current;
+    let mut legacy_truncated = false;
     if let Some(legacy) = legacy_scope.filter(|legacy| *legacy != scope) {
-        rows.extend(store.daemons_in_scope(legacy)?);
+        let mut legacy_rows = store.daemons_in_scope_newest(legacy, MAX_SCOPE_REGISTRY_ROWS + 1)?;
+        legacy_truncated = legacy_rows.len() > MAX_SCOPE_REGISTRY_ROWS;
+        legacy_rows.truncate(MAX_SCOPE_REGISTRY_ROWS);
+        rows.extend(legacy_rows);
     }
-    Ok(rows)
+    Ok(ScopedRegistry {
+        rows,
+        legacy_truncated,
+    })
+}
+
+fn startup_registry_block(
+    registry: &ScopedRegistry,
+    legacy_scope: Option<&str>,
+    pid_alive: impl Fn(i64) -> bool,
+) -> Option<&'static str> {
+    if live_legacy_scope_daemon(&registry.rows, legacy_scope, pid_alive) {
+        Some(
+            "a pre-upgrade daemon is still registered for this state directory (pid alive); stop it with `thegn daemon stop` before starting a new daemon",
+        )
+    } else if registry.legacy_truncated {
+        Some(
+            "the daemon registry holds more legacy rows for this state directory than a start can check; remove stale rows or stop old daemons with `thegn daemon stop`, then retry",
+        )
+    } else {
+        None
+    }
 }
 
 fn live_legacy_scope_daemon(
@@ -2402,15 +2431,19 @@ mod tests {
         };
 
         assert_eq!(
-            ids(scoped_registry_rows(&db, "v1-scope-a", Some("/scope/a")).unwrap()),
+            ids(scoped_registry_rows(&db, "v1-scope-a", Some("/scope/a"))
+                .unwrap()
+                .rows),
             vec!["cur".to_string(), "leg".to_string()]
         );
         assert_eq!(
-            ids(scoped_registry_rows(&db, "v1-scope-a", None).unwrap()),
+            ids(scoped_registry_rows(&db, "v1-scope-a", None).unwrap().rows),
             vec!["cur".to_string()]
         );
         assert_eq!(
-            ids(scoped_registry_rows(&db, "v1-scope-a", Some("v1-scope-a")).unwrap()),
+            ids(scoped_registry_rows(&db, "v1-scope-a", Some("v1-scope-a"))
+                .unwrap()
+                .rows),
             vec!["cur".to_string()]
         );
     }
@@ -2418,13 +2451,105 @@ mod tests {
     #[test]
     fn scoped_registry_rows_feed_the_same_boot_decisions() {
         let db = scoped_registry_fixture();
-        let rows = scoped_registry_rows(&db, "v1-scope-a", Some("/scope/a")).unwrap();
+        let rows = scoped_registry_rows(&db, "v1-scope-a", Some("/scope/a"))
+            .unwrap()
+            .rows;
 
         assert_eq!(
             boot_sweep_targets(&rows, "v1-scope-a", Some("/scope/a"), |pid| pid == 22),
             vec!["cur".to_string()]
         );
         assert!(live_legacy_scope_daemon(&rows, Some("/scope/a"), |pid| pid == 22));
+    }
+
+    #[test]
+    fn scoped_registry_rows_caps_each_scope_newest_first() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=MAX_SCOPE_REGISTRY_ROWS + 10 {
+            let id = format!("legacy-{n:03}");
+            db.put_daemon(&DaemonRow {
+                heartbeat_at: n as i64,
+                ..row(&id, "/scope/a", 1)
+            })
+            .unwrap();
+        }
+        for n in 0..3 {
+            db.put_daemon(&row(&format!("current-{n}"), "v1-scope-a", 1))
+                .unwrap();
+        }
+
+        let registry = scoped_registry_rows(&db, "v1-scope-a", Some("/scope/a")).unwrap();
+        assert_eq!(registry.rows.len(), 3 + MAX_SCOPE_REGISTRY_ROWS);
+        assert!(registry.legacy_truncated);
+        assert!(
+            registry
+                .rows
+                .iter()
+                .any(|row| row.daemon_id == "legacy-266")
+        );
+        assert!(
+            !registry
+                .rows
+                .iter()
+                .any(|row| row.daemon_id == "legacy-001")
+        );
+
+        for legacy_scope in [None, Some("v1-scope-a")] {
+            let registry = scoped_registry_rows(&db, "v1-scope-a", legacy_scope).unwrap();
+            assert_eq!(registry.rows.len(), 3);
+            assert!(!registry.legacy_truncated);
+        }
+
+        let exact_db = Db::open_memory().unwrap();
+        for n in 1..=MAX_SCOPE_REGISTRY_ROWS {
+            let id = format!("exact-{n:03}");
+            exact_db
+                .put_daemon(&DaemonRow {
+                    heartbeat_at: n as i64,
+                    ..row(&id, "/scope/exact", 1)
+                })
+                .unwrap();
+        }
+        let exact =
+            scoped_registry_rows(&exact_db, "v1-scope-exact", Some("/scope/exact")).unwrap();
+        assert!(!exact.legacy_truncated);
+    }
+
+    #[test]
+    fn startup_registry_block_refuses_a_truncated_legacy_registry() {
+        let registry = ScopedRegistry {
+            rows: vec![row("old-dead", "/state/a", 11)],
+            legacy_truncated: true,
+        };
+        let reason = startup_registry_block(&registry, Some("/state/a"), |pid| pid == 22).unwrap();
+        assert!(reason.contains("more legacy rows"));
+        assert_eq!(
+            startup_registry_block(
+                &ScopedRegistry {
+                    legacy_truncated: false,
+                    ..registry
+                },
+                Some("/state/a"),
+                |pid| pid == 22
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_registry_block_keeps_the_live_legacy_refusal() {
+        let registry = ScopedRegistry {
+            rows: vec![row("old-live", "/state/a", 22)],
+            legacy_truncated: false,
+        };
+        let reason = startup_registry_block(&registry, Some("/state/a"), |pid| pid == 22).unwrap();
+        assert!(reason.contains("pre-upgrade daemon is still registered"));
+        let truncated = ScopedRegistry {
+            legacy_truncated: true,
+            ..registry
+        };
+        let reason = startup_registry_block(&truncated, Some("/state/a"), |pid| pid == 22).unwrap();
+        assert!(reason.contains("pre-upgrade daemon is still registered"));
     }
 
     #[test]
