@@ -445,6 +445,7 @@ async fn collect_jira_pages(
     let mut start_at = 0;
     let mut issues = Vec::new();
     let mut total = None;
+    let mut seen_keys = std::collections::HashSet::new();
     for page in 0..MAX_LIST_PAGES {
         let page_size = if limit == 0 {
             100
@@ -472,7 +473,9 @@ async fn collect_jira_pages(
         let received = result.issues.len();
         for issue in result.issues {
             checked_jira_key(&issue.key)?;
-            issues.push(jira_issue_to_domain(issue, base_url));
+            if seen_keys.insert(issue.key.clone()) {
+                issues.push(jira_issue_to_domain(issue, base_url));
+            }
         }
         if limit > 0 && issues.len() >= limit {
             issues.truncate(limit);
@@ -1705,6 +1708,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_dedupes_a_key_repeated_on_a_later_page() {
+        let (result, requests) = run_search(
+            "needle",
+            0,
+            vec![jira_search_page(0, 4, 2), jira_search_page(1, 4, 2)],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        let numbers = result
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["PROJ-1", "PROJ-2", "PROJ-3"]);
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_dedupes_before_counting_the_limit() {
+        let (result, requests) = run_search(
+            "needle",
+            3,
+            vec![jira_search_page(0, 10, 2), jira_search_page(1, 10, 2)],
+            Arc::new(TrackerHttpBudget::with_permits(1)),
+        )
+        .await;
+        let numbers = result
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["PROJ-1", "PROJ-2", "PROJ-3"]);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("maxResults=3"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
     async fn search_limit_zero_requests_a_bounded_page() {
         let (result, requests) = run_search(
             "needle",
@@ -1738,7 +1778,9 @@ mod tests {
         let (result, requests) = run_search(
             "needle",
             0,
-            vec![jira_search_page(0, usize::MAX, 100)],
+            (0..MAX_LIST_PAGES)
+                .map(|page| jira_search_page(page * 100, usize::MAX, 100))
+                .collect(),
             Arc::new(TrackerHttpBudget::with_permits(1)),
         )
         .await;
@@ -1789,7 +1831,9 @@ mod tests {
     async fn list_page_cap_returns_collected_rows_as_partial() {
         let (result, requests) = run_list(
             IssueFilter::default(),
-            vec![jira_search_page(0, usize::MAX, 100)],
+            (0..MAX_LIST_PAGES)
+                .map(|page| jira_search_page(page * 100, usize::MAX, 100))
+                .collect(),
             Arc::new(TrackerHttpBudget::with_permits(1)),
         )
         .await;
