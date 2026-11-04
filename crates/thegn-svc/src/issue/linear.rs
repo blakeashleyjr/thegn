@@ -1058,6 +1058,63 @@ mod tests {
         (result, queries)
     }
 
+    async fn run_list(
+        limit: usize,
+        responses: Vec<serde_json::Value>,
+        budget: Arc<TrackerHttpBudget>,
+    ) -> (Result<Vec<Issue>, IssueError>, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route_queries = Arc::clone(&queries);
+        let responses = Arc::new(responses);
+        let route_responses = Arc::clone(&responses);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_queries = Arc::clone(&route_queries);
+                let route_responses = Arc::clone(&route_responses);
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let mut queries = route_queries.lock().unwrap();
+                    let index = queries.len();
+                    queries.push(request["query"].as_str().unwrap().to_string());
+                    drop(queries);
+                    let payload = route_responses
+                        .get(index)
+                        .or_else(|| route_responses.last())
+                        .expect("at least one Linear fixture response");
+                    let mut response =
+                        (StatusCode::OK, Body::from(payload.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            None,
+            budget,
+            &format!("http://{address}"),
+        );
+        let result = backend
+            .list_issues(&IssueFilter {
+                limit,
+                ..Default::default()
+            })
+            .await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let queries = queries.lock().unwrap().clone();
+        (result, queries)
+    }
+
     async fn update_with_echoed_issue(issue: serde_json::Value) -> Result<Issue, IssueError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1294,7 +1351,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(numbers, ["ABC-1", "ABC-2", "ABC-3"]);
         assert_eq!(queries.len(), 2);
-        assert!(queries[1].contains("first: 1"), "{}", queries[1]);
+        assert!(queries[1].contains("first: 1,"), "{}", queries[1]);
+    }
+
+    #[tokio::test]
+    async fn list_dedupes_before_counting_the_limit() {
+        let responses = vec![
+            json!({"data":{"issues":{"nodes":[list_item(1),list_item(2)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(2),list_item(3)],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-2"}}}}),
+            json!({"data":{"issues":{"nodes":[list_item(4)],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+        ];
+        let (result, queries) =
+            run_list(3, responses, Arc::new(TrackerHttpBudget::with_permits(1))).await;
+        let numbers = result
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["ABC-1", "ABC-2", "ABC-3"]);
+        assert_eq!(queries.len(), 2);
+        assert!(queries[1].contains("first: 1,"), "{}", queries[1]);
     }
 
     #[tokio::test]
