@@ -259,6 +259,14 @@ self: {
     ui.sidebar_icon_ahead = cfg.uiSidebarIconAhead;
     ui.sidebar_icon_behind = cfg.uiSidebarIconBehind;
     ui.sidebar_icon_status = cfg.uiSidebarIconStatus;
+    search.max_results = cfg.searchMaxResults;
+    search.respect_gitignore = cfg.searchRespectGitignore;
+    search.include_hidden = cfg.searchIncludeHidden;
+    search.structural = cfg.searchStructural;
+    palette.content_max_results = cfg.paletteContentMaxResults;
+    palette.file_max_results = cfg.paletteFileMaxResults;
+    palette.symbol_max_results = cfg.paletteSymbolMaxResults;
+    palette.content_search_hidden = cfg.paletteContentSearchHidden;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -578,6 +586,54 @@ in {
       type = lib.types.nullOr (lib.types.str);
       default = null;
       description = "Override glyph for the dirty status marker; empty uses the built-in glyph. Unset (null) = the binary's default.";
+    };
+
+    searchMaxResults = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum results per search (pane-history list and workspace search stream). Unset (null) = the binary's default.";
+    };
+
+    searchRespectGitignore = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether the workspace search walker honors .gitignore. Unset (null) = the binary's default.";
+    };
+
+    searchIncludeHidden = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether the workspace search walker descends hidden files and directories. Unset (null) = the binary's default.";
+    };
+
+    searchStructural = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["ast-grep" "none"]);
+      default = null;
+      description = "Structural (AST) search tier: ast-grep, or none to disable it. Unset (null) = the binary's default.";
+    };
+
+    paletteContentMaxResults = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum content-search matches in the Search Everywhere palette. Unset (null) = the binary's default.";
+    };
+
+    paletteFileMaxResults = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum file-path results after fuzzy ranking. Unset (null) = the binary's default.";
+    };
+
+    paletteSymbolMaxResults = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.unsigned);
+      default = null;
+      description = "Maximum symbol matches returned. Unset (null) = the binary's default.";
+    };
+
+    paletteContentSearchHidden = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Include hidden and ignored files in the file index. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {

@@ -89,6 +89,14 @@
           uiSidebarIconAhead = "+";
           uiSidebarIconBehind = "-";
           uiSidebarIconStatus = "*";
+          searchMaxResults = 500;
+          searchRespectGitignore = false;
+          searchIncludeHidden = true;
+          searchStructural = "none";
+          paletteContentMaxResults = 250;
+          paletteFileMaxResults = 100;
+          paletteSymbolMaxResults = 50;
+          paletteContentSearchHidden = true;
           monitorSystem = "htop";
           monitorGpu = "nvtop";
           agents = [

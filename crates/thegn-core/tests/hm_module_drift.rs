@@ -63,8 +63,6 @@ const OMITTED: &[(&str, &str)] = &[
     ("automations", "automation rules are not exposed"),
     ("strip", "strip behavior is not exposed"),
     ("panel", "panel layout is not exposed"),
-    ("search", "search policy is not exposed"),
-    ("palette", "palette behavior is not exposed"),
     ("lsp", "language-server configuration is not exposed"),
     ("semantic", "semantic indexing is not exposed"),
     ("daemon", "daemon configuration is not exposed"),
@@ -559,6 +557,8 @@ fn every_schema_key_is_rendered_or_dispositioned() {
     for section in [
         "theme",
         "ui",
+        "search",
+        "palette",
         "monitor",
         "pr",
         "watch",
@@ -715,6 +715,61 @@ fn hm_ui_enum_options_offer_only_canonical_spellings() {
     }
 }
 
+#[test]
+fn hm_search_and_palette_families_are_fully_rendered() {
+    let rendered = rendered_paths(&module_src());
+    for table in ["search", "palette"] {
+        let properties = schema_field(table)["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{table} schema properties"));
+        let mut missing: Vec<String> = properties
+            .keys()
+            .filter_map(|key| {
+                let path = format!("{table}.{key}");
+                (!rendered.contains(&path)).then_some(path)
+            })
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "Home Manager must render every {table} scalar; missing: {missing:?}"
+        );
+    }
+}
+
+#[test]
+fn hm_search_structural_offers_only_implemented_spellings() {
+    let enums = enum_lists(&module_src());
+    let values = enums
+        .iter()
+        .find(|(name, _)| name == "searchStructural")
+        .map(|(_, values)| values)
+        .unwrap_or_else(|| panic!("Home Manager enum option `searchStructural` is missing"));
+    let actual: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    let schema = schema_field("search.structural");
+    let mut implemented: BTreeSet<&str> = schema["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("destination `search.structural` has no enum"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if let Some(marker) = schema.get(thegn_core::config_validate::ENUM_MARKER) {
+        for reserved in marker["reserved"].as_array().into_iter().flatten() {
+            if let Some(spelling) = reserved.as_str() {
+                implemented.remove(spelling);
+            }
+        }
+    }
+    assert!(
+        !implemented.is_empty(),
+        "search.structural must retain at least one implemented spelling"
+    );
+    assert_eq!(
+        actual, implemented,
+        "Home Manager searchStructural must offer exactly the implemented spellings"
+    );
+}
+
 /// Every `config_enum!` in the schema: its accepted spellings (canonical +
 /// aliases), keyed by definition name.
 fn schema_enums() -> Vec<(String, BTreeSet<String>)> {
@@ -829,6 +884,10 @@ fn every_numeric_option_matches_its_destination_range() {
         ("watchPrIntervalSecs", "watch.pr_interval_secs"),
         ("port", "sandbox.remote.port"),
         ("themePanePadding", "theme.pane_padding"),
+        ("searchMaxResults", "search.max_results"),
+        ("paletteContentMaxResults", "palette.content_max_results"),
+        ("paletteFileMaxResults", "palette.file_max_results"),
+        ("paletteSymbolMaxResults", "palette.symbol_max_results"),
     ];
     let options = numeric_options(&module_src());
     let actual_names: BTreeSet<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
@@ -913,6 +972,7 @@ fn every_nix_enum_matches_its_destination_enum() {
         ("uiSidebarProjectSort", "ui.sidebar_project_sort"),
         ("uiSidebarTerminalsSection", "ui.sidebar_terminals_section"),
         ("uiSidebarFocusDetail", "ui.sidebar_focus_detail"),
+        ("searchStructural", "search.structural"),
     ];
     let enums = enum_lists(&module_src());
     let actual_names: BTreeSet<&str> = enums.iter().map(|(name, _)| name.as_str()).collect();
