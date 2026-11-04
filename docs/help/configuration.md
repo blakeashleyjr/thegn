@@ -534,6 +534,10 @@ rejects. It also exposes `confirmDelete` and the scalar theme options
 `searchMaxResults`, `searchRespectGitignore`, `searchIncludeHidden`,
 `searchStructural`, `paletteContentMaxResults`, `paletteFileMaxResults`,
 `paletteSymbolMaxResults` and `paletteContentSearchHidden`.
+It also exposes `sessionScrollbackLines`, `sessionRestoreGraceSecs`,
+`sessionFocusOnCreate` and `sessionResidentPoolLimit` for `[session]`, and
+`clipboardImagePaste`, `clipboardMaxImageBytes`, `clipboardRemoteDir` and
+`clipboardKeepHours` for `[clipboard]`.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled
