@@ -293,6 +293,23 @@ fn ensure_unclaimed(conn: &Connection, worktree: &str) -> Result<()> {
     Ok(())
 }
 
+/// Release the claim an EXPIRED drain left on a row that already landed. A landed row has no admissible status, so
+/// admission can never recover it; without this the row's bookkeeping is refused for ever. The claim generation is
+/// kept (monotonic), so the former owner stays fenced. A live lease, a NULL lease and every non-landed row are untouched.
+pub(crate) fn reap_expired_landed_claim(conn: &Connection, worktree: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE merge_queue SET claim_owner=NULL,claim_phase='unclaimed',claim_lease_until_ms=NULL, \
+         claim_owner_hint=NULL,claim_launch_nonce=NULL,claim_diagnostic=NULL \
+         WHERE worktree=?1 AND status='landed' AND claim_owner IS NOT NULL \
+           AND claim_lease_until_ms IS NOT NULL AND claim_lease_until_ms<?2",
+        params![worktree, util::now_ms()],
+    )?;
+    if changed > 0 {
+        tracing::warn!(target: "thegn::db", worktree = %worktree, "released the expired merge claim of a landed row");
+    }
+    Ok(changed > 0)
+}
+
 fn record_merge_event(conn: &Connection, event: &MergeQueueEvent) -> Result<()> {
     conn.execute(
         "INSERT INTO merge_queue_events \
@@ -473,6 +490,7 @@ impl Db {
             if !matches {
                 return Ok(false);
             }
+            reap_expired_landed_claim(conn, worktree)?;
             let now = util::now();
             let changed = conn.execute(
                 r#"INSERT INTO merge_queue
@@ -530,6 +548,7 @@ fn enqueue_merge_row(
     identity: Option<&MergeEnqueueIdentity>,
 ) -> Result<()> {
     let now = util::now();
+    reap_expired_landed_claim(db.conn(), worktree)?;
     let changed = db.conn().execute(
         r#"INSERT INTO merge_queue
              (worktree,branch,target_branch,status,queued_at,updated_at,
@@ -1185,6 +1204,7 @@ impl WorktreeAuxStore for Db {
             None
         };
         let conn: &Connection = tx.as_deref().unwrap_or(base);
+        reap_expired_landed_claim(conn, worktree)?;
         let row: Option<MergeRowSnapshot> = conn
             .query_row(
                 "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
