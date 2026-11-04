@@ -518,7 +518,7 @@ fn publish_if_unchanged_in(
     dir: &Path,
     expected: &AuthorizedKeyRecord,
     next: &AuthorizedKeyRecord,
-) -> Result<()> {
+) -> Result<AuthorizedKeyRecord> {
     thegn_core::managed_ssh::publish_if_unchanged_at(dir, expected, next)
 }
 
@@ -543,8 +543,7 @@ fn update_recovery(record: &mut AuthorizedKeyRecord, recovery: RotationRecovery)
     let expected = record.clone();
     let mut next = expected.clone();
     next.rotation_recovery = Some(recovery);
-    publish_if_unchanged_in(&thegn_core::managed_ssh::dir(), &expected, &next)?;
-    *record = next;
+    *record = publish_if_unchanged_in(&thegn_core::managed_ssh::dir(), &expected, &next)?;
     Ok(())
 }
 
@@ -552,8 +551,7 @@ fn clear_recovery(record: &mut AuthorizedKeyRecord) -> Result<()> {
     let expected = record.clone();
     let mut next = expected.clone();
     next.rotation_recovery = None;
-    publish_if_unchanged_in(&thegn_core::managed_ssh::dir(), &expected, &next)?;
-    *record = next;
+    *record = publish_if_unchanged_in(&thegn_core::managed_ssh::dir(), &expected, &next)?;
     Ok(())
 }
 
@@ -1191,6 +1189,7 @@ mod tests {
             key_path: PathBuf::from("/keys/managed"),
             key_fingerprint: "SHA256:test".to_string(),
             authorized_at: 1,
+            generation: 0,
             proxy_worktree: None,
             rotation_recovery: recovery,
         }
@@ -1246,8 +1245,8 @@ mod tests {
         let a = custody_record("instance-a", Some(recovery_marker("a")));
         let b = custody_record("instance-a", Some(recovery_marker("b")));
         let c = custody_record("instance-a", Some(recovery_marker("c")));
-        thegn_core::managed_ssh::record_authorized_at(&dir, &a).unwrap();
-        thegn_core::managed_ssh::record_authorized_at(&dir, &b).unwrap();
+        let a = thegn_core::managed_ssh::record_authorized_at(&dir, &a).unwrap();
+        let b = thegn_core::managed_ssh::record_authorized_at(&dir, &b).unwrap();
 
         let result = publish_if_unchanged_in(&dir, &a, &c);
         assert!(matches!(result, Err(error) if error.downcast_ref::<CustodyChanged>().is_some()));
@@ -1263,13 +1262,95 @@ mod tests {
         let dir = temp.path().join("authorized.d");
         let a = custody_record("instance-a", Some(recovery_marker("a")));
         let c = custody_record("instance-a", Some(recovery_marker("c")));
-        thegn_core::managed_ssh::record_authorized_at(&dir, &a).unwrap();
-
-        publish_if_unchanged_in(&dir, &a, &c).unwrap();
+        let a = thegn_core::managed_ssh::record_authorized_at(&dir, &a).unwrap();
+        let c = publish_if_unchanged_in(&dir, &a, &c).unwrap();
         assert_eq!(
             thegn_core::managed_ssh::read_at(&dir, &c.provider, &c.account, &c.instance).unwrap(),
             Some(c)
         );
+    }
+
+    #[test]
+    fn consecutive_recovery_writes_chain_on_the_stamped_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("authorized.d");
+        let a = thegn_core::managed_ssh::record_authorized_at(
+            &dir,
+            &custody_record("instance-a", None),
+        )
+        .unwrap();
+        let b = publish_if_unchanged_in(
+            &dir,
+            &a,
+            &AuthorizedKeyRecord {
+                rotation_recovery: Some(recovery_marker("b")),
+                ..a.clone()
+            },
+        )
+        .unwrap();
+        let c = publish_if_unchanged_in(
+            &dir,
+            &b,
+            &AuthorizedKeyRecord {
+                rotation_recovery: None,
+                ..b.clone()
+            },
+        )
+        .unwrap();
+        assert!(c.generation > b.generation && b.generation > a.generation);
+
+        let stale = publish_if_unchanged_in(
+            &dir,
+            &b,
+            &AuthorizedKeyRecord {
+                rotation_recovery: Some(recovery_marker("stale")),
+                ..b.clone()
+            },
+        );
+        assert!(matches!(stale, Err(error) if error.downcast_ref::<CustodyChanged>().is_some()));
+        assert_eq!(
+            thegn_core::managed_ssh::read_at(&dir, &c.provider, &c.account, &c.instance).unwrap(),
+            Some(c)
+        );
+    }
+
+    #[test]
+    fn update_and_clear_recovery_keep_the_stamped_row_for_the_next_cas() {
+        let _state = thegn_core::testenv::IsolatedState::new();
+        let dir = thegn_core::managed_ssh::dir();
+        let mut record = thegn_core::managed_ssh::record_authorized_at(
+            &dir,
+            &custody_record("instance-a", None),
+        )
+        .unwrap();
+        let initial_generation = record.generation;
+
+        update_recovery(&mut record, recovery_marker("pending")).unwrap();
+        let updated = thegn_core::managed_ssh::read_at(
+            &dir,
+            &record.provider,
+            &record.account,
+            &record.instance,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record, updated);
+        assert!(record.generation > initial_generation);
+        assert!(record.rotation_recovery.is_some());
+
+        let updated_generation = record.generation;
+        clear_recovery(&mut record).unwrap();
+        let cleared = thegn_core::managed_ssh::read_at(
+            &dir,
+            &record.provider,
+            &record.account,
+            &record.instance,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record, cleared);
+        assert!(record.generation > updated_generation);
+        assert!(record.rotation_recovery.is_none());
     }
 
     #[expect(

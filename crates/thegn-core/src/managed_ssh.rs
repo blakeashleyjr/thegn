@@ -7,8 +7,10 @@
 //! rotation/audit rather than silently losing revocation state.
 //! Provisioning never replaces a row with pending rotation recovery.
 //! Every mutation runs under one process-shared ledger lock; rotation writes
-//! are compare-and-swap against the row they read.
+//! are compare-and-swap against the row they read, and every publish stamps a
+//! ledger-wide monotonic generation.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -59,6 +61,12 @@ pub struct AuthorizedKeyRecord {
     pub key_path: PathBuf,
     pub key_fingerprint: String,
     pub authorized_at: i64,
+    /// Ledger-wide monotonic generation stamped by every custody publish under
+    /// the ledger lock; rows written before generations existed read as 0.
+    /// Compare-and-swap equality includes it, so a row revoked and re-published
+    /// with identical fields never matches an older snapshot.
+    #[serde(default)]
+    pub generation: u64,
     /// Host-side worktree identity needed to reconstruct transports whose
     /// proxy is worktree-bound (currently Sprites SSH-over-WSS). Optional so
     /// pre-field custody records continue to deserialize and fail closed when
@@ -98,6 +106,62 @@ pub struct RotationRecovery {
 
 pub fn dir() -> PathBuf {
     crate::util::thegn_dir().join("ssh").join("authorized.d")
+}
+
+const GENERATION_FILE: &str = ".custody.generation";
+
+fn read_generation_high_water(dir: &Path) -> Result<u64> {
+    let path = dir.join(GENERATION_FILE);
+    let mut file = match crate::fsperm::open_regular_file_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read managed SSH custody generation counter {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    let mut value = String::new();
+    std::io::Read::take(&mut file, 64)
+        .read_to_string(&mut value)
+        .with_context(|| {
+            format!(
+                "managed SSH custody generation counter {} is corrupt",
+                path.display()
+            )
+        })?;
+    if value.len() > 32 {
+        anyhow::bail!(
+            "managed SSH custody generation counter {} is corrupt",
+            path.display()
+        );
+    }
+    value.trim().parse::<u64>().with_context(|| {
+        format!(
+            "managed SSH custody generation counter {} is corrupt",
+            path.display()
+        )
+    })
+}
+
+fn next_generation(dir: &Path, floor: u64) -> Result<u64> {
+    let path = dir.join(GENERATION_FILE);
+    let next = read_generation_high_water(dir)?
+        .max(floor)
+        .checked_add(1)
+        .context("managed SSH custody generation counter is exhausted")?;
+    crate::fsperm::write_owner_only_atomic(&path, format!("{next}\n").as_bytes()).with_context(
+        || {
+            format!(
+                "publish managed SSH custody generation counter {}",
+                path.display()
+            )
+        },
+    )?;
+    Ok(next)
 }
 
 pub fn key_fingerprint(public_key: &str) -> String {
@@ -347,8 +411,8 @@ fn record_authorized_with_proxy_worktree_at(
         }
         .into());
     }
-    publish_locked(dir, &record)?;
-    Ok(record.key_fingerprint)
+    let published = publish_locked(dir, &record)?;
+    Ok(published.key_fingerprint)
 }
 
 pub fn record_rotation_completed_at(
@@ -365,8 +429,8 @@ pub fn record_rotation_completed_at(
         public_key,
         expected.proxy_worktree.as_deref(),
     )?;
-    publish_if_unchanged_at(dir, expected, &record)?;
-    Ok(record.key_fingerprint)
+    let published = publish_if_unchanged_at(dir, expected, &record)?;
+    Ok(published.key_fingerprint)
 }
 
 fn authorized_record(
@@ -384,12 +448,16 @@ fn authorized_record(
         key_path: key_path.to_path_buf(),
         key_fingerprint: try_key_fingerprint(public_key)?,
         authorized_at: crate::util::now(),
+        generation: 0,
         proxy_worktree: proxy_worktree.map(str::to_string),
         rotation_recovery: None,
     })
 }
 
-pub fn record_authorized_at(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
+pub fn record_authorized_at(
+    dir: &Path,
+    record: &AuthorizedKeyRecord,
+) -> Result<AuthorizedKeyRecord> {
     let _ledger = lock_ledger(dir)?;
     publish_locked(dir, record)
 }
@@ -428,13 +496,15 @@ fn lock_ledger(dir: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-fn publish_locked(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
+fn publish_locked(dir: &Path, record: &AuthorizedKeyRecord) -> Result<AuthorizedKeyRecord> {
     let path = record_path(dir, &record.provider, &record.account, &record.instance);
     let legacy = legacy_record_path(dir, &record.provider, &record.account, &record.instance);
+    let mut floor = 0;
     for candidate in [&path, &legacy] {
         if let Some(existing) = read_record(candidate).with_context(|| {
             format!("publish managed SSH custody record {}", candidate.display())
         })? {
+            floor = floor.max(existing.generation);
             check_tuple(
                 &existing,
                 &record.provider,
@@ -444,19 +514,21 @@ fn publish_locked(dir: &Path, record: &AuthorizedKeyRecord) -> Result<()> {
             )?;
         }
     }
-    crate::fsperm::write_owner_only_atomic(&path, &serde_json::to_vec_pretty(record)?)
+    let mut stamped = record.clone();
+    stamped.generation = next_generation(dir, floor)?;
+    crate::fsperm::write_owner_only_atomic(&path, &serde_json::to_vec_pretty(&stamped)?)
         .with_context(|| format!("publish managed SSH custody record {}", path.display()))?;
     if legacy != path {
         remove_if_exists(&legacy)?;
     }
-    Ok(())
+    Ok(stamped)
 }
 
 pub fn publish_if_unchanged_at(
     dir: &Path,
     expected: &AuthorizedKeyRecord,
     next: &AuthorizedKeyRecord,
-) -> Result<()> {
+) -> Result<AuthorizedKeyRecord> {
     anyhow::ensure!(
         next.provider == expected.provider
             && next.account == expected.account
@@ -593,8 +665,7 @@ pub fn record_rotation_recovery(
 ) -> Result<AuthorizedKeyRecord> {
     let mut updated = record.clone();
     updated.rotation_recovery = recovery;
-    publish_if_unchanged_at(&dir(), record, &updated)?;
-    Ok(updated)
+    publish_if_unchanged_at(&dir(), record, &updated)
 }
 
 pub fn list() -> Result<Vec<AuthorizedKeyRecord>> {
@@ -659,6 +730,7 @@ mod tests {
             key_path: PathBuf::from("/state/ssh/fly-env-FLY-WORK_ed25519"),
             key_fingerprint: key_fingerprint("ssh-ed25519 AAAATEST comment"),
             authorized_at: 1,
+            generation: 0,
             proxy_worktree: None,
             rotation_recovery: None,
         }
@@ -767,6 +839,166 @@ mod tests {
         assert_eq!(published.key_fingerprint, fingerprint);
     }
 
+    #[test]
+    fn every_publish_stamps_a_strictly_increasing_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
+        let fingerprint = record_authorized_with_proxy_worktree_at(
+            temp.path(),
+            "fly",
+            "account",
+            "instance",
+            Path::new("/k"),
+            key,
+            None,
+        )
+        .unwrap();
+        let first = read_at(temp.path(), "fly", "account", "instance")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.key_fingerprint, fingerprint);
+        assert!(first.generation >= 1);
+
+        std::fs::remove_file(temp.path().join(GENERATION_FILE)).unwrap();
+        let second = publish_if_unchanged_at(temp.path(), &first, &first).unwrap();
+        assert!(second.generation > first.generation);
+        assert_eq!(
+            read_at(temp.path(), "fly", "account", "instance").unwrap(),
+            Some(second.clone())
+        );
+
+        record_revoked_at(temp.path(), "fly", "account", "instance").unwrap();
+        let third = record_authorized_at(temp.path(), &second).unwrap();
+        assert!(third.generation > second.generation);
+    }
+
+    #[test]
+    fn compare_and_publish_refuses_a_row_revoked_and_republished_with_identical_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = record();
+        let snapshot = record_authorized_at(temp.path(), &input).unwrap();
+        record_revoked_at(
+            temp.path(),
+            &input.provider,
+            &input.account,
+            &input.instance,
+        )
+        .unwrap();
+        let republished = record_authorized_at(temp.path(), &input).unwrap();
+        let stale = AuthorizedKeyRecord {
+            key_fingerprint: "SHA256:stale".into(),
+            ..snapshot.clone()
+        };
+
+        let result = publish_if_unchanged_at(temp.path(), &snapshot, &stale);
+
+        assert!(matches!(result, Err(error) if error.downcast_ref::<CustodyChanged>().is_some()));
+        assert_eq!(
+            read_at(
+                temp.path(),
+                &input.provider,
+                &input.account,
+                &input.instance
+            )
+            .unwrap(),
+            Some(republished.clone())
+        );
+        assert!(republished.generation > snapshot.generation);
+    }
+
+    #[test]
+    fn pre_generation_rows_read_as_generation_zero_and_can_be_compared_and_published() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = record();
+        let mut value = serde_json::to_value(&input).unwrap();
+        value.as_object_mut().unwrap().remove("generation");
+        std::fs::write(
+            record_path(
+                temp.path(),
+                &input.provider,
+                &input.account,
+                &input.instance,
+            ),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let snapshot = read_at(
+            temp.path(),
+            &input.provider,
+            &input.account,
+            &input.instance,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.generation, 0);
+
+        let next = AuthorizedKeyRecord {
+            key_fingerprint: "SHA256:updated-legacy".into(),
+            ..snapshot.clone()
+        };
+        let published = publish_if_unchanged_at(temp.path(), &snapshot, &next).unwrap();
+        assert!(published.generation >= 1);
+        assert_eq!(
+            read_at(
+                temp.path(),
+                &input.provider,
+                &input.account,
+                &input.instance
+            )
+            .unwrap(),
+            Some(published)
+        );
+    }
+
+    #[test]
+    fn corrupt_generation_counter_fails_closed_before_any_row_is_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let counter = temp.path().join(GENERATION_FILE);
+        std::fs::write(&counter, b"not-a-number").unwrap();
+        let error = record_authorized_at(temp.path(), &record()).unwrap_err();
+        assert!(format!("{error:#}").contains("generation counter"));
+        assert!(list_at(temp.path()).unwrap().is_empty());
+
+        std::fs::remove_file(&counter).unwrap();
+        std::fs::create_dir(&counter).unwrap();
+        let error = record_authorized_at(temp.path(), &record()).unwrap_err();
+        assert!(format!("{error:#}").contains("generation counter"));
+        assert!(list_at(temp.path()).unwrap().is_empty());
+
+        std::fs::remove_dir(&counter).unwrap();
+        std::fs::write(&counter, "18446744073709551615").unwrap();
+        let error = record_authorized_at(temp.path(), &record()).unwrap_err();
+        assert!(format!("{error:#}").contains("exhausted"));
+        assert!(list_at(temp.path()).unwrap().is_empty());
+
+        std::fs::write(&counter, "123456789012345678901234567890123").unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                record_authorized_at(temp.path(), &record()).unwrap_err()
+            )
+            .contains("generation counter")
+        );
+        std::fs::write(&counter, [0xff]).unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                record_authorized_at(temp.path(), &record()).unwrap_err()
+            )
+            .contains("generation counter")
+        );
+        assert!(list_at(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generation_counter_is_not_listed_as_custody() {
+        let temp = tempfile::tempdir().unwrap();
+        let published = record_authorized_at(temp.path(), &record()).unwrap();
+
+        assert_eq!(list_at(temp.path()).unwrap(), vec![published]);
+        assert!(temp.path().join(GENERATION_FILE).exists());
+    }
+
     fn recovering_record(key_fingerprint: &str) -> AuthorizedKeyRecord {
         AuthorizedKeyRecord {
             provider: "fly".into(),
@@ -775,6 +1007,7 @@ mod tests {
             key_path: PathBuf::from("/state/old-key"),
             key_fingerprint: key_fingerprint.into(),
             authorized_at: 1,
+            generation: 0,
             proxy_worktree: None,
             rotation_recovery: Some(RotationRecovery {
                 key_path: PathBuf::from("/state/next-key"),
@@ -795,8 +1028,8 @@ mod tests {
         let old_key =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
         let old_fingerprint = try_key_fingerprint(old_key).unwrap();
-        let original = recovering_record(&old_fingerprint);
-        record_authorized_at(temp.path(), &original).unwrap();
+        let original =
+            record_authorized_at(temp.path(), &recovering_record(&old_fingerprint)).unwrap();
         let record_file = record_path(
             temp.path(),
             &original.provider,
@@ -838,8 +1071,11 @@ mod tests {
         let old_key =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
         let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
-        let original = recovering_record(try_key_fingerprint(old_key).unwrap().as_str());
-        record_authorized_at(temp.path(), &original).unwrap();
+        let original = record_authorized_at(
+            temp.path(),
+            &recovering_record(try_key_fingerprint(old_key).unwrap().as_str()),
+        )
+        .unwrap();
 
         let fingerprint = record_rotation_completed_at(
             temp.path(),
@@ -873,14 +1109,13 @@ mod tests {
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
         let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
         let old_fingerprint = try_key_fingerprint(old_key).unwrap();
-        let original = recovering_record(&old_fingerprint);
-        record_authorized_at(&dir(), &original).unwrap();
+        let original = record_authorized_at(&dir(), &recovering_record(&old_fingerprint)).unwrap();
 
         let unrelated = AuthorizedKeyRecord {
             instance: "another-instance".into(),
             ..original.clone()
         };
-        record_authorized_at(&dir(), &unrelated).unwrap();
+        let unrelated = record_authorized_at(&dir(), &unrelated).unwrap();
 
         record_rotation_completed(&original, Path::new("/state/completed-key"), new_key).unwrap();
 
@@ -913,6 +1148,7 @@ mod tests {
             key_path: PathBuf::from("/state/old-key"),
             key_fingerprint: try_key_fingerprint(old_key).unwrap(),
             authorized_at: 1,
+            generation: 0,
             proxy_worktree: None,
             rotation_recovery: None,
         };
@@ -1046,7 +1282,7 @@ mod tests {
         assert_eq!(list_at(temp.path()).unwrap(), vec![existing.clone()]);
         let mut updated = existing.clone();
         updated.authorized_at += 1;
-        record_authorized_at(temp.path(), &updated).unwrap();
+        let updated = record_authorized_at(temp.path(), &updated).unwrap();
         assert!(canonical.exists());
         assert!(!legacy.exists());
         assert_eq!(list_at(temp.path()).unwrap(), vec![updated]);
@@ -1078,8 +1314,7 @@ mod tests {
     #[test]
     fn custody_round_trip_records_identity_without_public_key_material() {
         let temp = tempfile::tempdir().unwrap();
-        let record = record();
-        record_authorized_at(temp.path(), &record).unwrap();
+        let record = record_authorized_at(temp.path(), &record()).unwrap();
         assert_eq!(
             read_at(
                 temp.path(),
@@ -1118,8 +1353,7 @@ mod tests {
     #[test]
     fn custody_publish_is_owner_only_and_atomically_replaces_one_identity() {
         let temp = tempfile::tempdir().unwrap();
-        let mut original = record();
-        record_authorized_at(temp.path(), &original).unwrap();
+        let mut original = record_authorized_at(temp.path(), &record()).unwrap();
 
         if let Some(mode) = crate::fsperm::mode_bits(temp.path()).unwrap() {
             assert_eq!(mode, 0o700);
@@ -1146,7 +1380,7 @@ mod tests {
             retiring_started: true,
             retiring_completed: false,
         });
-        record_authorized_at(temp.path(), &original).unwrap();
+        original = record_authorized_at(temp.path(), &original).unwrap();
 
         assert_eq!(list_at(temp.path()).unwrap(), vec![original.clone()]);
         assert_eq!(
@@ -1286,8 +1520,8 @@ mod tests {
         let mut second = first.clone();
         second.account = "account-b".into();
         second.key_path = PathBuf::from("/state/ssh/account-b_ed25519");
-        record_authorized_at(temp.path(), &first).unwrap();
-        record_authorized_at(temp.path(), &second).unwrap();
+        let first = record_authorized_at(temp.path(), &first).unwrap();
+        let second = record_authorized_at(temp.path(), &second).unwrap();
         assert_eq!(list_at(temp.path()).unwrap().len(), 2);
         assert_eq!(
             read_at(
@@ -1328,9 +1562,9 @@ mod tests {
         let mut first = a.clone();
         first.account = "account-a".into();
         first.instance = "a".into();
-        record_authorized_at(temp.path(), &z).unwrap();
-        record_authorized_at(temp.path(), &a).unwrap();
-        record_authorized_at(temp.path(), &first).unwrap();
+        let z = record_authorized_at(temp.path(), &z).unwrap();
+        let a = record_authorized_at(temp.path(), &a).unwrap();
+        let first = record_authorized_at(temp.path(), &first).unwrap();
 
         assert_eq!(list_at(temp.path()).unwrap(), vec![first, a, z]);
     }
@@ -1501,8 +1735,7 @@ mod tests {
     fn revoke_waits_for_a_held_ledger_lock() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
-        let row = record();
-        record_authorized_at(&dir, &row).unwrap();
+        let row = record_authorized_at(&dir, &record()).unwrap();
         let held = lock_ledger(&dir).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker_dir = dir.clone();
@@ -1538,17 +1771,17 @@ mod tests {
     #[test]
     fn compare_and_publish_refuses_a_changed_row_and_keeps_it() {
         let temp = tempfile::tempdir().unwrap();
-        let original = record();
+        let input = record();
         let changed = AuthorizedKeyRecord {
             key_fingerprint: "SHA256:changed".into(),
-            ..original.clone()
+            ..input.clone()
         };
         let next = AuthorizedKeyRecord {
             key_fingerprint: "SHA256:next".into(),
-            ..original.clone()
+            ..input.clone()
         };
-        record_authorized_at(temp.path(), &original).unwrap();
-        record_authorized_at(temp.path(), &changed).unwrap();
+        let original = record_authorized_at(temp.path(), &input).unwrap();
+        let changed = record_authorized_at(temp.path(), &changed).unwrap();
 
         let result = publish_if_unchanged_at(temp.path(), &original, &next);
 
@@ -1573,12 +1806,12 @@ mod tests {
     #[test]
     fn compare_and_publish_refuses_a_changed_identity_before_writing() {
         let temp = tempfile::tempdir().unwrap();
-        let original = record();
+        let input = record();
         let changed_identity = AuthorizedKeyRecord {
             instance: "another-instance".into(),
-            ..original.clone()
+            ..input.clone()
         };
-        record_authorized_at(temp.path(), &original).unwrap();
+        let original = record_authorized_at(temp.path(), &input).unwrap();
 
         let result = publish_if_unchanged_at(temp.path(), &original, &changed_identity);
 
@@ -1604,8 +1837,7 @@ mod tests {
     fn concurrent_compare_and_publish_from_one_snapshot_has_exactly_one_winner() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
-        let original = record();
-        record_authorized_at(dir, &original).unwrap();
+        let original = record_authorized_at(dir, &record()).unwrap();
         // Every scoped writer starts from the same stored snapshot. The shared
         // barrier releases all eight before any writer can publish; every
         // handle is collected before joining so the race is concurrent.
@@ -1634,9 +1866,9 @@ mod tests {
 
         let mut winners = Vec::new();
         let mut changed = 0;
-        for (next, result) in outcomes {
+        for (_next, result) in outcomes {
             match result {
-                Ok(()) => winners.push(next),
+                Ok(published) => winners.push(published),
                 Err(error) => {
                     assert!(error.downcast_ref::<CustodyChanged>().is_some());
                     changed += 1;
@@ -1715,13 +1947,13 @@ mod tests {
         let old_key =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICXLY4ay5H8w/Ud7QvnU1EtrjkvENKLoy7B0YU17bVzq vec2";
         let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgVgF3FLyN2aHUalBpkk3cMVfTgD+7TrbdfTAcSvLvB thegn";
-        let original = recovering_record(&try_key_fingerprint(old_key).unwrap());
+        let original_input = recovering_record(&try_key_fingerprint(old_key).unwrap());
         let changed = AuthorizedKeyRecord {
             key_fingerprint: "SHA256:changed".into(),
-            ..original.clone()
+            ..original_input.clone()
         };
-        record_authorized_at(temp.path(), &original).unwrap();
-        record_authorized_at(temp.path(), &changed).unwrap();
+        let original = record_authorized_at(temp.path(), &original_input).unwrap();
+        let changed = record_authorized_at(temp.path(), &changed).unwrap();
 
         let result = record_rotation_completed_at(
             temp.path(),
@@ -1745,8 +1977,7 @@ mod tests {
     #[test]
     fn ledger_lock_file_is_not_listed_as_custody() {
         let temp = tempfile::tempdir().unwrap();
-        let row = record();
-        record_authorized_at(temp.path(), &row).unwrap();
+        let row = record_authorized_at(temp.path(), &record()).unwrap();
 
         assert_eq!(list_at(temp.path()).unwrap(), vec![row]);
         // The base already ignores non-JSON entries; the lock's existence is
