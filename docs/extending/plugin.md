@@ -6,7 +6,7 @@ a POSIX shell script with `printf` is enough.
 
 1. **Manifest**: declared, not printed — a `[[plugins]]` entry or a
    `<config_dir>/plugins/<name>/plugin.toml` with `id`, `name`, `version`,
-   `api` (the contract version, currently `"0.3.0"`), `capabilities`
+   `api` (the contract version, currently `"0.4.0"`), `capabilities`
    (`surface:statusbar`, …), `contributions` (extension point + label +
    surface + cadence), `command = ["…"]`, and optional `scopes`, `mode`
    (`one_shot`/`resident`), `timeout_secs` (clamped to 1–3600 seconds with a
