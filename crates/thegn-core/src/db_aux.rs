@@ -2377,10 +2377,32 @@ impl WorktreeAuxStore for Db {
             let provider = row.get::<_, Option<String>>(1)?;
             let account = row.get::<_, Option<String>>(2)?;
             let issue_ref = match (provider, account) {
-                (Some(provider), Some(account)) => {
-                    crate::issue::IssueRef::new(provider, account, id.clone()).ok()
+                (Some(provider), Some(account)) => Some(
+                    crate::issue::IssueRef::new(provider, account, id.clone()).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                ),
+                (None, None) => None,
+                (None, Some(_)) => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        1,
+                        "provider".to_string(),
+                        rusqlite::types::Type::Null,
+                    ));
                 }
-                _ => None,
+                (Some(_), None) => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        2,
+                        "account".to_string(),
+                        rusqlite::types::Type::Null,
+                    ));
+                }
             };
             Ok((id, issue_ref))
         })?;
