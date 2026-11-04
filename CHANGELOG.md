@@ -18,11 +18,11 @@ All notable changes to **thegn** are documented here. The format follows
   since the branch was queued.
 - The PR queue holds a merge as `needs_human` before requesting anything when
   the forge cannot fence the merge to the reviewed head.
-- Configuration rejects `[ci] log_tail_lines` values above 100000.
-- CI log tails discard invalid UTF-8 and over-long lines and mark the result
-  truncated; CRLF endings are preserved.
-- The Home Manager module adds typed, null-default `programs.thegn.ui*` options
-  for display-only `[ui]` settings.
+- Configuration rejects `[ci] log_tail_lines` values above 100000; accepted
+  log tails retain invalid UTF-8 and over-long-line handling, truncation
+  marking, and CRLF preservation.
+- The Home Manager module adds typed, null-default `programs.thegn.search*` and
+  `programs.thegn.palette*` options for search and palette settings.
 
 ### Fixed
 
