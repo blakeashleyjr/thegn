@@ -3,7 +3,7 @@
 //! This module performs no I/O. The caller supplies the facts it probed about
 //! the host, sandbox mounts, callback binary, and provider home.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::sandbox::{Backend, Mount};
 
@@ -86,6 +86,18 @@ pub fn classify_worker(facts: &WorkerFacts<'_>) -> WorkerReadiness {
 }
 
 fn writable(mounts: &[Mount], path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+        || mounts.iter().any(|mount| {
+            Path::new(&mount.dest)
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        })
+    {
+        return false;
+    }
+
     mounts
         .iter()
         .enumerate()
@@ -204,6 +216,24 @@ mod tests {
 
         let prefix_mount = [m("/work/tree", false)];
         assert!(!writable(&prefix_mount, Path::new("/work/tree2/subdir")));
+
+        let outside_worktree = facts(&prefix_mount, Path::new("/work/tree2"));
+        assert_eq!(
+            classify_worker(&outside_worktree),
+            WorkerReadiness::CannotWriteWorktree
+        );
+    }
+
+    #[test]
+    fn writable_rejects_parent_dir_components_in_paths_and_mount_destinations() {
+        let mounts = [m("/work/tree", false)];
+        assert!(!writable(&mounts, Path::new("/work/tree/../secret")));
+
+        let parent_dir_mount = [m("/work/tree/..", false)];
+        assert!(!writable(&parent_dir_mount, Path::new("/work/secret")));
+
+        let mixed_mounts = [m("/work/tree", false), m("/outside/../secret", false)];
+        assert!(!writable(&mixed_mounts, Path::new("/work/tree")));
     }
 
     #[test]
@@ -227,7 +257,11 @@ mod tests {
 
     #[test]
     fn classify_config_pin_does_not_make_git_metadata_unwritable() {
-        let mounts = [m("/git/common", false), m("/git/common/config", true)];
+        let mounts = [
+            m("/work/tree", false),
+            m("/git/common", false),
+            m("/git/common/config", true),
+        ];
         let facts = WorkerFacts {
             git_common_dir: Some(Path::new("/git/common")),
             ..facts(&mounts, Path::new("/work/tree"))
@@ -296,7 +330,7 @@ mod tests {
     #[test]
     fn classify_check_order_is_stable() {
         let mounts = [m("/work/tree", true)];
-        let facts = WorkerFacts {
+        let first_failure = WorkerFacts {
             git_common_dir: Some(Path::new("/git/common")),
             callback: CallbackBinary::Missing,
             provider_home: Some(Path::new("/provider/home")),
@@ -305,8 +339,40 @@ mod tests {
         };
 
         assert_eq!(
-            classify_worker(&facts),
+            classify_worker(&first_failure),
             WorkerReadiness::CannotWriteWorktree
+        );
+
+        let writable_worktree = [m("/work/tree", false)];
+        let metadata_before_callback = WorkerFacts {
+            git_common_dir: Some(Path::new("/git/common")),
+            callback: CallbackBinary::Missing,
+            ..facts(&writable_worktree, Path::new("/work/tree"))
+        };
+        assert_eq!(
+            classify_worker(&metadata_before_callback),
+            WorkerReadiness::CannotWriteGitMetadata
+        );
+
+        let callback_before_provider_home = WorkerFacts {
+            callback: CallbackBinary::Missing,
+            provider_home: Some(Path::new("/provider/home")),
+            provider_home_exists: false,
+            ..facts(&writable_worktree, Path::new("/work/tree"))
+        };
+        assert_eq!(
+            classify_worker(&callback_before_provider_home),
+            WorkerReadiness::CallbackUnavailable
+        );
+
+        let backend_none_before_unsupported_backend = WorkerFacts {
+            backend: Backend::None,
+            callback: CallbackBinary::Missing,
+            ..facts(&[], Path::new("/work/tree"))
+        };
+        assert_eq!(
+            classify_worker(&backend_none_before_unsupported_backend),
+            WorkerReadiness::ContainmentAbsent
         );
     }
 
