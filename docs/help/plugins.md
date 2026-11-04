@@ -180,6 +180,14 @@ programs in the Work tab.
 Set `background = true` together with the `background:sync` capability to let
 a hidden app keep syncing. This requires `trusted_native = true`.
 
+## Previewing app plugins
+
+`thegn plugin preview --fixture gallery` renders the bundled widget gallery with the shared app renderer, with no
+account, network or plugin process. Add `--headless` for a one-line JSON screen snapshot (`--size COLSxROWS` sets the
+geometry), or pass `--fixture <file>` with your own `{"view": ..., "inputs": [...]}` document. `--record <file>` writes a
+new owner-only trace (an existing file is never overwritten); only synthetic fixtures recorded with `--include-content`
+can be replayed with `--replay <file>`. Previewing a running plugin is not available yet.
+
 ## Provider plugins
 
 A plugin can _be_ a provider: an `IssueProvider` contribution makes the

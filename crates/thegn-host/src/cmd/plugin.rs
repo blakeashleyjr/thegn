@@ -7,9 +7,14 @@
 //! - `check` — full validation (api compatibility, command presence,
 //!   contribution acceptance, id clashes, unparseable manifests); exits
 //!   non-zero when any *enabled* plugin fails, so it fits a hook.
+//! - `preview` — render a synthetic fixture or trace through the shared app
+//!   renderer without starting a plugin process.
 //!
 //! There is no `restart` verb: crashed resident plugins restart themselves
 //! with backoff, and deliberate restarts ride config hot-reload.
+
+mod preview;
+mod trace;
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -230,6 +235,8 @@ pub enum Action {
     },
     /// Validate every enabled plugin; exits non-zero on any problem.
     Check,
+    /// Preview a synthetic fixture or a recorded trace with the shared app renderer (no plugin process is started).
+    Preview(preview::Options),
 }
 
 /// The directory plugin directories live under (`plugin.toml` per subdir):
@@ -338,6 +345,7 @@ fn inspection_lines(admitted: &AdmittedPlugin) -> Vec<String> {
 pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
     let dir = config_dir(config_path);
     match action {
+        Action::Preview(options) => preview::run(options),
         Action::List { json } => {
             let admitted = thegn_svc::plugin::loader::admit(cfg, &dir);
             if json {
