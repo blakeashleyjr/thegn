@@ -225,7 +225,8 @@ mod db_open_memo;
 /// v99: ci_log_cache.context + ci_autofix_dedupe.context, provider context of CI logs and autofix claims (THE-550).
 /// v100: calendar_diagnostics, per-account parser diagnostic counts of the last applied calendar page (THE-468).
 /// v101: shares.owner_pid + shares.owner_start_ticks, the share start process that owns a share row (THE-341).
-pub const SCHEMA_VERSION: i64 = 101;
+/// v102: issue_links.provider + issue_links.account, the exact tracker account a worktree's linked issue came from (THE-324).
+pub const SCHEMA_VERSION: i64 = 102;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1819,6 +1820,7 @@ impl Db {
                     crate::db_migrate::verify_v99_schema(&conn)?;
                     crate::db_migrate::verify_v100_schema(&conn)?;
                     crate::db_migrate::verify_v101_schema(&conn)?;
+                    crate::db_migrate::verify_v102_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2504,6 +2506,7 @@ impl Db {
         crate::db_migrate::migrate_v99(&conn)?;
         crate::db_migrate::migrate_v100(&conn)?;
         crate::db_migrate::migrate_v101(&conn)?;
+        crate::db_migrate::migrate_v102(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2543,6 +2546,7 @@ impl Db {
             crate::db_migrate::verify_v99_schema(&conn)?;
             crate::db_migrate::verify_v100_schema(&conn)?;
             crate::db_migrate::verify_v101_schema(&conn)?;
+            crate::db_migrate::verify_v102_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can

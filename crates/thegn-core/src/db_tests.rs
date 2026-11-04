@@ -3076,6 +3076,54 @@ fn issue_links_crud() {
 }
 
 #[test]
+fn issue_link_ref_records_the_account_and_legacy_links_stay_unbound() {
+    use crate::issue::IssueRef;
+
+    let db = db();
+    let work = IssueRef::new("linear", "work", "linear:A-1").unwrap();
+    db.link_issue_ref("/wt/a", &work).unwrap();
+    db.link_issue("/wt/a", "github:42").unwrap();
+    db.conn()
+        .execute(
+            "UPDATE issue_links SET linked_at=CASE issue_id WHEN 'linear:A-1' THEN 2 ELSE 1 END WHERE worktree_path='/wt/a'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        db.linked_issue_refs("/wt/a").unwrap(),
+        vec![
+            ("linear:A-1".to_string(), Some(work.clone())),
+            ("github:42".to_string(), None),
+        ]
+    );
+
+    let home = IssueRef::new("linear", "home", "linear:A-1").unwrap();
+    db.link_issue_ref("/wt/a", &home).unwrap();
+    assert_eq!(db.linked_issue_refs("/wt/a").unwrap().len(), 2);
+    db.link_issue("/wt/a", "linear:A-1").unwrap();
+    assert_eq!(
+        db.linked_issue_refs("/wt/a").unwrap()[0],
+        ("linear:A-1".to_string(), Some(home))
+    );
+
+    let invalid = IssueRef {
+        v: 1,
+        provider: "linear".into(),
+        account: String::new(),
+        id: "linear:A-2".into(),
+    };
+    assert!(db.link_issue_ref("/wt/a", &invalid).is_err());
+    assert_eq!(db.linked_issue_refs("/wt/a").unwrap().len(), 2);
+    assert!(
+        db.linked_issues("/wt/a")
+            .unwrap()
+            .contains(&"linear:A-1".to_string())
+    );
+    db.unlink_issue("/wt/a", "linear:A-1").unwrap();
+    assert_eq!(db.linked_issue_refs("/wt/a").unwrap().len(), 1);
+}
+
+#[test]
 fn notifications_put_and_read_and_mark_read() {
     let db = db();
     // No notifications initially.
