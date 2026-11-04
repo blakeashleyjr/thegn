@@ -313,3 +313,76 @@ fn branch_root_refuses_non_issue_rows() {
         "b branches from an issue row"
     );
 }
+
+#[test]
+fn move_on_merge_routes_a_linked_issue_to_its_stored_account() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work", "home"], &calls);
+    let linked = vec![(
+        "plugin:demo:1".to_string(),
+        Some(thegn_core::issue::IssueRef::new("plugin:demo", "home", "plugin:demo:1").unwrap()),
+    )];
+
+    assert!(move_linked_issues_done(&router, &linked).is_empty());
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &["home"]
+    );
+}
+
+#[test]
+fn move_on_merge_refuses_a_removed_account_without_falling_back() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work", "home"], &calls);
+    let linked = vec![(
+        "plugin:demo:1".to_string(),
+        Some(thegn_core::issue::IssueRef::new("plugin:demo", "gone", "plugin:demo:1").unwrap()),
+    )];
+
+    let failures = move_linked_issues_done(&router, &linked);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, "plugin:demo:1");
+    assert!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+}
+
+#[test]
+fn move_on_merge_legacy_link_stays_ambiguous_with_two_accounts() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work", "home"], &calls);
+    let linked = vec![("plugin:demo:1".to_string(), None)];
+
+    let failures = move_linked_issues_done(&router, &linked);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].1.contains("work"));
+    assert!(failures[0].1.contains("home"));
+    assert!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+}
+
+#[test]
+fn move_on_merge_legacy_link_uses_the_sole_backend() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = recording_router(&["work"], &calls);
+    let linked = vec![("plugin:demo:1".to_string(), None)];
+
+    assert!(move_linked_issues_done(&router, &linked).is_empty());
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &["work"]
+    );
+}

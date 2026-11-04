@@ -85,6 +85,7 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
     let wt_str = wt.to_string_lossy().to_string();
     if let Some(issue) = cursor_issue(ctx) {
         let id = issue.id.clone();
+        let link_ref = thegn_core::issue::IssueRef::of(&issue);
         let already_linked = ctx.model.panel.tracker_links.contains(&id);
         let refresh_tx = ctx.refresh_tx.clone();
         let waker = ctx.waker.clone();
@@ -94,7 +95,10 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
             let result = if already_linked {
                 db.unlink_issue(&wt_for_write, &id_for_write)
             } else {
-                db.link_issue(&wt_for_write, &id_for_write)
+                match &link_ref {
+                    Some(issue_ref) => db.link_issue_ref(&wt_for_write, issue_ref),
+                    None => db.link_issue(&wt_for_write, &id_for_write),
+                }
             };
             if let Err(error) = result {
                 tracing::debug!(target: "thegn::db", %error, "issue link update failed");
@@ -666,6 +670,31 @@ fn pulse_model_refresh(
     if let Err(error) = waker.wake() {
         tracing::debug!(%error, "failed to wake after issue link update");
     }
+}
+
+pub(crate) fn move_linked_issues_done(
+    router: &thegn_svc::issue::IssueRouter,
+    linked: &[(String, Option<thegn_core::issue::IssueRef>)],
+) -> Vec<(String, String)> {
+    let patch = thegn_core::issue::IssuePatch {
+        status: Some(thegn_core::issue::IssueStatus::Done),
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    for (id, issue_ref) in linked {
+        let result = match issue_ref {
+            Some(issue_ref) => {
+                thegn_svc::issue::block_on_tracker(router.update_issue_ref(issue_ref, &patch))
+            }
+            None => thegn_svc::issue::block_on_tracker(router.update_issue(id, &patch)),
+        }
+        .and_then(|inner| inner);
+        if let Err(error) = result {
+            tracing::warn!(target: "thegn::issues", error = %error, "failed to move linked issue {id} to Done on merge");
+            failures.push((id.clone(), error.to_string()));
+        }
+    }
+    failures
 }
 
 #[cfg(test)]

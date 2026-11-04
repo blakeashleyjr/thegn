@@ -2341,6 +2341,52 @@ impl WorktreeAuxStore for Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    fn link_issue_ref(
+        &self,
+        worktree_path: &str,
+        issue_ref: &crate::issue::IssueRef,
+    ) -> Result<()> {
+        issue_ref
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.conn().execute(
+            r#"INSERT INTO issue_links(worktree_path,issue_id,linked_at,provider,account)
+               VALUES(?1,?2,?3,?4,?5)
+               ON CONFLICT(worktree_path,issue_id) DO UPDATE SET
+                 linked_at=?3, provider=?4, account=?5"#,
+            params![
+                worktree_path,
+                issue_ref.id,
+                util::now(),
+                issue_ref.provider,
+                issue_ref.account
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn linked_issue_refs(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Vec<(String, Option<crate::issue::IssueRef>)>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT issue_id, provider, account FROM issue_links WHERE worktree_path=?1 ORDER BY linked_at DESC",
+        )?;
+        let rows = stmt.query_map(params![worktree_path], |row| {
+            let id = row.get::<_, String>(0)?;
+            let provider = row.get::<_, Option<String>>(1)?;
+            let account = row.get::<_, Option<String>>(2)?;
+            let issue_ref = match (provider, account) {
+                (Some(provider), Some(account)) => {
+                    crate::issue::IssueRef::new(provider, account, id.clone()).ok()
+                }
+                _ => None,
+            };
+            Ok((id, issue_ref))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     // --- reflog-undo bookkeeping (which resets are OURS, per worktree) ------
     /// Record a reset target we are about to create, pruning each worktree's
     /// mark set to the freshest 100 (the undo planner only reads ~100 reflog

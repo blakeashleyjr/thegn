@@ -4620,7 +4620,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
             // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
             if cfg.issues.move_on_merge
                 && pr.state == "MERGED"
-                && let Ok(linked) = db.linked_issues(&wt)
+                && let Ok(linked) = db.linked_issue_refs(&wt)
                 && !linked.is_empty()
             {
                 let local_cwd =
@@ -4630,29 +4630,19 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 // Provider-as-plugin: append live plugin issue providers.
                 crate::plugin_providers::extend_issue_router(&mut router);
                 if router.is_configured() {
-                    let patch = thegn_core::issue::IssuePatch {
-                        status: Some(thegn_core::issue::IssueStatus::Done),
-                        ..Default::default()
-                    };
-                    for id in &linked {
-                        match thegn_svc::issue::block_on_tracker(router.update_issue(id, &patch)) {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) | Err(e) => {
-                                tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
-                                let message = crate::hydrate_tracker::move_on_merge_failure_message(
-                                    id,
-                                    &e.to_string(),
-                                );
-                                if let Err(error) = crate::automation_events::emit_once(
-                                    &db,
-                                    "automation_failed",
-                                    id,
-                                    &message,
-                                    &wt,
-                                ) {
-                                    tracing::debug!(target: "thegn::issues", issue = %id, %error, "could not persist move-on-merge failure notification");
-                                }
-                            }
+                    for (id, error) in
+                        crate::handlers::tracker::move_linked_issues_done(&router, &linked)
+                    {
+                        let message =
+                            crate::hydrate_tracker::move_on_merge_failure_message(&id, &error);
+                        if let Err(error) = crate::automation_events::emit_once(
+                            &db,
+                            "automation_failed",
+                            &id,
+                            &message,
+                            &wt,
+                        ) {
+                            tracing::debug!(target: "thegn::issues", issue = %id, %error, "could not persist move-on-merge failure notification");
                         }
                     }
                 }
