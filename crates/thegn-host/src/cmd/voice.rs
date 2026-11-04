@@ -102,19 +102,7 @@ fn validate_credential_reference(reference: &str) -> Result<()> {
 }
 
 fn remove_model(dir: &std::path::Path, name: &str) -> Result<()> {
-    models::sweep_temps(dir)?;
-    let path = models::path_in(dir, name)?;
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let marker = dir.join(format!("ggml-{name}.verified.json"));
-    match std::fs::remove_file(marker) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    models::remove(dir, name)
 }
 
 pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
@@ -302,7 +290,7 @@ fn prompt(label: &str, default: &str) -> Result<String> {
 fn pull(name: &str, yes: bool) -> Result<PathBuf> {
     let artifact = models::model(name)?;
     eprintln!(
-        "Whisper {}: {} bytes ({:.1} MiB), SHA-256 verified.",
+        "Whisper {}: {} bytes ({:.1} MiB), pinned SHA-256; verified after download.",
         name,
         artifact.bytes,
         artifact.bytes as f64 / 1048576.0
@@ -368,7 +356,20 @@ mod tests {
     fn model_remove_is_idempotent() {
         let state = thegn_core::testenv::IsolatedState::new();
         let dir = state.root().join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ggml-tiny.bin"), b"model").unwrap();
+        std::fs::write(dir.join("ggml-tiny.verified.json"), b"marker").unwrap();
+        let stale = dir.join(".thegn-voice-model-stale");
+        std::fs::write(&stale, b"temp").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 + 1);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
         assert!(remove_model(&dir, "tiny").is_ok());
+        assert!(!dir.join("ggml-tiny.bin").exists());
+        assert!(!dir.join("ggml-tiny.verified.json").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         assert!(remove_model(&dir, "tiny").is_ok());
     }
 }

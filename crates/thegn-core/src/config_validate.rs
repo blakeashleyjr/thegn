@@ -295,7 +295,9 @@ pub fn validate_diagnostics_with_policy(
         message,
     }));
     if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
-        if let Err(message) = cfg.voice.validate_credential_transport() {
+        if cfg.voice.kind == crate::config::VoiceKind::Http
+            && let Err(message) = cfg.voice.validate_credential_transport()
+        {
             diagnostics.push(ValidationDiagnostic {
                 severity: ValidationSeverity::Error,
                 message,
@@ -1174,6 +1176,10 @@ mod tests {
                 false,
             ),
             ("[voice]\nendpoint = \"http://stt.example/stt\"\n", true),
+            (
+                "[voice]\nkind = \"command\"\ncredential = \"env:TOKEN\"\nendpoint = \"http://stt.example/stt\"\n",
+                true,
+            ),
         ] {
             let errors = validate_str(body);
             assert_eq!(errors.is_empty(), accepted, "{body}: {errors:?}");
