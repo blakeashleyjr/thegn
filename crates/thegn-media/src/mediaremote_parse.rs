@@ -212,4 +212,33 @@ mod tests {
         assert_eq!(state.title, "Get Lucky");
         assert_eq!(state.artist, "Daft Punk");
     }
+
+    #[test]
+    fn decode_budget_oversized_response_admits_within_the_state_ceiling() {
+        use crate::budget::{MAX_STATE_BYTES, state_bytes};
+        use crate::model::MAX_FIELD_BYTES;
+
+        let big = "a".repeat(MAX_FIELD_BYTES * 3);
+        let response = json!({
+            "title": &big,
+            "artist": &big,
+            "album": &big,
+            "playing": true,
+            "bundleIdentifier": format!("com.example.{big}"),
+        })
+        .to_string();
+        let parsed = decode_get(&response)
+            .expect("a large response decodes")
+            .expect("a track is present");
+        assert_eq!(parsed.player.len(), MAX_FIELD_BYTES * 3);
+
+        let admitted = parsed.admitted();
+        assert_eq!(admitted.player.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.title.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.artist.len(), MAX_FIELD_BYTES);
+        assert_eq!(admitted.album.len(), MAX_FIELD_BYTES);
+        assert!(admitted.art_url.is_none());
+        assert!(admitted.track_id.is_none());
+        assert!(state_bytes(&admitted) <= MAX_STATE_BYTES);
+    }
 }
