@@ -57,6 +57,9 @@ The `issues.list` capability (`thegn api call issues.list` or HTTP `GET
 account is listed with its account, provider, kind and reason; validated rows
 from a partial account are kept. `complete` is true only when all accounts
 answer fully, and the call fails only if every configured account fails.
+With no `limit`, GitHub listing or search that exceeds the 100-issue cap, and a
+full Kaneo project page, are reported as partial accounts; the rows already
+seen are kept and `complete` is false.
 The `issues.get`, `issues.update` and `issues.comment` control API operations
 also accept `account` (HTTP `?account=<name>`) to route an issue to the named
 `[[issues.issue_accounts]]` entry. With `account`, the id must be
@@ -277,6 +280,10 @@ with an unknown head is printed but not cached. The CI panel's failed-job log
 windows and background log ingestion apply a stricter check: they reuse a
 cached window only for the run's current head and only if the job has not
 finished again since the log was fetched.
+When the current provider context is known, `ci logs` and the control API's
+`ci.logs` fetch again instead of reusing a cached log from another context.
+If the current context is unknown, the cached row is still used. The PR queue
+quotes a cached log only when its recorded context matches the current one.
 If run detail is unavailable or the job is not listed, `ci logs` still prints
 the log without a job name or head, warns, and does not cache it. With `--json`,
 the warnings are in a `warnings` array (empty for a cached log); the control
