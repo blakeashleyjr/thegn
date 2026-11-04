@@ -438,7 +438,7 @@ mod tests {
     use crate::plugin::session::tests::FixtureSupervisor;
     use crate::plugin::session::{ResidentSession, SessionEvent, SessionWriter};
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use thegn_core::config::IssuesConfig;
 
     fn sh(script: &str) -> Vec<String> {
@@ -1143,12 +1143,78 @@ done
         (shared, bridge)
     }
 
+    /// Model a live session writer without a plugin reply. Frames leave the
+    /// bounded egress queue after successful writes, while bridge calls stay
+    /// pending until a response or close arrives.
+    struct DrainFixture {
+        stop: Arc<AtomicBool>,
+        written: Arc<AtomicUsize>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl DrainFixture {
+        fn start(shared: Arc<super::super::session::admission::Shared>) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let written = Arc::new(AtomicUsize::new(0));
+            let thread_written = written.clone();
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    if let Some(frame) = shared.pop() {
+                        shared.written(frame.len());
+                        thread_written.fetch_add(1, Ordering::Release);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+            Self {
+                stop,
+                written,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for DrainFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    async fn start_stalled_calls(
+        bridge: Arc<ProviderBridge>,
+        written: Arc<AtomicUsize>,
+        count: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<serde_json::Value, BridgeError>>> {
+        let mut calls = Vec::with_capacity(count);
+        for started in 1..=count {
+            let bridge = bridge.clone();
+            calls.push(tokio::spawn(async move {
+                bridge
+                    .call("issues", "stall", serde_json::Value::Null)
+                    .await
+            }));
+            // Model its complete pipe write before starting another call.
+            // The plugin still never replies, so its pending entry remains.
+            while written.load(Ordering::Acquire) < started {
+                tokio::task::yield_now().await;
+            }
+        }
+        calls
+    }
+
     async fn wait_for_pending(bridge: &ProviderBridge, count: usize) {
+        // Detached transport fixtures drain frames on a real writer thread;
+        // allow that thread to run between polls instead of busy-yielding.
         for _ in 0..10_000 {
             if bridge.pending.lock().unwrap().calls.len() >= count {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("bridge never reached {count} pending calls");
     }
@@ -1163,16 +1229,23 @@ done
     #[test]
     fn saturated_bridge_refuses_the_extra_call_without_growing_pending() {
         let (shared, bridge) = detached_bridge(Duration::from_secs(30));
+        let _drain = DrainFixture::start(shared.clone());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         let (results, extra, after_close) = rt.block_on(async {
-            let calls = futures_util::future::join_all(
-                (0..MAX_QUEUED_FRAMES)
-                    .map(|_| bridge.call("issues", "stall", serde_json::Value::Null)),
-            );
+            let calls = async {
+                futures_util::future::join_all(
+                    start_stalled_calls(bridge.clone(), _drain.written.clone(), MAX_QUEUED_FRAMES)
+                        .await,
+                )
+                .await
+                .into_iter()
+                .map(|result| result.unwrap())
+                .collect::<Vec<_>>()
+            };
             let probe = async {
                 wait_for_pending(&bridge, MAX_QUEUED_FRAMES).await;
                 let extra = bridge
@@ -1267,16 +1340,28 @@ done
     fn independent_provider_bridges_have_independent_pending_capacity() {
         let (shared_a, bridge_a) = detached_bridge(Duration::from_secs(30));
         let (shared_b, bridge_b) = detached_bridge(Duration::from_secs(30));
+        let _drain_a = DrainFixture::start(shared_a.clone());
+        let _drain_b = DrainFixture::start(shared_b.clone());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         let (results_a, extra_a, result_b) = rt.block_on(async {
-            let calls_a = futures_util::future::join_all(
-                (0..MAX_QUEUED_FRAMES)
-                    .map(|_| bridge_a.call("issues", "stall", serde_json::Value::Null)),
-            );
+            let calls_a = async {
+                futures_util::future::join_all(
+                    start_stalled_calls(
+                        bridge_a.clone(),
+                        _drain_a.written.clone(),
+                        MAX_QUEUED_FRAMES,
+                    )
+                    .await,
+                )
+                .await
+                .into_iter()
+                .map(|result| result.unwrap())
+                .collect::<Vec<_>>()
+            };
             let probe_a = async {
                 wait_for_pending(&bridge_a, MAX_QUEUED_FRAMES).await;
                 let extra_a = bridge_a
