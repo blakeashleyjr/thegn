@@ -1371,6 +1371,75 @@ fn race_operator_verbs_are_refused_while_a_drain_holds_the_row() {
     f.close();
 }
 
+// The drain process owns the row claim while its gate process blocks on the
+// fixture FIFO. `merge land` is a separate custody-owned CLI process; the row
+// must still be folding when it performs the ready precheck. The lease clock
+// is not simulated, so no recovery path can admit another drain. Releasing the
+// FIFO completes the original gate exactly once without moving either ref or
+// adding another land audit event.
+#[test]
+fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
+    let mut f = one_row_fixture(FixtureOpts {
+        gate: String::new(),
+        auto_land: false,
+        agent: AgentMode::HeldAtFloor,
+    });
+    let repo = f.repo.clone();
+    let worktree = f.held.clone();
+    let root = f.root.path().to_path_buf();
+    let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    let worktree_tip_before = f.git(&worktree, &["rev-parse", "HEAD"]);
+    make_gate_fifo(&root, "gate-hold");
+    let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
+    let owner = f.start_cli(&["merge", "drain", "--json"]);
+    wait_gate_count(&root, "gate-runs", "start ", 1);
+    let held = row_state(&f);
+    assert_ne!(held.phase, "unclaimed");
+    assert_eq!(held.status, "folding");
+    assert!(held.generation >= 1);
+
+    let wt = worktree.to_str().unwrap().to_owned();
+    let land = f.cli_failing(&["merge", "land", "--worktree", &wt]);
+    assert!(
+        format!("{}{}", land.stdout, land.stderr).contains("merge-queue row is folding, not ready")
+    );
+    assert_eq!(row_state(&f), held);
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before
+    );
+    assert_eq!(
+        f.git(&worktree, &["rev-parse", "HEAD"]),
+        worktree_tip_before
+    );
+    assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
+
+    release_gate(&root, "gate-hold", "gate-open");
+    let winner = f.finish_cli(owner);
+    assert!(winner.status.success());
+    let winner_json: Value = serde_json::from_str(&winner.stdout).unwrap();
+    assert_eq!(winner_json["ready"], json!(["feature"]));
+    let after_drain = row_state(&f);
+    assert_eq!(after_drain.status, "ready");
+    assert_eq!(after_drain.phase, "unclaimed");
+    assert_eq!(gate_count(&root, "gate-runs", "start "), 1);
+    assert_eq!(
+        f.git(&repo, &["rev-parse", "refs/heads/main"]),
+        target_before
+    );
+    assert_eq!(
+        f.git(&worktree, &["rev-parse", "HEAD"]),
+        worktree_tip_before
+    );
+    assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
+
+    f.cli(&["merge", "rm", "--worktree", &wt]);
+    assert!(f.rows().is_empty());
+    gate_release.disarm();
+    f.close();
+}
+
 // The fixture gives each CLI a custody-owned process group, while
 // `integrate_gate::Workspace::spawn` puts the gate in its own group. SIGKILL
 // therefore kills owner A but leaves its FIFO-blocked gate to write `end`.
