@@ -283,6 +283,115 @@ fn stage_worker_access_report(cfg: &Config) {
             "  UNSAFE        pipeline stage `{stage}` agent `{agent}` has a full-access command token while no containment is resolved (heuristic)"
         );
     }
+    stage_worker_readiness_report(cfg);
+}
+
+fn stage_worker_readiness(
+    sandbox_enabled: bool,
+    backend: Backend,
+    mounts: &[thegn_core::sandbox::Mount],
+    worktree: &std::path::Path,
+    git_common_dir: Option<&std::path::Path>,
+    callback_ok: bool,
+    linux_host: bool,
+) -> thegn_core::sandbox_worker_ready::WorkerReadiness {
+    use thegn_core::sandbox_worker_ready::{CallbackBinary, WorkerFacts, classify_worker};
+
+    let (backend, mounts) = if sandbox_enabled {
+        (backend, mounts)
+    } else {
+        (Backend::None, &[][..])
+    };
+    let facts = WorkerFacts {
+        linux_host,
+        backend,
+        mounts,
+        worktree,
+        git_common_dir,
+        callback: if callback_ok {
+            CallbackBinary::Present
+        } else {
+            CallbackBinary::Missing
+        },
+        provider_home: None,
+        provider_home_exists: true,
+    };
+    classify_worker(&facts)
+}
+
+fn worker_readiness_line(
+    readiness: thegn_core::sandbox_worker_ready::WorkerReadiness,
+    backend: Backend,
+) -> String {
+    use thegn_core::sandbox_worker_ready::WorkerReadiness;
+
+    match readiness {
+        WorkerReadiness::Ready => format!(
+            "  worker        ready         stage workers can write the worktree and git metadata under `{}` and reach the callback binary",
+            backend.label()
+        ),
+        WorkerReadiness::UnsupportedPlatform | WorkerReadiness::UnsupportedBackend => format!(
+            "  NOT PROVEN    stage worker containment is {}: this platform or backend is not supported here, which is not a pass",
+            readiness.as_str()
+        ),
+        WorkerReadiness::ContainmentAbsent => format!(
+            "  NOT READY     stage worker: {} \u{2014} no sandbox backend resolved; see Backend selection above",
+            readiness.as_str()
+        ),
+        WorkerReadiness::CannotWriteWorktree => format!(
+            "  NOT READY     stage worker: {} \u{2014} the worktree is not a writable mount",
+            readiness.as_str()
+        ),
+        WorkerReadiness::CannotWriteGitMetadata => format!(
+            "  NOT READY     stage worker: {} \u{2014} the git common dir is not a writable mount",
+            readiness.as_str()
+        ),
+        WorkerReadiness::CallbackUnavailable => format!(
+            "  NOT READY     stage worker: {} \u{2014} the thegn binary was replaced or removed since launch; restart thegn",
+            readiness.as_str()
+        ),
+        WorkerReadiness::ProviderHomeUnavailable => format!(
+            "  NOT READY     stage worker: {} \u{2014} the provider home is missing or not writable",
+            readiness.as_str()
+        ),
+    }
+}
+
+fn stage_worker_readiness_report(cfg: &Config) {
+    if cfg.pipeline.stages.is_empty() {
+        return;
+    }
+    let Some(worktree) = current_worktree_root() else {
+        outln!("  worker        (not inside a git worktree; nothing to probe)");
+        return;
+    };
+    let loc = thegn_core::remote::GitLoc::Local(worktree.clone());
+    let name = worktree
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("stage-worker");
+    let spec = thegn_core::sandbox::resolve(&cfg.sandbox, &loc, name);
+    let git_common_dir = thegn_core::util::git_out(
+        &worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(std::path::PathBuf::from)
+    .filter(|p| p.as_path() != worktree.as_path() && !worktree.starts_with(p));
+    let callback_ok =
+        thegn_core::util::self_exe_path().is_some() && !thegn_core::util::self_exe_is_stale();
+    let linux_host = std::env::consts::OS == "linux";
+    let backend = spec.as_ref().map_or(Backend::None, |s| s.backend);
+    let mounts = spec.as_ref().map_or(&[][..], |s| &s.mounts[..]);
+    let readiness = stage_worker_readiness(
+        cfg.sandbox.enabled,
+        backend,
+        mounts,
+        &worktree,
+        git_common_dir.as_deref(),
+        callback_ok,
+        linux_host,
+    );
+    outln!("{}", worker_readiness_line(readiness, backend));
 }
 
 fn devcontainer_json(cfg: &Config) -> serde_json::Value {
@@ -5956,6 +6065,170 @@ agent = "unsafe"
         cfg.sandbox.enabled = true;
         assert!(unsafe_full_access_stages(&cfg, Backend::Bwrap).is_empty());
         assert_eq!(unsafe_full_access_stages(&cfg, Backend::None).len(), 1);
+    }
+
+    #[test]
+    fn stage_worker_readiness_is_containment_absent_when_the_sandbox_is_disabled() {
+        assert_eq!(
+            stage_worker_readiness(
+                false,
+                Backend::Bwrap,
+                &[],
+                std::path::Path::new("/w/t"),
+                None,
+                true,
+                true,
+            ),
+            thegn_core::sandbox_worker_ready::WorkerReadiness::ContainmentAbsent
+        );
+    }
+
+    #[test]
+    fn stage_worker_readiness_is_unsupported_off_linux_before_anything_else() {
+        assert_eq!(
+            stage_worker_readiness(
+                false,
+                Backend::Bwrap,
+                &[],
+                std::path::Path::new("/w/t"),
+                None,
+                true,
+                false,
+            ),
+            thegn_core::sandbox_worker_ready::WorkerReadiness::UnsupportedPlatform
+        );
+    }
+
+    #[test]
+    fn stage_worker_readiness_is_ready_for_bwrap_with_writable_worktree_and_git_dir() {
+        let mounts = [
+            thegn_core::sandbox::Mount {
+                host: "/w/t".into(),
+                dest: "/w/t".into(),
+                ro: false,
+                cache: false,
+            },
+            thegn_core::sandbox::Mount {
+                host: "/g/c".into(),
+                dest: "/g/c".into(),
+                ro: false,
+                cache: false,
+            },
+        ];
+        assert_eq!(
+            stage_worker_readiness(
+                true,
+                Backend::Bwrap,
+                &mounts,
+                std::path::Path::new("/w/t"),
+                Some(std::path::Path::new("/g/c")),
+                true,
+                true,
+            ),
+            thegn_core::sandbox_worker_ready::WorkerReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn stage_worker_readiness_reports_a_read_only_git_dir_and_a_stale_callback() {
+        let mounts = [
+            thegn_core::sandbox::Mount {
+                host: "/w/t".into(),
+                dest: "/w/t".into(),
+                ro: false,
+                cache: false,
+            },
+            thegn_core::sandbox::Mount {
+                host: "/g/c".into(),
+                dest: "/g/c".into(),
+                ro: true,
+                cache: false,
+            },
+        ];
+        let git_dir = Some(std::path::Path::new("/g/c"));
+        assert_eq!(
+            stage_worker_readiness(
+                true,
+                Backend::Bwrap,
+                &mounts,
+                std::path::Path::new("/w/t"),
+                git_dir,
+                false,
+                true,
+            ),
+            thegn_core::sandbox_worker_ready::WorkerReadiness::CannotWriteGitMetadata
+        );
+
+        let writable_mounts = [
+            mounts[0].clone(),
+            thegn_core::sandbox::Mount {
+                ro: false,
+                ..mounts[1].clone()
+            },
+        ];
+        assert_eq!(
+            stage_worker_readiness(
+                true,
+                Backend::Bwrap,
+                &writable_mounts,
+                std::path::Path::new("/w/t"),
+                git_dir,
+                false,
+                true,
+            ),
+            thegn_core::sandbox_worker_ready::WorkerReadiness::CallbackUnavailable
+        );
+    }
+
+    #[test]
+    fn stage_worker_readiness_is_unsupported_backend_for_systemd() {
+        assert_eq!(
+            stage_worker_readiness(
+                true,
+                Backend::Systemd,
+                &[],
+                std::path::Path::new("/w/t"),
+                None,
+                true,
+                true,
+            ),
+            thegn_core::sandbox_worker_ready::WorkerReadiness::UnsupportedBackend
+        );
+    }
+
+    #[test]
+    fn worker_readiness_line_covers_every_variant_and_only_ready_is_a_pass() {
+        use thegn_core::sandbox_worker_ready::WorkerReadiness;
+
+        let variants = [
+            WorkerReadiness::Ready,
+            WorkerReadiness::ContainmentAbsent,
+            WorkerReadiness::UnsupportedPlatform,
+            WorkerReadiness::UnsupportedBackend,
+            WorkerReadiness::CannotWriteWorktree,
+            WorkerReadiness::CannotWriteGitMetadata,
+            WorkerReadiness::CallbackUnavailable,
+            WorkerReadiness::ProviderHomeUnavailable,
+        ];
+        for readiness in variants {
+            let line = worker_readiness_line(readiness, Backend::Bwrap);
+            assert!(line.contains(readiness.as_str()), "{line}");
+            match readiness {
+                WorkerReadiness::Ready => {
+                    assert!(line.starts_with("  worker        ready"), "{line}")
+                }
+                WorkerReadiness::UnsupportedPlatform | WorkerReadiness::UnsupportedBackend => {
+                    assert!(line.contains("NOT PROVEN"), "{line}");
+                }
+                WorkerReadiness::ContainmentAbsent
+                | WorkerReadiness::CannotWriteWorktree
+                | WorkerReadiness::CannotWriteGitMetadata
+                | WorkerReadiness::CallbackUnavailable
+                | WorkerReadiness::ProviderHomeUnavailable => {
+                    assert!(line.contains("NOT READY"), "{line}");
+                }
+            }
+        }
     }
 
     #[test]
