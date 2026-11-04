@@ -136,6 +136,9 @@ pub enum SessionAction {
         /// The owner id holding `--lease`.
         #[arg(long, value_name = "ID", requires = "lease")]
         owner: Option<String>,
+        /// The Lead lease generation printed by `dispatch lease acquire`; a stale generation is refused.
+        #[arg(long, value_name = "GEN", requires = "lease", value_parser = clap::value_parser!(i64).range(1..))]
+        lease_gen: Option<i64>,
         /// Resume an eligible unfinished pipeline roster row (THE-86): an
         /// unstamped spawning/running row is refused because its worker may
         /// still be live; otherwise the source is reconciled and the fresh
@@ -482,6 +485,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             chunk,
             lease,
             owner,
+            lease_gen,
             resume_work: resume_row,
             json,
         } => {
@@ -491,8 +495,13 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     "--lease applies to a stage dispatch (--stage --issue) or --resume-work"
                 );
             }
-            let resume_proof = match (lease.as_deref(), owner.as_deref()) {
-                (Some(name), Some(owner)) => LeadProof::Lease { name, owner },
+            let resume_proof = match (lease.as_deref(), owner.as_deref(), lease_gen) {
+                (Some(name), Some(owner), Some(generation)) => LeadProof::Fenced {
+                    name,
+                    owner,
+                    generation,
+                },
+                (Some(name), Some(owner), None) => LeadProof::Lease { name, owner },
                 _ => LeadProof::Unbound,
             };
             if let Some(row_id) = resume_row {
@@ -520,6 +529,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         chunk: chunk.as_deref(),
                         lease: lease.as_deref(),
                         owner: owner.as_deref(),
+                        lease_gen,
                         agent: agent.as_deref(),
                         // clap requires --worktree unless --resume-work (and
                         // the two conflict), so this is always Some here.
@@ -848,6 +858,7 @@ struct StageDispatch<'a> {
     chunk: Option<&'a str>,
     lease: Option<&'a str>,
     owner: Option<&'a str>,
+    lease_gen: Option<i64>,
     /// Explicit `--agent`, overriding the stage's configured one.
     agent: Option<&'a str>,
     worktree: &'a str,
@@ -1064,8 +1075,13 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     // the previous attempt is unaffected — only rows still occupying a slot
     // refuse. The deliberate-duplicate escape hatch lives on `dispatch claim
     // --allow-duplicate <reason>`, which records the justification.
-    let proof = match (d.lease, d.owner) {
-        (Some(name), Some(owner)) => LeadProof::Lease { name, owner },
+    let proof = match (d.lease, d.owner, d.lease_gen) {
+        (Some(name), Some(owner), Some(generation)) => LeadProof::Fenced {
+            name,
+            owner,
+            generation,
+        },
+        (Some(name), Some(owner), None) => LeadProof::Lease { name, owner },
         _ => LeadProof::Unbound,
     };
     let outcome = super::dispatch::claim_admitted_with_refresh_led(
@@ -2417,6 +2433,64 @@ mod resume_work_tests {
         assert_eq!(
             db.get_dispatch(source).unwrap().unwrap().status,
             AgentDispatchStatus::Failed
+        );
+    }
+
+    #[test]
+    fn lease_gen_session_open_requires_a_lease() {
+        use clap::Parser as _;
+
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn",
+                "session",
+                "open",
+                "--stage",
+                "code",
+                "--issue",
+                "linear:X",
+                "--worktree",
+                "/w",
+                "--lease",
+                "l",
+                "--owner",
+                "o",
+                "--lease-gen",
+                "2",
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn",
+                "session",
+                "open",
+                "--stage",
+                "code",
+                "--issue",
+                "linear:X",
+                "--worktree",
+                "/w",
+                "--lease-gen",
+                "2",
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thegn",
+                "session",
+                "open",
+                "--resume-work",
+                "5",
+                "--lease",
+                "l",
+                "--owner",
+                "o",
+                "--lease-gen",
+                "2",
+            ])
+            .is_ok()
         );
     }
 }
