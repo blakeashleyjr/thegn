@@ -1,0 +1,9 @@
+# THE-523 path-based writer caller ledger; this allowlist is SHRINK-ONLY.
+# Enforced by crates/thegn-core/tests/fsperm_path_write_ratchet.rs.
+# Blind spot: crates outside thegn-core, thegn-host, and thegn-svc are not scanned.
+# machine0/attest.rs: provisioning attestation record; no credential.
+# projection/manifest.rs: projection ownership manifest has identity digest + generation.
+# share/mod.rs: share credential files; THE-328 owns atomic/no-follow materialisation.
+machine0/attest.rs
+projection/manifest.rs
+share/mod.rs
