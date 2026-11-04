@@ -1187,7 +1187,9 @@ const MAX_LOSS_MARK_BYTES: usize = 1024 * 1024;
 const MAX_LOSS_STREAMS: usize = 2 * limits::MAX_ROOTS * limits::MAX_SERVERS_PER_ROOT;
 /// Per-document loss rows shown for one root (the summary counts them all).
 const MAX_LOSS_ROWS: usize = 64;
+/// Diagnostic code identifying warnings for servers backing off after failed starts.
 const SERVER_CODE: &str = "thegn-lsp-server";
+/// Maximum backing-off server warning rows shown for one root.
 const MAX_SERVER_ROWS: usize = limits::MAX_SERVERS_PER_ROOT;
 
 /// Owned bytes of one loss entry (its stream key plus the empty set).
@@ -1429,6 +1431,7 @@ impl LspDiagnostics {
     }
 
     /// One bounded warning per server backing off after a failed start (see [`LspInner::failed_servers`]).
+    /// The retry countdown is a snapshot refreshed at hydration apply, so it may be stale between hydrations.
     fn server_rows(&self, root: &Path) -> Vec<DiagnosticItem> {
         self.servers
             .get(root)
