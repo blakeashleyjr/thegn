@@ -87,6 +87,80 @@ where
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownResult {
+    Stopped,
+    Refused(String),
+    StillRunning,
+}
+
+/// Ask every verified listener to shut down, then wait (under the ONE `deadline`) for each to disappear.
+/// Results come back in `ours` order, one per listener.
+async fn shutdown_ours<R, RF, P, PF>(
+    ours: &[PathBuf],
+    deadline: tokio::time::Instant,
+    mut request: R,
+    probe: P,
+) -> Vec<(PathBuf, ShutdownResult)>
+where
+    R: FnMut(PathBuf) -> RF,
+    RF: Future<Output = std::result::Result<(), String>>,
+    P: FnMut(PathBuf) -> PF,
+    PF: Future<Output = bool>,
+{
+    let mut refused = HashMap::new();
+    let mut waiting = Vec::new();
+    for path in ours {
+        match probe_before_deadline(deadline, request(path.clone())).await {
+            Some(Ok(())) => waiting.push(path.clone()),
+            Some(Err(error)) => {
+                refused.insert(path.clone(), error);
+            }
+            None => {
+                refused.insert(
+                    path.clone(),
+                    "stop deadline reached before shutdown".to_string(),
+                );
+            }
+        }
+    }
+    let survivors = wait_until_stopped(
+        waiting,
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        probe,
+    )
+    .await
+    .into_iter()
+    .collect::<HashSet<_>>();
+    ours.iter()
+        .map(|path| {
+            let result = if let Some(error) = refused.remove(path) {
+                ShutdownResult::Refused(error)
+            } else if survivors.contains(path) {
+                ShutdownResult::StillRunning
+            } else {
+                ShutdownResult::Stopped
+            };
+            (path.clone(), result)
+        })
+        .collect()
+}
+
+/// The failure labels `stop_verdict` reports: a refused listener as `"<label> (<error>)"`, a survivor as `"<label>"`.
+fn shutdown_failures(
+    results: &[(PathBuf, ShutdownResult)],
+    label: impl Fn(&std::path::Path) -> String,
+) -> Vec<String> {
+    results
+        .iter()
+        .filter_map(|(path, result)| match result {
+            ShutdownResult::Stopped => None,
+            ShutdownResult::Refused(error) => Some(format!("{} ({})", label(path), error)),
+            ShutdownResult::StillRunning => Some(label(path)),
+        })
+        .collect()
+}
+
 async fn classify_targets<F, Fut>(
     targets: Vec<PathBuf>,
     deadline: tokio::time::Instant,
@@ -249,53 +323,43 @@ fn stop(cfg: &Config) -> Result<()> {
             return Ok(());
         }
 
-        let mut refused = HashMap::new();
-        let mut waiting = Vec::new();
-        for path in &ours {
-            let client = ControlClient::new(ControlAddr::Unix(path.clone()));
-            match probe_before_deadline(
-                stop_deadline,
-                client.call_raw("POST", "/v1/daemon/shutdown", None),
-            )
-            .await
-            {
-                Some(Ok(_)) => waiting.push(path.clone()),
-                Some(Err(error)) => {
-                    refused.insert(path.clone(), error.to_string());
-                }
-                None => {
-                    refused.insert(path.clone(), "stop deadline reached before shutdown".into());
-                }
-            }
-        }
-        let survivors = wait_until_stopped(
-            waiting,
-            stop_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        let results = shutdown_ours(
+            &ours,
+            stop_deadline,
+            |path| async move {
+                ControlClient::new(ControlAddr::Unix(path))
+                    .call_raw("POST", "/v1/daemon/shutdown", None)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
             |path| async move {
                 let health = ControlClient::new(ControlAddr::Unix(path)).health().await;
                 still_live(&health)
             },
         )
         .await;
-        let survivors = survivors.into_iter().collect::<HashSet<_>>();
-        let mut failures = Vec::new();
-        for path in &ours {
+        for (path, result) in &results {
             let client = ControlClient::new(ControlAddr::Unix(path.clone()));
             let label = crate::daemon::client::socket_label(&client);
-            if let Some(error) = refused.get(path) {
-                outln!("shutdown refused for {}: {}", label, error);
-                failures.push(format!("{} ({})", label, error));
-            } else if survivors.contains(path) {
-                outln!(
-                    "still running after {}s: {}",
-                    crate::daemon::service::SHUTDOWN_TOTAL_DEADLINE.as_secs(),
-                    label
-                );
-                failures.push(label);
-            } else {
-                outln!("stopped {}", label);
+            match result {
+                ShutdownResult::Refused(error) => {
+                    outln!("shutdown refused for {}: {}", label, error);
+                }
+                ShutdownResult::StillRunning => {
+                    outln!(
+                        "still running after {}s: {}",
+                        crate::daemon::service::SHUTDOWN_TOTAL_DEADLINE.as_secs(),
+                        label
+                    );
+                }
+                ShutdownResult::Stopped => outln!("stopped {}", label),
             }
         }
+        let failures = shutdown_failures(&results, |path| {
+            let client = ControlClient::new(ControlAddr::Unix(path.to_path_buf()));
+            crate::daemon::client::socket_label(&client)
+        });
         stop_verdict(ours.len(), &failures, &unknown)
     })
 }
@@ -317,8 +381,8 @@ async fn probe_before_deadline<F: Future>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Classified, classify_targets, probe_before_deadline, still_live, stop_targets,
-        stop_verdict, wait_until_stopped,
+        Classified, ShutdownResult, classify_targets, probe_before_deadline, shutdown_failures,
+        shutdown_ours, still_live, stop_targets, stop_verdict, wait_until_stopped,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -595,5 +659,107 @@ mod tests {
         .await;
         assert!(survivors.is_empty());
         assert!(tokio::time::Instant::now() - started < Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ours_reports_current_plus_two_legacy_listeners_individually() {
+        let current = PathBuf::from("current");
+        let legacy_a = PathBuf::from("legacy_a");
+        let legacy_b = PathBuf::from("legacy_b");
+        let ours = vec![current.clone(), legacy_a.clone(), legacy_b.clone()];
+        let started = tokio::time::Instant::now();
+        let results = shutdown_ours(
+            &ours,
+            started + Duration::from_secs(3),
+            |path| async move {
+                if path.as_os_str() == "legacy_a" {
+                    Err("503 refused".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |path| async move { path.as_os_str() == "legacy_b" },
+        )
+        .await;
+
+        assert_eq!(
+            results,
+            vec![
+                (current, ShutdownResult::Stopped),
+                (legacy_a, ShutdownResult::Refused("503 refused".to_string())),
+                (legacy_b, ShutdownResult::StillRunning),
+            ]
+        );
+        let failures = shutdown_failures(&results, |path| path.display().to_string());
+        assert_eq!(
+            failures,
+            vec!["legacy_a (503 refused)".to_string(), "legacy_b".to_string()]
+        );
+        let error = stop_verdict(3, &failures, &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("2 of 3 listeners still live"));
+        assert!(message.contains("legacy_a"));
+        assert!(message.contains("legacy_b"));
+        let elapsed = tokio::time::Instant::now() - started;
+        assert!(elapsed >= Duration::from_secs(3));
+        assert!(elapsed < Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ours_with_every_listener_gone_has_no_failures() {
+        let ours = vec![
+            PathBuf::from("current"),
+            PathBuf::from("legacy_a"),
+            PathBuf::from("legacy_b"),
+        ];
+        let results = shutdown_ours(
+            &ours,
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            |_path| async { Ok(()) },
+            |_path| async { false },
+        )
+        .await;
+
+        assert!(
+            results
+                .iter()
+                .all(|(_, result)| matches!(result, ShutdownResult::Stopped))
+        );
+        let failures = shutdown_failures(&results, |path| path.display().to_string());
+        assert!(failures.is_empty());
+        assert!(stop_verdict(3, &[], &[]).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_shutdown_request_spends_the_one_total_deadline_and_never_reports_success() {
+        let a = PathBuf::from("a");
+        let b = PathBuf::from("b");
+        let ours = vec![a.clone(), b.clone()];
+        let started = tokio::time::Instant::now();
+        let results = shutdown_ours(
+            &ours,
+            started + Duration::from_secs(2),
+            |path| async move {
+                if path.as_os_str() == "a" {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                Ok(())
+            },
+            |_path| async { true },
+        )
+        .await;
+
+        assert_eq!(
+            results[0],
+            (
+                a,
+                ShutdownResult::Refused("stop deadline reached before shutdown".to_string())
+            )
+        );
+        assert_eq!(results[1].1, ShutdownResult::StillRunning);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(2)
+        );
     }
 }
