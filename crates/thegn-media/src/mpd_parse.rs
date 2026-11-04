@@ -233,7 +233,7 @@ mod tests {
         use crate::model::MAX_FIELD_BYTES;
 
         let big = "a".repeat(MAX_FIELD_BYTES * 3);
-        let lines = vec![
+        let lines = [
             format!("Title: {big}"),
             format!("Artist: {big}"),
             format!("Album: {big}"),
