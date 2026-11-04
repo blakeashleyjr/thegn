@@ -865,15 +865,16 @@
     },
     {
       "change": "monitor-framework",
-      "lifecycle": "active",
-      "disposition": "strategic-unstarted",
+      "archive_path": "openspec/changes/archive/2026-11-03-monitor-framework/",
+      "lifecycle": "archived",
+      "disposition": "alpha-delivery",
       "owners": [
         {
           "issue": "THE-1362",
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Framework layers shipped in batches 42-49; the task ledger is re-owned to THE-1362 for evidence ticks and the X-2/X-3/SPEC-1 cleanup."
+      "summary": "Framework layers shipped in batches 42-49; ledger ticked with evidence in batches 83 and 85 and archived in batch 85."
     },
     {
       "change": "monitor-overview",

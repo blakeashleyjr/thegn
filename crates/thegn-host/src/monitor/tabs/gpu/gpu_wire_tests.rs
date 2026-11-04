@@ -120,7 +120,7 @@ fn gpu_overlay_ingest_is_visible_only_and_pause_freezes_model() {
 }
 
 #[test]
-fn gpu_overlay_uses_legacy_view_when_engine_collector_is_absent() {
+fn gpu_overlay_uses_section_stack_view_when_engine_collector_is_absent() {
     let mut overlay = overlay();
     let mut frame = frame();
     frame.parts.gpu_engines.devices.clear();
@@ -131,7 +131,7 @@ fn gpu_overlay_uses_legacy_view_when_engine_collector_is_absent() {
 
     assert!(matches!(
         overlay.view(),
-        crate::monitor::board::ActiveView::Legacy(_)
+        crate::monitor::board::ActiveView::SectionStack(_)
     ));
 }
 
