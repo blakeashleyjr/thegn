@@ -382,6 +382,37 @@
       "changes": [
         "add-voice-mode"
       ]
+    },
+    {
+      "issue": "THE-1672",
+      "project": "Plugin UI Platform",
+      "changes": [],
+      "no_spec_rationale": "Tracking epic only: its four slices THE-1673 through THE-1676 own the OpenSpec changes."
+    },
+    {
+      "issue": "THE-1673",
+      "project": "Plugin UI Platform",
+      "changes": [
+        "add-plugin-app-tabs"
+      ]
+    },
+    {
+      "issue": "THE-1674",
+      "project": "Plugin UI Platform",
+      "changes": [],
+      "no_spec_rationale": "Not started: its proposal follows the add-plugin-app-tabs landing (THE-1673)."
+    },
+    {
+      "issue": "THE-1675",
+      "project": "Plugin UI Platform",
+      "changes": [],
+      "no_spec_rationale": "Not started: its proposal follows the add-plugin-app-tabs landing (THE-1673)."
+    },
+    {
+      "issue": "THE-1676",
+      "project": "Plugin UI Platform",
+      "changes": [],
+      "no_spec_rationale": "Not started: its proposal follows the add-plugin-app-tabs landing (THE-1673)."
     }
   ]
 }

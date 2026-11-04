@@ -544,6 +544,7 @@ fn clamp_notice(key: &str, clamped: &[thegn_core::channel::Feature]) -> Option<S
         ("observe", _) => Feature::Observe,
         ("placement", _) => Feature::Placement,
         ("voice", _) => Feature::Voice,
+        ("apps", _) => Feature::PluginApps,
         _ => return None,
     };
     clamped.contains(&feature).then(|| {
@@ -780,6 +781,10 @@ mod tests {
         assert!(clamp_notice("sandbox.remote.host", &clamped).is_some());
         assert_eq!(clamp_notice("ui.language", &clamped), None);
         assert_eq!(clamp_notice("issues.provider", &clamped), None);
+        let plugin_apps = [Feature::PluginApps];
+        let notice = clamp_notice("apps.default_tab", &plugin_apps).unwrap();
+        assert!(notice.contains("configuration for [apps] was disabled"));
+        assert!(notice.contains("plugin_apps"));
         let cfg = Config::default();
         let json = serde_json::to_value(cfg.value_at("issues").unwrap()).unwrap();
         assert!(json.is_object());

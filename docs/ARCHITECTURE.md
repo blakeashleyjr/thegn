@@ -20,7 +20,9 @@ thegn-host  ── compositor: tokio runtime, portable-pty, termwiz Surface, chr
    │                        forge/CI models + parsers
    ├─► thegn-media, thegn-metrics, thegn-proc ── per-OS leaf crates (core-free)
    ├─► thegn-voice ── optional CPAL/Whisper leaf; handles owned by voice worker
-   └─► tg-kit + gtui-* ── the embedded-app contract (AppTile) and the Observe app
+   ├─► tg-kit + gtui-* ── the embedded-app contract (AppTile) and the Observe app
+   └─► thegn-plugin-ui ── pure widget engine for plugin app tabs (AppView → ratatui buffer;
+                           input → AppEvent); no I/O
 
 thegn-proxy ── OPT-IN model-proxy daemon (binary `tgproxy`): the axum I/O shell
    └─► thegn-core   around `thegn_core::proxy`'s pure routing logic. Its own
@@ -227,6 +229,12 @@ the plugin runtime (`openspec/specs/plugin-runtime`): loader (`[[plugins]]`
   `provider.call` (`ProviderBridge` correlation + per-plugin timeout) and
   joins every `IssueRouter` beside configured accounts. Nothing plugin-side
   ever touches the idle loop (channel + waker, like every producer).
+
+Plugin app tabs use the adapter in `apps/plugin.rs` and loop glue in
+`handlers/plugin_apps.rs`. Reliable app requests are keyed by the resident
+`SessionGen`, so responses from an old process cannot complete a new session's
+request. Their deadlines are folded into the poll timeout only while a request
+is pending; an idle app adds no timer or wake source.
 
 Resident process ownership lives in `thegn-svc::plugin::session`; platform I/O
 and child identity operations are confined to `plugin/platform/`. That narrow

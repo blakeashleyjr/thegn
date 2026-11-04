@@ -8101,6 +8101,7 @@ dependencies = [
  "thegn-core",
  "thegn-media",
  "thegn-metrics",
+ "thegn-plugin-ui",
  "thegn-proc",
  "thegn-svc",
  "thegn-voice",
@@ -8147,6 +8148,18 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thegn-proc",
+]
+
+[[package]]
+name = "thegn-plugin-ui"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "tg-kit",
+ "thegn-core",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

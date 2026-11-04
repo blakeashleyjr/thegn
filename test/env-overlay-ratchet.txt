@@ -336,6 +336,8 @@ placement.preset
 placement.spillover_envs
 placement.strictest_allowed_mode
 plugins.api
+# plugins.background is per-plugin permission and must never be granted by an ambient environment variable.
+plugins.background
 plugins.capabilities
 plugins.command
 plugins.cwd
