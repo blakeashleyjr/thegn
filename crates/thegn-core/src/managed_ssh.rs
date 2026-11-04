@@ -1866,7 +1866,7 @@ mod tests {
 
         let mut winners = Vec::new();
         let mut changed = 0;
-        for (next, result) in outcomes {
+        for (_next, result) in outcomes {
             match result {
                 Ok(published) => winners.push(published),
                 Err(error) => {
