@@ -157,7 +157,10 @@ dashboard (`j`/`k` or the arrow keys, `esc` to close):
 - **loop** — the event-loop rollup: wakes/s, render / input / flush / drain /
   switch latency, the frame mix, PTY throughput, and the idle and render-busy
   ratios. Populated only with `THEGN_PERF=1` (or while the Telemetry panel
-  section is open); otherwise it says so.
+  section is open); otherwise it says so. Render and `input→submit` show
+  p50 · p95 · p99; `input→sink` and `submit→sink` show p95 · p99. Below 20
+  samples, render/input show p50 and the sink rows show p99 with `n=<count>`
+  and `(sparse)`; empty windows say `no samples`.
 
 The modal narrows gracefully: below ~70 columns the two-column key/value grids
 fold to one and the session table sheds its worktree and size columns.

@@ -1058,6 +1058,7 @@ mod tests {
             authorized_at: 1,
             proxy_worktree: None,
             rotation_recovery: None,
+            generation: 0,
         };
         let mut cases = vec![None];
         for field in ["provider", "account", "instance", "path", "fingerprint"] {
@@ -1105,6 +1106,7 @@ mod tests {
             authorized_at: 1,
             proxy_worktree: None,
             rotation_recovery: None,
+            generation: 0,
         };
         let reads = std::cell::Cell::new(0);
         for fail in [true, false] {

@@ -2741,6 +2741,52 @@ fn share_secret_capture_sees_events() {
 
 #[cfg(unix)]
 #[test]
+fn share_secret_never_reaches_a_rendered_crash_report() {
+    let _serial = share_secret_test_lock();
+    let (capture, _fallback) = install_share_secret_capture();
+    capture.clear();
+    let canary = "tg-b84-share-canary-crash";
+    let script_dir = tempfile::tempdir().expect("private fake-client directory");
+    let state = tempfile::tempdir().expect("private share state directory");
+    let script = script_dir.path().join("fake-client");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'auth failed for %s\\n' \"$BORE_SECRET\"\nprintf 'auth failed for %s\\n' \"$BORE_SECRET\" >&2\nexit 1\n",
+    )
+    .expect("write fake client");
+    let plan = share_secret_plan(canary, &script);
+
+    let error = start(&plan, state.path(), Duration::from_secs(5)).expect_err("client must fail");
+
+    let mut ring_tail = capture.records();
+    ring_tail.push(format!("WARN thegn::share plan={plan:?}"));
+    ring_tail.push(format!("WARN thegn::share start failed: {error:#}"));
+    ring_tail.push(format!("WARN thegn::share child env BORE_SECRET={canary}"));
+    ring_tail.push(format!(
+        "WARN thegn::share legacy argv bore local 3000 --secret {canary}"
+    ));
+    let report = thegn_core::diagnostics::CrashReport {
+        identity: thegn_core::diagnostics::Identity::default(),
+        run_id: "b84share".into(),
+        proc_kind: thegn_core::diagnostics::ProcKind::Host,
+        thread: "main".into(),
+        panic_line: format!("thread 'main' panicked at share: {error:?} BORE_SECRET={canary}"),
+        backtrace: "0: share_frame".into(),
+        ring_tail,
+    };
+    let rendered = report.render();
+
+    assert!(
+        !rendered.contains(canary),
+        "rendered crash report contained the secret: {rendered}"
+    );
+    assert!(rendered.contains("BORE_SECRET=***redacted***"));
+    assert!(rendered.contains("--secret ***redacted***"));
+    assert!(!state.path().join("frpc.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn share_secrets_never_reach_tracing_errors_or_files_on_a_clean_start_and_stop() {
     let _serial = share_secret_test_lock();
     let (capture, _fallback) = install_share_secret_capture();

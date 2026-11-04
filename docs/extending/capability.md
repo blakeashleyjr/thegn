@@ -27,10 +27,15 @@ Every external door projects `thegn_core::capability::CATALOG`
      file, reason column included, from the table) — that allowlist is
      shrink-only (`ratchet_pins_surface_gaps`): adding an excuse fails until the
      file grows a line, burning one means deleting its line, and an empty table
-     is pinned empty. A surface a capability is _deliberately never_ exposed on
-     (e.g. admin verbs off MCP/plugin) is expressed by narrowing the row's
-     surface set, never by an excuse. A routed-but-inert row marks itself with
-     `stub: Some(reason)` so `thegn api coverage` counts it apart.
+     is pinned empty. Every gap also needs a row in `GAP_DISPOSITIONS` (a typed
+     `GapDisposition`: `Deferred { review }` names the issue that owns it), and
+     `just ratchet-update` regenerates docs/api/surface-gaps.md;
+     `gap_dispositions_cover_every_gap_exactly` and
+     `surface_gaps_doc_matches_the_table` fail otherwise. A surface a
+     capability is _deliberately never_ exposed on (e.g. admin verbs off
+     MCP/plugin) is expressed by narrowing the row's surface set, never by an
+     excuse. A routed-but-inert row marks itself with `stub: Some(reason)` so
+     `thegn api coverage` counts it apart.
 5. **Wire schema**: new wire types derive `schemars::JsonSchema`, join
    `tests/control_schema.rs`'s list, and the snapshot is regenerated
    (`THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-svc --test
