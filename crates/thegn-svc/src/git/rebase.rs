@@ -34,6 +34,14 @@ fn read_rebase_marker(loc: &GitLoc, rel: &str) -> Result<Option<Vec<u8>>> {
         .with_context(|| format!("read sequencer marker {rel}"))
 }
 
+/// Markers that mean git's apply backend owns the sequencer: an apply-backend
+/// `git rebase` writes `onto`/`rebasing`, `git am` writes `applying`.
+const APPLY_BACKEND_MARKERS: [&str; 3] = [
+    "rebase-apply/onto",
+    "rebase-apply/rebasing",
+    "rebase-apply/applying",
+];
+
 /// Resolve and read the local live todo without following a final-component
 /// symlink. A missing path is distinct from an unreadable or non-regular one.
 fn read_local_pending_todo(loc: &GitLoc) -> Result<Option<(std::path::PathBuf, Vec<u8>)>> {
@@ -607,10 +615,17 @@ pub trait RebaseOps: GitBackend {
         run_w(loc, &[], &["rebase", "--abort"]).map(|_| ())
     }
 
-    /// The paused rebase's live state, or `None` when no interactive rebase
-    /// is in progress.
+    /// The paused rebase's live state, or `None` when no sequencer state is
+    /// present. Apply-backend rebase and `git am` state is an error.
     fn rebase_status(&self, loc: &GitLoc) -> Result<Option<RebaseStatus>> {
         let Some(onto) = read_rebase_marker(loc, "rebase-merge/onto")? else {
+            for marker in APPLY_BACKEND_MARKERS {
+                if read_rebase_marker(loc, marker)?.is_some() {
+                    return Err(anyhow!(
+                        "a rebase that is not an interactive thegn rebase, or a git am, is in progress ({marker} exists); finish or abort it with git (git rebase --continue/--abort or git am --continue/--abort) before using the rebase editor"
+                    ));
+                }
+            }
             return Ok(None);
         };
         let head_name = read_rebase_marker(loc, "rebase-merge/head-name")?
@@ -1274,6 +1289,45 @@ mod tests {
             .expect("rebase markers indicate an active rebase");
         assert!(status.done.is_empty());
         assert_eq!(status.remaining.len(), 1);
+    }
+
+    #[test]
+    fn rebase_status_reports_an_apply_backend_rebase_as_an_error() {
+        let r = repo("rebase-status-apply-backend");
+        let rebase_apply = r.dir.join(".git/rebase-apply");
+        std::fs::create_dir_all(&rebase_apply).unwrap();
+        std::fs::write(rebase_apply.join("onto"), "abc\n").unwrap();
+        std::fs::write(rebase_apply.join("rebasing"), "").unwrap();
+
+        let error = CliGit
+            .rebase_status(&r.loc())
+            .expect_err("an apply-backend rebase is in progress");
+        assert!(format!("{error:#}").contains("rebase-apply"));
+    }
+
+    #[test]
+    fn rebase_status_reports_git_am_in_progress_as_an_error() {
+        let r = repo("rebase-status-git-am");
+        let rebase_apply = r.dir.join(".git/rebase-apply");
+        std::fs::create_dir_all(&rebase_apply).unwrap();
+        std::fs::write(rebase_apply.join("applying"), "").unwrap();
+        std::fs::write(rebase_apply.join("next"), "1\n").unwrap();
+        std::fs::write(rebase_apply.join("last"), "1\n").unwrap();
+
+        let error = CliGit
+            .rebase_status(&r.loc())
+            .expect_err("git am is in progress");
+        assert!(format!("{error:#}").contains("rebase-apply"));
+    }
+
+    #[test]
+    fn rebase_status_with_no_sequencer_state_is_none() {
+        let r = repo("rebase-status-clean");
+        r.commit_file("initial.txt", "initial\n", "initial");
+        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
+
+        std::fs::create_dir_all(r.dir.join(".git/rebase-apply")).unwrap();
+        assert!(CliGit.rebase_status(&r.loc()).unwrap().is_none());
     }
 
     #[test]
