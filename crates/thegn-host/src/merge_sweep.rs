@@ -2776,7 +2776,7 @@ mod retry_tests {
         let claim = fixture
             .db
             .admit_merge_claim(&thegn_core::store::MergeClaimRequest {
-                worktree,
+                worktree: worktree.clone(),
                 branch: row.branch,
                 repo_root: fixture.root.to_string_lossy().into_owned(),
                 target_branch: row.target_branch,
