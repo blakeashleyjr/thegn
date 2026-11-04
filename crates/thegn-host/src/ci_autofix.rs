@@ -40,8 +40,13 @@ pub(crate) fn authorize(
     }
     let root = thegn_core::repo::main_worktree(Path::new(&entry.worktree))
         .unwrap_or_else(|| Path::new(&entry.worktree).to_path_buf());
+    if full.repo_ci(&root).autofix.mode == CiAutofixMode::Off {
+        return;
+    }
     let location = db.location_for(&entry.worktree).ok().flatten();
     let loc = thegn_core::remote::GitLoc::from_db(&entry.worktree, location.as_deref());
+    // Remote/provider readers deliberately have no current context: resolving it would run git
+    // through a remote control path, so known-context cached logs fail closed until refreshed.
     let current = crate::ci_refresh::reader_cache_context(&loc, &full.repo_ci(&root));
     authorize_entry(full, db, &entry, current.as_deref(), None);
 }
@@ -69,7 +74,18 @@ fn authorize_entry(
     current_context: Option<&str>,
     selected_forge: Option<&dyn Forge>,
 ) {
+    // Keep Off mode silent even when a human clicks a candidate that has gone stale.
+    let root = thegn_core::repo::main_worktree(Path::new(&entry.worktree))
+        .unwrap_or_else(|| Path::new(&entry.worktree).to_path_buf());
+    if full.repo_ci(&root).autofix.mode == CiAutofixMode::Off {
+        return;
+    }
     if !thegn_core::ci_log::cached_log_context_matches(entry, current_context) {
+        tracing::info!(
+            target: "thegn::ci_autofix",
+            job = %entry.job_name,
+            "holding CI autofix authorization because cached provider context differs"
+        );
         let message = format!(
             "CI job {} failed, but its cached log belongs to another provider context than this worktree's current one; autofix is held until the log is refreshed",
             entry.job_name
@@ -1159,6 +1175,86 @@ mod tests {
                 handoff.entry.context
             )
         );
+    }
+
+    #[test]
+    fn authorize_off_mode_stays_silent_for_a_context_mismatch() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Off, &fixture.pr.head_ref_oid);
+        handoff.entry.context = "github:github.com/acme/other".into();
+
+        authorize_entry(
+            &handoff.config,
+            &handoff.db,
+            &handoff.entry,
+            Some("github:github.com/acme/repo"),
+            Some(&handoff.forge),
+        );
+
+        assert!(handoff.db.get_unread_notifications().unwrap().is_empty());
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+    }
+
+    #[test]
+    fn authorize_remote_provider_wrapper_refuses_known_context_until_refreshed() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Auto, &fixture.pr.head_ref_oid);
+        handoff.entry.context = "github:github.com/acme/other".into();
+        handoff.db.put_ci_log(&handoff.entry).unwrap();
+        let provider_location = serde_json::json!({
+            "control_prefix": ["sprite", "exec", "--"],
+            "path": "/workspace"
+        })
+        .to_string();
+        handoff
+            .db
+            .set_worktree_location(&handoff.entry.worktree, &provider_location)
+            .unwrap();
+
+        authorize(&handoff.config, &handoff.db, &handoff.entry.candidate());
+
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        let notifications = handoff.db.get_unread_notifications().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            notifications[0]
+                .message
+                .contains("another provider context")
+        );
+    }
+
+    #[test]
+    fn authorize_context_refusal_does_not_replace_the_existing_candidate_notification() {
+        let fixture = Fixture::new();
+        let mut handoff = handoff(&fixture, CiAutofixMode::Suggest, &fixture.pr.head_ref_oid);
+        handoff.entry.context = "github:github.com/acme/other".into();
+        consider_candidate_with_forge(
+            &handoff.config,
+            &handoff.db,
+            &handoff.entry,
+            false,
+            Some(&handoff.forge),
+        );
+
+        authorize_entry(
+            &handoff.config,
+            &handoff.db,
+            &handoff.entry,
+            Some("github:github.com/acme/repo"),
+            Some(&handoff.forge),
+        );
+
+        let notifications = handoff.db.get_unread_notifications().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            notifications[0]
+                .message
+                .contains("ready for a PR-agent handoff")
+        );
+        assert!(!handoff.sentinel.exists());
+        assert_eq!(handoff.db.list_pr_queue().unwrap()[0].agent_attempts, 0);
     }
 
     #[test]
