@@ -134,6 +134,16 @@ fn run_read(loc: &GitLoc, args: &[&str]) -> Result<String> {
     Ok(stdout)
 }
 
+/// The commit id `HEAD` names right now. A rebase plan is verified against, and launched on, this one id.
+fn head_oid(loc: &GitLoc) -> Result<String> {
+    let out = run_read(loc, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let oid = out.trim();
+    if oid.is_empty() {
+        bail!("git returned no commit for HEAD");
+    }
+    Ok(oid.to_owned())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RebaseOpts {
     /// Disable gpg signing for the rewrite (`[git] override_gpg`).
@@ -207,6 +217,18 @@ fn rebase_with_todo_inner(
     todo: &[TodoEntry],
     opts: &RebaseOpts,
 ) -> Result<RebaseOutcome> {
+    rebase_with_todo_pinned(loc, base, todo, opts, &mut || {})
+}
+
+/// `before_launch` runs after the todo scratch is written and before git is started. Production passes a no-op; a test uses
+/// it to move HEAD in exactly that window.
+fn rebase_with_todo_pinned(
+    loc: &GitLoc,
+    base: &str,
+    todo: &[TodoEntry],
+    opts: &RebaseOpts,
+    before_launch: &mut dyn FnMut(),
+) -> Result<RebaseOutcome> {
     if let Some(entry) = todo.iter().find(|entry| entry.action.is_commit())
         && matches!(
             &entry.action,
@@ -225,11 +247,12 @@ fn rebase_with_todo_inner(
     // Every planned commit (including `drop`ped ones, which keep a `drop <sha>`
     // line) is in the todo, so a range commit missing from it means HEAD advanced.
     // Bail loudly rather than rewrite the branch to a lossy result.
+    let pinned_head = head_oid(loc).context("verify rebase range before starting")?;
     {
         let range = if base == "--root" {
-            "HEAD".to_string()
+            pinned_head.clone()
         } else {
-            format!("{base}..HEAD")
+            format!("{base}..{pinned_head}")
         };
         let revs = run_read(loc, &["rev-list", "--reverse", &range])
             .context("verify rebase range before starting")?;
@@ -295,6 +318,15 @@ fn rebase_with_todo_inner(
                     return Err(error).context("write prepared rebase todo");
                 }
             }
+        }
+        before_launch();
+        let head_now = head_oid(loc).context("re-check HEAD before starting the rebase")?;
+        if head_now != pinned_head {
+            bail!(
+                "HEAD moved from {} to {} after the rebase plan was verified — reload and retry; nothing was changed",
+                pinned_head.get(..12).unwrap_or(&pinned_head),
+                head_now.get(..12).unwrap_or(&head_now)
+            );
         }
         let editor = format!("cp {}", sh_quote(&scratch));
         let mut args = gpg_args(opts.override_gpg).to_vec();
@@ -1043,6 +1075,53 @@ mod tests {
         // The branch is untouched — c5 is still there.
         assert_eq!(r.out(&["rev-parse", "HEAD"]), head_before);
         assert_eq!(r.subjects(), ["c5", "c4", "c3", "c2", "c1"]);
+    }
+
+    #[test]
+    fn rebase_refuses_when_head_moves_after_the_plan_is_verified() {
+        let r = linear("head-pin");
+        let c2 = r.sha_of("c2");
+        let base = base_for(&r.loc(), &c2).unwrap();
+        let todo = CliGit.rebase_todo_for(&r.loc(), &c2).unwrap();
+
+        let mut moved = false;
+        let error = rebase_with_todo_pinned(&r.loc(), &base, &todo, &opts(), &mut || {
+            r.commit_file("f5.txt", "5\n", "c5");
+            moved = true;
+        })
+        .unwrap_err();
+
+        assert!(moved);
+        assert!(
+            format!("{error:#}").contains("HEAD moved"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(r.subjects(), ["c5", "c4", "c3", "c2", "c1"]);
+        assert!(
+            !r.dir
+                .join(r.out(&["rev-parse", "--git-path", "rebase-merge"]))
+                .exists()
+        );
+        assert!(std::fs::read_dir(r.dir.join(".git")).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("thegn-todo-")
+        }));
+    }
+
+    #[test]
+    fn rebase_with_todo_pinned_completes_when_head_is_stable() {
+        let r = linear("head-pin-stable");
+        let c2 = r.sha_of("c2");
+        let base = base_for(&r.loc(), &c2).unwrap();
+        let todo = CliGit.rebase_todo_for(&r.loc(), &c2).unwrap();
+
+        let outcome = rebase_with_todo_pinned(&r.loc(), &base, &todo, &opts(), &mut || {}).unwrap();
+
+        assert_eq!(outcome, RebaseOutcome::Done);
+        assert_eq!(r.subjects(), ["c4", "c3", "c2", "c1"]);
     }
 
     #[test]
