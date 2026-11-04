@@ -31,6 +31,13 @@ pub(crate) enum ProcOutcome {
     Spawn,
     Timeout,
     Wait,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "matched by callers; the shared runner no longer reports reader failures separately"
+        )
+    )]
     Read,
     Exited {
         status: ExitStatus,
@@ -102,15 +109,15 @@ fn stream_for(cap: Option<usize>) -> thegn_proc::Stream {
     }
 }
 
-fn captured(capture: thegn_proc::Capture) -> Captured {
+fn captured(capture: thegn_proc::Capture, requested: bool) -> Captured {
     Captured {
         bytes: capture.bytes,
-        truncated: capture.truncated,
+        truncated: capture.truncated || (requested && !capture.eof),
     }
 }
 
 /// The complete mapping from a shared-runner `Run` to sandbox probe outcomes.
-fn map_run(run: thegn_proc::Run) -> ProcOutcome {
+fn map_run(run: thegn_proc::Run, capture: Capture) -> ProcOutcome {
     let thegn_proc::Run {
         end,
         leader,
@@ -124,8 +131,8 @@ fn map_run(run: thegn_proc::Run) -> ProcOutcome {
         (thegn_proc::End::LeaderExited, thegn_proc::Leader::Reaped(status)) => {
             ProcOutcome::Exited {
                 status,
-                stdout: captured(stdout),
-                stderr: captured(stderr),
+                stdout: captured(stdout, capture.stdout.is_some()),
+                stderr: captured(stderr, capture.stderr.is_some()),
             }
         }
         (thegn_proc::End::LeaderExited, _)
@@ -161,7 +168,7 @@ fn run_inner(
         }
         None => (thegn_proc::run(&mut command, &limits, &cancel), None),
     };
-    let outcome = map_run(run);
+    let outcome = map_run(run, capture);
     let delivery = match (&outcome, feed) {
         (ProcOutcome::Exited { .. }, Some(feed)) if !feed.complete => InputDelivery::Failed,
         (ProcOutcome::Exited { .. }, _) => InputDelivery::Complete,
@@ -258,7 +265,6 @@ fn reaper_sender() -> Option<&'static Sender<Child>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
     use std::thread;
     use std::time::Instant;
 
@@ -311,67 +317,116 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn map_run_maps_every_end_and_a_missing_leader() {
+        use std::io;
+
+        let requested = Capture {
+            stdout: Some(16),
+            stderr: Some(16),
+        };
         let run = |end, leader| thegn_proc::Run {
             end,
             group: thegn_proc::GroupState::Unknown,
             leader,
             leader_exited_first: false,
-            stdout: thegn_proc::Capture::default(),
-            stderr: thegn_proc::Capture::default(),
+            stdout: thegn_proc::Capture {
+                eof: true,
+                ..Default::default()
+            },
+            stderr: thegn_proc::Capture {
+                eof: true,
+                ..Default::default()
+            },
             containment: thegn_proc::Containment::ProcessGroup,
         };
 
         assert!(matches!(
-            map_run(run(thegn_proc::End::TimedOut, thegn_proc::Leader::Detached)),
+            map_run(
+                run(thegn_proc::End::TimedOut, thegn_proc::Leader::Detached),
+                requested
+            ),
             ProcOutcome::Timeout
         ));
         assert!(matches!(
-            map_run(run(
-                thegn_proc::End::Cancelled,
-                thegn_proc::Leader::Detached
-            )),
+            map_run(
+                run(thegn_proc::End::Cancelled, thegn_proc::Leader::Detached),
+                requested
+            ),
             ProcOutcome::Wait
         ));
         assert!(matches!(
-            map_run(run(
-                thegn_proc::End::Supervise(io::Error::other("wait failed")),
-                thegn_proc::Leader::ReapFailed(io::Error::other("wait failed")),
-            )),
+            map_run(
+                run(
+                    thegn_proc::End::Supervise(io::Error::other("wait failed")),
+                    thegn_proc::Leader::ReapFailed(io::Error::other("wait failed")),
+                ),
+                requested
+            ),
             ProcOutcome::Wait
         ));
         assert!(matches!(
-            map_run(run(
-                thegn_proc::End::OutputLimit(thegn_proc::Which::Stdout),
-                thegn_proc::Leader::Detached,
-            )),
+            map_run(
+                run(
+                    thegn_proc::End::OutputLimit(thegn_proc::Which::Stdout),
+                    thegn_proc::Leader::Detached,
+                ),
+                requested
+            ),
             ProcOutcome::Wait
         ));
         assert!(matches!(
-            map_run(run(
-                thegn_proc::End::LeaderExited,
-                thegn_proc::Leader::Detached
-            )),
+            map_run(
+                run(thegn_proc::End::LeaderExited, thegn_proc::Leader::Detached),
+                requested
+            ),
             ProcOutcome::Wait
         ));
         assert!(matches!(
-            map_run(run(
-                thegn_proc::End::Spawn(io::Error::from(io::ErrorKind::NotFound)),
-                thegn_proc::Leader::NotSpawned
-            )),
+            map_run(
+                run(
+                    thegn_proc::End::Spawn(io::Error::from(io::ErrorKind::NotFound)),
+                    thegn_proc::Leader::NotSpawned
+                ),
+                requested
+            ),
             ProcOutcome::Spawn
         ));
 
         let status = std::process::Command::new("true").status().unwrap();
-        match map_run(run(
-            thegn_proc::End::LeaderExited,
-            thegn_proc::Leader::Reaped(status),
-        )) {
+        match map_run(
+            run(
+                thegn_proc::End::LeaderExited,
+                thegn_proc::Leader::Reaped(status),
+            ),
+            requested,
+        ) {
             ProcOutcome::Exited { stdout, stderr, .. } => {
                 assert!(!stdout.truncated);
                 assert!(!stderr.truncated);
             }
             other => panic!("reaped leader should map to exit, got {other:?}"),
         }
+
+        let status = std::process::Command::new("true").status().unwrap();
+        let partial = thegn_proc::Run {
+            end: thegn_proc::End::LeaderExited,
+            group: thegn_proc::GroupState::Drained,
+            leader: thegn_proc::Leader::Reaped(status),
+            leader_exited_first: true,
+            stdout: thegn_proc::Capture {
+                bytes: b"partial".to_vec(),
+                eof: false,
+                ..Default::default()
+            },
+            stderr: thegn_proc::Capture {
+                eof: true,
+                ..Default::default()
+            },
+            containment: thegn_proc::Containment::ProcessGroup,
+        };
+        assert!(
+            map_run(partial, requested).into_stdout().is_none(),
+            "a captured stream closed before EOF must not be reported as complete output"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -630,6 +685,28 @@ mod tests {
             other => panic!("leader should finish despite inherited pipe: {other:?}"),
         }
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lingering_descendant_with_closed_pipes_is_quiesced_until_deadline() {
+        // The helper remains in the runner's process group but cannot hold either
+        // captured pipe open, so only group quiescence keeps the run alive.
+        let started = Instant::now();
+        let outcome = run_bounded(
+            &sh("sleep 30 </dev/null >/dev/null 2>&1 & exit 0"),
+            Duration::from_millis(300),
+            Capture {
+                stdout: None,
+                stderr: None,
+            },
+        );
+
+        assert!(matches!(outcome, ProcOutcome::Exited { .. }));
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "same-group helper with closed pipes must keep the runner quiescing until its deadline"
+        );
     }
 
     #[cfg(unix)]
