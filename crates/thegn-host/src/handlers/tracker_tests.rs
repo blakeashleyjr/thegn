@@ -13,6 +13,7 @@ impl thegn_svc::issue::IssueBackend for RecordingBackend {
 
     fn caps(&self) -> thegn_svc::issue::IssueCaps {
         thegn_svc::issue::IssueCaps {
+            patch_status: true,
             patch_assignee_me: true,
             ..Default::default()
         }
@@ -323,7 +324,8 @@ fn move_on_merge_routes_a_linked_issue_to_its_stored_account() {
         Some(thegn_core::issue::IssueRef::new("plugin:demo", "home", "plugin:demo:1").unwrap()),
     )];
 
-    assert!(move_linked_issues_done(&router, &linked).is_empty());
+    let failures = move_linked_issues_done(&router, &linked);
+    assert!(failures.is_empty(), "merge update failures: {failures:?}");
     assert_eq!(
         calls
             .lock()
@@ -377,7 +379,8 @@ fn move_on_merge_legacy_link_uses_the_sole_backend() {
     let router = recording_router(&["work"], &calls);
     let linked = vec![("plugin:demo:1".to_string(), None)];
 
-    assert!(move_linked_issues_done(&router, &linked).is_empty());
+    let failures = move_linked_issues_done(&router, &linked);
+    assert!(failures.is_empty(), "merge update failures: {failures:?}");
     assert_eq!(
         calls
             .lock()
