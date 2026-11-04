@@ -1728,4 +1728,286 @@ mod tests {
 
         assert!(!cell.wait_newer(0, Duration::from_millis(20)));
     }
+
+    mod reload_and_disabled {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::net::TcpListener;
+        use thegn_core::config::NamedCommand;
+        use thegn_core::config_model_proxy::{
+            BudgetBreach, BudgetConfig, BudgetLimit, ProviderEntry, RouteEntry, RoutingStrategy,
+        };
+
+        fn named_command(source: &str) -> NamedCommand {
+            toml::from_str(source).expect("agent entry")
+        }
+
+        #[test]
+        fn disabled_proxy_skips_an_opted_in_agent_without_touching_the_network() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let cfg = Config {
+                model_proxy: ModelProxyConfig {
+                    enabled: false,
+                    listen: listener.local_addr().unwrap().to_string(),
+                    ..ModelProxyConfig::default()
+                },
+                agents: vec![named_command(
+                    "name = \"claude\"\ncommand = \"claude\"\nroute_via_proxy = true\n",
+                )],
+                ..Config::default()
+            };
+
+            match agent_proxy_env(&cfg, "claude", "/tmp/wt") {
+                ProxyEnvDecision::Skipped(reason) => {
+                    assert_eq!(reason, "[model_proxy] disabled");
+                }
+                _ => panic!("an opted-in agent must be skipped while the proxy is disabled"),
+            }
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+
+        #[test]
+        fn non_opted_in_agents_are_left_alone_even_when_the_proxy_is_enabled() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let cfg = Config {
+                model_proxy: ModelProxyConfig {
+                    enabled: true,
+                    listen: listener.local_addr().unwrap().to_string(),
+                    ..ModelProxyConfig::default()
+                },
+                agents: vec![named_command("name = \"plain\"\ncommand = \"plain\"\n")],
+                ..Config::default()
+            };
+
+            assert!(matches!(
+                agent_proxy_env(&cfg, "plain", "/tmp/wt"),
+                ProxyEnvDecision::NotRequested
+            ));
+            assert!(matches!(
+                agent_proxy_env(&cfg, "nope", "/tmp/wt"),
+                ProxyEnvDecision::NotRequested
+            ));
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+
+        #[test]
+        fn disabled_proxy_never_publishes_a_restart_or_start() {
+            assert_eq!(
+                supervisor_step(&ModelProxyConfig::default(), None),
+                SupervisorStep::Idle
+            );
+            let disabled_with_changed_listen = ModelProxyConfig {
+                listen: "127.0.0.1:47998".into(),
+                ..ModelProxyConfig::default()
+            };
+            assert_eq!(
+                supervisor_step(&disabled_with_changed_listen, None),
+                SupervisorStep::Idle
+            );
+        }
+
+        #[test]
+        fn every_reloadable_field_class_restarts_the_running_proxy() {
+            let base = ModelProxyConfig {
+                enabled: true,
+                ..ModelProxyConfig::default()
+            };
+            let changed = vec![
+                (
+                    "listen",
+                    ModelProxyConfig {
+                        listen: "127.0.0.1:47997".into(),
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "routing",
+                    ModelProxyConfig {
+                        routing: RoutingStrategy::CostAware,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "usage_aware",
+                    ModelProxyConfig {
+                        usage_aware: true,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "last_resort",
+                    ModelProxyConfig {
+                        last_resort: true,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "first_byte_timeout_secs",
+                    ModelProxyConfig {
+                        first_byte_timeout_secs: 46,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "idle_timeout_secs",
+                    ModelProxyConfig {
+                        idle_timeout_secs: 121,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "heartbeat_secs",
+                    ModelProxyConfig {
+                        heartbeat_secs: 11,
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "providers",
+                    ModelProxyConfig {
+                        providers: vec![ProviderEntry {
+                            name: "p".into(),
+                            ..ProviderEntry::default()
+                        }],
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "routes",
+                    ModelProxyConfig {
+                        routes: vec![RouteEntry {
+                            name: "r".into(),
+                            ..RouteEntry::default()
+                        }],
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "aliases",
+                    ModelProxyConfig {
+                        aliases: BTreeMap::from([("fast".into(), "r".into())]),
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "budget.enabled",
+                    ModelProxyConfig {
+                        budget: BudgetConfig {
+                            enabled: true,
+                            ..base.budget.clone()
+                        },
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "budget.on_breach",
+                    ModelProxyConfig {
+                        budget: BudgetConfig {
+                            on_breach: BudgetBreach::Refuse,
+                            ..base.budget.clone()
+                        },
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "budget.window_secs",
+                    ModelProxyConfig {
+                        budget: BudgetConfig {
+                            window_secs: 3600,
+                            ..base.budget.clone()
+                        },
+                        ..base.clone()
+                    },
+                ),
+                (
+                    "budget.scopes",
+                    ModelProxyConfig {
+                        budget: BudgetConfig {
+                            scopes: BTreeMap::from([(
+                                "default".into(),
+                                BudgetLimit {
+                                    tokens: Some(1000),
+                                    cost_usd: None,
+                                },
+                            )]),
+                            ..base.budget.clone()
+                        },
+                        ..base.clone()
+                    },
+                ),
+            ];
+
+            assert_eq!(
+                supervisor_step(&base, Some(&base)),
+                SupervisorStep::Ensure,
+                "unchanged config"
+            );
+            for (field, desired) in changed {
+                assert_eq!(
+                    supervisor_step(&desired, Some(&base)),
+                    SupervisorStep::Restart,
+                    "changed field class: {field}"
+                );
+            }
+        }
+
+        #[test]
+        fn enabled_transitions_start_and_stop_the_owned_proxy() {
+            let enabled = ModelProxyConfig {
+                enabled: true,
+                ..ModelProxyConfig::default()
+            };
+            let disabled = ModelProxyConfig::default();
+
+            assert_eq!(
+                supervisor_step(&enabled, None),
+                SupervisorStep::Ensure,
+                "disabled to enabled starts the desired proxy"
+            );
+            assert_eq!(
+                supervisor_step(&disabled, Some(&enabled)),
+                SupervisorStep::Stop,
+                "enabled to disabled stops the applied proxy"
+            );
+            assert_eq!(
+                supervisor_step(&disabled, None),
+                SupervisorStep::Idle,
+                "a stopped disabled proxy remains idle"
+            );
+        }
+
+        #[test]
+        fn reload_field_guard_lists_every_model_proxy_field() {
+            // Adding a field to either config struct breaks this guard at compile time;
+            // add a row to every_reloadable_field_class_restarts_the_running_proxy too.
+            let ModelProxyConfig {
+                enabled: _,
+                listen: _,
+                routing: _,
+                usage_aware: _,
+                last_resort: _,
+                first_byte_timeout_secs: _,
+                idle_timeout_secs: _,
+                heartbeat_secs: _,
+                providers: _,
+                routes: _,
+                aliases: _,
+                budget: _,
+            } = ModelProxyConfig::default();
+            let BudgetConfig {
+                enabled: _,
+                on_breach: _,
+                window_secs: _,
+                scopes: _,
+            } = BudgetConfig::default();
+        }
+    }
 }
