@@ -1375,7 +1375,8 @@ fn race_operator_verbs_are_refused_while_a_drain_holds_the_row() {
 // fixture FIFO. `merge land` is a separate custody-owned CLI process; the row
 // must still be folding when it performs the ready precheck. The lease clock
 // is not simulated, so no recovery path can admit another drain. Releasing the
-// FIFO completes the original gate exactly once without moving the target ref.
+// FIFO completes the original gate exactly once without moving either ref or
+// adding another land audit event.
 #[test]
 fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
     let mut f = one_row_fixture(FixtureOpts {
@@ -1386,6 +1387,7 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
     let repo = f.repo.clone();
     let root = f.root.path().to_path_buf();
     let target_before = f.git(&repo, &["rev-parse", "refs/heads/main"]);
+    let worktree_tip_before = f.git(&f.held, &["rev-parse", "HEAD"]);
     make_gate_fifo(&root, "gate-hold");
     let mut gate_release = GateReleaseGuard::new(&root, "gate-hold", "gate-open");
     let owner = f.start_cli(&["merge", "drain", "--json"]);
@@ -1406,6 +1408,7 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
         target_before
     );
+    assert_eq!(f.git(&f.held, &["rev-parse", "HEAD"]), worktree_tip_before);
     assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
 
     release_gate(&root, "gate-hold", "gate-open");
@@ -1421,6 +1424,8 @@ fn race_merge_land_is_refused_while_a_drain_holds_the_row() {
         f.git(&repo, &["rev-parse", "refs/heads/main"]),
         target_before
     );
+    assert_eq!(f.git(&f.held, &["rev-parse", "HEAD"]), worktree_tip_before);
+    assert_eq!(event_rows(&f, "land"), vec!["not_ready".to_string()]);
 
     f.cli(&["merge", "rm", "--worktree", &wt]);
     assert!(f.rows().is_empty());
