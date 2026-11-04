@@ -672,13 +672,13 @@ mod tests {
             &ours,
             started + Duration::from_secs(3),
             |path| async move {
-                if path == PathBuf::from("legacy_a") {
+                if path.as_os_str() == "legacy_a" {
                     Err("503 refused".to_string())
                 } else {
                     Ok(())
                 }
             },
-            |path| async move { path == PathBuf::from("legacy_b") },
+            |path| async move { path.as_os_str() == "legacy_b" },
         )
         .await;
 
@@ -740,7 +740,7 @@ mod tests {
             &ours,
             started + Duration::from_secs(2),
             |path| async move {
-                if path == PathBuf::from("a") {
+                if path.as_os_str() == "a" {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                 }
                 Ok(())
@@ -756,7 +756,7 @@ mod tests {
                 ShutdownResult::Refused("stop deadline reached before shutdown".to_string())
             )
         );
-        assert_ne!(results[1].1, ShutdownResult::Stopped);
+        assert_eq!(results[1].1, ShutdownResult::StillRunning);
         assert_eq!(
             tokio::time::Instant::now() - started,
             Duration::from_secs(2)
