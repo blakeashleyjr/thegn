@@ -15,7 +15,7 @@ use thegn_core::config::{Config, ShareProviderKind};
 use thegn_core::db::{Db, ShareRow};
 use thegn_core::models::ShareOwner;
 use thegn_core::outln;
-use thegn_core::share::{ShareOwnerState, build_share_spec};
+use thegn_core::share::{ShareOwnerState, ShareState, build_share_spec};
 use thegn_core::store::WorktreeAuxStore;
 use thegn_svc::share::{self, ShareLaunch, ShareProvider};
 
@@ -537,7 +537,12 @@ fn stop_plan(
     let Some(configured) = plan_port else {
         return StopPlan::RefuseProcess;
     };
-    if row.public_url.is_none() && matches!(row.state.as_str(), "starting" | "failed") {
+    if row.public_url.is_none()
+        && matches!(
+            ShareState::parse(&row.state),
+            Some(ShareState::Starting | ShareState::Failed)
+        )
+    {
         return StopPlan::TeardownTailscale;
     }
     if recorded_port != Some(configured) {

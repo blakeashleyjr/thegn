@@ -151,6 +151,96 @@ pub fn share_owner_state(
     }
 }
 
+/// Lifecycle state of a share row. `as_str` is the exact text stored in `shares.state` today
+/// (`starting`, `up`, `failed`); `Stopping` and `Unknown` are modelled here ahead of their persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShareState {
+    /// A row recorded before exposure; the tunnel may or may not be public yet.
+    Starting,
+    /// The provider reported a public/served URL and the row was committed.
+    Up,
+    /// Teardown requested and not yet verified.
+    Stopping,
+    /// Liveness cannot be established from the recorded identity; needs reconciliation.
+    Unknown,
+    /// Start or teardown failed; the row is a tombstone that stays visible until stopped or forgotten.
+    Failed,
+}
+
+/// What a reader that finds a row in a given state, after a crash, must do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareRecovery {
+    /// Leave the row alone: its owner is alive, or it is an inert tombstone.
+    Keep,
+    /// The exposure may exist without an owner: tear it down, then record Failed.
+    TearDownThenFail,
+    /// Teardown was requested and never confirmed: retry it.
+    RetryTeardown,
+    /// Re-read provider/process truth before trusting the row.
+    Reconcile,
+}
+
+impl ShareState {
+    pub const ALL: [ShareState; 5] = [
+        Self::Starting,
+        Self::Up,
+        Self::Stopping,
+        Self::Unknown,
+        Self::Failed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Up => "up",
+            Self::Stopping => "stopping",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Exact, case-sensitive inverse of [`ShareState::as_str`]; `None` for any other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.as_str() == text)
+    }
+
+    /// Whether a row may move from `self` to `next`. Writing the same state again is always allowed (idempotent retry).
+    /// The table (rows = from, columns = to):
+    /// Starting -> Up, Failed, Stopping; Up -> Stopping, Failed, Unknown; Stopping -> Failed;
+    /// Unknown -> Up, Failed, Stopping; Failed -> Starting (an explicit restart, new generation), Stopping (retry a leftover teardown).
+    /// A successful teardown deletes the row, so "gone" is not a state.
+    pub fn may_become(self, next: ShareState) -> bool {
+        use ShareState::{Failed, Starting, Stopping, Unknown, Up};
+        self == next
+            || matches!(
+                (self, next),
+                (Starting, Up | Failed | Stopping)
+                    | (Up, Stopping | Failed | Unknown)
+                    | (Stopping, Failed)
+                    | (Unknown, Up | Failed | Stopping)
+                    | (Failed, Starting | Stopping)
+            )
+    }
+
+    /// Crash-recovery decision for a row found in `self` whose recorded owner process is `owner`.
+    pub fn recovery(self, owner: ShareOwnerState) -> ShareRecovery {
+        match (self, owner) {
+            (Self::Failed, _) => ShareRecovery::Keep,
+            (Self::Stopping, _) => ShareRecovery::RetryTeardown,
+            (Self::Unknown, _) => ShareRecovery::Reconcile,
+            (Self::Starting, ShareOwnerState::Alive) | (Self::Up, ShareOwnerState::Alive) => {
+                ShareRecovery::Keep
+            }
+            (Self::Starting, ShareOwnerState::Exited | ShareOwnerState::Unrecorded) => {
+                ShareRecovery::TearDownThenFail
+            }
+            (Self::Up, ShareOwnerState::Exited | ShareOwnerState::Unrecorded) => {
+                ShareRecovery::Reconcile
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +249,112 @@ mod tests {
         ShareConfig {
             provider: ShareProviderKind::Bore,
             ..ShareConfig::default()
+        }
+    }
+
+    #[test]
+    fn share_state_names_round_trip_and_unknown_text_is_refused() {
+        let names = ["starting", "up", "stopping", "unknown", "failed"];
+        for (state, name) in ShareState::ALL.into_iter().zip(names) {
+            assert_eq!(state.as_str(), name);
+            assert_eq!(ShareState::parse(state.as_str()), Some(state));
+        }
+        for text in ["", "UP", "Up", "up ", "running"] {
+            assert_eq!(
+                ShareState::parse(text),
+                None,
+                "unexpectedly parsed {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn share_state_transition_table_is_pinned_cell_by_cell() {
+        const EXPECTED: [[bool; 5]; 5] = [
+            [true, true, true, false, true],
+            [false, true, true, true, true],
+            [false, false, true, false, true],
+            [false, true, true, true, true],
+            [true, false, true, false, true],
+        ];
+        for (row, from) in ShareState::ALL.into_iter().enumerate() {
+            for (col, to) in ShareState::ALL.into_iter().enumerate() {
+                assert_eq!(
+                    from.may_become(to),
+                    EXPECTED[row][col],
+                    "unexpected transition {from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn share_state_only_failed_may_restart_and_nothing_returns_to_starting_otherwise() {
+        for from in ShareState::ALL {
+            if !matches!(from, ShareState::Starting | ShareState::Failed) {
+                assert!(!from.may_become(ShareState::Starting));
+            }
+        }
+        assert!(ShareState::Failed.may_become(ShareState::Starting));
+        for from in [ShareState::Up, ShareState::Unknown, ShareState::Stopping] {
+            assert!(!from.may_become(ShareState::Starting));
+        }
+        assert!(!ShareState::Stopping.may_become(ShareState::Up));
+        assert!(!ShareState::Stopping.may_become(ShareState::Unknown));
+    }
+
+    #[test]
+    fn share_state_recovery_table_covers_every_state_and_owner_pair() {
+        const EXPECTED: [[ShareRecovery; 3]; 5] = [
+            [
+                ShareRecovery::TearDownThenFail,
+                ShareRecovery::Keep,
+                ShareRecovery::TearDownThenFail,
+            ],
+            [
+                ShareRecovery::Reconcile,
+                ShareRecovery::Keep,
+                ShareRecovery::Reconcile,
+            ],
+            [
+                ShareRecovery::RetryTeardown,
+                ShareRecovery::RetryTeardown,
+                ShareRecovery::RetryTeardown,
+            ],
+            [
+                ShareRecovery::Reconcile,
+                ShareRecovery::Reconcile,
+                ShareRecovery::Reconcile,
+            ],
+            [
+                ShareRecovery::Keep,
+                ShareRecovery::Keep,
+                ShareRecovery::Keep,
+            ],
+        ];
+        let owners = [
+            ShareOwnerState::Unrecorded,
+            ShareOwnerState::Alive,
+            ShareOwnerState::Exited,
+        ];
+        for (row, state) in ShareState::ALL.into_iter().enumerate() {
+            for (col, owner) in owners.into_iter().enumerate() {
+                assert_eq!(
+                    state.recovery(owner),
+                    EXPECTED[row][col],
+                    "unexpected recovery for {state:?} with owner {owner:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn share_state_recovery_never_keeps_an_unowned_starting_share() {
+        for owner in [ShareOwnerState::Unrecorded, ShareOwnerState::Exited] {
+            assert_eq!(
+                ShareState::Starting.recovery(owner),
+                ShareRecovery::TearDownThenFail
+            );
         }
     }
 
