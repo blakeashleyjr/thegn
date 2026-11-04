@@ -65,6 +65,12 @@ If a clone crashed and left its staging directory behind, a later clone to the
 same destination reclaims it only when its process is gone and the directory
 is owned by you. Live clones, symlinks and other paths are left alone, and a
 failed cleanup does not fail the new clone.
+While cloning, thegn holds an owner-only `.<name>.clone-claim` file beside
+the destination with the process id and a generation. A second clone is
+refused before Git work while the first process is alive; a claim left by a
+dead process is reclaimed once. Symlinked, unreadable or unowned claims are
+refused with instructions to remove them if no clone is running. The claim is
+removed when cloning ends.
 
 A clone keeps the destination's parent directory open while it runs and
 promotes the staged clone relative to that directory without replacing an
@@ -158,5 +164,10 @@ the old branch is refused. Before creating a worktree, thegn checks whether
 its branch already exists; if Git cannot verify that (for example, because
 it times out), creation is refused without changing anything. Failed branch
 renames and worktree moves include Git's reason.
+The same fail-closed rule covers branch, worktree and base-branch reads:
+`thegn wt new` (including batched and issue-driven creation) and autopilot
+refuse when Git cannot be read instead of assuming no branches exist or
+silently choosing a default. A detached HEAD remains valid and uses the
+default branch as its base.
 Worktree tabs are named `<repo>/<exact branch>`. See the [[config-reference]]
 for every knob.
