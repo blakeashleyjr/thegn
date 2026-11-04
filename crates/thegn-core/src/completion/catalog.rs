@@ -54,6 +54,8 @@ pub enum SourceKind {
     /// Embedded skill package names. Configured user packages are discovered by
     /// the host and deliberately not walked on the latency-sensitive TAB path.
     Skill,
+    /// Managed Whisper model names from the voice model catalog.
+    VoiceModel,
 
     /// clap already completes this slot from the tree itself — subcommand
     /// names, flags, and `ValueEnum` arguments such as `completions <shell>`.
@@ -160,6 +162,7 @@ impl SourceKind {
         SourceKind::Capability,
         SourceKind::Action,
         SourceKind::Skill,
+        SourceKind::VoiceModel,
         SourceKind::Structural,
         SourceKind::Reserved(Reserved::Branch),
         SourceKind::Reserved(Reserved::Pr),
@@ -189,6 +192,7 @@ impl SourceKind {
             SourceKind::Capability => "capability",
             SourceKind::Action => "action",
             SourceKind::Skill => "skill",
+            SourceKind::VoiceModel => "voice-model",
             SourceKind::Structural => "structural",
             SourceKind::Reserved(r) => r.kind(),
         }
@@ -605,6 +609,7 @@ pub const CATALOG: &[Slot] = &[
     // Lead lease proof values required by pipeline mutations.
     slot("dispatch claim", "lease", SourceKind::Structural),
     slot("dispatch claim", "owner", SourceKind::Structural),
+    slot("dispatch claim", "lease_gen", SourceKind::Structural),
     slot(
         "dispatch claim",
         "why",
@@ -612,6 +617,7 @@ pub const CATALOG: &[Slot] = &[
     ),
     slot("dispatch put", "lease", SourceKind::Structural),
     slot("dispatch put", "owner", SourceKind::Structural),
+    slot("dispatch put", "lease_gen", SourceKind::Structural),
     slot(
         "dispatch put",
         "why",
@@ -619,8 +625,10 @@ pub const CATALOG: &[Slot] = &[
     ),
     slot("dispatch set-status", "lease", SourceKind::Structural),
     slot("dispatch set-status", "owner", SourceKind::Structural),
+    slot("dispatch set-status", "lease_gen", SourceKind::Structural),
     slot("session open", "lease", SourceKind::Structural),
     slot("session open", "owner", SourceKind::Structural),
+    slot("session open", "lease_gen", SourceKind::Structural),
     // The lease verbs take an action word, an owner token, a TTL and a lease
     // name: all operator-chosen strings with no enumerable source.
     slot("dispatch lease", "action", SourceKind::Structural),
@@ -715,6 +723,11 @@ pub const CATALOG: &[Slot] = &[
     slot("api call", "cap", SourceKind::Capability),
     // --- embedded skill ---------------------------------------------------
     slot("skills show", "name", SourceKind::Skill),
+    // Keep aligned with `thegn_svc::voice_models::MODELS`; core cannot depend
+    // on svc, so the source carries the catalog's stable names locally.
+    slot("voice model pull", "name", SourceKind::VoiceModel),
+    slot("voice model rm", "name", SourceKind::VoiceModel),
+    slot("voice setup", "model", SourceKind::VoiceModel),
     // Theme names are the merged built-in/local catalog. The import path is a
     // filesystem value and keeps clap's structural completion behavior.
     slot("theme set", "name", SourceKind::Theme),
@@ -728,8 +741,10 @@ pub const CATALOG: &[Slot] = &[
     slot("completions", "shell", SourceKind::Structural),
     slot("automations test", "fixture", SourceKind::Structural),
     slot("events tail", "kinds", SourceKind::Structural),
+    slot("voice setup", "kind", SourceKind::Structural),
     slot("skills seed", "worktree", SourceKind::Structural),
     slot("theme import", "file", SourceKind::Structural),
+    slot("voice setup", "model_path", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
     slot("pr queue rebind", "pr", SourceKind::Reserved(Reserved::Pr)),
@@ -745,6 +760,21 @@ pub const CATALOG: &[Slot] = &[
     slot(
         "automations test",
         "event",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "voice setup",
+        "credential",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "voice setup",
+        "endpoint",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "voice setup",
+        "language",
         SourceKind::Reserved(Reserved::Freeform),
     ),
     slot(
@@ -850,7 +880,10 @@ mod tests {
             .filter(|k| k.is_implemented() && !k.reads_db() && !k.reads_config())
             .map(|k| k.kind())
             .collect();
-        assert_eq!(in_process, ["theme", "capability", "action", "skill"]);
+        assert_eq!(
+            in_process,
+            ["theme", "capability", "action", "skill", "voice-model"]
+        );
     }
 
     #[test]

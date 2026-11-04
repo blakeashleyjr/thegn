@@ -43,6 +43,10 @@ profiling = ["dep:pprof"]
 dev = []
 # Optional call-home transport; release and Nix builds enable it explicitly (THE-672).
 iroh = ["thegn-svc/iroh"]
+# Native microphone/Whisper stay out of bridge and default builds until the
+# real-device release gates in docs/voice-verification.md pass.
+voice-native = ["dep:thegn-voice", "thegn-voice/native"]
+voice-metal = ["voice-native", "thegn-voice/metal"]
 
 [dependencies]
 url.workspace = true
@@ -55,6 +59,7 @@ thegn-core.workspace = true
 thegn-svc = { workspace = true, features = ["control-grpc"] }
 thegn-metrics.workspace = true
 thegn-media.workspace = true
+thegn-voice = { path = "../thegn-voice", optional = true }
 thegn-proc.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

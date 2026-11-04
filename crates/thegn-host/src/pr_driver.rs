@@ -803,7 +803,11 @@ pub(crate) fn drive_queue(
                     continue;
                 };
                 let ci_log = if kind == TaskKind::PrCiFailure {
-                    pr_ci_log_evidence(db, wt, &head)
+                    let current_context = thegn_svc::ci::cache_context(
+                        &GitLoc::for_worktree(Path::new(wt)),
+                        &full.repo_ci(repo_root),
+                    );
+                    pr_ci_log_evidence(db, wt, &head, current_context.as_deref())
                 } else {
                     None
                 };
@@ -1449,7 +1453,12 @@ pub(crate) fn compose_with_log(
     }
 }
 
-fn pr_ci_log_evidence(db: &Db, worktree: &str, head: &str) -> Option<String> {
+fn pr_ci_log_evidence(
+    db: &Db,
+    worktree: &str,
+    head: &str,
+    current_context: Option<&str>,
+) -> Option<String> {
     let entries = match db.list_ci_logs(&GitLoc::worktree_cache_key(Path::new(worktree))) {
         Ok(entries) => entries,
         Err(error) => {
@@ -1461,6 +1470,10 @@ fn pr_ci_log_evidence(db: &Db, worktree: &str, head: &str) -> Option<String> {
             return None;
         }
     };
+    let entries = entries
+        .into_iter()
+        .filter(|entry| thegn_core::ci_log::cached_log_context_matches(entry, current_context))
+        .collect::<Vec<_>>();
     thegn_core::ci_log::pr_repair_excerpt(
         &entries,
         head,
@@ -1870,7 +1883,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let evidence = pr_ci_log_evidence(&db, "/w/feat", "abc");
+        let evidence = pr_ci_log_evidence(&db, "/w/feat", "abc", None);
         assert!(evidence.is_some());
         let (_, prompt) = compose_with_log(
             &cfg(),
@@ -1900,7 +1913,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let evidence = pr_ci_log_evidence(&db, "/w/feat", "zzz");
+        let evidence = pr_ci_log_evidence(&db, "/w/feat", "zzz", None);
         assert!(evidence.is_none());
         let (_, prompt) = compose_with_log(
             &cfg(),
@@ -1913,6 +1926,42 @@ mod tests {
         )
         .unwrap();
         assert!(prompt.contains("no failing check details"));
+    }
+
+    #[test]
+    fn pr_ci_log_evidence_withholds_logs_from_another_provider_context() {
+        let db = Db::open_memory().unwrap();
+        db.put_ci_log(&thegn_core::ci_log::CiLogEntry {
+            worktree: "/w/feat".into(),
+            run_id: "11".into(),
+            job_id: "22".into(),
+            job_name: "test".into(),
+            text: "error: boom\n".into(),
+            head_sha: "abc".into(),
+            context: "github:github.com/o/a".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(pr_ci_log_evidence(&db, "/w/feat", "abc", Some("github:github.com/o/b")).is_none());
+        assert!(pr_ci_log_evidence(&db, "/w/feat", "abc", Some("github:github.com/o/a")).is_some());
+        assert!(pr_ci_log_evidence(&db, "/w/feat", "abc", None).is_none());
+    }
+
+    #[test]
+    fn pr_ci_log_evidence_keeps_legacy_logs_only_for_an_unknown_context() {
+        let db = Db::open_memory().unwrap();
+        db.put_ci_log(&thegn_core::ci_log::CiLogEntry {
+            worktree: "/w/feat".into(),
+            run_id: "11".into(),
+            job_id: "22".into(),
+            job_name: "test".into(),
+            text: "error: boom\n".into(),
+            head_sha: "abc".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(pr_ci_log_evidence(&db, "/w/feat", "abc", None).is_some());
+        assert!(pr_ci_log_evidence(&db, "/w/feat", "abc", Some("github:github.com/o/a")).is_none());
     }
 
     #[test]

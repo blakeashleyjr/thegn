@@ -6,6 +6,8 @@ name: sandbox-image
 # assembles and verifies the list from those digests, then attests the list and
 # both children before printing its digest for DEFAULT_BASE_DIGEST.
 # (crates/thegn-core/src/image.rs).
+# The publisher refuses a destination tag that moved during the run and reads
+# it back after the push.
 # Per-run architecture tags remain in GHCR; retention cleanup is tracked under THE-502.
 #
 # Registry pull is the ALTERNATE delivery route (the default is registry-less
@@ -139,6 +141,47 @@ jobs:
         with:
           name: image-arm64
           path: images/arm64
+      - name: record the destination tag before publishing
+        id: prior
+        env:
+          TAG: ${{ needs.admit.outputs.tag }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$ACTOR" \
+            --authfile "$HOME/.docker/config.json" --password-stdin
+          tag_digest() {
+            local raw err status=0
+            raw="$(mktemp)"; err="$(mktemp)"
+            skopeo inspect --raw --authfile "$HOME/.docker/config.json" \
+              "docker://$IMAGE:$TAG" >"$raw" 2>"$err" || status=$?
+            if [[ $status == 0 ]]; then
+              digest="sha256:$(sha256sum "$raw" | cut -d ' ' -f1)" || {
+                rm -f "$raw" "$err"
+                return 1
+              }
+              rm -f "$raw" "$err"
+              echo "$digest"
+            elif grep -qiE 'manifest unknown|name unknown' "$err"; then
+              rm -f "$raw" "$err"
+              echo absent
+            else
+              cat "$err" >&2
+              rm -f "$raw" "$err"
+              return 1
+            fi
+          }
+          prior="$(tag_digest)" || {
+            echo "::error::could not read $IMAGE:$TAG before publishing"
+            exit 1
+          }
+          [[ "$prior" == absent || "$prior" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::registry returned an invalid destination tag digest"
+            exit 1
+          }
+          echo "destination tag $IMAGE:$TAG was $prior before this run"
+          echo "digest=$prior" >> "$GITHUB_OUTPUT"
       - name: push per-arch archives by digest
         id: arch
         env:
@@ -170,6 +213,7 @@ jobs:
         id: push
         env:
           TAG: ${{ needs.admit.outputs.tag }}
+          PRIOR_DIGEST: ${{ steps.prior.outputs.digest }}
           AMD64_DIGEST: ${{ steps.arch.outputs.amd64_digest }}
           ARM64_DIGEST: ${{ steps.arch.outputs.arm64_digest }}
         run: |
@@ -185,6 +229,36 @@ jobs:
           podman manifest create --authfile "$HOME/.docker/config.json" "$IMAGE:$TAG" \
             "docker://$IMAGE@$amd64_digest" \
             "docker://$IMAGE@$arm64_digest"
+          tag_digest() {
+            local raw err status=0
+            raw="$(mktemp)"; err="$(mktemp)"
+            skopeo inspect --raw --authfile "$HOME/.docker/config.json" \
+              "docker://$IMAGE:$TAG" >"$raw" 2>"$err" || status=$?
+            if [[ $status == 0 ]]; then
+              digest="sha256:$(sha256sum "$raw" | cut -d ' ' -f1)" || {
+                rm -f "$raw" "$err"
+                return 1
+              }
+              rm -f "$raw" "$err"
+              echo "$digest"
+            elif grep -qiE 'manifest unknown|name unknown' "$err"; then
+              rm -f "$raw" "$err"
+              echo absent
+            else
+              cat "$err" >&2
+              rm -f "$raw" "$err"
+              return 1
+            fi
+          }
+          now="$(tag_digest)" || {
+            echo "::error::could not re-read $IMAGE:$TAG before pushing"
+            exit 1
+          }
+          if [[ "$now" != "$PRIOR_DIGEST" ]]; then
+            echo "::error::destination tag $IMAGE:$TAG moved during this run" \
+              "(expected $PRIOR_DIGEST, found $now); not published"
+            exit 1
+          fi
           list_digest_file=manifest-digest.txt
           podman manifest push --all --digestfile "$list_digest_file" \
             --authfile "$HOME/.docker/config.json" "$IMAGE:$TAG" "docker://$IMAGE:$TAG"
@@ -199,6 +273,7 @@ jobs:
       - name: verify pushed manifest by digest
         id: verify
         env:
+          TAG: ${{ needs.admit.outputs.tag }}
           AMD64_DIGEST: ${{ steps.push.outputs.amd64_digest }}
           ARM64_DIGEST: ${{ steps.push.outputs.arm64_digest }}
           LIST_DIGEST: ${{ steps.push.outputs.digest }}
@@ -211,6 +286,36 @@ jobs:
             echo "::error::pushed manifest bytes do not match the reported digest"
             exit 1
           }
+          tag_digest() {
+            local raw err status=0
+            raw="$(mktemp)"; err="$(mktemp)"
+            skopeo inspect --raw --authfile "$HOME/.docker/config.json" \
+              "docker://$IMAGE:$TAG" >"$raw" 2>"$err" || status=$?
+            if [[ $status == 0 ]]; then
+              digest="sha256:$(sha256sum "$raw" | cut -d ' ' -f1)" || {
+                rm -f "$raw" "$err"
+                return 1
+              }
+              rm -f "$raw" "$err"
+              echo "$digest"
+            elif grep -qiE 'manifest unknown|name unknown' "$err"; then
+              rm -f "$raw" "$err"
+              echo absent
+            else
+              cat "$err" >&2
+              rm -f "$raw" "$err"
+              return 1
+            fi
+          }
+          published="$(tag_digest)" || {
+            echo "::error::could not read $IMAGE:$TAG after pushing"
+            exit 1
+          }
+          if [[ "$published" != "$LIST_DIGEST" ]]; then
+            echo "::error::destination tag $IMAGE:$TAG was overwritten concurrently" \
+              "(expected $LIST_DIGEST, found $published); not reporting success"
+            exit 1
+          fi
           python3 -c 'import json, os, sys
           with open("manifest.json", encoding="utf-8") as source:
               manifest = json.load(source)

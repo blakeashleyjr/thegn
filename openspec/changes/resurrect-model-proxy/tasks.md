@@ -75,11 +75,17 @@ excision commits. Iterate with `just quick <crate>` + targeted
 - [x] 4.6 Budgets: restore budget.rs windows/anchors onto
       `model_proxy_budget_state`; `on_breach` warn/refuse/downgrade.
 - [x] 4.7 `/stats` + `/healthz` endpoints from the shared stats rollup.
-- [ ] 4.8 Restore/adapt the crate's e2e test suite (`tests/e2e.rs` in
+- [x] 4.8 Restore/adapt the crate's e2e test suite (`tests/e2e.rs` in
       history): failover, cooldown, streaming fall-through, alias/auto
-      routing, budget refuse, subscription $0 accounting. (Deferred: the
-      module-level unit tests cover the pure routing/failover/budget/auto/
-      usage logic; the mock-server e2e harness is a follow-up.)
+      routing, budget refuse, subscription $0 accounting. Evidence:
+      `crates/thegn-proxy/tests/e2e.rs` covers these in
+      `e2e_sequential_failover_serves_from_the_second_lane`,
+      `e2e_rate_limited_lane_cools_down_then_fails_back`,
+      `e2e_stream_falls_through_a_lane_that_sends_no_first_byte`,
+      `e2e_alias_and_auto_select_their_routes`,
+      `e2e_budget_refusal_never_reaches_the_upstream`,
+      `e2e_anthropic_stream_is_translated_from_openai_sse`, and
+      `e2e_subscription_lane_records_zero_cost_and_cache_tokens`.
 
 ## Phase 5 — host integration
 

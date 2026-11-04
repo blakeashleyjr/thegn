@@ -1,0 +1,68 @@
+{
+  "command": [
+    "/tmp/thegn-dictation-native/simd-target/debug/examples/verify",
+    "/tmp/thegn-dictation-native/data/thegn/voice/models/ggml-base.en.bin",
+    "/tmp/thegn-dictation-native/jfk.pcm",
+    "en",
+    "20"
+  ],
+  "build": "nix develop .#ci --command env RUSTC_WRAPPER= CARGO_TARGET_DIR=/tmp/thegn-dictation-native/simd-target GGML_NATIVE=ON GGML_CCACHE=OFF NIX_ENFORCE_NO_NATIVE=0 cargo build --locked -p thegn-voice --features native --example verify",
+  "profile": "dev Rust; upstream C++ RelWithDebInfo O2; machine-specific native SIMD; 4 inference threads",
+  "platform": "Linux-7.2.9-x86_64-with-glibc2.42",
+  "cpu": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+  "memory_kib": "MemTotal:       98134720 kB",
+  "workload": "concurrent native host test compilation, clippy queued",
+  "load_before": [
+    4.78955078125,
+    4.84716796875,
+    4.169921875
+  ],
+  "load_after": [
+    6.43310546875,
+    5.326171875,
+    4.37646484375
+  ],
+  "elapsed_seconds": 51.411320565000096,
+  "max_rss_kib": 349820,
+  "exit": 0,
+  "source_head": "be8ca932cdb8c95c28738113a6e579ac2bdbbab4",
+  "source_state": "uncommitted dictation implementation in tg-plump-pebble; source hashes below; subsequent Metal-only startup allocation preflight is included in this snapshot but unverified on Apple",
+  "model": "base.en",
+  "model_bytes": 147964211,
+  "model_sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+  "audio_url": "https://raw.githubusercontent.com/ggml-org/whisper.cpp/2eeeba56e9edd762b4b38467bab96c2517163158/samples/jfk.wav",
+  "audio_sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+  "audio_seconds": 11,
+  "microphone": "none; supplied upstream sample for inference, ALSA null for worker fixtures",
+  "limits": "decode timing only, repeated single English sample; not physical routing, permissions, broader corpus, capture-to-display or packaged-release acceptance",
+  "source_sha256": {
+    "Cargo.lock": "48ccdcc6dff82c96ffdb9a6c03d1542f9b795712c24d99f9934d6591e7d64983",
+    "crates/thegn-voice/Cargo.toml": "31cfccc38412e14615fbff11adb7bfadaa2f17256d0929bf6aa055703772efc0",
+    "crates/thegn-voice/src/lib.rs": "0b23723d4c2d6efbef0dcfb6fd3b84230c3ac7aeb629224a50c2ad17798589c0",
+    "crates/thegn-voice/src/whisper.rs": "9c115b7dcd18cb5b4ddc20be471e99f7e5dd639ef0e76f682185266475b7722d",
+    "crates/thegn-voice/src/capture.rs": "d9d367569643194159747fe94fd663ae65962bb8620c92be6e35c43327efed46",
+    "crates/thegn-voice/examples/verify.rs": "da7da72d4b262a0e3e0ee59e84ed04c373ea9b50ed3a6ffa1f697771daac5173"
+  },
+  "decode_statistics_ms": {
+    "method": "nearest rank",
+    "count": 20,
+    "all_resident_model_calls_p50": 2375,
+    "all_resident_model_calls_p95": 2914,
+    "after_first_call_p95": 3035,
+    "maximum": 3035,
+    "first_call": 2513
+  },
+  "scheduler_note": "Standalone inference example does not apply the host Utility QoS hook; priority was not recorded. Full worker/pane latency is unverified.",
+  "integration_source_sha256": {
+    "crates/thegn-core/src/voice.rs": "5d77eb8e2e0e080dc9464baab4e459274f5acfbfa4063d6da01a97cfa936a92d",
+    "crates/thegn-core/src/config_write.rs": "d0aee0e76bced0a398ae381a89a39725a67cc04c4a556315607f4af120062381",
+    "crates/thegn-host/src/voice.rs": "ccd928ee80e96b9928e1430d8bd1ddd39a71fb9b837a5f23d3bc22a7a32f2b99",
+    "crates/thegn-host/src/voice_worker.rs": "85170ccf081bc3d189ad9baf4d940b287375ec5e3f48aece5b3d3707c0b7ff64",
+    "crates/thegn-host/src/handlers/voice.rs": "cf38c88daee877a4606ea819d2f4922b675a55b5451b3acbb70f141b666b0c91",
+    "crates/thegn-host/src/cmd/voice.rs": "936357a347ed8da33bd5d540fa6cc41bf548f81504fc9f35887048c53d9c029b",
+    "crates/thegn-svc/src/voice_http.rs": "9b3dfbdb72e126aaee332ddada609367d938a3ad2c491ca39c7eef4058523a21",
+    "crates/thegn-svc/src/voice_models.rs": "71ee34f662e15591fd3c431aca771a2dc21ae0297c8c84919cad38e06a6115c2",
+    "crates/thegn-svc/src/voice_runtime.rs": "c11de690e172f89d275770a43ba29fee80d1fb8e6b3e3f306f87d30c2a8fb609",
+    "test/voice-native-worker.py": "1154cb08cafe8948d531a00415fa5fbcae97a80e8a8af12c92af95c104d7efb6"
+  }
+}

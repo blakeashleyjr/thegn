@@ -96,6 +96,13 @@ cat >"$fakebin/alacritty" <<'EOF'
 printf '%s\n' "$@" >"${TG_ALACRITTY_LOG:?}"
 EOF
 chmod 0755 "$fakebin/alacritty"
+cat >"$fakebin/desktop-file-validate" <<'EOF'
+#!/usr/bin/env sh
+printf '%s\n' "$1" >>"${TG_DFV_LOG:-/dev/null}"
+printf '%s\n' "${TG_DFV_MESSAGE-}"
+exit "${TG_DFV_STATUS:-0}"
+EOF
+chmod 0755 "$fakebin/desktop-file-validate"
 
 # install.sh copies the built binary, so the stub above lives at the expected
 # path in the throwaway repo. The fake cargo builds nothing.
@@ -679,6 +686,7 @@ EOF
 
   # batteries: user-local alacritty build
   mkdir -p "$tmp/build-bin"
+  cp "$fakebin/desktop-file-validate" "$tmp/build-bin/desktop-file-validate"
   cat >"$tmp/build-bin/cmake" <<'EOF'
 #!/usr/bin/env sh
 exit 0
@@ -976,5 +984,131 @@ HOME="$case_home" XDG_CONFIG_HOME="$case_config" XDG_DATA_HOME="$case_data" \
   cat "$tmp/uninstall-rejects-batteries.out" >&2
   exit 1
 }
+
+if ((freedesktop)); then
+  # desktop-validate-staged: the validator sees a private .desktop copy before publication.
+  dfv_bin="$tmp/dfv-bin"
+  dfv_data="$tmp/dfv-data"
+  dfv_log="$tmp/dfv.log"
+  PATH="$fakebin:$PATH" HOME="$tmp/dfv-home" XDG_CONFIG_HOME="$tmp/dfv-config" \
+    XDG_DATA_HOME="$dfv_data" TG_DFV_LOG="$dfv_log" \
+    "$install_repo/install.sh" "$dfv_bin" >"$tmp/dfv-install.out" 2>&1
+  [[ $(wc -l <"$dfv_log") -eq 1 ]] || {
+    echo "desktop validator was not called exactly once for the staged entry" >&2
+    cat "$tmp/dfv-install.out" >&2
+    exit 1
+  }
+  dfv_logged_path="$(<"$dfv_log")"
+  [[ $(basename "$dfv_logged_path") == thegn.desktop &&
+  $(dirname "$dfv_logged_path") != "$dfv_data/applications" &&
+  $dfv_logged_path != "$dfv_data"/* && -f $dfv_data/applications/thegn.desktop ]] || {
+    echo "desktop validator did not receive a private named copy before publication: $dfv_logged_path" >&2
+    exit 1
+  }
+
+  # desktop-validate-refusal-rolls-back: validator failure preserves the prior install and manifest.
+  cp "$dfv_bin/thegn" "$tmp/dfv-thegn.before"
+  cp "$dfv_bin/tg" "$tmp/dfv-tg.before"
+  cp "$dfv_bin/tg-tui" "$tmp/dfv-tg-tui.before"
+  cp "$dfv_data/applications/thegn.desktop" "$tmp/dfv-desktop.before"
+  dfv_manifest="$dfv_data/thegn/install-manifest"
+  dfv_manifest_before="$(cksum "$dfv_manifest")"
+  printf 'dfv new bytes\n' >"$install_repo/target/release/thegn"
+  dfv_status=0
+  if PATH="$fakebin:$PATH" HOME="$tmp/dfv-home" XDG_CONFIG_HOME="$tmp/dfv-config" \
+    XDG_DATA_HOME="$dfv_data" TG_DFV_STATUS=1 TG_DFV_MESSAGE='error: fixture rejection' \
+    "$install_repo/install.sh" "$dfv_bin" >"$tmp/dfv-refusal.out" 2>&1; then
+    echo "desktop validator rejection unexpectedly succeeded" >&2
+    exit 1
+  else
+    dfv_status=$?
+  fi
+  [[ $dfv_status -ne 0 && $(<"$tmp/dfv-refusal.out") == *"invalid desktop entry"* &&
+  $(<"$tmp/dfv-refusal.out") == *"fixture rejection"* &&
+  $(<"$tmp/dfv-refusal.out") == *"restored the previous installation"* ]] || {
+    echo "desktop validator rejection did not visibly refuse and roll back" >&2
+    cat "$tmp/dfv-refusal.out" >&2
+    exit 1
+  }
+  if ! cmp -s "$tmp/dfv-thegn.before" "$dfv_bin/thegn" || ! cmp -s "$tmp/dfv-tg.before" "$dfv_bin/tg" ||
+    ! cmp -s "$tmp/dfv-tg-tui.before" "$dfv_bin/tg-tui" ||
+    ! cmp -s "$tmp/dfv-desktop.before" "$dfv_data/applications/thegn.desktop"; then
+    echo "desktop validator refusal did not restore every prior artifact" >&2
+    exit 1
+  fi
+  [[ $(cksum "$dfv_manifest") == "$dfv_manifest_before" ]] || {
+    echo "desktop validator refusal changed the previous manifest" >&2
+    exit 1
+  }
+  shopt -s nullglob
+  dfv_leftovers=("$dfv_bin"/.thegn-install* "$dfv_data/applications"/.thegn-install*)
+  shopt -u nullglob
+  if ((${#dfv_leftovers[@]} > 0)); then
+    echo "desktop validator refusal left staging or backup files" >&2
+    printf '%s\n' "${dfv_leftovers[@]}" >&2
+    exit 1
+  fi
+  printf '#!/usr/bin/env sh\nexit 0\n' >"$install_repo/target/release/thegn"
+  chmod 0755 "$install_repo/target/release/thegn"
+
+  # desktop-validate-structure: the extracted function rejects malformed entries.
+  sed -n '/^validate_desktop_entry() {/,/^}/p' "$repo/install.sh" >"$tmp/vde.sh"
+  [[ -s $tmp/vde.sh ]] || {
+    echo "validate_desktop_entry function was not found for table tests" >&2
+    exit 1
+  }
+  (
+    PATH="$fakebin:$PATH"
+    # shellcheck disable=SC1091 # This extracted function file is generated just above.
+    source "$tmp/vde.sh"
+    vde_file="$tmp/vde-fixture.desktop"
+    vde_expect() {
+      local fixture="$1" expected_status="$2" actual_status=0
+      if validate_desktop_entry "$vde_file" "$tmp/bin/tg" >/dev/null 2>&1; then
+        actual_status=0
+      else
+        actual_status=$?
+      fi
+      if [[ $expected_status == 0 && $actual_status -ne 0 ]] ||
+        [[ $expected_status -ne 0 && $actual_status -eq 0 ]]; then
+        echo "desktop structure fixture failed: $fixture" >&2
+        return 1
+      fi
+    }
+    cp "$desktop" "$vde_file"
+    vde_expect generated-entry 0 || exit 1
+    printf 'Type=Application\nName=thegn\nX-Thegn-Installer=true\nExec=%s --standalone\nTryExec=%s\nIcon=thegn\n' \
+      "$tmp/bin/tg" "$tmp/bin/tg" >"$vde_file"
+    vde_expect missing-header 1 || exit 1
+    printf '[Desktop Entry]\nType=Application\nName=thegn\nX-Thegn-Installer=true\nExec=%s --standalone\nTryExec=%s\nIcon=thegn\n[Other]\n' \
+      "$tmp/bin/tg" "$tmp/bin/tg" >"$vde_file"
+    vde_expect second-group 1 || exit 1
+    printf '[Desktop Entry]\nType=Application\nName=thegn\nName=duplicate\nX-Thegn-Installer=true\nExec=%s --standalone\nTryExec=%s\nIcon=thegn\n' \
+      "$tmp/bin/tg" "$tmp/bin/tg" >"$vde_file"
+    vde_expect duplicate-name 1 || exit 1
+    printf '[Desktop Entry]\nType=Application\nName=thegn\nX-Thegn-Installer=true\nExec=/wrong/tg --standalone\nTryExec=%s\nIcon=thegn\n' \
+      "$tmp/bin/tg" >"$vde_file"
+    vde_expect wrong-exec 1 || exit 1
+    printf '[Desktop Entry]\nType=Application\nName=thegn\nX-Thegn-Installer=true\nExec=%s --standalone\nIcon=thegn\n' \
+      "$tmp/bin/tg" >"$vde_file"
+    vde_expect missing-tryexec 1 || exit 1
+    printf '[Desktop Entry]\nType=Application\nName=bad\001name\nX-Thegn-Installer=true\nExec=%s --standalone\nTryExec=%s\nIcon=thegn\n' \
+      "$tmp/bin/tg" "$tmp/bin/tg" >"$vde_file"
+    vde_expect control-character 1 || exit 1
+    printf '[Desktop Entry]\nType=Application\nnot a key\nName=thegn\nX-Thegn-Installer=true\nExec=%s --standalone\nTryExec=%s\nIcon=thegn\n' \
+      "$tmp/bin/tg" "$tmp/bin/tg" >"$vde_file"
+    vde_expect malformed-key 1 || exit 1
+  ) || exit 1
+
+  # desktop-validate-real-tool: positive control when the host has the real validator.
+  if command -v desktop-file-validate >/dev/null 2>&1; then
+    if ! desktop-file-validate "$desktop"; then
+      echo "desktop-file-validate rejected the generated entry" >&2
+      exit 1
+    fi
+  else
+    echo "desktop-file-validate not installed; real-tool check skipped"
+  fi
+fi
 
 echo "install plan checks passed"

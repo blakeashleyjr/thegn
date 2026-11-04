@@ -136,3 +136,70 @@ pub fn build(n: usize, dirty: usize) -> GitFixture {
 
     GitFixture { dir, worktrees }
 }
+
+/// Build one linked worktree with `files` committed text files, half of which
+/// are rewritten with added and removed lines to produce a worktree-vs-HEAD diff.
+/// The fixture owns the tempdir; use `.worktrees` for its single local GitLoc.
+pub fn build_diff(files: usize) -> GitFixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let home = root.join("home");
+    let gitconfig = root.join("gitconfig");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        &gitconfig,
+        "[user]\n\tname = bench\n\temail = bench@example.invalid\n[init]\n\tdefaultBranch = main\n",
+    )
+    .unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"], &home, &gitconfig);
+    for index in 0..files {
+        let subdir = repo.join(format!("src/{}", index / 100));
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(
+            subdir.join(format!("f_{index}.txt")),
+            format!("file {index}\nold line {index}\nend {index}\n"),
+        )
+        .unwrap();
+    }
+    git(&repo, &["add", "-A"], &home, &gitconfig);
+    git(
+        &repo,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"],
+        &home,
+        &gitconfig,
+    );
+
+    let wt = root.join("worktrees/diff");
+    if let Some(parent) = wt.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "bench-diff",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+        &home,
+        &gitconfig,
+    );
+    for index in (0..files).step_by(2) {
+        let subdir = wt.join(format!("src/{}", index / 100));
+        std::fs::write(
+            subdir.join(format!("f_{index}.txt")),
+            format!("file {index}\nnew line {index}\nextra line {index}\n"),
+        )
+        .unwrap();
+    }
+
+    GitFixture {
+        dir,
+        worktrees: vec![GitLoc::Local(wt)],
+    }
+}

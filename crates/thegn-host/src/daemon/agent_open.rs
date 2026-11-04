@@ -259,6 +259,7 @@ fn resolve_inner(
         Some(args) => format!("{cmd} {args}"),
         None => cmd,
     };
+    check_launch_command(&cmd)?;
 
     // Agent context follows live Git HEAD (read by the caller); an unavailable
     // or detached HEAD intentionally supplies no branch context.
@@ -292,6 +293,18 @@ fn resolve_inner(
     }
 
     Ok(spec)
+}
+
+fn check_launch_command(cmd: &str) -> Result<()> {
+    let limit = crate::agent_run::MAX_RENDERED_COMMAND_BYTES;
+    if cmd.len() > limit {
+        bail!(
+            "agent launch command is {} bytes, over the {} byte limit: shorten the task prompt",
+            cmd.len(),
+            limit
+        );
+    }
+    Ok(())
 }
 
 /// Format 16 random bytes as an RFC 4122 version-4 UUID.
@@ -1301,5 +1314,160 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn launch_command_over_the_limit_is_refused_before_launch() {
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().expect("in-memory db");
+        let worktree_path = worktree.path().to_string_lossy().into_owned();
+        db.put_workspace(&worktree_path, "test", "dir")
+            .expect("register workspace");
+        db.put_worktree(
+            "test/main",
+            &worktree_path,
+            &worktree_path,
+            "main",
+            None,
+            None,
+        )
+        .expect("register worktree");
+        let config = Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..cfg()
+        };
+        let spec = OpenSpec {
+            cwd: Some(worktree_path.clone()),
+            worktree: Some(worktree_path.clone()),
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            agent: "claude".into(),
+            prompt: "x".repeat(200 * 1024),
+            headless: Some(true),
+            bind_worktree: true,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            fork: false,
+            native_session_id: None,
+        };
+
+        let error = match resolve(&config, &db, &spec, &launch, None) {
+            Ok(_) => panic!("oversized launch command must be refused"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("byte limit"), "got {message}");
+        let rendered = command_for(&config, "claude", &launch.prompt, true, None, false, None)
+            .expect("oversized prompt renders");
+        assert!(
+            message.contains(&format!(
+                "{} bytes, over the {} byte limit",
+                rendered.len(),
+                crate::agent_run::MAX_RENDERED_COMMAND_BYTES
+            )),
+            "error must report rendered and permitted byte sizes: {message}"
+        );
+        assert_eq!(
+            db.worktree_agent(&worktree_path)
+                .expect("worktree agent read"),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_command_limit_table() {
+        let limit = crate::agent_run::MAX_RENDERED_COMMAND_BYTES;
+        assert!(check_launch_command(&"x".repeat(limit - 1)).is_ok());
+        assert!(check_launch_command(&"x".repeat(limit)).is_ok());
+        assert!(check_launch_command(&"x".repeat(limit + 1)).is_err());
+
+        let config = cfg();
+        let prompt = "x".repeat(200 * 1024);
+        let forms = [
+            ("headless", true, None, false),
+            ("interactive", false, None, false),
+            ("resume", true, Some("sess-1"), false),
+            ("continue", true, None, true),
+        ];
+        for (form, headless, resume, continue_last) in forms {
+            let command = command_for(
+                &config,
+                "claude",
+                &prompt,
+                headless,
+                resume,
+                continue_last,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{form} command should render: {error}"));
+            assert!(
+                check_launch_command(&command).is_err(),
+                "{form} command must exceed the limit"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_command_with_a_small_prompt_still_resolves() {
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let _state = crate::testenv::IsolatedState::new();
+        let db = Db::open_memory().expect("in-memory db");
+        let worktree_path = worktree.path().to_string_lossy().into_owned();
+        db.put_workspace(&worktree_path, "test", "dir")
+            .expect("register workspace");
+        db.put_worktree(
+            "test/main",
+            &worktree_path,
+            &worktree_path,
+            "main",
+            None,
+            None,
+        )
+        .expect("register worktree");
+        let config = Config {
+            sandbox: thegn_core::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..cfg()
+        };
+        let spec = OpenSpec {
+            cwd: Some(worktree_path.clone()),
+            worktree: Some(worktree_path.clone()),
+            ..OpenSpec::default()
+        };
+        let launch = AgentLaunch {
+            agent: "claude".into(),
+            prompt: "x".repeat(4 * 1024),
+            headless: Some(true),
+            bind_worktree: true,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            fork: false,
+            native_session_id: None,
+        };
+
+        let resolved = resolve(&config, &db, &spec, &launch, None).expect("small prompt resolves");
+        assert!(
+            resolved
+                .env
+                .iter()
+                .any(|(key, value)| key == "THEGN_PROMPT" && value == &launch.prompt),
+            "the small prompt remains in the launch environment"
+        );
+        assert_eq!(
+            db.worktree_agent(&worktree_path)
+                .expect("worktree agent read")
+                .as_deref(),
+            Some("claude"),
+            "the small prompt still binds the selected agent"
+        );
     }
 }

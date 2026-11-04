@@ -649,7 +649,11 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
         );
         if !force
             && let crate::merge_lifecycle::CleanupOutcome::Refused { class, .. } = &outcome
-            && *class != crate::merge_lifecycle::CleanupRefusal::ClaimBusy
+            && !matches!(
+                *class,
+                crate::merge_lifecycle::CleanupRefusal::ClaimBusy
+                    | crate::merge_lifecycle::CleanupRefusal::MergeClaimed
+            )
         {
             let retry = merge_sweep::CleanupRetry::after_refusal(
                 merge_sweep::CleanupRetry::from_detail(row.error_detail.as_deref()),
@@ -2261,6 +2265,10 @@ mod tests {
                 crate::merge_lifecycle::CleanupRefusal::ClaimBusy,
                 "claim_busy",
             ),
+            (
+                crate::merge_lifecycle::CleanupRefusal::MergeClaimed,
+                "merge_claimed",
+            ),
             (crate::merge_lifecycle::CleanupRefusal::Unsafe, "unsafe"),
             (crate::merge_lifecycle::CleanupRefusal::Remote, "remote"),
             (
@@ -2708,6 +2716,93 @@ mod retry_tests {
         );
         assert_eq!(fixture.db.list_merge_queue().unwrap(), before);
         drop(claim);
+    }
+
+    #[test]
+    fn cleanup_retry_merge_claimed_refusal_writes_no_marker() {
+        let fixture = refused_fixture("retry-merge-claimed");
+        clear_dispatch(&fixture);
+        let _claim = claim_landed_fixture(&fixture);
+        let before = fixture.db.list_merge_queue().unwrap();
+
+        let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(
+            report.kept[0].class,
+            crate::merge_lifecycle::CleanupRefusal::MergeClaimed
+        );
+        assert_eq!(fixture.db.list_merge_queue().unwrap(), before);
+        assert!(fixture.worktree.exists());
+    }
+
+    #[test]
+    fn cleanup_retry_expired_merge_claim_does_not_block_cleanup() {
+        let fixture = refused_fixture("retry-expired-merge-claim");
+        clear_dispatch(&fixture);
+        let claim = claim_landed_fixture(&fixture);
+        rusqlite::Connection::open(&fixture.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE merge_queue SET claim_lease_until_ms=1 WHERE worktree=?1",
+                [claim.worktree.as_str()],
+            )
+            .unwrap();
+
+        let report = sweep_with_db(&fixture.cfg, &fixture.root, false, &fixture.db);
+
+        assert!(!fixture.worktree.exists());
+        assert!(
+            !report.kept.iter().any(|entry| {
+                entry.class == crate::merge_lifecycle::CleanupRefusal::MergeClaimed
+            })
+        );
+    }
+
+    fn claim_landed_fixture(fixture: &RetryFixture) -> thegn_core::store::MergeClaim {
+        let row = fixture
+            .db
+            .list_merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == fixture.worktree.to_string_lossy().as_ref())
+            .expect("fixture has a landed queue row");
+        let commit = row.result_oid.expect("landed fixture has a result OID");
+        let worktree = fixture.worktree.to_string_lossy().into_owned();
+        fixture
+            .db
+            .update_merge_status(&worktree, "queued", None, None, None)
+            .unwrap();
+        let claim = fixture
+            .db
+            .admit_merge_claim(&thegn_core::store::MergeClaimRequest {
+                worktree: worktree.clone(),
+                branch: row.branch,
+                repo_root: fixture.root.to_string_lossy().into_owned(),
+                target_branch: row.target_branch,
+                location: row.location,
+                expected_status: "queued".into(),
+                lease_until_ms: util::now_ms() + 60_000,
+                owner_hint: Some("other-drain".into()),
+            })
+            .unwrap()
+            .expect("claim admitted for fixture row");
+        fixture
+            .db
+            .land_merge_status_claimed(
+                &claim,
+                &thegn_core::store::MergeStatusFields {
+                    result_oid: Some(commit.clone()),
+                    ..Default::default()
+                },
+                &commit,
+            )
+            .unwrap();
+        // Re-admitting the test claim transitions the queue row through
+        // `queued` and back to `landed`, which refreshes `updated_at`.
+        // Keep the fixture past its cleanup TTL so sweep reaches the claim fence.
+        age_landed_row(&fixture.db_path, &worktree);
+        claim
     }
 
     #[test]

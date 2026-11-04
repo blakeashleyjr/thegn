@@ -306,6 +306,7 @@ mod toast;
 mod toolchain_ui;
 mod usage_budget;
 mod voice;
+mod voice_worker;
 mod vps_bridge;
 mod vps_reaper;
 mod warmcache;
@@ -356,6 +357,11 @@ pub struct Cli {
 /// `thegn` (no subcommand) launches the interactive compositor.
 #[derive(Subcommand, Clone)]
 pub enum Command {
+    /// Experimental microphone dictation setup, status, and model store.
+    Voice {
+        #[command(subcommand)]
+        action: cmd::voice::Action,
+    },
     /// Inspect trusted automation rules or dry-run an event fixture.
     Automations {
         #[command(subcommand)]
@@ -950,6 +956,11 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_main() -> anyhow::Result<()> {
+    // Private worker bypasses normal config/channel/UI startup. Only an
+    // explicit parent launch can feed the bounded request on stdin.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--voice-worker")) {
+        return voice_worker::run();
+    }
     // Cap glibc's per-thread arena count before the runtime spawns any threads,
     // so the host can't sprawl across dozens of never-trimmed arenas (an audit
     // traced ~2.5 GB RSS to ~131 of them). No-op off glibc. See `mem`.
@@ -1416,6 +1427,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         }
     );
     let result = match command {
+        Command::Voice { action } => cmd::voice::run(&cfg, action, config_path),
         Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action, &config_path),

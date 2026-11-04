@@ -223,7 +223,9 @@ mod db_open_memo;
 /// v97: merge_queue_events.target_base_oid, the target base a drain landing replaced (THE-395).
 /// v98: pipeline_leases.generation + pipeline_lease_fence, the Lead-lease fencing generation (THE-208).
 /// v99: ci_log_cache.context + ci_autofix_dedupe.context, provider context of CI logs and autofix claims (THE-550).
-pub const SCHEMA_VERSION: i64 = 99;
+/// v100: calendar_diagnostics, per-account parser diagnostic counts of the last applied calendar page (THE-468).
+/// v101: shares.owner_pid + shares.owner_start_ticks, the share start process that owns a share row (THE-341).
+pub const SCHEMA_VERSION: i64 = 101;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1815,6 +1817,8 @@ impl Db {
                     crate::db_migrate::verify_v97_schema(&conn)?;
                     crate::db_migrate::verify_v98_schema(&conn)?;
                     crate::db_migrate::verify_v99_schema(&conn)?;
+                    crate::db_migrate::verify_v100_schema(&conn)?;
+                    crate::db_migrate::verify_v101_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2498,6 +2502,8 @@ impl Db {
         crate::db_migrate::migrate_v97(&conn)?;
         crate::db_migrate::migrate_v98(&conn)?;
         crate::db_migrate::migrate_v99(&conn)?;
+        crate::db_migrate::migrate_v100(&conn)?;
+        crate::db_migrate::migrate_v101(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2535,6 +2541,8 @@ impl Db {
             crate::db_migrate::verify_v97_schema(&conn)?;
             crate::db_migrate::verify_v98_schema(&conn)?;
             crate::db_migrate::verify_v99_schema(&conn)?;
+            crate::db_migrate::verify_v100_schema(&conn)?;
+            crate::db_migrate::verify_v101_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
@@ -2651,7 +2659,23 @@ impl Db {
             state: r.get(4)?,
             created_at: r.get(5)?,
             generation: crate::db_aux::decode_share_generation(r.get(6)?),
+            owner: Self::share_owner_from(r.get_ref(7)?, r.get_ref(8)?),
         })
+    }
+
+    fn share_owner_from(
+        pid: rusqlite::types::ValueRef<'_>,
+        ticks: rusqlite::types::ValueRef<'_>,
+    ) -> Option<crate::models::ShareOwner> {
+        let rusqlite::types::ValueRef::Integer(pid) = pid else {
+            return None;
+        };
+        let rusqlite::types::ValueRef::Integer(ticks) = ticks else {
+            return None;
+        };
+        let pid = u32::try_from(pid).ok().filter(|pid| *pid != 0)?;
+        let start_ticks = u64::try_from(ticks).ok()?;
+        Some(crate::models::ShareOwner { pid, start_ticks })
     }
 
     pub(crate) fn map_forward_row(r: &rusqlite::Row) -> rusqlite::Result<ForwardRow> {

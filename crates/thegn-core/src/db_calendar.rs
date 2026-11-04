@@ -17,8 +17,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::db::Db;
 use crate::store::{
-    CalendarCursor, CalendarPageApplied, CalendarPageWrite, CalendarRow, CalendarStore,
-    CalendarSyncRow, CalendarTombstones, EmptySnapshot,
+    CalendarCursor, CalendarDiagnosticCounts, CalendarDiagnosticsRow, CalendarPageApplied,
+    CalendarPageWrite, CalendarRow, CalendarStore, CalendarSyncRow, CalendarTombstones,
+    EmptySnapshot,
 };
 use crate::util;
 
@@ -274,6 +275,48 @@ impl CalendarStore for Db {
             "DELETE FROM calendar_events WHERE recurring = 0 AND end_ms < ?1",
             params![before_ms],
         )?)
+    }
+
+    fn put_calendar_diagnostics(
+        &self,
+        account: &str,
+        counts: &CalendarDiagnosticCounts,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO calendar_diagnostics (account, quarantined_events, unresolved_zones, other, overflow, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(account) DO UPDATE SET quarantined_events = ?2, unresolved_zones = ?3, \
+             other = ?4, overflow = ?5, recorded_at = ?6",
+            params![
+                account,
+                counts.quarantined_events,
+                counts.unresolved_zones,
+                counts.other,
+                counts.overflow,
+                util::now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn calendar_diagnostics(&self) -> Result<Vec<CalendarDiagnosticsRow>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT account, quarantined_events, unresolved_zones, other, overflow, recorded_at \
+             FROM calendar_diagnostics ORDER BY account",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CalendarDiagnosticsRow {
+                account: row.get(0)?,
+                counts: CalendarDiagnosticCounts {
+                    quarantined_events: row.get(1)?,
+                    unresolved_zones: row.get(2)?,
+                    other: row.get(3)?,
+                    overflow: row.get(4)?,
+                },
+                recorded_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
@@ -1143,5 +1186,46 @@ mod tests {
             db.claim_calendar_reminder("cal:acct/series@1000+10", 5_000)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn calendar_diagnostics_round_trip_and_overwrite() {
+        let db = Db::open_memory().unwrap();
+        db.put_calendar_diagnostics(
+            "b",
+            &CalendarDiagnosticCounts {
+                other: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.put_calendar_diagnostics(
+            "a",
+            &CalendarDiagnosticCounts {
+                quarantined_events: 1,
+                unresolved_zones: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rows = db.calendar_diagnostics().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].account, "a");
+        assert_eq!(
+            rows[0].counts,
+            CalendarDiagnosticCounts {
+                quarantined_events: 1,
+                unresolved_zones: 2,
+                ..Default::default()
+            }
+        );
+        assert!(rows[0].recorded_at > 0);
+        assert_eq!(rows[1].account, "b");
+        assert_eq!(rows[1].counts.other, 3);
+        db.put_calendar_diagnostics("a", &CalendarDiagnosticCounts::default())
+            .unwrap();
+        let rows = db.calendar_diagnostics().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].counts, CalendarDiagnosticCounts::default());
     }
 }

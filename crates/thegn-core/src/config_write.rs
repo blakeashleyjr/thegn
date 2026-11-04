@@ -458,6 +458,31 @@ pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
     set_key_checked(config_path, dotted, val, |_, _| Ok(()))
 }
 
+/// Replace dictation configuration in a single fenced atomic write, preserving
+/// unrelated tables/comments. Setup only calls this after acquisition succeeds.
+pub fn set_voice(config_path: &Path, voice: &crate::config::VoiceConfig) -> Result<()> {
+    let (mut doc, expected) = read_doc(config_path)?;
+    let voice_doc: toml_edit::DocumentMut = toml::to_string(voice)?.parse()?;
+    let mut table = voice_doc.as_table().clone();
+    if let Some(prior) = doc.get("voice").and_then(Item::as_table) {
+        *table.decor_mut() = prior.decor().clone();
+        table.set_position(prior.position());
+        for (mut key, item) in table.iter_mut() {
+            if let Some(old) = prior.key(&key) {
+                *key.leaf_decor_mut() = old.leaf_decor().clone();
+                *key.dotted_decor_mut() = old.dotted_decor().clone();
+            }
+            if let Some(old) = prior.get(&key).and_then(Item::as_value)
+                && let Some(new) = item.as_value_mut()
+            {
+                *new.decor_mut() = old.decor().clone();
+            }
+        }
+    }
+    doc["voice"] = Item::Table(table);
+    write_document_fenced_checked(config_path, &doc, expected.as_deref(), |_, _| Ok(()))
+}
+
 /// Set one dotted key and run `check` against the exact prior and proposed
 /// config contents while the writer lock is held, before anything is published.
 pub fn set_key_checked(
@@ -715,6 +740,31 @@ pub fn select_env_in_repo(repo_toml: &Path, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_setup_preserves_comments_and_removes_cleared_optional_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# user note\n[voice]\n# record explicitly\nenabled = false # opt-in\nmodel_path = '/old/model'\n[drawer]\nheight = '35%'\n").unwrap();
+        set_voice(
+            &path,
+            &crate::config::VoiceConfig {
+                enabled: true,
+                kind: crate::config::VoiceKind::Http,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.starts_with("# user note\n[voice]"), "{text}");
+        assert!(text.contains("enabled = true # opt-in"), "{text}");
+        assert!(text.contains("# record explicitly\nenabled"), "{text}");
+        assert!(!text.contains("model_path"));
+        let cfg: crate::config::Config = toml::from_str(&text).unwrap();
+        assert!(cfg.voice.enabled);
+        assert_eq!(cfg.voice.kind, crate::config::VoiceKind::Http);
+        assert!(text.contains("height = '35%'"));
+    }
 
     #[test]
     fn no_follow_config_errors_explain_symlink_refusal() {

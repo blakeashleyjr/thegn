@@ -14,7 +14,101 @@ All notable changes to **thegn** are documented here. The format follows
   (`plugin-app-drafts`/`plugin-app-requests`) open draft and request recovery.
   Plugin API is now 0.4.0; 0.3 plugins load unchanged.
 
+## [0.1.0-alpha.47] — 2026-11-03 (maintenance batch 84)
+
+### Added
+
+- `thegn doctor` reports stored problem counts for configured calendar
+  accounts, from each account's last applied page, in text and `--json`,
+  without creating the state database.
+- `--lease-gen` on dispatch claim, put and set-status and on `session open`
+  fences Lead mutations to the acquired lease generation; stale generations are
+  refused before writing.
+- `thegn api coverage` reports a disposition and any review trigger for each
+  excused control-surface gap, in text and `--json`.
+- The Home Manager module exposes `confirmDelete` and scalar `[theme]` options
+  for preset, focus border, pane padding, undercurl, color, glyphs, agent glyphs,
+  mascot and mascot motion.
+
+### Changed
+
+- The state database schema is now v100. Restart the host and daemon after
+  upgrading so they use the migrated database.
+- `thegn merge history` records a refused queue-aware `thegn merge land` as a
+  `land` event with its refusal outcome when a matching queue row exists; the
+  queue row remains unchanged.
+- Theme save and import refuse before writing when another theme file claims
+  the same exact name or slug.
+- PR review-task refreshes cannot add or reactivate a task when the active
+  roster has reached its 4,096-row limit; revising an active task remains
+  allowed.
+
+### Fixed
+
+- Oversized agent prompts are shortened to fit the command line and prompt
+  environment variables, with an omission marker, so they do not prevent the
+  agent from starting.
+- Worktree creation is refused without changes when Git cannot verify whether
+  the branch already exists; failed branch renames and worktree moves include
+  Git's reason.
+- Quitting during a scheduled calendar refresh starts no further account
+  fetches; fetches already in flight may finish.
+- Orphan detection keeps a live worktree's main container when its slug ends in
+  `-tgvpn` or `-tgagent`.
+- (dev channel) The x86_64 Linux `.#dev` package sets `THEGN_BRIDGE_BINARY` to
+  its bundled static provider bridge unless the variable is already set.
+
+### Security
+
+- (dev channel) SSH data projections (sshfs or sync) with different SSH extra
+  arguments have different identities; a mismatch is refused before any mount,
+  pull or push. Existing SSH projections with non-empty extra arguments may
+  need to be recreated after upgrading.
+- (dev channel) Managed SSH custody records use a monotonic generation, so a
+  revoked and republished key cannot match a stale rotation snapshot.
+
 ## [0.1.0-alpha.46] — 2026-11-03 (maintenance batch 83)
+
+### Added
+
+- The control API's `issues.get`, `issues.update` and `issues.comment` accept an
+  optional `account` to route each issue to its configured tracker account.
+- With `THEGN_PERF=1`, the perf rollup adds p95 latency keys; the status modal
+  shows sample counts for sparse loop windows and `no samples` for empty ones.
+
+### Changed
+
+- The state database schema is now v99. Restart the host and daemon after
+  upgrading so they use the migrated database.
+- CI log cache entries and autofix claims record their provider context.
+  Background ingestion reuses a cached log only for the same context; a
+  failure from another provider project becomes a new autofix candidate.
+
+### Fixed
+
+- Rebase, move, retag, reword and amend refuse a shallow-clone boundary with a
+  hint to fetch more history, instead of rewriting it as a root commit.
+- (dev channel) Cancelling a merge-queue drain stops an active cross-host bundle
+  transfer and reports cancellation as `gate_error`, rather than unreachable;
+  fetching the bundle is bounded by the same subprocess deadline.
+
+### Security
+
+- On Linux with usable `bwrap`, PDF renderers run without network access and
+  with only private scratch writable; otherwise they run as before.
+- The `devcontainer` CLI provider re-checks the selected config before
+  snapshotting and starting, and refuses a file that is no longer regular and
+  inside the worktree. If the later check refuses the CLI provider, thegn warns
+  and uses its native OCI path for the supported approved subset.
+- A language-server executable is re-checked before start; changed binaries and
+  paths that are not valid UTF-8 are refused.
+- (dev channel) Warm-pool claims verify the worktree's network egress policy on
+  the spare, re-apply drift, and quarantine an unverifiable spare before fresh
+  provisioning.
+- (dev channel) Remote and bridge worktree listings reject forged or ambiguous
+  records instead of returning a partial list.
+- Sandbox image builds no longer use registry credentials; each architecture's
+  image and the manifest list carry build-provenance attestations.
 
 ## [0.1.0-alpha.45] — 2026-11-03 (maintenance batch 82)
 
@@ -2459,7 +2553,8 @@ launcher picker and the merge queue's `agent_command` hook remain — they run
 whatever commands you configure. Leftover `[llm_proxy]` config sections and
 `proxy_*` tables in existing state databases are ignored harmlessly.
 
-[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.46...HEAD
+[Unreleased]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.47...HEAD
+[0.1.0-alpha.47]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.46...v0.1.0-alpha.47
 [0.1.0-alpha.46]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.45...v0.1.0-alpha.46
 [0.1.0-alpha.45]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.44...v0.1.0-alpha.45
 [0.1.0-alpha.44]: https://github.com/blakeashleyjr/thegn/compare/v0.1.0-alpha.43...v0.1.0-alpha.44

@@ -98,8 +98,8 @@ pub(crate) fn headless_settings_warnings(cfg: &thegn_core::config::Config) -> Ve
     warnings
 }
 
-#[cfg(any(unix, test))]
-const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
+/// Ceiling for any rendered agent command, queue or daemon launch.
+pub(crate) const MAX_RENDERED_COMMAND_BYTES: usize = 100 * 1024;
 
 #[cfg(any(unix, test))]
 fn rendered_command_exceeds_limit(command: &str) -> bool {
@@ -865,6 +865,20 @@ pub(crate) fn run_outcome_cancellable(
             "agent prompt was bounded to fit the rendered command; task data omitted"
         );
     }
+    if prompt_env(task).is_some() && task.prompt.len() > MAX_RENDERED_COMMAND_BYTES {
+        tracing::warn!(
+            target: "thegn::agent",
+            kind = %task.kind,
+            bounded_env_copies = if matches!(task.kind, TaskKind::MergeConflict | TaskKind::GateFailure) {
+                "THEGN_TASK_PROMPT,THEGN_MERGE_PROMPT"
+            } else {
+                "THEGN_TASK_PROMPT"
+            },
+            original_prompt_bytes = task.prompt.len(),
+            max_env_bytes = MAX_RENDERED_COMMAND_BYTES,
+            "agent prompt was bounded to fit the environment; task data omitted"
+        );
+    }
 
     // Join the shared aggregate slice, like the fold gate and every interactive
     // pane. A queue handoff runs a coding agent unattended — it must not be the
@@ -904,7 +918,10 @@ pub(crate) fn run_outcome_cancellable(
         .env("THEGN_TASK_KIND", task.kind.as_str())
         .env("THEGN_WORKTREE", task.worktree);
     if let Some((key, value)) = prompt_env(task) {
-        cmd.env(key, value);
+        cmd.env(
+            key,
+            thegn_core::agent_task::bound_text(value, MAX_RENDERED_COMMAND_BYTES),
+        );
     }
     if task.credential_free {
         cmd.env_clear();
@@ -918,7 +935,10 @@ pub(crate) fn run_outcome_cancellable(
         cmd.env("THEGN_TASK_KIND", task.kind.as_str())
             .env("THEGN_WORKTREE", task.worktree);
         if let Some((key, value)) = prompt_env(task) {
-            cmd.env(key, value);
+            cmd.env(
+                key,
+                thegn_core::agent_task::bound_text(value, MAX_RENDERED_COMMAND_BYTES),
+            );
         }
     }
     for (k, v) in legacy_env(task) {
@@ -1589,7 +1609,10 @@ fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
     }
     if matches!(task.kind, TaskKind::MergeConflict | TaskKind::GateFailure) {
         if prompt_env(task).is_some() {
-            out.push(("THEGN_MERGE_PROMPT", task.prompt.to_string()));
+            out.push((
+                "THEGN_MERGE_PROMPT",
+                thegn_core::agent_task::bound_text(task.prompt, MAX_RENDERED_COMMAND_BYTES),
+            ));
         }
         if let Some(t) = task.vars.get("target") {
             out.push(("THEGN_MERGE_TARGET", t.to_string()));
@@ -2537,6 +2560,87 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn env_prompt_legacy_merge_alias_is_bounded_with_the_omission_marker() {
+        let prompt = "p".repeat(200 * 1024);
+        let vars = vars();
+        let t = AgentTaskRun {
+            prompt: &prompt,
+            command_template: "agent --noninteractive",
+            ..task(TaskKind::MergeConflict, &vars)
+        };
+        let merge_prompt = legacy_env(&t)
+            .into_iter()
+            .find(|(key, _)| *key == "THEGN_MERGE_PROMPT")
+            .map(|(_, value)| value)
+            .expect("merge prompt alias");
+
+        assert!(merge_prompt.len() <= MAX_RENDERED_COMMAND_BYTES);
+        assert!(merge_prompt.contains("task data omitted"));
+        assert!(merge_prompt.starts_with('p'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_prompt_oversized_task_prompt_still_spawns_bounded() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let prompt = "x".repeat(200 * 1024);
+        let vars = vars();
+        let t = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            prompt: &prompt,
+            command_template: "printf %s \"$THEGN_TASK_PROMPT\" > task && printf %s \"$THEGN_MERGE_PROMPT\" > merge",
+            ..task(TaskKind::MergeConflict, &vars)
+        };
+
+        assert_eq!(run_outcome(&t), AgentRunVerdict::Exited(Some(0)));
+        for path in [worktree.path().join("task"), worktree.path().join("merge")] {
+            let value = std::fs::read_to_string(path).unwrap();
+            assert!(!value.is_empty());
+            assert!(value.len() <= MAX_RENDERED_COMMAND_BYTES);
+            assert!(value.contains("task data omitted"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maximal_quote_heavy_prompt_spawns_through_the_argv_transport() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir(worktree.path().join(".git")).unwrap();
+        let prompt = "'".repeat(64 * 1024);
+        let vars = vars();
+        let t = AgentTaskRun {
+            worktree: worktree.path().to_str().unwrap(),
+            prompt: &prompt,
+            command_template: "printf %s {prompt} > got",
+            ..task(TaskKind::MergeConflict, &vars)
+        };
+
+        assert_eq!(run_outcome(&t), AgentRunVerdict::Exited(Some(0)));
+        let got = std::fs::read_to_string(worktree.path().join("got")).unwrap();
+        assert!(!got.is_empty());
+        assert!(got.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
+        assert!(got.contains("task data omitted"));
+    }
+
+    #[test]
+    fn maximal_rendered_task_prompt_fits_every_transport_bound() {
+        let prompt = thegn_core::agent_task::render_kind_prompt(
+            TaskKind::Issue,
+            "{issue_body}",
+            &TaskVars::new().set("issue_body", "'".repeat(1 << 20)),
+        )
+        .unwrap();
+
+        assert!(prompt.len() <= thegn_core::agent_task::MAX_RENDERED_PROMPT_BYTES);
+        let (command, _) = fit_command("agent -p {prompt}", &prompt, &TaskVars::new())
+            .unwrap()
+            .expect("bounded rendered prompt should fit the command transport");
+        assert!(command.len() <= MAX_RENDERED_COMMAND_BYTES);
+        const { assert!(MAX_RENDERED_COMMAND_BYTES < 128 * 1024) };
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use crate::{
-    Capture, Containment, End, GroupState, Leader, Limits, POLL_INTERVAL, Run, Stream, Which,
-    aggregate_fit,
+    Capture, Containment, End, GroupState, InputFeed, Leader, Limits, POLL_INTERVAL, Run, Stream,
+    Which, aggregate_fit,
 };
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -175,6 +175,25 @@ pub(super) fn run_consuming(
     cancel: &AtomicBool,
     consume: &mut dyn FnMut(&[u8]),
 ) -> Run {
+    run_inner_wrapped(cmd, limits, cancel, consume, None).0
+}
+
+pub(super) fn run_with_input(
+    cmd: &mut Command,
+    limits: &Limits,
+    input: &[u8],
+    cancel: &AtomicBool,
+) -> (Run, InputFeed) {
+    run_inner_wrapped(cmd, limits, cancel, &mut |_bytes: &[u8]| {}, Some(input))
+}
+
+fn run_inner_wrapped(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: &mut dyn FnMut(&[u8]),
+    input: Option<&[u8]>,
+) -> (Run, InputFeed) {
     // Without the Unix Guard, contain consumer panics until the child is drained and reaped.
     let mut panic_payload = None;
     let mut guarded_consume = |bytes: &[u8]| {
@@ -185,11 +204,11 @@ pub(super) fn run_consuming(
             panic_payload = Some(payload);
         }
     };
-    let run = run_inner(cmd, limits, cancel, &mut guarded_consume);
+    let result = run_inner(cmd, limits, cancel, &mut guarded_consume, input);
     if let Some(payload) = panic_payload {
         std::panic::resume_unwind(payload);
     }
-    run
+    result
 }
 
 fn run_inner(
@@ -197,8 +216,13 @@ fn run_inner(
     limits: &Limits,
     cancel: &AtomicBool,
     consume: &mut dyn FnMut(&[u8]),
-) -> Run {
-    cmd.stdin(Stdio::null());
+    input: Option<&[u8]>,
+) -> (Run, InputFeed) {
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     cmd.stdout(match limits.stdout {
         Stream::Null => Stdio::null(),
         _ => Stdio::piped(),
@@ -207,19 +231,49 @@ fn run_inner(
         Stream::Null => Stdio::null(),
         _ => Stdio::piped(),
     });
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return Run {
-                end: End::Spawn(error),
-                group: GroupState::Unknown,
-                leader: Leader::NotSpawned,
-                leader_exited_first: false,
-                stdout: Capture::default(),
-                stderr: Capture::default(),
-                containment: Containment::DirectChildOnly,
-            };
+            return (
+                Run {
+                    end: End::Spawn(error),
+                    group: GroupState::Unknown,
+                    leader: Leader::NotSpawned,
+                    leader_exited_first: false,
+                    stdout: Capture::default(),
+                    stderr: Capture::default(),
+                    containment: Containment::DirectChildOnly,
+                },
+                InputFeed::default(),
+            );
         }
+    };
+    let mut feed_error = None;
+    let feed_rx = if let Some(input) = input {
+        let stdin = child.stdin.take();
+        let payload = input.to_vec();
+        let (feed_tx, feed_rx) = mpsc::sync_channel(1);
+        match stdin {
+            Some(mut stdin) => {
+                let spawned = thread::Builder::new()
+                    .name("thegn-proc-feed".to_owned())
+                    .spawn(move || {
+                        let result = stdin.write_all(&payload);
+                        if feed_tx.send(result).is_err() {
+                            // The run ended before it could observe the writer result.
+                        }
+                        drop(stdin);
+                    });
+                match spawned {
+                    Ok(handle) => drop(handle),
+                    Err(_spawn_error) => feed_error = Some(io::ErrorKind::Other),
+                }
+            }
+            None => feed_error = Some(io::ErrorKind::Other),
+        }
+        Some(feed_rx)
+    } else {
+        None
     };
     let (tx, rx) = mpsc::sync_channel(16);
     let mut child = Some(child);
@@ -369,7 +423,30 @@ fn run_inner(
         limits.stderr,
         limits.aggregate_tail_cap,
     );
-    run
+    let feed = if let Some(kind) = feed_error {
+        InputFeed {
+            written: 0,
+            complete: false,
+            error: Some(kind),
+        }
+    } else {
+        match feed_rx.map(|rx| rx.try_recv()) {
+            Some(Ok(Ok(()))) => InputFeed {
+                written: input.map_or(0, |bytes| bytes.len() as u64),
+                complete: true,
+                error: None,
+            },
+            Some(Ok(Err(error))) => InputFeed {
+                written: 0,
+                complete: false,
+                error: Some(error.kind()),
+            },
+            Some(Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)) | None => {
+                InputFeed::default()
+            }
+        }
+    };
+    (run, feed)
 }
 
 #[cfg(test)]
