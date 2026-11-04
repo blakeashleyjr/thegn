@@ -42,6 +42,11 @@ exits nonzero and keeps the record so you can retry. A share started by a
 foreground `thegn share start` ends when that command is interrupted. Use
 `thegn share stop <port> --forget` only to remove the saved record; it does not
 touch the tunnel.
+On Linux, `thegn share list` marks a share whose `thegn share start` process
+has exited (`up (owner exited)`; `"owner_state": "exited"` with `--json`).
+`thegn share stop` names that process and still asks you to check the client
+and use `--forget`; a share owned by a running `thegn share start` is never
+restarted by the thegn window when it opens.
 `thegn share start` refuses a port that already has a saved share; stop it
 first, or use `--forget` for a stale record. It records the share as `starting`
 before the tunnel comes up. `thegn share stop <port>` also tears down a

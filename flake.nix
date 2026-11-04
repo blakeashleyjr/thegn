@@ -215,6 +215,12 @@
       msrvCargo = pkgs.writeShellScriptBin "cargo-1.89" ''
         exec ${msrvRustToolchain}/bin/cargo "$@"
       '';
+      # Optional native dictation is exercised by the all-features gate. Keep
+      # its build tools in the development/CI shells without enabling it in
+      # release packages or the static remote bridge.
+      voiceNativeInputs =
+        [pkgs.cmake pkgs.pkg-config]
+        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.alsa-lib];
       spriteRustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
         extensions = ["clippy" "rustfmt" "llvm-tools-preview"];
       };
@@ -822,18 +828,22 @@
       # carries only what `just build` and `just test` actually use, so the job
       # both passes and gets cheaper. Keep it in sync with those two recipes.
       devShells.ci = pkgs.mkShell {
-        packages = [
-          rustToolchain
-          pkgs.just
-          # `just test` runs `cargo nextest run --workspace`.
-          pkgs.cargo-nextest
-          # libgit2-sys → libz-sys wants pkg-config + zlib; sqlite is vendored.
-          pkgs.pkg-config
-          pkgs.zlib
-        ];
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        packages =
+          [
+            rustToolchain
+            pkgs.just
+            # `just test` runs `cargo nextest run --workspace`.
+            pkgs.cargo-nextest
+            # libgit2-sys → libz-sys wants pkg-config + zlib; sqlite is vendored.
+            pkgs.pkg-config
+            pkgs.zlib
+          ]
+          ++ voiceNativeInputs;
       };
 
       devShells.default = pkgs.mkShell {
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         packages = with pkgs;
           [
             # rust toolchain (clippy/rustfmt/rust-analyzer + wasm32-wasip1 target)
@@ -886,6 +896,7 @@
           ]
           # The same pinned yazi as the package, so the drawer's preview tools
           # resolve on PATH and `just host` runs the version thegn ships.
+          ++ voiceNativeInputs
           ++ [yaziPinned]
           ++ yaziDeps
           # Faster linker, wired via CARGO_TARGET_*_RUSTFLAGS in shellHook
@@ -917,6 +928,7 @@
       # tool is one `nix shell nixpkgs#<tool>` away in-pane. Reuses `devShellHook`
       # (sccache/mold/yazi/openspec) so it never drifts from `default`.
       devShells.sprite-full = pkgs.mkShell {
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         packages = with pkgs;
           [
             spriteRustToolchain
@@ -940,6 +952,7 @@
             gdu
             openspec
           ]
+          ++ voiceNativeInputs
           ++ [yaziPinned]
           ++ yaziDeps
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold];

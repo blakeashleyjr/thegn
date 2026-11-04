@@ -10,23 +10,54 @@
 # SHRINK-ONLY. Enforced by crates/thegn-core/tests/env_overlay_coverage.rs;
 # regenerate with `just ratchet-update` (THEGN_RATCHET_UPDATE=1).
 
-accounts.dir
-accounts.name
-accounts.provider
-autopilot.agent
-autopilot.agent_command
-autopilot.agent_timeout_secs
-autopilot.assignee
-autopilot.done_on_merge
-autopilot.enabled
-autopilot.max_attempts
-autopilot.max_concurrent
-autopilot.open_as
-autopilot.pickup_status
-autopilot.trigger_label
 # autopilot.* — issue pickup is a trusted file/workspace policy, not a
 # launcher/environment switch; enabling it can run commands and make forge
 # writes, so every key stays file-only.
+# agents/tools.{harness,model,permissions} — per-ENTRY launch settings of a
+# list item, like `provider`; an env knob cannot address one entry of a list.
+# agents.drawer_* — structured per-entry drawer metadata; list entries have no
+# stable index-addressable THEGN_* environment override.
+# automations.* — trusted global/profile automation policy is intentionally
+# file-scoped; exposing it through process environment would make automation
+# behavior depend on unreviewed launcher state.
+# diagnostics.crash_sink — reserved provider-seam kind (Sentry-protocol crash
+# forwarding); not implemented, rejected at config-validate, so no runtime knob.
+# git_commands.{argv,template_policy,timeout_secs} — trusted per-entry command
+# configuration, like command/context below. An ambient THEGN_* knob cannot
+# address one list entry or widen its shell-template admission policy.
+# {merge,pr}_queue.agent_sandbox / agent_isolation_floor / agent_on_floor_miss —
+# the isolation the queues' agent handoff runs under. Per-queue policy chosen
+# alongside agent_command in config (and clamped by `[sandbox]`), not a launcher
+# knob; ordinary `[merge_queue]`/`[pr_queue]` policy is config-only, so these
+# follow their neighbours. Gate command deadlines have explicit environment
+# overrides because operators may bound a single launch independently.
+# model_proxy.* — the proxy is FILE-ONLY config, like [usage] and [observe]:
+# a listen socket, a routing strategy and streaming budgets are deployment
+# facts of a checked-in config, not per-launch knobs, and the section is the
+# credential-adjacent one (providers carry SecretRefs) — an env override of
+# `listen` or `routing` would let a launcher silently re-point an agent's
+# model traffic. `enabled` stays file-only for the same reason: turning the
+# proxy on is a deliberate act under a fresh section name, not an env flip.
+# plugins.api — existing per-plugin compatibility declaration, newly visible
+# to scalar coverage after its schema correction. There is no entry-addressable
+# ambient version override; keep it file-defined with the other manifest fields.
+# plugins.trusted_native is trust policy and must never be granted by an ambient environment variable.
+# Structured tuning for the tree-sitter entity index / repo map, not launcher
+# knobs: crawl and render budgets belong in config beside the rest of
+# [semantic] (same shape as the drawer.* and worktree_templates.* pins).
+# serve.* controls the remote-control trust boundary. Keep endpoint/topology,
+# local-admin/CORS/pairing policy, and especially the plaintext escape hatch in
+# reviewed global config (or the dedicated CLI flags) rather than ambient
+# process environment that a repository shell/direnv could inherit and widen.
+# tools.drawer_* — structured per-entry drawer metadata; list entries have no
+# stable index-addressable THEGN_* environment override.
+# Voice is an explicit, structured consent surface. In particular, argv
+# arrays are config-only so a launcher cannot silently redirect microphone
+# audio or transcription through an environment alias.
+
+accounts.dir
+accounts.name
+accounts.provider
 actions.action
 actions.close_on_exit
 actions.floating
@@ -44,11 +75,7 @@ activity.red_requires_agent
 activity.resume_grace_secs
 activity.spawn_grace_secs
 activity.unsolicited_gap_secs
-# agents/tools.{harness,model,permissions} — per-ENTRY launch settings of a
-# list item, like `provider`; an env knob cannot address one entry of a list.
 agents.command
-# agents.drawer_* — structured per-entry drawer metadata; list entries have no
-# stable index-addressable THEGN_* environment override.
 agents.drawer_cwd
 agents.drawer_scope
 agents.harness
@@ -58,14 +85,22 @@ agents.permissions
 agents.provider
 agents.resume
 agents.route_via_proxy
-# automations.* — trusted global/profile automation policy is intentionally
-# file-scoped; exposing it through process environment would make automation
-# behavior depend on unreviewed launcher state.
 automations.action_timeout_secs
 automations.audit_retention_per_rule
 automations.enabled
 automations.max_concurrent
 automations.queue_capacity
+autopilot.agent
+autopilot.agent_command
+autopilot.agent_timeout_secs
+autopilot.assignee
+autopilot.done_on_merge
+autopilot.enabled
+autopilot.max_attempts
+autopilot.max_concurrent
+autopilot.open_as
+autopilot.pickup_status
+autopilot.trigger_label
 bars.bottom_left
 bars.bottom_right
 bars.clock_format
@@ -88,9 +123,9 @@ calendar.show_week_numbers
 calendar.time_format
 calendar.ttl_secs
 calendar.week_start
-ci.log_tail_lines
 ci.log_cache_runs
 ci.log_max_bytes
+ci.log_tail_lines
 ci.max_runs
 ci.poll_interval_secs
 ci.provider
@@ -105,8 +140,6 @@ daemon.idle_exit_secs
 daemon.lease_grace_secs
 daemon.socket
 daemon.stream_gap_window_secs
-# diagnostics.crash_sink — reserved provider-seam kind (Sentry-protocol crash
-# forwarding); not implemented, rejected at config-validate, so no runtime knob.
 diagnostics.crash_sink
 drawer.command
 drawer.config_home
@@ -146,9 +179,6 @@ git.auto_fetch_min_interval_secs
 git.auto_fetch_notify
 git.merge_guard
 git.override_gpg
-# git_commands.{argv,template_policy,timeout_secs} — trusted per-entry command
-# configuration, like command/context below. An ambient THEGN_* knob cannot
-# address one list entry or widen its shell-template admission policy.
 git_commands.argv
 git_commands.command
 git_commands.context
@@ -157,12 +187,12 @@ git_commands.key
 git_commands.output
 git_commands.template_policy
 git_commands.timeout_secs
-hooks.pre_create
 hooks.post_create
-hooks.pre_destroy
 hooks.post_destroy
-hooks.session_start
+hooks.pre_create
+hooks.pre_destroy
 hooks.session_end
+hooks.session_start
 host_discovery.kind
 issues.filter_assignee_me
 issues.max_issues
@@ -208,12 +238,6 @@ media.show_art
 media.volume_step
 merge_queue.agent
 merge_queue.agent_command
-# {merge,pr}_queue.agent_sandbox / agent_isolation_floor / agent_on_floor_miss —
-# the isolation the queues' agent handoff runs under. Per-queue policy chosen
-# alongside agent_command in config (and clamped by `[sandbox]`), not a launcher
-# knob; ordinary `[merge_queue]`/`[pr_queue]` policy is config-only, so these
-# follow their neighbours. Gate command deadlines have explicit environment
-# overrides because operators may bound a single launch independently.
 merge_queue.agent_isolation_floor
 merge_queue.agent_max_attempts
 merge_queue.agent_on_floor_miss
@@ -246,13 +270,6 @@ merge_queue.rerere
 merge_queue.sign_commits
 merge_queue.snapshot_dirty
 merge_queue.target_branch
-# model_proxy.* — the proxy is FILE-ONLY config, like [usage] and [observe]:
-# a listen socket, a routing strategy and streaming budgets are deployment
-# facts of a checked-in config, not per-launch knobs, and the section is the
-# credential-adjacent one (providers carry SecretRefs) — an env override of
-# `listen` or `routing` would let a launcher silently re-point an agent's
-# model traffic. `enabled` stays file-only for the same reason: turning the
-# proxy on is a deliberate act under a fresh section name, not an env flip.
 model_proxy.enabled
 model_proxy.first_byte_timeout_secs
 model_proxy.heartbeat_secs
@@ -306,12 +323,6 @@ pins.scope
 pins.singleton
 pins.start
 pins.workspace
-presets.commands
-presets.cwd
-presets.description
-presets.layout
-presets.mode
-presets.name
 placement.enabled
 placement.headroom_ttl_secs
 placement.independent_safety_pct
@@ -324,9 +335,6 @@ placement.pack_strategy
 placement.preset
 placement.spillover_envs
 placement.strictest_allowed_mode
-# plugins.api — existing per-plugin compatibility declaration, newly visible
-# to scalar coverage after its schema correction. There is no entry-addressable
-# ambient version override; keep it file-defined with the other manifest fields.
 plugins.api
 plugins.capabilities
 plugins.command
@@ -337,7 +345,6 @@ plugins.mode
 plugins.name
 plugins.scopes
 plugins.timeout_secs
-# plugins.trusted_native is trust policy and must never be granted by an ambient environment variable.
 plugins.trusted_native
 plugins.version
 pr.ttl_secs
@@ -363,6 +370,12 @@ pr_queue.require_approval
 pr_queue.require_checks
 pr_queue.reset_attempts_on_push
 pr_queue.watch
+presets.commands
+presets.cwd
+presets.description
+presets.layout
+presets.mode
+presets.name
 profile_order
 recording.dir
 recording.max_bytes
@@ -388,9 +401,9 @@ sandbox.backend_chain
 sandbox.compose
 sandbox.default_backend
 sandbox.default_env
+sandbox.devcontainer
 sandbox.devenv
 sandbox.devshell
-sandbox.devcontainer
 sandbox.env_passthrough
 sandbox.failover
 sandbox.file_access
@@ -410,16 +423,9 @@ search.include_hidden
 search.max_results
 search.respect_gitignore
 search.structural
-# Structured tuning for the tree-sitter entity index / repo map, not launcher
-# knobs: crawl and render budgets belong in config beside the rest of
-# [semantic] (same shape as the drawer.* and worktree_templates.* pins).
 semantic.index_max_files
 semantic.map_budget_lines
 semantic.worktree_index
-# serve.* controls the remote-control trust boundary. Keep endpoint/topology,
-# local-admin/CORS/pairing policy, and especially the plaintext escape hatch in
-# reviewed global config (or the dedicated CLI flags) rather than ambient
-# process environment that a repository shell/direnv could inherit and widen.
 serve.advertise_host
 serve.advertise_port
 serve.bind
@@ -476,14 +482,12 @@ toolchain.deno
 toolchain.extra
 toolchain.go
 toolchain.jvm
-toolchain.mode
 toolchain.mise.inject
+toolchain.mode
 toolchain.node
 toolchain.python
 toolchain.ruby
 tools.command
-# tools.drawer_* — structured per-entry drawer metadata; list entries have no
-# stable index-addressable THEGN_* environment override.
 tools.drawer_cwd
 tools.drawer_scope
 tools.harness
@@ -509,16 +513,16 @@ ui.sidebar_icon_ahead
 ui.sidebar_icon_behind
 ui.sidebar_icon_status
 ui.sidebar_nav_skips_collapsed
+ui.sidebar_project_sort
 ui.sidebar_show_ahead_behind
 ui.sidebar_show_diff_stat
 ui.sidebar_show_jj
-ui.sidebar_show_submodules
 ui.sidebar_show_pr_chip
 ui.sidebar_show_status_icon
+ui.sidebar_show_submodules
 ui.sidebar_terminals_section
 ui.sidebar_wide_ratio
 ui.sidebar_width
-ui.sidebar_project_sort
 usage.allow_network
 usage.crit_percent
 usage.discover_profiles
@@ -530,6 +534,18 @@ usage.providers
 usage.statusbar
 usage.token_rollups
 usage.warn_percent
+voice.capture_command
+voice.command
+voice.credential
+voice.enabled
+voice.endpoint
+voice.kind
+voice.language
+voice.live_preview
+voice.max_seconds
+voice.model
+voice.model_path
+voice.timeout_seconds
 watch.pr_interval_secs
 weather.api_key
 weather.forecast_days
@@ -541,14 +557,6 @@ weather.show_forecast
 weather.stale_after_secs
 weather.timeout_secs
 weather.units
-# Voice is an explicit, structured consent surface. In particular, argv
-# arrays are config-only so a launcher cannot silently redirect microphone
-# audio or transcription through an environment alias.
-voice.capture_command
-voice.command
-voice.enabled
-voice.kind
-voice.max_seconds
 window_margin
 worktree_templates.agent
 worktree_templates.base

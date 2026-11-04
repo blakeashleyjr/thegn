@@ -112,7 +112,7 @@ fn zoom_uses_solver_area_and_escape_unzooms_before_close() {
 #[test]
 fn a_single_panel_never_focuses_or_zooms_and_escape_closes() {
     let mut board = Board::default();
-    let placed = board.placed(&LegacyTab, area());
+    let placed = board.placed(&SectionStackTab, area());
     board.focus_next(&placed);
     assert_eq!(board.focus, None);
     board.focus_prev(&placed);
@@ -123,7 +123,7 @@ fn a_single_panel_never_focuses_or_zooms_and_escape_closes() {
 }
 
 #[test]
-fn demand_unions_placed_panels_and_legacy_demands_every_collector() {
+fn demand_unions_placed_panels_and_section_stack_demands_every_collector() {
     let view = ThreePanels;
     let board = Board::default();
     let demand = board.demand(&view, area(), 750);
@@ -133,16 +133,16 @@ fn demand_unions_placed_panels_and_legacy_demands_every_collector() {
     assert!(demand.collectors.contains(CollectorId::Uptime));
     assert!(!demand.collectors.contains(CollectorId::Psi));
 
-    let legacy = board.demand(&LegacyTab, area(), 500);
+    let section_stack = board.demand(&SectionStackTab, area(), 500);
     assert_eq!(
-        legacy.collectors.len(),
+        section_stack.collectors.len(),
         CollectorId::ALL
             .iter()
             .filter(|id| !id.visible_only())
             .count()
     );
     for id in CollectorId::ALL {
-        assert_eq!(legacy.collectors.contains(id), !id.visible_only());
+        assert_eq!(section_stack.collectors.contains(id), !id.visible_only());
     }
 }
 
@@ -195,7 +195,7 @@ fn footer_shows_board_hints_only_for_multiple_panels_and_names_unzoom() {
 }
 
 #[test]
-fn legacy_paint_matches_render_stack_cells_and_styles() {
+fn section_stack_paint_matches_render_stack_cells_and_styles() {
     let body = vec![
         Section::Heading {
             label: "legacy heading".into(),
@@ -225,7 +225,7 @@ fn legacy_paint_matches_render_stack_cells_and_styles() {
     let mut expected = Surface::new(28, 8);
     let mut actual = Surface::new(28, 8);
     sections::render_stack(&mut expected, rect, 1, &body);
-    Board::default().paint(&LegacyTab, &mut actual, rect, 1, &body);
+    Board::default().paint(&SectionStackTab, &mut actual, rect, 1, &body);
     assert_eq!(
         expected.screen_chars_to_string(),
         actual.screen_chars_to_string()
@@ -247,6 +247,6 @@ fn paint_skips_a_solver_rect_when_the_body_is_empty() {
     }];
     let mut surface = Surface::new(8, 8);
     let before = surface.screen_chars_to_string();
-    Board::default().paint(&LegacyTab, &mut surface, rect, 0, &body);
+    Board::default().paint(&SectionStackTab, &mut surface, rect, 0, &body);
     assert_eq!(surface.screen_chars_to_string(), before);
 }

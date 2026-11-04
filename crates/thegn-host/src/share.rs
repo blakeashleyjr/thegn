@@ -164,6 +164,32 @@ pub(crate) fn apply_share_persist(db: &thegn_core::db::Db, op: SharePersist) {
     }
 }
 
+/// Liveness of a share row's recorded owner (one /proc read for a recorded owner; none otherwise).
+/// An unreadable or mismatched `/proc/<pid>/stat` is treated as exited; on Linux this is reliable
+/// only when the CLI and host share the same pid namespace and procfs is readable.
+pub(crate) fn owner_state_of(row: &thegn_core::db::ShareRow) -> thegn_core::share::ShareOwnerState {
+    thegn_core::share::share_owner_state(
+        row.owner,
+        row.owner
+            .and_then(|owner| crate::platform::process_start_ticks(owner.pid)),
+    )
+}
+
+/// Startup restore must not respawn a row that a live process other than this one owns.
+pub(crate) fn restore_skips_live_foreign_owner(
+    row: &thegn_core::db::ShareRow,
+    own_pid: u32,
+    live_start_ticks: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    match row.owner {
+        Some(owner) if owner.pid != own_pid => {
+            thegn_core::share::share_owner_state(Some(owner), live_start_ticks(owner.pid))
+                == thegn_core::share::ShareOwnerState::Alive
+        }
+        _ => false,
+    }
+}
+
 /// Durable operation for an event the supervisor accepted. `other_generation_live` is whether
 /// another generation still occupies the same (worktree, port). Only an unconditional upsert is
 /// suppressed then (it would overwrite the newer generation's row); a fenced delete always runs
@@ -2329,5 +2355,32 @@ mod tests {
         assert_eq!(views[0].provider, "frp");
         assert_eq!(views[0].url.as_deref(), Some("https://b.test"));
         assert_eq!(sup.generation_of("/wt", 3000), Some(101));
+    }
+
+    #[test]
+    fn restore_skips_only_a_live_foreign_owner() {
+        let row = thegn_core::db::ShareRow {
+            worktree: "/wt".into(),
+            local_port: 3000,
+            provider: "bore".into(),
+            public_url: None,
+            state: "up".into(),
+            created_at: 0,
+            generation: 41,
+            owner: Some(thegn_core::models::ShareOwner {
+                pid: 22,
+                start_ticks: 99,
+            }),
+        };
+        assert!(restore_skips_live_foreign_owner(&row, 11, |_| Some(99)));
+        assert!(!restore_skips_live_foreign_owner(&row, 22, |_| Some(99)));
+        assert!(!restore_skips_live_foreign_owner(&row, 11, |_| Some(100)));
+        assert!(!restore_skips_live_foreign_owner(&row, 11, |_| None));
+        let unrecorded = thegn_core::db::ShareRow { owner: None, ..row };
+        assert!(!restore_skips_live_foreign_owner(
+            &unrecorded,
+            11,
+            |_| Some(99)
+        ));
     }
 }

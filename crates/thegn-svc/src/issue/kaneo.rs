@@ -593,6 +593,7 @@ impl KaneoBackend {
         };
         let mut all = Vec::new();
         let mut successful_projects = 0;
+        let mut full_project_page = false;
         let mut first_error = None;
         for pid in projects {
             match self
@@ -601,6 +602,7 @@ impl KaneoBackend {
             {
                 Ok(issues) => {
                     successful_projects += 1;
+                    full_project_page |= issues.len() >= per_project;
                     all.extend(issues);
                 }
                 Err(e @ IssueError::Timeout(_)) => return Err(e),
@@ -630,6 +632,12 @@ impl KaneoBackend {
             return Err(IssueError::PartialList {
                 issues: all,
                 reason: "Kaneo project listing was incomplete",
+            });
+        }
+        if full_project_page && (filter.limit == 0 || all.len() < filter.limit) {
+            return Err(IssueError::PartialList {
+                issues: all,
+                reason: "Kaneo project page cap reached",
             });
         }
         Ok(all)
@@ -1667,6 +1675,123 @@ mod tests {
                 ]
             }]}
         })
+    }
+
+    fn cap_board(todo_tasks: usize, done_tasks: usize) -> serde_json::Value {
+        let tasks = |count: usize, status: &str| {
+            (0..count)
+                .map(|number| {
+                    json!({
+                        "id": format!("{status}-{number}"),
+                        "number": number,
+                        "title": "x",
+                        "status": status,
+                        "projectId": "p1"
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        json!({
+            "data": {
+                "workspaceId": "ws-1",
+                "columns": [
+                    { "slug": "todo", "name": "To Do", "tasks": tasks(todo_tasks, "todo") },
+                    { "slug": "done", "name": "Done", "isFinal": true, "tasks": tasks(done_tasks, "done") }
+                ]
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn cap_full_project_page_with_no_limit_is_partial() {
+        let (backend, server, _) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                cap_board(100, 0).to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+
+        match backend.list_issues(&IssueFilter::default()).await {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 100);
+                assert_eq!(reason, "Kaneo project page cap reached");
+            }
+            other => panic!("expected full-page partial list, got {other:?}"),
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cap_short_project_page_is_complete() {
+        let (backend, server, _) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                cap_board(3, 0).to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+
+        let issues = backend.list_issues(&IssueFilter::default()).await.unwrap();
+        assert_eq!(issues.len(), 3);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cap_full_page_short_of_a_positive_limit_is_partial() {
+        let board = cap_board(1, 2);
+        let (backend, server, _) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                board.to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+
+        match backend
+            .list_issues(&IssueFilter {
+                limit: 2,
+                statuses: vec![IssueStatus::Todo],
+                ..Default::default()
+            })
+            .await
+        {
+            Err(IssueError::PartialList { issues, reason }) => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(reason, "Kaneo project page cap reached");
+            }
+            other => panic!("expected filtered full-page partial list, got {other:?}"),
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+
+        let (backend, server, _) = kaneo_fixture(
+            vec![(
+                "/api/task/tasks/p1".into(),
+                StatusCode::OK,
+                board.to_string(),
+            )],
+            Some("p1".into()),
+        )
+        .await;
+        let issues = backend
+            .list_issues(&IssueFilter {
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(issues.len(), 2);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

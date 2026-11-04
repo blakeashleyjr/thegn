@@ -7387,6 +7387,14 @@ async fn event_loop<T: Terminal>(
         && let Some(db) = startup_db.as_ref()
     {
         for row in db.list_shares().unwrap_or_default() {
+            if crate::share::restore_skips_live_foreign_owner(
+                &row,
+                std::process::id(),
+                crate::platform::process_start_ticks,
+            ) {
+                tracing::debug!(target: "thegn::share", worktree = %row.worktree, port = row.local_port, "share restore skipped: a live share start process owns it");
+                continue;
+            }
             if row.state == "up" {
                 match share_supervisor.start(
                     // best-effort: restore: a failed share restart is re-attempted on the next launch
@@ -18445,7 +18453,7 @@ async fn event_loop<T: Terminal>(
                 // Escape cancels an active utterance before any modal or pane
                 // sees it. While idle it remains available to every existing
                 // overlay, preserving their established behavior.
-                if voice.is_recording() && crate::input::is_escape_key(&k.key) {
+                if voice.is_active() && crate::input::is_escape_key(&k.key) {
                     model.status = crate::handlers::voice::cancel(&mut voice, &waker);
                     keymap.reset();
                     dirty = true;

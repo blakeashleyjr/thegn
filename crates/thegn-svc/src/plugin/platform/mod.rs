@@ -31,6 +31,14 @@ pub(crate) fn executable_identity_metadata(
     platform_executable_identity_metadata(metadata)
 }
 
+/// Filesystem identity fields used to bind a verified voice-model marker to
+/// the exact file that was hashed. Platforms without these fields return None.
+pub(crate) fn voice_model_identity_metadata(
+    metadata: &std::fs::Metadata,
+) -> (Option<u64>, Option<u64>, Option<i64>, Option<i64>) {
+    platform_voice_model_identity_metadata(metadata)
+}
+
 /// Whether an accept error is a platform-specific resource exhaustion error.
 pub(crate) fn is_transient_accept_resource_error(raw_os_error: Option<i32>) -> bool {
     platform_is_transient_accept_resource_error(raw_os_error)

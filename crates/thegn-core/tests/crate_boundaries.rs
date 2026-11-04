@@ -47,6 +47,8 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("axum", &["thegn-host", "thegn-svc", "thegn-proxy"]),
     ("alacritty_terminal", &["thegn-host"]),
     ("gix", &["thegn-svc"]),
+    ("cpal", &["thegn-voice"]),
+    ("whisper-rs", &["thegn-voice"]),
 ];
 
 /// Crates that must stay substrate-free entirely (beyond `OWNERS`): the
@@ -63,6 +65,8 @@ const CORE_FORBIDDEN: &[&str] = &[
     "russh",
     "vt100",
     "gix",
+    "cpal",
+    "whisper-rs",
 ];
 
 fn workspace_root() -> std::path::PathBuf {

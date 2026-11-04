@@ -101,6 +101,11 @@ verifies the new commits. Otherwise they refuse with the reason; use
   claims the row, but they do not record the landed row and report that it was
   not recorded.
 - Deleting a worktree keeps its queue row while an active drain has claimed it.
+- Automatic landed-worktree cleanup (`on_landed = "remove"`/`"detach"`, the
+  `expire` sweep, and `thegn merge sweep`) skips a row another drain still
+  holds: nothing is removed, and the sweep lists it as `merge_claimed` without
+  starting the retry delay. The next sweep collects it after the drain releases
+  the row. An expired claim does not block cleanup.
 - Renaming a worktree that has a merge-queue row is refused, and nothing is
   renamed. While a drain holds the row the refusal names the drain; otherwise
   run `thegn merge rm` first. If the queue cannot be read, the rename is refused
@@ -116,7 +121,11 @@ verifies the new commits. Otherwise they refuse with the reason; use
   also names the target base: the commit the target branch pointed at before
   the land, so history shows candidate, base and result for every drain
   landing. Up to 200 events, including drain transitions, are kept per
-  worktree; a removed worktree's history is dropped with it.
+  worktree; a removed worktree's history is dropped with it. When a matching
+  queue row exists, a refused `thegn merge land` (or the panel's land key) is
+  recorded as operation `land` with its outcome (for example `not_ready`,
+  `candidate_moved` or `claimed`); the row stays unchanged, and an audit-write
+  failure does not hide the refusal.
 
 ## Land strategy, signing, drivers
 
@@ -193,13 +202,14 @@ else. A week is how long you have to notice.
   already past its grace period, now. `--force` ignores the remaining
   time and clears the lot.
   `thegn merge sweep` exits non-zero when a local worktree was refused or only
-  partly cleaned up, so scripts can tell. Existing THE-596 branch holds and
+  partly cleaned up, so scripts can tell. A `claim_busy` or `merge_claimed`
+  refusal also makes that sweep incomplete. Existing THE-596 branch holds and
   rows that cannot be identified as belonging to this repository are reported
   as informational and do not change the exit status.
   `thegn merge sweep --json` prints the same result as one JSON document; each
   refused entry in `kept` has a stable `class` (`database`, `identity`,
-  `claim_busy`, `unsafe`, `remote`, `resources`, `removal`), and `incomplete`
-  matches the exit status.
+  `claim_busy`, `merge_claimed`, `unsafe`, `remote`, `resources`, `removal`),
+  and `incomplete` matches the exit status.
 - A refused cleanup is retried with a growing delay (5 minutes, doubling up to
   a day). Until then it is reported as informational and does not make that
   sweep incomplete; `--force` retries immediately.
@@ -355,6 +365,10 @@ putting the prompt on the command line or in `$THEGN_TASK_PROMPT`. thegn deletes
 the file when the run ends; a remote sandbox placement refuses the run. A
 prompt file left by an interrupted run is removed when a later local agent run
 prepares that directory, if the regular `prompt-*` file is over 30 days old.
+Without `{prompt_file}`, an oversized prompt is shortened to fit (about
+100 KiB) with a `... task data omitted ...` marker. The
+`$THEGN_TASK_PROMPT` and `$THEGN_MERGE_PROMPT` copies have the same limit,
+so a large prompt does not prevent the agent from starting.
 
 If a queue agent is refused at sandbox entry, it is not started and its row
 records the refusal class and fix; merge-queue rows stay

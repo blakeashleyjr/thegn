@@ -471,7 +471,9 @@ subsystems is compiled in but **clamped off** outside the dev channel:
 Enable them with `THEGN_CHANNEL=dev`, or install the dev build
 (`nix run github:blakeashleyjr/thegn#dev` / `nix profile install
 github:blakeashleyjr/thegn#dev`, which lands as `thegn-dev` alongside a stable
-install). `thegn doctor` prints which channel you are on and what is clamped.
+install). `thegn doctor` prints which channel you are on and what is clamped. On
+x86_64 Linux, the `.#dev` package sets `THEGN_BRIDGE_BINARY` to its bundled
+static provider bridge unless you set that variable yourself.
 
 ## Development
 

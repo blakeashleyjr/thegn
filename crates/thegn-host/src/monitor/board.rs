@@ -28,13 +28,13 @@ pub(super) trait TabView {
     );
 }
 
-/// A tab that still renders its existing section stack as one full-area panel.
-/// Its all-collector demand intentionally keeps F7 history filling as it does
-/// today, while every other monitor tab remains on the legacy data path.
-pub(super) struct LegacyTab;
+/// The full-area section-stack view used by tabs without a board view: Processes,
+/// Notifications, and GPU when no engine device is present. Its demand includes
+/// every non-visible-only collector so F7 history keeps filling.
+pub(super) struct SectionStackTab;
 
 pub(super) enum ActiveView<'a> {
-    Legacy(LegacyTab),
+    SectionStack(SectionStackTab),
     Gpu(super::tabs::gpu::view::GpuView<'a>),
     Cpu(super::tabs::cpu::view::CpuView<'a>),
     Overview(OverviewView<'a>),
@@ -49,7 +49,7 @@ pub(super) enum ActiveView<'a> {
 impl TabView for ActiveView<'_> {
     fn specs(&self) -> &'static [PanelSpec] {
         match self {
-            Self::Legacy(view) => view.specs(),
+            Self::SectionStack(view) => view.specs(),
             Self::Gpu(view) => view.specs(),
             Self::Cpu(view) => view.specs(),
             Self::Overview(view) => view.specs(),
@@ -64,7 +64,7 @@ impl TabView for ActiveView<'_> {
 
     fn template(&self) -> Node {
         match self {
-            Self::Legacy(view) => view.template(),
+            Self::SectionStack(view) => view.template(),
             Self::Gpu(view) => view.template(),
             Self::Cpu(view) => view.template(),
             Self::Overview(view) => view.template(),
@@ -79,7 +79,7 @@ impl TabView for ActiveView<'_> {
 
     fn demand(&self, panel: PanelId) -> CollectorSet {
         match self {
-            Self::Legacy(view) => view.demand(panel),
+            Self::SectionStack(view) => view.demand(panel),
             Self::Gpu(view) => view.demand(panel),
             Self::Cpu(view) => view.demand(panel),
             Self::Overview(view) => view.demand(panel),
@@ -101,7 +101,7 @@ impl TabView for ActiveView<'_> {
         sections: &[Section],
     ) {
         match self {
-            Self::Legacy(view) => view.paint(surface, placed, rect, scroll, sections),
+            Self::SectionStack(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Gpu(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Cpu(view) => view.paint(surface, placed, rect, scroll, sections),
             Self::Overview(view) => view.paint(surface, placed, rect, scroll, sections),
@@ -120,30 +120,30 @@ impl<'a> ActiveView<'a> {
         if tab == super::MonitorTab::Overview {
             ActiveView::Overview(OverviewView(model))
         } else {
-            ActiveView::Legacy(LegacyTab)
+            ActiveView::SectionStack(SectionStackTab)
         }
     }
 }
 
-const LEGACY_PANEL: PanelId = PanelId("legacy");
-const LEGACY_VARIANTS: [Variant; 1] = [Variant {
+const SECTION_STACK_PANEL: PanelId = PanelId("legacy");
+const SECTION_STACK_VARIANTS: [Variant; 1] = [Variant {
     kind: VariantKind::Full,
     min: (1, 1),
     pref: (1, 1),
 }];
-const LEGACY_SPECS: [PanelSpec; 1] = [PanelSpec {
-    id: LEGACY_PANEL,
+const SECTION_STACK_SPECS: [PanelSpec; 1] = [PanelSpec {
+    id: SECTION_STACK_PANEL,
     priority: 0,
-    variants: &LEGACY_VARIANTS,
+    variants: &SECTION_STACK_VARIANTS,
 }];
 
-impl TabView for LegacyTab {
+impl TabView for SectionStackTab {
     fn specs(&self) -> &'static [PanelSpec] {
-        &LEGACY_SPECS
+        &SECTION_STACK_SPECS
     }
 
     fn template(&self) -> Node {
-        Node::Panel(LEGACY_PANEL)
+        Node::Panel(SECTION_STACK_PANEL)
     }
 
     fn demand(&self, _panel: PanelId) -> CollectorSet {
@@ -164,7 +164,7 @@ impl TabView for LegacyTab {
         scroll: usize,
         sections: &[Section],
     ) {
-        if placed.id == LEGACY_PANEL {
+        if placed.id == SECTION_STACK_PANEL {
             sections::render_stack(surface, rect, scroll, sections);
         }
     }
