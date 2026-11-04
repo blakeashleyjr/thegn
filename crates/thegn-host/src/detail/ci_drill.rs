@@ -519,6 +519,8 @@ mod tests {
                     fetched_at: 7,
                     head_sha: "abc123".into(),
                     context: String::new(),
+                    attempt: None,
+                    redaction_changed: Some(false),
                 }],
             },
         );
@@ -751,6 +753,8 @@ mod tests {
                     fetched_at: 7,
                     head_sha: "abc123".into(),
                     context: String::new(),
+                    attempt: None,
+                    redaction_changed: Some(false),
                 }],
             }
         ));
@@ -833,6 +837,8 @@ mod tests {
                     fetched_at: 7,
                     head_sha: "abc123".into(),
                     context: String::new(),
+                    attempt: None,
+                    redaction_changed: Some(false),
                 }],
             }
         ));

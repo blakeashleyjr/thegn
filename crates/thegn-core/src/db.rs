@@ -226,7 +226,8 @@ mod db_open_memo;
 /// v100: calendar_diagnostics, per-account parser diagnostic counts of the last applied calendar page (THE-468).
 /// v101: shares.owner_pid + shares.owner_start_ticks, the share start process that owns a share row (THE-341).
 /// v102: issue_links.provider + issue_links.account, the exact tracker account a worktree's linked issue came from (THE-324).
-pub const SCHEMA_VERSION: i64 = 102;
+/// v103: ci_log_cache.attempt + ci_log_cache.redaction_changed, the provider run attempt a cached log was captured for and whether the redactor changed its text (THE-543, THE-544).
+pub const SCHEMA_VERSION: i64 = 103;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1821,6 +1822,7 @@ impl Db {
                     crate::db_migrate::verify_v100_schema(&conn)?;
                     crate::db_migrate::verify_v101_schema(&conn)?;
                     crate::db_migrate::verify_v102_schema(&conn)?;
+                    crate::db_migrate::verify_v103_schema(&conn)?;
                     Ok(())
                 };
                 if let Some(key) = verification_key {
@@ -2507,6 +2509,7 @@ impl Db {
         crate::db_migrate::migrate_v100(&conn)?;
         crate::db_migrate::migrate_v101(&conn)?;
         crate::db_migrate::migrate_v102(&conn)?;
+        crate::db_migrate::migrate_v103(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -2547,6 +2550,7 @@ impl Db {
             crate::db_migrate::verify_v100_schema(&conn)?;
             crate::db_migrate::verify_v101_schema(&conn)?;
             crate::db_migrate::verify_v102_schema(&conn)?;
+            crate::db_migrate::verify_v103_schema(&conn)?;
         }
         // v69 is an authority ledger, not an optional cache. Verify its full
         // shape even on the fast/current-version path so a malformed table can
