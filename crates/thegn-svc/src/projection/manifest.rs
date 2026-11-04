@@ -373,6 +373,42 @@ mod tests {
     }
 
     #[test]
+    fn sync_projection_with_other_extra_args_is_refused() {
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim projection without extra args");
+        let mut other = spec.clone();
+        let Placement::Ssh(ssh) = &mut other.placement else {
+            unreachable!()
+        };
+        ssh.extra_args = vec!["-l".into(), "bob".into()];
+
+        assert!(matches!(
+            verify(&other),
+            Err(ProjectionOwnershipError::Mismatch(_))
+        ));
+        assert!(matches!(
+            claim_or_verify(&other),
+            Err(ProjectionOwnershipError::Mismatch(_))
+        ));
+    }
+
+    #[test]
+    fn sshfs_and_sync_share_a_mountpoint_but_not_ownership() {
+        // Positive control: mode is absent from the mountpoint formula but is
+        // part of the manifest identity.
+        let (_root, spec) = fixture(DataMode::Sync);
+        claim_or_verify(&spec).expect("claim sync projection");
+        let mut sshfs = spec.clone();
+        sshfs.mode = DataMode::Sshfs;
+
+        assert_eq!(sshfs.mountpoint, spec.mountpoint);
+        assert!(matches!(
+            verify(&sshfs),
+            Err(ProjectionOwnershipError::Mismatch(_))
+        ));
+    }
+
+    #[test]
     fn malformed_manifest_refuses_reuse() {
         let (_root, spec) = fixture(DataMode::Sync);
         claim_or_verify(&spec).expect("claim projection");
