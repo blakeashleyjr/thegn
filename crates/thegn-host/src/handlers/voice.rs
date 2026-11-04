@@ -289,14 +289,10 @@ fn apply_event(
                             && let Some(pane) =
                                 panes.as_deref_mut().and_then(|p| p.table.get_mut(&pane_id))
                         {
-                            match crate::run::paste_text_into_pane(pane, &transcript) {
-                                Ok(()) => model.status = "Voice transcript inserted".into(),
-                                Err(e) => {
-                                    voice.hold_transcript(transcript);
-                                    model.status =
-                                        format!("Voice transcript held: pane input failed: {e}")
-                                }
-                            }
+                            model.status = inject_transcript(voice, transcript, |text| {
+                                crate::run::paste_text_into_pane(pane, text)
+                                    .map_err(|error| error.to_string())
+                            });
                         }
                     }
                 }
@@ -314,6 +310,20 @@ enum Delivery {
     Nothing,
     Inject(String),
     Held(String),
+}
+
+fn inject_transcript(
+    voice: &mut VoiceController,
+    transcript: String,
+    paste: impl FnOnce(&str) -> Result<(), String>,
+) -> String {
+    match paste(&transcript) {
+        Ok(()) => "Voice transcript inserted".into(),
+        Err(error) => {
+            voice.hold_transcript(transcript);
+            format!("Voice transcript held: pane input failed: {error}")
+        }
+    }
 }
 
 fn deliver_transcript(
@@ -498,10 +508,10 @@ mod tests {
     #[test]
     fn paste_failure_keeps_held_text_for_a_successful_retry() {
         let mut voice = voice();
-        let failed = paste_held(&mut voice, "retry me".into(), |_| Err("closed".into()));
+        let failed = inject_transcript(&mut voice, "retry me".into(), |_| Err("closed".into()));
         assert!(failed.contains("closed"));
         assert_eq!(voice.take_held_transcript().as_deref(), Some("retry me"));
-        let inserted = paste_held(&mut voice, "retry me".into(), |_| Ok(()));
+        let inserted = inject_transcript(&mut voice, "retry me".into(), |_| Ok(()));
         assert_eq!(inserted, "Voice transcript inserted");
         assert!(!voice.has_held_transcript());
     }
@@ -513,7 +523,7 @@ mod tests {
         }
         let (waker, _master, _terminal) = test_waker();
         let mut voice = voice();
-        voice.capture_generation = 2;
+        voice.set_capture_generation_for_test(2);
         voice.next_request_id = 4;
         voice.state = VoiceState::Transcribing {
             pane_id: 1,
@@ -539,7 +549,7 @@ mod tests {
             request_id: 4,
         };
         voice
-            .tx
+            .sender_for_test()
             .send(VoiceMessage::Session {
                 pane_id: 1,
                 generation: 2,
@@ -548,7 +558,7 @@ mod tests {
             })
             .unwrap();
         voice
-            .tx
+            .sender_for_test()
             .send(VoiceMessage::Session {
                 pane_id: 1,
                 generation: 1,
@@ -572,7 +582,7 @@ mod tests {
         }
         let (waker, _master, _terminal) = test_waker();
         let mut voice = voice();
-        voice.capture_generation = 1;
+        voice.set_capture_generation_for_test(1);
         voice.next_request_id = 1;
         voice.state = VoiceState::Recording {
             pane_id: 7,

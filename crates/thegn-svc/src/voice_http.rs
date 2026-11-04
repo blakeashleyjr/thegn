@@ -64,6 +64,35 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), VoiceError> {
     Ok(())
 }
 
+fn bypass_proxy(url: &url::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
+}
+
+fn http_client_with_proxy(
+    endpoint: &str,
+    proxy: Option<reqwest::Proxy>,
+) -> Result<reqwest::Client, VoiceError> {
+    let url = url::Url::parse(endpoint)
+        .map_err(|_| VoiceError::InvalidInput("invalid HTTP endpoint URL".into()))?;
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10));
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    if bypass_proxy(&url) {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|_| VoiceError::Failed("HTTP client unavailable".into()))
+}
+
 fn validate_transport(endpoint: &str, credential: Option<&str>) -> Result<(), VoiceError> {
     validate_endpoint(endpoint)?;
     let cfg = VoiceConfig {
@@ -83,6 +112,16 @@ pub fn transcribe(
     wav: &[u8],
     cancel: &AtomicBool,
 ) -> Result<String, VoiceError> {
+    transcribe_with_proxy(cfg, credential, wav, cancel, None)
+}
+
+fn transcribe_with_proxy(
+    cfg: &VoiceConfig,
+    credential: Option<&str>,
+    wav: &[u8],
+    cancel: &AtomicBool,
+    proxy: Option<reqwest::Proxy>,
+) -> Result<String, VoiceError> {
     validate_transport(&cfg.endpoint, credential)?;
     if cfg.model.is_empty() {
         return Err(VoiceError::NotConfigured);
@@ -98,11 +137,7 @@ pub fn transcribe(
     }
     crate::voice_runtime::run(async {
         let operation = async {
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|_| VoiceError::Failed("HTTP client unavailable".into()))?;
+            let client = http_client_with_proxy(&cfg.endpoint, proxy)?;
             let file = reqwest::multipart::Part::bytes(wav.to_vec())
                 .file_name("dictation.wav")
                 .mime_str("audio/wav")
@@ -177,6 +212,19 @@ fn decode_response(body: &[u8]) -> Result<String, VoiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_proxy_decision_is_explicit() {
+        for (endpoint, expected) in [
+            ("http://127.0.0.1:8080/stt", true),
+            ("http://[::1]:8080/stt", true),
+            ("http://LOCALHOST:8080/stt", true),
+            ("http://127.0.0.1.evil.example/stt", false),
+            ("https://stt.example/stt", false),
+        ] {
+            assert_eq!(bypass_proxy(&url::Url::parse(endpoint).unwrap()), expected);
+        }
+    }
     #[test]
     fn validates_json_without_echoing_response_or_secrets() {
         assert_eq!(decode_response(br#"{"text":"hello"}"#).unwrap(), "hello");
@@ -422,5 +470,58 @@ mod loopback_tests {
         let error = transcribe(&cfg, None, b"RIFF0000WAVE", &AtomicBool::new(false)).unwrap_err();
         assert_eq!(error, VoiceError::Connection);
         assert!(!error.to_string().contains("secret-path"));
+    }
+
+    #[test]
+    fn transcribe_uses_loopback_client_and_reaches_fixture_directly() {
+        let (endpoint, server) = server(200, br#"{"text":"direct"}"#.to_vec(), false);
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_endpoint = format!("http://{}", proxy.local_addr().unwrap());
+        let proxy_thread = std::thread::spawn(move || {
+            proxy.set_nonblocking(true).unwrap();
+            let started = std::time::Instant::now();
+            loop {
+                match proxy.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let n = stream.read(&mut request).unwrap();
+                        stream
+                            .write_all(b"HTTP/1.1 502 Proxy used\r\nContent-Length: 0\r\n\r\n")
+                            .unwrap();
+                        return String::from_utf8_lossy(&request[..n]).into_owned();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() >= Duration::from_millis(500) {
+                            return String::new();
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("proxy fixture accept failed: {error}"),
+                }
+            }
+        });
+        let cfg = VoiceConfig {
+            endpoint,
+            model: "fixture-model".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            transcribe_with_proxy(
+                &cfg,
+                Some("fixture-token"),
+                b"RIFF0000WAVE",
+                &AtomicBool::new(false),
+                Some(reqwest::Proxy::http(&proxy_endpoint).unwrap())
+            )
+            .unwrap(),
+            "direct"
+        );
+        let proxy_request = proxy_thread.join().unwrap();
+        assert!(
+            proxy_request.is_empty(),
+            "loopback credential request reached proxy: {proxy_request}"
+        );
+        let request = String::from_utf8(server.join().unwrap()).unwrap();
+        assert!(request.contains("Bearer fixture-token"));
     }
 }

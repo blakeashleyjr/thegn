@@ -81,6 +81,9 @@ impl Engine {
         if samples.iter().map(|s| s * s).sum::<f32>() / (samples.len() as f32) < 0.000001 {
             return Ok(String::new());
         }
+        // Declare the callback context before `state`: ggml stores this
+        // pointer in the state backend, so the context must outlive the state.
+        let abort;
         let mut state = self.context.create_state()?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(
@@ -98,16 +101,17 @@ impl Engine {
         params.set_print_special(false);
         params.set_print_timestamps(false);
         let deadline = Instant::now() + timeout;
-        let abort = Abort {
+        abort = Abort {
             cancelled: cancelled.clone(),
             deadline,
         };
         // whisper-rs 0.16.0's safe helper double-boxes a trait object, then
         // casts that allocation to the original closure type in its trampoline.
         // Use a concrete, owned callback context instead (and avoid its leak).
-        // SAFETY: full() is synchronous and does not retain callbacks after it
-        // returns. The context stays alive and immutable throughout that call;
-        // the callback never accesses Whisper state, mutates data or panics.
+        // SAFETY: ggml retains the callback pointer in this state's backend
+        // until the state is dropped. `abort` was declared before `state`, so
+        // it outlives that pointer; it is immutable during inference and the
+        // callback never accesses Whisper state, mutates data or panics.
         unsafe {
             params.set_abort_callback(Some(should_abort));
             params.set_abort_callback_user_data(std::ptr::from_ref(&abort).cast_mut().cast());

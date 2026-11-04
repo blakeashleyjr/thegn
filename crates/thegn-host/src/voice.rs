@@ -122,6 +122,16 @@ impl VoiceController {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_capture_generation_for_test(&mut self, generation: u64) {
+        self.capture_generation = generation;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sender_for_test(&self) -> Sender<VoiceMessage> {
+        self.tx.clone()
+    }
+
     pub(crate) fn configure(&mut self, cfg: VoiceConfig) {
         if self.cfg != cfg {
             self.held_transcript = None;
@@ -801,6 +811,7 @@ fn terminate_capture_child(
         }
     }
     let reaped = Arc::clone(on_reaped);
+    let reaped_group = group.clone();
     match thread::Builder::new()
         .name("thegn-voice-rp".into())
         .spawn(move || {
@@ -808,6 +819,10 @@ fn terminate_capture_child(
             if let Err(error) = child.wait() {
                 tracing::warn!(%error, "voice capture reaper failed");
             } else {
+                while !reaped_group.is_empty() {
+                    reaped_group.kill();
+                    thread::sleep(Duration::from_millis(2));
+                }
                 reaped();
             }
         }) {
@@ -1006,7 +1021,7 @@ fn native_session(
     waker: &TerminalWaker,
 ) -> Result<(), String> {
     use crate::voice_worker::{Event, Request};
-    use std::io::{BufReader, Write};
+    use std::io::BufReader;
     if !cfg!(feature = "voice-native") {
         return Err("native capture is not compiled; use a voice-native/voice-metal build or configure capture_command".into());
     }
@@ -1025,9 +1040,13 @@ fn native_session(
         return Ok(());
     }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut command = Command::new(executable);
+    let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
+        executable.to_string_lossy().into_owned(),
+        "--voice-worker".into(),
+    ]);
+    let mut command = Command::new(argv[0].as_str());
     command
-        .arg("--voice-worker")
+        .args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -1079,87 +1098,61 @@ fn native_session(
             })
             .map_err(|e| e.to_string())?,
         );
-        let mut deadline = std::time::Instant::now()
+        let deadline = std::time::Instant::now()
             + cfg.max_duration()
             + cfg.request_timeout()
             + Duration::from_secs(10);
-        let mut stop_sent = false;
-        let result = loop {
-            if cancel.load(Ordering::Acquire) {
-                break Ok(());
-            }
-            match stop_rx.try_recv() {
-                Ok(CaptureCommand::Cancel) => break Ok(()),
-                Err(TryRecvError::Disconnected) if !stop_sent => break Ok(()),
-                Ok(CaptureCommand::Stop) if !stop_sent => {
-                    if input.write_all(b"stop\n").is_err() {
-                        break Err("voice worker stop failed".into());
-                    }
-                    stop_sent = true;
-                    deadline =
-                        std::time::Instant::now() + cfg.request_timeout() + Duration::from_secs(1);
-                }
-                _ => {}
-            }
-            if std::time::Instant::now() >= deadline {
-                break Err("voice worker timed out".into());
-            }
-            match event_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(Ok(Event::Captured(encoded))) => {
+        let monitored = monitor_worker_events(
+            event_rx,
+            stop_rx,
+            &cancel,
+            &mut input,
+            deadline,
+            cfg.request_timeout() + Duration::from_secs(1),
+        );
+        let mut result = monitored.result;
+        for event in monitored.events {
+            match event {
+                Event::Failed(_) => {}
+                Event::Captured(encoded) => {
                     use base64::Engine;
                     if cfg.kind != thegn_core::config::VoiceKind::Command {
-                        break Err("unexpected capture from transcription worker".into());
+                        result = Err("unexpected capture from transcription worker".into());
+                    } else {
+                        match base64::engine::general_purpose::STANDARD.decode(encoded) {
+                            Ok(wav) if wav.len() <= MAX_CAPTURE_BYTES => send_capture(
+                                tx,
+                                waker,
+                                VoiceMessage::CaptureComplete {
+                                    pane_id,
+                                    generation,
+                                    wav,
+                                },
+                            ),
+                            _ => result = Err("invalid native capture payload".into()),
+                        }
                     }
-                    let wav = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-                        Ok(wav) if wav.len() <= MAX_CAPTURE_BYTES => wav,
-                        _ => break Err("invalid native capture payload".into()),
-                    };
-                    send_capture(
-                        tx,
-                        waker,
-                        VoiceMessage::CaptureComplete {
-                            pane_id,
-                            generation,
-                            wav,
-                        },
-                    );
-                    break Ok(());
                 }
-                Ok(Ok(Event::Timing {
+                Event::Timing {
                     final_pass,
                     decode_ms,
                     audio_end_ms,
-                })) => {
+                } => {
                     tracing::info!(target: "thegn::voice", request_id, final_pass, decode_ms, audio_end_ms, "dictation timing");
                 }
-                Ok(Ok(event @ Event::Failed(_))) => {
-                    break terminal_worker_event(&event).unwrap_or(Ok(()));
-                }
-                Ok(Ok(event)) => {
-                    let final_result = matches!(event, Event::Final(_));
-                    send_capture(
-                        tx,
-                        waker,
-                        VoiceMessage::Session {
-                            pane_id,
-                            generation,
-                            request_id,
-                            event,
-                        },
-                    );
-                    if final_result {
-                        break Ok(());
-                    }
-                }
-                Ok(Err(reason)) => break Err(reason),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break Err(worker_eof_before_final());
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                event => send_capture(
+                    tx,
+                    waker,
+                    VoiceMessage::Session {
+                        pane_id,
+                        generation,
+                        request_id,
+                        event,
+                    },
+                ),
             }
-        };
+        }
         drop(input);
-        drop(event_rx);
         result
     })();
     let reaped = terminate_capture_child(child, group, &on_reaped);
@@ -1178,6 +1171,66 @@ fn native_session(
         );
     }
     outcome
+}
+
+struct WorkerMonitorResult {
+    result: Result<(), String>,
+    events: Vec<crate::voice_worker::Event>,
+}
+
+fn monitor_worker_events(
+    event_rx: Receiver<Result<crate::voice_worker::Event, String>>,
+    stop_rx: Receiver<CaptureCommand>,
+    cancel: &AtomicBool,
+    input: &mut impl std::io::Write,
+    mut deadline: std::time::Instant,
+    stop_timeout: Duration,
+) -> WorkerMonitorResult {
+    use crate::voice_worker::Event;
+
+    let mut stop_sent = false;
+    let mut events = Vec::new();
+    let result = loop {
+        if cancel.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        match stop_rx.try_recv() {
+            Ok(CaptureCommand::Cancel) => break Ok(()),
+            Err(TryRecvError::Disconnected) if !stop_sent => break Ok(()),
+            Ok(CaptureCommand::Stop) if !stop_sent => {
+                if input.write_all(b"stop\n").is_err() {
+                    break Err("voice worker stop failed".into());
+                }
+                stop_sent = true;
+                deadline = std::time::Instant::now() + stop_timeout;
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err("voice worker timed out".into());
+        }
+        match event_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(Ok(event)) => {
+                let terminal = matches!(
+                    &event,
+                    Event::Final(_) | Event::Failed(_) | Event::Captured(_)
+                );
+                events.push(event);
+                if let Some(Err(reason)) =
+                    terminal_worker_event(events.last().expect("just pushed event"))
+                {
+                    break Err(reason);
+                }
+                if terminal {
+                    break Ok(());
+                }
+            }
+            Ok(Err(reason)) => break Err(reason),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Err(worker_eof_before_final()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    WorkerMonitorResult { result, events }
 }
 
 #[cfg(test)]
@@ -1207,7 +1260,6 @@ mod tests {
             read_worker_event(&mut eof).unwrap().is_none(),
             "EOF before Final is observable"
         );
-        assert!(worker_eof_before_final().contains("without a final transcript"));
 
         let mut oversized =
             std::io::Cursor::new(vec![b'x'; crate::voice_worker::MAX_EVENT as usize + 1]);
@@ -1215,6 +1267,52 @@ mod tests {
             read_worker_event(&mut oversized)
                 .unwrap_err()
                 .contains("protocol limit")
+        );
+    }
+
+    #[test]
+    fn worker_monitor_maps_failed_eof_protocol_errors_and_final_events() {
+        use crate::voice_worker::Event;
+
+        let run = |messages: Vec<Result<Event, String>>, close: bool| {
+            let (event_tx, event_rx) = mpsc::channel();
+            let (stop_tx, stop_rx) = mpsc::channel();
+            for message in messages {
+                event_tx.send(message).unwrap();
+            }
+            if close {
+                drop(event_tx);
+            }
+            let mut input = Vec::new();
+            let result = monitor_worker_events(
+                event_rx,
+                stop_rx,
+                &AtomicBool::new(false),
+                &mut input,
+                std::time::Instant::now() + Duration::from_secs(30),
+                Duration::from_secs(30),
+            );
+            drop(stop_tx);
+            result
+        };
+
+        let failed = run(vec![Ok(Event::Failed("model unavailable".into()))], false);
+        assert_eq!(failed.result.unwrap_err(), "model unavailable");
+
+        let eof = run(Vec::new(), true);
+        assert!(
+            eof.result
+                .unwrap_err()
+                .contains("without a final transcript")
+        );
+
+        let protocol_error = run(vec![Err("protocol limit".into())], false);
+        assert_eq!(protocol_error.result.unwrap_err(), "protocol limit");
+
+        let final_event = run(vec![Ok(Event::Final("recognized".into()))], false);
+        assert!(final_event.result.is_ok());
+        assert!(
+            matches!(final_event.events.as_slice(), [Event::Final(text)] if text == "recognized")
         );
     }
 

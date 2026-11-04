@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 const TEMP_PREFIX: &str = ".thegn-voice-model-";
+const MARKER_TEMP_PREFIX: &str = ".thegn-voice-marker-";
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct Model {
     pub name: &'static str,
@@ -69,15 +71,10 @@ pub fn resolve(cfg: &thegn_core::config::VoiceConfig) -> Result<PathBuf> {
     path_in(&store_dir(), &cfg.model)
 }
 pub fn verify(path: &Path, artifact: &Model, cancel: &AtomicBool) -> Result<()> {
-    verify_with(path, artifact, cancel, || hash_file(path, cancel))
+    verify_with(path, artifact, || hash_file(path, cancel))
 }
 
-fn verify_with(
-    path: &Path,
-    artifact: &Model,
-    cancel: &AtomicBool,
-    hash: impl FnOnce() -> Result<String>,
-) -> Result<()> {
+fn verify_with(path: &Path, artifact: &Model, hash: impl FnOnce() -> Result<String>) -> Result<()> {
     let metadata = std::fs::metadata(path)?;
     if metadata.len() != artifact.bytes {
         bail!("model size mismatch; retry voice model pull");
@@ -88,8 +85,26 @@ fn verify_with(
     if hash()? != artifact.sha256 {
         bail!("model SHA-256 mismatch; retry voice model pull");
     }
-    write_marker(path, artifact, &metadata)?;
+    if let Err(error) = write_marker(path, artifact, &metadata) {
+        tracing::debug!(%error, "voice model marker not written");
+    }
     Ok(())
+}
+
+/// Remove a catalogued model, its verification marker and abandoned downloads.
+pub fn remove(dir: &Path, name: &str) -> Result<()> {
+    sweep_temps(dir)?;
+    let path = path_in(dir, name)?;
+    remove_if_present(&path)?;
+    remove_if_present(&marker_path(&path))
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String> {
@@ -114,6 +129,10 @@ struct VerifiedMarker {
     bytes: u64,
     modified_secs: u64,
     modified_nanos: u32,
+    device: Option<u64>,
+    inode: Option<u64>,
+    changed_secs: Option<i64>,
+    changed_nanos: Option<i64>,
     sha256: String,
 }
 
@@ -135,10 +154,16 @@ fn read_marker(path: &Path) -> Option<VerifiedMarker> {
 }
 
 fn marker_matches(marker: &VerifiedMarker, metadata: &std::fs::Metadata, artifact: &Model) -> bool {
+    let (device, inode, changed_secs, changed_nanos) =
+        crate::plugin::platform::voice_model_identity_metadata(metadata);
     marker_metadata(metadata).is_some_and(|(secs, nanos)| {
         marker.bytes == metadata.len()
             && marker.modified_secs == secs
             && marker.modified_nanos == nanos
+            && marker.device == device
+            && marker.inode == inode
+            && marker.changed_secs == changed_secs
+            && marker.changed_nanos == changed_nanos
             && marker.sha256 == artifact.sha256
     })
 }
@@ -147,16 +172,22 @@ fn write_marker(path: &Path, artifact: &Model, metadata: &std::fs::Metadata) -> 
     let Some((modified_secs, modified_nanos)) = marker_metadata(metadata) else {
         bail!("model modification time unavailable");
     };
+    let (device, inode, changed_secs, changed_nanos) =
+        crate::plugin::platform::voice_model_identity_metadata(metadata);
     let marker = VerifiedMarker {
         bytes: metadata.len(),
         modified_secs,
         modified_nanos,
+        device,
+        inode,
+        changed_secs,
+        changed_nanos,
         sha256: artifact.sha256.into(),
     };
     let parent = path.parent().context("model path has no parent")?;
     std::fs::create_dir_all(parent)?;
     let mut temp = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
+        .prefix(MARKER_TEMP_PREFIX)
         .tempfile_in(parent)?;
     serde_json::to_writer(&mut temp, &marker)?;
     temp.as_file().sync_all()?;
@@ -176,11 +207,24 @@ pub fn sweep_temps(dir: &Path) -> Result<()> {
         let entry = entry?;
         if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX)
             && entry.file_type()?.is_file()
+            && entry
+                .metadata()?
+                .modified()?
+                .elapsed()
+                .is_ok_and(|age| age >= STALE_TEMP_AGE)
         {
             std::fs::remove_file(entry.path())?;
         }
     }
     Ok(())
+}
+
+fn begin_pull(dir: &Path) -> Result<tempfile::NamedTempFile> {
+    std::fs::create_dir_all(dir)?;
+    sweep_temps(dir)?;
+    Ok(tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)?)
 }
 /// Install from a stream; used by the network path and corrupt/interrupted fixtures.
 pub fn install(
@@ -211,16 +255,27 @@ pub fn install(
         temp.write_all(&buf[..n])?;
         progress(total, artifact.bytes);
     }
+    let path = dir.join(format!("ggml-{}.bin", artifact.name));
+    finish_install(temp, &path, artifact, cancel)
+}
+
+fn finish_install(
+    temp: tempfile::NamedTempFile,
+    path: &Path,
+    artifact: &Model,
+    cancel: &AtomicBool,
+) -> Result<PathBuf> {
     if temp.as_file().metadata()?.len() != artifact.bytes
         || hash_file(temp.path(), cancel)? != artifact.sha256
     {
         bail!("model verification failed; retry voice model pull");
     }
     temp.as_file().sync_all()?;
-    let path = dir.join(format!("ggml-{}.bin", artifact.name));
-    temp.persist(&path).map_err(|e| e.error)?;
-    write_marker(&path, artifact, &std::fs::metadata(&path)?)?;
-    Ok(path)
+    temp.persist(path).map_err(|e| e.error)?;
+    if let Err(error) = write_marker(path, artifact, &std::fs::metadata(path)?) {
+        tracing::debug!(%error, "voice model marker not written");
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Async network streaming allows cancellation even while the peer is stalled.
@@ -230,11 +285,7 @@ pub fn pull(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    sweep_temps(dir)?;
-    let mut temp = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
-        .tempfile_in(dir)?;
+    let mut temp = begin_pull(dir)?;
     crate::voice_runtime::run(async {
         let operation = async {
             let client = reqwest::Client::builder()
@@ -279,16 +330,8 @@ pub fn pull(
             }
         }
     })??;
-    if temp.as_file().metadata()?.len() != artifact.bytes
-        || hash_file(temp.path(), cancel)? != artifact.sha256
-    {
-        bail!("model verification failed; retry voice model pull");
-    }
-    temp.as_file().sync_all()?;
     let path = path_in(dir, artifact.name)?;
-    temp.persist(&path).map_err(|e| e.error)?;
-    write_marker(&path, artifact, &std::fs::metadata(&path)?)?;
-    Ok(path)
+    finish_install(temp, &path, artifact, cancel)
 }
 #[cfg(test)]
 mod tests {
@@ -363,7 +406,7 @@ mod tests {
         )
         .unwrap();
         let hashes = std::cell::Cell::new(0);
-        verify_with(&path, &artifact, &AtomicBool::new(false), || {
+        verify_with(&path, &artifact, || {
             hashes.set(hashes.get() + 1);
             Ok(artifact.sha256.into())
         })
@@ -383,7 +426,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&path, b"xyz").unwrap();
-        let result = verify_with(&path, &artifact, &AtomicBool::new(false), || {
+        let result = verify_with(&path, &artifact, || {
             hashes.set(hashes.get() + 1);
             Ok("bad".into())
         });
@@ -392,14 +435,101 @@ mod tests {
     }
 
     #[test]
-    fn stale_download_temp_files_are_removed_by_pull_preparation_and_rm_sweep() {
+    fn pull_preparation_removes_only_stale_download_temps() {
         let dir = tempfile::tempdir().unwrap();
         let stale = dir.path().join(format!("{TEMP_PREFIX}leftover"));
         std::fs::write(&stale, b"partial download").unwrap();
-        sweep_temps(dir.path()).unwrap();
+        let old = std::time::SystemTime::now() - STALE_TEMP_AGE - std::time::Duration::from_secs(1);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let fresh = dir.path().join(format!("{TEMP_PREFIX}in-flight"));
+        std::fs::write(&fresh, b"active download").unwrap();
+        let marker_temp = dir.path().join(format!("{MARKER_TEMP_PREFIX}in-flight"));
+        std::fs::write(&marker_temp, b"active marker").unwrap();
+        let download = begin_pull(dir.path()).unwrap();
+        assert!(!stale.exists(), "pull preparation removes stale downloads");
         assert!(
-            !stale.exists(),
-            "next pull sweep removes abandoned temp file"
+            fresh.exists(),
+            "pull preparation preserves another active download"
         );
+        assert!(
+            marker_temp.exists(),
+            "pull preparation preserves marker writes"
+        );
+        drop(download);
+    }
+
+    #[test]
+    fn verified_marker_rejects_same_size_same_mtime_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = Model {
+            name: "fixture",
+            bytes: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        let path = install(
+            dir.path(),
+            &artifact,
+            &b"abc"[..],
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let (device, inode, changed_secs, changed_nanos) =
+            crate::plugin::platform::voice_model_identity_metadata(&before);
+        if device.is_none() || inode.is_none() || changed_secs.is_none() || changed_nanos.is_none()
+        {
+            return;
+        }
+        let modified = before.modified().unwrap();
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"xyz").unwrap();
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(marker_metadata(&before), marker_metadata(&after));
+        assert!(!marker_matches(
+            &read_marker(&path).unwrap(),
+            &after,
+            &artifact
+        ));
+    }
+
+    #[test]
+    fn verification_succeeds_when_marker_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = Model {
+            name: "fixture",
+            bytes: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        let path = dir.path().join("ggml-fixture.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        std::fs::create_dir(marker_path(&path)).unwrap();
+        assert!(verify(&path, &artifact, &AtomicBool::new(false)).is_ok());
+    }
+
+    #[test]
+    fn remove_deletes_model_marker_and_stale_temp_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ggml-tiny.bin"), b"model").unwrap();
+        std::fs::write(dir.path().join("ggml-tiny.verified.json"), b"marker").unwrap();
+        let stale = dir.path().join(format!("{TEMP_PREFIX}stale"));
+        std::fs::write(&stale, b"partial").unwrap();
+        let old = std::time::SystemTime::now() - STALE_TEMP_AGE - std::time::Duration::from_secs(1);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        remove(dir.path(), "tiny").unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        remove(dir.path(), "tiny").unwrap();
     }
 }

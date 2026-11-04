@@ -56,8 +56,13 @@ fn voice_probes(cfg: &Config) -> Vec<ProbeReport> {
         return vec![ProbeReport::reserved("voice", v.kind.as_str())];
     }
     match v.kind {
-        VoiceKind::Http => vec![crate::voice_http::HttpVoiceProvider::new(v.clone(), None).probe()
-            .note("credential readiness is reported without resolving secrets; capture uses the host build")],
+        VoiceKind::Http => {
+            let mut report = crate::voice_http::HttpVoiceProvider::new(v.clone(), None).probe();
+            if let Err(message) = v.validate_credential_transport() {
+                report.availability = Availability::Unavailable(message);
+            }
+            vec![report.note("credential readiness is reported without resolving secrets; capture uses the host build")]
+        }
         VoiceKind::Command => {
             let mut report = crate::voice::CommandVoiceProvider::new(v.clone()).probe();
             if !v.enabled {
@@ -635,6 +640,28 @@ mod tests {
         // JSON shape doctor prints.
         let v = serde_json::to_value(&reports).unwrap();
         assert!(v[0]["seam"].is_string() && v[0]["availability"]["state"].is_string());
+    }
+
+    #[test]
+    fn http_voice_probe_refuses_credentialed_plaintext_non_loopback() {
+        let cfg = Config {
+            voice: thegn_core::config::VoiceConfig {
+                enabled: true,
+                kind: thegn_core::config::VoiceKind::Http,
+                endpoint: "http://stt.example/transcribe".into(),
+                credential: Some("env:VOICE_TOKEN".into()),
+                ..Default::default()
+            },
+            ..hermetic_config()
+        };
+        let report = voice_probes(&cfg)
+            .into_iter()
+            .find(|report| report.seam == "voice")
+            .unwrap();
+        assert!(report.availability.is_unavailable());
+        assert!(
+            matches!(report.availability, Availability::Unavailable(ref text) if text.contains("use https"))
+        );
     }
 
     #[test]
