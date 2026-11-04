@@ -3336,6 +3336,8 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     cfg.sandbox.remote.host = "box.example".into();
     cfg.host.insert("gpu".into(), Default::default());
     cfg.voice.enabled = true;
+    cfg.apps.default_tab = "plugin:todoist:workspace".into();
+    cfg.apps.tab_order.push("plugin:todoist:workspace".into());
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
 
@@ -3345,8 +3347,43 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     assert!(cfg.sandbox.remote.host.is_empty());
     assert!(cfg.host.is_empty());
     assert!(!cfg.voice.enabled);
+    assert_eq!(cfg.apps.default_tab, "work");
+    assert_eq!(cfg.apps.tab_order, ["work"]);
     // Every gated feature reports as clamped.
-    assert_eq!(clamped.len(), Feature::ALL.len());
+    assert_eq!(clamped.len(), 6);
+    assert!(clamped.contains(&Feature::PluginApps));
+}
+
+#[test]
+fn clamp_to_channel_strips_plugin_app_tabs_in_stable() {
+    use crate::channel::{Channel, Feature};
+
+    let mut cfg = Config {
+        apps: crate::config::AppsConfig {
+            default_tab: "plugin:todoist:workspace".into(),
+            tab_order: vec!["work".into(), " plugin:todoist:workspace ".into()],
+        },
+        ..Config::default()
+    };
+
+    assert_eq!(
+        cfg.clamp_to_channel(Channel::Stable),
+        vec![Feature::PluginApps]
+    );
+    assert_eq!(cfg.apps.default_tab, "work");
+    assert_eq!(cfg.apps.tab_order, ["work"]);
+
+    let mut dev_cfg = Config {
+        apps: crate::config::AppsConfig {
+            default_tab: "plugin:todoist:workspace".into(),
+            tab_order: vec!["work".into(), "plugin:todoist:workspace".into()],
+        },
+        ..Config::default()
+    };
+    let before = dev_cfg.clone();
+    assert!(dev_cfg.clamp_to_channel(Channel::Dev).is_empty());
+    assert_eq!(dev_cfg.apps.default_tab, before.apps.default_tab);
+    assert_eq!(dev_cfg.apps.tab_order, before.apps.tab_order);
 }
 
 #[test]
@@ -4261,4 +4298,30 @@ fn stats_net_icons_default_empty_and_parse() {
     assert_eq!(cfg.stats.net_icons.ethernet, "ETH");
     assert!(cfg.stats.net_icons.wifi.is_empty());
     assert!(cfg.stats.net_icons.generic.is_empty());
+}
+
+mod apps_tests {
+    use crate::config::AppsConfig;
+
+    #[test]
+    fn plugin_tab_ids_require_three_valid_namespaced_parts() {
+        for id in ["plugin:a:b", "plugin:plugin.name_1:contribution-x"] {
+            assert!(
+                AppsConfig::is_plugin_tab_id(id),
+                "expected {id:?} to be valid"
+            );
+        }
+        for id in [
+            "plugin:a",
+            "plugin::b",
+            "plugin:a:b/c",
+            "plugin:a:b:c",
+            "Plugin:a:b",
+        ] {
+            assert!(
+                !AppsConfig::is_plugin_tab_id(id),
+                "expected {id:?} to be rejected"
+            );
+        }
+    }
 }

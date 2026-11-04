@@ -1023,7 +1023,7 @@ fn timeline_section(events: &[thegn_core::models::TimelineEvent]) -> Vec<PanelRo
         };
         // Right-align the event's age — a timeline without time reads as a
         // meaningless list of words.
-        let ago = thegn_core::util::age(ev.ts_ms);
+        let ago = timeline_age(ev.ts_ms);
         rows.push(PanelRow::plain(Line::split(
             vec![
                 sp(2),
@@ -1035,6 +1035,13 @@ fn timeline_section(events: &[thegn_core::models::TimelineEvent]) -> Vec<PanelRo
         )));
     }
     rows
+}
+
+/// The right-aligned age of a timeline event. `TimelineEvent::ts_ms` is epoch
+/// milliseconds; `util::age` takes epoch seconds, so passing `ts_ms` directly
+/// clamped every row to `0s`.
+fn timeline_age(ts_ms: i64) -> String {
+    thegn_core::util::age(ts_ms.div_euclid(1000))
 }
 
 pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
@@ -1338,7 +1345,7 @@ fn sandbox_full_with(ctx: &SectionCtx, show_all: bool) -> Vec<PanelRow> {
             seg(g2(), format!("{src} ")),
             seg(kind_col, format!("{:<8}", ev.kind)),
             seg(d(), detail_txt),
-            seg(g2(), format!("  {}", thegn_core::util::age(ev.ts_ms))),
+            seg(g2(), format!("  {}", timeline_age(ev.ts_ms))),
         ]);
     }
 
@@ -1454,6 +1461,54 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn timeline_event(age_secs: i64) -> thegn_core::models::TimelineEvent {
+        thegn_core::models::TimelineEvent {
+            ts_ms: thegn_core::util::now_ms() - age_secs * 1000,
+            source: thegn_core::models::TimelineSource::Sandbox,
+            kind: "exec".into(),
+            detail: "3f8a1c".into(),
+        }
+    }
+
+    #[test]
+    fn timeline_age_converts_milliseconds_to_the_seconds_formatter() {
+        assert_eq!(timeline_age(thegn_core::util::now_ms() - 7_200_000), "2h");
+        assert_eq!(timeline_age(thegn_core::util::now_ms() - 120_000), "2m");
+        assert_eq!(
+            timeline_age(thegn_core::util::now_ms() - 3 * 86_400_000),
+            "3d"
+        );
+    }
+
+    #[test]
+    fn timeline_age_shows_in_the_panel_timeline_block() {
+        let rows = timeline_section(&[timeline_event(7_200)]);
+        let rendered = text(&rows);
+        assert!(rendered.contains("2h"), "timeline age: {rendered}");
+        assert!(!rendered.contains("0s"), "timeline age: {rendered}");
+    }
+
+    #[test]
+    fn timeline_age_shows_in_the_full_view_detail_pane() {
+        let model = FrameModel {
+            timeline: vec![timeline_event(7_200)],
+            ..model_with_containers()
+        };
+        let ui = PanelUi {
+            open: Section::Sandbox,
+            width: PanelWidth::Full,
+            ..PanelUi::default()
+        };
+        let ctx = SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 200,
+            rows: 40,
+        };
+        let rendered = text(&sandbox_full_with(&ctx, false));
+        assert!(rendered.contains("2h"), "full timeline age: {rendered}");
     }
 
     #[test]

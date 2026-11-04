@@ -756,6 +756,91 @@ fn refusal_remediation_every_class_has_label_and_text() {
 }
 
 #[test]
+fn refusal_is_identical_for_every_placement_and_builds_no_argv() {
+    let placements = vec![
+        Placement::Local,
+        Placement::Ssh(SshPlacement::plain(
+            "devbox".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        )),
+        Placement::Provider(crate::placement::ProviderPlacement {
+            provider: "test".into(),
+            id: "sandbox".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![],
+            up_command: vec![],
+            down_command: vec![],
+        }),
+        Placement::K8s(crate::placement::K8sPlacement {
+            kubectl: "kubectl".into(),
+            context: None,
+            namespace: None,
+            pod: "pod".into(),
+            container: Some("dev".into()),
+            pod_template: None,
+            image: None,
+        }),
+    ];
+    let compose = crate::sandbox_compose::ComposeSpec {
+        files: vec!["compose.yml".into()],
+        service: Some("app".into()),
+        run_services: Vec::new(),
+    }
+    .encode();
+    let mut messages = Vec::new();
+    let mut hints = Vec::new();
+
+    for placement in &placements {
+        let mut s = spec(Backend::Podman);
+        s.read_only_root = true;
+        s.compose = Some(compose.clone());
+        s.placement = placement.clone();
+
+        let error =
+            enter_argv(&s, "true").expect_err("a Compose spec with read_only_root is refused");
+        match &error {
+            EnterError::Refused(refusal) => {
+                assert_eq!(refusal.class, RefusalClass::ComposePolicy);
+                assert_eq!(refusal.backend, "podman-rootless");
+                assert!(refusal.path.is_none());
+                assert_eq!(error.to_string(), refusal.message);
+                messages.push(refusal.message.clone());
+            }
+            other => panic!("expected Compose policy refusal, got {other:?}"),
+        }
+
+        let hint = error.remediation_hint();
+        assert_eq!(
+            enter_argv_guarded(&s, "true").err(),
+            Some(error.clone()),
+            "guarded and unguarded builders must return the same typed refusal"
+        );
+        hints.push(hint);
+    }
+
+    assert!(messages.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(hints.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(
+        hints.first().is_some_and(
+            |hint| hint.contains(&format!("[{}]", RefusalClass::ComposePolicy.label()))
+        )
+    );
+
+    // Positive control: a valid SSH placement still produces a wrapped argv.
+    let mut ok = spec(Backend::Podman);
+    ok.placement = Placement::Ssh(SshPlacement::plain(
+        "devbox".into(),
+        22,
+        false,
+        TransportKind::Ssh,
+    ));
+    let argv = enter_argv(&ok, "bash -l").expect("valid volume names");
+    assert_eq!(argv[0], "ssh");
+}
+
+#[test]
 fn refusal_remediation_hint_names_class_path_and_fix() {
     let spec = spec(Backend::Docker);
     let error = refusal(

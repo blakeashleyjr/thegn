@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -29,7 +28,6 @@ use super::session::{MAX_QUEUED_FRAMES, SessionFailure, SessionWriter};
 pub struct ProviderBridge {
     writer: SessionWriter,
     timeout: Duration,
-    next_id: AtomicU64,
     pending: Mutex<Pending>,
 }
 
@@ -87,10 +85,6 @@ impl ProviderBridge {
         let bridge = Arc::new(Self {
             writer,
             timeout,
-            // Provider request ids share the wire with host.call replies (the
-            // plugin allocates its own request ids); start high so the two
-            // streams cannot collide in logs.
-            next_id: AtomicU64::new(1_000_000),
             pending: Mutex::new(Pending {
                 closed: None,
                 calls: HashMap::new(),
@@ -151,10 +145,7 @@ impl ProviderBridge {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, BridgeError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let Ok(id) = self
-            .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        else {
+        let Ok(id) = self.writer.next_request_id() else {
             return Err(BridgeError::Transport(
                 "provider request ids are exhausted".into(),
             ));
@@ -447,7 +438,7 @@ mod tests {
     use crate::plugin::session::tests::FixtureSupervisor;
     use crate::plugin::session::{ResidentSession, SessionEvent, SessionWriter};
     use std::collections::BTreeMap;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use thegn_core::config::IssuesConfig;
 
     fn sh(script: &str) -> Vec<String> {
@@ -542,6 +533,28 @@ done
         let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(10));
         *bridge_slot.lock().unwrap() = Some(bridge.clone());
         (fixture, session, bridge)
+    }
+
+    #[test]
+    fn provider_and_app_requests_never_share_an_id() {
+        let (_fixture, session, bridge) = live_bridge();
+        let writer = session.writer();
+        let app_id = writer
+            .request(
+                thegn_core::plugin_api::PluginCallback::OnEvent,
+                serde_json::json!({"event":"save"}),
+            )
+            .unwrap();
+        assert_eq!(app_id, 1_000_000);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(bridge.call("issues", "get_issue", serde_json::Value::Null));
+
+        assert!(result.is_ok());
+        assert_eq!(writer.next_request_peek(), app_id + 2);
     }
 
     #[test]
@@ -674,7 +687,7 @@ done
         assert_eq!(issues[0].title, "from plugin");
         assert_eq!(issues[0].provider, "plugin:demo");
         // An unsupported op surfaces as a classified error.
-        let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
+        let before = bridge.writer.next_request_peek();
         let err = rt
             .block_on(backend.add_comment("plugin:demo:1", "hi"))
             .unwrap_err();
@@ -684,10 +697,7 @@ done
         assert_eq!(*op, "add_comment");
         // comments=true means the request reached the plugin, which then
         // exercised the second (upstream unsupported) degradation boundary.
-        assert_eq!(
-            bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
-            before + 1
-        );
+        assert_eq!(bridge.writer.next_request_peek(), before + 1);
     }
 
     #[test]
@@ -695,7 +705,7 @@ done
         let (_fixture, _session, bridge) = live_bridge();
         let backend =
             PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default()).unwrap();
-        let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
+        let before = bridge.writer.next_request_peek();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -706,10 +716,7 @@ done
         assert!(matches!(err, IssueError::Unsupported("add_comment")));
         // Omitted caps are the old-manifest all-false default; the adapter
         // must reject locally before allocating a provider request id.
-        assert_eq!(
-            bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
-            before
-        );
+        assert_eq!(bridge.writer.next_request_peek(), before);
     }
 
     #[test]
@@ -721,7 +728,7 @@ done
         router
             .push_backend("demo".into(), Box::new(backend))
             .unwrap();
-        let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
+        let before = bridge.writer.next_request_peek();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -736,10 +743,7 @@ done
             ))
             .unwrap();
         assert_eq!(updated.title, "updated by plugin");
-        assert_eq!(
-            bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
-            before + 1
-        );
+        assert_eq!(bridge.writer.next_request_peek(), before + 1);
     }
 
     #[test]
@@ -1108,7 +1112,11 @@ done
             SessionWriter(super::super::session::admission::Shared::new()),
             Duration::from_millis(200),
         );
-        bridge.next_id.store(u64::MAX, Ordering::Relaxed);
+        bridge
+            .writer
+            .0
+            .next_request
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1120,7 +1128,7 @@ done
             result,
             Err(BridgeError::Transport(message)) if message.contains("exhausted")
         ));
-        assert_eq!(bridge.next_id.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(bridge.writer.next_request_peek(), u64::MAX);
         assert!(bridge.pending.lock().unwrap().calls.is_empty());
     }
 
@@ -1135,12 +1143,78 @@ done
         (shared, bridge)
     }
 
+    /// Model a live session writer without a plugin reply. Frames leave the
+    /// bounded egress queue after successful writes, while bridge calls stay
+    /// pending until a response or close arrives.
+    struct DrainFixture {
+        stop: Arc<AtomicBool>,
+        written: Arc<AtomicUsize>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl DrainFixture {
+        fn start(shared: Arc<super::super::session::admission::Shared>) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let written = Arc::new(AtomicUsize::new(0));
+            let thread_written = written.clone();
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    if let Some(frame) = shared.pop() {
+                        shared.written(frame.len());
+                        thread_written.fetch_add(1, Ordering::Release);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+            Self {
+                stop,
+                written,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for DrainFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("drain fixture thread panicked");
+            }
+        }
+    }
+
+    async fn start_stalled_calls(
+        bridge: Arc<ProviderBridge>,
+        written: Arc<AtomicUsize>,
+        count: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<serde_json::Value, BridgeError>>> {
+        let mut calls = Vec::with_capacity(count);
+        for started in 1..=count {
+            let bridge = bridge.clone();
+            calls.push(tokio::spawn(async move {
+                bridge
+                    .call("issues", "stall", serde_json::Value::Null)
+                    .await
+            }));
+            // Model its complete pipe write before starting another call.
+            // The plugin still never replies, so its pending entry remains.
+            while written.load(Ordering::Acquire) < started {
+                tokio::task::yield_now().await;
+            }
+        }
+        calls
+    }
+
     async fn wait_for_pending(bridge: &ProviderBridge, count: usize) {
+        // Detached transport fixtures drain frames on a real writer thread;
+        // allow that thread to run between polls instead of busy-yielding.
         for _ in 0..10_000 {
             if bridge.pending.lock().unwrap().calls.len() >= count {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("bridge never reached {count} pending calls");
     }
@@ -1155,16 +1229,23 @@ done
     #[test]
     fn saturated_bridge_refuses_the_extra_call_without_growing_pending() {
         let (shared, bridge) = detached_bridge(Duration::from_secs(30));
+        let _drain = DrainFixture::start(shared.clone());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         let (results, extra, after_close) = rt.block_on(async {
-            let calls = futures_util::future::join_all(
-                (0..MAX_QUEUED_FRAMES)
-                    .map(|_| bridge.call("issues", "stall", serde_json::Value::Null)),
-            );
+            let calls = async {
+                futures_util::future::join_all(
+                    start_stalled_calls(bridge.clone(), _drain.written.clone(), MAX_QUEUED_FRAMES)
+                        .await,
+                )
+                .await
+                .into_iter()
+                .map(|result| result.unwrap())
+                .collect::<Vec<_>>()
+            };
             let probe = async {
                 wait_for_pending(&bridge, MAX_QUEUED_FRAMES).await;
                 let extra = bridge
@@ -1259,16 +1340,28 @@ done
     fn independent_provider_bridges_have_independent_pending_capacity() {
         let (shared_a, bridge_a) = detached_bridge(Duration::from_secs(30));
         let (shared_b, bridge_b) = detached_bridge(Duration::from_secs(30));
+        let _drain_a = DrainFixture::start(shared_a.clone());
+        let _drain_b = DrainFixture::start(shared_b.clone());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         let (results_a, extra_a, result_b) = rt.block_on(async {
-            let calls_a = futures_util::future::join_all(
-                (0..MAX_QUEUED_FRAMES)
-                    .map(|_| bridge_a.call("issues", "stall", serde_json::Value::Null)),
-            );
+            let calls_a = async {
+                futures_util::future::join_all(
+                    start_stalled_calls(
+                        bridge_a.clone(),
+                        _drain_a.written.clone(),
+                        MAX_QUEUED_FRAMES,
+                    )
+                    .await,
+                )
+                .await
+                .into_iter()
+                .map(|result| result.unwrap())
+                .collect::<Vec<_>>()
+            };
             let probe_a = async {
                 wait_for_pending(&bridge_a, MAX_QUEUED_FRAMES).await;
                 let extra_a = bridge_a

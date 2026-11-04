@@ -16,6 +16,7 @@ answer. Architecture context: [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 | an issue tracker provider                              | [tracker-provider.md](tracker-provider.md)   |
 | a calendar command plugin                              | [calendar-plugin.md](calendar-plugin.md)     |
 | a plugin (out of process, or a plugin-backed provider) | [plugin.md](plugin.md)                       |
+| a resident plugin app tab                              | [plugin-apps.md](plugin-apps.md)             |
 | a host capability (API / MCP / plugin verb)            | [capability.md](capability.md)               |
 | a coding-agent harness (Claude Code / Codex / …)       | [harness.md](harness.md)                     |
 | an IDE integration (the inbound boundary)              | [ide-integration.md](ide-integration.md)     |

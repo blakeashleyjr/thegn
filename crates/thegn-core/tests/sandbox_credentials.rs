@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use thegn_core::config::{FileAccess, Network};
 use thegn_core::sandbox::{Backend, SandboxLimits, SandboxSpec, ensure, enter_argv};
 
+#[path = "support/bounded_run.rs"]
+mod bounded_run;
+
 fn skip() -> bool {
     !thegn_core::util::have("podman")
         || std::env::var("CI").is_ok()
@@ -61,10 +64,9 @@ fn base_spec(name: &str) -> SandboxSpec {
 }
 
 fn exec_in(container: &str, shell_expr: &str) -> String {
-    let out = std::process::Command::new("podman")
-        .args(["exec", container, "sh", "-c", shell_expr])
-        .output()
-        .expect("podman exec failed");
+    let mut command = std::process::Command::new("podman");
+    command.args(["exec", container, "sh", "-c", shell_expr]);
+    let out = bounded_run::output(&mut command).expect("podman exec failed");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -84,10 +86,9 @@ fn e1_env_overrides_inject_scoped_key() {
 
     // Run a command inside the container via enter_argv to pick up env_overrides.
     let argv = enter_argv(&spec, "echo $ANTHROPIC_API_KEY").expect("valid volume names");
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .expect("enter_argv exec failed");
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    let out = bounded_run::output(&mut command).expect("enter_argv exec failed");
     let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
     force_rm(name);
     assert_eq!(val, "sk-test-scoped", "scoped key should be injected");
@@ -111,10 +112,9 @@ fn e2_env_block_strips_passthrough_key() {
     ensure(&spec).expect("ensure failed");
 
     let argv = enter_argv(&spec, "echo ${ANTHROPIC_API_KEY:-ABSENT}").expect("valid volume names");
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .expect("enter_argv exec failed");
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    let out = bounded_run::output(&mut command).expect("enter_argv exec failed");
     let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
     force_rm(name);
     assert_eq!(
@@ -139,10 +139,9 @@ fn e3_env_override_beats_passthrough() {
     ensure(&spec).expect("ensure failed");
 
     let argv = enter_argv(&spec, "echo $MY_KEY").expect("valid volume names");
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .expect("enter_argv exec failed");
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    let out = bounded_run::output(&mut command).expect("enter_argv exec failed");
     let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
     force_rm(name);
     assert_eq!(val, "override-value", "env_overrides must beat passthrough");

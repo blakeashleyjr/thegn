@@ -293,6 +293,23 @@ fn ensure_unclaimed(conn: &Connection, worktree: &str) -> Result<()> {
     Ok(())
 }
 
+/// Release the claim an EXPIRED drain left on a row that already landed. A landed row has no admissible status, so
+/// admission can never recover it; without this the row's bookkeeping is refused for ever. The claim generation is
+/// kept (monotonic), so the former owner stays fenced. A live lease, a NULL lease and every non-landed row are untouched.
+pub(crate) fn reap_expired_landed_claim(conn: &Connection, worktree: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE merge_queue SET claim_owner=NULL,claim_phase='unclaimed',claim_lease_until_ms=NULL, \
+         claim_owner_hint=NULL,claim_launch_nonce=NULL,claim_diagnostic=NULL \
+         WHERE worktree=?1 AND status='landed' AND claim_owner IS NOT NULL \
+           AND claim_lease_until_ms IS NOT NULL AND claim_lease_until_ms<?2",
+        params![worktree, util::now_ms()],
+    )?;
+    if changed > 0 {
+        tracing::warn!(target: "thegn::db", worktree = %worktree, "released the expired merge claim of a landed row");
+    }
+    Ok(changed > 0)
+}
+
 fn record_merge_event(conn: &Connection, event: &MergeQueueEvent) -> Result<()> {
     conn.execute(
         "INSERT INTO merge_queue_events \
@@ -473,6 +490,7 @@ impl Db {
             if !matches {
                 return Ok(false);
             }
+            reap_expired_landed_claim(conn, worktree)?;
             let now = util::now();
             let changed = conn.execute(
                 r#"INSERT INTO merge_queue
@@ -530,6 +548,7 @@ fn enqueue_merge_row(
     identity: Option<&MergeEnqueueIdentity>,
 ) -> Result<()> {
     let now = util::now();
+    reap_expired_landed_claim(db.conn(), worktree)?;
     let changed = db.conn().execute(
         r#"INSERT INTO merge_queue
              (worktree,branch,target_branch,status,queued_at,updated_at,
@@ -1316,6 +1335,7 @@ impl WorktreeAuxStore for Db {
             None
         };
         let conn: &Connection = tx.as_deref().unwrap_or(base);
+        reap_expired_landed_claim(conn, worktree)?;
         let row: Option<MergeRowSnapshot> = conn
             .query_row(
                 "SELECT status, claim_owner, updated_at, candidate_oid, result_oid \
@@ -2338,6 +2358,74 @@ impl WorktreeAuxStore for Db {
             .conn()
             .prepare("SELECT issue_id,worktree_path FROM issue_links ORDER BY linked_at DESC")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn link_issue_ref(
+        &self,
+        worktree_path: &str,
+        issue_ref: &crate::issue::IssueRef,
+    ) -> Result<()> {
+        issue_ref
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        self.conn().execute(
+            r#"INSERT INTO issue_links(worktree_path,issue_id,linked_at,provider,account)
+               VALUES(?1,?2,?3,?4,?5)
+               ON CONFLICT(worktree_path,issue_id) DO UPDATE SET
+                 linked_at=?3, provider=?4, account=?5"#,
+            params![
+                worktree_path,
+                issue_ref.id,
+                util::now(),
+                issue_ref.provider,
+                issue_ref.account
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn linked_issue_refs(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Vec<(String, Option<crate::issue::IssueRef>)>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT issue_id, provider, account FROM issue_links WHERE worktree_path=?1 ORDER BY linked_at DESC",
+        )?;
+        let rows = stmt.query_map(params![worktree_path], |row| {
+            let id = row.get::<_, String>(0)?;
+            let provider = row.get::<_, Option<String>>(1)?;
+            let account = row.get::<_, Option<String>>(2)?;
+            let issue_ref = match (provider, account) {
+                (Some(provider), Some(account)) => Some(
+                    crate::issue::IssueRef::new(provider, account, id.clone()).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                ),
+                (None, None) => None,
+                (None, Some(_)) => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        1,
+                        "provider".to_string(),
+                        rusqlite::types::Type::Null,
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        2,
+                        "account".to_string(),
+                        rusqlite::types::Type::Null,
+                    ));
+                }
+            };
+            Ok((id, issue_ref))
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 

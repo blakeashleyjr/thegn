@@ -127,7 +127,7 @@ fn fmt_dur(secs: i64) -> String {
 }
 
 impl AppTile for ObserveTile {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "observe"
     }
 

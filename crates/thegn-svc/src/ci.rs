@@ -2853,6 +2853,37 @@ mod tests {
     }
 
     #[test]
+    fn collector_drops_an_invalid_utf8_line_and_flags_the_tail_truncated() {
+        let mut input = b"before\n".to_vec();
+        input.extend_from_slice(&[0xff, 0xfe]);
+        input.extend_from_slice(b" SYNTHETIC_BAD_LINE\nafter\n");
+        let (text, truncated) = collect_log(input.as_slice()).unwrap();
+
+        assert_eq!(text, "before\nafter\n");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn collector_keeps_crlf_and_redacts_a_crlf_framed_pem_block() {
+        let input = "-----BEGIN PRIVATE KEY-----\r\nSYNTHETIC_CRLF_BODY\r\n-----END PRIVATE KEY-----\r\nafter\r\n";
+        let (text, truncated) = collect_log(input.as_bytes()).unwrap();
+
+        assert!(!text.contains("SYNTHETIC_CRLF_BODY"));
+        assert!(text.ends_with("after\r\n"));
+        assert!(text.contains("***redacted***\r\n"));
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn collector_redacts_an_unterminated_final_line_inside_a_pem_block() {
+        let input = "ordinary\n-----BEGIN PRIVATE KEY-----\nSYNTHETIC_UNTERMINATED_BODY";
+        let (text, _) = collect_log(input.as_bytes()).unwrap();
+
+        assert!(!text.contains("SYNTHETIC_UNTERMINATED_BODY"));
+        assert!(text.starts_with("ordinary\n"));
+    }
+
+    #[test]
     fn remote_host_to_system() {
         assert_eq!(
             system_from_remote_host("git@github.com:o/r.git"),

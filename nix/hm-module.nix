@@ -235,6 +235,30 @@ self: {
     theme.agent_glyphs = cfg.themeAgentGlyphs;
     theme.mascot = cfg.themeMascot;
     theme.mascot_motion = cfg.themeMascotMotion;
+    ui.confirm_delete_project = cfg.uiConfirmDeleteProject;
+    ui.full_mode_chip = cfg.uiFullModeChip;
+    ui.dismiss_overlay_on_click_outside = cfg.uiDismissOverlayOnClickOutside;
+    ui.sidebar_freeze_sort = cfg.uiSidebarFreezeSort;
+    ui.sidebar_nav_skips_collapsed = cfg.uiSidebarNavSkipsCollapsed;
+    ui.sidebar_dividers = cfg.uiSidebarDividers;
+    ui.fullscreen_keep_masthead = cfg.uiFullscreenKeepMasthead;
+    ui.fullscreen_keep_statusbar = cfg.uiFullscreenKeepStatusbar;
+    ui.sidebar_show_status_icon = cfg.uiSidebarShowStatusIcon;
+    ui.sidebar_show_diff_stat = cfg.uiSidebarShowDiffStat;
+    ui.sidebar_show_ahead_behind = cfg.uiSidebarShowAheadBehind;
+    ui.sidebar_show_pr_chip = cfg.uiSidebarShowPrChip;
+    ui.sidebar_show_jj = cfg.uiSidebarShowJj;
+    ui.sidebar_show_submodules = cfg.uiSidebarShowSubmodules;
+    ui.sidebar_detail_branch = cfg.uiSidebarDetailBranch;
+    ui.sidebar_detail_branch_stat = cfg.uiSidebarDetailBranchStat;
+    ui.sidebar_detail_pr = cfg.uiSidebarDetailPr;
+    ui.sidebar_project_sort = cfg.uiSidebarProjectSort;
+    ui.sidebar_terminals_section = cfg.uiSidebarTerminalsSection;
+    ui.sidebar_focus_detail = cfg.uiSidebarFocusDetail;
+    ui.language = cfg.uiLanguage;
+    ui.sidebar_icon_ahead = cfg.uiSidebarIconAhead;
+    ui.sidebar_icon_behind = cfg.uiSidebarIconBehind;
+    ui.sidebar_icon_status = cfg.uiSidebarIconStatus;
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
@@ -409,6 +433,151 @@ in {
       type = lib.types.nullOr (lib.types.enum ["blink" "still"]);
       default = null;
       description = "Splash-mascot motion. Unset (null) = the binary's default.";
+    };
+
+    uiConfirmDeleteProject = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Ask before destructive project worktree actions. Unset (null) = the binary's default.";
+    };
+
+    uiFullModeChip = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Whether to display the full word for the mode chip. Unset (null) = the binary's default.";
+    };
+
+    uiDismissOverlayOnClickOutside = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Dismiss a detail popup when the user left-clicks outside it, like Escape. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarFreezeSort = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Hold the sidebar's worktree order steady while you are navigating it. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarNavSkipsCollapsed = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Shift+Alt+↑/↓ steps past workspaces and terminal hosts you have collapsed. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarDividers = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Separate one workspace's block from the next in the sidebar. Unset (null) = the binary's default.";
+    };
+
+    uiFullscreenKeepMasthead = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "In full-window pane fullscreen, keep the top masthead bar visible. Unset (null) = the binary's default.";
+    };
+
+    uiFullscreenKeepStatusbar = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "In full-window pane fullscreen, keep the bottom status bar visible. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarShowStatusIcon = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the dirty status icon in a worktree row's right cluster. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarShowDiffStat = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the uncommitted working-tree line stat in a worktree row's right cluster. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarShowAheadBehind = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the upstream ahead and behind counts in a worktree row. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarShowPrChip = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the compact open-PR chip in a worktree row's right cluster. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarShowJj = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the jujutsu-colocation marker when the repo has a .jj/ beside .git/. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarShowSubmodules = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show a separate indicator when a submodule pointer or checkout is dirty. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarDetailBranch = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Lead the focused detail line with the branch name. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarDetailBranchStat = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the total branch-vs-default-branch line stat on the focused detail line. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarDetailPr = lib.mkOption {
+      type = lib.types.nullOr (lib.types.bool);
+      default = null;
+      description = "Show the open PR number on the focused detail line. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarProjectSort = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["manual" "attention"]);
+      default = null;
+      description = "Sidebar project ordering: keep the manual order, or bubble the most-urgent project to the top. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarTerminalsSection = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["always" "nonempty"]);
+      default = null;
+      description = "Sidebar TERMINALS section visibility. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarFocusDetail = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum ["all" "cursor" "off"]);
+      default = null;
+      description = "Which rows expand to a detail line while the sidebar is focused. Unset (null) = the binary's default.";
+    };
+
+    uiLanguage = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      example = "auto";
+      description = "Language code, or auto to detect from system. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarIconAhead = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Override glyph for the ahead marker; empty uses the built-in glyph. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarIconBehind = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Override glyph for the behind marker; empty uses the built-in glyph. Unset (null) = the binary's default.";
+    };
+
+    uiSidebarIconStatus = lib.mkOption {
+      type = lib.types.nullOr (lib.types.str);
+      default = null;
+      description = "Override glyph for the dirty status marker; empty uses the built-in glyph. Unset (null) = the binary's default.";
     };
 
     monitorSystem = lib.mkOption {

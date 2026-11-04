@@ -1889,10 +1889,10 @@ fn collect_sidebar_status(
         })
         .cloned()
         .collect();
-    if keep_ok {
-        let fingerprint_keep: std::collections::HashSet<String> =
-            paths.iter().chain(all_wt_paths.iter()).cloned().collect();
-        crate::hydrate_tuning::retain_glyph_fingerprints(&fingerprint_keep);
+    let glyph_keep: Option<std::collections::HashSet<String>> =
+        keep_ok.then(|| paths.iter().chain(all_wt_paths.iter()).cloned().collect());
+    if let Some(keep) = &glyph_keep {
+        crate::hydrate_tuning::retain_glyph_fingerprints(keep);
     }
     // Resolve DB-backed location and bridge state before taking the UI-shared
     // glyph cache mutex. Reuse this hydration's Db instead of opening/querying
@@ -2048,9 +2048,8 @@ fn collect_sidebar_status(
         // other workspaces. Dead rows still get pruned — but only when the
         // registry reads succeeded, so a transient DB error can't masquerade
         // as an empty registry and flush the cache.
-        if keep_ok {
-            cache
-                .retain(|k, _| paths.iter().any(|p| p == k) || all_wt_paths.iter().any(|p| p == k));
+        if let Some(keep) = &glyph_keep {
+            retain_registered_glyphs(&mut cache, keep);
         }
         persist
     };
@@ -2205,6 +2204,16 @@ fn glyph_persist_entry(path: &str, row: &GlyphRow) -> (String, String) {
         path.to_string(),
         serde_json::to_string(row).unwrap_or_default(),
     )
+}
+
+/// Drop every cached glyph row whose worktree is not in `keep`. Called with the glyph mutex held, so the
+/// membership test must stay O(1): the keep set is built BEFORE the lock (THE-656), never rebuilt or
+/// scanned here.
+fn retain_registered_glyphs(
+    cache: &mut std::collections::HashMap<String, (GlyphRow, Instant)>,
+    keep: &std::collections::HashSet<String>,
+) {
+    cache.retain(|path, _| keep.contains(path));
 }
 
 /// The active worktree's LOC report, read straight out of `loc_cache`.
@@ -4620,7 +4629,7 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
             // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
             if cfg.issues.move_on_merge
                 && pr.state == "MERGED"
-                && let Ok(linked) = db.linked_issues(&wt)
+                && let Ok(linked) = db.linked_issue_refs(&wt)
                 && !linked.is_empty()
             {
                 let local_cwd =
@@ -4630,29 +4639,19 @@ pub(crate) fn spawn_pr_cache_refresh_with_generation(
                 // Provider-as-plugin: append live plugin issue providers.
                 crate::plugin_providers::extend_issue_router(&mut router);
                 if router.is_configured() {
-                    let patch = thegn_core::issue::IssuePatch {
-                        status: Some(thegn_core::issue::IssueStatus::Done),
-                        ..Default::default()
-                    };
-                    for id in &linked {
-                        match thegn_svc::issue::block_on_tracker(router.update_issue(id, &patch)) {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) | Err(e) => {
-                                tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
-                                let message = crate::hydrate_tracker::move_on_merge_failure_message(
-                                    id,
-                                    &e.to_string(),
-                                );
-                                if let Err(error) = crate::automation_events::emit_once(
-                                    &db,
-                                    "automation_failed",
-                                    id,
-                                    &message,
-                                    &wt,
-                                ) {
-                                    tracing::debug!(target: "thegn::issues", issue = %id, %error, "could not persist move-on-merge failure notification");
-                                }
-                            }
+                    for (id, error) in
+                        crate::handlers::tracker::move_linked_issues_done(&router, &linked)
+                    {
+                        let message =
+                            crate::hydrate_tracker::move_on_merge_failure_message(&id, &error);
+                        if let Err(error) = crate::automation_events::emit_once(
+                            &db,
+                            "automation_failed",
+                            &id,
+                            &message,
+                            &wt,
+                        ) {
+                            tracing::debug!(target: "thegn::issues", issue = %id, %error, "could not persist move-on-merge failure notification");
                         }
                     }
                 }

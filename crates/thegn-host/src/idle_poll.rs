@@ -12,7 +12,7 @@
 //! module locks the *poll* decision the same way, and `just lint` asserts the
 //! loop has exactly one timed `poll_input` site, which consumes it.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The busy-time batching window.
 pub(crate) const BATCH_POLL: Duration = Duration::from_millis(8);
@@ -36,6 +36,23 @@ pub(crate) fn poll_timeout(
     }
 }
 
+/// Fold an absolute app-request deadline into the poll timeout. A missing
+/// deadline preserves a true idle block.
+pub(crate) fn fold_deadline(
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    match (timeout, deadline) {
+        (None, None) => None,
+        (Some(timeout), None) => Some(timeout),
+        (None, Some(deadline)) => Some(deadline.saturating_duration_since(now)),
+        (Some(timeout), Some(deadline)) => {
+            Some(timeout.min(deadline.saturating_duration_since(now)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +73,41 @@ mod tests {
     #[test]
     fn log_backlog_keeps_an_otherwise_idle_loop_working() {
         assert_eq!(poll_timeout(None, false, false, true), Some(BATCH_POLL));
+    }
+
+    #[test]
+    fn fold_none_keeps_idle_none() {
+        assert_eq!(fold_deadline(None, None, Instant::now()), None);
+    }
+
+    #[test]
+    fn fold_takes_the_earlier() {
+        let now = Instant::now();
+        assert_eq!(
+            fold_deadline(
+                Some(Duration::from_secs(1)),
+                Some(now + Duration::from_millis(200)),
+                now
+            ),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(
+            fold_deadline(
+                Some(Duration::from_millis(200)),
+                Some(now + Duration::from_secs(1)),
+                now
+            ),
+            Some(Duration::from_millis(200))
+        );
+    }
+
+    #[test]
+    fn past_deadline_is_zero() {
+        let now = Instant::now();
+        assert_eq!(
+            fold_deadline(None, Some(now - Duration::from_millis(1)), now),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

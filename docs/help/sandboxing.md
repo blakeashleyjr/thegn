@@ -396,6 +396,13 @@ worktree. A symlink swap or non-regular file refuses provider use before
 `devcontainer up` runs. The first check also runs before the snapshot
 is written; if the later check refuses the CLI provider, thegn warns
 and uses its native OCI path for the supported approved subset.
+The trust digest also covers Compose `env_file`, build Dockerfile, `extends.file`
+and `include` references, following nested files up to 4 levels and 256
+references. Absolute, remote, interpolated or repository-escaping paths, and
+references beyond either limit, refuse provider use. Every provider exec and
+session lookup rechecks that both the selected config and its snapshot remain
+regular files inside the worktree; a failed check refuses exec or drops the
+session.
 
 `thegn doctor` shows the `Devcontainer support` block: mode, repo, candidates,
 selected file or selection error, provider, status, trust counts, and backend
@@ -626,7 +633,11 @@ environment's non-empty network allow/block policy when the provider supports
 egress control. If needed, the policy is re-applied and read back. If
 verification fails, `thegn env restore` fails and reports that the sandbox is
 running without verified egress; warm-pool recycle destroys the spare. A
-successful `env restore` reports the verified counts.
+successful `env restore` reports the verified counts. On the dev channel,
+opening a worktree against an existing provider sandbox with egress control
+also verifies its non-empty network policy and reapplies it if it drifted. If
+the policy cannot be verified, opening is refused and the sandbox is left in
+place; a newly created sandbox that fails verification is still destroyed.
 
 If a worktree's environment selection cannot be read from the state database,
 thegn never falls back to the default environment. `thegn env` verbs report an
