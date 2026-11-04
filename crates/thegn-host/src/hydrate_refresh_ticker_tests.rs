@@ -1,6 +1,7 @@
 //! Real production-thread regression with a finite, owned clock. No fixture
 //! starts a sampler, opens a database, resolves credentials, or runs a provider.
 use super::*;
+use crate::hydrate_schedule::{generation_is_current, scheduled_delivery};
 use std::sync::{Mutex, mpsc};
 use thegn_core::config::{CalendarAccount, CalendarProviderKind, Config};
 
@@ -787,4 +788,47 @@ fn monitor_on_another_tab_lists_at_summary_cadence_until_containers_is_shown() {
     fixture.set_demand(ContainerDemand::resolve(false, true, true, false, false));
     fixture.advance_to(12);
     assert_eq!(fixture.observed.lock().unwrap().containers, vec![1, 12]);
+}
+
+#[test]
+fn owner_shutdown_supersedes_every_scheduled_fence() {
+    let ticker = RefreshTicker {
+        command: Arc::new(Mutex::new(None)),
+        stop: Arc::new(AtomicBool::new(false)),
+        worker: None,
+    };
+    let mut owner = crate::hydrate_schedule::ScheduleOwner::from_test(
+        ticker,
+        ScheduleConfig::from_config(&Config::default()),
+        Arc::new(AtomicU64::new(1)),
+    );
+    let fence = (owner.fence(), 1_u64);
+
+    assert!(generation_is_current(Some(&fence)));
+    owner.shutdown();
+
+    assert!(!generation_is_current(Some(&fence)));
+    assert!(!owner.is_current(1));
+    assert!(scheduled_delivery(Some(&fence), RefreshKind::Ci { force: false }).is_none());
+    assert!(generation_is_current(None));
+}
+
+#[test]
+fn owner_drop_supersedes_its_fence() {
+    let ticker = RefreshTicker {
+        command: Arc::new(Mutex::new(None)),
+        stop: Arc::new(AtomicBool::new(false)),
+        worker: None,
+    };
+    let owner = crate::hydrate_schedule::ScheduleOwner::from_test(
+        ticker,
+        ScheduleConfig::from_config(&Config::default()),
+        Arc::new(AtomicU64::new(1)),
+    );
+    let fence = (owner.fence(), 1_u64);
+
+    assert!(generation_is_current(Some(&fence)));
+    drop(owner);
+
+    assert!(!generation_is_current(Some(&fence)));
 }
