@@ -254,7 +254,10 @@ pub struct IssueFilter {
     pub repo: Option<String>,
     /// Free-text search query.
     pub query: Option<String>,
-    /// Maximum number of issues to return (provider may impose lower cap).
+    /// Maximum number of issues to return. `0` means every matching issue,
+    /// bounded by provider caps: a list cut by a cap is returned as
+    /// `PartialList` (in svc), never as complete. A positive limit that is met
+    /// is complete.
     pub limit: usize,
 }
 
