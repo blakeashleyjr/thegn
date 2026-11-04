@@ -895,4 +895,61 @@ mod tests {
         assert!(!is_valid_opaque_id("a\nb"));
         assert!(!is_valid_opaque_id("a\u{1b}b"));
     }
+
+    #[test]
+    fn media_help_page_states_the_canonical_budget() {
+        let page = include_str!("../../../docs/help/media.md");
+        let page = page.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for needle in [
+            format!("{MAX_FIELD_BYTES} bytes"),
+            format!("{MAX_LABEL_CHARS} characters"),
+            format!("{MAX_COMBINING_RUN} combining accent marks"),
+            format!("{MAX_ID_BYTES} bytes"),
+            format!("{MAX_QUEUE_ITEMS} queue rows"),
+            format!("{MAX_PLAYLISTS} playlists"),
+            format!("{MAX_PLAYERS} players"),
+        ] {
+            assert!(
+                page.contains(needle.as_str()),
+                "help page is missing budget text: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_admitted_rows_render_bounded_labels() {
+        let item = QueueItem {
+            id: "q1".into(),
+            title: "e\u{301}".repeat(5000),
+            artist: "\u{202e}".repeat(2000),
+            ..Default::default()
+        }
+        .admitted()
+        .expect("valid id");
+        assert!(item.title.len() <= MAX_FIELD_BYTES);
+        assert!(item.artist.len() <= MAX_FIELD_BYTES);
+
+        let label = item.label();
+        assert!(label.chars().count() <= MAX_LABEL_CHARS + 3);
+        assert!(!label.contains('\u{202e}'));
+        assert!(label.ends_with("..."));
+
+        let zero_width = MediaState {
+            title: "\u{200b}".repeat(1024 * 1024),
+            ..Default::default()
+        }
+        .admitted();
+        assert!(zero_width.title.len() <= MAX_FIELD_BYTES);
+        let zero_width_label = display_text(&zero_width.title);
+        assert!(zero_width_label.is_empty());
+
+        let oversized_id = QueueItem {
+            id: "x".repeat(MAX_ID_BYTES + 1),
+            title: "t".into(),
+            ..Default::default()
+        }
+        .admitted();
+        assert!(oversized_id.is_none());
+    }
 }

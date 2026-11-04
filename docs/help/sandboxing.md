@@ -390,6 +390,12 @@ The `devcontainer` CLI provider's trust digest covers the selected
 files inside the repository. The digest is checked before `devcontainer up`
 and each exec; changing one of those files requires fresh approval. A missing,
 absolute, or repository-escaping reference refuses provider use.
+Before snapshotting the selected config and again before `devcontainer up`, the
+CLI provider checks that `devcontainer.json` is still a regular file inside the
+worktree. A symlink swap or non-regular file refuses provider use before
+`devcontainer up` runs. The first check also runs before the snapshot
+is written; if the later check refuses the CLI provider, thegn warns
+and uses its native OCI path for the supported approved subset.
 
 `thegn doctor` shows the `Devcontainer support` block: mode, repo, candidates,
 selected file or selection error, provider, status, trust counts, and backend
@@ -599,6 +605,11 @@ changes rather than treating the pool as empty.
 When a worktree opens and its spare ledger cannot be read, a warning appears on
 the status line and in a toast, and the worktree is provisioned fresh instead
 of claiming a spare.
+On the dev channel, before a spare is handed to a worktree, the worktree's
+network allow/block policy is verified on that spare and re-applied if it
+drifted. An unverifiable spare is quarantined (listed in `thegn doctor`) and
+the worktree is provisioned fresh. Providers without egress control and empty
+policies skip this check.
 If the current warm-pool target cannot be read, reconciliation makes no pool
 changes rather than falling back to the configured size. The warm-pool keys
 report `warm pool: cannot read the current target: ...` and save nothing.

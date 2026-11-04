@@ -470,6 +470,14 @@ pub trait WorktreeAuxStore {
     /// Read an operator-event history newest first, limited to at most `limit` rows.
     fn merge_queue_events(&self, worktree: &str, limit: usize) -> Result<Vec<MergeQueueEvent>>;
 
+    /// Record a refused operation against an existing merge-queue row without changing the row.
+    /// The event carries the row's status, version and OIDs, with `new_status` set to `None`.
+    /// Returns false and writes nothing when no row exists or the events table predates the
+    /// current shape. Land refusal outcomes include `not_on_branch`, `branch_unreadable`,
+    /// `not_ready`, `no_result`, `branch_mismatch`, `no_candidate`, `candidate_moved`, `remote`,
+    /// `claimed`, `registry_changed`, and `queue_changed`.
+    fn record_merge_refusal(&self, worktree: &str, operation: &str, outcome: &str) -> Result<bool>;
+
     /// Install only the fixed branch-retained cleanup marker if every decoded
     /// field still matches this landed observation. Preserve timestamps and
     /// raw nullable location/attempt aliases; false means revoked/already held.

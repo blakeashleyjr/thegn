@@ -58,6 +58,9 @@ Saving or importing never replaces a theme file that already exists unless
 the builder loaded that exact file: `thegn theme import` refuses a name that
 is already taken, and **Save as** over an existing theme is refused when the
 file changed on disk after the catalog loaded it (reopen the builder to reload it).
+Saving or importing is also refused when another `.toml` theme file claims the
+same exact name or slug, even if that file's filename does not match. Rename or
+remove the claiming file before saving again.
 
 The shipped Gogh importer accepts `name`, optional `variant`,
 `background`, `foreground`, `cursor`, and `color_01` through `color_16`.

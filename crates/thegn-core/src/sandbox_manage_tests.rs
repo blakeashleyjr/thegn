@@ -500,16 +500,26 @@ fn suffix_like_live_main_container_is_never_removed() {
     let bar = crate::sandbox::container_name("/w/bar-tgvpn");
     let all = vec![foo.clone(), bar.clone()];
     let plain = plan_gc(&active, &all, Some(&all), Some(&all));
-    assert_eq!(plain.remove, all, "documents the suffix-like name-rule bug");
+    assert!(
+        plain.remove.is_empty(),
+        "the name rule keeps suffix-like live main containers (THE-513f)"
+    );
 
-    let plan = refine_gc_plan(plain, &active, &mut |name| {
-        let path = if name == foo.as_str() {
-            b"/w/foo-tgagent".as_slice()
-        } else {
-            b"/w/bar-tgvpn".as_slice()
-        };
-        Some((MAIN_ROLE.to_string(), worktree_label_value(path)))
-    });
+    let plan = refine_gc_plan(
+        GcPlan {
+            remove: all.clone(),
+            unverified: Vec::new(),
+        },
+        &active,
+        &mut |name| {
+            let path = if name == foo.as_str() {
+                b"/w/foo-tgagent".as_slice()
+            } else {
+                b"/w/bar-tgvpn".as_slice()
+            };
+            Some((MAIN_ROLE.to_string(), worktree_label_value(path)))
+        },
+    );
 
     assert!(plan.remove.is_empty());
     assert!(plan.unverified.is_empty());
