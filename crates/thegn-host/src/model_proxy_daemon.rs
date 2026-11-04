@@ -869,6 +869,15 @@ fn restart_preflight_live(old: &ModelProxyConfig, desired: &ModelProxyConfig) ->
     }
 }
 
+fn should_log_held_restart_warning(warning_logged: &mut bool) -> bool {
+    if *warning_logged {
+        false
+    } else {
+        *warning_logged = true;
+        true
+    }
+}
+
 fn supervisor_wait(step: SupervisorStep, failures: u32) -> Option<Duration> {
     if step == SupervisorStep::Idle {
         None
@@ -901,6 +910,7 @@ pub fn spawn_supervisor(cfg: &Config) {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             let mut applied: Option<ModelProxyConfig> = None;
             let mut failures: u32 = 0;
+            let mut held_restart_warning_logged = false;
             loop {
                 reap_spawned_child();
                 let (seen, desired) = DESIRED.snapshot();
@@ -915,6 +925,9 @@ pub fn spawn_supervisor(cfg: &Config) {
                     }
                     _ => None,
                 };
+                if held.is_none() {
+                    held_restart_warning_logged = false;
+                }
                 match step {
                     SupervisorStep::Stop => {
                         match stop(&desired) {
@@ -935,7 +948,7 @@ pub fn spawn_supervisor(cfg: &Config) {
                     }
                     SupervisorStep::Restart if held.is_some() => {
                         failures = failures.saturating_add(1);
-                        if failures == 1
+                        if should_log_held_restart_warning(&mut held_restart_warning_logged)
                             && let Some(reason) = held.as_deref()
                         {
                             tracing::warn!(
@@ -1609,6 +1622,17 @@ mod tests {
         assert_eq!(result, RestartPreflight::Proceed);
         assert_eq!(seen, Some(listen_addr(&desired)));
         assert_ne!(seen, Some(listen_addr(&old)));
+    }
+
+    #[test]
+    fn restart_preflight_warning_logs_once_per_held_streak() {
+        let mut warning_logged = false;
+
+        assert!(should_log_held_restart_warning(&mut warning_logged));
+        assert!(!should_log_held_restart_warning(&mut warning_logged));
+
+        warning_logged = false;
+        assert!(should_log_held_restart_warning(&mut warning_logged));
     }
 
     #[test]
