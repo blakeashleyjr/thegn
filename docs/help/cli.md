@@ -57,9 +57,9 @@ The `issues.list` capability (`thegn api call issues.list` or HTTP `GET
 account is listed with its account, provider, kind and reason; validated rows
 from a partial account are kept. `complete` is true only when all accounts
 answer fully, and the call fails only if every configured account fails.
-With no `limit`, GitHub listing or search that exceeds the 100-issue cap, and a
-full Kaneo project page, are reported as partial accounts; the rows already
-seen are kept and `complete` is false.
+A GitHub listing or search that exceeds the 100-issue cap with no `limit` is
+reported as a partial account. A full Kaneo project page is also partial unless
+the requested limit was met; rows already seen are kept and `complete` is false.
 The `issues.get`, `issues.update` and `issues.comment` control API operations
 also accept `account` (HTTP `?account=<name>`) to route an issue to the named
 `[[issues.issue_accounts]]` entry. With `account`, the id must be
