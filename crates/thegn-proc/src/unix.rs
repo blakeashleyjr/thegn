@@ -1,6 +1,6 @@
 use crate::{
-    BACKOFF_CAP, Capture, Containment, End, GroupState, Leader, Limits, POLL_INTERVAL, Run, Stream,
-    Which, aggregate_fit,
+    BACKOFF_CAP, Capture, Containment, End, GroupState, InputFeed, Leader, Limits, POLL_INTERVAL,
+    Run, Stream, Which, aggregate_fit,
 };
 use nix::{
     errno::Errno,
@@ -44,11 +44,72 @@ impl Guard {
     }
 }
 
-struct Pipes {
+struct Pipes<'a> {
     stdout: Option<File>,
     stderr: Option<File>,
     out_open: bool,
     err_open: bool,
+    feed: Feed<'a>,
+}
+
+struct Feed<'a> {
+    stdin: Option<File>,
+    input: &'a [u8],
+    pos: usize,
+    state: InputFeed,
+}
+
+const FEED_PUMP_CAP: usize = 1 << 20;
+
+impl Feed<'_> {
+    fn pending(&self) -> bool {
+        self.stdin.is_some()
+    }
+
+    fn pump(&mut self) {
+        let mut written_this_call: usize = 0;
+        while self.stdin.is_some() {
+            if self.pos == self.input.len() {
+                self.close();
+                self.state.complete = true;
+                return;
+            }
+            if written_this_call >= FEED_PUMP_CAP {
+                return;
+            }
+            let remaining = (self.input.len() - self.pos).min(FEED_PUMP_CAP - written_this_call);
+            let fd = self.stdin.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+            // SAFETY: stdin is a live owned descriptor and the input slice is valid for remaining bytes.
+            let count =
+                unsafe { libc::write(fd, self.input[self.pos..].as_ptr().cast(), remaining) };
+            if count > 0 {
+                let count = count as usize;
+                self.pos += count;
+                written_this_call += count;
+                self.state.written = self.state.written.saturating_add(count as u64);
+                continue;
+            }
+            if count == 0 {
+                self.close();
+                self.state.error = Some(io::ErrorKind::WriteZero);
+                return;
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => return,
+                kind => {
+                    self.close();
+                    self.state.error = Some(kind);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.stdin = None;
+    }
 }
 
 type Consumer<'a> = &'a mut dyn FnMut(&[u8]);
@@ -201,7 +262,7 @@ fn group_exists(pid: libc::pid_t) -> bool {
     }
 }
 
-fn poll_pipes(pipes: &Pipes, timeout: Duration) -> io::Result<bool> {
+fn poll_pipes(pipes: &Pipes<'_>, timeout: Duration) -> io::Result<bool> {
     let mut fds = [
         libc::pollfd {
             fd: pipes
@@ -210,6 +271,16 @@ fn poll_pipes(pipes: &Pipes, timeout: Duration) -> io::Result<bool> {
                 .filter(|_| pipes.out_open)
                 .map_or(-1, AsRawFd::as_raw_fd),
             events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: pipes
+                .feed
+                .stdin
+                .as_ref()
+                .filter(|_| pipes.feed.pending())
+                .map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLOUT,
             revents: 0,
         },
         libc::pollfd {
@@ -223,7 +294,7 @@ fn poll_pipes(pipes: &Pipes, timeout: Duration) -> io::Result<bool> {
         },
     ];
     let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: fds points to two initialized pollfd records for the duration of poll.
+    // SAFETY: fds points to three initialized pollfd records for the duration of poll.
     let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
     if result < 0 {
         let error = io::Error::last_os_error();
@@ -238,10 +309,11 @@ fn poll_pipes(pipes: &Pipes, timeout: Duration) -> io::Result<bool> {
 }
 
 fn drain(
-    pipes: &mut Pipes,
+    pipes: &mut Pipes<'_>,
     out: &mut Accumulator<'_>,
     err: &mut Accumulator<'_>,
 ) -> io::Result<Option<Which>> {
+    pipes.feed.pump();
     let mut result = None;
     if pipes.out_open
         && let Some(pipe) = &pipes.stdout
@@ -280,13 +352,15 @@ fn drain(
     Ok(result)
 }
 
-fn nap(pipes: &mut Pipes, backoff: Duration) -> io::Result<()> {
-    if pipes.out_open || pipes.err_open {
+fn nap(pipes: &mut Pipes<'_>, backoff: Duration) -> io::Result<()> {
+    if pipes.out_open || pipes.err_open || pipes.feed.pending() {
         match poll_pipes(pipes, backoff) {
             Ok(_) => {}
-            Err(_error) => {
+            Err(error) => {
                 pipes.out_open = false;
                 pipes.err_open = false;
+                pipes.feed.close();
+                pipes.feed.state.error = Some(error.kind());
                 std::thread::sleep(backoff);
             }
         }
@@ -299,7 +373,7 @@ fn nap(pipes: &mut Pipes, backoff: Duration) -> io::Result<()> {
 fn wait_empty(
     pid: libc::pid_t,
     deadline: Instant,
-    pipes: &mut Pipes,
+    pipes: &mut Pipes<'_>,
     out: &mut Accumulator<'_>,
     err: &mut Accumulator<'_>,
     backoff: &mut Duration,
@@ -388,7 +462,30 @@ pub(super) fn run_consuming(
     cancel: &AtomicBool,
     consume: &mut dyn FnMut(&[u8]),
 ) -> Run {
-    cmd.stdin(Stdio::null());
+    run_inner(cmd, limits, cancel, consume, None).0
+}
+
+pub(super) fn run_with_input(
+    cmd: &mut Command,
+    limits: &Limits,
+    input: &[u8],
+    cancel: &AtomicBool,
+) -> (Run, InputFeed) {
+    run_inner(cmd, limits, cancel, &mut |_bytes: &[u8]| {}, Some(input))
+}
+
+fn run_inner(
+    cmd: &mut Command,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    consume: &mut dyn FnMut(&[u8]),
+    input: Option<&[u8]>,
+) -> (Run, InputFeed) {
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     cmd.stdout(if matches!(limits.stdout, Stream::Null) {
         Stdio::null()
     } else {
@@ -403,15 +500,18 @@ pub(super) fn run_consuming(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return Run {
-                end: End::Spawn(error),
-                group: GroupState::Unknown,
-                leader: Leader::NotSpawned,
-                leader_exited_first: false,
-                stdout: Capture::default(),
-                stderr: Capture::default(),
-                containment: Containment::ProcessGroup,
-            };
+            return (
+                Run {
+                    end: End::Spawn(error),
+                    group: GroupState::Unknown,
+                    leader: Leader::NotSpawned,
+                    leader_exited_first: false,
+                    stdout: Capture::default(),
+                    stderr: Capture::default(),
+                    containment: Containment::ProcessGroup,
+                },
+                InputFeed::default(),
+            );
         }
     };
     let pid = child.id() as libc::pid_t;
@@ -426,24 +526,49 @@ pub(super) fn run_consuming(
         // SAFETY: ownership of this raw descriptor is transferred from ChildStderr to File.
         unsafe { File::from_raw_fd(fd) }
     });
+    let stdin = child.stdin.take().map(|pipe| {
+        let fd = pipe.into_raw_fd();
+        // SAFETY: ownership of this raw descriptor is transferred from ChildStdin to File.
+        unsafe { File::from_raw_fd(fd) }
+    });
+    let input_bytes = input.unwrap_or(&[]);
+    let mut feed = Feed {
+        stdin,
+        input: input_bytes,
+        pos: 0,
+        state: InputFeed::default(),
+    };
+    if input.is_some() && input_bytes.is_empty() {
+        feed.close();
+        feed.state.complete = true;
+    }
     let mut pipes = Pipes {
         out_open: stdout.is_some(),
         err_open: stderr.is_some(),
         stdout,
         stderr,
+        feed,
     };
-    for pipe in [&pipes.stdout, &pipes.stderr].into_iter().flatten() {
-        if let Err(_error) = set_nonblocking(pipe) {
-            send_group_signal(pid, Signal::SIGKILL);
-            if let Err(_kill_error) = child.kill() {
-                // The group signal above is the primary cleanup; wait still reaps the leader.
-            }
-            let leader = match child.wait() {
-                Ok(status) => Leader::Reaped(status),
-                Err(wait_error) => Leader::ReapFailed(wait_error),
-            };
-            guard.disarm();
-            return Run {
+    let setup_error = [&pipes.stdout, &pipes.stderr, &pipes.feed.stdin]
+        .into_iter()
+        .flatten()
+        .find_map(|pipe| set_nonblocking(pipe).err());
+    if let Some(error) = setup_error {
+        if pipes.feed.pending() {
+            pipes.feed.state.error = Some(error.kind());
+        }
+        pipes.feed.close();
+        send_group_signal(pid, Signal::SIGKILL);
+        if let Err(_kill_error) = child.kill() {
+            // The group signal above is the primary cleanup; wait still reaps the leader.
+        }
+        let leader = match child.wait() {
+            Ok(status) => Leader::Reaped(status),
+            Err(wait_error) => Leader::ReapFailed(wait_error),
+        };
+        guard.disarm();
+        return (
+            Run {
                 end: End::TimedOut,
                 group: GroupState::Terminated,
                 leader,
@@ -451,8 +576,9 @@ pub(super) fn run_consuming(
                 stdout: Capture::default(),
                 stderr: Capture::default(),
                 containment: Containment::ProcessGroup,
-            };
-        }
+            },
+            pipes.feed.state,
+        );
     }
     let start = Instant::now();
     let deadline = start + limits.timeout;
@@ -520,6 +646,7 @@ pub(super) fn run_consuming(
         if let Err(_error) = nap(&mut pipes, backoff.min(remaining)) {}
         backoff = crate::next_backoff(backoff, remaining);
     };
+    pipes.feed.close();
     let mut group = GroupState::Unknown;
     let mut signalled = false;
     if !matches!(end, End::LeaderExited | End::Supervise(_)) {
@@ -629,7 +756,7 @@ pub(super) fn run_consuming(
         limits.aggregate_tail_cap,
     );
     guard.disarm();
-    run
+    (run, pipes.feed.state)
 }
 
 #[cfg(test)]
@@ -1267,5 +1394,116 @@ mod tests {
             crate::ProcError::NonZero(status).to_string(),
             format!("exited with {status}")
         );
+    }
+
+    #[test]
+    fn input_payload_reaches_the_child_and_closes_stdin() {
+        let scripts = Scripts::new();
+        let script = scripts.write("input-round-trip.sh", "cat\n");
+        let input = b"alpha\nbeta\n";
+        let (run, feed) = crate::run_with_input(
+            &mut command(&script),
+            &limits(Duration::from_secs(5)),
+            input,
+            &AtomicBool::new(false),
+        );
+        assert!(run.success());
+        assert_eq!(run.stdout.bytes, input);
+        assert_eq!(
+            feed,
+            crate::InputFeed {
+                written: 11,
+                complete: true,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn large_input_feeds_without_deadlock_while_output_drains() {
+        let scripts = Scripts::new();
+        let script = scripts.write("input-large.sh", "cat\n");
+        let input = vec![b'x'; 1 << 20];
+        let (run, feed) = crate::run_with_input(
+            &mut command(&script),
+            &limits(Duration::from_secs(10)),
+            &input,
+            &AtomicBool::new(false),
+        );
+        assert!(run.success());
+        assert!(feed.complete);
+        assert_eq!(feed.written, 1 << 20);
+        assert_eq!(run.stdout.total, 1 << 20);
+    }
+
+    #[test]
+    fn child_that_never_reads_stdin_does_not_block_the_run() {
+        let scripts = Scripts::new();
+        let script = scripts.write("input-unread.sh", "exit 0\n");
+        let input = vec![0_u8; 1 << 20];
+        let started = Instant::now();
+        let (run, feed) = crate::run_with_input(
+            &mut command(&script),
+            &limits(Duration::from_secs(10)),
+            &input,
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(run.end, End::LeaderExited));
+        assert!(!feed.complete);
+        assert!(feed.written < (1 << 20));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stdin_holding_child_still_times_out_and_is_killed() {
+        let scripts = Scripts::new();
+        let script = scripts.write("input-held.sh", "sleep 30\n");
+        let input = vec![0_u8; 1 << 20];
+        let (run, feed) = crate::run_with_input(
+            &mut command(&script),
+            &limits(Duration::from_millis(300)),
+            &input,
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(run.end, End::TimedOut));
+        assert_eq!(run.group, GroupState::Terminated);
+        assert!(matches!(run.leader, Leader::Reaped(_)));
+        assert!(!feed.complete);
+    }
+
+    #[test]
+    fn empty_input_delivers_eof_at_once() {
+        let scripts = Scripts::new();
+        let script = scripts.write("input-empty.sh", "cat\n");
+        let (run, feed) = crate::run_with_input(
+            &mut command(&script),
+            &limits(Duration::from_secs(5)),
+            b"",
+            &AtomicBool::new(false),
+        );
+        assert!(run.success());
+        assert!(run.stdout.bytes.is_empty());
+        assert_eq!(
+            feed,
+            crate::InputFeed {
+                written: 0,
+                complete: true,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn plain_run_keeps_stdin_null() {
+        // Positive control: this already passes without run_with_input.
+        let scripts = Scripts::new();
+        let script = scripts.write("input-null.sh", "cat\n");
+        let run = run(
+            &mut command(&script),
+            &limits(Duration::from_secs(5)),
+            &AtomicBool::new(false),
+        );
+        assert!(run.success());
+        assert!(run.stdout.bytes.is_empty());
     }
 }
