@@ -29,6 +29,16 @@ pub(crate) struct RequestLedger {
     local_usage: BTreeMap<String, (usize, usize)>,
 }
 impl RequestLedger {
+    #[cfg(test)]
+    pub(crate) fn set_local_usage(&mut self, surface: String, usage: (usize, usize)) {
+        self.local_usage.insert(surface, usage);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_usage(&self, surface: &str) -> Option<(usize, usize)> {
+        self.local_usage.get(surface).copied()
+    }
+
     fn bytes(&self) -> usize {
         self.pending.values().map(|pending| pending.bytes).sum()
     }
@@ -91,6 +101,29 @@ impl AppState {
             delivery_bytes: 0,
             error: None,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn track_test_pending(&mut self, event: AppEventParams) {
+        let session = self.session.expect("test app session");
+        let bytes = serde_json::to_vec(&event)
+            .expect("test event serializes")
+            .len();
+        let id = u64::MAX;
+        self.requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .insert(
+                (session, id),
+                Pending {
+                    event,
+                    deadline: Instant::now() + self.timeout,
+                    session,
+                    unknown: false,
+                    bytes,
+                },
+            );
+        self.pending.insert((session, id));
     }
     /// Accepted frames and responses retain their originating wire order.
     pub(crate) fn apply_view(&mut self, view: AppView) -> Result<(), String> {
@@ -902,7 +935,7 @@ mod tests {
 
     #[test]
     fn request_budget_refuses_the_ninth_request() {
-        with_writer(|writer| {
+        with_writer(|writer, _messages| {
             let mut state = AppState::new(false);
             state.session = Some(1);
             state.writer = Some(writer);
@@ -1075,24 +1108,41 @@ mod tests {
                 .contains("Malformed acknowledgment")
         );
     }
-    fn with_writer(test: impl FnOnce(SessionWriter)) {
+    fn with_writer(
+        test: impl FnOnce(SessionWriter, Arc<Mutex<Vec<thegn_core::plugin_api::RpcMessage>>>),
+    ) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
         let supervisor = thegn_svc::plugin::ResidentSupervisor::new(runtime.handle().clone());
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let callback_messages = messages.clone();
         let session = thegn_svc::plugin::ResidentSession::spawn(
             &supervisor,
             "host-app-fixture",
-            &["sh".into(), "-c".into(), "cat >/dev/null".into()],
+            &[
+                "sh".into(),
+                "-c".into(),
+                "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".into(),
+            ],
             &BTreeMap::new(),
             None,
-            |_| {},
+            // The fixture echoes host frames so tests can observe messages
+            // through the real session protocol and parser.
+            move |event| {
+                if let thegn_svc::plugin::SessionEvent::Message(message) = event {
+                    callback_messages
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push(message);
+                }
+            },
         )
         .unwrap();
         let writer = session.writer();
-        test(writer);
+        test(writer, messages);
         drop(session);
         let report = runtime.block_on(
             supervisor.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(3)),
@@ -1101,7 +1151,7 @@ mod tests {
     }
     #[test]
     fn submission_admission_counts_dirty_drafts_across_app_surfaces() {
-        with_writer(|writer| {
+        with_writer(|writer, _messages| {
             let mut state = AppState::new(false);
             state.session = Some(1);
             state.writer = Some(writer);
@@ -1156,17 +1206,7 @@ mod tests {
     }
     #[test]
     fn epoch_changes_resend_grid_viewport_without_physical_resize() {
-        with_writer(|writer| {
-            let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-            let output = seen.clone();
-            writer
-                .observe_outbound(Arc::new(move |frame| {
-                    output
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .push(serde_json::from_slice(frame).unwrap())
-                }))
-                .unwrap();
+        with_writer(|writer, seen| {
             let mut state = AppState::new(false);
             state.session = Some(1);
             state.writer = Some(writer);
@@ -1196,12 +1236,26 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .epoch = 2;
             tile.pump();
+            for _ in 0..100 {
+                if seen
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .iter()
+                    .any(|message| {
+                        message.params["payload"]["event"] == "resize"
+                            && message.params["payload"]["data"]["width"] == 80
+                    })
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert!(
                 seen.lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .iter()
-                    .any(|frame| frame["params"]["payload"]["event"] == "resize"
-                        && frame["params"]["payload"]["data"]["width"] == 80)
+                    .any(|message| message.params["payload"]["event"] == "resize"
+                        && message.params["payload"]["data"]["width"] == 80)
             );
         });
     }

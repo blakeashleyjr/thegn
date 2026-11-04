@@ -3336,6 +3336,8 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     cfg.sandbox.remote.host = "box.example".into();
     cfg.host.insert("gpu".into(), Default::default());
     cfg.voice.enabled = true;
+    cfg.apps.default_tab = "plugin:todoist:workspace".into();
+    cfg.apps.tab_order.push("plugin:todoist:workspace".into());
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
 
@@ -3345,8 +3347,11 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     assert!(cfg.sandbox.remote.host.is_empty());
     assert!(cfg.host.is_empty());
     assert!(!cfg.voice.enabled);
+    assert_eq!(cfg.apps.default_tab, "work");
+    assert_eq!(cfg.apps.tab_order, ["work"]);
     // Every gated feature reports as clamped.
-    assert_eq!(clamped.len(), Feature::ALL.len());
+    assert_eq!(clamped.len(), 6);
+    assert!(clamped.contains(&Feature::PluginApps));
 }
 
 #[test]
