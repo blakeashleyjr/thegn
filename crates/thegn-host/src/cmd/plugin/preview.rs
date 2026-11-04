@@ -11,6 +11,7 @@ use tg_kit::ratatui::{buffer::Buffer, layout::Rect};
 use tg_kit::{AppTile, InputEvent, InputResult, Key, Modifiers, Theme};
 use thegn_core::plugin_app::AppView;
 use thegn_plugin_ui::UiEngine;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Args)]
 pub struct Options {
@@ -285,7 +286,7 @@ fn synthetic(options: &Options, trace: Arc<Mutex<Trace>>) -> Result<Box<dyn AppT
     let mut ui = UiEngine::new(Theme::prism());
     let mut area = Rect::new(0, 0, options.size.0, options.size.1);
     if let Some(path) = &options.fixture {
-        let value = if path == Path::new("gallery") {
+        let value = if is_gallery_selector(path) {
             serde_json::from_str(include_str!("gallery.json"))?
         } else {
             read_json(path)?
@@ -349,13 +350,7 @@ fn snapshot_value(tile: &mut dyn AppTile, size: (u16, u16)) -> Value {
     let lines: Vec<String> = buffer
         .content
         .chunks(size.0 as usize)
-        .map(|row| {
-            row.iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        })
+        .map(|row| visible_row(row).trim_end().to_string())
         .collect();
     json!({
         "cols": size.0,
@@ -364,6 +359,25 @@ fn snapshot_value(tile: &mut dyn AppTile, size: (u16, u16)) -> Value {
         "cursor": tile.cursor(),
         "status": tile.status_line(),
     })
+}
+
+fn is_gallery_selector(path: &Path) -> bool {
+    path.as_os_str() == std::ffi::OsStr::new("gallery")
+}
+
+fn visible_row(row: &[tg_kit::ratatui::buffer::Cell]) -> String {
+    let mut text = String::new();
+    let mut skip_continuation = false;
+    for cell in row {
+        if skip_continuation {
+            skip_continuation = false;
+            continue;
+        }
+        let symbol = cell.symbol();
+        text.push_str(symbol);
+        skip_continuation = UnicodeWidthStr::width(symbol) > 1;
+    }
+    text
 }
 
 fn snapshot(tile: &mut dyn AppTile, size: (u16, u16)) -> Result<()> {
@@ -446,6 +460,21 @@ mod tests {
         assert!(dimensions("0x24").is_err());
         assert!(dimensions("900x24").is_err());
         assert!(dimensions("80x257").is_err());
+    }
+
+    #[test]
+    fn wide_grapheme_snapshot_skips_ratatui_continuation_cells() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_string(0, 0, "漢x", tg_kit::ratatui::style::Style::default());
+        assert_eq!(visible_row(&buffer.content), "漢x  ");
+    }
+
+    #[test]
+    fn gallery_selector_does_not_capture_a_dot_relative_file() {
+        assert!(is_gallery_selector(Path::new("gallery")));
+        assert!(!is_gallery_selector(Path::new("./gallery")));
+        assert!(!is_gallery_selector(Path::new("/tmp/gallery")));
     }
 
     #[test]

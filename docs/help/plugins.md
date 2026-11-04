@@ -186,7 +186,8 @@ a hidden app keep syncing. This requires `trusted_native = true`.
 account, network or plugin process. Add `--headless` for a one-line JSON screen snapshot (`--size COLSxROWS` sets the
 geometry), or pass `--fixture <file>` with your own `{"view": ..., "inputs": [...]}` document. `--record <file>` writes a
 new owner-only trace (an existing file is never overwritten); only synthetic fixtures recorded with `--include-content`
-can be replayed with `--replay <file>`. Previewing a running plugin is not available yet.
+can be replayed with `--replay <file>`. If a fixture file in the current directory is named `gallery`, pass it as
+`--fixture ./gallery` to distinguish it from the bundled fixture. Previewing a running plugin is not available yet.
 
 ## Provider plugins
 

@@ -100,8 +100,9 @@ A fixture is a JSON object with `view` (an `AppView`) and optional `inputs`. Eac
 `{"paste": "text"}`, or `{"resize": [cols, rows]}`. Keys are `enter`, `escape`, `tab`, `back_tab`, `backspace`,
 `delete`, `left`, `right`, `up`, `down`, `home`, `end`, `page_up`, `page_down`, `f1` through `f35`, or one character;
 key inputs may also set `ctrl`, `alt`, and `shift` booleans. `thegn plugin preview --fixture gallery` selects the bundled
-fixture, and `--headless` emits a JSON screen snapshot. `--record <file>` creates a new owner-only trace and refuses an
-existing path. Replay with `--replay <file>` accepts only an unredacted synthetic trace recorded with `--include-content`;
-redacted traces cannot be replayed.
+fixture, and `--headless` emits a JSON screen snapshot. Use `--fixture ./gallery` for a file with that name in the
+current directory. `--record <file>` creates a new owner-only trace and refuses an existing path. Replay with
+`--replay <file>` accepts only an unredacted synthetic trace recorded with `--include-content`; redacted traces cannot be
+replayed.
 
 The plugin SDK crate and example plugins are tracked under THE-1675 and THE-1676.

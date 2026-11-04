@@ -318,16 +318,6 @@ pub const CATALOG: &[Slot] = &[
     slot("merge add", "why", SourceKind::Reserved(Reserved::Freeform)),
     slot("merge history", "worktree", SourceKind::Worktree),
     slot("merge history", "limit", SourceKind::Structural),
-    // `plugin preview` takes no plugin id and never starts a plugin to complete a value. Paths are clap's own
-    // filesystem completion; the size is a COLSxROWS scalar with no enumerable source.
-    slot("plugin preview", "fixture", SourceKind::Structural),
-    slot("plugin preview", "replay", SourceKind::Structural),
-    slot("plugin preview", "record", SourceKind::Structural),
-    slot(
-        "plugin preview",
-        "size",
-        SourceKind::Reserved(Reserved::Freeform),
-    ),
     slot("merge land", "worktree", SourceKind::Worktree),
     slot("merge land", "worktree_pos", SourceKind::Worktree),
     slot("merge retry", "worktree", SourceKind::Worktree),
@@ -374,6 +364,16 @@ pub const CATALOG: &[Slot] = &[
     slot("placement explain", "worktree_pos", SourceKind::Worktree),
     slot("placement plan", "worktree", SourceKind::Worktree),
     slot("placement plan", "worktree_pos", SourceKind::Worktree),
+    // `plugin preview` takes no plugin id and never starts a plugin to complete a value. Paths are clap's own
+    // filesystem completion; the size is a COLSxROWS scalar with no enumerable source.
+    slot("plugin preview", "fixture", SourceKind::Structural),
+    slot("plugin preview", "replay", SourceKind::Structural),
+    slot("plugin preview", "record", SourceKind::Structural),
+    slot(
+        "plugin preview",
+        "size",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("pr approve", "worktree", SourceKind::Worktree),
     slot("pr auto-merge", "worktree", SourceKind::Worktree),
     slot("pr comment", "worktree", SourceKind::Worktree),
