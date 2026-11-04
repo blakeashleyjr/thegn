@@ -154,6 +154,9 @@ writes an owner-only intent record in the repository Git directory; the next
 rename or worktree creation in that repository, and a check at every launch,
 resolve an interrupted move or refuse an ambiguous state, keep the record and
 show the outcome in a launch toast. A path that is not a registered worktree on
-the old branch is refused.
+the old branch is refused. Before creating a worktree, thegn checks whether
+its branch already exists; if Git cannot verify that (for example, because
+it times out), creation is refused without changing anything. Failed branch
+renames and worktree moves include Git's reason.
 Worktree tabs are named `<repo>/<exact branch>`. See the [[config-reference]]
 for every knob.
