@@ -34,6 +34,50 @@ const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const BUNDLE_STDERR_TAIL: usize = 64 * 1024;
 const BUNDLE_READER_GRACE: Duration = Duration::from_millis(100);
 
+thread_local! {
+    /// The merge-claim generation of the drain attempt running on this thread (None outside a drain attempt).
+    static INGEST_CLAIM_GENERATION: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Marks the current thread as running a merge-queue attempt under claim `generation` until dropped. Nested scopes restore the
+/// previous value.
+pub(crate) struct IngestClaimScope {
+    previous: Option<i64>,
+}
+
+impl IngestClaimScope {
+    pub(crate) fn enter(generation: i64) -> Self {
+        let previous = INGEST_CLAIM_GENERATION.with(|cell| cell.replace(Some(generation)));
+        Self { previous }
+    }
+}
+
+impl Drop for IngestClaimScope {
+    fn drop(&mut self) {
+        INGEST_CLAIM_GENERATION.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// The claim generation of the drain attempt on this thread, if any.
+pub(crate) fn current_ingest_claim_generation() -> Option<i64> {
+    INGEST_CLAIM_GENERATION.with(std::cell::Cell::get)
+}
+
+/// The 32-bit generation field of an ingest ref name: the claim generation clamped into `0..=u32::MAX`, `0` outside a drain.
+fn generation_field(generation: Option<i64>) -> u32 {
+    let clamped = generation.unwrap_or(0).clamp(0, i64::from(u32::MAX));
+    u32::try_from(clamped).unwrap_or(u32::MAX)
+}
+
+/// The generation field of `ref_name` when it is `<prefix><16 lower hex>`; None for any other shape.
+fn ref_generation_field(ref_name: &str, prefix: &str) -> Option<u32> {
+    let tail = ref_name.strip_prefix(prefix)?;
+    if !is_lower_hex_16(tail) {
+        return None;
+    }
+    u32::from_str_radix(&tail[..8], 16).ok()
+}
+
 struct BundleLimits {
     max_bytes: u64,
     deadline: Duration,
@@ -126,7 +170,7 @@ impl Drop for IngestRef {
 }
 
 /// Ensure `branch`'s tip is available in the target store. Cross-host refs are
-/// unique per source authority, worktree and random ingestion generation.
+/// unique per source authority, worktree, claim generation and random nonce.
 pub fn ingest_tip(target: &GitLoc, branch: &str, branch_loc: &GitLoc) -> Result<IngestedTip> {
     if !needs_ingest(target, branch_loc) {
         return Ok(IngestedTip {
@@ -208,9 +252,15 @@ fn ingest_tip_with_expected(
 
 fn generation_ref(branch_loc: &GitLoc, branch: &str) -> Result<String> {
     let row = row_key(branch_loc, branch);
-    let mut generation = [0_u8; 8];
-    getrandom::fill(&mut generation).context("mint merge-queue ingest generation")?;
-    Ok(format!("refs/thegn/mq/{row}/{}", hex_prefix(&generation)))
+    let field = generation_field(current_ingest_claim_generation());
+    // A 32-bit nonce makes a same-row, same-generation collision about 1 in 4 billion
+    // while a prior ref is still live; the generation field separates different claims.
+    let mut nonce = [0_u8; 4];
+    getrandom::fill(&mut nonce).context("mint merge-queue ingest generation")?;
+    Ok(format!(
+        "refs/thegn/mq/{row}/{field:08x}{}",
+        hex_prefix(&nonce)
+    ))
 }
 
 fn row_key(branch_loc: &GitLoc, branch: &str) -> String {
@@ -237,6 +287,8 @@ fn loc_path(loc: &GitLoc) -> String {
 fn prune_refs(target: &GitLoc, branch_loc: &GitLoc, branch: &str) -> Result<()> {
     const PRUNE_LIMIT: usize = 64;
     let prefix = format!("refs/thegn/mq/{}/", row_key(branch_loc, branch));
+    let mine: Option<u32> =
+        current_ingest_claim_generation().map(|generation| generation_field(Some(generation)));
     let refs = match enumerate_stale_refs(target, &prefix) {
         Ok(refs) => refs,
         Err(error) => {
@@ -252,6 +304,14 @@ fn prune_refs(target: &GitLoc, branch_loc: &GitLoc, branch: &str) -> Result<()> 
         );
     }
     for ref_name in refs {
+        if let Some(mine) = mine
+            && ref_generation_field(&ref_name, &prefix).is_some_and(|theirs| theirs > mine)
+        {
+            // A claim-generation reset can leave a higher-generation ref behind; a scoped
+            // drain preserves it, and the orphan sweep reaps it only after the row is gone.
+            tracing::debug!(ref_name = %ref_name, "kept the merge-queue ingest ref of a newer claim generation");
+            continue;
+        }
         if let Err(error) = ref_update(target, &["update-ref", "-d", &ref_name]) {
             tracing::warn!(ref_name = %ref_name, error = %error, "failed to prune stale merge-queue ingest ref");
         }
@@ -1535,6 +1595,150 @@ mod tests {
         assert!(!refs_after_ingest.contains(&legacy_ref.to_string()));
         assert!(!refs_after_ingest.contains(&stale_generation));
         assert_eq!(refs_after_ingest, vec![ingested.ref_name.clone()]);
+        drop(ingested);
+    }
+
+    #[test]
+    fn ingest_claim_ref_embeds_the_generation() {
+        let scope = IngestClaimScope::enter(7);
+        let name = generation_ref(&GitLoc::Local(PathBuf::from("/src")), "feat").unwrap();
+        let parts: Vec<_> = name.split('/').collect();
+        assert_eq!(parts.len(), 5);
+        assert!(is_lower_hex_16(parts[3]));
+        assert!(is_lower_hex_16(parts[4]));
+        assert!(parts[4].starts_with("00000007"));
+        assert_eq!(current_ingest_claim_generation(), Some(7));
+        drop(scope);
+
+        let outside = generation_ref(&GitLoc::Local(PathBuf::from("/src")), "feat").unwrap();
+        assert!(outside.rsplit('/').next().unwrap().starts_with("00000000"));
+        assert_eq!(current_ingest_claim_generation(), None);
+    }
+
+    #[test]
+    fn ingest_claim_scope_nests_and_restores() {
+        let outer = IngestClaimScope::enter(1);
+        assert_eq!(current_ingest_claim_generation(), Some(1));
+        let inner = IngestClaimScope::enter(2);
+        assert_eq!(current_ingest_claim_generation(), Some(2));
+        drop(inner);
+        assert_eq!(current_ingest_claim_generation(), Some(1));
+        drop(outer);
+        assert_eq!(current_ingest_claim_generation(), None);
+    }
+
+    #[test]
+    fn ingest_claim_late_owner_keeps_the_newer_claimants_ref() {
+        let fixture = stores("source");
+        let newer = {
+            let _scope = IngestClaimScope::enter(2);
+            ingest(&fixture, None).unwrap()
+        };
+        let late = {
+            let _scope = IngestClaimScope::enter(1);
+            ingest(&fixture, None).unwrap()
+        };
+        let refs = list_refs(&fixture.target);
+        assert!(refs.contains(&newer.ref_name));
+        assert!(refs.contains(&late.ref_name));
+        assert!(
+            newer
+                .ref_name
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .starts_with("00000002")
+        );
+        assert!(
+            late.ref_name
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .starts_with("00000001")
+        );
+
+        drop(late);
+        // IngestRef::drop deletes by ref name and OID; both refs share this OID, so only
+        // `late.ref_name` disappears and the newer ref remains.
+        assert_eq!(list_refs(&fixture.target), vec![newer.ref_name.clone()]);
+        drop(newer);
+        assert!(list_refs(&fixture.target).is_empty());
+    }
+
+    #[test]
+    fn ingest_claim_newer_claimant_prunes_lower_and_equal_generations() {
+        let fixture = stores("source");
+        let target_oid =
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+        let prefix = format!(
+            "refs/thegn/mq/{}/",
+            row_key(&GitLoc::Local(fixture.source.clone()), "feat")
+        );
+        let lower = format!("{prefix}00000001deadbeef");
+        let equal = format!("{prefix}00000002deadbeef");
+        let newer = format!("{prefix}00000003deadbeef");
+        let legacy = "refs/thegn/mq/feat".to_string();
+        for ref_name in [&lower, &equal, &newer, &legacy] {
+            git(&fixture.target, &["update-ref", ref_name, &target_oid]);
+        }
+
+        let _scope = IngestClaimScope::enter(2);
+        let ingested = ingest(&fixture, None).unwrap();
+        let refs = list_refs(&fixture.target);
+        assert!(!refs.contains(&lower));
+        assert!(!refs.contains(&equal));
+        assert!(!refs.contains(&legacy));
+        assert!(refs.contains(&newer));
+        assert!(refs.contains(&ingested.ref_name));
+        drop(ingested);
+    }
+
+    #[test]
+    fn ingest_without_a_claim_scope_prunes_every_generation() {
+        let fixture = stores("source");
+        let target_oid =
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+        let stale = format!(
+            "refs/thegn/mq/{}/0000000500000000",
+            row_key(&GitLoc::Local(fixture.source.clone()), "feat")
+        );
+        git(&fixture.target, &["update-ref", &stale, &target_oid]);
+
+        let ingested = ingest(&fixture, None).unwrap();
+        let refs = list_refs(&fixture.target);
+        assert!(!refs.contains(&stale));
+        assert!(refs.contains(&ingested.ref_name));
+        drop(ingested);
+    }
+
+    #[test]
+    fn ingest_claim_prune_keeps_unrelated_row_refs_and_orphan_sweep_layout() {
+        let fixture = stores("source");
+        let target_oid =
+            thegn_core::util::git_out(&fixture.target, &["rev-parse", "HEAD"]).unwrap();
+        let other_source = GitLoc::Local(PathBuf::from("/other-source"));
+        let unrelated = format!(
+            "refs/thegn/mq/{}/0000000400000000",
+            row_key(&other_source, "feat")
+        );
+        git(&fixture.target, &["update-ref", &unrelated, &target_oid]);
+        let ingested = {
+            let _scope = IngestClaimScope::enter(3);
+            ingest(&fixture, None).unwrap()
+        };
+        let report = sweep_orphan_ingest_refs(&GitLoc::Local(fixture.target.clone()), || {
+            Ok(vec![
+                (GitLoc::Local(fixture.source.clone()), "feat".to_string()),
+                (other_source, "feat".to_string()),
+            ])
+        })
+        .unwrap();
+        assert_eq!(report.deleted, 0);
+        assert!(is_lower_hex_16(
+            ingested.ref_name.rsplit('/').next().unwrap()
+        ));
+        assert!(list_refs(&fixture.target).contains(&ingested.ref_name));
+        assert!(list_refs(&fixture.target).contains(&unrelated));
         drop(ingested);
     }
 
