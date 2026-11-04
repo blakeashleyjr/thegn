@@ -2129,6 +2129,65 @@ fn ci_logs_reply_without_warnings_still_decodes() {
 }
 
 #[test]
+fn ci_logs_reply_carries_redaction_changed_and_older_replies_decode() {
+    let legacy: super::CiLogsReply = serde_json::from_value(serde_json::json!({
+        "worktree": "/repo",
+        "run_id": "run",
+        "job_id": "job",
+        "logs": [],
+        "source": "cache",
+        "fetched_at": 1,
+        "truncated": false,
+        "redacted": true
+    }))
+    .unwrap();
+    assert_eq!(legacy.redaction_changed, None);
+
+    let changed: super::CiLogsReply = serde_json::from_value(serde_json::json!({
+        "worktree": "/repo",
+        "run_id": "run",
+        "job_id": "job",
+        "logs": [],
+        "source": "cache",
+        "fetched_at": 1,
+        "truncated": false,
+        "redacted": true,
+        "redaction_changed": true
+    }))
+    .unwrap();
+    assert_eq!(changed.redaction_changed, Some(true));
+
+    let unchanged: super::CiLogsReply = serde_json::from_value(serde_json::json!({
+        "worktree": "/repo",
+        "run_id": "run",
+        "job_id": "job",
+        "logs": [],
+        "source": "cache",
+        "fetched_at": 1,
+        "truncated": false,
+        "redacted": true,
+        "redaction_changed": false
+    }))
+    .unwrap();
+    assert_eq!(unchanged.redaction_changed, Some(false));
+
+    let encoded_legacy = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(
+        encoded_legacy.get("redaction_changed"),
+        Some(&serde_json::Value::Null)
+    );
+    let encoded_changed = serde_json::to_value(super::CiLogsReply {
+        redaction_changed: Some(true),
+        ..legacy
+    })
+    .unwrap();
+    assert_eq!(
+        encoded_changed.get("redaction_changed"),
+        Some(&serde_json::json!(true))
+    );
+}
+
+#[test]
 fn issue_listing_serializes_issues_complete_and_incomplete() {
     let encoded = serde_json::to_value(super::IssueListing {
         issues: vec![],
