@@ -891,8 +891,6 @@ fn expired_claim_on_a_non_landed_row_is_still_refused_by_remove() {
         matches!(remove, Err(error) if error.to_string().contains(crate::store::MERGE_CLAIM_ACTIVE))
     );
     assert_eq!(db.list_merge_queue().unwrap()[0].status, "folding");
-    let mut expected = request();
-    expected.expected_status = "folding".into();
-    let recovered = db.admit_merge_claim(&expected).unwrap().unwrap();
+    let recovered = db.admit_merge_claim(&request()).unwrap().unwrap();
     assert_eq!(recovered.generation, 2);
 }
